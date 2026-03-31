@@ -1,0 +1,32 @@
+[package]
+name = "did-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS DID Provider Capsule - did:key identity"
+license = "MIT"
+
+[[bin]]
+name = "did-provider"
+path = "src/main.rs"
+
+[dependencies]
+elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+zeroize = "1"
+bs58 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

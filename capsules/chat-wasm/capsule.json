@@ -1,0 +1,18 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "chat-wasm",
+  "version": "0.1.0",
+  "description": "P2P chat client - WASM stdio variant (same wire format as microVM chat)",
+  "author": "elastos",
+  "type": "wasm",
+  "entrypoint": "chat-stdio.wasm",
+  "requires": [],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": ["localhost://Users/self/.AppData/LocalHost/Chat/*"],
+    "messaging": []
+  }
+}

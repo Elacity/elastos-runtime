@@ -1,0 +1,13 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "gba-ucity",
+  "version": "0.1.0",
+  "description": "uCity Advance - open-source city builder for GBA",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "ucity.gba",
+  "viewer": "gba-emulator",
+  "permissions": {
+    "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/gba-ucity/*"]
+  }
+}

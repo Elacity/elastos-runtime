@@ -1,0 +1,16 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "gba-emulator",
+  "version": "0.1.0",
+  "description": "Game Boy Advance emulator (mGBA)",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "permissions": {
+    "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
+  },
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  }
+}

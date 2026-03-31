@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+# Main Cargo.lock is committed for reproducible builds
+# Sub-workspace locks are gitignored (independent builds)
+capsules/*/Cargo.lock
+tools/*/Cargo.lock
+
+# Node.js
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ElastOS
+/storage/
+*.wasm
+.last-published-cid
+
+
+# Logs
+*.log

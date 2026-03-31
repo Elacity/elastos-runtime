@@ -1,0 +1,11 @@
+[package]
+name = "ai-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS AI provider - OpenAI-compatible LLM routing"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }

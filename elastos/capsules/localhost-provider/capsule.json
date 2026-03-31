@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "localhost-provider",
+  "version": "0.1.0",
+  "description": "Localhost provider - secure access to local machine resources",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "localhost://*",
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": [
+      "localhost://UsersAI/",
+      "localhost://AppCapsules/",
+      "localhost://ElastOS/",
+      "localhost://Local/",
+      "localhost://MyWebSite/",
+      "localhost://PC2Host/",
+      "localhost://Public/",
+      "localhost://Users/"
+    ],
+    "messaging": ["*"]
+  }
+}

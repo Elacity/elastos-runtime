@@ -1,0 +1,22 @@
+[package]
+name = "localhost-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Localhost Provider Capsule"
+license = "MIT"
+
+[[bin]]
+name = "localhost-provider"
+path = "src/main.rs"
+
+[dependencies]
+elastos-common = { path = "../../crates/elastos-common" }
+elastos-guest = { path = "../../crates/elastos-guest" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+aes-gcm = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3.10"

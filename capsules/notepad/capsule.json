@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "notepad",
+  "version": "0.1.0",
+  "description": "Capability-aware note storage",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "capabilities": ["localhost://Users/self/Documents/Notes/*"],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}

@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ElastOS Documents</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  color: #24292e;
+  background: #fff;
+}
+
+/* Single-doc mode: centered content */
+body.single #wrapper {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+/* Multi-doc mode: sidebar + content */
+body.multi #wrapper {
+  display: flex;
+  min-height: 100vh;
+}
+
+#sidebar {
+  display: none;
+  width: 260px;
+  min-width: 260px;
+  background: #f6f8fa;
+  border-right: 1px solid #e1e4e8;
+  padding: 1.25rem 0;
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+body.multi #sidebar { display: block; }
+
+#sidebar .sidebar-title {
+  font-size: 0.8em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6a737d;
+  padding: 0 1.25rem 0.75rem;
+}
+
+#sidebar a {
+  display: block;
+  padding: 0.35rem 1.25rem;
+  color: #24292e;
+  text-decoration: none;
+  font-size: 0.9em;
+  border-left: 3px solid transparent;
+}
+
+#sidebar a:hover {
+  background: #e1e4e8;
+}
+
+#sidebar a.active {
+  background: #fff;
+  border-left-color: #0366d6;
+  font-weight: 600;
+  color: #0366d6;
+}
+
+#content-area {
+  flex: 1;
+  min-width: 0;
+  max-width: 860px;
+  padding: 2rem 2.5rem;
+}
+
+body.single #content-area {
+  max-width: none;
+}
+
+/* Content styles */
+h1, h2, h3, h4, h5, h6 {
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+h1:first-child, h2:first-child { margin-top: 0; }
+
+h1 { font-size: 2em; padding-bottom: 0.3em; border-bottom: 1px solid #eaecef; }
+h2 { font-size: 1.5em; padding-bottom: 0.3em; border-bottom: 1px solid #eaecef; }
+h3 { font-size: 1.25em; }
+
+p { margin-bottom: 1em; }
+
+a { color: #0366d6; text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.875em;
+  background: #f6f8fa;
+  padding: 0.2em 0.4em;
+  border-radius: 3px;
+}
+
+pre {
+  background: #f6f8fa;
+  padding: 1em;
+  overflow-x: auto;
+  border-radius: 6px;
+  margin-bottom: 1em;
+  line-height: 1.45;
+}
+
+pre code { background: none; padding: 0; font-size: 0.85em; }
+
+blockquote {
+  border-left: 4px solid #dfe2e5;
+  padding: 0.5em 1em;
+  color: #6a737d;
+  margin-bottom: 1em;
+}
+
+ul, ol { padding-left: 2em; margin-bottom: 1em; }
+li { margin-bottom: 0.25em; }
+li > ul, li > ol { margin-bottom: 0; }
+
+table { border-collapse: collapse; margin-bottom: 1em; width: 100%; }
+th, td { border: 1px solid #dfe2e5; padding: 0.5em 0.75em; text-align: left; }
+th { background: #f6f8fa; font-weight: 600; }
+
+hr { border: none; border-top: 1px solid #eaecef; margin: 1.5em 0; }
+img { max-width: 100%; }
+
+.loading { color: #6a737d; font-style: italic; text-align: center; padding: 3em; }
+.error { color: #cb2431; background: #ffeef0; padding: 1em; border-radius: 6px; margin: 1em 0; }
+
+.elastos-footer {
+  margin-top: 3em;
+  padding-top: 1em;
+  border-top: 1px solid #eaecef;
+  color: #6a737d;
+  font-size: 0.85em;
+  text-align: center;
+}
+
+/* Share metadata badge */
+.share-meta {
+  font-size: 0.82em;
+  color: #586069;
+  background: #f1f8ff;
+  border: 1px solid #c8e1ff;
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  margin-bottom: 1.5em;
+  line-height: 1.5;
+}
+.share-meta strong { color: #24292e; }
+.share-meta .version-tag {
+  display: inline-block;
+  background: #0366d6;
+  color: #fff;
+  font-size: 0.85em;
+  font-weight: 600;
+  padding: 0.1em 0.45em;
+  border-radius: 3px;
+  margin-left: 0.3em;
+}
+.share-meta .meta-sep { color: #d1d5da; margin: 0 0.4em; }
+.share-meta a { color: #0366d6; }
+#sidebar .share-meta {
+  margin: 0 1rem 0.75rem;
+  font-size: 0.78em;
+}
+
+/* Mobile: collapse sidebar */
+@media (max-width: 768px) {
+  body.multi #wrapper { flex-direction: column; }
+  #sidebar {
+    width: 100%;
+    min-width: 100%;
+    height: auto;
+    position: static;
+    border-right: none;
+    border-bottom: 1px solid #e1e4e8;
+    padding: 0.75rem 0;
+  }
+  #sidebar a { display: inline-block; padding: 0.3rem 0.75rem; border-left: none; }
+  #sidebar a.active { border-left: none; border-bottom: 2px solid #0366d6; }
+  #content-area { padding: 1.5rem; }
+}
+</style>
+</head>
+<body class="single">
+
+<div id="wrapper">
+  <nav id="sidebar"></nav>
+  <div id="content-area">
+    <div id="share-meta-container"></div>
+    <div id="content" class="loading">Loading document...</div>
+    <div class="elastos-footer">Shared via ElastOS</div>
+  </div>
+</div>
+
+<script>
+// --- Markdown renderer ---
+
+function renderMarkdown(src) {
+  var html = '';
+  var lines = src.replace(/\r\n/g, '\n').split('\n');
+  var i = 0;
+
+  while (i < lines.length) {
+    var line = lines[i];
+
+    if (line.match(/^```/)) {
+      var lang = line.slice(3).trim();
+      var code = [];
+      i++;
+      while (i < lines.length && !lines[i].match(/^```/)) {
+        code.push(escapeHtml(lines[i]));
+        i++;
+      }
+      i++;
+      html += '<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + code.join('\n') + '</code></pre>\n';
+      continue;
+    }
+
+    if (line.match(/^(\*{3,}|-{3,}|_{3,})\s*$/)) {
+      html += '<hr>\n';
+      i++;
+      continue;
+    }
+
+    var headingMatch = line.match(/^(#{1,6})\s+(.*)/);
+    if (headingMatch) {
+      var level = headingMatch[1].length;
+      html += '<h' + level + '>' + renderInline(headingMatch[2]) + '</h' + level + '>\n';
+      i++;
+      continue;
+    }
+
+    if (line.match(/^\|/) && i + 1 < lines.length && lines[i + 1].match(/^\|[\s:|-]+\|/)) {
+      html += renderTable(lines, i);
+      i++;
+      i++;
+      while (i < lines.length && lines[i].match(/^\|/)) i++;
+      continue;
+    }
+
+    if (line.match(/^>\s?/)) {
+      var quoteLines = [];
+      while (i < lines.length && lines[i].match(/^>\s?/)) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      html += '<blockquote>' + renderMarkdown(quoteLines.join('\n')) + '</blockquote>\n';
+      continue;
+    }
+
+    if (line.match(/^[\s]*[-*+]\s/)) {
+      html += renderList(lines, i, 'ul');
+      while (i < lines.length && (lines[i].match(/^[\s]*[-*+]\s/) || (lines[i].match(/^\s+\S/) && !lines[i].match(/^[\s]*\d+\.\s/)))) i++;
+      continue;
+    }
+
+    if (line.match(/^[\s]*\d+\.\s/)) {
+      html += renderList(lines, i, 'ol');
+      while (i < lines.length && (lines[i].match(/^[\s]*\d+\.\s/) || (lines[i].match(/^\s+\S/) && !lines[i].match(/^[\s]*[-*+]\s/)))) i++;
+      continue;
+    }
+
+    if (line.trim() === '') { i++; continue; }
+
+    var para = [];
+    while (i < lines.length && lines[i].trim() !== '' &&
+           !lines[i].match(/^#{1,6}\s/) && !lines[i].match(/^```/) &&
+           !lines[i].match(/^>\s?/) && !lines[i].match(/^[-*+]\s/) &&
+           !lines[i].match(/^\d+\.\s/) && !lines[i].match(/^\|/) &&
+           !lines[i].match(/^(\*{3,}|-{3,}|_{3,})\s*$/)) {
+      para.push(lines[i]);
+      i++;
+    }
+    html += '<p>' + renderInline(para.join('\n')) + '</p>\n';
+  }
+  return html;
+}
+
+function renderInline(text) {
+  text = escapeHtml(text);
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function(_, alt, url) {
+    return safeUrl(url) ? '<img src="' + escapeAttr(url) + '" alt="' + escapeAttr(alt) + '">' : escapeHtml(alt);
+  });
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(_, label, url) {
+    // Internal .md links: navigate within viewer instead of following
+    if (safeUrl(url) && url.match(/\.md$/i) && !url.match(/^https?:/)) {
+      return '<a href="#" data-doc="' + escapeAttr(url) + '">' + label + '</a>';
+    }
+    return safeUrl(url) ? '<a href="' + escapeAttr(url) + '" rel="noopener">' + label + '</a>' : label;
+  });
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  text = text.replace(/(?<!\w)_(.+?)_(?!\w)/g, '<em>$1</em>');
+  text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+  text = text.replace(/  \n/g, '<br>');
+  return text;
+}
+
+function safeUrl(url) {
+  var trimmed = url.trim().toLowerCase();
+  if (trimmed.match(/^(javascript|data|vbscript|blob):/i)) return false;
+  if (trimmed.match(/^https?:\/\//) || trimmed.match(/^#/)) return true;
+  if (trimmed.match(/^[a-z][a-z0-9+.-]*:/)) return false;
+  return true;
+}
+
+function escapeAttr(text) {
+  return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderList(lines, start, tag) {
+  var html = '<' + tag + '>\n';
+  var i = start;
+  var pattern = tag === 'ul' ? /^[\s]*[-*+]\s(.*)/ : /^[\s]*\d+\.\s(.*)/;
+  while (i < lines.length) {
+    var match = lines[i].match(pattern);
+    if (match) {
+      var itemText = match[1];
+      i++;
+      while (i < lines.length && lines[i].match(/^\s+\S/) && !lines[i].match(pattern)) {
+        itemText += ' ' + lines[i].trim();
+        i++;
+      }
+      html += '<li>' + renderInline(itemText) + '</li>\n';
+    } else { break; }
+  }
+  html += '</' + tag + '>\n';
+  return html;
+}
+
+function renderTable(lines, start) {
+  var html = '<table>\n<thead><tr>';
+  var headers = parseTableRow(lines[start]);
+  for (var h = 0; h < headers.length; h++) html += '<th>' + renderInline(headers[h]) + '</th>';
+  html += '</tr></thead>\n<tbody>\n';
+  for (var r = start + 2; r < lines.length && lines[r].match(/^\|/); r++) {
+    var cells = parseTableRow(lines[r]);
+    html += '<tr>';
+    for (var c = 0; c < cells.length; c++) html += '<td>' + renderInline(cells[c]) + '</td>';
+    html += '</tr>\n';
+  }
+  html += '</tbody></table>\n';
+  return html;
+}
+
+function parseTableRow(line) {
+  return line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(function(c) { return c.trim(); });
+}
+
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// --- App logic ---
+
+var contentEl = document.getElementById('content');
+var sidebarEl = document.getElementById('sidebar');
+var currentFile = null;
+var fileList = null;
+
+function loadDocument(file) {
+  currentFile = file;
+  contentEl.className = 'loading';
+  contentEl.textContent = 'Loading...';
+
+  // Update URL without reload
+  var params = new URLSearchParams(window.location.search);
+  params.set('file', file);
+  history.replaceState(null, '', '?' + params.toString());
+
+  // Update sidebar active state
+  var links = sidebarEl.querySelectorAll('a');
+  for (var j = 0; j < links.length; j++) {
+    links[j].className = links[j].getAttribute('data-file') === file ? 'active' : '';
+  }
+
+  fetch(file)
+    .then(function(r) {
+      if (!r.ok) throw new Error('File not found: ' + file + ' (HTTP ' + r.status + ')');
+      return r.text();
+    })
+    .then(function(md) {
+      contentEl.className = '';
+      contentEl.innerHTML = renderMarkdown(md);
+      window.scrollTo(0, 0);
+
+      // Set title from first heading or filename
+      var firstH1 = contentEl.querySelector('h1');
+      document.title = (firstH1 ? firstH1.textContent : file.replace(/\.md$/i, '')) + ' \u2014 ElastOS';
+
+      // Wire up internal doc links
+      var docLinks = contentEl.querySelectorAll('a[data-doc]');
+      for (var k = 0; k < docLinks.length; k++) {
+        docLinks[k].addEventListener('click', function(e) {
+          e.preventDefault();
+          var target = this.getAttribute('data-doc');
+          // Resolve relative paths — if the linked file is in our file list, navigate to it
+          var resolved = resolveDocLink(target);
+          if (resolved) {
+            loadDocument(resolved);
+          } else {
+            // Not in our bundle — try loading anyway (might be a relative path)
+            loadDocument(target);
+          }
+        });
+      }
+    })
+    .catch(function(err) {
+      contentEl.className = 'error';
+      contentEl.textContent = err.message;
+    });
+}
+
+function resolveDocLink(target) {
+  if (!fileList) return target;
+  // Direct match
+  for (var i = 0; i < fileList.length; i++) {
+    if (fileList[i] === target) return target;
+  }
+  // Try matching by filename only (handles relative paths like ../ROADMAP.md)
+  var basename = target.split('/').pop();
+  for (var j = 0; j < fileList.length; j++) {
+    if (fileList[j].split('/').pop() === basename) return fileList[j];
+  }
+  return null;
+}
+
+function displayName(file) {
+  // Strip extension, prettify
+  return file.replace(/\.md$/i, '').replace(/[_-]/g, ' ');
+}
+
+function buildSidebar(files) {
+  var html = '<div class="sidebar-title">Documents</div>';
+  for (var i = 0; i < files.length; i++) {
+    html += '<a href="#" data-file="' + escapeAttr(files[i]) + '">' + escapeHtml(displayName(files[i])) + '</a>';
+  }
+  sidebarEl.innerHTML = html;
+
+  // Click handlers
+  var links = sidebarEl.querySelectorAll('a');
+  for (var j = 0; j < links.length; j++) {
+    links[j].addEventListener('click', function(e) {
+      e.preventDefault();
+      loadDocument(this.getAttribute('data-file'));
+    });
+  }
+}
+
+// --- Share metadata badge ---
+
+function loadShareMeta(isMulti) {
+  fetch('_share.json')
+    .then(function(r) {
+      if (!r.ok) throw new Error('no meta');
+      return r.json();
+    })
+    .then(function(meta) {
+      var html = '<div class="share-meta">';
+      html += '<strong>' + escapeHtml(meta.share_id || '') + '</strong>';
+      html += '<span class="version-tag">v' + (meta.version || '?') + '</span>';
+      if (meta.created_at) {
+        var d = new Date(meta.created_at * 1000);
+        html += '<span class="meta-sep">|</span>' + d.toLocaleDateString();
+      }
+      if (meta.author_did) {
+        var did = meta.author_did;
+        var short = did.length > 24 ? did.slice(0, 16) + '...' + did.slice(-4) : did;
+        html += '<span class="meta-sep">|</span>' + escapeHtml(short);
+      }
+      if (meta.prev) {
+        var prevUrl;
+        var loc = window.location;
+        var pathMatch = loc.pathname.match(/^\/ipfs\/[^/]+/);
+        var subdomainMatch = loc.hostname.match(/^([^.]+)\.ipfs\./);
+        if (pathMatch) {
+          prevUrl = loc.origin + '/ipfs/' + meta.prev + '/';
+        } else if (subdomainMatch) {
+          var rest = loc.hostname.substring(subdomainMatch[0].length);
+          prevUrl = loc.protocol + '//' + meta.prev + '.ipfs.' + rest + '/';
+        } else {
+          prevUrl = null;
+        }
+        if (prevUrl) {
+          html += '<span class="meta-sep">|</span><a href="' + escapeAttr(prevUrl) + '">prev</a>';
+        }
+      }
+      html += '</div>';
+      if (isMulti) {
+        // In multi-doc mode: inject into sidebar, hide standalone container
+        var metaContainer = document.getElementById('share-meta-container');
+        if (metaContainer) metaContainer.style.display = 'none';
+        // Insert after sidebar-title
+        var titleEl = sidebarEl.querySelector('.sidebar-title');
+        if (titleEl) {
+          titleEl.insertAdjacentHTML('afterend', html);
+        } else {
+          sidebarEl.insertAdjacentHTML('afterbegin', html);
+        }
+      } else {
+        // In single-doc mode: render in standalone container
+        var container = document.getElementById('share-meta-container');
+        if (container) container.innerHTML = html;
+      }
+    })
+    .catch(function() { /* No _share.json — backward compat */ });
+}
+
+// --- Init ---
+
+(function() {
+  var params = new URLSearchParams(window.location.search);
+
+  // Try multi-doc mode: load _files.json
+  fetch('_files.json')
+    .then(function(r) {
+      if (!r.ok) throw new Error('no index');
+      return r.json();
+    })
+    .then(function(files) {
+      if (!Array.isArray(files) || files.length === 0) throw new Error('empty');
+
+      // Multi-doc mode
+      fileList = files;
+      document.body.className = 'multi';
+      buildSidebar(files);
+      loadShareMeta(true);
+
+      // Determine which file to show
+      var requested = params.get('file');
+      if (requested && files.indexOf(requested) !== -1) {
+        loadDocument(requested);
+      } else if (files.indexOf('README.md') !== -1) {
+        loadDocument('README.md');
+      } else {
+        loadDocument(files[0]);
+      }
+    })
+    .catch(function() {
+      // Single-doc mode (backwards compatible)
+      document.body.className = 'single';
+      var file = params.get('file') || 'content.md';
+      loadDocument(file);
+      loadShareMeta(false);
+    });
+})();
+</script>
+</body>
+</html>

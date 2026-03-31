@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/elastos-common",
+    "crates/elastos-storage",
+    "crates/elastos-compute",
+    "crates/elastos-crosvm",
+    "crates/elastos-tls",
+    "crates/elastos-identity",
+    "crates/elastos-namespace",
+    "crates/elastos-runtime",
+    "crates/elastos-server",
+    "crates/elastos-guest",
+    "capsules/shell",
+    "capsules/localhost-provider",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/elacity/elastos-runtime"
+
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"    # Enough for backtraces, ~60% less artifact size
+
+[profile.dev.package."*"]
+opt-level = 1                 # Optimize deps (compiled once, run many times)
+
+[profile.test]
+opt-level = 0
+debug = "line-tables-only"

@@ -1,0 +1,38 @@
+[package]
+name = "elastos-namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ElastOS Namespace - Content-addressed storage and path→CID mapping"
+
+[dependencies]
+elastos-common = { path = "../elastos-common" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Crypto (content hashing, namespace signatures)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+# Async
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+
+# CID multihash verification
+cid = "0.11"
+multihash = "0.19"
+
+# Logging
+tracing = "0.1"
+
+# Temp files (content cache)
+tempfile = "3.10"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }
+tempfile = "3.10"
+rand = "0.8"

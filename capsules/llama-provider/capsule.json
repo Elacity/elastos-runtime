@@ -1,0 +1,21 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "llama-provider",
+  "version": "0.1.0",
+  "description": "Local LLM inference via llama-server",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "llama-server", "kind": "external" },
+    { "name": "model-qwen3.5-0.8b", "kind": "external" }
+  ],
+  "provides": "elastos://llama/*",
+  "resources": {
+    "memory_mb": 4096,
+    "gpu": true
+  },
+  "microvm": {
+    "http_port": 11434
+  }
+}

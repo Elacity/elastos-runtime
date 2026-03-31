@@ -1,0 +1,18 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "ai-provider",
+  "version": "0.1.0",
+  "description": "AI provider - routes LLM requests to local llama, Venice, or local Codex CLI",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "llama-provider", "kind": "capsule" }
+  ],
+  "provides": "elastos://ai/*",
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

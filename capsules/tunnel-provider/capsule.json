@@ -1,0 +1,20 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "tunnel-provider",
+  "version": "0.1.0",
+  "description": "Carrier network provider for elastos://tunnel/ (public cloudflared quick tunnels)",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "cloudflared", "kind": "external" }
+  ],
+  "provides": "elastos://tunnel/*",
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "carrier": true
+  }
+}

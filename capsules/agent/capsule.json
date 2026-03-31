@@ -1,0 +1,16 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "agent",
+  "version": "0.1.0",
+  "description": "AI chat agent - joins P2P channels and responds via LLM",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "did-provider", "kind": "capsule" }
+  ],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  }
+}

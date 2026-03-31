@@ -1,0 +1,509 @@
+{
+  "schema": "elastos.components/v1",
+  "capsules": {
+    "shell": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "localhost-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "chat": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "chat-wasm": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["any"],
+      "note": "WASM capsule (wasm32-wasip1) — platform-independent, runs via runtime bridge"
+    },
+    "notepad": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "did-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "ipfs-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "ai-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "llama-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "tunnel-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    },
+    "agent": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": ["x86_64-linux", "aarch64-linux"]
+    }
+  },
+  "external": {
+    "shell": {
+      "version": "0.1.0",
+      "install_path": "bin/shell",
+      "description": "Host shell binary required for managed chat runtime and service startup",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "shell-linux-amd64",
+          "install_path": "bin/shell"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "shell-linux-arm64",
+          "install_path": "bin/shell"
+        }
+      }
+    },
+    "localhost-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/localhost-provider",
+      "description": "Host localhost provider binary required for runtime storage access",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "localhost-provider-linux-amd64",
+          "install_path": "bin/localhost-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "localhost-provider-linux-arm64",
+          "install_path": "bin/localhost-provider"
+        }
+      }
+    },
+    "did-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/did-provider",
+      "description": "Host DID provider binary required for managed chat identity",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "did-provider-linux-amd64",
+          "install_path": "bin/did-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "did-provider-linux-arm64",
+          "install_path": "bin/did-provider"
+        }
+      }
+    },
+    "webspace-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/webspace-provider",
+      "description": "Host WebSpace resolver binary required for localhost://WebSpaces/<moniker>/... handles",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "webspace-provider-linux-amd64",
+          "install_path": "bin/webspace-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "webspace-provider-linux-arm64",
+          "install_path": "bin/webspace-provider"
+        }
+      }
+    },
+    "pc2": {
+      "version": "0.1.0",
+      "install_path": "capsules/pc2",
+      "description": "First-party PC2 home capsule required for the default elastos home surface",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "pc2-linux-amd64.tar.gz",
+          "extract_path": "pc2",
+          "install_path": "capsules/pc2"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "pc2-linux-arm64.tar.gz",
+          "extract_path": "pc2",
+          "install_path": "capsules/pc2"
+        }
+      }
+    },
+    "chat": {
+      "version": "0.1.0",
+      "install_path": "capsules/chat",
+      "description": "Packaged IRC-style microVM chat bundle for the full-screen Carrier chat path",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chat-linux-amd64.tar.gz",
+          "extract_path": "chat",
+          "install_path": "capsules/chat"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chat-linux-arm64.tar.gz",
+          "extract_path": "chat",
+          "install_path": "capsules/chat"
+        }
+      }
+    },
+    "chat-wasm": {
+      "version": "0.1.0",
+      "install_path": "capsules/chat-wasm",
+      "description": "Packaged WASM IRC bundle for the non-KVM full-screen Carrier chat path",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chat-wasm-linux-amd64.tar.gz",
+          "extract_path": "chat-wasm",
+          "install_path": "capsules/chat-wasm"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chat-wasm-linux-arm64.tar.gz",
+          "extract_path": "chat-wasm",
+          "install_path": "capsules/chat-wasm"
+        }
+      }
+    },
+    "ipfs-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/ipfs-provider",
+      "description": "Host IPFS bridge binary required for direct share/open and attest commands",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "ipfs-provider-linux-amd64",
+          "install_path": "bin/ipfs-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "ipfs-provider-linux-arm64",
+          "install_path": "bin/ipfs-provider"
+        }
+      }
+    },
+    "tunnel-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/tunnel-provider",
+      "description": "Host tunnel provider binary required for immediate public share links",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "tunnel-provider-linux-amd64",
+          "install_path": "bin/tunnel-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "tunnel-provider-linux-arm64",
+          "install_path": "bin/tunnel-provider"
+        }
+      }
+    },
+    "site-provider": {
+      "version": "0.1.0",
+      "install_path": "bin/site-provider",
+      "description": "Host site provider binary required for serving localhost://MyWebSite over local HTTP",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "site-provider-linux-amd64",
+          "install_path": "bin/site-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "site-provider-linux-arm64",
+          "install_path": "bin/site-provider"
+        }
+      }
+    },
+    "md-viewer": {
+      "version": "0.1.0",
+      "install_path": "capsules/md-viewer",
+      "description": "Markdown viewer assets required for direct share/open flows",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "md-viewer-linux-amd64.tar.gz",
+          "extract_path": "md-viewer",
+          "install_path": "capsules/md-viewer"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "md-viewer-linux-arm64.tar.gz",
+          "extract_path": "md-viewer",
+          "install_path": "capsules/md-viewer"
+        }
+      }
+    },
+    "gba-emulator": {
+      "version": "0.1.0",
+      "install_path": "capsules/gba-emulator",
+      "description": "Browser GBA viewer bundle used by PC2 and elastos run",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-emulator-linux-amd64.tar.gz",
+          "extract_path": "gba-emulator",
+          "install_path": "capsules/gba-emulator"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-emulator-linux-arm64.tar.gz",
+          "extract_path": "gba-emulator",
+          "install_path": "capsules/gba-emulator"
+        }
+      }
+    },
+    "gba-ucity": {
+      "version": "0.1.0",
+      "install_path": "capsules/gba-ucity",
+      "description": "Bundled uCity demo cartridge for the browser GBA viewer",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-ucity-linux-amd64.tar.gz",
+          "extract_path": "gba-ucity",
+          "install_path": "capsules/gba-ucity"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "gba-ucity-linux-arm64.tar.gz",
+          "extract_path": "gba-ucity",
+          "install_path": "capsules/gba-ucity"
+        }
+      }
+    },
+    "crosvm": {
+      "version": "2026.03.08",
+      "install_path": "bin/crosvm",
+      "description": "crosvm VM monitor required for capsule microVM execution",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "QmU9LGXBWbar3cvPmBCennB5RgJs1GQehMNwZhKZBPdxgP",
+          "checksum": "sha256:f18567c730a01dc296cfb72e6dd650dedc28249387200ae29fa7e939d4b6b5a4",
+          "size": 13730576,
+          "install_path": "bin/crosvm"
+        },
+        "linux-arm64": {
+          "cid": "QmYUMQzCftCbKnuN1MKvqfPjXN2UnYFpxCy8bGBfAKqqV5",
+          "checksum": "sha256:5a5cac01177b85dca09cf230289ed92516f9e4d94788e91f1852fcc24b92b41b",
+          "size": 9301632,
+          "install_path": "bin/crosvm"
+        }
+      }
+    },
+    "vmlinux": {
+      "version": "r0017-virtio-console",
+      "install_path": "bin/vmlinux",
+      "description": "ElastOS guest kernel (6.1.59, CONFIG_VIRTIO_CONSOLE=y) for crosvm capsule boot",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "Qmeb1qaqfMiri7G123FWmMz6qt74xhPjAgAJEy8ZSrFKh7",
+          "checksum": "sha256:eccb4f318ba37309af5fae01bc610b76033707ec8149002d26675aed66d8578b",
+          "install_path": "bin/vmlinux"
+        },
+        "linux-arm64": {
+          "strategy": "local-copy",
+          "source": "/boot/Image",
+          "note": "Upstream crosvm aarch64 test kernel is broken on GICv3-only hosts (Jetson). Uses host kernel instead.",
+          "install_path": "bin/vmlinux"
+        }
+      }
+    },
+    "kubo": {
+      "version": "0.40.1",
+      "platforms": {
+        "linux-amd64": {
+          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-amd64.tar.gz",
+          "checksum": "sha512:86f9c07bca62d09839e53553df0f81bc306364b1467a459d52f3e4505cc948d196ed0c219c03c667cd681e057bb24bbfc0e0eebf4b83bc64a36a0e9923a60e05",
+          "extract_path": "kubo/ipfs",
+          "install_path": "bin/kubo"
+        },
+        "linux-arm64": {
+          "url": "https://dist.ipfs.tech/kubo/v0.40.1/kubo_v0.40.1_linux-arm64.tar.gz",
+          "checksum": "sha512:07a52fb63c37ac687ad41bc949f60e16856387d5d33ecf452771b5d992fa4fe2e659f383d267de69cd9755aa5751847aab66247b5cdeeaad7a06b780ece51cb7",
+          "extract_path": "kubo/ipfs",
+          "install_path": "bin/kubo"
+        }
+      }
+    },
+    "cloudflared": {
+      "version": "2026.2.0",
+      "platforms": {
+        "linux-amd64": {
+          "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-amd64",
+          "checksum": "sha256:176746db3be7dc7bd48f3dd287c8930a4645ebb6e6700f883fddda5a4c307c16",
+          "install_path": "bin/cloudflared"
+        },
+        "linux-arm64": {
+          "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.2.0/cloudflared-linux-arm64",
+          "checksum": "sha256:03c5d58e283f521d752dc4436014eb341092edf076eb1095953ab82debe54a8e",
+          "install_path": "bin/cloudflared"
+        }
+      }
+    },
+    "llama-server": {
+      "version": "b8192",
+      "platforms": {
+        "linux-amd64": {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b8192/llama-b8192-bin-ubuntu-x64.tar.gz",
+          "checksum": "sha256:7f98074d1d5596bd8153b5a23aaa5ed77a3759ded9527f39e24d1695c45c35f3",
+          "extract_path": "llama-b8192/llama-server",
+          "install_path": "bin/llama-server"
+        },
+        "linux-arm64": {
+          "strategy": "source-build",
+          "note": "No official aarch64 binary. Run: scripts/build-llama-server.sh"
+        }
+      }
+    },
+    "model-qwen3.5-0.8b": {
+      "version": "Q4_K_M",
+      "size_mb": 507,
+      "description": "Qwen3.5 0.8B Q4_K_M — small default for fast local startup",
+      "platforms": {
+        "*": {
+          "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+          "checksum": "sha256:bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+          "install_path": "models/Qwen3.5-0.8B-Q4_K_M.gguf"
+        }
+      }
+    },
+    "model-qwen3.5-4b": {
+      "version": "Q4_K_M",
+      "size_mb": 2740,
+      "description": "Qwen3.5 4B Q4_K_M — default for Orin Nano reliability",
+      "platforms": {
+        "*": {
+          "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+          "checksum": "sha256:00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "install_path": "models/Qwen3.5-4B-Q4_K_M.gguf"
+        }
+      }
+    },
+    "model-qwen3.5-9b": {
+      "version": "Q4_K_M",
+      "size_mb": 5680,
+      "description": "Qwen3.5 9B Q4_K_M — higher quality, needs more memory",
+      "platforms": {
+        "*": {
+          "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+          "checksum": "sha256:03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
+          "install_path": "models/Qwen3.5-9B-Q4_K_M.gguf"
+        }
+      }
+    }
+  },
+  "profiles": {
+    "minimal": {
+      "description": "Runtime VM prerequisites only",
+      "components": ["crosvm", "vmlinux"]
+    },
+    "pc2": {
+      "description": "Managed PC2 home plus native Carrier chat",
+      "components": ["shell", "localhost-provider", "did-provider", "webspace-provider", "pc2"]
+    },
+    "demo": {
+      "description": "PC2 demo path with native chat, IRC, site, sharing, and browser capsule surfaces",
+      "components": ["shell", "localhost-provider", "did-provider", "webspace-provider", "pc2", "chat", "chat-wasm", "gba-emulator", "gba-ucity", "site-provider", "tunnel-provider", "cloudflared", "kubo", "ipfs-provider", "md-viewer", "crosvm", "vmlinux"]
+    },
+    "irc": {
+      "description": "Packaged IRC-style microVM chat on a KVM-capable host",
+      "components": ["shell", "localhost-provider", "did-provider", "chat", "crosvm", "vmlinux"]
+    },
+    "agent-local-ai": {
+      "description": "Local AI agent with IPFS",
+      "components": ["shell", "localhost-provider", "did-provider", "webspace-provider", "pc2", "kubo", "ipfs-provider", "md-viewer", "llama-server", "model-qwen3.5-0.8b"]
+    },
+    "public-gateway": {
+      "description": "Public content gateway with tunnel",
+      "components": ["shell", "localhost-provider", "did-provider", "webspace-provider", "pc2", "kubo", "ipfs-provider", "site-provider", "tunnel-provider", "md-viewer", "cloudflared"]
+    },
+    "full": {
+      "description": "All components",
+      "components": ["shell", "localhost-provider", "did-provider", "webspace-provider", "pc2", "chat", "chat-wasm", "gba-emulator", "gba-ucity", "ipfs-provider", "site-provider", "tunnel-provider", "md-viewer", "crosvm", "vmlinux", "kubo", "cloudflared", "llama-server", "model-qwen3.5-0.8b", "model-qwen3.5-4b", "model-qwen3.5-9b"]
+    }
+  }
+}

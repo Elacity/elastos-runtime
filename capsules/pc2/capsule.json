@@ -1,0 +1,18 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "pc2",
+  "version": "0.1.0",
+  "description": "Local sovereign PC2 dashboard over rooted localhost state",
+  "author": "elastos",
+  "type": "wasm",
+  "entrypoint": "pc2.wasm",
+  "requires": [],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": [],
+    "messaging": []
+  }
+}

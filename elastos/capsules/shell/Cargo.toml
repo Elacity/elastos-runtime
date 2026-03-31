@@ -1,0 +1,16 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Shell Capsule - auto-grants capability requests"
+license = "MIT"
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"

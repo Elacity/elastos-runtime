@@ -1,0 +1,23 @@
+[package]
+name = "pc2"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS PC2 Lobby Alpha - local sovereign home dashboard"
+license = "MIT"
+
+[[bin]]
+name = "pc2"
+path = "src/main.rs"
+
+[dependencies]
+elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

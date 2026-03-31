@@ -1,0 +1,529 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* ElastOS brand colors - dark with cyan accent */
+  --shell-color: #1a2a3a;
+  --shell-light: #2a3a4a;
+  --shell-dark: #0f1a25;
+  --accent-color: #00d4aa;
+  --accent-light: #00ffcc;
+  --accent-dark: #00a080;
+  
+  /* Fixed base size - make it big and readable */
+  --gba-width: 380px;
+}
+
+body {
+  background: linear-gradient(135deg, #0a0f15 0%, #1a2530 50%, #0a1520 100%);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 15px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #e0e0e0;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow-x: hidden;
+}
+
+/* ========== GBA SHELL ========== */
+#gba-shell {
+  width: var(--gba-width);
+  background: linear-gradient(180deg, var(--shell-light) 0%, var(--shell-color) 50%, var(--shell-dark) 100%);
+  border-radius: 30px 30px 50px 50px;
+  padding: 20px;
+  padding-top: 25px;
+  box-shadow: 
+    0 30px 60px rgba(0, 0, 0, 0.6),
+    0 15px 30px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.3);
+  position: relative;
+  border: 1px solid rgba(0, 212, 170, 0.15);
+}
+
+#gba-shell::after {
+  content: 'E';
+  position: absolute;
+  bottom: 8px;
+  right: 15px;
+  font-size: 14px;
+  font-weight: bold;
+  color: var(--accent-color);
+  opacity: 0.6;
+  font-family: Arial, sans-serif;
+}
+
+/* ========== SHOULDER BUTTONS ========== */
+.shoulder-buttons {
+  position: absolute;
+  top: -12px;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 30px;
+}
+
+.shoulder-btn {
+  width: 65px;
+  height: 22px;
+  background: linear-gradient(180deg, #2a3a4a, #1a2a3a);
+  border: 1px solid rgba(0, 212, 170, 0.2);
+  border-radius: 5px 5px 3px 3px;
+  color: var(--accent-color);
+  font-size: 11px;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 
+    0 3px 6px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: all 0.04s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.shoulder-btn:active, .shoulder-btn.pressed {
+  transform: translateY(1px);
+  background: linear-gradient(180deg, #1a2a3a, #2a3a4a);
+  box-shadow: 
+    0 1px 3px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+/* ========== SCREEN AREA ========== */
+.shell-content {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ========== SCREEN AREA ========== */
+.screen-section {
+  display: flex;
+  justify-content: center;
+}
+
+#screen-bezel {
+  background: linear-gradient(145deg, #0f1820, #070d14);
+  border-radius: 4px 4px 18px 18px;
+  padding: 15px;
+  padding-top: 18px;
+  box-shadow: 
+    inset 0 2px 6px rgba(0, 0, 0, 0.6),
+    0 1px 0 rgba(255, 255, 255, 0.05);
+  position: relative;
+}
+
+#screen-container {
+  position: relative;
+  background: #000;
+  border-radius: 2px;
+  overflow: hidden;
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.8);
+}
+
+canvas {
+  display: block;
+  width: 300px;
+  height: 200px;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+#power-led {
+  position: absolute;
+  bottom: 6px;
+  left: 12px;
+  width: 5px;
+  height: 5px;
+  background: var(--accent-color);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--accent-color), inset 0 -1px 2px rgba(0, 0, 0, 0.3);
+}
+
+#power-led.off {
+  background: #333;
+  box-shadow: none;
+}
+
+.screen-text {
+  text-align: center;
+  margin-top: 4px;
+}
+
+.screen-text span {
+  font-size: 7px;
+  color: rgba(255, 255, 255, 0.2);
+  letter-spacing: 1px;
+}
+
+/* ========== CONTROLS ========== */
+#controls-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 25px;
+  padding: 0 10px;
+}
+
+/* D-Pad */
+.control-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.dpad-btn {
+  width: 45px;
+  height: 45px;
+  background: linear-gradient(145deg, #1a2530, #0f1820);
+  border: 1px solid rgba(0, 212, 170, 0.15);
+  border-radius: 6px;
+  color: #555;
+  cursor: pointer;
+  box-shadow: 
+    0 3px 6px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.04s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.dpad-btn:active, .dpad-btn.pressed {
+  background: linear-gradient(145deg, #0f1820, #1a2530);
+  border-color: rgba(0, 212, 170, 0.3);
+  transform: translateY(2px);
+  box-shadow: 
+    0 1px 3px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.dpad-btn .arrow {
+  font-size: 16px;
+}
+
+.dpad-row {
+  display: flex;
+}
+
+.dpad-center {
+  width: 45px;
+  height: 45px;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  cursor: default;
+}
+
+/* SELECT / START */
+.center-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+  transform: rotate(-25deg);
+  margin-top: 10px;
+}
+
+.small-btn {
+  width: 40px;
+  height: 14px;
+  background: linear-gradient(145deg, #333344, #222233);
+  border: none;
+  border-radius: 8px;
+  color: #555;
+  font-size: 6px;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  box-shadow: 
+    0 2px 4px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  transition: all 0.04s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.small-btn:active, .small-btn.pressed {
+  transform: translateY(1px);
+  box-shadow: 
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+/* A / B Buttons */
+.action-buttons {
+  display: flex;
+  gap: 10px;
+  transform: rotate(-25deg);
+  margin-top: 15px;
+}
+
+.action-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: linear-gradient(145deg, #00d4aa, #008866);
+  border: 2px solid rgba(0, 212, 170, 0.3);
+  color: #fff;
+  font-size: 18px;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 
+    0 4px 10px rgba(0, 212, 170, 0.3),
+    inset 0 2px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.2);
+  transition: all 0.04s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.action-btn:active, .action-btn.pressed {
+  background: linear-gradient(145deg, #008866, #00d4aa);
+  transform: translateY(2px);
+  box-shadow: 
+    0 2px 5px rgba(0, 212, 170, 0.3),
+    inset 0 2px 0 rgba(255, 255, 255, 0.2),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.2);
+}
+
+.action-btn#btn-a {
+  margin-top: 18px;
+}
+
+/* ========== EMULATOR CONTROLS ========== */
+#emulator-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 15px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+#emulator-controls button {
+  background: rgba(0, 212, 170, 0.15);
+  color: var(--accent-color);
+  border: 1px solid rgba(0, 212, 170, 0.3);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 10px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+#emulator-controls button:hover {
+  background: rgba(0, 212, 170, 0.25);
+}
+
+#emulator-controls button:active {
+  background: rgba(0, 212, 170, 0.35);
+}
+
+#emulator-controls button.active {
+  background: var(--accent-color);
+  color: #000;
+  border-color: var(--accent-color);
+}
+
+#emulator-controls button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.separator {
+  width: 1px;
+  height: 14px;
+  background: #444;
+}
+
+#volume-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#volume-group label {
+  font-size: 9px;
+  color: #777;
+}
+
+#volume-slider {
+  width: 45px;
+  accent-color: var(--accent-color);
+}
+
+/* ========== DROP ZONE ========== */
+#drop-zone {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 20, 30, 0.95);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+#drop-zone:hover {
+  background: rgba(15, 30, 45, 0.95);
+}
+
+#drop-zone.drag-over {
+  background: rgba(0, 212, 170, 0.15);
+  border: 2px dashed var(--accent-color);
+}
+
+#drop-zone.hidden {
+  display: none;
+}
+
+#drop-zone p {
+  font-size: 14px;
+  color: #777;
+  margin-top: 8px;
+  text-align: center;
+}
+
+#drop-zone .icon {
+  font-size: 36px;
+  color: var(--accent-color);
+}
+
+#file-input {
+  display: none;
+}
+
+/* ========== STATUS ========== */
+#status {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #777;
+  min-height: 1.2em;
+  text-align: center;
+}
+
+#status.error {
+  color: #ff6b6b;
+}
+
+/* ========== FULLSCREEN ========== */
+/* When screen-container is the fullscreen element */
+#screen-container:fullscreen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#screen-container:fullscreen canvas {
+  height: 80vh;
+  width: auto;
+  aspect-ratio: 3 / 2;
+}
+
+/* ========== MOBILE RESPONSIVE ========== */
+@media (max-width: 420px) {
+  :root {
+    --gba-width: 95vw;
+  }
+  
+  canvas {
+    width: 70vw;
+    height: calc(70vw * 0.667);
+  }
+  
+  .dpad-btn, .dpad-center {
+    width: 11vw;
+    height: 11vw;
+    max-width: 45px;
+    max-height: 45px;
+  }
+  
+  .action-btn {
+    width: 12vw;
+    height: 12vw;
+    max-width: 48px;
+    max-height: 48px;
+    font-size: 14px;
+  }
+  
+  .small-btn {
+    width: 10vw;
+    height: 3.5vw;
+    max-width: 40px;
+    max-height: 14px;
+    font-size: 5px;
+  }
+  
+  .shoulder-btn {
+    width: 17vw;
+    height: 5.5vw;
+    max-width: 65px;
+    max-height: 22px;
+    font-size: 10px;
+  }
+  
+  #controls-bar {
+    padding: 0 2vw;
+    margin-top: 5vw;
+  }
+  
+  .center-buttons {
+    margin-top: 2vw;
+  }
+  
+  .action-buttons {
+    margin-top: 3vw;
+  }
+  
+  .action-btn#btn-a {
+    margin-top: 4vw;
+  }
+  
+  #emulator-controls {
+    margin-top: 10px;
+    gap: 4px;
+  }
+  
+  #emulator-controls button {
+    padding: 4px 6px;
+    font-size: 8px;
+  }
+}
+
+/* Touch optimizations */
+@media (hover: none) {
+  .dpad-btn,
+  .action-btn,
+  .small-btn,
+  .shoulder-btn {
+    -webkit-tap-highlight-color: rgba(106, 106, 255, 0.25);
+  }
+}
+
+/* Landscape mobile */
+@media (max-height: 500px) and (orientation: landscape) {
+  :root {
+    --gba-width: 50vh;
+  }
+  
+  body {
+    padding: 8px;
+  }
+  
+  #emulator-controls {
+    margin-top: 8px;
+  }
+}

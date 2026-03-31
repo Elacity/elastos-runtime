@@ -1,0 +1,17 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "shell",
+  "version": "0.1.0",
+  "description": "ElastOS shell - orchestrates capability grants and capsule lifecycle",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": [],
+    "messaging": ["*"]
+  }
+}

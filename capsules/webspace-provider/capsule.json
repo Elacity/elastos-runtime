@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "webspace-provider",
+  "version": "0.1.0",
+  "description": "Dynamic WebSpace resolver for localhost://WebSpaces/<moniker>/...",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "capabilities": ["localhost://WebSpaces/*"],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  }
+}

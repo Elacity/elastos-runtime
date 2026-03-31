@@ -1,0 +1,15 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "did-provider",
+  "version": "0.1.0",
+  "description": "DID identity provider - did:key with portable Ed25519 keypair",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://did/*",
+  "capabilities": ["localhost://ElastOS/SystemServices/Identity/*"],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  }
+}

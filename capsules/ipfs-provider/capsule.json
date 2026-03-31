@@ -1,0 +1,18 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "ipfs-provider",
+  "version": "0.1.0",
+  "description": "IPFS operations via managed Kubo daemon",
+  "author": "elastos",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "kubo", "kind": "external" }
+  ],
+  "provides": "elastos://ipfs/*",
+  "capabilities": ["localhost://ElastOS/SystemServices/IPFS/*"],
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  }
+}

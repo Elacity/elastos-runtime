@@ -1,0 +1,138 @@
+# Rust
+**/target/
+**/*.rs.bk
+# Main Cargo.lock committed for reproducible builds; negate the ignore
+!elastos/Cargo.lock
+
+# Node.js
+node_modules/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ElastOS
+elastos/storage/
+*.wasm
+*.gba
+
+# Vendored GBA runtime + tracked open-source ROM
+!capsules/gba-emulator/mgba.js
+!capsules/gba-emulator/mgba.wasm
+
+# Allow tracked ROM templates (uCity Advance is open-source)
+!capsules/gba-ucity/ucity.gba
+
+# Logs
+*.log
+
+# Large binary files (MicroVM rootfs, VM kernels)
+*.ext4
+*.ext4.downloading
+**/kernel/vmlinux
+
+# Build artifacts (release tarballs, platform binaries)
+artifacts/
+artifacts-aarch64/
+
+# Secrets and credentials
+.env
+*.pem
+*.key
+*.hex
+*.secret
+credentials.json
+
+# Cache
+.elastos/
+
+# Claude Code (user-specific settings)
+.claude/
+
+# External dependencies
+puter-upstream/
+
+# Release publisher state (local)
+/.last-release-cid
+/.last-release-head-cid
+/last-install-script-cid
+/last-ipns-name
+/last-public-install-url
+/last-release-cid
+/last-release-head-cid
+__pycache__/
+
+# --- Operator-local / internal tooling (not part of public runtime) ---
+
+# Fabro workflow orchestrator (internal ops)
+fabro/
+fabro.toml
+
+# Session plans and working notes
+plans/
+
+# Historical phase archives
+archive/
+
+# Control graph tooling (internal codebase health)
+control_graph/
+control_graph_viewer/
+
+# Website deployment artifacts
+website/
+
+# AI models
+models/
+
+# QA framework (internal journeys and checklists)
+qa/
+
+# Operator-local docs
+docs/DAILY_OPERATIONS.md
+docs/MODEL_POLICY.md
+docs/EVIDENCE_LEVELS.md
+docs/ANTI_DRIFT.md
+docs/FRACTALS_INTEGRATION.md
+docs/GRAPH_WORKER.md
+docs/CONTROL_GRAPH.md
+docs/RC1_GATEWAY_HANDOFF.md
+docs/RC1_HOST_TO_JETSON_PLAN.md
+docs/NOTES.md
+docs/STATUS.md
+docs/WCI_LOCALHOST_MASTER_PLAN.md
+docs/FALLBACK_LEDGER.md
+docs/CARRIER_TRUST_DECISION.md
+docs/PC2_LOBBY_ALPHA.md
+
+# Internal agent/operator config
+AGENT.md
+CLAUDE.md
+elastos/CLAUDE.md
+SOUL.md
+
+# Operator scripts (fabro, graph workers, deploy, ops)
+scripts/fabro-*.py
+scripts/graph_worker*.py
+scripts/control_graph*.py
+scripts/deploy_control_graph_viewer.py
+scripts/deploy-site.sh
+scripts/sync_control_graph_viewer_data.py
+scripts/show_worker_model_policy.py
+scripts/qmd-freshness.py
+scripts/ops/
+scripts/system/
+scripts/publish-ceremony.sh
+scripts/publish-impact.sh
+scripts/publish-mark-proven.sh
+scripts/publish-refresh-host.sh
+scripts/dev-sync-jetson.sh
+scripts/full-check-inventory.sh
+scripts/control_graph_cron.py
+scripts/status.sh

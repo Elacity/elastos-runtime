@@ -1,0 +1,18 @@
+[package]
+name = "elastos-guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ElastOS Guest SDK - APIs for capsule developers"
+
+[dependencies]
+# Minimal dependencies for WASM compatibility
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "dep:serde_json"]

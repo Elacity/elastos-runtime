@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>GBA Emulator - ElastOS</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="gba-shell">
+    <div class="shoulder-buttons">
+      <button id="btn-l" class="shoulder-btn" data-key="l">L</button>
+      <button id="btn-r" class="shoulder-btn" data-key="r">R</button>
+    </div>
+    
+    <div class="shell-content">
+      <div class="screen-section">
+        <div id="screen-bezel">
+          <div id="screen-container">
+            <canvas id="canvas" width="240" height="160"></canvas>
+            <div id="drop-zone">
+              <div class="icon">&#127918;</div>
+              <p>Drop a .gba ROM here or click to browse</p>
+              <input type="file" id="file-input" accept=".gba,.gbc,.gb,.zip">
+            </div>
+          </div>
+          <div id="power-led"></div>
+        </div>
+      </div>
+      
+      <div id="controls-bar">
+        <div class="control-group">
+          <button id="btn-dpad-up" class="dpad-btn" data-key="up">
+            <span class="arrow">&#9650;</span>
+          </button>
+          <div class="dpad-row">
+            <button id="btn-dpad-left" class="dpad-btn" data-key="left">
+              <span class="arrow">&#9664;</span>
+            </button>
+            <button id="btn-dpad-center" class="dpad-btn dpad-center"></button>
+            <button id="btn-dpad-right" class="dpad-btn" data-key="right">
+              <span class="arrow">&#9654;</span>
+            </button>
+          </div>
+          <button id="btn-dpad-down" class="dpad-btn" data-key="down">
+            <span class="arrow">&#9660;</span>
+          </button>
+        </div>
+        
+        <div class="center-buttons">
+          <button id="btn-select" class="small-btn" data-key="select">SELECT</button>
+          <button id="btn-start" class="small-btn" data-key="start">START</button>
+        </div>
+        
+        <div class="action-buttons">
+          <button id="btn-b" class="action-btn" data-key="b">B</button>
+          <button id="btn-a" class="action-btn" data-key="a">A</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="emulator-controls">
+    <button id="btn-pause" disabled>Pause</button>
+    <button id="btn-ff" disabled>FF</button>
+    <button id="btn-fullscreen">FS</button>
+    <div class="separator"></div>
+    <button id="btn-save1" disabled>Save 1</button>
+    <button id="btn-save2" disabled>Save 2</button>
+    <button id="btn-save3" disabled>Save 3</button>
+    <div class="separator"></div>
+    <button id="btn-load1" disabled>Load 1</button>
+    <button id="btn-load2" disabled>Load 2</button>
+    <button id="btn-load3" disabled>Load 3</button>
+    <div class="separator"></div>
+    <div id="volume-group">
+      <label for="volume-slider">Vol</label>
+      <input type="range" id="volume-slider" min="0" max="100" value="50">
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <script type="module" src="emulator.js"></script>
+</body>
+</html>

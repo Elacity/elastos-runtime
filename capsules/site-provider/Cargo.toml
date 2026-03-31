@@ -1,0 +1,15 @@
+[package]
+name = "site-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS site provider - serves localhost://MyWebSite over local HTTP"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+[workspace]

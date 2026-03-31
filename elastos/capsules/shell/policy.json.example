@@ -1,0 +1,12 @@
+{
+  "allow": [
+    "elastos://peer/*",
+    "elastos://did/*",
+    "localhost://Users/*",
+    "localhost://UsersAI/*",
+    "localhost://Public/*",
+    "localhost://MyWebSite/*",
+    "localhost://Local/*",
+    "localhost://ElastOS/SystemServices/*"
+  ]
+}
