@@ -125,7 +125,7 @@ See [SITES.md](SITES.md) for the contract and current implementation status.
 
 ### Prerequisites
 
-- Rust toolchain via [rustup.rs](https://rustup.rs)
+- Rust 1.89+ via [rustup.rs](https://rustup.rs)
 - Git
 - Linux with KVM for microVM work (`native`, `WSL2`, or `aarch64` such as Jetson)
 - `just` recommended: `cargo install just`

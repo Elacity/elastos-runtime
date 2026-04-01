@@ -16,6 +16,8 @@ This installs the signed `elastos` binary, provisions the core PC2 home profile 
 
 ## Build From Source
 
+Requires Rust 1.89+.
+
 ```bash
 cargo install just
 just build
@@ -37,12 +39,20 @@ elastos
 # P2P chat
 elastos chat --nick alice
 
-# Share a file
+# One-time extras for direct share/open
+elastos setup --with kubo --with ipfs-provider --with md-viewer
+
+# Share a file over the IPFS-backed content path
 elastos share README.md
+
+# Preview a shared CID locally (or on another machine with the same extras)
+elastos open elastos://<cid> --browser
 
 # See all commands
 elastos --help
 ```
+
+Direct `share`/`open` are content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only PC2 core profile.
 
 Power-user paths such as `elastos run` require an explicit runtime and the correct working directory. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for source builds, capsule development, and explicit runtime workflows.
 

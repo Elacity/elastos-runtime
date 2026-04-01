@@ -83,7 +83,14 @@ pub async fn run_share(
     println!();
     println!("Shared: elastos://{}", cid);
     println!();
-    println!("  Open locally:    elastos open elastos://{}", cid);
+    println!(
+        "  Preview local:   elastos open elastos://{} --browser",
+        cid
+    );
+    println!(
+        "  Open elsewhere:  after `elastos setup --with kubo --with ipfs-provider --with md-viewer`, run `elastos open elastos://{} --browser`",
+        cid
+    );
     println!(
         "  Public link:     run `elastos share --public {}`",
         path.display()

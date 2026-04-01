@@ -1668,7 +1668,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elastos-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "serde",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-compute"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-crosvm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "elastos-common",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-identity"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-namespace"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-tls"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum-server",

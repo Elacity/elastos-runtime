@@ -2,6 +2,13 @@
 
 All notable changes to the public ElastOS Runtime repository.
 
+## [0.1.1] - 2026-03-31
+
+### Fixed
+- Removed the installer's undeclared `xxd` dependency from signature verification so minimal environments can install from the canonical gateway without extra packages.
+- Pinned the documented and declared Rust toolchain to `1.89+` so fresh source builds match the actual compiler floor.
+- Tightened PC2 home guidance and native chat runtime reuse so the public onboarding path stays coherent on WSL and Jetson.
+
 ## [0.1.0] - 2026-03-31
 
 ### Added

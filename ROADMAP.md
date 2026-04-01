@@ -12,7 +12,7 @@ For current state, see [state.md](state.md).
 Make this repository the trusted local runtime layer of ElastOS:
 - execute capsules predictably
 - expose one coherent local object model
-- use Carrier-first off-box transport
+- use Carrier as the secure off-box plane for communication and content
 - keep release, install, update, share, and site flows boring
 - give PC2 a stable front door instead of a demo-only shell
 
@@ -68,22 +68,40 @@ The goal is one stable object model, not a pile of one-off path conventions.
 The object model should lead with human concepts, not implementation seams.
 Users should primarily think in terms like people, spaces, sites, shares, apps, and agents rather than providers, runtimes, gateways, or transport details.
 
+The same applies to off-box content.
+Sharing, opening, public links, and site publication should read as operations on the same runtime objects, not as separate products with different transport stories.
+Carrier should be the secure plane that carries those off-box interactions from the user's point of view, while lower-level storage or distribution mechanisms remain implementation details.
+
 One concept should survive across multiple realizations.
 If something appears in PC2, under `localhost://...`, as an `elastos://...` object, or through a public URL, it should still read as the same underlying thing rather than four different products glued together.
 
 Keep the ontology small and flexible.
 Prefer a minimal set of durable concepts and role-based views over a deep rigid hierarchy that will be wrong once the system grows.
 
-### 5. Build native collaboration around Carrier and runtime objects
+### 5. Build native collaboration and content around Carrier and runtime objects
 
 Native `Chat` is the proving surface.
 IRC and other compatibility surfaces may help earn the runtime contract, but they should not replace the target architecture.
-Long term, collaboration should be Carrier-first, capability-gated, and built on runtime/provider boundaries rather than classic centralized web-server assumptions.
+Long term, communication and content exchange should be Carrier-first, capability-gated, and built on runtime/provider boundaries rather than classic centralized web-server assumptions.
+
+Carrier should not appear to users as "just chat transport."
+It should become the trusted off-box plane for:
+- presence and direct communication
+- signed content exchange and discovery
+- object publication and retrieval
+- site and share promotion across machines
+
+The user contract should stay simple:
+- chat, share, open, and site flows operate on runtime objects
+- security and identity are consistent across those flows
+- transport/storage internals do not leak into the primary product story
 
 ### 6. Keep site and publication flows local-first
 
 `MyWebSite`, publication, release channels, and public serving should keep moving toward one coherent local-first story with explicit promotion and rollback.
 The runtime should own the object/state model cleanly, even when gateways or public edges sit in front of it.
+
+Over time, the same Carrier-secured plane used for collaboration should also make content and publication feel like part of one coherent system rather than a collection of unrelated subcommands.
 
 ## Later Direction
 

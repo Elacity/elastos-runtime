@@ -13,7 +13,7 @@ For install and product use, start with the repository root [README.md](../READM
 ## Prerequisites
 
 ### Required
-- Rust 1.70+ (2021 edition)
+- Rust 1.89+ (2021 edition)
 - Linux
 - Git
 
@@ -30,6 +30,8 @@ cd elastos-runtime/elastos
 cargo build --workspace --release
 ./target/release/elastos --help
 ```
+
+If you use `rustup`, the repository root includes a `rust-toolchain.toml` pin for the expected toolchain.
 
 ## Developer Flow
 

@@ -233,6 +233,19 @@ d = json.load(sys.stdin)
 print(json.dumps(d, separators=(',', ':'), sort_keys=True))"
 }
 
+hex_to_bin() {
+    local hex="$1"
+    local output="$2"
+    python3 - "$hex" "$output" <<'PY'
+import pathlib
+import sys
+
+hex_data = sys.argv[1].strip()
+output = pathlib.Path(sys.argv[2])
+output.write_bytes(bytes.fromhex(hex_data))
+PY
+}
+
 # ── Ed25519 verification ─────────────────────────────────────────────
 
 has_ed25519() {
@@ -303,8 +316,6 @@ verify_signature() {
         die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended)."
     fi
 
-    command -v xxd &>/dev/null || die "xxd required for signature verification"
-
     local payload sig_hex signer_did payload_signer_did
     payload=$(json_payload "$json_file")
     sig_hex=$(json_get "$json_file" 'd["signature"]')
@@ -332,12 +343,12 @@ verify_signature() {
     local tmpdir
     tmpdir=$(mktemp -d)
 
-    echo -n "${der_prefix}${pubkey_hex}" | xxd -r -p | \
-        openssl pkey -inform DER -pubin -out "${tmpdir}/pubkey.pem" 2>/dev/null \
+    hex_to_bin "${der_prefix}${pubkey_hex}" "${tmpdir}/pubkey.der"
+    openssl pkey -inform DER -pubin -in "${tmpdir}/pubkey.der" -out "${tmpdir}/pubkey.pem" 2>/dev/null \
         || die "Failed to create PEM from public key"
 
-    echo -n "$digest_hex" | xxd -r -p > "${tmpdir}/digest.bin"
-    echo -n "$sig_hex" | xxd -r -p > "${tmpdir}/sig.bin"
+    hex_to_bin "$digest_hex" "${tmpdir}/digest.bin"
+    hex_to_bin "$sig_hex" "${tmpdir}/sig.bin"
 
     if openssl pkeyutl -verify -pubin -inkey "${tmpdir}/pubkey.pem" \
         -in "${tmpdir}/digest.bin" -sigfile "${tmpdir}/sig.bin" \
@@ -429,7 +440,6 @@ if [[ "$ALLOW_UNSIGNED" != true ]]; then
     if ! has_ed25519; then
         die "OpenSSL does not support Ed25519 on this system.\n  Install OpenSSL 1.1.1+ or pass --allow-unsigned (NOT recommended).\n  Failing closed for your safety."
     fi
-    command -v xxd &>/dev/null || die "xxd required for signature verification"
 fi
 
 echo ""
