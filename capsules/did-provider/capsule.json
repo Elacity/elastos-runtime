@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "did-provider",
   "version": "0.1.0",
-  "description": "DID identity provider - did:key with portable Ed25519 keypair",
+  "description": "DID identity provider - device-backed did:key identity",
   "author": "elastos",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",

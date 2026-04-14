@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+elastos-identity = { path = "../../elastos/crates/elastos-identity" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

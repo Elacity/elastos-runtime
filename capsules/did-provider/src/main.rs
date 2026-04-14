@@ -1,7 +1,8 @@
 //! ElastOS DID Provider Capsule
 //!
-//! Manages a portable Ed25519 identity as a did:key.
-//! Random keypair (not derived from device key) — portable across devices.
+//! Manages the device-backed Ed25519 identity as a did:key.
+//! The main DID is derived from the shared device key so every runtime surface
+//! sees the same stable identity.
 //! Wire protocol: line-delimited JSON over stdin/stdout.
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -190,41 +191,9 @@ impl DidProvider {
 
     fn load_or_generate_key(&mut self) -> Result<(), String> {
         let dk = self.device_key.as_ref().ok_or("No device key")?;
-        let dir = self.did_dir();
-        let key_path = dir.join("key.enc");
-
-        // Derive an AES key specifically for DID key storage
-        let storage_key = derive_storage_key(dk);
-
-        if key_path.exists() {
-            // Load existing key
-            let encrypted = std::fs::read(&key_path)
-                .map_err(|e| format!("Failed to read DID key: {}", e))?;
-            let mut secret_bytes = decrypt_data(&storage_key, &encrypted)?;
-            if secret_bytes.len() != 32 {
-                return Err(format!("Invalid DID key length: {}", secret_bytes.len()));
-            }
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(&secret_bytes);
-            let signing_key = SigningKey::from_bytes(&key_arr);
-            self.verifying_key = Some(signing_key.verifying_key());
-            self.signing_key = Some(signing_key);
-            secret_bytes.zeroize();
-            key_arr.zeroize();
-        } else {
-            // Generate new random keypair
-            let signing_key = SigningKey::generate(&mut OsRng);
-            self.verifying_key = Some(signing_key.verifying_key());
-
-            // Persist encrypted
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| format!("Failed to create DID dir: {}", e))?;
-            let encrypted = encrypt_data(&storage_key, signing_key.as_bytes())?;
-            std::fs::write(&key_path, encrypted)
-                .map_err(|e| format!("Failed to write DID key: {}", e))?;
-
-            self.signing_key = Some(signing_key);
-        }
+        let (signing_key, _did) = elastos_identity::derive_did(dk);
+        self.verifying_key = Some(signing_key.verifying_key());
+        self.signing_key = Some(signing_key);
 
         Ok(())
     }
@@ -686,12 +655,35 @@ mod tests {
     }
 
     #[test]
+    fn test_main_did_matches_runtime_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bp = dir.path().to_str().unwrap();
+        let device_key = make_device_key();
+        let expected_did = elastos_identity::derive_did(&device_key).1;
+
+        let provider = init_provider(Some(bp));
+        let actual_did = match provider.get_did() {
+            Response::Ok { data: Some(d) } => d["did"].as_str().unwrap().to_string(),
+            other => panic!("Expected DID, got {:?}", other),
+        };
+
+        assert_eq!(
+            actual_did, expected_did,
+            "did-provider must match the runtime's device-derived DID"
+        );
+    }
+
+    #[test]
     fn test_different_device_key_cannot_read_did() {
         let dir = tempfile::tempdir().unwrap();
         let bp = dir.path().to_str().unwrap();
 
         // Create with one device key
-        let _provider = init_provider(Some(bp));
+        let provider1 = init_provider(Some(bp));
+        let did1 = match provider1.get_did() {
+            Response::Ok { data: Some(d) } => d["did"].as_str().unwrap().to_string(),
+            _ => panic!("Expected DID"),
+        };
 
         // Try to load with a different device key
         let config = serde_json::json!({
@@ -699,12 +691,16 @@ mod tests {
             "base_path": bp,
         });
         let mut provider2 = DidProvider::new();
-        let _resp = provider2.handle(Request::Init { config });
+        let _ = provider2.handle(Request::Init { config });
+        let did2 = match provider2.get_did() {
+            Response::Ok { data: Some(d) } => d["did"].as_str().unwrap().to_string(),
+            other => panic!("Expected DID, got {:?}", other),
+        };
 
-        // Should fail to decrypt the key (or generate a new one)
-        if let Response::Error { code, .. } = provider2.get_did() {
-            assert_eq!(code, "not_init");
-        }
+        assert_ne!(
+            did1, did2,
+            "changing the device key must change the main DID"
+        );
     }
 
     #[test]
