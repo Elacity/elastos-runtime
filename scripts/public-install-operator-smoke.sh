@@ -38,7 +38,7 @@ install_operator_home() {
 
 json_field() {
     local key="$1"
-    python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "${key}"
+    python3 -c 'import json,sys; value=json.load(sys.stdin).get(sys.argv[1], ""); print("" if value is None else value)' "${key}"
 }
 
 retry_json_command() {
