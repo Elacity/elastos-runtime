@@ -87,26 +87,43 @@ pub fn parse(input: &str) -> Command {
     }
 }
 
+pub fn launched_from_pc2() -> bool {
+    std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("pc2")
+}
+
 /// Help text for all commands.
-pub fn help_text() -> &'static str {
-    "Channels:\n\
-     \x20 /join #channel   Join or create a channel\n\
-     \x20 /part            Leave current channel\n\
-     \x20 /list            Show joined channels\n\
-     \n\
-     Messaging:\n\
-     \x20 /msg nick text   Send a direct message\n\
-     \x20 /nick name       Change your nickname\n\
-     \n\
-     Peers:\n\
-     \x20 /peers           List connected peers\n\
-     \x20 /ticket          Show your connect code\n\
-     \x20 /connect <code>  Connect to someone's code\n\
-     \n\
-     Other:\n\
-     \x20 /help            Show this help\n\
-     \x20 /home            Return to PC2 / exit chat\n\
-     \x20 /quit            Exit"
+pub fn help_text(from_pc2: bool) -> String {
+    let home_line = if from_pc2 {
+        " /home            Return to PC2"
+    } else {
+        " /home            Exit chat to terminal"
+    };
+    let quit_line = if from_pc2 {
+        " /quit            Leave chat and return to PC2"
+    } else {
+        " /quit            Exit chat to terminal"
+    };
+
+    format!(
+        "Channels:\n\
+         \x20 /join #channel   Join or create a channel\n\
+         \x20 /part            Leave current channel\n\
+         \x20 /list            Show joined channels\n\
+         \n\
+         Messaging:\n\
+         \x20 /msg nick text   Send a direct message\n\
+         \x20 /nick name       Change your nickname\n\
+         \n\
+         Peers:\n\
+         \x20 /peers           List connected peers\n\
+         \x20 /ticket          Show your connect code\n\
+         \x20 /connect <code>  Connect to someone's code\n\
+         \n\
+         Other:\n\
+         \x20 /help            Show this help\n\
+        {home_line}\n\
+        {quit_line}"
+    )
 }
 
 #[cfg(test)]
@@ -171,4 +188,19 @@ mod tests {
     fn test_parse_join_rejects_at_prefix() {
         assert!(matches!(parse("/join @alice"), Command::Error(_)));
     }
+
+    #[test]
+    fn help_text_is_explicit_for_pc2_launch() {
+        let help = help_text(true);
+        assert!(help.contains("/home            Return to PC2"));
+        assert!(help.contains("/quit            Leave chat and return to PC2"));
+    }
+
+    #[test]
+    fn help_text_is_explicit_for_terminal_launch() {
+        let help = help_text(false);
+        assert!(help.contains("/home            Exit chat to terminal"));
+        assert!(help.contains("/quit            Exit chat to terminal"));
+    }
+
 }

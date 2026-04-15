@@ -5,9 +5,6 @@ use anyhow::Context;
 
 use elastos_server::sources::default_data_dir;
 
-use crate::chat_cmd::request_attached_capability;
-use crate::shell_cmd;
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IdentityProfile {
     pub(crate) did: Option<String>,
@@ -42,57 +39,6 @@ pub(crate) async fn load_identity_profile(data_dir: &Path) -> anyhow::Result<Ide
         .map(|(_, did)| did)
         .filter(|did| !did.trim().is_empty());
     let nickname = elastos_identity::load_nickname(data_dir).ok().flatten();
-    Ok(IdentityProfile { did, nickname })
-}
-
-pub(crate) async fn load_identity_profile_from_coords(
-    coords: &crate::shell_cmd::RuntimeCoords,
-) -> anyhow::Result<IdentityProfile> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let tokens = shell_cmd::attach_to_runtime(coords).await?;
-    let did_cap = request_attached_capability(
-        &client,
-        &coords.api_url,
-        &tokens.client_token,
-        "elastos://did/*",
-        "execute",
-    )
-    .await?;
-
-    let did = did_provider_request(
-        &client,
-        &coords.api_url,
-        &tokens.client_token,
-        &did_cap,
-        "get_did",
-        serde_json::json!({}),
-    )
-    .await?
-    .get("data")
-    .and_then(|d| d.get("did"))
-    .and_then(|v| v.as_str())
-    .map(|did| did.to_string());
-
-    let nickname = did_provider_request(
-        &client,
-        &coords.api_url,
-        &tokens.client_token,
-        &did_cap,
-        "get_nickname",
-        serde_json::json!({}),
-    )
-    .await
-    .ok()
-    .and_then(|body| {
-        body.get("data")
-            .and_then(|d| d.get("nickname"))
-            .and_then(|v| v.as_str())
-            .map(|nick| nick.trim().to_string())
-            .filter(|nick| !nick.is_empty())
-    });
-
     Ok(IdentityProfile { did, nickname })
 }
 
@@ -179,33 +125,6 @@ fn validate_nickname(nickname: &str) -> anyhow::Result<()> {
         anyhow::bail!("nickname must not contain control characters");
     }
     Ok(())
-}
-
-async fn did_provider_request(
-    client: &reqwest::Client,
-    api: &str,
-    client_token: &str,
-    did_cap: &str,
-    op: &str,
-    body: serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let resp = client
-        .post(format!("{}/api/provider/did/{}", api, op))
-        .header("Authorization", format!("Bearer {}", client_token))
-        .header("X-Capability-Token", did_cap)
-        .json(&body)
-        .send()
-        .await?;
-    let body: serde_json::Value = resp.json().await?;
-    if body.get("status").and_then(|s| s.as_str()) == Some("error") {
-        anyhow::bail!(
-            "{}",
-            body.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown did-provider error")
-        );
-    }
-    Ok(body)
 }
 
 #[cfg(test)]

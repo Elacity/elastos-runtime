@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+use tokio::time::sleep;
 
 use elastos_common::localhost::{
     edge_site_head_path, my_website_root_path, publisher_site_releases_dir, ALL_ROOTS,
@@ -118,7 +120,7 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     },
     SystemServiceSpec {
         name: "Full-screen Apps",
-        role: "Supports immersive full-screen app capsules such as IRC in microVM and WASM form.",
+        role: "Supports immersive full-screen app capsules such as packaged chat in microVM and WASM form.",
         backing: &["crosvm", "vmlinux"],
     },
 ];
@@ -138,6 +140,27 @@ const CORE_ACTIONS: &[ActionSpec] = &[
         description: "Open native chat, send a message, and return here when you exit.",
         args: &["chat"],
         core: true,
+    },
+    ActionSpec {
+        id: "room-approve",
+        label: "Approve browser pairing",
+        description: "Approve the next pending room browser request.",
+        args: &[],
+        core: false,
+    },
+    ActionSpec {
+        id: "room-deny",
+        label: "Deny browser pairing",
+        description: "Deny the next pending room browser request.",
+        args: &[],
+        core: false,
+    },
+    ActionSpec {
+        id: "room-revoke-all",
+        label: "Disconnect browsers",
+        description: "Revoke all active room browser sessions.",
+        args: &[],
+        core: false,
     },
     ActionSpec {
         id: "site-local",
@@ -199,6 +222,10 @@ struct Pc2Snapshot {
     site: SiteStatus,
     #[serde(default)]
     shares: ShareStatus,
+    #[serde(default)]
+    room: RoomStatus,
+    #[serde(default)]
+    notifications: NotificationStatus,
     roots: Vec<RootStatus>,
     components: Vec<ComponentStatus>,
     cached_capsules: Vec<String>,
@@ -228,6 +255,125 @@ struct ShareChannelStatus {
     status: String,
     #[serde(default)]
     head_cid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomStatus {
+    #[serde(default)]
+    room_slug: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    owner_did: Option<String>,
+    #[serde(default)]
+    current_key_epoch: u64,
+    #[serde(default)]
+    admin_count: usize,
+    #[serde(default)]
+    member_count: usize,
+    #[serde(default)]
+    active_member_count: usize,
+    #[serde(default)]
+    pending_invite_count: usize,
+    #[serde(default)]
+    allow_guest_invites: bool,
+    #[serde(default)]
+    allow_member_invites: bool,
+    #[serde(default)]
+    allow_members_to_host_guests: bool,
+    #[serde(default)]
+    local_runtime_did: Option<String>,
+    #[serde(default)]
+    local_runtime_role: Option<String>,
+    #[serde(default)]
+    canonical_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    ephemeral_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    pairing_allowed: bool,
+    #[serde(default)]
+    pairing_block_reason: Option<String>,
+    #[serde(default)]
+    pending_count: usize,
+    #[serde(default)]
+    active_session_count: usize,
+    #[serde(default)]
+    latest_request_name: Option<String>,
+    #[serde(default)]
+    latest_request_device: Option<String>,
+    #[serde(default)]
+    active_participants: Vec<RoomParticipantStatus>,
+    #[serde(default)]
+    pending_requests: Vec<RoomPendingRequestStatus>,
+    #[serde(default)]
+    active_sessions: Vec<RoomSessionStatus>,
+    #[serde(default)]
+    members: Vec<RoomMemberStatus>,
+    #[serde(default)]
+    pending_invites: Vec<RoomInviteStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomParticipantStatus {
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomPendingRequestStatus {
+    request_id: String,
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomSessionStatus {
+    token: String,
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomMemberStatus {
+    member_did: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RoomInviteStatus {
+    invite_id: String,
+    invited_did: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationStatus {
+    #[serde(default)]
+    unread_count: usize,
+    #[serde(default)]
+    attention_count: usize,
+    #[serde(default)]
+    entries: Vec<NotificationEntryStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationEntryStatus {
+    id: String,
+    source_app: String,
+    kind: String,
+    title: String,
+    body: String,
+    #[serde(default)]
+    action_ref: Option<NotificationActionRefStatus>,
+    #[serde(default)]
+    read: bool,
+    severity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationActionRefStatus {
+    app: String,
+    action_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +515,7 @@ struct Pc2Intent {
     action: String,
 }
 
+#[derive(Clone)]
 struct SessionAccess {
     client: reqwest::Client,
     api_url: String,
@@ -505,7 +652,32 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
         snapshot.notice = notice.take();
         write_snapshot(&access, &session, &snapshot).await?;
         clear_intent(&access, &session).await?;
-        run_pc2_capsule(&data_dir, &coords.api_url, &tokens.client_token, &session).await?;
+        let updater_access = access.clone();
+        let updater_session = session.clone();
+        let updater_notice = snapshot.notice.clone();
+        let updater_site_url = dashboard.local_site_url().map(|url| url.to_string());
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = sleep(Duration::from_millis(300)) => {}
+                }
+
+                let mut next_snapshot =
+                    match gather_snapshot_with_site_preview(updater_site_url.as_deref()).await {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => continue,
+                    };
+                next_snapshot.notice = updater_notice.clone();
+                let _ = write_snapshot(&updater_access, &updater_session, &next_snapshot).await;
+            }
+        });
+        let capsule_result =
+            run_pc2_capsule(&data_dir, &coords.api_url, &tokens.client_token, &session).await;
+        let _ = stop_tx.send(true);
+        let _ = updater.await;
+        capsule_result?;
 
         let Some(intent) = read_intent(&access, &session).await? else {
             break Ok(());
@@ -518,9 +690,16 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
             }
             action_id => {
                 notice = Some(
-                    dispatch_action(action_id, &snapshot, &coords, &mut dashboard)
-                        .await
-                        .unwrap_or_else(|err| format!("Action failed: {}", err)),
+                    match dispatch_action(action_id, &snapshot, &coords, &mut dashboard).await {
+                        Ok(message) => {
+                            let _ = elastos_server::notifications::mark_acted_for_action(
+                                &default_data_dir(),
+                                action_id,
+                            );
+                            message
+                        }
+                        Err(err) => format!("Action failed: {}", err),
+                    },
                 );
             }
         }
@@ -546,6 +725,10 @@ async fn gather_snapshot_with_site_preview(
     let site_head = load_site_head_summary(&data_dir);
     let release_count = count_site_releases(&data_dir);
     let nickname = load_runtime_nickname(&data_dir).await;
+    let room_summary = elastos_server::room_service::load_summary(&data_dir).unwrap_or_default();
+    let _ = elastos_server::notifications::sync_room_notifications(&data_dir, &room_summary);
+    let notification_summary =
+        elastos_server::notifications::load_summary(&data_dir).unwrap_or_default();
 
     let mut snapshot = Pc2Snapshot {
         version: LOBBY_VERSION.to_string(),
@@ -574,6 +757,124 @@ async fn gather_snapshot_with_site_preview(
             release_count,
         },
         shares: gather_share_status(),
+        room: RoomStatus {
+            room_slug: room_summary.room_slug,
+            title: room_summary.room_control.title,
+            owner_did: room_summary.room_control.owner_did,
+            current_key_epoch: room_summary.room_control.current_key_epoch,
+            admin_count: room_summary.room_control.admin_count,
+            member_count: room_summary.room_control.member_count,
+            active_member_count: room_summary.room_control.active_member_count,
+            pending_invite_count: room_summary.room_control.pending_invites.len(),
+            allow_guest_invites: room_summary.room_control.access_policy.allow_guest_invites,
+            allow_member_invites: room_summary.room_control.access_policy.allow_member_invites,
+            allow_members_to_host_guests: room_summary
+                .room_control
+                .access_policy
+                .allow_members_to_host_guests,
+            local_runtime_did: room_summary.local_runtime_did,
+            local_runtime_role: room_summary.local_runtime_role.map(|role| {
+                match role {
+                    elastos_server::room_service::RoomRole::Owner => "owner",
+                    elastos_server::room_service::RoomRole::Admin => "admin",
+                    elastos_server::room_service::RoomRole::Member => "member",
+                }
+                .to_string()
+            }),
+            canonical_hosted_guest_url: room_summary.canonical_hosted_guest_url,
+            ephemeral_hosted_guest_url: room_summary.ephemeral_hosted_guest_url,
+            pairing_allowed: room_summary.pairing_allowed,
+            pairing_block_reason: room_summary.pairing_block_reason,
+            pending_count: room_summary.pending_count,
+            active_session_count: room_summary.active_session_count,
+            latest_request_name: room_summary.latest_request_name,
+            latest_request_device: room_summary.latest_request_device,
+            active_participants: room_summary
+                .active_participants
+                .into_iter()
+                .map(|participant| RoomParticipantStatus {
+                    display_name: participant.display_name,
+                    device_label: participant.device_label,
+                })
+                .collect(),
+            pending_requests: room_summary
+                .pending_requests
+                .into_iter()
+                .map(|request| RoomPendingRequestStatus {
+                    request_id: request.request_id,
+                    display_name: request.display_name,
+                    device_label: request.device_label,
+                })
+                .collect(),
+            active_sessions: room_summary
+                .active_sessions
+                .into_iter()
+                .map(|session| RoomSessionStatus {
+                    token: session.token,
+                    display_name: session.display_name,
+                    device_label: session.device_label,
+                })
+                .collect(),
+            members: room_summary
+                .room_control
+                .members
+                .into_iter()
+                .map(|member| RoomMemberStatus {
+                    member_did: member.member_did,
+                    role: match member.role {
+                        elastos_server::room_service::RoomRole::Owner => "owner",
+                        elastos_server::room_service::RoomRole::Admin => "admin",
+                        elastos_server::room_service::RoomRole::Member => "member",
+                    }
+                    .to_string(),
+                })
+                .collect(),
+            pending_invites: room_summary
+                .room_control
+                .pending_invites
+                .into_iter()
+                .map(|invite| RoomInviteStatus {
+                    invite_id: invite.invite_id,
+                    invited_did: invite.invited_did,
+                    role: match invite.role {
+                        elastos_server::room_service::RoomRole::Owner => "owner",
+                        elastos_server::room_service::RoomRole::Admin => "admin",
+                        elastos_server::room_service::RoomRole::Member => "member",
+                    }
+                    .to_string(),
+                })
+                .collect(),
+        },
+        notifications: NotificationStatus {
+            unread_count: notification_summary.unread_count,
+            attention_count: notification_summary.attention_count,
+            entries: notification_summary
+                .entries
+                .into_iter()
+                .map(|entry| NotificationEntryStatus {
+                    id: entry.id,
+                    source_app: entry.source_app,
+                    kind: entry.kind,
+                    title: entry.title,
+                    body: entry.body,
+                    action_ref: entry
+                        .action_ref
+                        .map(|action_ref| NotificationActionRefStatus {
+                            app: action_ref.app,
+                            action_id: action_ref.action_id,
+                        }),
+                    read: entry.read,
+                    severity: match entry.severity {
+                        elastos_server::notifications::NotificationSeverity::Info => "info",
+                        elastos_server::notifications::NotificationSeverity::Attention => {
+                            "attention"
+                        }
+                        elastos_server::notifications::NotificationSeverity::Critical => "critical",
+                    }
+                    .to_string(),
+                })
+                .collect(),
+        },
         roots: gather_roots(&data_dir),
         components: gather_components(&data_dir),
         cached_capsules: gather_cached_capsules(&data_dir),
@@ -615,6 +916,7 @@ async fn gather_snapshot_with_site_preview(
 
     // Dynamically discover installed capsules and add launchable ones.
     snapshot.actions.extend(gather_capsule_actions(&data_dir));
+    snapshot.actions.extend(gather_room_actions(&snapshot));
 
     Ok(snapshot)
 }
@@ -646,7 +948,7 @@ fn create_session(data_dir: &Path) -> anyhow::Result<Pc2Session> {
     let uri_root = format!("localhost://{}", local_root);
     let path = data_dir
         .join("Local")
-        .join("SharedByLocalUsersAndBots")
+        .join("Shared")
         .join("PC2")
         .join("sessions")
         .join(&id);
@@ -723,7 +1025,7 @@ async fn run_pc2_capsule(
     let capsule_dir = resolve_pc2_capsule_dir(data_dir)?;
     let runtime_storage = data_dir
         .join("Local")
-        .join("SharedByLocalUsersAndBots")
+        .join("Shared")
         .join("PC2")
         .join("bootstrap-storage");
     fs::create_dir_all(&runtime_storage)?;
@@ -841,6 +1143,145 @@ async fn dispatch_action(
     if let Some(capsule_name) = action_id.strip_prefix("capsule-") {
         return run_capsule_action(capsule_name, dashboard).await;
     }
+    if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
+        return match elastos_server::notifications::mark_read(&default_data_dir(), notification_id)?
+        {
+            true => Ok("Marked inbox entry read.".to_string()),
+            false => Ok("That inbox entry was already read or is no longer present.".to_string()),
+        };
+    }
+    if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
+        return match elastos_server::notifications::dismiss(&default_data_dir(), notification_id)? {
+            true => Ok("Dismissed inbox entry.".to_string()),
+            false => Ok("That inbox entry is already gone.".to_string()),
+        };
+    }
+    if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
+        return match elastos_server::room_service::approve_request(&default_data_dir(), request_id)?
+        {
+            Some(outcome) => Ok(format!(
+                "Approved room browser pairing for {} on {}.",
+                outcome.display_name, outcome.device_label
+            )),
+            None => Ok("That room browser request is no longer pending.".to_string()),
+        };
+    }
+    if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
+        return match elastos_server::room_service::deny_request(
+            &default_data_dir(),
+            request_id,
+            "Denied in PC2",
+        )? {
+            Some(outcome) => Ok(format!(
+                "Denied room browser pairing for {} on {}.",
+                outcome.display_name, outcome.device_label
+            )),
+            None => Ok("That room browser request is no longer pending.".to_string()),
+        };
+    }
+    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
+        return match elastos_server::room_service::revoke_session(&default_data_dir(), token)? {
+            Some(outcome) => Ok(format!(
+                "Disconnected room browser session for {} on {}.",
+                outcome.display_name, outcome.device_label
+            )),
+            None => Ok("That room browser session is already gone.".to_string()),
+        };
+    }
+    if let Some(invite_id) = action_id.strip_prefix("room-accept-invite:") {
+        let actor_did = snapshot.room.local_runtime_did.clone().ok_or_else(|| {
+            anyhow::anyhow!("local runtime DID is not available for room invite acceptance")
+        })?;
+        let member = elastos_server::room_service::accept_room_invite(
+            &default_data_dir(),
+            elastos_server::room_service::RoomInviteAcceptInput {
+                actor_did,
+                invite_id: invite_id.to_string(),
+            },
+        )?;
+        return Ok(format!("Joined room as {}.", member.member_did));
+    }
+    if let Some(invite_id) = action_id.strip_prefix("room-revoke-invite:") {
+        let actor_did = require_room_admin_actor(snapshot)?;
+        return match elastos_server::room_service::revoke_room_invite(
+            &default_data_dir(),
+            &actor_did,
+            invite_id,
+        )? {
+            Some(invite) => Ok(format!(
+                "Revoked sovereign member invite for {}.",
+                invite.invited_did
+            )),
+            None => Ok("That sovereign member invite is already gone.".to_string()),
+        };
+    }
+    if let Some(member_did) = action_id.strip_prefix("room-remove-member:") {
+        let actor_did = require_room_admin_actor(snapshot)?;
+        return match elastos_server::room_service::remove_room_member(
+            &default_data_dir(),
+            elastos_server::room_service::RoomMemberRemoveInput {
+                actor_did,
+                member_did: member_did.to_string(),
+            },
+        )? {
+            Some(member) => Ok(format!(
+                "Removed sovereign member {} from the room.",
+                member.member_did
+            )),
+            None => Ok("That sovereign member is already gone.".to_string()),
+        };
+    }
+    if action_id == "room-policy-toggle-guests" {
+        let actor_did = require_room_admin_actor(snapshot)?;
+        let updated = elastos_server::room_service::update_room_access_policy(
+            &default_data_dir(),
+            elastos_server::room_service::RoomAccessPolicyUpdateInput {
+                actor_did,
+                allow_guest_invites: !snapshot.room.allow_guest_invites,
+                allow_member_invites: snapshot.room.allow_member_invites,
+                allow_members_to_host_guests: snapshot.room.allow_members_to_host_guests,
+            },
+        )?;
+        return Ok(if updated.allow_guest_invites {
+            "Opened hosted guest access for the room.".to_string()
+        } else {
+            "Closed hosted guest access for the room.".to_string()
+        });
+    }
+    if action_id == "room-policy-toggle-members" {
+        let actor_did = require_room_admin_actor(snapshot)?;
+        let updated = elastos_server::room_service::update_room_access_policy(
+            &default_data_dir(),
+            elastos_server::room_service::RoomAccessPolicyUpdateInput {
+                actor_did,
+                allow_guest_invites: snapshot.room.allow_guest_invites,
+                allow_member_invites: !snapshot.room.allow_member_invites,
+                allow_members_to_host_guests: snapshot.room.allow_members_to_host_guests,
+            },
+        )?;
+        return Ok(if updated.allow_member_invites {
+            "Opened sovereign member invites for the room.".to_string()
+        } else {
+            "Closed sovereign member invites for the room.".to_string()
+        });
+    }
+    if action_id == "room-policy-toggle-member-hosts" {
+        let actor_did = require_room_admin_actor(snapshot)?;
+        let updated = elastos_server::room_service::update_room_access_policy(
+            &default_data_dir(),
+            elastos_server::room_service::RoomAccessPolicyUpdateInput {
+                actor_did,
+                allow_guest_invites: snapshot.room.allow_guest_invites,
+                allow_member_invites: snapshot.room.allow_member_invites,
+                allow_members_to_host_guests: !snapshot.room.allow_members_to_host_guests,
+            },
+        )?;
+        return Ok(if updated.allow_members_to_host_guests {
+            "Allowed ordinary members to host browser guests for the room.".to_string()
+        } else {
+            "Restricted guest browser hosting to owners and admins.".to_string()
+        });
+    }
 
     let Some(action) = action_spec(action_id) else {
         anyhow::bail!("Unknown PC2 action: {}", action_id);
@@ -868,6 +1309,9 @@ enum ActionLaunch {
     External(&'static [&'static str]),
     ManagedIdentityNicknameSet,
     ManagedChat,
+    ManagedRoomApprove,
+    ManagedRoomDeny,
+    ManagedRoomRevokeAll,
     ManagedLocalSitePreview,
     ManagedPublicSitePreview,
     ManagedSharesList,
@@ -893,6 +1337,49 @@ async fn run_action(
             let _parent_surface = ScopedEnvVar::set("ELASTOS_PARENT_SURFACE", "pc2");
             crate::chat_cmd::run_chat_from_pc2(None, None, coords.clone()).await?;
             Ok(format!("Returned home from {}.", action.label))
+        }
+        ActionLaunch::ManagedRoomApprove => {
+            match elastos_server::room_service::approve_next_request(&default_data_dir())? {
+                Some(outcome) => Ok(format!(
+                    "Approved room browser pairing for {} on {}.",
+                    outcome.display_name, outcome.device_label
+                )),
+                None => Ok("No pending room browser requests.".to_string()),
+            }
+        }
+        ActionLaunch::ManagedRoomDeny => {
+            match elastos_server::room_service::deny_next_request(
+                &default_data_dir(),
+                "Denied in PC2",
+            )? {
+                Some(outcome) => Ok(format!(
+                    "Denied room browser pairing for {} on {}.",
+                    outcome.display_name, outcome.device_label
+                )),
+                None => Ok("No pending room browser requests.".to_string()),
+            }
+        }
+        ActionLaunch::ManagedRoomRevokeAll => {
+            match elastos_server::room_service::revoke_all_sessions(&default_data_dir())? {
+                Some(outcome) => {
+                    let detail = outcome
+                        .revoked_participants
+                        .iter()
+                        .map(|participant| {
+                            format!(
+                                "{} on {}",
+                                participant.display_name, participant.device_label
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Ok(format!(
+                        "Disconnected {} room browser session(s): {}.",
+                        outcome.revoked_count, detail
+                    ))
+                }
+                None => Ok("No active room browser sessions.".to_string()),
+            }
         }
         ActionLaunch::ManagedLocalSitePreview => {
             let addr = crate::choose_local_open_addr(None)?;
@@ -1020,6 +1507,15 @@ fn action_launch_with_kvm(
     } else if action.id == "chat" {
         let _ = (snapshot, kvm_supported);
         ActionLaunch::ManagedChat
+    } else if action.id == "room-approve" {
+        let _ = (snapshot, kvm_supported);
+        ActionLaunch::ManagedRoomApprove
+    } else if action.id == "room-deny" {
+        let _ = (snapshot, kvm_supported);
+        ActionLaunch::ManagedRoomDeny
+    } else if action.id == "room-revoke-all" {
+        let _ = (snapshot, kvm_supported);
+        ActionLaunch::ManagedRoomRevokeAll
     } else if action.id == "site-local" {
         ActionLaunch::ManagedLocalSitePreview
     } else if action.id == "site-ephemeral" {
@@ -1057,6 +1553,15 @@ fn action_command_with_kvm(
     }
     if action.id == "site-local" {
         return "pc2: open localhost://MyWebSite in browser".to_string();
+    }
+    if action.id == "room-approve" {
+        return "pc2: approve the next pending room browser request".to_string();
+    }
+    if action.id == "room-deny" {
+        return "pc2: deny the next pending room browser request".to_string();
+    }
+    if action.id == "room-revoke-all" {
+        return "pc2: revoke all active room browser sessions".to_string();
     }
     if action.id == "site-ephemeral" {
         return "pc2: open a temporary HTTPS URL for MyWebSite and return home".to_string();
@@ -1315,12 +1820,7 @@ fn load_existing_did(data_dir: &Path) -> Option<String> {
 }
 
 async fn load_runtime_nickname(data_dir: &Path) -> Option<String> {
-    let coords_path = shell_cmd::runtime_coord_path(data_dir);
-    let coords = shell_cmd::read_runtime_coords(&coords_path).await?;
-    crate::identity_cmd::load_identity_profile_from_coords(&coords)
-        .await
-        .ok()
-        .and_then(|profile| profile.nickname)
+    elastos_identity::load_nickname(data_dir).ok().flatten()
 }
 
 fn load_default_source(data_dir: &Path) -> anyhow::Result<Option<SourceStatus>> {
@@ -1827,7 +2327,7 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
         "  Network:   {}",
         match snapshot.runtime.peer_count {
             Some(0) if snapshot.runtime.ticket.is_some() =>
-                "Carrier ready; waiting for another PC2".to_string(),
+                "Carrier bootstrap ready; waiting for another PC2".to_string(),
             Some(0) => "starting up".to_string(),
             Some(1) => "1 Carrier peer reachable".to_string(),
             Some(peers) => format!("{} Carrier peers reachable", peers),
@@ -1844,6 +2344,29 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
             "not staged"
         }
     )?;
+    if snapshot.room.pending_count > 0 {
+        let latest = match (
+            snapshot.room.latest_request_name.as_deref(),
+            snapshot.room.latest_request_device.as_deref(),
+        ) {
+            (Some(name), Some(device)) => format!("{} on {}", name, device),
+            (Some(name), None) => name.to_string(),
+            _ => "browser approval needed".to_string(),
+        };
+        writeln!(
+            out,
+            "  Pairing:   {} pending ({})",
+            snapshot.room.pending_count, latest
+        )?;
+    }
+    if snapshot.room.active_session_count > 0 {
+        writeln!(
+            out,
+            "  Room:      {} browser(s) active ({})",
+            snapshot.room.active_session_count,
+            format_room_participants(&snapshot.room.active_participants)
+        )?;
+    }
     if let Some(url) = snapshot.site.local_url.as_deref() {
         writeln!(out, "  Preview:   {}", url.trim_end_matches('/'))?;
     }
@@ -1989,7 +2512,7 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
         ),
         "Local" => (
             "Scratch space for temporary work, session state, and things that are not public yet.",
-            "localhost://Local/SharedByLocalUsersAndBots",
+            "localhost://Local/Shared",
         ),
         "MyWebSite" => (
             "Browser-facing site root for the current sovereign PC2, with preview, releases, and live channels.",
@@ -2020,6 +2543,43 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
 }
 
 fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness {
+    if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
+        return if snapshot
+            .room
+            .pending_requests
+            .iter()
+            .any(|request| request.request_id == request_id)
+        {
+            ActionReadiness::Ready
+        } else {
+            ActionReadiness::Blocked("browser pairing request is no longer pending".to_string())
+        };
+    }
+    if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
+        return if snapshot
+            .room
+            .pending_requests
+            .iter()
+            .any(|request| request.request_id == request_id)
+        {
+            ActionReadiness::Ready
+        } else {
+            ActionReadiness::Blocked("browser pairing request is no longer pending".to_string())
+        };
+    }
+    if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
+        return if snapshot
+            .room
+            .active_sessions
+            .iter()
+            .any(|session| session.token == token)
+        {
+            ActionReadiness::Ready
+        } else {
+            ActionReadiness::Blocked("browser session is no longer active".to_string())
+        };
+    }
+
     match action_id {
         "identity-nickname-set" => require_components(
             snapshot,
@@ -2031,6 +2591,20 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
             &["shell", "localhost-provider", "did-provider"],
             "run: elastos setup",
         ),
+        "room-approve" | "room-deny" => {
+            if snapshot.room.pending_count == 0 {
+                ActionReadiness::Blocked("no browser pairing requests pending".to_string())
+            } else {
+                ActionReadiness::Ready
+            }
+        }
+        "room-revoke-all" => {
+            if snapshot.room.active_session_count == 0 {
+                ActionReadiness::Blocked("no active browser sessions".to_string())
+            } else {
+                ActionReadiness::Ready
+            }
+        }
         "site-local" => {
             if !snapshot.site.staged {
                 return ActionReadiness::Blocked(
@@ -2063,8 +2637,220 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
             ),
             Some(_) => ActionReadiness::Ready,
         },
+        "room-policy-toggle-guests"
+        | "room-policy-toggle-members"
+        | "room-policy-toggle-member-hosts" => {
+            if room_admin_role(snapshot) {
+                ActionReadiness::Ready
+            } else {
+                ActionReadiness::Blocked(
+                    "only owners and admins may change room access policy".to_string(),
+                )
+            }
+        }
+        _ if action_id.starts_with("room-revoke-invite:") => {
+            if room_admin_role(snapshot) {
+                ActionReadiness::Ready
+            } else {
+                ActionReadiness::Blocked(
+                    "only owners and admins may revoke sovereign member invites".to_string(),
+                )
+            }
+        }
+        _ if action_id.starts_with("room-remove-member:") => {
+            if room_admin_role(snapshot) {
+                ActionReadiness::Ready
+            } else {
+                ActionReadiness::Blocked(
+                    "only owners and admins may remove sovereign members".to_string(),
+                )
+            }
+        }
+        _ if action_id.starts_with("room-accept-invite:") => {
+            if snapshot.room.local_runtime_did.is_some() {
+                ActionReadiness::Ready
+            } else {
+                ActionReadiness::Blocked("local runtime DID is not available yet".to_string())
+            }
+        }
         _ => ActionReadiness::Blocked("unknown action".to_string()),
     }
+}
+
+fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
+    let mut actions = Vec::new();
+    if room_admin_role(snapshot) {
+        actions.push(ActionInfo {
+            id: "room-policy-toggle-guests".to_string(),
+            label: if snapshot.room.allow_guest_invites {
+                "Close hosted guest access".to_string()
+            } else {
+                "Open hosted guest access".to_string()
+            },
+            description: if snapshot.room.allow_guest_invites {
+                "Stop new browser guests from requesting access on the hosted room URL.".to_string()
+            } else {
+                "Allow new browser guests to request access on the hosted room URL.".to_string()
+            },
+            command: "pc2: toggle hosted guest access for this room".to_string(),
+            ready: true,
+            reason: None,
+        });
+        actions.push(ActionInfo {
+            id: "room-policy-toggle-members".to_string(),
+            label: if snapshot.room.allow_member_invites {
+                "Close sovereign member invites".to_string()
+            } else {
+                "Open sovereign member invites".to_string()
+            },
+            description: if snapshot.room.allow_member_invites {
+                "Stop issuing new sovereign PC2 member invites for this room.".to_string()
+            } else {
+                "Allow new sovereign PC2 member invites for this room.".to_string()
+            },
+            command: "pc2: toggle sovereign member invites for this room".to_string(),
+            ready: true,
+            reason: None,
+        });
+        actions.push(ActionInfo {
+            id: "room-policy-toggle-member-hosts".to_string(),
+            label: if snapshot.room.allow_members_to_host_guests {
+                "Restrict member guest hosting".to_string()
+            } else {
+                "Allow member guest hosting".to_string()
+            },
+            description: if snapshot.room.allow_members_to_host_guests {
+                "Limit hosted guest access to owners and admins only.".to_string()
+            } else {
+                "Allow ordinary members to host browser guests from their runtimes.".to_string()
+            },
+            command: "pc2: toggle whether ordinary members may host browser guests".to_string(),
+            ready: true,
+            reason: None,
+        });
+    }
+    if let Some(local_runtime_did) = snapshot.room.local_runtime_did.as_deref() {
+        for invite in &snapshot.room.pending_invites {
+            if invite.invited_did == local_runtime_did {
+                actions.push(ActionInfo {
+                    id: format!("room-accept-invite:{}", invite.invite_id),
+                    label: format!("Join as {} member", invite.role),
+                    description: "Accept this sovereign member invite on the local runtime."
+                        .to_string(),
+                    command: "pc2: accept this sovereign room invite on the local runtime"
+                        .to_string(),
+                    ready: true,
+                    reason: None,
+                });
+            }
+        }
+    }
+    if room_admin_role(snapshot) {
+        for invite in &snapshot.room.pending_invites {
+            actions.push(ActionInfo {
+                id: format!("room-revoke-invite:{}", invite.invite_id),
+                label: format!("Revoke invite for {}", invite.invited_did),
+                description: format!("Revoke this pending sovereign {} invite.", invite.role),
+                command: "pc2: revoke this specific sovereign member invite".to_string(),
+                ready: true,
+                reason: None,
+            });
+        }
+        for member in &snapshot.room.members {
+            if member.role == "owner" {
+                continue;
+            }
+            if snapshot.room.local_runtime_did.as_deref() == Some(member.member_did.as_str()) {
+                continue;
+            }
+            if can_manage_member(snapshot, member) {
+                actions.push(ActionInfo {
+                    id: format!("room-remove-member:{}", member.member_did),
+                    label: format!("Remove {}", member.member_did),
+                    description: format!("Remove this sovereign {} from the room.", member.role),
+                    command: "pc2: remove this sovereign member from the room".to_string(),
+                    ready: true,
+                    reason: None,
+                });
+            }
+        }
+    }
+    for request in &snapshot.room.pending_requests {
+        actions.push(ActionInfo {
+            id: format!("room-approve-request:{}", request.request_id),
+            label: format!(
+                "Approve {} on {}",
+                request.display_name, request.device_label
+            ),
+            description: "Approve this specific room browser request.".to_string(),
+            command: "pc2: approve this specific room browser request".to_string(),
+            ready: true,
+            reason: None,
+        });
+        actions.push(ActionInfo {
+            id: format!("room-deny-request:{}", request.request_id),
+            label: format!("Deny {} on {}", request.display_name, request.device_label),
+            description: "Deny this specific room browser request.".to_string(),
+            command: "pc2: deny this specific room browser request".to_string(),
+            ready: true,
+            reason: None,
+        });
+    }
+    for session in &snapshot.room.active_sessions {
+        actions.push(ActionInfo {
+            id: format!("room-revoke-session:{}", session.token),
+            label: format!(
+                "Disconnect {} on {}",
+                session.display_name, session.device_label
+            ),
+            description: "Disconnect this specific room browser session.".to_string(),
+            command: "pc2: disconnect this specific room browser session".to_string(),
+            ready: true,
+            reason: None,
+        });
+    }
+    actions
+}
+
+fn room_admin_role(snapshot: &Pc2Snapshot) -> bool {
+    matches!(
+        snapshot.room.local_runtime_role.as_deref(),
+        Some("owner" | "admin")
+    )
+}
+
+fn can_manage_member(snapshot: &Pc2Snapshot, member: &RoomMemberStatus) -> bool {
+    match snapshot.room.local_runtime_role.as_deref() {
+        Some("owner") => member.role != "owner",
+        Some("admin") => member.role == "member",
+        _ => false,
+    }
+}
+
+fn require_room_admin_actor(snapshot: &Pc2Snapshot) -> anyhow::Result<String> {
+    if !room_admin_role(snapshot) {
+        anyhow::bail!("only owners and admins may change room access policy");
+    }
+    snapshot.room.local_runtime_did.clone().ok_or_else(|| {
+        anyhow::anyhow!("local runtime DID is not available for room policy changes")
+    })
+}
+
+fn format_room_participants(participants: &[RoomParticipantStatus]) -> String {
+    if participants.is_empty() {
+        return "browser room active".to_string();
+    }
+    participants
+        .iter()
+        .take(3)
+        .map(|participant| {
+            format!(
+                "{} on {}",
+                participant.display_name, participant.device_label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn run_pc2_update_check(snapshot: &Pc2Snapshot) -> anyhow::Result<String> {
@@ -2251,6 +3037,8 @@ mod tests {
                 release_count: 0,
             },
             shares: ShareStatus::default(),
+            room: RoomStatus::default(),
+            notifications: NotificationStatus::default(),
             roots: Vec::new(),
             components,
             cached_capsules: Vec::new(),
@@ -2261,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_action_stays_native_when_irc_is_not_packaged() {
+    fn chat_action_stays_native_when_fullscreen_chat_is_not_packaged() {
         let snapshot = sample_snapshot_with_components(&[
             "shell",
             "localhost-provider",
@@ -2279,7 +3067,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_action_stays_native_even_when_irc_prereqs_are_present() {
+    fn chat_action_stays_native_even_when_fullscreen_chat_prereqs_are_present() {
         let snapshot = sample_snapshot_with_components(&[
             "shell",
             "localhost-provider",
@@ -2315,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_action_launch_uses_managed_native_when_irc_is_not_packaged() {
+    fn chat_action_launch_uses_managed_native_when_fullscreen_chat_is_not_packaged() {
         let snapshot = sample_snapshot_with_components(&[
             "shell",
             "localhost-provider",
@@ -2381,13 +3169,79 @@ mod tests {
     }
 
     #[test]
-    fn only_public_site_action_stays_hidden_when_blocked() {
+    fn conditional_actions_stay_hidden_when_blocked() {
         let non_core: Vec<&str> = CORE_ACTIONS
             .iter()
             .filter(|a| !a.core)
             .map(|a| a.id)
             .collect();
         assert!(non_core.contains(&"site-ephemeral"));
+        assert!(non_core.contains(&"room-approve"));
+        assert!(non_core.contains(&"room-deny"));
+        assert!(non_core.contains(&"room-revoke-all"));
+    }
+
+    #[test]
+    fn room_actions_require_pending_pairing() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        assert!(matches!(
+            action_readiness("room-approve", &snapshot),
+            ActionReadiness::Blocked(_)
+        ));
+
+        snapshot.room.pending_count = 1;
+        assert!(matches!(
+            action_readiness("room-approve", &snapshot),
+            ActionReadiness::Ready
+        ));
+    }
+
+    #[test]
+    fn room_revoke_requires_active_sessions() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        assert!(matches!(
+            action_readiness("room-revoke-all", &snapshot),
+            ActionReadiness::Blocked(_)
+        ));
+
+        snapshot.room.active_session_count = 1;
+        assert!(matches!(
+            action_readiness("room-revoke-all", &snapshot),
+            ActionReadiness::Ready
+        ));
+    }
+
+    #[test]
+    fn room_policy_actions_require_admin_role() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.local_runtime_role = Some("member".to_string());
+        assert!(matches!(
+            action_readiness("room-policy-toggle-guests", &snapshot),
+            ActionReadiness::Blocked(_)
+        ));
+
+        snapshot.room.local_runtime_role = Some("owner".to_string());
+        assert!(matches!(
+            action_readiness("room-policy-toggle-guests", &snapshot),
+            ActionReadiness::Ready
+        ));
+    }
+
+    #[test]
+    fn room_policy_actions_surface_for_room_admins() {
+        let mut snapshot = sample_snapshot_with_components(&[]);
+        snapshot.room.local_runtime_role = Some("owner".to_string());
+        snapshot.room.allow_guest_invites = true;
+        snapshot.room.allow_member_invites = false;
+        snapshot.room.allow_members_to_host_guests = true;
+
+        let labels: Vec<String> = gather_room_actions(&snapshot)
+            .into_iter()
+            .map(|action| action.label)
+            .collect();
+        assert!(labels.contains(&"Close hosted guest access".to_string()));
+        assert!(labels.contains(&"Open sovereign member invites".to_string()));
+        assert!(labels.contains(&"Restrict member guest hosting".to_string()));
     }
 
     #[test]

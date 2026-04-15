@@ -242,6 +242,19 @@ fn native_discovery_consumer_id(topic: &str, session_id: &str) -> String {
     format!("native-chat-discovery:{}:{}", topic, session_id)
 }
 
+fn resolve_chat_nickname(
+    requested_nick: Option<String>,
+    local_nickname: Option<String>,
+    attached_nickname: Option<String>,
+    env_user: Option<String>,
+) -> String {
+    requested_nick
+        .or(local_nickname)
+        .or(attached_nickname)
+        .or(env_user)
+        .unwrap_or_else(|| "anon".to_string())
+}
+
 pub async fn run_chat(nick: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
     // Native chat client — connects to the running runtime's Carrier
     // via the provider API. No capsule, no VM, no separate Carrier node.
@@ -281,12 +294,18 @@ async fn run_native_chat_with_runtime(
     let api = &coords.api_url;
     let client_token = &tokens.client_token;
     let identity = load_attached_chat_identity(&client, api, client_token).await;
+    let local_nickname = elastos_identity::load_nickname(&default_data_dir())
+        .ok()
+        .flatten();
     let self_did = identity.did;
     let self_session_id = new_chat_session_id();
     let room_consumer_id = native_room_consumer_id(CHAT_TOPIC, &self_session_id);
-    let nick = requested_nick
-        .or(identity.nickname)
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "anon".into()));
+    let nick = resolve_chat_nickname(
+        requested_nick,
+        local_nickname,
+        identity.nickname,
+        std::env::var("USER").ok(),
+    );
     let peer_cap =
         request_attached_capability(&client, api, client_token, "elastos://peer/*", "execute")
             .await?;
@@ -448,8 +467,10 @@ async fn run_native_chat_with_runtime(
     }
 
     eprintln!(
-        "Chat as '{}' on {}. Type messages and press Enter.\nType /home to return to PC2, or /quit to exit.\n",
-        nick, CHAT_TOPIC
+        "Chat as '{}' on {}. Type messages and press Enter.\n{}\n",
+        nick,
+        CHAT_TOPIC,
+        native_chat_exit_hint(std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref())
     );
 
     let recv_client = client.clone();
@@ -1801,6 +1822,14 @@ fn return_to_pc2_if_requested(home_requested: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn native_chat_exit_hint(parent_surface: Option<&str>) -> &'static str {
+    if parent_surface == Some("pc2") {
+        "Type /home to return to PC2, or /quit to leave chat and return to PC2."
+    } else {
+        "Type /home to return to PC2, or /quit to exit to the terminal."
+    }
+}
+
 pub(crate) async fn request_attached_capability(
     client: &reqwest::Client,
     api: &str,
@@ -1983,6 +2012,42 @@ mod tests {
     }
 
     #[test]
+    fn chat_nickname_prefers_requested_then_local_then_attached_then_env() {
+        assert_eq!(
+            resolve_chat_nickname(
+                Some("cli".to_string()),
+                Some("local".to_string()),
+                Some("attached".to_string()),
+                Some("env".to_string())
+            ),
+            "cli"
+        );
+        assert_eq!(
+            resolve_chat_nickname(
+                None,
+                Some("local".to_string()),
+                Some("attached".to_string()),
+                Some("env".to_string())
+            ),
+            "local"
+        );
+        assert_eq!(
+            resolve_chat_nickname(
+                None,
+                None,
+                Some("attached".to_string()),
+                Some("env".to_string())
+            ),
+            "attached"
+        );
+        assert_eq!(
+            resolve_chat_nickname(None, None, None, Some("env".to_string())),
+            "env"
+        );
+        assert_eq!(resolve_chat_nickname(None, None, None, None), "anon");
+    }
+
+    #[test]
     fn native_room_consumer_id_is_session_scoped() {
         assert_eq!(
             native_room_consumer_id("#general", "abc123"),
@@ -2161,6 +2226,22 @@ mod tests {
         let home_requested = native_chat_tty_loop_from_io(&ctx, &mut input, &ui);
 
         assert!(!home_requested);
+    }
+
+    #[test]
+    fn native_chat_exit_hint_is_explicit_for_pc2_launch() {
+        assert_eq!(
+            native_chat_exit_hint(Some("pc2")),
+            "Type /home to return to PC2, or /quit to leave chat and return to PC2."
+        );
+    }
+
+    #[test]
+    fn native_chat_exit_hint_is_explicit_for_terminal_launch() {
+        assert_eq!(
+            native_chat_exit_hint(None),
+            "Type /home to return to PC2, or /quit to exit to the terminal."
+        );
     }
 
     #[test]

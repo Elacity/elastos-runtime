@@ -30,6 +30,7 @@ const CHAT_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
+const LOCAL_SYSTEM_CHANNEL_PREFIX: char = '!';
 const PRESENCE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5);
 const PRESENCE_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
@@ -444,12 +445,14 @@ fn run_loop(
             }
         }
 
-        // Poll for new messages periodically (only when connected)
-        if !app.peer_token.is_empty() && last_poll.elapsed() >= poll_interval {
+        if last_poll.elapsed() >= poll_interval {
             last_poll = std::time::Instant::now();
-            poll_messages(app, args);
-            poll_peers(app, args);
-            poll_presence(app);
+            poll_local_channels(app, args);
+            if !app.peer_token.is_empty() {
+                poll_messages(app, args);
+                poll_peers(app, args);
+                poll_presence(app);
+            }
         }
     }
 
@@ -589,7 +592,7 @@ fn handle_key(app: &mut App, key: KeyEvent, args: &Args) -> Result<()> {
                     }
                 }
                 Command::Help => {
-                    for line in command::help_text().lines() {
+                    for line in command::help_text(command::launched_from_pc2()).lines() {
                         app.system_message(line);
                     }
                 }
@@ -856,6 +859,29 @@ fn local_now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn poll_local_channels(app: &mut App, args: &Args) {
+    if app.storage_token.is_empty() || args.no_history {
+        return;
+    }
+
+    let channels = match api::load_json::<Vec<String>>(&app.storage_token, "chat/channels.json") {
+        Ok(Some(channels)) => channels,
+        _ => return,
+    };
+
+    for channel in channels
+        .into_iter()
+        .filter(|channel| channel.starts_with(LOCAL_SYSTEM_CHANNEL_PREFIX))
+    {
+        let _ = app.ensure_channel(&channel);
+        if let Ok(history) = api::load_history(&app.storage_token, &channel) {
+            if !history.is_empty() {
+                app.append_messages(&channel, history);
+            }
+        }
+    }
 }
 
 /// Poll for new gossip messages on all joined #channels.

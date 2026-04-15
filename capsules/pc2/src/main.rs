@@ -16,6 +16,7 @@ thread_local! {
 const STARTUP_ENTER_SETTLE_WINDOW: Duration = Duration::from_millis(350);
 const ESCAPE_SEQUENCE_SETTLE_WINDOW: Duration = Duration::from_millis(25);
 const ESCAPE_SEQUENCE_MAX_BYTES: usize = 8;
+const LIVE_REFRESH_POLL_MS: i32 = 300;
 
 #[derive(Debug, Clone, Deserialize)]
 struct Pc2Snapshot {
@@ -29,6 +30,10 @@ struct Pc2Snapshot {
     site: SiteStatus,
     #[serde(default)]
     shares: ShareStatus,
+    #[serde(default)]
+    room: RoomStatus,
+    #[serde(default)]
+    notifications: NotificationStatus,
     roots: Vec<RootStatus>,
     actions: Vec<ActionInfo>,
     #[serde(default)]
@@ -57,6 +62,130 @@ struct ShareChannelStatus {
     status: String,
     #[serde(default)]
     head_cid: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomStatus {
+    #[serde(default)]
+    room_slug: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    owner_did: Option<String>,
+    #[serde(default)]
+    current_key_epoch: u64,
+    #[serde(default)]
+    admin_count: usize,
+    #[serde(default)]
+    member_count: usize,
+    #[serde(default)]
+    active_member_count: usize,
+    #[serde(default)]
+    pending_invite_count: usize,
+    #[serde(default)]
+    allow_guest_invites: bool,
+    #[serde(default)]
+    allow_member_invites: bool,
+    #[serde(default)]
+    allow_members_to_host_guests: bool,
+    #[serde(default)]
+    local_runtime_did: Option<String>,
+    #[serde(default)]
+    local_runtime_role: Option<String>,
+    #[serde(default)]
+    canonical_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    ephemeral_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    pairing_allowed: bool,
+    #[serde(default)]
+    pairing_block_reason: Option<String>,
+    #[serde(default)]
+    pending_count: usize,
+    #[serde(default)]
+    active_session_count: usize,
+    #[serde(default)]
+    active_participants: Vec<RoomParticipantStatus>,
+    #[serde(default)]
+    pending_requests: Vec<RoomPendingRequestStatus>,
+    #[serde(default)]
+    active_sessions: Vec<RoomSessionStatus>,
+    #[serde(default)]
+    members: Vec<RoomMemberStatus>,
+    #[serde(default)]
+    pending_invites: Vec<RoomInviteStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomParticipantStatus {
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomPendingRequestStatus {
+    #[allow(dead_code)]
+    request_id: String,
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomSessionStatus {
+    #[allow(dead_code)]
+    token: String,
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomMemberStatus {
+    member_did: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RoomInviteStatus {
+    #[allow(dead_code)]
+    invite_id: String,
+    invited_did: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct NotificationStatus {
+    #[serde(default)]
+    unread_count: usize,
+    #[serde(default)]
+    attention_count: usize,
+    #[serde(default)]
+    entries: Vec<NotificationEntryStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct NotificationEntryStatus {
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    source_app: String,
+    #[allow(dead_code)]
+    kind: String,
+    #[allow(dead_code)]
+    title: String,
+    body: String,
+    #[allow(dead_code)]
+    action_ref: Option<NotificationActionRefStatus>,
+    #[allow(dead_code)]
+    read: bool,
+    #[allow(dead_code)]
+    severity: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct NotificationActionRefStatus {
+    #[allow(dead_code)]
+    app: String,
+    action_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +256,7 @@ struct Pc2Intent<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Home,
+    Inbox,
     People,
     Spaces,
     Apps,
@@ -137,6 +267,7 @@ enum Tab {
 struct TuiState {
     tab: Tab,
     home_index: usize,
+    inbox_index: usize,
     people_index: usize,
     space_index: usize,
     app_index: usize,
@@ -150,15 +281,16 @@ struct AppEntry {
     action_id: String,
     label: String,
     category: &'static str,
-    description: &'static str,
+    description: String,
     command: String,
     state: String,
+    is_control: bool,
 }
 
 #[derive(Clone, Copy)]
 struct AppSurfaceSpec {
     name: &'static str,
-    action_id: &'static str,
+    action_ids: &'static [&'static str],
     label: &'static str,
     category: &'static str,
     description: &'static str,
@@ -172,6 +304,8 @@ enum UiKey {
     Left,
     Right,
     Enter,
+    MarkRead,
+    Dismiss,
     Refresh,
     Quit,
     Help,
@@ -184,67 +318,63 @@ struct TerminalGuard;
 const APP_SURFACES: &[AppSurfaceSpec] = &[
     AppSurfaceSpec {
         name: "chat",
-        action_id: "chat",
+        action_ids: &["chat"],
         label: "Chat",
         category: "Communication",
         description: "Talk to people and connected PC2s from this local world.",
         command: "elastos chat",
     },
     AppSurfaceSpec {
-        name: "chat-microvm",
-        action_id: "chat-microvm",
-        label: "IRC",
+        name: "chat-fullscreen",
+        action_ids: &["capsule-chat-wasm", "capsule-chat"],
+        label: "Full-screen Chat",
         category: "Communication",
-        description: "Packaged full-screen Carrier-backed IRC chat in a microVM, using the same room as native Chat.",
-        command: "elastos capsule chat --lifecycle interactive --interactive",
-    },
-    AppSurfaceSpec {
-        name: "chat-wasm",
-        action_id: "chat-wasm",
-        label: "Chat WASM",
-        category: "Communication",
-        description: "Packaged full-screen Carrier-backed IRC chat in WASM for the explicit non-KVM capsule path.",
+        description: "Open the packaged full-screen Carrier chat surface from PC2.",
         command: "elastos capsule chat-wasm --lifecycle interactive --interactive",
     },
     AppSurfaceSpec {
         name: "site-local",
-        action_id: "site-local",
+        action_ids: &["site-local"],
         label: "MyWebSite",
         category: "Web",
-        description: "Open your local site preview in the browser and keep release/public actions nearby.",
+        description:
+            "Open your local site preview in the browser and keep release/public actions nearby.",
         command: "elastos site serve --mode local --browser",
     },
     AppSurfaceSpec {
         name: "site-ephemeral",
-        action_id: "site-ephemeral",
+        action_ids: &["site-ephemeral"],
         label: "Go public",
         category: "Web",
-        description: "Start a temporary public HTTPS URL for MyWebSite and return home when it is ready.",
+        description:
+            "Start a temporary public HTTPS URL for MyWebSite and return home when it is ready.",
         command: "elastos site serve --mode ephemeral",
     },
     AppSurfaceSpec {
         name: "shares-list",
-        action_id: "shares-list",
+        action_ids: &["shares-list"],
         label: "Shared",
         category: "Web",
-        description: "Review shared channels, open links, and follow the next steps for public content.",
+        description:
+            "Review shared channels, open links, and follow the next steps for public content.",
         command: "elastos shares list",
     },
     AppSurfaceSpec {
         name: "gba-ucity",
-        action_id: "gba-ucity",
+        action_ids: &["capsule-gba-ucity"],
         label: "GBA UCity",
-        category: "Creative",
+        category: "Games",
         description:
-            "Open the bundled uCity game in the GBA viewer with the ROM preloaded, plus a public URL when available.",
-        command: "./scripts/gba.sh capsules/gba-ucity",
+            "Open the bundled uCity demo cartridge in the browser GBA viewer and return home.",
+        command: "elastos capsule gba-ucity --lifecycle interactive --interactive",
     },
     AppSurfaceSpec {
         name: "update-check",
-        action_id: "update-check",
+        action_ids: &["update-check"],
         label: "Updates",
         category: "System",
-        description: "Check the stamped trusted release line and return home with a concise result.",
+        description:
+            "Check the stamped trusted release line and return home with a concise result.",
         command: "elastos update --check",
     },
 ];
@@ -330,17 +460,47 @@ fn main() -> Result<()> {
     let write_token = request_capability(&session_scope, "write")?;
     let snapshot_path = format!("{}/snapshot.json", session_root.trim_end_matches('/'));
     let intent_path = format!("{}/intent.json", session_root.trim_end_matches('/'));
-    let snapshot: Pc2Snapshot =
-        serde_json::from_slice(&storage_read(&read_token, &snapshot_path)?)?;
+    let snapshot = load_snapshot(&read_token, &snapshot_path)?;
 
-    dashboard_loop(&snapshot, &write_token, &intent_path)
+    dashboard_loop(
+        &read_token,
+        &snapshot_path,
+        snapshot,
+        &write_token,
+        &intent_path,
+    )
 }
 
-fn dashboard_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &str) -> Result<()> {
+fn load_snapshot(read_token: &str, snapshot_path: &str) -> Result<Pc2Snapshot> {
+    Ok(serde_json::from_slice(&storage_read(
+        read_token,
+        snapshot_path,
+    )?)?)
+}
+
+fn dashboard_loop(
+    read_token: &str,
+    snapshot_path: &str,
+    snapshot: Pc2Snapshot,
+    write_token: &str,
+    intent_path: &str,
+) -> Result<()> {
     if should_use_tui() {
-        dashboard_tui_loop(snapshot, write_token, intent_path)
+        dashboard_tui_loop(
+            read_token,
+            snapshot_path,
+            snapshot,
+            write_token,
+            intent_path,
+        )
     } else {
-        dashboard_line_loop(snapshot, write_token, intent_path)
+        dashboard_line_loop(
+            read_token,
+            snapshot_path,
+            snapshot,
+            write_token,
+            intent_path,
+        )
     }
 }
 
@@ -356,7 +516,13 @@ fn should_use_tui() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-fn dashboard_tui_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &str) -> Result<()> {
+fn dashboard_tui_loop(
+    read_token: &str,
+    snapshot_path: &str,
+    mut snapshot: Pc2Snapshot,
+    write_token: &str,
+    intent_path: &str,
+) -> Result<()> {
     let mut state = TuiState::default();
     let _guard = TerminalGuard::enter()?;
     let mut startup_input_drained = false;
@@ -366,7 +532,7 @@ fn dashboard_tui_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &s
 
     loop {
         if needs_render {
-            render_tui(snapshot, &state)?;
+            render_tui(&snapshot, &state)?;
             needs_render = false;
         }
         if !startup_input_drained {
@@ -375,6 +541,13 @@ fn dashboard_tui_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &s
         }
 
         let key = read_ui_key()?;
+        if key == UiKey::None {
+            if let Ok(next_snapshot) = load_snapshot(read_token, snapshot_path) {
+                snapshot = next_snapshot;
+                needs_render = true;
+            }
+            continue;
+        }
         match startup_home_enter_decision(
             &state,
             key,
@@ -432,25 +605,55 @@ fn dashboard_tui_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &s
                 needs_render = true;
             }
             UiKey::Up => {
-                state.move_prev(snapshot);
+                state.move_prev(&snapshot);
                 state.notice = None;
                 needs_render = true;
             }
             UiKey::Down => {
-                state.move_next(snapshot);
+                state.move_next(&snapshot);
                 state.notice = None;
                 needs_render = true;
             }
             UiKey::Enter => {
                 state.notice = None;
                 home_launch_ready_at = None;
-                if let Some(action_id) = state.activate(snapshot) {
+                if let Some(action_id) = state.activate(&snapshot) {
                     write_intent(write_token, intent_path, action_id)?;
                     return Ok(());
                 }
             }
+            UiKey::MarkRead => {
+                if state.tab == Tab::Inbox {
+                    if let Some(notification_id) =
+                        selected_notification(&snapshot, state.inbox_index)
+                            .map(|entry| entry.id.as_str())
+                    {
+                        write_intent(
+                            write_token,
+                            intent_path,
+                            &format!("notification-read:{notification_id}"),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            UiKey::Dismiss => {
+                if state.tab == Tab::Inbox {
+                    if let Some(notification_id) =
+                        selected_notification(&snapshot, state.inbox_index)
+                            .map(|entry| entry.id.as_str())
+                    {
+                        write_intent(
+                            write_token,
+                            intent_path,
+                            &format!("notification-dismiss:{notification_id}"),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
             UiKey::Digit(index) => {
-                let quick_actions = quick_launch_action_indices(snapshot);
+                let quick_actions = quick_launch_action_indices(&snapshot);
                 if let Some(action_idx) = quick_actions.get(index.saturating_sub(1)).copied() {
                     state.tab = Tab::Home;
                     state.home_index = index.saturating_sub(1).min(quick_actions.len() - 1);
@@ -508,12 +711,24 @@ fn startup_home_enter_decision(
     HomeLaunchDecision::Allow
 }
 
-fn dashboard_line_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &str) -> Result<()> {
-    let quick_actions = quick_launch_action_indices(snapshot);
+fn dashboard_line_loop(
+    read_token: &str,
+    snapshot_path: &str,
+    mut snapshot: Pc2Snapshot,
+    write_token: &str,
+    intent_path: &str,
+) -> Result<()> {
     loop {
-        render_line_dashboard(snapshot)?;
+        render_line_dashboard(&snapshot)?;
         print!("Select action (number, r refresh, q exit, ? help): ");
         io::stdout().flush()?;
+
+        if !stdin_has_input(LIVE_REFRESH_POLL_MS)? {
+            if let Ok(next_snapshot) = load_snapshot(read_token, snapshot_path) {
+                snapshot = next_snapshot;
+            }
+            continue;
+        }
 
         let mut input = String::new();
         if io::stdin().read_line(&mut input)? == 0 {
@@ -548,6 +763,7 @@ fn dashboard_line_loop(snapshot: &Pc2Snapshot, write_token: &str, intent_path: &
             continue;
         };
 
+        let quick_actions = quick_launch_action_indices(&snapshot);
         let Some(action_idx) = quick_actions.get(index.saturating_sub(1)).copied() else {
             println!("No action {}. Pick 1-{}.", index, quick_actions.len());
             wait_for_enter()?;
@@ -633,6 +849,16 @@ fn render_line_dashboard(snapshot: &Pc2Snapshot) -> Result<()> {
     }
 
     println!();
+    println!("Inbox");
+    println!(
+        "  Attention: {} waiting / {} unread",
+        snapshot.notifications.attention_count, snapshot.notifications.unread_count
+    );
+    for entry in snapshot.notifications.entries.iter().take(3) {
+        println!("  - {}", entry.body);
+    }
+
+    println!();
     println!("People");
     for line in people_summary_lines(snapshot) {
         println!("  {}", line);
@@ -695,6 +921,7 @@ impl Default for TuiState {
         Self {
             tab: Tab::Home,
             home_index: 0,
+            inbox_index: 0,
             people_index: 0,
             space_index: 0,
             app_index: 0,
@@ -707,7 +934,8 @@ impl Default for TuiState {
 impl TuiState {
     fn next_tab(&mut self) {
         self.tab = match self.tab {
-            Tab::Home => Tab::People,
+            Tab::Home => Tab::Inbox,
+            Tab::Inbox => Tab::People,
             Tab::People => Tab::Spaces,
             Tab::Spaces => Tab::Apps,
             Tab::Apps => Tab::System,
@@ -718,7 +946,8 @@ impl TuiState {
     fn prev_tab(&mut self) {
         self.tab = match self.tab {
             Tab::Home => Tab::System,
-            Tab::People => Tab::Home,
+            Tab::Inbox => Tab::Home,
+            Tab::People => Tab::Inbox,
             Tab::Spaces => Tab::People,
             Tab::Apps => Tab::Spaces,
             Tab::System => Tab::Apps,
@@ -730,6 +959,11 @@ impl TuiState {
             Tab::Home => {
                 if !home_action_indices(snapshot).is_empty() {
                     self.home_index = self.home_index.saturating_sub(1);
+                }
+            }
+            Tab::Inbox => {
+                if !notification_indices(snapshot).is_empty() {
+                    self.inbox_index = self.inbox_index.saturating_sub(1);
                 }
             }
             Tab::People => {
@@ -759,6 +993,12 @@ impl TuiState {
                     self.home_index = (self.home_index + 1).min(items.len() - 1);
                 }
             }
+            Tab::Inbox => {
+                let items = notification_indices(snapshot);
+                if !items.is_empty() {
+                    self.inbox_index = (self.inbox_index + 1).min(items.len() - 1);
+                }
+            }
             Tab::People => {
                 let items = people_action_indices(snapshot);
                 if !items.is_empty() {
@@ -784,6 +1024,9 @@ impl TuiState {
     fn activate<'a>(&self, snapshot: &'a Pc2Snapshot) -> Option<&'a str> {
         match self.tab {
             Tab::Home => selected_action(snapshot, &home_action_indices(snapshot), self.home_index)
+                .map(|action| action.id.as_str()),
+            Tab::Inbox => selected_notification_action(snapshot, self.inbox_index)
+                .filter(|action| action.ready)
                 .map(|action| action.id.as_str()),
             Tab::People => selected_action(
                 snapshot,
@@ -819,10 +1062,15 @@ impl Drop for TerminalGuard {
 }
 
 fn read_ui_key() -> Result<UiKey> {
+    if !stdin_has_input(LIVE_REFRESH_POLL_MS)? {
+        return Ok(UiKey::None);
+    }
     let byte = read_stdin_byte()?;
     let key = match byte {
         b'q' | b'Q' => UiKey::Quit,
         b'r' | b'R' => UiKey::Refresh,
+        b'm' | b'M' => UiKey::MarkRead,
+        b'd' | b'D' => UiKey::Dismiss,
         b'?' => UiKey::Help,
         b'\n' | b'\r' => UiKey::Enter,
         b'\t' | b'l' | b'L' => UiKey::Right,
@@ -905,6 +1153,7 @@ fn build_tui_screen(snapshot: &Pc2Snapshot, state: &TuiState, cols: usize, rows:
 
     match state.tab {
         Tab::Home => render_home_tab(&mut screen, snapshot, state, body_width),
+        Tab::Inbox => render_inbox_tab(&mut screen, snapshot, state, body_width),
         Tab::People => render_people_tab(&mut screen, snapshot, state, body_width),
         Tab::Spaces => render_spaces_tab(&mut screen, snapshot, state, body_width),
         Tab::Apps => render_apps_tab(&mut screen, snapshot, state, body_width),
@@ -915,7 +1164,7 @@ fn build_tui_screen(snapshot: &Pc2Snapshot, state: &TuiState, cols: usize, rows:
         push_screen_blank(&mut screen);
         push_screen_line(&mut screen, &section_title("Help", cols));
         for line in wrap_text(
-            "Arrows or hjkl move, Tab switches sections, Enter launches the selected app, digits 1-9 quick-launch actions, r refreshes the snapshot, q leaves PC2 home.",
+            "Arrows or hjkl move, Tab switches sections, Enter runs the selected action, digits 1-9 quick-launch actions, m marks an inbox entry read, d dismisses it, r refreshes the snapshot, q leaves PC2 home.",
             body_width,
         ) {
             push_screen_line(&mut screen, &format!("  {}", line));
@@ -948,7 +1197,7 @@ fn build_tui_screen(snapshot: &Pc2Snapshot, state: &TuiState, cols: usize, rows:
     push_screen_line(
         &mut screen,
         &fit_line(
-            " Keys: hjkl/arrows  Tab  Enter  1-9  r refresh  q quit  ? help",
+            " Keys: hjkl/arrows  Tab  Enter  1-9  m read  d dismiss  r refresh  q quit  ? help",
             cols,
         ),
     );
@@ -982,6 +1231,70 @@ fn render_home_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
             push_screen_line(buf, &format!("  {}", fit_line(&line, total_width)));
         }
     }
+}
+
+fn render_inbox_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+    let total_width = width.max(60);
+    let column_width = column_width(total_width);
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+
+    let entries = notification_entries(snapshot);
+    let list = if entries.is_empty() {
+        vec!["No inbox entries waiting.".to_string()]
+    } else {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                format!(
+                    "{} {} [{}{}]",
+                    selected_marker(idx == state.inbox_index),
+                    entry.title,
+                    entry.severity,
+                    if entry.read { "" } else { ", new" }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    push_section_lines(&mut left, "Inbox", &list);
+
+    let overview = vec![
+        format!("Unread     {}", snapshot.notifications.unread_count),
+        format!("Attention  {}", snapshot.notifications.attention_count),
+        format!("Entries    {}", entries.len()),
+    ];
+    push_section_lines(&mut left, "Overview", &overview);
+
+    if let Some(entry) = selected_notification(snapshot, state.inbox_index) {
+        let mut details = vec![
+            format!("Title      {}", entry.title),
+            format!("Severity   {}", entry.severity),
+            format!("Source     {}", entry.source_app),
+            format!("State      {}", if entry.read { "read" } else { "unread" }),
+        ];
+        details.extend(wrap_with_label("Body", &entry.body, column_width));
+        if let Some(action) = selected_notification_action(snapshot, state.inbox_index) {
+            details.push(format!("Action     {}", action.label));
+            details.push(format!(
+                "ActionUse  {}",
+                if action.ready { "ready" } else { "blocked" }
+            ));
+            details.push("Enter      run this inbox action and return here".to_string());
+            if let Some(reason) = &action.reason {
+                details.extend(wrap_with_label("Setup", reason, column_width));
+            }
+        } else if entry.action_ref.is_some() {
+            details.push("Action     no longer available".to_string());
+        } else {
+            details.push("Action     informational only".to_string());
+        }
+        details.push("m          mark this inbox entry read".to_string());
+        details.push("d          dismiss this inbox entry".to_string());
+        push_section_lines(&mut right, "Selected", &details);
+    }
+
+    render_two_columns(buf, &left, &right, total_width);
 }
 
 fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
@@ -1044,23 +1357,93 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         format!(
             "Delivery   {}",
             if snapshot.runtime.peer_count.unwrap_or_default() == 0 {
-                "Local only until another participant joins Chat, IRC, or Chat WASM"
+                "Local only until another participant joins Chat"
             } else {
-                "Open Chat, IRC, or Chat WASM and send a line to confirm room delivery"
+                "Open Chat and send a line to confirm room delivery"
+            }
+        ),
+    ];
+    connections.push(
+        "Mode       Native chat is the current first-class PC2 conversation path.".to_string(),
+    );
+    push_section_lines(&mut right, "Connections", &connections);
+
+    let mut room = vec![
+        format!("Pending    {}", snapshot.room.pending_count),
+        format!("Active     {}", snapshot.room.active_session_count),
+        format!(
+            "Guests     {}",
+            if snapshot.room.allow_guest_invites {
+                "hosted guest invites enabled"
+            } else {
+                "hosted guest invites disabled"
             }
         ),
         format!(
-            "IRC        {}",
-            action_state_label(action_by_id(snapshot, "chat-microvm"))
+            "Members    {}",
+            if snapshot.room.allow_member_invites {
+                "sovereign member invites enabled"
+            } else {
+                "sovereign member invites disabled"
+            }
         ),
-        "Mode       IRC and Chat WASM are full-screen Carrier chat capsules, separate from native Chat but on the same room.".to_string(),
     ];
-    if let Some(action) = action_by_id(snapshot, "chat-microvm") {
-        if let Some(reason) = &action.reason {
-            connections.extend(wrap_with_label("Prep", reason, column_width));
+    room.push(format!(
+        "Hosting    {}",
+        if snapshot.room.allow_members_to_host_guests {
+            "members may host browser guests"
+        } else {
+            "only owners and admins may host browser guests"
+        }
+    ));
+    room.push(format!(
+        "Invites    {}",
+        snapshot.room.pending_invite_count
+    ));
+    if let Some(url) = snapshot.room.canonical_hosted_guest_url.as_deref() {
+        room.push(format!(
+            "Hosted     {}",
+            truncate(url, column_width.saturating_sub(13).max(28))
+        ));
+    }
+    if let Some(url) = snapshot.room.ephemeral_hosted_guest_url.as_deref() {
+        room.push(format!(
+            "Quick URL  {}",
+            truncate(url, column_width.saturating_sub(13).max(28))
+        ));
+    }
+    if snapshot.room.pending_requests.is_empty() {
+        room.push("Requests   no browser pairing requests pending".to_string());
+    } else {
+        for request in snapshot.room.pending_requests.iter().take(4) {
+            room.push(format!(
+                "Request    {} on {}",
+                request.display_name, request.device_label
+            ));
         }
     }
-    push_section_lines(&mut right, "Connections", &connections);
+    if snapshot.room.active_sessions.is_empty() {
+        room.push("Browsers   no active browser sessions".to_string());
+    } else {
+        for session in snapshot.room.active_sessions.iter().take(4) {
+            room.push(format!(
+                "Browser    {} on {}",
+                session.display_name, session.device_label
+            ));
+        }
+    }
+    for invite in snapshot.room.pending_invites.iter().take(2) {
+        room.push(format!(
+            "Invite     {} as {}",
+            truncate(&invite.invited_did, column_width.saturating_sub(18).max(16)),
+            invite.role
+        ));
+    }
+    room.push(
+        "Control    Open Apps -> Room Browser for targeted browser approve, deny, and disconnect."
+            .to_string(),
+    );
+    push_section_lines(&mut right, "Room Browser", &room);
 
     if let Some(action) = selected_action(snapshot, &people_actions, state.people_index) {
         let mut profile = vec![
@@ -1076,7 +1459,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         } else {
             profile.push("Enter      run this People action and return home".to_string());
         }
-        push_section_lines(&mut right, "Profile", &profile);
+        push_section_lines(&mut right, "Selected", &profile);
     }
 
     render_two_columns(buf, &left, &right, total_width);
@@ -1134,26 +1517,44 @@ fn render_apps_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
     push_section_lines(&mut left, "Apps", &list);
 
     if let Some(entry) = entries.get(state.app_index.min(entries.len().saturating_sub(1))) {
-        let mut details = vec![
-            format!("Surface    {}", entry.name),
-            format!("State      {}", entry.state),
-            format!("Category   {}", entry.category),
-        ];
-        details.extend(wrap_with_label(
-            "What it does",
-            entry.description,
-            column_width,
-        ));
-        details.extend(wrap_with_label("Command", &entry.command, column_width));
+        let mut details = if entry.action_id == "room-browser" {
+            room_browser_app_detail_lines(snapshot, entry, column_width)
+        } else {
+            let mut details = vec![
+                format!("Surface    {}", entry.name),
+                format!("State      {}", entry.state),
+                format!("Category   {}", entry.category),
+            ];
+            details.extend(wrap_with_label(
+                "What it does",
+                &entry.description,
+                column_width,
+            ));
+            details.extend(wrap_with_label("Command", &entry.command, column_width));
+            details
+        };
         if let Some(action) = selected_app_action(snapshot, state.app_index) {
             if action.ready {
-                details.push("Enter      launch from PC2".to_string());
+                details.push(if entry.is_control {
+                    "Enter      run this room action and return here".to_string()
+                } else {
+                    "Enter      launch from PC2".to_string()
+                });
             } else {
-                details.push("Enter      not ready from PC2 yet".to_string());
+                details.push(if entry.is_control {
+                    "Enter      room action not ready yet".to_string()
+                } else {
+                    "Enter      not ready from PC2 yet".to_string()
+                });
                 if let Some(reason) = &action.reason {
                     details.extend(wrap_with_label("Setup", reason, column_width));
                 }
             }
+        } else if entry.action_id == "room-browser" {
+            details.push(
+                "Enter      no direct launch; review the room controls listed below in Apps"
+                    .to_string(),
+            );
         } else {
             details.push("Enter      no direct launch from PC2 yet".to_string());
         }
@@ -1183,6 +1584,7 @@ fn push_screen_blank(buf: &mut String) {
 fn render_tabs(active: Tab, cols: usize) -> String {
     let tabs = [
         render_tab(active == Tab::Home, "Home"),
+        render_tab(active == Tab::Inbox, "Inbox"),
         render_tab(active == Tab::People, "People"),
         render_tab(active == Tab::Spaces, "Spaces"),
         render_tab(active == Tab::Apps, "Apps"),
@@ -1290,10 +1692,6 @@ fn people_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
             action_state_label(action_by_id(snapshot, "chat"))
         ),
         format!(
-            "IRC        {}",
-            action_state_label(action_by_id(snapshot, "chat-microvm"))
-        ),
-        format!(
             "Peers      {}",
             format!(
                 "{} endpoints reachable",
@@ -1328,7 +1726,10 @@ fn spaces_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
 }
 
 fn apps_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
-    let entries = app_entries(snapshot);
+    let entries = app_entries(snapshot)
+        .into_iter()
+        .filter(|entry| !entry.is_control)
+        .collect::<Vec<_>>();
     let mut lines = Vec::new();
     let mut last_category = "";
     for entry in entries.into_iter().take(8) {
@@ -1359,6 +1760,10 @@ fn compact_system_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
         format!(
             "Updates    {}",
             action_state_label(action_by_id(snapshot, "update-check"))
+        ),
+        format!(
+            "Inbox      {} attention · {} unread",
+            snapshot.notifications.attention_count, snapshot.notifications.unread_count
         ),
         format!(
             "Services   {} / {} ready",
@@ -1415,7 +1820,7 @@ fn header_summary_line(snapshot: &Pc2Snapshot) -> String {
         "finish setup"
     };
     let peers = match snapshot.runtime.peer_count {
-        Some(0) if snapshot.runtime.ticket.is_some() => "awaiting peers".to_string(),
+        Some(0) if snapshot.runtime.ticket.is_some() => "bootstrap ready".to_string(),
         Some(0) => "starting up".to_string(),
         Some(1) => "1 endpoint reachable".to_string(),
         Some(count) => format!("{} endpoints reachable", count),
@@ -1453,7 +1858,7 @@ fn network_summary(snapshot: &Pc2Snapshot) -> String {
     let peers = snapshot.runtime.peer_count.unwrap_or(0);
     if peers == 0 {
         if snapshot.runtime.ticket.is_some() {
-            "Carrier ready; waiting for another participant".to_string()
+            "Carrier bootstrap ready; waiting for another participant".to_string()
         } else {
             "starting up".to_string()
         }
@@ -1571,7 +1976,17 @@ fn section_title(title: &str, cols: usize) -> String {
 }
 
 fn home_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
-    let mut indices = prioritized_action_indices(snapshot, &["chat", "site-local", "update-check"]);
+    let mut indices = prioritized_action_indices(
+        snapshot,
+        &[
+            "chat",
+            "room-approve",
+            "room-deny",
+            "room-revoke-all",
+            "site-local",
+            "update-check",
+        ],
+    );
     for idx in prioritized_ready_action_indices(snapshot, &["site-ephemeral"]) {
         if !indices.contains(&idx) {
             indices.push(idx);
@@ -1588,7 +2003,15 @@ fn home_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
 }
 
 fn people_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
-    prioritized_action_indices(snapshot, &["identity-nickname-set", "chat", "chat-microvm"])
+    prioritized_action_indices(snapshot, &["identity-nickname-set", "chat"])
+}
+
+fn notification_entries(snapshot: &Pc2Snapshot) -> &[NotificationEntryStatus] {
+    &snapshot.notifications.entries
+}
+
+fn notification_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+    (0..notification_entries(snapshot).len()).collect()
 }
 
 fn space_root_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
@@ -1614,7 +2037,13 @@ fn prioritized_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec<usize
 fn prioritized_ready_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec<usize> {
     prioritized_action_indices(snapshot, ids)
         .into_iter()
-        .filter(|idx| snapshot.actions.get(*idx).map(|action| action.ready).unwrap_or(false))
+        .filter(|idx| {
+            snapshot
+                .actions
+                .get(*idx)
+                .map(|action| action.ready)
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -1648,6 +2077,26 @@ fn selected_space_action<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Opti
     space_action_for_root(snapshot, &root.name)
 }
 
+fn selected_notification<'a>(
+    snapshot: &'a Pc2Snapshot,
+    selected: usize,
+) -> Option<&'a NotificationEntryStatus> {
+    let entries = notification_entries(snapshot);
+    entries.get(selected.min(entries.len().saturating_sub(1)))
+}
+
+fn selected_notification_action<'a>(
+    snapshot: &'a Pc2Snapshot,
+    selected: usize,
+) -> Option<&'a ActionInfo> {
+    let entry = selected_notification(snapshot, selected)?;
+    let action_id = entry
+        .action_ref
+        .as_ref()
+        .map(|action_ref| action_ref.action_id.as_str())?;
+    action_by_id(snapshot, action_id)
+}
+
 fn selected_app_action<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Option<&'a ActionInfo> {
     let entries = app_entries(snapshot);
     let entry = entries.get(selected.min(entries.len().saturating_sub(1)))?;
@@ -1656,6 +2105,15 @@ fn selected_app_action<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Option
 
 fn action_by_id<'a>(snapshot: &'a Pc2Snapshot, id: &str) -> Option<&'a ActionInfo> {
     snapshot.actions.iter().find(|action| action.id == id)
+}
+
+fn first_action_by_id<'a>(
+    snapshot: &'a Pc2Snapshot,
+    action_ids: &[&str],
+) -> Option<&'a ActionInfo> {
+    action_ids
+        .iter()
+        .find_map(|action_id| action_by_id(snapshot, action_id))
 }
 
 fn space_action_for_root<'a>(snapshot: &'a Pc2Snapshot, root_name: &str) -> Option<&'a ActionInfo> {
@@ -1722,6 +2180,12 @@ fn blocked_space_enter_summary(root_name: &str) -> String {
     }
 }
 
+fn next_step_command(reason: &str) -> Option<&str> {
+    reason
+        .split_once("run: ")
+        .map(|(_, command)| command.trim())
+}
+
 fn render_home_actions(
     snapshot: &Pc2Snapshot,
     indices: &[usize],
@@ -1780,11 +2244,11 @@ fn home_action_state<'a>(action: &'a ActionInfo, snapshot: &Pc2Snapshot) -> &'a 
 fn home_action_summary(action: &ActionInfo) -> &str {
     match action.id.as_str() {
         "chat" => "Send a message and return home",
-        "chat-microvm" => "Open the full-screen IRC capsule and return home",
-        "chat-wasm" => "Open the full-screen WASM IRC capsule and return home",
+        "room-approve" => "Approve the next pending room browser request",
+        "room-deny" => "Deny the next pending room browser request",
+        "room-revoke-all" => "Revoke active room browser sessions",
         "site-local" => "Stage, preview, and check live state for MyWebSite",
         "site-ephemeral" => "Open a temporary public HTTPS URL for MyWebSite",
-        "gba-ucity" => "Open uCity in the browser viewer and keep the public URL nearby",
         "shares-list" => "Review shared channels, open links, and next steps",
         "update-check" => "Check the current trusted release status",
         _ => action.description.as_str(),
@@ -1794,12 +2258,12 @@ fn home_action_summary(action: &ActionInfo) -> &str {
 fn action_display_label<'a>(action: &'a ActionInfo) -> &'a str {
     match action.id.as_str() {
         "chat" => "Chat",
-        "chat-microvm" => "IRC",
-        "chat-wasm" => "Chat WASM",
+        "room-approve" => "Approve pairing",
+        "room-deny" => "Deny pairing",
+        "room-revoke-all" => "Disconnect browsers",
         "site-local" => "MyWebSite",
         "site-ephemeral" => "Go public",
         "shares-list" => "Shared",
-        "gba-ucity" => "GBA UCity",
         "update-check" => "Updates",
         _ => action.label.as_str(),
     }
@@ -1822,6 +2286,22 @@ fn alerts_lines(snapshot: &Pc2Snapshot, width: usize, notice: Option<&str>) -> V
             "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`."
                 .to_string(),
         );
+    }
+    for entry in snapshot.notifications.entries.iter().take(3) {
+        alerts.push(entry.body.clone());
+    }
+    if snapshot.notifications.entries.len() > 3 {
+        alerts.push(format!(
+            "{} more inbox notification(s) waiting.",
+            snapshot.notifications.entries.len() - 3
+        ));
+    }
+    if snapshot.room.active_session_count > 0 {
+        alerts.push(format!(
+            "Room Browser has {} active browser session(s): {}.",
+            snapshot.room.active_session_count,
+            format_room_participants(&snapshot.room.active_participants)
+        ));
     }
     if snapshot.source.is_none() {
         alerts.push(
@@ -1848,6 +2328,23 @@ fn notice_covers_alert(notice: &str, alert: &str) -> bool {
         || notice.starts_with(alert)
         || alert.starts_with(notice)
         || (notice.contains("MyWebSite is empty.") && alert.contains("MyWebSite is empty."))
+}
+
+fn format_room_participants(participants: &[RoomParticipantStatus]) -> String {
+    if participants.is_empty() {
+        return "browser room active".to_string();
+    }
+    participants
+        .iter()
+        .take(3)
+        .map(|participant| {
+            format!(
+                "{} on {}",
+                participant.display_name, participant.device_label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn runtime_state_label(snapshot: &Pc2Snapshot) -> String {
@@ -1886,8 +2383,18 @@ fn space_detail_lines(root: &RootStatus, snapshot: &Pc2Snapshot, width: usize) -
             details.push(format!("State      {}", website_summary(snapshot)));
             if let Some(url) = snapshot.site.local_url.as_deref() {
                 details.push(format!("Preview    {}", url.trim_end_matches('/')));
+            } else if let Some(action) = action_by_id(snapshot, "site-local") {
+                if action.ready {
+                    details.push("Preview    press Enter to start the local preview".to_string());
+                } else if let Some(reason) = action.reason.as_deref() {
+                    if let Some(command) = next_step_command(reason) {
+                        details.push(format!("Next       {}", command));
+                    } else {
+                        details.extend(wrap_with_label("Setup", reason, width));
+                    }
+                }
             } else if snapshot.site.staged {
-                details.push("Preview    press Enter to start the local preview".to_string());
+                details.push("Next       elastos site stage <dir>".to_string());
             } else {
                 details.push("Next       elastos site stage <dir>".to_string());
             }
@@ -1970,47 +2477,298 @@ fn app_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
     let mut entries = Vec::new();
 
     for spec in APP_SURFACES {
-        let Some(action) = action_by_id(snapshot, spec.action_id) else {
+        let Some(action) = first_action_by_id(snapshot, spec.action_ids) else {
             continue;
         };
-        let active = app_surface_active(snapshot, spec);
+        let active = app_surface_active(snapshot, spec, action);
+        if action.id == "shares-list" && !active && snapshot.shares.channel_count == 0 {
+            continue;
+        }
         if !(action.ready || active) {
             continue;
         }
         let state = if active { "active" } else { "ready" }.to_string();
         entries.push(AppEntry {
             name: spec.name.to_string(),
-            action_id: spec.action_id.to_string(),
+            action_id: action.id.clone(),
             label: spec.label.to_string(),
             category: spec.category,
-            description: spec.description,
+            description: spec.description.to_string(),
             command: if action.command.is_empty() {
                 spec.command.to_string()
             } else {
                 action.command.clone()
             },
             state,
+            is_control: false,
         });
-    }
 
-    entries.sort_by_key(|entry| {
-        (
-            app_category_order(entry.category),
-            entry.label.to_ascii_lowercase(),
-        )
-    });
+        if action.id == "chat" {
+            if let Some(entry) = room_browser_app_entry(snapshot) {
+                entries.push(entry);
+                entries.extend(room_control_entries(snapshot));
+            }
+        }
+    }
     entries
 }
 
-fn app_surface_active(snapshot: &Pc2Snapshot, spec: &AppSurfaceSpec) -> bool {
-    match spec.action_id {
-        "site-local" => snapshot.site.local_url.is_some(),
-        _ => snapshot.runtime.running_capsules.iter().any(|item| {
-            item == spec.name
-                || item.starts_with(&format!("{} ", spec.name))
-                || item.starts_with(&format!("{}(", spec.name))
-        }),
+fn room_browser_app_entry(snapshot: &Pc2Snapshot) -> Option<AppEntry> {
+    if snapshot.room.room_slug.is_empty()
+        && snapshot.room.pending_count == 0
+        && snapshot.room.active_session_count == 0
+        && snapshot.room.member_count == 0
+        && snapshot.room.local_runtime_role.is_none()
+    {
+        return None;
     }
+
+    let state = if snapshot.room.pending_count > 0 {
+        "attention"
+    } else if snapshot.room.active_session_count > 0 {
+        "active"
+    } else if !snapshot.room.pairing_allowed {
+        "restricted"
+    } else if snapshot.room.member_count > 0
+        || snapshot.room.local_runtime_role.is_some()
+    {
+        "ready"
+    } else {
+        "idle"
+    };
+
+    Some(AppEntry {
+        name: "room-browser".to_string(),
+        action_id: "room-browser".to_string(),
+        label: "Room Browser".to_string(),
+        category: "Communication",
+        description:
+            "Hosted guest room plus sovereign PC2 member room control, with per-browser session approval."
+                .to_string(),
+        command: "PC2 room control stays local to this runtime.".to_string(),
+        state: state.to_string(),
+        is_control: false,
+    })
+}
+
+fn room_control_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
+    let mut entries = Vec::new();
+    for action in &snapshot.actions {
+        let is_room_control = action.id.starts_with("room-approve-request:")
+            || action.id.starts_with("room-deny-request:")
+            || action.id.starts_with("room-revoke-session:")
+            || action.id.starts_with("room-accept-invite:")
+            || action.id.starts_with("room-revoke-invite:")
+            || action.id.starts_with("room-remove-member:")
+            || matches!(
+                action.id.as_str(),
+                "room-policy-toggle-guests"
+                    | "room-policy-toggle-members"
+                    | "room-policy-toggle-member-hosts"
+            );
+        if !is_room_control {
+            continue;
+        }
+        entries.push(AppEntry {
+            name: "room-browser".to_string(),
+            action_id: action.id.clone(),
+            label: action.label.clone(),
+            category: "Communication",
+            description: action.description.clone(),
+            command: action.command.clone(),
+            state: if action.ready {
+                "ready".to_string()
+            } else {
+                "blocked".to_string()
+            },
+            is_control: true,
+        });
+    }
+    entries
+}
+
+fn room_browser_app_detail_lines(
+    snapshot: &Pc2Snapshot,
+    entry: &AppEntry,
+    width: usize,
+) -> Vec<String> {
+    let mut details = vec![
+        format!("Surface    {}", entry.name),
+        format!("State      {}", entry.state),
+        format!("Category   {}", entry.category),
+    ];
+    details.extend(wrap_with_label("What it does", &entry.description, width));
+
+    if !snapshot.room.title.is_empty() {
+        details.push(format!("Title      {}", snapshot.room.title));
+    }
+    if !snapshot.room.room_slug.is_empty() {
+        details.push(format!("Room       {}", snapshot.room.room_slug));
+    }
+    if let Some(role) = snapshot.room.local_runtime_role.as_deref() {
+        details.push(format!("Role       {}", role));
+    } else {
+        details.push("Role       local runtime is not a room member".to_string());
+    }
+    if let Some(runtime_did) = snapshot.room.local_runtime_did.as_deref() {
+        details.push(format!(
+            "Runtime    {}",
+            truncate(runtime_did, width.saturating_sub(13).max(16))
+        ));
+    }
+    if let Some(owner_did) = snapshot.room.owner_did.as_deref() {
+        details.push(format!(
+            "Owner      {}",
+            truncate(owner_did, width.saturating_sub(13).max(16))
+        ));
+    }
+    details.push(format!(
+        "Members    {} total · {} active · {} admin",
+        snapshot.room.member_count,
+        snapshot.room.active_member_count,
+        snapshot.room.admin_count
+    ));
+    details.push(format!(
+        "Key epoch  {}",
+        snapshot.room.current_key_epoch
+    ));
+    details.push(format!(
+        "Guests     {}",
+        if snapshot.room.allow_guest_invites {
+            "hosted guest invites enabled"
+        } else {
+            "hosted guest invites disabled"
+        }
+    ));
+    details.push(format!(
+        "Members    {}",
+        if snapshot.room.allow_member_invites {
+            "sovereign member invites enabled"
+        } else {
+            "sovereign member invites disabled"
+        }
+    ));
+    details.push(format!(
+        "Hosting    {}",
+        if snapshot.room.allow_members_to_host_guests {
+            "members may host browser guests"
+        } else {
+            "only owners and admins may host browser guests"
+        }
+    ));
+    if let Some(url) = snapshot.room.canonical_hosted_guest_url.as_deref() {
+        details.push(format!(
+            "Hosted URL {}",
+            truncate(url, width.saturating_sub(12).max(28))
+        ));
+    }
+    if let Some(url) = snapshot.room.ephemeral_hosted_guest_url.as_deref() {
+        details.push(format!(
+            "Quick URL  {}",
+            truncate(url, width.saturating_sub(12).max(28))
+        ));
+    }
+    if snapshot.room.pending_invite_count > 0 {
+        details.push(format!(
+            "Invites    {} pending",
+            snapshot.room.pending_invite_count
+        ));
+        for invite in snapshot.room.pending_invites.iter().take(3) {
+            details.push(format!(
+                "Invite     {} as {}",
+                truncate(&invite.invited_did, width.saturating_sub(18).max(16)),
+                invite.role
+            ));
+        }
+    } else {
+        details.push("Invites    no sovereign member invites pending".to_string());
+    }
+    if snapshot.room.owner_did.is_none() {
+        details.push("CLI        elastos room seed --title \"Room\"".to_string());
+    } else if matches!(
+        snapshot.room.local_runtime_role.as_deref(),
+        Some("owner") | Some("admin")
+    ) {
+        details.push("CLI        elastos room invite <did:key:...> --role member".to_string());
+    }
+
+    if snapshot.room.members.is_empty() {
+        details.push("Roster     no sovereign members yet".to_string());
+    } else {
+        for member in snapshot.room.members.iter().take(4) {
+            details.push(format!(
+                "Member     {} ({})",
+                truncate(&member.member_did, width.saturating_sub(18).max(16)),
+                member.role
+            ));
+        }
+    }
+
+    if !snapshot.room.pairing_allowed {
+        if let Some(reason) = snapshot.room.pairing_block_reason.as_deref() {
+            details.extend(wrap_with_label("Pairing", reason, width));
+        } else {
+            details.push("Pairing    blocked on this runtime".to_string());
+        }
+    } else {
+        details.push("Pairing    allowed for this runtime".to_string());
+    }
+
+    if snapshot.room.pending_requests.is_empty() {
+        details.push("Pending    no browser pairing requests".to_string());
+    } else {
+        details.push(format!(
+            "Pending    {} browser request(s)",
+            snapshot.room.pending_requests.len()
+        ));
+        for request in snapshot.room.pending_requests.iter().take(3) {
+            details.push(format!(
+                "Request    {} on {}",
+                request.display_name, request.device_label
+            ));
+        }
+    }
+
+    if snapshot.room.active_sessions.is_empty() {
+        details.push("Browsers   no active browser sessions".to_string());
+    } else {
+        details.push(format!(
+            "Browsers   {} active session(s)",
+            snapshot.room.active_sessions.len()
+        ));
+        for session in snapshot.room.active_sessions.iter().take(3) {
+            details.push(format!(
+                "Browser    {} on {}",
+                session.display_name, session.device_label
+            ));
+        }
+    }
+
+    let available_controls = room_control_entries(snapshot);
+    if available_controls.is_empty() {
+        details.push("Control    No room actions are waiting right now.".to_string());
+    } else {
+        details.push(format!(
+            "Control    {} targeted room action(s) are available below this room in Apps.",
+            available_controls.len()
+        ));
+        for control in available_controls.iter().take(3) {
+            details.push(format!("Next       {}", control.label));
+        }
+    }
+    details
+}
+
+fn app_surface_active(snapshot: &Pc2Snapshot, spec: &AppSurfaceSpec, action: &ActionInfo) -> bool {
+    if action.id == "site-local" {
+        return snapshot.site.local_url.is_some();
+    }
+    let runtime_name = action.id.strip_prefix("capsule-").unwrap_or(spec.name);
+    snapshot.runtime.running_capsules.iter().any(|item| {
+        item == runtime_name
+            || item.starts_with(&format!("{} ", runtime_name))
+            || item.starts_with(&format!("{}(", runtime_name))
+    })
 }
 
 fn render_app_list(entries: &[AppEntry], selected: usize) -> Vec<String> {
@@ -2024,21 +2782,15 @@ fn render_app_list(entries: &[AppEntry], selected: usize) -> Vec<String> {
         lines.push(format!(
             "{} {} [{}]",
             selected_marker(idx == selected),
-            entry.label,
+            if entry.is_control {
+                format!("  {}", entry.label)
+            } else {
+                entry.label.clone()
+            },
             entry.state
         ));
     }
     lines
-}
-
-fn app_category_order(category: &str) -> usize {
-    match category {
-        "Communication" => 0,
-        "Web" => 1,
-        "Creative" => 2,
-        "System" => 3,
-        _ => 5,
-    }
 }
 
 fn fit_line(text: &str, cols: usize) -> String {
@@ -2247,6 +2999,38 @@ mod tests {
                 release_count: 0,
             },
             shares: ShareStatus::default(),
+            room: RoomStatus {
+                room_slug: "room-browser".to_string(),
+                title: "Room".to_string(),
+                owner_did: Some("did:key:z6Mkowner".to_string()),
+                current_key_epoch: 1,
+                admin_count: 1,
+                member_count: 3,
+                active_member_count: 1,
+                pending_invite_count: 0,
+                allow_guest_invites: true,
+                allow_member_invites: true,
+                allow_members_to_host_guests: true,
+                local_runtime_did: Some("did:key:z6MkhExample".to_string()),
+                local_runtime_role: Some("owner".to_string()),
+                canonical_hosted_guest_url: Some(
+                    "https://elastos.elacitylabs.com/apps/room-browser/".to_string(),
+                ),
+                ephemeral_hosted_guest_url: None,
+                pairing_allowed: true,
+                pairing_block_reason: None,
+                pending_count: 0,
+                active_session_count: 0,
+                active_participants: Vec::new(),
+                pending_requests: Vec::new(),
+                active_sessions: Vec::new(),
+                members: vec![RoomMemberStatus {
+                    member_did: "did:key:z6MkhExample".to_string(),
+                    role: "owner".to_string(),
+                }],
+                pending_invites: Vec::new(),
+            },
+            notifications: NotificationStatus::default(),
             roots: vec![
                 RootStatus {
                     name: "Users".to_string(),
@@ -2291,7 +3075,7 @@ mod tests {
                     path: Some("/tmp/Local".to_string()),
                     exists: true,
                     description: "Local root".to_string(),
-                    example: "localhost://Local/SharedByLocalUsersAndBots".to_string(),
+                    example: "localhost://Local/Shared".to_string(),
                 },
                 RootStatus {
                     name: "WebSpaces".to_string(),
@@ -2355,13 +3139,41 @@ mod tests {
                     reason: None,
                 },
                 ActionInfo {
-                    id: "chat-microvm".to_string(),
-                    label: "IRC".to_string(),
-                    description: String::new(),
-                    command: "elastos capsule chat --lifecycle interactive --interactive"
+                    id: "capsule-chat-wasm".to_string(),
+                    label: "chat-wasm".to_string(),
+                    description: "Packaged WASM chat bundle".to_string(),
+                    command: "elastos capsule chat-wasm --lifecycle interactive --interactive"
                         .to_string(),
-                    ready: false,
-                    reason: Some("missing crosvm".to_string()),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
+                    id: "capsule-gba-ucity".to_string(),
+                    label: "gba-ucity".to_string(),
+                    description: "Bundled uCity demo cartridge".to_string(),
+                    command: "elastos capsule gba-ucity --lifecycle interactive --interactive"
+                        .to_string(),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
+                    id: "capsule-gba-emulator".to_string(),
+                    label: "gba-emulator".to_string(),
+                    description: "Browser GBA viewer bundle".to_string(),
+                    command: "elastos capsule gba-emulator --lifecycle interactive --interactive"
+                        .to_string(),
+                    ready: true,
+                    reason: None,
+                },
+                ActionInfo {
+                    id: "capsule-mystery-capsule".to_string(),
+                    label: "mystery-capsule".to_string(),
+                    description: "Unknown capsule".to_string(),
+                    command:
+                        "elastos capsule mystery-capsule --lifecycle interactive --interactive"
+                            .to_string(),
+                    ready: true,
+                    reason: None,
                 },
             ],
             cached_capsules: vec![
@@ -2484,12 +3296,20 @@ mod tests {
     }
 
     #[test]
-    fn app_entries_only_include_launchable_capsules() {
+    fn app_entries_include_managed_room_surface() {
         let snapshot = sample_snapshot();
         let entries = app_entries(&snapshot);
         assert!(entries
             .iter()
             .any(|entry| entry.label == "Chat" && entry.state == "active"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Full-screen Chat"));
+        assert!(entries.iter().any(|entry| entry.label == "GBA UCity"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Room Browser" && entry.state == "ready"));
+        assert!(!entries.iter().any(|entry| entry.label == "Shared"));
         assert!(!entries.iter().any(|entry| entry.label == "Codex"));
         assert!(!entries.iter().any(|entry| entry.label == "Mystery Capsule"));
         assert!(!entries.iter().any(|entry| entry.label == "PC2 Home"));
@@ -2501,24 +3321,6 @@ mod tests {
     fn quick_launch_includes_remaining_actions_after_primary_cards() {
         let snapshot = sample_snapshot();
         let ids: Vec<&str> = quick_launch_action_indices(&snapshot)
-            .into_iter()
-            .map(|idx| snapshot.actions[idx].id.as_str())
-            .collect();
-        assert_eq!(ids, vec!["chat", "site-local", "update-check"]);
-    }
-
-    #[test]
-    fn home_actions_stay_focused_even_when_irc_is_ready() {
-        let mut snapshot = sample_snapshot();
-        if let Some(action) = snapshot
-            .actions
-            .iter_mut()
-            .find(|action| action.id == "chat-microvm")
-        {
-            action.ready = true;
-            action.reason = None;
-        }
-        let ids: Vec<&str> = home_action_indices(&snapshot)
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
@@ -2553,7 +3355,430 @@ mod tests {
             .into_iter()
             .map(|idx| snapshot.actions[idx].id.as_str())
             .collect();
-        assert_eq!(ids, vec!["chat", "site-local", "update-check", "shares-list"]);
+        assert_eq!(
+            ids,
+            vec!["chat", "site-local", "update-check", "shares-list"]
+        );
+    }
+
+    #[test]
+    fn pending_pairing_surfaces_approval_actions_on_home() {
+        let mut snapshot = sample_snapshot();
+        snapshot.room.pending_count = 1;
+        snapshot.notifications.entries = vec![NotificationEntryStatus {
+            id: "room-pair-request:req-1".to_string(),
+            source_app: "room-browser".to_string(),
+            kind: "room_pair_request".to_string(),
+            title: "Alice wants to pair".to_string(),
+            body: "Alice on Phone wants to join Room.".to_string(),
+            action_ref: Some(NotificationActionRefStatus {
+                app: "room-browser".to_string(),
+                action_id: "room-approve-request:req-1".to_string(),
+            }),
+            read: false,
+            severity: "attention".to_string(),
+        }];
+        snapshot.notifications.unread_count = 1;
+        snapshot.notifications.attention_count = 1;
+        snapshot.actions.insert(
+            1,
+            ActionInfo {
+                id: "room-approve".to_string(),
+                label: "Approve browser pairing".to_string(),
+                description: String::new(),
+                command: "pc2 approve".to_string(),
+                ready: true,
+                reason: None,
+            },
+        );
+        snapshot.actions.insert(
+            2,
+            ActionInfo {
+                id: "room-deny".to_string(),
+                label: "Deny browser pairing".to_string(),
+                description: String::new(),
+                command: "pc2 deny".to_string(),
+                ready: true,
+                reason: None,
+            },
+        );
+
+        let ids: Vec<&str> = home_action_indices(&snapshot)
+            .into_iter()
+            .map(|idx| snapshot.actions[idx].id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "chat",
+                "room-approve",
+                "room-deny",
+                "site-local",
+                "update-check"
+            ]
+        );
+        let alerts = alerts_lines(&snapshot, 120, None);
+        assert!(alerts
+            .iter()
+            .any(|line| line.contains("Alice on Phone wants to join Room.")));
+    }
+
+    #[test]
+    fn active_browser_sessions_surface_disconnect_action_on_home() {
+        let mut snapshot = sample_snapshot();
+        snapshot.room.active_session_count = 2;
+        snapshot.room.active_participants = vec![
+            RoomParticipantStatus {
+                display_name: "Alice".to_string(),
+                device_label: "Phone".to_string(),
+            },
+            RoomParticipantStatus {
+                display_name: "Bob".to_string(),
+                device_label: "Safari".to_string(),
+            },
+        ];
+        snapshot.actions.insert(
+            1,
+            ActionInfo {
+                id: "room-revoke-all".to_string(),
+                label: "Disconnect browsers".to_string(),
+                description: String::new(),
+                command: "pc2 revoke".to_string(),
+                ready: true,
+                reason: None,
+            },
+        );
+
+        let ids: Vec<&str> = home_action_indices(&snapshot)
+            .into_iter()
+            .map(|idx| snapshot.actions[idx].id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "chat",
+                "room-revoke-all",
+                "site-local",
+                "update-check"
+            ]
+        );
+
+        let alerts = alerts_lines(&snapshot, 120, None);
+        assert!(alerts.iter().any(
+            |line| line.contains("2 active browser session(s): Alice on Phone, Bob on Safari")
+        ));
+    }
+
+    #[test]
+    fn people_tab_keeps_room_summary_but_moves_controls_to_apps() {
+        let mut snapshot = sample_snapshot();
+        snapshot.room.pending_count = 1;
+        snapshot.room.pending_requests = vec![RoomPendingRequestStatus {
+            request_id: "req-1".to_string(),
+            display_name: "Alice".to_string(),
+            device_label: "Phone".to_string(),
+        }];
+        snapshot.room.active_session_count = 1;
+        snapshot.room.active_sessions = vec![RoomSessionStatus {
+            token: "tok-1".to_string(),
+            display_name: "Bob".to_string(),
+            device_label: "Safari".to_string(),
+        }];
+        snapshot.actions.push(ActionInfo {
+            id: "room-approve-request:req-1".to_string(),
+            label: "Approve Alice on Phone".to_string(),
+            description: String::new(),
+            command: "pc2 approve specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-deny-request:req-1".to_string(),
+            label: "Deny Alice on Phone".to_string(),
+            description: String::new(),
+            command: "pc2 deny specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-revoke-session:tok-1".to_string(),
+            label: "Disconnect Bob on Safari".to_string(),
+            description: String::new(),
+            command: "pc2 disconnect specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+
+        let ids: Vec<&str> = people_action_indices(&snapshot)
+            .into_iter()
+            .map(|idx| snapshot.actions[idx].id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["chat"]);
+
+        let mut buf = String::new();
+        render_people_tab(&mut buf, &snapshot, &TuiState::default(), 120);
+        assert!(buf.contains("Room Browser"));
+        assert!(buf.contains("Request    Alice on Phone"));
+        assert!(buf.contains("Browser    Bob on Safari"));
+    }
+
+    #[test]
+    fn apps_tab_surfaces_room_control_details() {
+        let mut snapshot = sample_snapshot();
+        snapshot.room.title = "Room".to_string();
+        snapshot.room.room_slug = "room-browser".to_string();
+        snapshot.room.local_runtime_role = Some("owner".to_string());
+        snapshot.room.owner_did = Some("did:key:z6Mkowner".to_string());
+        snapshot.room.current_key_epoch = 3;
+        snapshot.room.admin_count = 1;
+        snapshot.room.member_count = 4;
+        snapshot.room.active_member_count = 2;
+        snapshot.room.pending_count = 1;
+        snapshot.room.pending_requests = vec![RoomPendingRequestStatus {
+            request_id: "req-1".to_string(),
+            display_name: "Alice".to_string(),
+            device_label: "Phone".to_string(),
+        }];
+        snapshot.room.pending_invite_count = 1;
+        snapshot.room.pending_invites = vec![RoomInviteStatus {
+            invite_id: "inv-1".to_string(),
+            invited_did: "did:key:z6invitee".to_string(),
+            role: "member".to_string(),
+        }];
+        snapshot.room.active_session_count = 1;
+        snapshot.room.active_sessions = vec![RoomSessionStatus {
+            token: "tok-1".to_string(),
+            display_name: "Bob".to_string(),
+            device_label: "Safari".to_string(),
+        }];
+        snapshot.room.members = vec![
+            RoomMemberStatus {
+                member_did: "did:key:z6Mkowner".to_string(),
+                role: "owner".to_string(),
+            },
+            RoomMemberStatus {
+                member_did: "did:key:z6member".to_string(),
+                role: "member".to_string(),
+            },
+        ];
+
+        let entry_index = app_entries(&snapshot)
+            .iter()
+            .position(|entry| entry.label == "Room Browser")
+            .expect("room entry missing");
+
+        let mut state = TuiState::default();
+        state.tab = Tab::Apps;
+        state.app_index = entry_index;
+
+        let mut buf = String::new();
+        render_apps_tab(&mut buf, &snapshot, &state, 120);
+        assert!(buf.contains("Room Browser"));
+        assert!(buf.contains("Role       owner"));
+        assert!(buf.contains("Members    4 total"));
+        assert!(buf.contains("Request    Alice on Phone"));
+        assert!(buf.contains("Browser    Bob on Safari"));
+
+        let detail_lines =
+            room_browser_app_detail_lines(&snapshot, &app_entries(&snapshot)[entry_index], 120);
+        assert!(detail_lines
+            .iter()
+            .any(|line| line
+                .contains("Hosted URL https://elastos.elacitylabs.com/apps/room-browser/")));
+        assert!(detail_lines
+            .iter()
+            .any(|line| line.contains("Invite     did:key:z6invitee as member")));
+        assert!(detail_lines
+            .iter()
+            .any(|line| line.contains("Member     did:key:z6member (member)")));
+    }
+
+    #[test]
+    fn apps_tab_surfaces_targeted_room_controls() {
+        let mut snapshot = sample_snapshot();
+        snapshot.room.allow_guest_invites = true;
+        snapshot.room.allow_member_invites = false;
+        snapshot.room.pending_count = 1;
+        snapshot.room.pending_requests = vec![RoomPendingRequestStatus {
+            request_id: "req-1".to_string(),
+            display_name: "Alice".to_string(),
+            device_label: "Phone".to_string(),
+        }];
+        snapshot.room.pending_invite_count = 1;
+        snapshot.room.pending_invites = vec![RoomInviteStatus {
+            invite_id: "inv-1".to_string(),
+            invited_did: "did:key:z6member".to_string(),
+            role: "member".to_string(),
+        }];
+        snapshot.room.active_session_count = 1;
+        snapshot.room.active_sessions = vec![RoomSessionStatus {
+            token: "tok-1".to_string(),
+            display_name: "Bob".to_string(),
+            device_label: "Safari".to_string(),
+        }];
+        snapshot.room.members.push(RoomMemberStatus {
+            member_did: "did:key:z6member".to_string(),
+            role: "member".to_string(),
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-policy-toggle-guests".to_string(),
+            label: "Close hosted guest access".to_string(),
+            description: "Stop new browser guests from requesting access on the hosted room URL."
+                .to_string(),
+            command: "pc2 toggle hosted guest access".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-policy-toggle-members".to_string(),
+            label: "Open sovereign member invites".to_string(),
+            description: "Allow new sovereign PC2 member invites for this room.".to_string(),
+            command: "pc2 toggle sovereign member invites".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-revoke-invite:inv-1".to_string(),
+            label: "Revoke invite for did:key:z6member".to_string(),
+            description: "Revoke this specific sovereign member invite".to_string(),
+            command: "pc2 revoke invite".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-remove-member:did:key:z6member".to_string(),
+            label: "Remove did:key:z6member".to_string(),
+            description: "Remove this sovereign member".to_string(),
+            command: "pc2 remove member".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-approve-request:req-1".to_string(),
+            label: "Approve Alice on Phone".to_string(),
+            description: "Approve this browser".to_string(),
+            command: "pc2 approve specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-deny-request:req-1".to_string(),
+            label: "Deny Alice on Phone".to_string(),
+            description: "Deny this browser".to_string(),
+            command: "pc2 deny specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+        snapshot.actions.push(ActionInfo {
+            id: "room-revoke-session:tok-1".to_string(),
+            label: "Disconnect Bob on Safari".to_string(),
+            description: "Disconnect this browser".to_string(),
+            command: "pc2 disconnect specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+
+        let entries = app_entries(&snapshot);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Room Browser" && !entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Close hosted guest access" && entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Open sovereign member invites" && entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Revoke invite for did:key:z6member" && entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Remove did:key:z6member" && entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Approve Alice on Phone" && entry.is_control));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.label == "Disconnect Bob on Safari" && entry.is_control));
+
+        let control_index = entries
+            .iter()
+            .position(|entry| entry.label == "Approve Alice on Phone")
+            .expect("approve control missing");
+        assert_eq!(
+            selected_app_action(&snapshot, control_index).map(|action| action.id.as_str()),
+            Some("room-approve-request:req-1")
+        );
+
+        let list = render_app_list(&entries, control_index).join("\n");
+        assert!(list.contains("  Approve Alice on Phone [ready]"));
+        assert!(list.contains("  Close hosted guest access [ready]"));
+    }
+
+    #[test]
+    fn inbox_tab_surfaces_notifications_and_resolves_actions() {
+        let mut snapshot = sample_snapshot();
+        snapshot.notifications.unread_count = 1;
+        snapshot.notifications.attention_count = 1;
+        snapshot.notifications.entries = vec![NotificationEntryStatus {
+            id: "room-pair-request:req-1".to_string(),
+            source_app: "room-browser".to_string(),
+            kind: "room_pair_request".to_string(),
+            title: "Alice wants to pair".to_string(),
+            body: "Alice on Phone wants to join Room.".to_string(),
+            action_ref: Some(NotificationActionRefStatus {
+                app: "room-browser".to_string(),
+                action_id: "room-approve-request:req-1".to_string(),
+            }),
+            read: false,
+            severity: "attention".to_string(),
+        }];
+        snapshot.actions.push(ActionInfo {
+            id: "room-approve-request:req-1".to_string(),
+            label: "Approve Alice on Phone".to_string(),
+            description: "Approve this browser".to_string(),
+            command: "pc2 approve specific".to_string(),
+            ready: true,
+            reason: None,
+        });
+
+        let mut state = TuiState::default();
+        state.tab = Tab::Inbox;
+
+        let mut buf = String::new();
+        render_inbox_tab(&mut buf, &snapshot, &state, 120);
+        assert!(buf.contains("Alice wants to pair"));
+        assert!(buf.contains("Approve Alice on Phone"));
+        assert_eq!(
+            state.activate(&snapshot),
+            Some("room-approve-request:req-1")
+        );
+    }
+
+    #[test]
+    fn inbox_tab_order_sits_between_home_and_people() {
+        let mut state = TuiState::default();
+        state.next_tab();
+        assert_eq!(state.tab, Tab::Inbox);
+        state.next_tab();
+        assert_eq!(state.tab, Tab::People);
+        state.prev_tab();
+        assert_eq!(state.tab, Tab::Inbox);
+    }
+
+    #[test]
+    fn shared_only_appears_in_apps_when_catalog_has_entries() {
+        let mut snapshot = sample_snapshot();
+        assert!(!app_entries(&snapshot)
+            .iter()
+            .any(|entry| entry.label == "Shared"));
+
+        snapshot.shares.channel_count = 1;
+        snapshot.shares.active_count = 1;
+
+        assert!(app_entries(&snapshot)
+            .iter()
+            .any(|entry| entry.label == "Shared"));
     }
 
     #[test]
@@ -2608,7 +3833,6 @@ mod tests {
         assert!(screen.starts_with("\x1b[H\x1b[J"));
         assert!(!screen.ends_with("\r\n"));
         assert!(screen.contains("1 Chat [ready]"));
-        assert!(!screen.contains("IRC [setup]"));
         assert!(screen.contains("2 MyWebSite [ready]"));
         assert!(screen.contains("3 Updates [ready]"));
         assert!(!screen.contains("Shared [ready]"));
@@ -2644,7 +3868,8 @@ mod tests {
             .find(|action| action.id == "site-local")
         {
             action.ready = false;
-            action.reason = Some("missing site-provider".to_string());
+            action.reason =
+                Some("missing site-provider — run: elastos setup --profile demo".to_string());
         }
 
         assert_eq!(website_status_label(&snapshot), "site staged");
@@ -2664,7 +3889,8 @@ mod tests {
             .find(|action| action.id == "site-local")
         {
             action.ready = false;
-            action.reason = Some("missing site-provider".to_string());
+            action.reason =
+                Some("missing site-provider — run: elastos setup --profile demo".to_string());
         }
 
         let screen = build_tui_screen(
@@ -2677,7 +3903,9 @@ mod tests {
             32,
         );
         assert!(screen.contains("1. MyWebSite [staged]"));
+        assert!(screen.contains("Next       elastos setup --profile demo"));
         assert!(screen.contains("Enter      show MyWebSite next steps and return home"));
+        assert!(!screen.contains("Preview    press Enter to start the local preview"));
     }
 
     #[test]

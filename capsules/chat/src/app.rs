@@ -148,6 +148,15 @@ impl App {
         self.active_channel = self.channels.len() - 1;
     }
 
+    /// Ensure a channel exists without stealing focus.
+    pub fn ensure_channel(&mut self, name: &str) -> bool {
+        if self.channels.iter().any(|c| c.name == name) {
+            return false;
+        }
+        self.channels.push(Channel::new(name));
+        true
+    }
+
     /// Leave the active channel
     pub fn part_channel(&mut self) -> Option<String> {
         if self.channels.is_empty() {
@@ -405,6 +414,18 @@ mod tests {
         assert_eq!(app.active_channel, 1);
         app.join_channel("#general");
         assert_eq!(app.active_channel, 0);
+    }
+
+    #[test]
+    fn test_ensure_channel_does_not_switch_active_channel() {
+        let mut app = App::new("alice");
+        app.join_channel("#general");
+        app.join_channel("#random");
+        assert_eq!(app.active_channel_name(), "#random");
+        assert!(app.ensure_channel("!pc2"));
+        assert_eq!(app.active_channel_name(), "#random");
+        assert_eq!(app.channels.len(), 3);
+        assert!(!app.ensure_channel("!pc2"));
     }
 
     #[test]

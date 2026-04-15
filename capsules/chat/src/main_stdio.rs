@@ -24,6 +24,7 @@ const CHAT_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
+const LOCAL_SYSTEM_CHANNEL_PREFIX: char = '!';
 const PRESENCE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5);
 const PRESENCE_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
@@ -172,9 +173,29 @@ fn main() -> Result<()> {
         }
     }
 
-    let channels = vec!["#general".to_string()];
+    if !args.no_history {
+        if let Ok(token) = session::acquire_storage_token() {
+            app.storage_token = token;
+        }
+    }
+
+    let channels = if !app.storage_token.is_empty() && !args.no_history {
+        api::load_json(&app.storage_token, "chat/channels.json")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| vec!["#general".to_string()])
+    } else {
+        vec!["#general".to_string()]
+    };
     for channel in &channels {
         app.join_channel(channel);
+        if !args.no_history && !app.storage_token.is_empty() {
+            if let Ok(history) = api::load_history(&app.storage_token, channel) {
+                if !history.is_empty() {
+                    app.append_messages(channel, history);
+                }
+            }
+        }
         if !app.peer_token.is_empty() && channel.starts_with('#') {
             let _ = session::join_topic(&app.peer_token, channel);
             ensure_room_discovery_subscription(&mut app, channel);
@@ -184,7 +205,7 @@ fn main() -> Result<()> {
 
     app.system_message_to(
         "#general",
-        &format!("Welcome to ElastOS IRC v{}! Type /help for commands.", CHAT_VERSION),
+        &format!("Welcome to ElastOS Chat v{}! Type /help for commands.", CHAT_VERSION),
     );
 
     if !app.peer_token.is_empty() {
@@ -220,11 +241,14 @@ fn main() -> Result<()> {
             }
         }
 
-        if !app.peer_token.is_empty() && last_poll.elapsed() >= Duration::from_millis(500) {
+        if last_poll.elapsed() >= Duration::from_millis(500) {
             last_poll = Instant::now();
-            poll_messages(&mut app, &args);
-            poll_peers(&mut app, &args);
-            poll_presence(&mut app);
+            poll_local_channels(&mut app, &args);
+            if !app.peer_token.is_empty() {
+                poll_messages(&mut app, &args);
+                poll_peers(&mut app, &args);
+                poll_presence(&mut app);
+            }
         }
     }
 
@@ -294,6 +318,29 @@ fn ensure_storage_capability(app: &mut App) -> bool {
         Err(e) => {
             app.set_status(&format!("History storage unavailable: {}", e));
             false
+        }
+    }
+}
+
+fn poll_local_channels(app: &mut App, args: &Args) {
+    if app.storage_token.is_empty() || args.no_history {
+        return;
+    }
+
+    let channels = match api::load_json::<Vec<String>>(&app.storage_token, "chat/channels.json") {
+        Ok(Some(channels)) => channels,
+        _ => return,
+    };
+
+    for channel in channels
+        .into_iter()
+        .filter(|channel| channel.starts_with(LOCAL_SYSTEM_CHANNEL_PREFIX))
+    {
+        let _ = app.ensure_channel(&channel);
+        if let Ok(history) = api::load_history(&app.storage_token, &channel) {
+            if !history.is_empty() {
+                app.append_messages(&channel, history);
+            }
         }
     }
 }
@@ -387,7 +434,7 @@ fn handle_key(app: &mut App, key: RawKey, args: &Args) -> Result<()> {
                     app.system_message(&format!("Channels: {}", names.join(", ")));
                 }
                 Command::Help => {
-                    for line in command::help_text().lines() {
+                    for line in command::help_text(command::launched_from_pc2()).lines() {
                         app.system_message(line);
                     }
                 }

@@ -50,7 +50,7 @@ impl AnsiUi {
             1,
             &truncate(
                 &format!(
-                    " ElastOS IRC v{} | {} | {} | {}",
+                    " ElastOS Chat v{} | {} | {} | {}",
                     CHAT_VERSION,
                     app.nickname,
                     app.active_channel_name(),
@@ -83,7 +83,7 @@ impl AnsiUi {
         );
 
         let footer = if app.status.is_empty() {
-            " Esc /home to return | /quit to exit | Tab switch channel "
+            default_footer_text(crate::command::launched_from_pc2())
         } else {
             app.status.as_str()
         };
@@ -111,6 +111,14 @@ impl Drop for AnsiUi {
     fn drop(&mut self) {
         let _ = write!(self.stderr, "\x1b[2J\x1b[H\x1b[?1049l\x1b[?25h");
         let _ = self.stderr.flush();
+    }
+}
+
+fn default_footer_text(from_pc2: bool) -> &'static str {
+    if from_pc2 {
+        " Esc /home to PC2 | /quit leave chat to PC2 | Tab switch channel "
+    } else {
+        " Esc /home to exit | /quit exit to terminal | Tab switch channel "
     }
 }
 
