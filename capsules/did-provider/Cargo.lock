@@ -315,6 +315,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "hex",
+ "hkdf",
  "p256",
  "rand",
  "serde",

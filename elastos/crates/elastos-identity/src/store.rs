@@ -5,6 +5,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,6 +69,66 @@ pub fn load_or_create_did(data_dir: &Path) -> anyhow::Result<(ed25519_dalek::Sig
     let device_key = load_or_create_device_key(data_dir)?;
     let (signing_key, did) = derive_did(&device_key);
     Ok((signing_key, did))
+}
+
+/// Load the locally persisted DID nickname, if present.
+pub fn load_nickname(data_dir: &Path) -> anyhow::Result<Option<String>> {
+    let device_key = load_or_create_device_key(data_dir)?;
+    load_nickname_with_device_key(data_dir, &device_key)
+}
+
+/// Load the locally persisted DID nickname using an explicit device key.
+pub fn load_nickname_with_device_key(
+    data_dir: &Path,
+    device_key: &[u8; 32],
+) -> anyhow::Result<Option<String>> {
+    let path = nickname_path(data_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let encrypted = std::fs::read(&path)?;
+    let plaintext = decrypt_data(&derive_storage_key(device_key), &encrypted)?;
+    let nickname = String::from_utf8(plaintext)?;
+    let nickname = nickname.trim().to_string();
+    if nickname.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(nickname))
+    }
+}
+
+/// Persist the local DID nickname without requiring a running host/runtime.
+pub fn save_nickname(data_dir: &Path, nickname: &str) -> anyhow::Result<()> {
+    let device_key = load_or_create_device_key(data_dir)?;
+    save_nickname_with_device_key(data_dir, &device_key, nickname)
+}
+
+/// Persist the local DID nickname using an explicit device key.
+pub fn save_nickname_with_device_key(
+    data_dir: &Path,
+    device_key: &[u8; 32],
+    nickname: &str,
+) -> anyhow::Result<()> {
+    let nickname = nickname.trim();
+    if nickname.is_empty() {
+        anyhow::bail!("nickname must not be empty");
+    }
+
+    let path = nickname_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encrypted = encrypt_data(&derive_storage_key(device_key), nickname.as_bytes())?;
+    std::fs::write(&path, encrypted)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(())
 }
 
 /// Derive an Ed25519 SigningKey + `did:key` from a 32-byte secret.
@@ -158,6 +219,18 @@ fn decrypt_data(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Vec<u8>> {
     cipher
         .decrypt(nonce, ciphertext.as_ref())
         .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))
+}
+
+fn derive_storage_key(device_key: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, device_key);
+    let mut okm = [0u8; 32];
+    hk.expand(b"elastos-did-storage", &mut okm)
+        .expect("HKDF expand");
+    okm
+}
+
+fn nickname_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("did").join("nickname.enc")
 }
 
 impl IdentityStore {
@@ -357,6 +430,13 @@ mod tests {
             "same device_key must produce same signing key"
         );
         assert_eq!(did1, did2, "same device_key must produce same DID");
+    }
+
+    #[test]
+    fn test_nickname_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        save_nickname(dir.path(), "alice").unwrap();
+        assert_eq!(load_nickname(dir.path()).unwrap().as_deref(), Some("alice"));
     }
 
     #[test]

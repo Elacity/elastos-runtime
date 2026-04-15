@@ -36,13 +36,25 @@ enum Request {
         config: serde_json::Value,
     },
     GetDid,
-    Resolve { did: String },
-    Sign { data: String },
-    Verify { did: String, data: String, signature: String },
+    Resolve {
+        did: String,
+    },
+    Sign {
+        data: String,
+    },
+    Verify {
+        did: String,
+        data: String,
+        signature: String,
+    },
     GetNickname,
-    SetNickname { nickname: String },
+    SetNickname {
+        nickname: String,
+    },
     /// Get or create a named persona DID (for agents/sub-identities)
-    GetPersonaDid { name: String },
+    GetPersonaDid {
+        name: String,
+    },
     Shutdown,
 }
 
@@ -91,7 +103,10 @@ fn decode_did_key(did: &str) -> Result<VerifyingKey, String> {
         .map_err(|e| format!("Invalid base58: {}", e))?;
 
     if bytes.len() != 34 {
-        return Err(format!("Expected 34 bytes (2 prefix + 32 key), got {}", bytes.len()));
+        return Err(format!(
+            "Expected 34 bytes (2 prefix + 32 key), got {}",
+            bytes.len()
+        ));
     }
     if bytes[0] != MULTICODEC_ED25519_PUB[0] || bytes[1] != MULTICODEC_ED25519_PUB[1] {
         return Err("Not an Ed25519 multicodec prefix".to_string());
@@ -101,8 +116,7 @@ fn decode_did_key(did: &str) -> Result<VerifyingKey, String> {
         .try_into()
         .map_err(|_| "Invalid key length".to_string())?;
 
-    VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|e| format!("Invalid Ed25519 public key: {}", e))
+    VerifyingKey::from_bytes(&key_bytes).map_err(|e| format!("Invalid Ed25519 public key: {}", e))
 }
 
 fn did_document(did: &str) -> serde_json::Value {
@@ -149,7 +163,11 @@ impl DidProvider {
             Request::GetDid => self.get_did(),
             Request::Resolve { did } => self.resolve(&did),
             Request::Sign { data } => self.sign(&data),
-            Request::Verify { did, data, signature } => self.verify(&did, &data, &signature),
+            Request::Verify {
+                did,
+                data,
+                signature,
+            } => self.verify(&did, &data, &signature),
             Request::GetNickname => self.get_nickname(),
             Request::SetNickname { nickname } => self.set_nickname(&nickname),
             Request::GetPersonaDid { name } => self.get_persona_did(&name),
@@ -248,12 +266,16 @@ impl DidProvider {
 
         let sig_bytes = match hex::decode(sig_hex) {
             Ok(s) => s,
-            Err(e) => return Response::error("invalid_signature", &format!("Invalid hex sig: {}", e)),
+            Err(e) => {
+                return Response::error("invalid_signature", &format!("Invalid hex sig: {}", e))
+            }
         };
 
         let signature = match Signature::from_slice(&sig_bytes) {
             Ok(s) => s,
-            Err(e) => return Response::error("invalid_signature", &format!("Invalid signature: {}", e)),
+            Err(e) => {
+                return Response::error("invalid_signature", &format!("Invalid signature: {}", e))
+            }
         };
 
         let valid = vk.verify(&data, &signature).is_ok();
@@ -310,10 +332,7 @@ impl DidProvider {
                 Ok(encrypted) => match decrypt_data(&storage_key, &encrypted) {
                     Ok(mut secret_bytes) => {
                         if secret_bytes.len() != 32 {
-                            return Response::error(
-                                "key_error",
-                                "Invalid persona key length",
-                            );
+                            return Response::error("key_error", "Invalid persona key length");
                         }
                         let mut key_arr = [0u8; 32];
                         key_arr.copy_from_slice(&secret_bytes);
@@ -327,9 +346,7 @@ impl DidProvider {
                         return Response::error("key_error", &format!("Decrypt failed: {}", e))
                     }
                 },
-                Err(e) => {
-                    return Response::error("key_error", &format!("Read failed: {}", e))
-                }
+                Err(e) => return Response::error("key_error", &format!("Read failed: {}", e)),
             }
         } else {
             // Generate new persona keypair
@@ -347,9 +364,7 @@ impl DidProvider {
                         );
                     }
                 }
-                Err(e) => {
-                    return Response::error("key_error", &format!("Encrypt failed: {}", e))
-                }
+                Err(e) => return Response::error("key_error", &format!("Encrypt failed: {}", e)),
             }
             vk
         };
@@ -366,43 +381,33 @@ impl DidProvider {
 
     // === Storage helpers ===
 
-    fn did_dir(&self) -> std::path::PathBuf {
-        let base = if self.storage_path.is_empty() {
+    fn base_dir(&self) -> std::path::PathBuf {
+        if self.storage_path.is_empty() {
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
         } else {
             std::path::PathBuf::from(&self.storage_path)
-        };
-        base.join("did")
+        }
+    }
+
+    fn did_dir(&self) -> std::path::PathBuf {
+        self.base_dir().join("did")
     }
 
     fn try_load_nickname(&mut self) {
-        let dir = self.did_dir();
-        let path = dir.join("nickname.enc");
         if let Some(ref dk) = self.device_key {
-            let storage_key = derive_storage_key(dk);
-            if let Ok(data) = std::fs::read(&path) {
-                if let Ok(plaintext) = decrypt_data(&storage_key, &data) {
-                    if let Ok(nick) = String::from_utf8(plaintext) {
-                        let nick = nick.trim().to_string();
-                        if !nick.is_empty() {
-                            self.nickname = Some(nick);
-                        }
-                    }
-                }
+            if let Ok(Some(nick)) =
+                elastos_identity::load_nickname_with_device_key(&self.base_dir(), dk)
+            {
+                self.nickname = Some(nick);
             }
         }
     }
 
     fn save_nickname(&self, nickname: &str) {
-        let Some(ref dk) = self.device_key else { return };
-        let dir = self.did_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
+        let Some(ref dk) = self.device_key else {
             return;
-        }
-        let storage_key = derive_storage_key(dk);
-        if let Ok(encrypted) = encrypt_data(&storage_key, nickname.as_bytes()) {
-            std::fs::write(dir.join("nickname.enc"), encrypted).ok();
-        }
+        };
+        let _ = elastos_identity::save_nickname_with_device_key(&self.base_dir(), dk, nickname);
     }
 }
 
@@ -508,8 +513,7 @@ mod tests {
         [42u8; 32]
     }
 
-    fn init_provider(base_path: Option<&str>) -> DidProvider {
-        let dk = make_device_key();
+    fn init_provider_with_device_key(base_path: Option<&str>, dk: [u8; 32]) -> DidProvider {
         let mut config = serde_json::json!({
             "encryption_key": hex::encode(dk),
         });
@@ -519,6 +523,25 @@ mod tests {
         let mut provider = DidProvider::new();
         provider.handle(Request::Init { config });
         provider
+    }
+
+    fn init_provider(base_path: Option<&str>) -> DidProvider {
+        init_provider_with_device_key(base_path, make_device_key())
+    }
+
+    fn write_runtime_device_key(base_dir: &std::path::Path, dk: [u8; 32]) {
+        let identity_dir = base_dir.join("identity");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::write(identity_dir.join("device.key"), dk).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                identity_dir.join("device.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -538,7 +561,11 @@ mod tests {
         match provider.get_did() {
             Response::Ok { data: Some(d) } => {
                 let did = d["did"].as_str().unwrap();
-                assert!(did.starts_with("did:key:z"), "DID should start with did:key:z, got: {}", did);
+                assert!(
+                    did.starts_with("did:key:z"),
+                    "DID should start with did:key:z, got: {}",
+                    did
+                );
             }
             other => panic!("Expected ok response, got {:?}", other),
         }
@@ -720,6 +747,42 @@ mod tests {
         match provider.get_nickname() {
             Response::Ok { data: Some(d) } => assert_eq!(d["nickname"], "alice"),
             other => panic!("Expected nickname alice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_provider_set_nickname_is_visible_to_identity_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let dk = make_device_key();
+        write_runtime_device_key(dir.path(), dk);
+
+        {
+            let mut provider =
+                init_provider_with_device_key(Some(dir.path().to_str().unwrap()), dk);
+            provider.handle(Request::SetNickname {
+                nickname: "alice".to_string(),
+            });
+        }
+
+        assert_eq!(
+            elastos_identity::load_nickname(dir.path())
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn test_identity_library_nickname_is_visible_to_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let dk = make_device_key();
+        write_runtime_device_key(dir.path(), dk);
+        elastos_identity::save_nickname(dir.path(), "bob").unwrap();
+
+        let provider = init_provider_with_device_key(Some(dir.path().to_str().unwrap()), dk);
+        match provider.get_nickname() {
+            Response::Ok { data: Some(d) } => assert_eq!(d["nickname"], "bob"),
+            other => panic!("Expected nickname bob, got {:?}", other),
         }
     }
 

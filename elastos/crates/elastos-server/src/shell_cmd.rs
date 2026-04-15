@@ -461,20 +461,6 @@ async fn reuse_pc2_runtime_for_chat(data_dir: &Path) -> Option<RuntimeCoords> {
     }
 }
 
-/// Ensure a runtime is running for local identity/profile management.
-/// This keeps the approval surface narrow: only DID provider operations
-/// are auto-approved for the managed helper runtime.
-pub(crate) async fn ensure_runtime_for_identity(data_dir: &Path) -> anyhow::Result<RuntimeCoords> {
-    ensure_managed_runtime(
-        data_dir,
-        RUNTIME_KIND_MANAGED_IDENTITY,
-        "identity-auto.json",
-        &["elastos://did/*"],
-        "identity",
-    )
-    .await
-}
-
 /// Ensure a runtime is running for the local PC2 dashboard. Like native chat,
 /// this is a managed one-terminal bootstrap that hides runtime plumbing from
 /// the user-facing home surface.

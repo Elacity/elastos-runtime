@@ -37,8 +37,12 @@ pub async fn run_identity(cmd: crate::IdentityCommand) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn load_identity_profile(data_dir: &Path) -> anyhow::Result<IdentityProfile> {
-    let coords = shell_cmd::ensure_runtime_for_identity(data_dir).await?;
-    load_identity_profile_from_coords(&coords).await
+    let did = elastos_identity::load_or_create_did(data_dir)
+        .ok()
+        .map(|(_, did)| did)
+        .filter(|did| !did.trim().is_empty());
+    let nickname = elastos_identity::load_nickname(data_dir).ok().flatten();
+    Ok(IdentityProfile { did, nickname })
 }
 
 pub(crate) async fn load_identity_profile_from_coords(
@@ -99,31 +103,7 @@ pub(crate) async fn set_local_nickname(
     let current = load_identity_profile(data_dir).await.unwrap_or_default();
     let value = resolve_nickname_input(value, current.nickname.as_deref())?;
     validate_nickname(&value)?;
-
-    let coords = shell_cmd::ensure_runtime_for_identity(data_dir).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let tokens = shell_cmd::attach_to_runtime(&coords).await?;
-    let did_cap = request_attached_capability(
-        &client,
-        &coords.api_url,
-        &tokens.client_token,
-        "elastos://did/*",
-        "execute",
-    )
-    .await?;
-
-    did_provider_request(
-        &client,
-        &coords.api_url,
-        &tokens.client_token,
-        &did_cap,
-        "set_nickname",
-        serde_json::json!({ "nickname": value }),
-    )
-    .await?;
-
+    elastos_identity::save_nickname(data_dir, &value)?;
     Ok(value)
 }
 

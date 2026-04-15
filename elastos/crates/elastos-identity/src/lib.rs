@@ -10,8 +10,9 @@ pub mod store;
 pub mod webauthn;
 
 pub use store::{
-    derive_did, encode_did_key, load_or_create_device_key, load_or_create_did, IdentityData,
-    IdentityStore, StoredCredential, MULTICODEC_ED25519_PUB,
+    derive_did, encode_did_key, load_nickname, load_nickname_with_device_key,
+    load_or_create_device_key, load_or_create_did, save_nickname, save_nickname_with_device_key,
+    IdentityData, IdentityStore, StoredCredential, MULTICODEC_ED25519_PUB,
 };
 pub use webauthn::{
     AuthenticationResponse, AuthenticatorAssertionResponse, AuthenticatorAttestationResponse,
