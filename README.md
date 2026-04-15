@@ -8,11 +8,33 @@ Pre-release and unstable. Verified on Linux `x86_64` and `aarch64`. Not for prod
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+# Core PC2 front door only
 elastos setup
+
+# Same front door, broader demo/test surfaces
+elastos setup --profile demo
+
 elastos
 ```
 
-This installs the signed `elastos` binary, provisions the core PC2 home profile through the trusted-source path, and opens the PC2 home surface.
+This installs the signed `elastos` binary.
+
+- `elastos setup` provisions the core PC2 front door.
+- `elastos setup --profile demo` provisions the broader demo/test surface, including the hosted room browser capsule.
+- `elastos setup --profile operator` prepares the explicit operator lane used by `elastos serve`, `elastos node ...`, `elastos agent`, and `elastos run`.
+- Hosted room browser access currently needs both: `setup --profile demo` installs the browser surface, and `setup --profile operator` prepares the explicit runtime lane that `elastos room open` reuses.
+
+Then `elastos` opens the PC2 home surface.
+
+## Choose A Lane
+
+One ElastOS home may have only one live host owner at a time.
+
+- PC2 lane: `elastos setup` or `elastos setup --profile demo`, then `elastos`.
+- Operator lane: `elastos setup --profile operator`, then `elastos serve`.
+- Hosted room/browser lane on the installed path: `elastos setup --profile demo`, `elastos setup --profile operator`, `elastos serve`, then `elastos room open`.
+- `elastos room open` is not a second host. It reuses the live `elastos serve` runtime and opens the room gateway through it.
+- `elastos` and `elastos serve` are not two parallel entrypoints for the same home. Stop one before starting the other, or use separate homes if you intentionally need both.
 
 ## Build From Source
 
@@ -22,6 +44,8 @@ Requires Rust 1.89+.
 cargo install just
 just build
 just test
+just verify          # source-local gate
+just verify-release  # canonical publisher gate
 ```
 
 Or manually:
@@ -32,13 +56,37 @@ cd elastos && cargo build --workspace --release
 
 ## Run
 
+Normal user lane:
+
 ```bash
 # Open the PC2 home surface
 elastos
 
 # P2P chat
 elastos chat --nick alice
+```
 
+Explicit operator lane:
+
+```bash
+# Start the explicit runtime owner
+elastos serve
+
+# Sovereign room status and control
+elastos room show
+elastos room pending
+elastos room approve
+elastos room open --addr 0.0.0.0:8090
+# then open http://127.0.0.1:8090/apps/room-browser/
+
+# Operator peer control
+elastos node info
+elastos node status --peer <did:key:...>
+```
+
+No-runtime content-plane and site commands:
+
+```bash
 # One-time extras for direct share/open
 elastos setup --with kubo --with ipfs-provider --with md-viewer
 
@@ -52,9 +100,24 @@ elastos open elastos://<cid> --browser
 elastos --help
 ```
 
+Important:
+
+- `elastos room show` works without a live runtime, but `elastos room open` requires a running `elastos serve` in the same home plus the hosted room browser surface from `elastos setup --profile demo`.
+- `elastos` is the PC2 front door. It does not currently attach to an already-running operator runtime in the same home.
+- The hosted room route is `/apps/room-browser/`. `/apps/room/` is not a public route.
+
 Direct `share`/`open` are content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only PC2 core profile.
 
 Power-user paths such as `elastos run` require an explicit runtime and the correct working directory. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for source builds, capsule development, and explicit runtime workflows.
+
+The interactive product contract is narrower than the full command surface:
+
+- first-class: `elastos`, `elastos pc2`, `PC2 -> Chat`
+- secondary shortcut: `elastos chat`
+- secondary packaged path: `elastos capsule <name> --lifecycle interactive --interactive`
+- operator/developer-only: `elastos agent`, `elastos node`, `elastos run`, non-interactive `elastos capsule`
+
+See [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md) for the exact runtime, TTY, and home/exit semantics.
 
 ## Architecture
 
@@ -81,7 +144,10 @@ The runtime is the small trusted base. Everything above it — including the she
 
 - fresh install → setup → PC2 home
 - native P2P chat, plus local/source proof for WASM chat interop
+- sovereign room membership/invite flow, hosted room-browser access under the explicit operator lane, and local cross-runtime Carrier room sync proof
 - signed publish, install, and update flow
+- operator-only remote node status and trusted-source update control over Carrier via `elastos node ...`
+- explicit operator runtime prep via `elastos setup --profile operator`
 - content sharing and local site hosting
 - DID-backed identity across surfaces
 - agent capsule with signed gossip and verified-only AI responses
@@ -96,13 +162,14 @@ Every command has one runtime expectation. No command may hang.
 
 | Class | Commands | Contract |
 |---|---|---|
-| Managed dashboard | `elastos`, `elastos pc2` | Auto-starts loopback runtime, renders PC2 |
-| Managed user | `elastos chat` | Auto-starts local runtime after setup |
+| Managed dashboard | `elastos`, `elastos pc2` | Auto-starts or reuses the managed `pc2` runtime for the first-class PC2 front door |
+| Managed packaged interactive | `elastos capsule <name> --lifecycle interactive --interactive` | Secondary packaged path; reuses a compatible active runtime or the managed `pc2` runtime when needed |
+| Managed user | `elastos chat` | Native chat shortcut; reuses a healthy PC2 runtime first, otherwise managed chat runtime |
 | No runtime | `elastos share`, `elastos open`, `elastos shares *`, `elastos attest`, `elastos update`, `elastos setup`, `elastos site *` | Runs direct |
-| Operator | `elastos agent`, `elastos capsule`, `elastos run` | Requires explicit `elastos serve` |
+| Operator | `elastos room open`, `elastos agent`, non-interactive `elastos capsule`, `elastos run` | Requires one explicit live runtime owner per home (`elastos serve`) |
 | Starts own service | `elastos serve`, `elastos gateway`, `elastos site serve` | Starts its own daemon |
 
-See [docs/COMMAND_MATRIX.md](docs/COMMAND_MATRIX.md) for the full contract.
+See [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md) for the interactive contract and [docs/COMMAND_MATRIX.md](docs/COMMAND_MATRIX.md) for the full command/runtime table.
 
 ## Repository Structure
 
@@ -121,6 +188,8 @@ elastos-runtime/
 | Document | What |
 |----------|------|
 | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, build, first runs |
+| [docs/INSTALL.md](docs/INSTALL.md) | Install, update, and trust model details |
+| [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md) | Blessed interactive runtime, TTY, and home/exit model |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Runtime design and trust boundaries |
 | [docs/COMMAND_MATRIX.md](docs/COMMAND_MATRIX.md) | Runtime expectation per command |
 | [docs/NAMESPACES.md](docs/NAMESPACES.md) | localhost:// and elastos:// namespace model |

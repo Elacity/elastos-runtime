@@ -130,7 +130,7 @@ The shell capsule enforces capability policy. The default is secure:
 - **With terminal** (interactive): `cli` mode — operator approves/denies each request
 - **Without terminal** (daemon): `agent` mode — policy-file rules, built-in defaults cover standard capsules
 
-Custom policy files can be placed at `~/.config/elastos/runtime-policy.json`.
+Custom policy files can live at `~/.local/share/elastos/policy.json`, or you can point to another file with `ELASTOS_POLICY_FILE`.
 
 ## Trust Model
 

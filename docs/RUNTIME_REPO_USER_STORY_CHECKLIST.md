@@ -4,14 +4,16 @@ Release-facing checklist for the new runtime repository.
 
 Use this in two ways:
 - as the automatic proof map: which repo command or smoke script proves each story
-- as the manual operator guide: what to run on the seed node, WSL, and Jetson
+- as the manual operator guide: what to run on the seed node and installed target hosts
 
 Rules:
-- WSL and Jetson only count on the installed path: `install.sh` or `elastos update`
-- seed-node source proofs do not close WSL/Jetson acceptance by themselves
-- `just verify` is the dev/source gate; `just verify-release` is the canonical-publisher release-trust gate
+- installed target hosts only count on the installed path: `install.sh` or `elastos update`
+- seed-node source proofs do not close installed-host acceptance by themselves
+- `just verify` is the dev/source gate, should stay hermetic to the worktree under test, and `just verify-release` is the canonical-publisher release-trust gate
 - if a PC2 surface is shipped, it must be installed, launchable, and useful
 - if a story is not proven, hide or demote the surface instead of overclaiming
+- if a dedicated smoke script no longer exists, say so explicitly instead of pointing reviewers at dead commands
+- the older dedicated `scripts/public-install-update-smoke.sh` and `scripts/public-linux-runtime-portability-smoke.sh` proofs are not separate active scripts on this line; their concerns are now covered by the `scripts/public-install-*.sh` acceptance helpers, rerunning those helpers against a published gateway via `ELASTOS_PUBLISHER_GATEWAY=<url>`, and `just verify-release`
 
 ## Host Roles
 
@@ -19,26 +21,28 @@ Rules:
   - repo checkout
   - local build/test/proof host
   - trusted-source/operator runtime host
-- WSL:
-  - installed x86_64 target-machine proof
-- Jetson:
-  - installed arm64 target-machine proof
+- Installed x86_64 host:
+  - installed target-machine proof
+- Installed arm64 host:
+  - installed target-machine proof
 
 ## Release-Critical Stories
 
-| ID | Story | Automatic proof | Seed node manual | WSL manual | Jetson manual |
+| ID | Story | Automatic proof | Seed node manual | Installed x86_64 manual | Installed arm64 manual |
 |---|---|---|---|---|---|
 | RS-00 | Repo gates are green | `just verify` | Inspect failures, keep worktree clean enough to trust gates | n/a | n/a |
-| RS-01 | Trusted install/update path works | `scripts/public-install-update-smoke.sh` | Verify source host serves the expected signer/trusted source | `install.sh` or `elastos update`, then `elastos source show` and `elastos update --check` | same as WSL |
+| RS-01 | Trusted install/update path works | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | Verify source host serves the expected signer/trusted source | `install.sh` or `elastos update`, then `elastos source show` and `elastos update --check` | same as installed x86_64 |
 | RS-02 | DID-backed identity works | `scripts/public-install-identity-smoke.sh` and `scripts/local-identity-profile-smoke.sh` | `elastos identity show`, `nickname set/get`, PC2 People | same on installed path | same on installed path |
-| RS-03 | PC2 front door works | `scripts/pc2-smoke.sh`, `scripts/pc2-frontdoor-smoke.sh`, `scripts/public-install-pc2-frontdoor-smoke.sh` | launch `elastos`, enter/exit Chat and MyWebSite, return home | `elastos` -> PC2 -> Chat/MyWebSite -> home | same as WSL |
-| RS-04 | Native chat works | `scripts/local-carrier-chat-smoke.sh` where applicable | open Chat locally, verify send/receive and `/home` / `/quit` | `elastos` -> Chat, exchange messages with Jetson | same as WSL |
+| RS-03 | PC2 front door works | `scripts/local-carrier-setup-smoke.sh`, `scripts/pc2-frontdoor-smoke.sh`, `scripts/public-install-pc2-frontdoor-smoke.sh` | launch `elastos`, enter/exit Chat and MyWebSite, return home | `elastos` -> PC2 -> Chat/MyWebSite -> home | same as installed x86_64 |
+| RS-04 | Native chat works | `scripts/local-carrier-chat-smoke.sh` where applicable | open Chat locally, verify send/receive and `/home` / `/quit` | `elastos` -> Chat, exchange messages with another installed host | same as installed x86_64 |
 | RS-05 | Chat WASM works | `scripts/chat-wasm-local-smoke.sh`, `scripts/chat-wasm-native-interop-smoke.sh`, `scripts/shared-runtime-gossip-proof.sh` | run `elastos capsule chat-wasm --lifecycle interactive --interactive` or local dev path and exchange with native chat | n/a unless explicitly shipped there | n/a unless explicitly shipped there |
-| RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct full-screen chat and `Apps -> Full-screen Chat` | same as WSL |
-| RS-07 | MyWebSite is useful | covered partly by PC2 frontdoor smokes | preview opens, `Go public` gives URL, return to PC2 home | preview from PC2 works, notice is useful | same as WSL |
-| RS-08 | Shared is useful | `scripts/pc2-smoke.sh` and `scripts/command-smoke.sh` | `elastos shares list` returns meaningful state | open Shared from PC2 and confirm it is not misleading | same as WSL |
-| RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from PC2 or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed PC2, verify launch and usefulness | same as WSL |
-| RS-10 | Updates surface is honest | `scripts/public-install-update-smoke.sh` plus PC2 smoke coverage | `elastos update --check`, verify source/runtime state | PC2 Updates action returns useful status | same as WSL |
+| RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts; installed-path proof is manual on this line | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct packaged chat | same as installed x86_64 |
+| RS-07 | MyWebSite is useful | covered partly by PC2 frontdoor smokes | preview opens, `Go public` gives URL, return to PC2 home | preview from PC2 works, notice is useful | same as installed x86_64 |
+| RS-08 | Shared is useful | `scripts/command-smoke.sh` | `elastos shares list` returns meaningful state | open Shared from PC2 and confirm it is not misleading | same as installed x86_64 |
+| RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from PC2 or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed PC2, verify launch and usefulness | same as installed x86_64 |
+| RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | PC2 Updates action returns useful status | same as installed x86_64 |
+| RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
+| RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
 
 ## Story Details
 
@@ -52,7 +56,7 @@ just verify
 
 Pass when:
 - `alignment-check`
-- PC2 smokes
+- clean-home PC2 setup plus front door smokes
 - command smoke
 - fmt
 - clippy
@@ -65,11 +69,13 @@ all pass in one run.
 Automatic:
 ```bash
 cd <repo-root>
-bash scripts/public-install-update-smoke.sh
-bash scripts/public-linux-runtime-portability-smoke.sh
+bash scripts/public-install-operator-smoke.sh
+
+# after publishing a candidate gateway
+ELASTOS_PUBLISHER_GATEWAY=<published-url> bash scripts/public-install-operator-smoke.sh
 ```
 
-Manual on WSL and Jetson:
+Manual on installed hosts:
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 elastos --version
@@ -81,7 +87,8 @@ Pass when:
 - install succeeds
 - trusted source is stamped
 - node id is present
-- update status is coherent
+- operator-side `node status` and `node update --check` are coherent
+- the same installed-path operator smoke succeeds against the published gateway when a candidate exists
 
 ### RS-02 DID-backed identity works
 
@@ -91,7 +98,7 @@ cd <repo-root>
 bash scripts/public-install-identity-smoke.sh
 ```
 
-Manual on seed, WSL, and Jetson:
+Manual on seed and installed hosts:
 ```bash
 elastos identity show
 elastos identity nickname set <nick>
@@ -109,12 +116,12 @@ Pass when:
 Automatic:
 ```bash
 cd <repo-root>
-bash scripts/pc2-smoke.sh
+bash scripts/local-carrier-setup-smoke.sh
 bash scripts/pc2-frontdoor-smoke.sh
 bash scripts/public-install-pc2-frontdoor-smoke.sh
 ```
 
-Manual on WSL and Jetson:
+Manual on installed hosts:
 1. Run `elastos`
 2. Confirm PC2 home renders
 3. Open `Chat`
@@ -132,10 +139,10 @@ Pass when:
 Automatic:
 - use current local Carrier chat smoke where applicable
 
-Manual on WSL and Jetson:
+Manual on installed hosts:
 1. Open `elastos`
 2. Enter `Chat`
-3. Exchange messages between WSL and Jetson
+3. Exchange messages between two installed hosts
 4. Verify your own send is echoed locally
 5. Exit with `Esc`, `/home`, and `/quit`
 
@@ -172,20 +179,16 @@ cd <repo-root>
 bash scripts/chat-demo-local-smoke.sh
 ```
 
-Manual on WSL and Jetson:
+Installed-host proof for this story is currently manual on this line.
+
+Manual on installed hosts:
 ```bash
 elastos setup --profile chat
 elastos capsule chat --lifecycle interactive --interactive --config '{"nick":"<nick>"}'
 ```
 
-Also verify in PC2:
-1. `elastos`
-2. `Apps -> Full-screen Chat`
-3. Exchange a message with the other host
-
 Pass when:
 - direct full-screen chat works
-- `Apps -> Full-screen Chat` works
 - microVM TUI is usable and returns home
 
 ### RS-07 MyWebSite is useful
@@ -193,7 +196,7 @@ Pass when:
 Automatic:
 - covered partially by PC2 frontdoor smokes
 
-Manual on seed, WSL, and Jetson:
+Manual on seed and installed hosts:
 1. Stage a simple site
 2. Open `MyWebSite` from PC2
 3. Confirm local preview URL is useful
@@ -211,10 +214,9 @@ Automatic:
 ```bash
 cd <repo-root>
 bash scripts/command-smoke.sh
-bash scripts/pc2-smoke.sh
 ```
 
-Manual on seed, WSL, and Jetson:
+Manual on seed and installed hosts:
 1. Create at least one share
 2. Open `Shared` from PC2
 3. Confirm the screen reflects real channels/next steps
@@ -231,7 +233,7 @@ cd <repo-root>
 bash scripts/gba-demo-smoke.sh
 ```
 
-Manual on seed, WSL, and Jetson if surfaced:
+Manual on seed and installed hosts if surfaced:
 1. Open `GBA UCity`
 2. Confirm viewer loads
 3. Confirm ROM boots
@@ -248,10 +250,13 @@ Pass when:
 Automatic:
 ```bash
 cd <repo-root>
-bash scripts/public-install-update-smoke.sh
+bash scripts/public-install-operator-smoke.sh
+
+# after publishing a candidate gateway
+ELASTOS_PUBLISHER_GATEWAY=<published-url> bash scripts/public-install-operator-smoke.sh
 ```
 
-Manual on WSL and Jetson:
+Manual on installed hosts:
 1. Run `elastos update --check`
 2. Open `Updates` from PC2
 3. Compare the message
@@ -259,6 +264,68 @@ Manual on WSL and Jetson:
 Pass when:
 - PC2 and CLI tell the same story
 - no fake `ready/current` message when trusted-source check failed
+
+### RS-11 Sovereign room sync works
+
+Automatic:
+```bash
+cd <repo-root>/elastos
+cargo test -p elastos-server --lib api::gateway::tests::test_room_service_cross_runtime_presence_syncs_join_and_leave -- --exact --nocapture
+cargo test -p elastos-server --lib api::gateway::tests::test_room_service_cross_runtime_room_syncs_over_carrier -- --exact --nocapture
+cargo test -p elastos-server --lib api::gateway::tests::test_room_service_cross_runtime_attachment_syncs_over_carrier -- --exact --nocapture
+```
+
+Manual across two runtimes:
+1. On runtime A, run `elastos room seed --title "Review Room"`
+2. On runtime A, run `elastos room invite-export <did:key:...> --role member > invite.json`
+3. On runtime B, run `elastos room invite-import invite.json`
+4. On runtime B, run `elastos room accept <invite-id>`
+5. On runtime B, run `elastos room accept-export <invite-id> > acceptance.json`
+6. On runtime A, run `elastos room accept-import acceptance.json`
+7. Start the explicit operator lane and open the hosted room path on both runtimes
+8. Pair both browsers or local room sessions
+9. Confirm runtime B sees runtime A join before any text message is sent
+10. Confirm runtime A sees runtime B join before any text message is sent
+11. Send one text message from runtime A
+12. Confirm runtime B receives it
+13. Send one reply from runtime B
+14. Confirm runtime A receives it
+15. Upload one attachment from runtime A
+16. Confirm runtime B sees the attachment object and can fetch the bytes
+17. Leave the room from runtime B
+18. Confirm runtime A sees the leave event and the participant roster shrinks
+
+Pass when:
+- owner and guest converge on the same room membership
+- both runtimes surface join/leave presence before and after chat
+- text delivery works both ways without duplicate replay
+- attachment delivery works and fetched bytes match
+
+### RS-12 Operator remote control works
+
+Automatic:
+```bash
+cd <repo-root>
+bash scripts/public-install-operator-smoke.sh
+cd elastos
+cargo test -p elastos-server --lib operator_control::tests::test_two_node_operator_status -- --ignored --exact --nocapture
+```
+
+Manual across controller and target runtimes:
+1. On the target, run `elastos setup --profile operator`
+2. On the target, run `elastos serve`
+3. On the target, copy the DID and connect ticket from `elastos node info`
+4. On the target, allow the controller DID with `elastos node peer add --did <controller-did> --allow status.read --allow update.check --allow room.read`
+5. On the controller, add the target with `elastos node peer add --did <target-did> --ticket <ticket>`
+6. On the controller, run `elastos node status --peer <target-did>`
+7. On the controller, run `elastos node room show --peer <target-did>`
+8. On the controller, run `elastos node update --peer <target-did> --check`
+
+Pass when:
+- the target is reachable over Carrier
+- `node status` reports the correct runtime kind and version
+- `node room show` returns the remote room summary coherently
+- `node update --check` reports the trusted source coherently
 
 ## Minimum Publish Bar
 
@@ -269,6 +336,8 @@ For the new runtime repo, the minimum honest publish set is:
 - RS-03
 - RS-04
 - RS-10
+- RS-11
+- RS-12
 
 Everything else must either:
 - pass its own story, or
@@ -290,36 +359,44 @@ bash scripts/gba-demo-smoke.sh
 just verify-release
 ```
 
-### WSL
+### Installed x86_64 host
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-elastos update
-elastos setup --profile pc2
-elastos setup --profile chat
+elastos setup
+elastos setup --profile demo
 elastos
+
+# if validating room or operator flows on this host
+elastos setup --profile operator
+elastos serve
 ```
 
 Manual checks:
 - People / identity
 - Chat
-- Full-screen Chat
 - MyWebSite
 - Updates
+- Room browser after `setup --profile demo` plus `setup --profile operator`
+- Full-screen Chat only if you are explicitly closing RS-06 on this host
 
-### Jetson
+### Installed arm64 host
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-elastos update
-elastos setup --profile pc2
-elastos setup --profile chat
+elastos setup
+elastos setup --profile demo
 elastos
+
+# if validating room or operator flows on this host
+elastos setup --profile operator
+elastos serve
 ```
 
 Manual checks:
 - People / identity
 - Chat
-- Full-screen Chat
 - MyWebSite
 - Updates
+- Room browser after `setup --profile demo` plus `setup --profile operator`
+- Full-screen Chat only if you are explicitly closing RS-06 on this host

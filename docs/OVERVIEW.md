@@ -38,16 +38,20 @@ The current preview is grounded in code and recorded proof, but not every path h
 
 - signed install from `https://elastos.elacitylabs.com/install.sh`
 - `elastos setup` for the core PC2 home profile
+- `elastos setup --profile demo` for the broader demo/test surface, including the hosted room-browser asset set
+- `elastos setup --profile operator` for the explicit operator lane
 - `elastos` opens the sovereign PC2 home surface on the current live public `x86_64` line
 - `elastos pc2` is the explicit PC2 home alias
 - one-terminal native `elastos chat`
+- sovereign room invite/accept control plus hosted room-browser access on top of the explicit operator lane
+- operator peer control over Carrier with `elastos node info`, `peer`, `status`, `room`, and `update` flows
 - direct `share`, `open`, `shares *`, and `attest` when the explicit extras are installed
 - immediate public sharing through `elastos share --public`
 - signed publish, install, and update
 - native chat as the default proving surface, with explicit WASM and microVM chat proving paths
 - initial read-only `webspace-provider` resolution under `localhost://WebSpaces/Elastos`
 
-Current Jetson/WSL front-door re-proof remains open. See [state.md](../state.md) and [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for the current proof surface.
+Further installed-host front-door re-proof remains open. See [state.md](../state.md) and [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for the current proof surface.
 
 ## Runtime Classes
 
@@ -59,6 +63,13 @@ The current command split is intentional:
 - managed user runtime
   - `elastos chat`
 - no runtime
+  - `elastos room show`
+  - `elastos room pending`
+  - `elastos room seed`
+  - `elastos room invite-*`
+  - `elastos room accept-*`
+  - `elastos node info`
+  - `elastos node peer *`
   - `elastos share`
   - `elastos open`
   - `elastos shares *`
@@ -76,8 +87,12 @@ The current command split is intentional:
   - `elastos site promote <channel> <release>`
   - `elastos site bind-domain`
 - operator runtime
+  - `elastos room open`
+  - `elastos node status --peer ...`
+  - `elastos node room * --peer ...`
+  - `elastos node update --peer ...`
   - `elastos agent`
-  - `elastos capsule`
+  - non-interactive `elastos capsule`
   - WASM/microVM `elastos run`
 - starts own service
   - `elastos serve`
@@ -186,8 +201,8 @@ That means:
 
 What is proven today:
 
-- local operator proof for `elastos agent --backend codex`
-- persistent operator Codex chat service on this server
+- local operator proof for the explicit `elastos agent` path
+- the explicit operator lane as a real, separate surface from the PC2 front door
 
 What is not claimed today:
 

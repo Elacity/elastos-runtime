@@ -1108,11 +1108,8 @@ pub(crate) fn set_room_session_cookie_header(
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
 }
 
-pub(crate) fn clear_room_session_cookie_header(
-    secure: bool,
-) -> anyhow::Result<HeaderValue> {
-    let mut value =
-        format!("{ROOM_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+pub(crate) fn clear_room_session_cookie_header(secure: bool) -> anyhow::Result<HeaderValue> {
+    let mut value = format!("{ROOM_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
     if secure {
         value.push_str("; Secure");
     }

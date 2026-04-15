@@ -2,30 +2,47 @@
 
 The `scripts/` tree is organized around one rule:
 
-- the `scripts/` root contains the commands a developer or operator should type directly
+- the `scripts/` root contains top-level commands a developer or operator may run directly
 - subdirectories contain lower-level support tooling
+
+Not every root script is a stable end-user entrypoint. Some root scripts are
+explicit proof, smoke, audit, or release helpers and should be documented as
+such.
 
 ## Root Entry Points
 
-Canonical user-facing entrypoints stay at the root:
+Top-level directly-invoked entrypoints stay at the root:
 
 - `agent.sh` — run the agent capsule
 - `build.sh` — build runtime and capsules
 - `chat.sh` — launch the chat demo
-- `dev-sync-jetson.sh` — fast host-to-Jetson sync loop
 - `gba.sh` — launch the GBA demo
 - `install.sh` — signed installer
 - `notepad.sh` — launch the notepad demo
 - `pc2-demo-local.sh` — prepare and launch the local source-based PC2 demo in a clean temp home
-- `public-gateway.sh` — launch the public gateway flow
 - `publish-release.sh` — low-level release publisher
-- `release-demo-gate.sh` — release acceptance helper
 - `resolve-binary.sh` — shared binary resolver sourced by root launchers
 - `setup-crosvm.sh` — install runtime VM prerequisites
 - `share-demo.sh` — share project docs/content
-- `status.sh` — inspect local build/runtime state
 
 If a script is something a human is expected to type from docs, it belongs here.
+
+## Root Proof Helpers
+
+Proof, smoke, and audit helpers also currently live at the root. Common examples:
+
+- `command-smoke.sh`
+- `installed-command-audit.sh`
+- `local-carrier-chat-smoke.sh`
+- `local-carrier-setup-smoke.sh`
+- `pc2-frontdoor-smoke.sh`
+- `public-install-identity-smoke.sh`
+- `public-install-operator-smoke.sh`
+- `public-install-pc2-frontdoor-smoke.sh`
+
+These are review and release helpers, not automatically part of the stable
+end-user command contract. The `public-install-*.sh` helpers can target a
+published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`.
 
 ## Support Subdirectories
 
@@ -37,19 +54,10 @@ If a script is something a human is expected to type from docs, it belongs here.
 - `fetch/` — asset/tool fetchers
   - `fetch-cloudflared.sh`
   - `fetch-model.sh`
-- `ops/` — specialized operations and diagnostics
-  - `jetson-gateway.sh`
-  - `jetson-vm-diagnose.sh`
-  - `host-doctor.sh`
-  - `host-refresh.sh`
-  - `host-reset.sh`
-- `system/` — unit/service assets
-  - `elastos-gateway.service`
-  - `elastos-runtime.service`
-  - `elastos-agent-codex.service`
-  - runtime/agent wrapper scripts and env/policy examples
+- `lib/` — shared shell helpers sourced by top-level proof and release scripts
+  - `runtime-cleanup.sh`
 
-These scripts are intentionally less prominent. They support the canonical flows but are not the default starting point for new contributors.
+Any deeper deployment or helper assets should stay out of the public root-script story unless they are part of the shipped public contract.
 
 ## Design Rules
 

@@ -2,6 +2,10 @@
 
 Every `elastos` command has exactly one runtime expectation. No command may hang.
 
+For the narrower interactive front-door contract, see [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md).
+
+Single-host rule: one ElastOS home may have one live host owner at a time. Managed dashboard paths own the managed PC2 lane, `elastos serve` owns the explicit operator lane, and `elastos room open` is the explicit helper that reuses the live operator lane instead of starting a second host.
+
 ## Runtime Classes
 
 | Class | Description | Auto-start |
@@ -10,7 +14,26 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
 | **Managed Dashboard Runtime** | Auto-starts/reuses a dedicated local runtime for the dashboard/home surface | Yes |
 | **Managed User Runtime** | Auto-starts/reuses background runtime | Yes |
 | **Operator Runtime** | Requires explicit `elastos serve` running | No |
-| **Starts Own Service** | Starts its own daemon or service process | N/A |
+| **Service Entrypoint** | Starts or attaches to an explicit service surface | N/A |
+
+## Interactive Surface Status
+
+Not every interactive command is equally product-facing.
+
+- First-class public front door:
+  - `elastos`
+  - `elastos pc2`
+  - `PC2 -> Chat`
+- Secondary supported shortcut:
+  - `elastos chat`
+- Secondary packaged surface path:
+  - `elastos capsule <name> --lifecycle interactive --interactive`
+- Operator or developer surfaces:
+  - `elastos agent`
+  - `elastos run ...`
+  - non-interactive `elastos capsule ...`
+
+The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md).
 
 ## Command Classification
 
@@ -32,6 +55,13 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
 | `elastos publish-release` | Spawns own pipeline |
 | `elastos config *` | Local config file |
 | `elastos emergency *` | Key rotation |
+| `elastos room show|pending|seed|invite-*|accept-*|approve|deny|reset` | Local sovereign room control, summary, pending browser-pair review, and signed invite/accept envelope flow. `room show/pending/approve/deny` can drive pairing from the CLI without a live runtime. |
+| `elastos node info` | Local operator-node identity and route snapshot; no local runtime required |
+| `elastos node peer add|list|remove` | Local operator peer config; no local runtime required |
+| `elastos node status --peer <did>` | Source-side operator command; the target peer should be prepared with `elastos setup --profile operator` and running explicit `elastos serve` |
+| `elastos node room * --peer <did>` | Source-side explicit remote room control over Carrier. Reads room state, reviews pending browser pair requests, approves/denies them, and starts/reuses the remote room gateway. The target peer must explicitly allow `room.read`, `room.approve`, `room.deny`, and/or `room.open`. |
+| `elastos node update --peer <did> --check` | Source-side operator command; the target peer should be prepared with `elastos setup --profile operator` and running explicit `elastos serve` |
+| `elastos node update --peer <did> --apply --yes` | Source-side operator command; mutating remote trusted-source update; target restart is still manual and the target peer should be prepared with `elastos setup --profile operator` |
 | `elastos share` | Bundles content + direct IPFS bridge; exits immediately. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with md-viewer` |
 | `elastos share --public` | Bundles content + direct IPFS bridge + direct tunnel-provider public edge; keeps the immediate public link alive until Ctrl+C |
 | `elastos open` | Direct IPFS bridge + local web serve. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with md-viewer` |
@@ -59,29 +89,30 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
 |---------|-------|
 | `elastos` | Default user entrypoint. Opens the sovereign PC2 home surface with no subcommand. |
 | `elastos pc2` | Explicit alias for the sovereign PC2 home surface. Auto-starts/reuses a dedicated managed `pc2` runtime on loopback, renders the local `pc2` WASM capsule, and returns home after launched actions exit. |
-| `elastos capsule <name> --lifecycle interactive --interactive` | Packaged installed capsule path. Reuses an existing runtime when one is already active; otherwise auto-starts/reuses the managed `pc2` runtime so packaged surfaces like `chat` and `chat-wasm` can launch without `elastos serve`. |
+| `elastos capsule <name> --lifecycle interactive --interactive` | Interactive packaged capsule path. Reuses a compatible active runtime when one is already running; otherwise uses the managed `pc2` runtime. |
 
 ### Managed User Runtime (auto-start)
 
 | Command | Policy needed | Notes |
 |---------|---------------|-------|
-| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. Starts/reuses a managed chat runtime on loopback. Packaged full-screen chat surfaces launch through `elastos capsule ...`, not `elastos chat`. |
+| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed `pc2` runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
 
 ### Operator Runtime (requires `elastos serve`)
 
 | Command | Notes |
 |---------|-------|
 | `elastos agent` | Shell/supervisor orchestration via forward_to_shell; chat-managed runtime does not satisfy this |
+| `elastos room open` | Requires a running operator runtime in the same home. Reuses the live `elastos serve` runtime and opens the hosted room gateway through it; it does not start a second host. The browser surface it exposes comes from `elastos setup --profile demo`. |
 | `elastos run` (MicroVM) | Supervisor capsule launch; chat-managed runtime does not satisfy this |
 | `elastos run` (WASM) | Attaches to running runtime for provider bridge; chat-managed runtime does not satisfy this |
 | `elastos capsule` (non-interactive) | Supervisor capsule management that is not an interactive packaged app surface still requires `elastos serve` |
 
-### Starts Own Service
+### Service Entrypoint
 
 | Command | Notes |
 |---------|-------|
 | `elastos serve` | Starts the runtime daemon |
-| `elastos gateway` | Starts a direct gateway service |
+| `elastos gateway` | Starts a direct gateway service when no local operator runtime already owns the home; otherwise reuses the running local operator runtime authority |
 | `elastos site serve` | Starts a direct static site service in local or ephemeral mode |
 
 ## Rules
@@ -100,6 +131,7 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
    Then run this command again.
    ```
 7. `elastos run` is the explicit power-user path for arbitrary path/CID capsules. Data capsules run in-process; WASM and MicroVM paths require a running operator runtime.
+8. `elastos` and `elastos serve` are different lanes for the same home. They do not currently merge into one shared live session. `elastos room open` is the one explicit helper that reuses the live operator lane.
 
 ## Future: Expanding Managed Runtime
 

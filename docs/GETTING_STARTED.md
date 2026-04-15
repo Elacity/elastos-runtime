@@ -15,7 +15,27 @@ elastos setup
 elastos
 ```
 
-After setup, `elastos` opens the sovereign PC2 home surface. From there you can launch chat and inspect your rooted localhost world. PC2 is the front door, but home/app return behavior is still being tightened on some installed hosts. No separate `elastos serve` terminal is needed for the normal user path.
+After setup, `elastos` opens the sovereign PC2 home surface. From there you can launch chat and inspect your rooted localhost world. PC2 is the front door. No separate `elastos serve` terminal is needed for the normal user path.
+
+### Choose One Lane Per Home
+
+One ElastOS home may have only one live host owner at a time.
+
+- PC2 lane:
+  - `elastos setup` or `elastos setup --profile demo`
+  - then `elastos`
+- Operator lane:
+  - `elastos setup --profile operator`
+  - then `elastos serve`
+- Hosted room/browser validation lane:
+  - `elastos setup --profile demo`
+  - `elastos setup --profile operator`
+  - then `elastos serve`
+  - then `elastos room open --addr 0.0.0.0:8090`
+- Treat hosted room as a lane switch after PC2 checks, not as something that merges into a still-running `elastos` session in the same home.
+- `elastos room open` is not a second host. It reuses the live `elastos serve` runtime and opens the room gateway through it.
+- Do not run `elastos` and `elastos serve` side by side in the same home and expect them to merge. Stop one first or use separate homes if you intentionally need both.
+- If `elastos serve` already owns the home, `elastos` will not start in that same home until you stop `serve`.
 
 What this gives you today:
 
@@ -31,6 +51,17 @@ elastos chat --nick alice
 elastos update
 ```
 
+If you want the same PC2 front door plus the broader demo/test surfaces:
+
+```bash
+elastos setup --profile demo
+elastos
+```
+
+`setup --profile demo` adds more shipped surfaces. It does not change the single-host rule above.
+
+For the hosted room browser path, `setup --profile demo` is the piece that installs the shipped room browser surface.
+
 If you want direct share/open on top of the default PC2 core profile, add the explicit extras first:
 
 ```bash
@@ -42,12 +73,31 @@ elastos share --public README.md
 
 Important boundary:
 
-- `chat` is the only managed user-runtime command
+- `chat` is the only standalone managed user-runtime command
 - `setup` stays first-party and Carrier-only by default
 - direct share/open/site/public-edge tooling is explicit extra setup, not part of the default PC2 core profile
-- `agent`, `capsule`, and WASM/microVM `run` remain explicit operator-runtime surfaces
+- `agent`, `capsule`, WASM/microVM `run`, and `room open` remain explicit operator-runtime surfaces
 
-See [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for the full command/runtime contract.
+See [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md) for the blessed interactive contract and [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for the full command/runtime table.
+
+## Interactive Path Status
+
+Current status by intent:
+
+- first-class public path:
+  - `elastos`
+  - `elastos pc2`
+  - `PC2 -> Chat`
+- secondary shortcut:
+  - `elastos chat`
+- secondary packaged surface path:
+  - `elastos capsule <name> --lifecycle interactive --interactive`
+- operator or developer-only:
+  - `elastos agent`
+  - `elastos run ...`
+  - non-interactive `elastos capsule ...`
+
+The public product contract is intentionally centered on the PC2 front door, not on direct packaged-surface launches.
 
 ## Direct Chat Shortcuts
 
@@ -57,7 +107,9 @@ If you want to jump straight into chat without going through PC2 home:
 elastos chat --nick alice
 ```
 
-There is also a packaged full-screen chat capsule path:
+`elastos chat` is a shortcut to the same native chat surface used from PC2. On the current native terminal path, `Esc` or `/home` returns to PC2; `/quit` exits to the invoking terminal.
+
+There are also packaged chat-family paths, but they are secondary today rather than the main product contract:
 
 ```bash
 elastos setup --profile chat
@@ -70,6 +122,12 @@ For the non-KVM packaged WASM variant:
 elastos setup --profile demo
 elastos capsule chat-wasm --lifecycle interactive --interactive --config '{"nick":"alice"}'
 ```
+
+Important honesty rule for those packaged paths:
+
+- when launched from PC2, they can return to PC2
+- when launched directly from the terminal, both `/home` and `/quit` return to the invoking terminal
+- they should not be documented as the boring default path unless they are explicitly surfaced and proven on the installed route
 
 ## Elastos Sites
 
@@ -127,7 +185,7 @@ See [SITES.md](SITES.md) for the contract and current implementation status.
 
 - Rust 1.89+ via [rustup.rs](https://rustup.rs)
 - Git
-- Linux with KVM for microVM work (`native`, `WSL2`, or `aarch64` such as Jetson)
+- Linux with KVM for microVM work on supported hardware
 - `just` recommended: `cargo install just`
 
 No OpenSSL is required for the core runtime. Most crypto is pure Rust.
@@ -138,6 +196,8 @@ No OpenSSL is required for the core runtime. Most crypto is pure Rust.
 cargo install just
 just build
 just test
+just verify
+just verify-release
 ```
 
 Or manually:
@@ -178,19 +238,29 @@ These source-side scripts are developer/demo entrypoints. They are not the publi
 
 ## Operator Runtime
 
-These commands require an explicit runtime:
+These commands belong to the explicit operator lane:
 
 ```bash
+elastos setup --profile operator
 elastos serve
-elastos agent --backend codex
+elastos room open --addr 0.0.0.0:8090
+elastos node info
+elastos agent
 elastos capsule ...
 elastos run ...
 ```
+
+Hosted room note:
+
+- `elastos room open` needs the explicit operator runtime from `setup --profile operator`.
+- The browser surface it exposes comes from `setup --profile demo`.
+- The canonical local route is `http://127.0.0.1:8090/apps/room-browser/`.
 
 Rule:
 
 - if a command is operator-runtime, it should fail fast and tell you to start `elastos serve`
 - a chat-managed runtime does not satisfy operator-runtime commands
+- `room open` is the explicit room/browser helper on top of `elastos serve`; it is not a separate host lane
 
 ## Capsule Development
 
@@ -223,19 +293,15 @@ Current trust model:
 - providers expose scoped actions like storage, DID, peer, IPFS, and AI
 - Carrier owns networking semantics; capsules do not get raw networking by default
 
-## Cross-Device Notes
+## Installed-Host Notes
 
-The current preview is exercised on:
-
-- Linux `x86_64`
-- Linux `aarch64`
-- WSL
-- Jetson
+The current preview is exercised on Linux `x86_64` and `aarch64`.
 
 Current honest proof scope is narrower than that platform list:
 
-- the live public x86_64 outsider path is proven on the current release line
-- Jetson/WSL `elastos -> PC2 -> Chat -> home` is still an open target-machine proof item
+- the live public x86_64 outsider path is proven
+- full installed `elastos -> PC2 -> Chat -> home` is still a manual target-machine acceptance item on additional hosts
+- installed hosted room-browser validation is still a manual operator-lane acceptance item
 
 See [state.md](../state.md) for the factual current evidence level.
 
