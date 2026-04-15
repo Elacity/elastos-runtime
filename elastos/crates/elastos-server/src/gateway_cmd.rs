@@ -37,6 +37,8 @@ where
     eprintln!("[gateway] ElastOS {} starting on {}", ELASTOS_VERSION, addr);
 
     let data_dir = default_data_dir();
+    let _host_guard = crate::host_lock::acquire_host_process_lock(&data_dir, "gateway", &addr)?;
+    crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway");
     let ipfs_binary = find_installed_provider_binary("ipfs-provider");
     if ipfs_binary.is_none() {
         eprintln!("[gateway] Warning: ipfs-provider not found. IPFS fetch will fail.");
@@ -65,6 +67,9 @@ where
     );
 
     let data_dir = default_data_dir();
+    let _host_guard =
+        crate::host_lock::acquire_host_process_lock(&data_dir, "gateway-public", &addr)?;
+    crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway-public");
     let components_path = data_dir.join("components.json");
     if !components_path.exists() {
         anyhow::bail!(

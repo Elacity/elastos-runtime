@@ -4,6 +4,7 @@ use std::sync::Arc;
 use elastos_compute::ComputeProvider;
 use elastos_crosvm::{CrosvmConfig, CrosvmProvider};
 use elastos_runtime::{bootstrap, session};
+use sha2::Digest as _;
 
 pub async fn run_serve(
     addr: String,
@@ -12,6 +13,9 @@ pub async fn run_serve(
     cid: Option<String>,
 ) -> anyhow::Result<()> {
     let data_dir = crate::default_data_dir();
+    let _host_guard =
+        elastos_server::host_lock::acquire_host_process_lock(&data_dir, "serve", &addr)?;
+    elastos_server::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "serve");
     let (_runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
     if is_first_run {
         crate::print_first_run_welcome(&data_dir);
@@ -363,6 +367,11 @@ pub async fn run_serve(
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| crate::shell_cmd::RUNTIME_KIND_OPERATOR.to_string());
+    let binary_sha256 = match std::env::var("ELASTOS_RUNTIME_BINARY_SHA256") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => current_binary_sha256().unwrap_or_default(),
+    };
+    let policy_sha256 = std::env::var("ELASTOS_RUNTIME_POLICY_SHA256").unwrap_or_default();
     let coords = crate::shell_cmd::RuntimeCoords {
         api_url: format!(
             "http://127.0.0.1:{}",
@@ -373,6 +382,8 @@ pub async fn run_serve(
         client_token: String::new(),
         pid: std::process::id(),
         runtime_kind: runtime_kind.clone(),
+        binary_sha256,
+        policy_sha256,
     };
     let coords_path = crate::shell_cmd::runtime_coord_path(&data_dir);
     if let Err(e) = crate::shell_cmd::write_runtime_coords(&coords_path, &coords) {
@@ -421,4 +432,11 @@ pub async fn run_serve(
     .await?;
 
     Ok(())
+}
+
+fn current_binary_sha256() -> anyhow::Result<String> {
+    let self_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
+    let bytes = std::fs::read(self_exe)?;
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }

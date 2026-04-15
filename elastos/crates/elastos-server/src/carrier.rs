@@ -46,6 +46,7 @@ use elastos_common::localhost::{
 };
 use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
 
+use crate::operator_control::{OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN};
 use crate::sources::TrustedSource;
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
@@ -527,14 +528,6 @@ pub async fn start_carrier_node(
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
-    let file_handler = FileHandler {
-        data_dir: data_dir.clone(),
-    };
-    let router = Router::builder(endpoint.clone())
-        .accept(CARRIER_ALPN, file_handler)
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
-
     let gossip_state = Arc::new(Mutex::new(GossipState::new(
         endpoint.clone(),
         gossip.clone(),
@@ -542,6 +535,22 @@ pub async fn start_carrier_node(
         Some(signing_key.clone()),
         Some(did.to_string()),
     )));
+
+    let file_handler = FileHandler {
+        data_dir: data_dir.clone(),
+    };
+    let operator_handler = OperatorHandler::new(OperatorRuntimeContext {
+        data_dir: data_dir.clone(),
+        local_did: did.to_string(),
+        endpoint: endpoint.clone(),
+        peers: gossip_state.lock().await.peers.clone(),
+        request_serial: Arc::new(Mutex::new(())),
+    });
+    let router = Router::builder(endpoint.clone())
+        .accept(CARRIER_ALPN, file_handler)
+        .accept(OPERATOR_ALPN, operator_handler)
+        .accept(iroh_gossip::ALPN, gossip.clone())
+        .spawn();
 
     let bound_port = endpoint
         .bound_sockets()

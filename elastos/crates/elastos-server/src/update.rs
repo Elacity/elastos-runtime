@@ -346,7 +346,36 @@ pub async fn run_update(
     force: bool,
 ) -> anyhow::Result<()> {
     let data_dir = default_data_dir();
-    let sources = load_trusted_sources(&data_dir)?;
+    run_update_for_data_dir(
+        &data_dir,
+        fetch_fn,
+        try_p2p_fn,
+        check_only,
+        head_cid_override,
+        no_p2p,
+        cli_gateways,
+        version,
+        auto_confirm,
+        force,
+    )
+    .await
+}
+
+/// Main update flow using an explicit runtime data dir.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_update_for_data_dir(
+    data_dir: &Path,
+    fetch_fn: &FetchFn,
+    try_p2p_fn: Option<&TryP2pFn>,
+    check_only: bool,
+    head_cid_override: Option<String>,
+    no_p2p: bool,
+    cli_gateways: Vec<String>,
+    version: &str,
+    auto_confirm: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let sources = load_trusted_sources(data_dir)?;
     let source = sources.default_source().cloned().ok_or_else(|| {
         anyhow::anyhow!("No trusted source configured. Run `elastos source add ...` first.")
     })?;
@@ -489,7 +518,7 @@ pub async fn run_update(
         release_cid,
         &current_version,
         &source,
-        &data_dir,
+        data_dir,
         check_only,
         &ordered_gateways,
         auto_confirm,

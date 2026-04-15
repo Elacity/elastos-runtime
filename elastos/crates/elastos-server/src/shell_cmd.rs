@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use elastos_server::local_http::LoopbackHttpBaseUrl;
 use elastos_server::sources::{default_data_dir, OwnershipRepairGuard};
+use sha2::Digest;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RuntimeCoords {
@@ -21,6 +22,10 @@ pub(crate) struct RuntimeCoords {
     pub(crate) pid: u32,
     #[serde(default = "default_runtime_kind")]
     pub(crate) runtime_kind: String,
+    #[serde(default)]
+    pub(crate) binary_sha256: String,
+    #[serde(default)]
+    pub(crate) policy_sha256: String,
 }
 
 pub(crate) const RUNTIME_KIND_OPERATOR: &str = "operator";
@@ -54,6 +59,31 @@ impl RuntimeCoords {
     pub(crate) fn is_operator_runtime(&self) -> bool {
         !is_managed_user_runtime_kind(&self.runtime_kind)
     }
+}
+
+fn managed_runtime_lane_conflict_message(
+    surface_name: &str,
+    owner: &elastos_server::host_lock::HostProcessInfo,
+) -> String {
+    let next_step = match owner.role.as_str() {
+        "serve" => format!(
+            "`elastos serve` already owns this home. Stop it first if you want the managed {} lane, or keep using the operator lane with commands like `elastos node ...`, `elastos agent`, `elastos run`, or `elastos capsule`.",
+            surface_name
+        ),
+        "gateway" | "gateway-public" => format!(
+            "A gateway host already owns this home. Stop that gateway first if you want the managed {} lane, or keep using the existing gateway surface.",
+            surface_name
+        ),
+        other => format!(
+            "Host role '{}' already owns this home. Stop it first if you want the managed {} lane, or keep using its existing surface.",
+            other, surface_name
+        ),
+    };
+
+    format!(
+        "Cannot auto-start local {} runtime while another ElastOS host already owns this identity (pid {}, role '{}', addr {}).\n\n{}",
+        surface_name, owner.pid, owner.role, owner.addr, next_step
+    )
 }
 
 struct SavedTermios(libc::termios);
@@ -306,8 +336,54 @@ pub(crate) async fn attach_client_token_to_operator_runtime(
     let coords = read_operator_runtime_coords(&coords_path)
         .await
         .ok_or_else(|| anyhow::anyhow!(OPERATOR_RUNTIME_REQUIRED_MESSAGE))?;
+    if let Some(reason) = operator_runtime_staleness_reason(&coords).await? {
+        anyhow::bail!("{}", reason);
+    }
     let tokens = attach_to_runtime(&coords).await?;
     Ok((coords, tokens.client_token))
+}
+
+pub(crate) async fn operator_runtime_staleness_reason(
+    coords: &RuntimeCoords,
+) -> anyhow::Result<Option<String>> {
+    if !coords.is_operator_runtime() {
+        return Ok(None);
+    }
+
+    let expected_version = env!("ELASTOS_VERSION");
+    match runtime_version_from_health(&coords.api_url).await {
+        Some(actual) if actual != expected_version => {
+            return Ok(Some(format!(
+                "local operator runtime is stale (running {}, expected {}). Restart it with `elastos serve`.",
+                actual, expected_version
+            )));
+        }
+        Some(_) => {}
+        None => {
+            return Ok(Some(format!(
+                "local operator runtime version is unknown (expected {}). Restart it with `elastos serve`.",
+                expected_version
+            )));
+        }
+    }
+
+    let self_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
+    let expected_binary_sha256 = sha256_file(&self_exe)?;
+    if coords.binary_sha256.is_empty() {
+        return Ok(Some(
+            "local operator runtime fingerprint is missing. Restart it with `elastos serve`."
+                .to_string(),
+        ));
+    }
+    if coords.binary_sha256 != expected_binary_sha256 {
+        return Ok(Some(
+            "local operator runtime binary changed on disk. Restart it with `elastos serve`."
+                .to_string(),
+        ));
+    }
+
+    Ok(None)
 }
 
 async fn call_attach(
@@ -508,6 +584,13 @@ async fn ensure_managed_runtime(
     surface_name: &str,
 ) -> anyhow::Result<RuntimeCoords> {
     let coords_path = runtime_coord_path(data_dir);
+    let self_exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
+    let binary_sha256 = sha256_file(&self_exe)?;
+    let policy = serde_json::json!({
+        "allow": allow_resources
+    });
+    let policy_sha256 = sha256_bytes(serde_json::to_vec(&policy)?.as_slice());
 
     // 1. Check for existing runtime (operator-started or previous chat-started)
     if let Some(coords) = read_runtime_coords(&coords_path).await {
@@ -528,7 +611,20 @@ async fn ensure_managed_runtime(
                 // kill all existing sessions. Always reuse the running runtime.
                 {
                     match runtime_version_from_health(&coords.api_url).await {
-                        Some(actual) if actual == expected => return Ok(coords),
+                        Some(actual) if actual == expected => {
+                            if coords.binary_sha256 == binary_sha256
+                                && coords.policy_sha256 == policy_sha256
+                            {
+                                return Ok(coords);
+                            }
+                            if runtime_notices_enabled() {
+                                eprintln!(
+                                    "Managed {} runtime fingerprint changed. Restarting...",
+                                    surface_name
+                                );
+                            }
+                            terminate_managed_chat_runtime(&coords, &coords_path).await;
+                        }
                         Some(actual) => {
                             if runtime_notices_enabled() {
                                 eprintln!(
@@ -553,6 +649,10 @@ async fn ensure_managed_runtime(
         } else {
             return Ok(coords);
         }
+    }
+
+    if let Some(owner) = elastos_server::host_lock::active_host_process(data_dir)? {
+        anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner));
     }
 
     if runtime_notices_enabled() {
@@ -584,9 +684,6 @@ async fn ensure_managed_runtime(
         );
     }
 
-    // Find the runtime binary (same binary we're running from)
-    let self_exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let managed_addr = reserve_managed_chat_addr()
         .map_err(|e| anyhow::anyhow!("Failed to reserve managed runtime port: {}", e))?;
 
@@ -597,9 +694,6 @@ async fn ensure_managed_runtime(
     let policy_dir = data_dir.join("policy");
     std::fs::create_dir_all(&policy_dir)?;
     let policy_path = policy_dir.join(policy_file_name);
-    let policy = serde_json::json!({
-        "allow": allow_resources
-    });
     std::fs::write(&policy_path, serde_json::to_string_pretty(&policy)?)?;
 
     // 4. Create log directory
@@ -617,6 +711,8 @@ async fn ensure_managed_runtime(
         .env("ELASTOS_POLICY_FILE", &policy_path)
         .env("ELASTOS_SHELL_MODE", "agent")
         .env("ELASTOS_RUNTIME_KIND", runtime_kind)
+        .env("ELASTOS_RUNTIME_BINARY_SHA256", &binary_sha256)
+        .env("ELASTOS_RUNTIME_POLICY_SHA256", &policy_sha256)
         .stdout(std::process::Stdio::from(log_file.try_clone()?))
         .stderr(std::process::Stdio::from(log_file))
         .stdin(std::process::Stdio::null())
@@ -699,6 +795,15 @@ fn format_runtime_start_timeout_message(surface_name: &str, log_path: &Path) -> 
             log_path.display()
         )
     }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(sha256_bytes(&bytes))
 }
 
 fn summarize_runtime_start_failure(log_path: &Path) -> Option<String> {
@@ -826,5 +931,34 @@ mod tests {
         let actual = pc2_runtime_coord_path(tmp.path());
         std::env::remove_var("ELASTOS_RUNTIME_COORDS_FILE");
         assert_eq!(actual, tmp.path().join("pc2-runtime-coords.json"));
+    }
+
+    #[test]
+    fn managed_runtime_lane_conflict_mentions_operator_lane_when_serve_owns_home() {
+        let owner = elastos_server::host_lock::HostProcessInfo {
+            pid: 123,
+            role: "serve".to_string(),
+            addr: "0.0.0.0:3000".to_string(),
+        };
+
+        let message = managed_runtime_lane_conflict_message("pc2", &owner);
+
+        assert!(message.contains("`elastos serve` already owns this home."));
+        assert!(message.contains("managed pc2 lane"));
+        assert!(message.contains("`elastos node ...`"));
+    }
+
+    #[test]
+    fn managed_runtime_lane_conflict_mentions_gateway_when_gateway_owns_home() {
+        let owner = elastos_server::host_lock::HostProcessInfo {
+            pid: 456,
+            role: "gateway".to_string(),
+            addr: "127.0.0.1:8090".to_string(),
+        };
+
+        let message = managed_runtime_lane_conflict_message("chat", &owner);
+
+        assert!(message.contains("gateway host already owns this home"));
+        assert!(message.contains("managed chat lane"));
     }
 }

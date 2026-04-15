@@ -8,6 +8,7 @@ mod config_cmd;
 mod gateway_entry;
 mod identity_cmd;
 mod init_cmd;
+mod node_cmd;
 mod pc2_cmd;
 mod publish;
 mod release_cmd;
@@ -374,6 +375,10 @@ enum Commands {
     #[command(subcommand)]
     Webspace(WebspaceCommand),
 
+    /// Manage operator peers and safe remote node actions
+    #[command(subcommand)]
+    Node(NodeCommand),
+
     /// Sign a payload from stdin with domain-separated Ed25519
     #[command(name = "sign-payload")]
     SignPayload {
@@ -524,6 +529,83 @@ enum SharesCommand {
     Head {
         /// Channel name
         channel: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NodeCommand {
+    /// Show local operator-node identity and connect information
+    Info {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage known operator peers and local allowlists
+    #[command(subcommand)]
+    Peer(NodePeerCommand),
+    /// Read safe remote node status from an allowed peer
+    Status {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check or apply a trusted-source update on an allowed peer
+    Update {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Only check for updates, never apply them
+        #[arg(long, conflicts_with = "apply")]
+        check: bool,
+        /// Apply the trusted-source update on the remote peer
+        #[arg(long, conflicts_with = "check")]
+        apply: bool,
+        /// Confirm the remote mutating action
+        #[arg(long, requires = "apply")]
+        yes: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NodePeerCommand {
+    /// Add or update a known operator peer
+    Add {
+        /// Peer runtime DID
+        #[arg(long)]
+        did: String,
+        /// Optional human label
+        #[arg(long)]
+        label: Option<String>,
+        /// Carrier connect ticket for reaching that runtime
+        #[arg(long)]
+        ticket: Option<String>,
+        /// Allow this DID to request a safe operator action on this runtime
+        #[arg(long = "allow")]
+        allow: Vec<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List configured operator peers
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a known operator peer and revoke all operator permissions
+    Remove {
+        /// Peer runtime DID
+        #[arg(long)]
+        did: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -893,6 +975,10 @@ async fn main() -> anyhow::Result<()> {
             return webspace_cmd::run(cmd).await;
         }
 
+        Commands::Node(cmd) => {
+            return node_cmd::run_node(cmd).await;
+        }
+
         Commands::SignPayload { domain, key } => {
             trust_cmd::run_sign_payload(domain, key)?;
         }
@@ -1022,7 +1108,7 @@ fn print_first_run_welcome(data_dir: &std::path::Path) {
     println!();
     println!("  Shell policy:    cli (interactive) with TTY, agent (rules) without");
     println!("  User path:       elastos chat auto-starts after setup");
-    println!("  Operator path:   elastos serve, then elastos run / agent / capsule");
+    println!("  Operator path:   elastos serve, then elastos node / run / agent / capsule");
     println!();
 }
 
