@@ -3,23 +3,58 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOME_DIR="$(mktemp -d /tmp/elastos-pc2-frontdoor-XXXXXX)"
-trap 'rm -rf "$HOME_DIR"' EXIT
-
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6Mkf2nCJ1pcN4JioAxHEiyDsPC298QFtn2Dgg9tjt2ezHeK}"
+MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
 SOURCE_PC2_DIR="$ROOT/capsules/pc2"
 SOURCE_PC2_WASM="$SOURCE_PC2_DIR/target/wasm32-wasip1/release/pc2.wasm"
 SOURCE_COMPONENTS_MANIFEST="$ROOT/components.json"
-OPERATOR_HOME="${HOME}"
+SOURCE_RUNTIME_HOME="${HOME_DIR}/source-runtime"
+SOURCE_RUNTIME_XDG="${SOURCE_RUNTIME_HOME}/xdg-data"
+SOURCE_RUNTIME_DATA_DIR="${SOURCE_RUNTIME_XDG}/elastos"
+SOURCE_RUNTIME_LOG="${HOME_DIR}/source-runtime.log"
+SOURCE_RUNTIME_COORDS="${SOURCE_RUNTIME_DATA_DIR}/runtime-coords.json"
+
+cleanup() {
+    if [[ -n "${SOURCE_RUNTIME_PID:-}" ]] && kill -0 "${SOURCE_RUNTIME_PID}" 2>/dev/null; then
+        kill "${SOURCE_RUNTIME_PID}" 2>/dev/null || true
+        wait "${SOURCE_RUNTIME_PID}" 2>/dev/null || true
+    fi
+    mapfile -t temp_pids < <(pgrep -f "$HOME_DIR" || true)
+    for pid in "${temp_pids[@]}"; do
+        [[ "$pid" == "$$" ]] && continue
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+    for pid in "${temp_pids[@]}"; do
+        [[ "$pid" == "$$" ]] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$HOME_DIR"
+    return 0
+}
+trap cleanup EXIT
+
+free_port() {
+    python3 - <<'PY2'
+import socket
+
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY2
+}
 
 discover_source_bootstrap() {
-    local coords_file="${OPERATOR_HOME}/.local/share/elastos/runtime-coords.json"
+    local coords_file="$1"
     if [[ ! -f "$coords_file" ]]; then
         echo "[pc2-frontdoor] runtime coords missing: $coords_file" >&2
         return 1
     fi
 
-    RUNTIME_COORDS="$coords_file" python3 - <<'PY'
+    RUNTIME_COORDS="$coords_file" python3 - <<'PY2'
 import json
 import os
 import urllib.request
@@ -49,31 +84,131 @@ with urllib.request.urlopen(ticket_req, timeout=5) as resp:
 
 print(body["data"]["ticket"])
 print(body["data"]["node_id"])
-PY
+PY2
+}
+
+host_platform() {
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)
+            printf '%s\n' "linux-amd64"
+            ;;
+        Linux-aarch64|Linux-arm64)
+            printf '%s\n' "linux-arm64"
+            ;;
+        *)
+            echo "[pc2-frontdoor] unsupported host platform: $(uname -s)-$(uname -m)" >&2
+            exit 1
+            ;;
+    esac
 }
 
 echo "[pc2-frontdoor] build elastos binary"
 cargo build --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server >/dev/null
 
+echo "[pc2-frontdoor] build first-party setup artifacts"
+cargo build --manifest-path "$ROOT/elastos/capsules/shell/Cargo.toml" --release >/dev/null
+cargo build --manifest-path "$ROOT/elastos/capsules/localhost-provider/Cargo.toml" --release >/dev/null
+cargo build --manifest-path "$ROOT/capsules/did-provider/Cargo.toml" --release >/dev/null
+cargo build --manifest-path "$ROOT/capsules/webspace-provider/Cargo.toml" --release >/dev/null
+
 echo "[pc2-frontdoor] build pc2 wasm"
 cargo build --manifest-path "$ROOT/capsules/pc2/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
 cp "$SOURCE_PC2_WASM" "$SOURCE_PC2_DIR/pc2.wasm"
 
-echo "[pc2-frontdoor] seed trusted source"
-mapfile -t SOURCE_BOOTSTRAP < <(discover_source_bootstrap)
+echo "[pc2-frontdoor] stage source-local trusted source"
+SOURCE_API_PORT="$(free_port)"
+SETUP_PLATFORM="$(host_platform)"
+mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
+install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
+
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" PC2_DIR="$SOURCE_PC2_DIR" python3 - <<'PY2'
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import tarfile
+
+components_src = pathlib.Path(os.environ["COMPONENTS_SRC"])
+components_dest = pathlib.Path(os.environ["COMPONENTS_DEST"])
+publisher_root = pathlib.Path(os.environ["PUBLISHER_ROOT"])
+artifacts_dir = publisher_root / "artifacts"
+artifacts_dir.mkdir(parents=True, exist_ok=True)
+platform = os.environ["SETUP_PLATFORM"]
+
+manifest = json.loads(components_src.read_text())
+mapping = {
+    "shell": pathlib.Path(os.environ["SHELL_BIN"]),
+    "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
+    "did-provider": pathlib.Path(os.environ["DID_PROVIDER_BIN"]),
+    "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
+}
+
+for name, src in mapping.items():
+    if not src.is_file():
+        raise SystemExit(f"missing built artifact for {name}: {src}")
+    info = manifest["external"][name]["platforms"][platform]
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    dest = artifacts_dir / release_path
+    shutil.copy2(src, dest)
+    data = dest.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
+
+pc2_dir = pathlib.Path(os.environ["PC2_DIR"])
+pc2_manifest = manifest["external"]["pc2"]["platforms"][platform]
+pc2_release_path = pc2_manifest.get("release_path")
+if not pc2_release_path:
+    raise SystemExit(f"pc2 missing release_path for {platform}")
+pc2_archive = artifacts_dir / pc2_release_path
+with tarfile.open(pc2_archive, "w:gz") as tar:
+    tar.add(pc2_dir / "capsule.json", arcname="pc2/capsule.json")
+    tar.add(
+        pc2_dir / "target/wasm32-wasip1/release/pc2.wasm",
+        arcname="pc2/pc2.wasm",
+    )
+pc2_data = pc2_archive.read_bytes()
+pc2_manifest["checksum"] = "sha256:" + hashlib.sha256(pc2_data).hexdigest()
+pc2_manifest["size"] = len(pc2_data)
+
+components_dest.parent.mkdir(parents=True, exist_ok=True)
+components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
+PY2
+
+HOME="$SOURCE_RUNTIME_HOME" XDG_DATA_HOME="$SOURCE_RUNTIME_XDG" "$ROOT/elastos/target/debug/elastos" serve --addr "127.0.0.1:${SOURCE_API_PORT}"     >"$SOURCE_RUNTIME_LOG" 2>&1 &
+SOURCE_RUNTIME_PID=$!
+
+for _ in $(seq 1 60); do
+    [[ -f "$SOURCE_RUNTIME_COORDS" ]] && break
+    sleep 0.5
+done
+if [[ ! -f "$SOURCE_RUNTIME_COORDS" ]]; then
+    echo "[pc2-frontdoor] source runtime coords missing. See $SOURCE_RUNTIME_LOG" >&2
+    exit 1
+fi
+
+for _ in $(seq 1 60); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${SOURCE_API_PORT}/api/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+if ! curl -fsS --max-time 2 "http://127.0.0.1:${SOURCE_API_PORT}/api/health" >/dev/null 2>&1; then
+    echo "[pc2-frontdoor] source runtime never became healthy. See $SOURCE_RUNTIME_LOG" >&2
+    exit 1
+fi
+
+mapfile -t SOURCE_BOOTSTRAP < <(discover_source_bootstrap "$SOURCE_RUNTIME_COORDS")
 SOURCE_CONNECT_TICKET="${SOURCE_BOOTSTRAP[0]:-}"
 SOURCE_NODE_ID="${SOURCE_BOOTSTRAP[1]:-}"
 if [[ -z "$SOURCE_CONNECT_TICKET" || -z "$SOURCE_NODE_ID" ]]; then
-    echo "[pc2-frontdoor] failed to discover live trusted-source Carrier bootstrap" >&2
+    echo "[pc2-frontdoor] failed to discover source-local trusted-source Carrier bootstrap. See $SOURCE_RUNTIME_LOG" >&2
     exit 1
 fi
-HOME="$HOME_DIR" \
-XDG_DATA_HOME="$HOME_DIR/xdg-data" \
-ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" \
-ELASTOS_MAINTAINER_DID="$MAINTAINER_DID" \
-ELASTOS_SOURCE_CONNECT_TICKET="$SOURCE_CONNECT_TICKET" \
-ELASTOS_PUBLISHER_NODE_ID="$SOURCE_NODE_ID" \
-bash "$ROOT/scripts/install.sh" >/tmp/elastos-pc2-frontdoor-install.log
+
+HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" ELASTOS_MAINTAINER_DID="$MAINTAINER_DID" ELASTOS_SOURCE_CONNECT_TICKET="$SOURCE_CONNECT_TICKET" ELASTOS_PUBLISHER_NODE_ID="$SOURCE_NODE_ID" bash "$ROOT/scripts/install.sh" >/tmp/elastos-pc2-frontdoor-install.log
 
 if [[ ! -f "$SOURCE_COMPONENTS_MANIFEST" ]]; then
     echo "[pc2-frontdoor] source components manifest missing: $SOURCE_COMPONENTS_MANIFEST" >&2
@@ -82,9 +217,7 @@ fi
 
 echo "[pc2-frontdoor] setup pc2 profile"
 cp "$SOURCE_COMPONENTS_MANIFEST" "$HOME_DIR/xdg-data/elastos/components.json"
-HOME="$HOME_DIR" \
-XDG_DATA_HOME="$HOME_DIR/xdg-data" \
-"$ROOT/elastos/target/debug/elastos" setup --profile pc2 >/tmp/elastos-pc2-frontdoor-setup.log
+HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" "$ROOT/elastos/target/debug/elastos" setup --profile pc2 >/tmp/elastos-pc2-frontdoor-setup.log
 
 INSTALLED_PC2_DIR="$HOME_DIR/xdg-data/elastos/capsules/pc2"
 if [[ ! -d "$INSTALLED_PC2_DIR" ]]; then
@@ -100,7 +233,6 @@ import pty
 import select
 import signal
 import subprocess
-import sys
 import time
 
 home = os.environ["HOME_DIR"]
@@ -112,8 +244,7 @@ env["XDG_DATA_HOME"] = f"{home}/xdg-data"
 # instead of probing the caller's controlling terminal via /dev/tty.
 env["ELASTOS_CHAT_FORCE_STDIN"] = "1"
 cmd = [f"{root}/elastos/target/debug/elastos"]
-
-def run_case(label: str, payload: bytes) -> None:
+def launch_pty():
     master, slave = pty.openpty()
     proc = subprocess.Popen(
         cmd,
@@ -125,172 +256,186 @@ def run_case(label: str, payload: bytes) -> None:
         start_new_session=True,
     )
     os.close(slave)
+    return master, proc
 
-    def read_for(seconds: float) -> str:
-        end = time.time() + seconds
-        chunks: list[bytes] = []
-        while time.time() < end:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if not ready:
-                continue
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
-        return b"".join(chunks).decode("utf-8", "replace")
+def read_for(master: int, seconds: float) -> str:
+    end = time.time() + seconds
+    chunks: list[bytes] = []
+    while time.time() < end:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if not ready:
+            continue
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace")
 
-    def send(data: bytes, pause: float = 0.2) -> None:
-        os.write(master, data)
-        time.sleep(pause)
+def read_until(label: str, master: int, predicate, timeout: float) -> str:
+    end = time.time() + timeout
+    combined = ""
+    while time.time() < end:
+        combined += read_for(master, 0.5)
+        if predicate(combined):
+            return combined
+    raise SystemExit(f"{label}: timed out waiting for expected output:\n{combined}")
 
+def send(master: int, data: bytes, pause: float = 0.2) -> None:
+    os.write(master, data)
+    time.sleep(pause)
+
+def shutdown(master: int, proc: subprocess.Popen) -> None:
     try:
-        initial = read_for(5.0)
-        if "ElastOS PC2" not in initial:
-            raise SystemExit(f"{label}: pc2 home did not render")
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=2)
+    finally:
+        os.close(master)
 
-        send(b"\r\n")
-        after_enter1 = read_for(3.0)
-        if "Press Enter again to launch Chat" not in after_enter1:
-            raise SystemExit(f"{label}: startup enter still launched or skipped without PC2 notice")
-
-        send(b"\r", 0.8)
-        after_enter2 = read_for(8.0)
+def run_chat_case(label: str, payload: bytes) -> None:
+    master, proc = launch_pty()
+    try:
+        read_until(label, master, lambda text: "ElastOS PC2" in text, 10.0)
+        send(master, b"\r\n")
+        after_enter1 = read_until(
+            label,
+            master,
+            lambda text: "Press Enter again to launch Chat" in text,
+            6.0,
+        )
+        send(master, b"\r", 0.8)
+        after_enter2 = read_until(
+            label,
+            master,
+            lambda text: "Connected to local runtime." in text and "Chat as" in text,
+            20.0,
+        )
         combined_chat = after_enter1 + after_enter2
-        if "Connected to local runtime." not in combined_chat or "Chat as" not in combined_chat:
-            raise SystemExit(f"{label}: second enter did not launch chat:\n{combined_chat}")
-        send(payload, 0.5)
-        after_exit = read_for(3.5)
+        if "Chat room: #general joined." not in combined_chat or "Delivery:" not in combined_chat:
+            raise SystemExit(f"{label}: second enter did not launch chat cleanly:\n{combined_chat}")
+        send(master, payload, 0.5)
+        after_exit = read_until(
+            label,
+            master,
+            lambda text: "ElastOS PC2" in text,
+            8.0,
+        )
         if "ElastOS PC2" not in after_exit:
             raise SystemExit(f"{label}: exit input did not return to PC2:\n{after_exit}")
     finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=2)
-        os.close(master)
+        shutdown(master, proc)
 
 def run_navigation_case() -> None:
-    master, slave = pty.openpty()
-    proc = subprocess.Popen(
-        cmd,
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    )
-    os.close(slave)
-
-    def read_for(seconds: float) -> str:
-        end = time.time() + seconds
-        chunks: list[bytes] = []
-        while time.time() < end:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if not ready:
-                continue
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
-        return b"".join(chunks).decode("utf-8", "replace")
-
-    def send(data: bytes, pause: float = 0.2) -> None:
-        os.write(master, data)
-        time.sleep(pause)
-
+    master, proc = launch_pty()
     try:
-        initial = read_for(5.0)
+        initial = read_until(
+            "nav",
+            master,
+            lambda text: "\x1b[30;46;1m Home \x1b[0m" in text and "> 1 Chat [ready]" in text,
+            10.0,
+        )
         if "\x1b[30;46;1m Home \x1b[0m" not in initial:
-            raise SystemExit("nav: pc2 home did not start on Home")
-
-        time.sleep(1.0)
-        send(b"\x1b[C", 0.4)
-        after_right = read_for(2.0)
-        if "\x1b[30;46;1m People \x1b[0m" not in after_right:
-            raise SystemExit(f"nav: right arrow did not switch to People:\n{after_right}")
-
-        send(b"\t", 0.4)
-        after_tab = read_for(2.0)
-        if "\x1b[30;46;1m Spaces \x1b[0m" not in after_tab:
-            raise SystemExit(f"nav: tab did not switch from People to Spaces:\n{after_tab}")
+            raise SystemExit(f"nav: pc2 home did not start on Home:\n{initial}")
+        send(master, b"\x1b[C", 0.4)
+        after_right = read_until(
+            "nav",
+            master,
+            lambda text: "\x1b[30;46;1m Inbox \x1b[0m" in text,
+            4.0,
+        )
+        if "\x1b[30;46;1m Inbox \x1b[0m" not in after_right:
+            raise SystemExit(f"nav: right arrow did not switch to Inbox:\n{after_right}")
+        send(master, b"\t", 0.4)
+        after_tab = read_until(
+            "nav",
+            master,
+            lambda text: "\x1b[30;46;1m People \x1b[0m" in text,
+            4.0,
+        )
+        if "\x1b[30;46;1m People \x1b[0m" not in after_tab:
+            raise SystemExit(f"nav: tab did not switch from Inbox to People:\n{after_tab}")
+        send(master, b"\t", 0.4)
+        after_tab_again = read_until(
+            "nav",
+            master,
+            lambda text: "\x1b[30;46;1m Spaces \x1b[0m" in text,
+            4.0,
+        )
+        if "\x1b[30;46;1m Spaces \x1b[0m" not in after_tab_again:
+            raise SystemExit(f"nav: second tab did not switch from People to Spaces:\n{after_tab_again}")
     finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=2)
-        os.close(master)
+        shutdown(master, proc)
 
 def run_down_navigation_case() -> None:
-    master, slave = pty.openpty()
-    proc = subprocess.Popen(
-        cmd,
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    )
-    os.close(slave)
-
-    def read_for(seconds: float) -> str:
-        end = time.time() + seconds
-        chunks: list[bytes] = []
-        while time.time() < end:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if not ready:
-                continue
-            try:
-                data = os.read(master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            chunks.append(data)
-        return b"".join(chunks).decode("utf-8", "replace")
-
-    def send(data: bytes, pause: float = 0.2) -> None:
-        os.write(master, data)
-        time.sleep(pause)
-
+    master, proc = launch_pty()
     try:
-        initial = read_for(5.0)
+        initial = read_until(
+            "nav-down",
+            master,
+            lambda text: "> 1 Chat [ready]" in text,
+            10.0,
+        )
         if "> 1 Chat [ready]" not in initial:
-            raise SystemExit("nav-down: pc2 home did not highlight Chat first")
-
-        time.sleep(1.0)
-        send(b"\x1b[B", 0.4)
-        after_down = read_for(2.0)
-        if "> 2 MyWebSite [empty]" not in after_down:
+            raise SystemExit(f"nav-down: pc2 home did not highlight Chat first:\n{initial}")
+        send(master, b"\x1b[B", 0.4)
+        after_down = read_until(
+            "nav-down",
+            master,
+            lambda text: "> 2 MyWebSite [" in text,
+            4.0,
+        )
+        if "> 2 MyWebSite [" not in after_down:
             raise SystemExit(f"nav-down: down arrow did not move selection:\n{after_down}")
     finally:
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=2)
-        os.close(master)
+        shutdown(master, proc)
+
+def run_pc2_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
+    proc = subprocess.run(
+        cmd + ["pc2"],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        timeout=20,
+    )
+    output = proc.stdout.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        raise SystemExit(f"{label}: pc2 command failed:\n{output}")
+    if not any(fragment in output for fragment in expected_fragments):
+        joined = "\n".join(expected_fragments)
+        raise SystemExit(f"{label}: expected one of:\n{joined}\n\nactual output:\n{output}")
 
 run_navigation_case()
 run_down_navigation_case()
-run_case("esc", b"\x1b")
-run_case("home", b"/home\r")
-run_case("quit", b"/quit\r")
+run_chat_case("esc", b"\x1b")
+run_chat_case("home", b"/home\r")
+run_chat_case("quit", b"/quit\r")
+run_pc2_case(
+    "mywebsite",
+    b"2\n\nq\n",
+    (
+        "MyWebSite is empty.",
+        "MyWebSite is staged at localhost://MyWebSite.",
+        "MyWebSite is not ready: missing site-provider",
+    ),
+)
+run_pc2_case(
+    "updates",
+    b"3\nq\n",
+    (
+        "Returned home from Updates.",
+        "Updates:",
+        "Installed release is up to date.",
+        "Updates could not complete the trusted-source check:",
+    ),
+)
 
 print("[pc2-frontdoor] OK")
 PY

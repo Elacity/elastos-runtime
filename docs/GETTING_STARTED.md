@@ -57,10 +57,10 @@ If you want to jump straight into chat without going through PC2 home:
 elastos chat --nick alice
 ```
 
-There is also a packaged IRC capsule path:
+There is also a packaged full-screen chat capsule path:
 
 ```bash
-elastos setup --profile irc
+elastos setup --profile chat
 elastos capsule chat --lifecycle interactive --interactive --config '{"nick":"alice"}'
 ```
 

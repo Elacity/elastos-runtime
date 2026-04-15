@@ -34,7 +34,7 @@ Rules:
 | RS-03 | PC2 front door works | `scripts/pc2-smoke.sh`, `scripts/pc2-frontdoor-smoke.sh`, `scripts/public-install-pc2-frontdoor-smoke.sh` | launch `elastos`, enter/exit Chat and MyWebSite, return home | `elastos` -> PC2 -> Chat/MyWebSite -> home | same as WSL |
 | RS-04 | Native chat works | `scripts/local-carrier-chat-smoke.sh` where applicable | open Chat locally, verify send/receive and `/home` / `/quit` | `elastos` -> Chat, exchange messages with Jetson | same as WSL |
 | RS-05 | Chat WASM works | `scripts/chat-wasm-local-smoke.sh`, `scripts/chat-wasm-native-interop-smoke.sh`, `scripts/shared-runtime-gossip-proof.sh` | run `elastos capsule chat-wasm --lifecycle interactive --interactive` or local dev path and exchange with native chat | n/a unless explicitly shipped there | n/a unless explicitly shipped there |
-| RS-06 | IRC microVM works | `scripts/irc-demo-local-smoke.sh` on KVM hosts, `scripts/public-install-irc-smoke.sh` as installed gate | source-local KVM proof if applicable | `elastos setup --profile irc`, then direct IRC and `Apps -> IRC` | same as WSL |
+| RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct full-screen chat and `Apps -> Full-screen Chat` | same as WSL |
 | RS-07 | MyWebSite is useful | covered partly by PC2 frontdoor smokes | preview opens, `Go public` gives URL, return to PC2 home | preview from PC2 works, notice is useful | same as WSL |
 | RS-08 | Shared is useful | `scripts/pc2-smoke.sh` and `scripts/command-smoke.sh` | `elastos shares list` returns meaningful state | open Shared from PC2 and confirm it is not misleading | same as WSL |
 | RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from PC2 or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed PC2, verify launch and usefulness | same as WSL |
@@ -164,28 +164,28 @@ Pass when:
 - lower-layer gossip proof passes
 - end-to-end native ↔ WASM smoke passes
 
-### RS-06 IRC microVM works
+### RS-06 Full-screen chat microVM works
 
 Automatic:
 ```bash
 cd <repo-root>
-bash scripts/public-install-irc-smoke.sh
+bash scripts/chat-demo-local-smoke.sh
 ```
 
 Manual on WSL and Jetson:
 ```bash
-elastos setup --profile irc
+elastos setup --profile chat
 elastos capsule chat --lifecycle interactive --interactive --config '{"nick":"<nick>"}'
 ```
 
 Also verify in PC2:
 1. `elastos`
-2. `Apps -> IRC`
+2. `Apps -> Full-screen Chat`
 3. Exchange a message with the other host
 
 Pass when:
-- direct IRC works
-- `Apps -> IRC` works
+- direct full-screen chat works
+- `Apps -> Full-screen Chat` works
 - microVM TUI is usable and returns home
 
 ### RS-07 MyWebSite is useful
@@ -296,14 +296,14 @@ just verify-release
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 elastos update
 elastos setup --profile pc2
-elastos setup --profile irc
+elastos setup --profile chat
 elastos
 ```
 
 Manual checks:
 - People / identity
 - Chat
-- IRC
+- Full-screen Chat
 - MyWebSite
 - Updates
 
@@ -313,13 +313,13 @@ Manual checks:
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 elastos update
 elastos setup --profile pc2
-elastos setup --profile irc
+elastos setup --profile chat
 elastos
 ```
 
 Manual checks:
 - People / identity
 - Chat
-- IRC
+- Full-screen Chat
 - MyWebSite
 - Updates

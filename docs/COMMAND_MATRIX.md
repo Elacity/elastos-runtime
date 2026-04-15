@@ -65,7 +65,7 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
 
 | Command | Policy needed | Notes |
 |---------|---------------|-------|
-| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. Starts/reuses a managed chat runtime on loopback. Packaged IRC/WASM surfaces launch through `elastos capsule ...`, not `elastos chat`. |
+| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. Starts/reuses a managed chat runtime on loopback. Packaged full-screen chat surfaces launch through `elastos capsule ...`, not `elastos chat`. |
 
 ### Operator Runtime (requires `elastos serve`)
 

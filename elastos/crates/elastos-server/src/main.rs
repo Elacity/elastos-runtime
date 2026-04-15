@@ -414,7 +414,7 @@ enum Commands {
 
     /// Install the default runtime profile or an explicit setup profile
     Setup {
-        /// Profile name. Default is `pc2`. Use `demo` for site/share/browser extras, or `irc` for the packaged microVM chat path.
+        /// Profile name. Default is `pc2`. Use `demo` for site/share/browser extras, or `chat` for the packaged full-screen chat path.
         #[arg(long)]
         profile: Option<String>,
 

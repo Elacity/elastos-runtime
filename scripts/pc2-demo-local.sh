@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6Mkf2nCJ1pcN4JioAxHEiyDsPC298QFtn2Dgg9tjt2ezHeK}"
+MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
 LAUNCH=1
 SKIP_BUILD=0
 DEMO_HOME="${ELASTOS_DEMO_HOME:-}"
@@ -31,13 +31,13 @@ Usage:
 
 What it does:
   1. Builds the repo-local elastos binary and pc2.wasm (unless --skip-build)
-  2. Builds a local IRC microVM chat bundle and stages it into the temp home
+  2. Builds a local full-screen chat microVM bundle and stages it into the temp home
   3. Installs into a clean temp home using the canonical maintainer DID + gateway
   4. Generates a local override manifest so `setup --profile demo` and
-     `setup --profile irc` can use the current source demo profile plus the
-     locally staged IRC bundle
+     `setup --profile chat` can use the current source demo profile plus the
+     locally staged chat bundle
   5. Reuses host-installed `crosvm` / `vmlinux` when available
-  6. Runs `setup --profile demo` and `setup --profile irc`
+  6. Runs `setup --profile demo` and `setup --profile chat`
   7. Stages a tiny MyWebSite demo page
   8. Launches repo-local `elastos` into PC2 (unless --prepare-only)
 
@@ -149,7 +149,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 || ! -f "$ROOT/artifacts/chat.capsule.tar.gz" ]]; then
-    echo "[pc2-demo-local] build IRC microVM bundle"
+    echo "[pc2-demo-local] build full-screen chat microVM bundle"
     host_shell bash "$ROOT/scripts/build/build-rootfs.sh" chat --output "$ROOT/artifacts"
 fi
 
@@ -164,7 +164,7 @@ ELASTOS_PUBLISHER_NODE_ID="$HOST_PUBLISHER_NODE_ID" \
 ELASTOS_IPNS_NAME="$HOST_IPNS_NAME" \
 bash "$ROOT/scripts/install.sh"
 
-echo "[pc2-demo-local] stage local IRC bundle"
+echo "[pc2-demo-local] stage local chat bundle"
 CHAT_ARTIFACT_RAW="$ROOT/artifacts/chat.capsule.tar.gz"
 CHAT_ARTIFACT_STAGE="$DEMO_HOME/.chat-artifact-stage"
 CHAT_ARTIFACT="$DEMO_HOME/chat-${SETUP_PLATFORM}.tar.gz"
@@ -252,7 +252,7 @@ chat_component.setdefault("version", "0.1.0")
 chat_component.setdefault("install_path", "capsules/chat")
 chat_component.setdefault(
     "description",
-    "Packaged IRC-style microVM chat bundle for the full-screen Carrier chat path",
+    "Packaged microVM chat bundle for the full-screen Carrier chat path",
 )
 chat_platforms = chat_component.setdefault("platforms", {})
 chat_platforms[setup_platform] = {
@@ -296,11 +296,11 @@ XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
 "$ROOT/elastos/target/debug/elastos" setup --profile demo
 
-echo "[pc2-demo-local] setup irc profile"
+echo "[pc2-demo-local] setup chat profile"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
-"$ROOT/elastos/target/debug/elastos" setup --profile irc
+"$ROOT/elastos/target/debug/elastos" setup --profile chat
 
 mkdir -p "$SITE_SRC"
 cat > "$SITE_SRC/index.html" <<'HTML'

@@ -23,8 +23,8 @@ What it does:
   2. Starts a repo-local operator runtime
   3. Launches the explicit WASM chat target from capsules/chat-wasm
 
-This is the explicit local/dev path for the WASM IRC/chat target.
-It is not the shipping IRC microVM path.
+This is the explicit local/dev path for the WASM chat target.
+It is not the shipping microVM chat path.
 EOF
 }
 

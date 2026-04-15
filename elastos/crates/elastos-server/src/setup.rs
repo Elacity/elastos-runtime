@@ -119,8 +119,34 @@ pub async fn run(
     });
 
     if profile.is_none() && with.is_empty() {
-        println!("Using default setup profile: {}", DEFAULT_SETUP_PROFILE);
+        println!(
+            "Using default setup profile: {} (managed PC2 home + native Carrier chat).",
+            DEFAULT_SETUP_PROFILE
+        );
+        println!("Use `--profile demo` for site/share/browser demo surfaces.");
+        println!("Use `--profile chat` for the packaged microVM chat path.");
+        println!("Use `--profile operator` for explicit serve/node/run/agent flows.");
         println!();
+    } else if let Some(selected_profile) = selected_profile {
+        match selected_profile {
+            "pc2" => {
+                println!("Selected profile: pc2 (managed PC2 home + native Carrier chat)");
+                println!();
+            }
+            "demo" => {
+                println!("Selected profile: demo (PC2 + site/share/browser demo surfaces)");
+                println!();
+            }
+            "chat" => {
+                println!("Selected profile: chat (packaged microVM chat on a KVM-capable host)");
+                println!();
+            }
+            "operator" => {
+                println!("Selected profile: operator (explicit serve/node/run/agent runtime)");
+                println!();
+            }
+            _ => {}
+        }
     }
 
     let components = resolve_components(&manifest, selected_profile, &with, &without)?;
@@ -234,11 +260,7 @@ pub async fn run(
             let dest = data_dir.join(install_path);
             println!("[install] {} — copying from {}", name, source.display());
             atomic_copy_file(&source, &dest)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o644));
-            }
+            set_local_copy_permissions(&source, &dest);
             maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
             println!("  Installed: {}", dest.display());
             installed_count += 1;
@@ -329,6 +351,20 @@ fn data_dir() -> anyhow::Result<PathBuf> {
             PathBuf::from(home).join(".local/share/elastos")
         });
     Ok(dir)
+}
+
+fn set_local_copy_permissions(source: &Path, dest: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = match fs::metadata(source) {
+            Ok(metadata) if metadata.permissions().mode() & 0o111 != 0 => 0o755,
+            Ok(_) => 0o644,
+            Err(_) => 0o644,
+        };
+        let _ = fs::set_permissions(dest, fs::Permissions::from_mode(mode));
+    }
 }
 
 // ── Platform detection ──────────────────────────────────────────────
@@ -887,7 +923,17 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     }
 
     println!();
-    print_profile_section("Recommended profiles:", manifest, &["pc2", "demo", "irc"]);
+    println!("Quick start:");
+    println!("  elastos setup                # default pc2 profile");
+    println!("  elastos setup --profile demo # pc2 + site/share/browser demo surfaces");
+    println!("  elastos setup --profile chat # packaged full-screen chat");
+    println!("  elastos setup --profile operator # explicit serve/node/run/agent runtime");
+    println!();
+    print_profile_section(
+        "Recommended profiles:",
+        manifest,
+        &["pc2", "demo", "chat", "operator"],
+    );
     print_profile_section(
         "Advanced profiles:",
         manifest,
@@ -897,7 +943,8 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     let listed = [
         "pc2",
         "demo",
-        "irc",
+        "chat",
+        "operator",
         "minimal",
         "public-gateway",
         "agent-local-ai",
@@ -987,11 +1034,7 @@ fn resolve_components(
 }
 
 fn normalize_profile_name(name: &str) -> &str {
-    match name {
-        "chat" => DEFAULT_SETUP_PROFILE,
-        "focus-chat" | "immersive-chat" => "irc",
-        other => other,
-    }
+    name
 }
 
 // ── Elastos fetch-path resolution ──────────────────────────────────
@@ -1107,11 +1150,7 @@ pub async fn refresh_installed_components_for_update(
                 continue;
             }
             atomic_copy_file(&source, &dest)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o644));
-            }
+            set_local_copy_permissions(&source, &dest);
             refreshed.push(name.clone());
             continue;
         }
@@ -1654,15 +1693,15 @@ mod tests {
 
         assert!(manifest.external.contains_key("kubo"));
         assert!(manifest.profiles.contains_key("pc2"));
-        assert!(manifest.profiles.contains_key("irc"));
+        assert!(manifest.profiles.contains_key("chat"));
+        assert!(manifest.profiles.contains_key("operator"));
         assert!(manifest.profiles.contains_key("full"));
     }
 
     #[test]
-    fn test_normalize_irc_profile_aliases() {
-        assert_eq!(normalize_profile_name("focus-chat"), "irc");
-        assert_eq!(normalize_profile_name("immersive-chat"), "irc");
-        assert_eq!(normalize_profile_name("irc"), "irc");
+    fn test_normalize_profile_name_preserves_chat_profile() {
+        assert_eq!(normalize_profile_name("chat"), "chat");
+        assert_eq!(normalize_profile_name("pc2"), "pc2");
     }
 
     #[test]
@@ -2088,6 +2127,24 @@ mod tests {
 
         let result = verify_installed_component_binary(data_dir, "vmlinux", &install_path).unwrap();
         assert!(result.starts_with("sha256:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_copy_permissions_preserve_executability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source-bin");
+        let dest = tmp.path().join("dest-bin");
+        fs::write(&source, b"binary").unwrap();
+        fs::write(&dest, b"binary").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+
+        set_local_copy_permissions(&source, &dest);
+
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

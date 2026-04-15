@@ -206,7 +206,7 @@
     },
     "chat": {
       "install_path": "capsules/chat",
-      "description": "Packaged IRC-style microVM chat bundle for the full-screen Carrier chat path",
+      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -228,7 +228,7 @@
     },
     "chat-wasm": {
       "install_path": "capsules/chat-wasm",
-      "description": "Packaged WASM IRC bundle for the non-KVM full-screen Carrier chat path",
+      "description": "Packaged WASM chat bundle for the non-KVM full-screen Carrier chat path",
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -374,6 +374,28 @@
         }
       }
     },
+    "room-browser": {
+      "install_path": "capsules/room-browser",
+      "description": "Hosted browser capsule for the sovereign room service",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "room-browser-linux-amd64.tar.gz",
+          "extract_path": "room-browser",
+          "install_path": "capsules/room-browser"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "room-browser-linux-arm64.tar.gz",
+          "extract_path": "room-browser",
+          "install_path": "capsules/room-browser"
+        }
+      }
+    },
     "crosvm": {
       "install_path": "bin/crosvm",
       "description": "crosvm VM monitor required for capsule microVM execution",
@@ -506,7 +528,7 @@
       ]
     },
     "demo": {
-      "description": "PC2 demo path with native chat, IRC, site, sharing, and browser capsule surfaces",
+      "description": "PC2 demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
       "components": [
         "shell",
         "localhost-provider",
@@ -517,18 +539,17 @@
         "chat-wasm",
         "gba-emulator",
         "gba-ucity",
+        "room-browser",
         "site-provider",
         "tunnel-provider",
         "cloudflared",
         "kubo",
         "ipfs-provider",
-        "md-viewer",
-        "crosvm",
-        "vmlinux"
+        "md-viewer"
       ]
     },
-    "irc": {
-      "description": "Packaged IRC-style microVM chat on a KVM-capable host",
+    "chat": {
+      "description": "Packaged full-screen microVM chat on a KVM-capable host",
       "components": [
         "shell",
         "localhost-provider",
@@ -536,6 +557,14 @@
         "chat",
         "crosvm",
         "vmlinux"
+      ]
+    },
+    "operator": {
+      "description": "Explicit operator runtime for serve, node, run, and agent flows",
+      "components": [
+        "shell",
+        "localhost-provider",
+        "did-provider"
       ]
     },
     "agent-local-ai": {
@@ -581,6 +610,7 @@
         "chat-wasm",
         "gba-emulator",
         "gba-ucity",
+        "room-browser",
         "ipfs-provider",
         "site-provider",
         "tunnel-provider",

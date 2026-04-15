@@ -64,7 +64,7 @@ while time.time() < deadline:
             break
         captured.extend(chunk)
         text = captured.decode("utf-8", errors="ignore")
-        if "ElastOS IRC v" in text and "smoke | #general" in text and not quit_sent:
+        if "ElastOS Chat v" in text and "smoke | #general" in text and not quit_sent:
             os.write(master, b"/quit\r")
             quit_sent = True
             banner_seen = True
@@ -86,7 +86,7 @@ finally:
         fh.write(captured)
 
 if not banner_seen:
-    sys.stderr.write("[chat-wasm-local-smoke] did not observe IRC banner before timeout\n")
+    sys.stderr.write("[chat-wasm-local-smoke] did not observe chat banner before timeout\n")
     sys.exit(1)
 
 if proc.returncode not in (0, None):
@@ -101,8 +101,8 @@ fi
 
 grep -q "launch explicit WASM chat target" "$OUTPUT_LOG" \
     || { echo "[chat-wasm-local-smoke] missing launch marker" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
-grep -q "ElastOS IRC v" "$OUTPUT_LOG" \
-    || { echo "[chat-wasm-local-smoke] missing IRC banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
+grep -q "ElastOS Chat v" "$OUTPUT_LOG" \
+    || { echo "[chat-wasm-local-smoke] missing chat banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
 grep -q "smoke | #general" "$OUTPUT_LOG" \
     || { echo "[chat-wasm-local-smoke] missing explicit nick in chat banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
 

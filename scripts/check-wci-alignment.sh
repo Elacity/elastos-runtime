@@ -101,7 +101,7 @@ check_forbidden 'localhost://storage' 'legacy single-root localhost contract'
 check_forbidden 'Local/PC2' 'legacy PC2 local session path'
 check_forbidden 'join\("Local"\)\.join\("PC2"\)' 'legacy PC2 local session join path'
 check_forbidden 'site stage\|list\|path\|serve' 'stale site command claim including removed list subcommand'
-check_forbidden 'setup --profile chat' 'legacy setup profile guidance'
+check_forbidden 'setup --profile irc' 'legacy setup profile guidance'
 check_forbidden 'Start runtime:[[:space:]]+elastos serve' 'legacy install banner runtime hint'
 check_forbidden 'Using publisher gateway' 'setup/update should not present publisher gateway as default ElastOS transport'
 check_forbidden 'Checking publisher gateway' 'update should not default to publisher gateway transport'
@@ -212,12 +212,12 @@ missing_demo = sorted(required_demo.difference(demo_components))
 if missing_demo:
     print("[alignment] demo profile missing required demo components:", ", ".join(missing_demo))
     sys.exit(1)
-irc = components["profiles"].get("irc")
-if not irc:
-    print("[alignment] irc profile is missing")
+chat = components["profiles"].get("chat")
+if not chat:
+    print("[alignment] chat profile is missing")
     sys.exit(1)
-irc_components = set(irc["components"])
-required_irc = {
+chat_components = set(chat["components"])
+required_chat = {
     "shell",
     "localhost-provider",
     "did-provider",
@@ -225,14 +225,14 @@ required_irc = {
     "crosvm",
     "vmlinux",
 }
-missing_irc = sorted(required_irc.difference(irc_components))
-if missing_irc:
-    print("[alignment] irc profile missing required IRC components:", ", ".join(missing_irc))
+missing_chat = sorted(required_chat.difference(chat_components))
+if missing_chat:
+    print("[alignment] chat profile missing required microVM chat components:", ", ".join(missing_chat))
     sys.exit(1)
-forbidden_irc = {"kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared"}
-bad_irc = sorted(forbidden_irc.intersection(irc_components))
-if bad_irc:
-    print("[alignment] irc profile includes non-IRC transport/public components:", ", ".join(bad_irc))
+forbidden_chat = {"kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared"}
+bad_chat = sorted(forbidden_chat.intersection(chat_components))
+if bad_chat:
+    print("[alignment] chat profile includes non-chat transport/public components:", ", ".join(bad_chat))
     sys.exit(1)
 webspace_component = components["external"].get("webspace-provider")
 if not webspace_component:

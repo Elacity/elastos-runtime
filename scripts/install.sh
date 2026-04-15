@@ -167,16 +167,127 @@ sha256_check() {
     local file="$1"
     local expected="$2"
     local actual
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$file" | cut -d' ' -f1)
-    elif command -v shasum &>/dev/null; then
-        actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
-    else
-        die "Neither sha256sum nor shasum found"
-    fi
+    actual=$(sha256_file "$file")
     if [[ "$actual" != "$expected" ]]; then
         die "SHA-256 mismatch!\n  Expected: ${expected}\n  Got:      ${actual}"
     fi
+}
+
+sha256_file() {
+    local file="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    else
+        die "Neither sha256sum nor shasum found"
+    fi
+}
+
+stop_stale_runtime_if_needed() {
+    local coords_path="$1"
+    local label="$2"
+    local expected_sha="$3"
+    local pid=""
+    local running_sha=""
+
+    [[ -f "$coords_path" ]] || return 0
+
+    read -r pid running_sha < <(python3 - "$coords_path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    sys.exit(0)
+pid = data.get("pid", "")
+sha = data.get("binary_sha256", "")
+print(f"{pid} {sha}")
+PY
+    )
+
+    if [[ -z "$pid" ]]; then
+        rm -f "$coords_path"
+        return 0
+    fi
+
+    if [[ ! -d "/proc/${pid}" ]]; then
+        rm -f "$coords_path"
+        return 0
+    fi
+
+    if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
+        return 0
+    fi
+
+    info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
+    kill "${pid}" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [[ ! -d "/proc/${pid}" ]] && break
+        sleep 0.2
+    done
+    if [[ -d "/proc/${pid}" ]]; then
+        kill -9 "${pid}" 2>/dev/null || true
+    fi
+    rm -f "$coords_path"
+}
+
+stop_stale_installed_elastos_processes() {
+    local label="$1"
+    local expected_sha="$2"
+    shift 2
+    local binary="${INSTALL_DIR}/elastos"
+    local pid=""
+    local running_sha=""
+
+    [[ -x "$binary" ]] || return 0
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        [[ -d "/proc/${pid}" ]] || continue
+        running_sha=$(sha256_file "/proc/${pid}/exe" 2>/dev/null || true)
+        if [[ -n "$running_sha" && "$running_sha" == "$expected_sha" ]]; then
+            continue
+        fi
+        info "Stopping stale ${label} (pid ${pid}) so the new install starts cleanly"
+        kill "${pid}" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [[ ! -d "/proc/${pid}" ]] && break
+            sleep 0.2
+        done
+        if [[ -d "/proc/${pid}" ]]; then
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+    done < <(python3 - "$binary" "$@" <<'PY'
+import os
+import sys
+
+binary = os.path.realpath(sys.argv[1])
+expected_args = sys.argv[2:]
+
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except Exception:
+        continue
+    raw = [item.decode("utf-8", "ignore") for item in raw if item]
+    if not raw:
+        continue
+    try:
+        exe = os.path.realpath(raw[0])
+    except Exception:
+        continue
+    if exe != binary:
+        continue
+    if raw[1:1 + len(expected_args)] == expected_args:
+        print(pid)
+PY
+    )
 }
 
 # Fetch a CID from IPFS gateways (tries each in order)
@@ -617,6 +728,11 @@ fi
 
 info "Installing components.json to ${DATA_DIR}/..."
 cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
+
+stop_stale_runtime_if_needed "${DATA_DIR}/runtime-coords.json" "runtime" "${BINARY_SHA256}"
+stop_stale_runtime_if_needed "${DATA_DIR}/pc2-runtime-coords.json" "PC2 runtime" "${BINARY_SHA256}"
+stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room open
+stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
 # ── Save Carrier contact + release metadata for `elastos upgrade` ────
 

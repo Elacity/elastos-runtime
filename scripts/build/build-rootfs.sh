@@ -15,6 +15,27 @@ die() { echo "Error: $*" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+default_elastos_data_dir() {
+    if [ -n "${ELASTOS_HOST_DATA_DIR:-}" ]; then
+        printf '%s\n' "${ELASTOS_HOST_DATA_DIR}"
+        return
+    fi
+    if [ -n "${ELASTOS_DATA_DIR:-}" ]; then
+        printf '%s\n' "${ELASTOS_DATA_DIR}"
+        return
+    fi
+    if [ -n "${XDG_DATA_HOME:-}" ]; then
+        printf '%s\n' "${XDG_DATA_HOME%/}/elastos"
+        return
+    fi
+
+    local host_home="${HOME}"
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        host_home="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+    fi
+    printf '%s\n' "${host_home}/.local/share/elastos"
+}
+
 CAPSULE_NAME="${1:?Usage: build-rootfs.sh <capsule-name> [--target <rust-target>] [--output <dir>] [--skip-compile]}"
 OUTPUT_DIR="${PROJECT_ROOT}/artifacts"
 CROSS_TARGET=""
@@ -100,9 +121,6 @@ else
     esac
 fi
 
-# Cross-compilation asset cache (populated by publish-release.sh --cross).
-CROSS_CACHE_DIR="${HOME}/.local/share/elastos/cross/${TARGET_ARCH}"
-
 # ── Resolve cargo target-dir from workspace config ────────────────
 CARGO_TARGET_DIR=""
 if [[ -f "${PROJECT_ROOT}/elastos/.cargo/config.toml" ]]; then
@@ -113,13 +131,11 @@ fi
 COMPONENTS_JSON="${PROJECT_ROOT}/components.json"
 [ -f "${COMPONENTS_JSON}" ] || die "components.json not found at ${COMPONENTS_JSON}"
 
-# Source of external dependencies on host. Prefer the invoking user's data dir
-# when running via sudo so we reuse artifacts from `elastos setup`.
-HOST_HOME="${HOME}"
-if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-    HOST_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
-fi
-HOST_DATA_DIR="${ELASTOS_HOST_DATA_DIR:-${HOST_HOME}/.local/share/elastos}"
+# Source of external dependencies and cross assets. Resolve one canonical
+# ElastOS data dir so publish/setup/rootfs flows do not disagree on where
+# support binaries live when XDG_DATA_HOME is set.
+HOST_DATA_DIR="$(default_elastos_data_dir)"
+CROSS_CACHE_DIR="${HOST_DATA_DIR}/cross/${TARGET_ARCH}"
 
 # ── Build the capsule binary (static-linked via musl — required for VM rootfs) ─
 if [ "$SKIP_COMPILE" = true ]; then

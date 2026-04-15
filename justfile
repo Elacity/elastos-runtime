@@ -49,7 +49,7 @@ fmt:
 # Pre-commit gate: alignment, smoke tests, fmt/lint/test
 verify:
     just alignment-check
-    just pc2-smoke
+    just local-carrier-setup-smoke
     ./scripts/command-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
@@ -65,21 +65,17 @@ verify-release:
 alignment-check:
     ./scripts/check-wci-alignment.sh
 
-# Scripted PC2 home behavior smoke
-pc2-smoke:
-    ./scripts/pc2-smoke.sh
-
 # Real-PTY source proof: current target-built elastos + current pc2.wasm against clean-home data
 pc2-frontdoor-smoke:
     ./scripts/pc2-frontdoor-smoke.sh
 
+# Clean-home setup proof for the current local trusted-source path
+local-carrier-setup-smoke:
+    ./scripts/local-carrier-setup-smoke.sh
+
 # Prepare and launch a clean temp-home local PC2 demo from source
 pc2-demo-local *args:
     ./scripts/pc2-demo-local.sh {{args}}
-
-# Local Carrier-only setup smoke against a staged local trusted source
-local-carrier-setup-smoke:
-    ./scripts/local-carrier-setup-smoke.sh
 
 # Audit an installed-style elastos binary on a clean home
 installed-command-audit bin="":

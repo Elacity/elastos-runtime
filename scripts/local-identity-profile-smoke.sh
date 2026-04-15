@@ -7,7 +7,7 @@ DEFAULT_ELASTOS_BIN="${ROOT}/elastos/target/debug/elastos"
 ELASTOS_BIN="${ELASTOS_BIN:-${DEFAULT_ELASTOS_BIN}}"
 HOME_DIR="${ELASTOS_LOCAL_IDENTITY_HOME:-$(mktemp -d /tmp/elastos-local-identity-XXXXXX)}"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6Mkf2nCJ1pcN4JioAxHEiyDsPC298QFtn2Dgg9tjt2ezHeK}"
+MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
 SOURCE_COMPONENTS_MANIFEST="${ROOT}/components.json"
 OPERATOR_HOME="${HOME}"
 SKIP_BUILD=0
@@ -24,7 +24,7 @@ What it proves:
   3. DID nickname set/get/show
   4. PC2 status snapshot reflects the same nickname
   5. `chat` defaults to the DID nickname
-  6. `codex` resolves to a persona DID distinct from the root DID
+  6. a named agent persona resolves to a DID distinct from the root DID
 EOF
 }
 

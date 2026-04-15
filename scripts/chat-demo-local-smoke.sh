@@ -2,19 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEST_HOME="${ELASTOS_IRC_LOCAL_SMOKE_HOME:-$(mktemp -d /tmp/elastos-irc-local-smoke-XXXXXX)}"
-OUTPUT_LOG="${TEST_HOME}/irc-demo.log"
+TEST_HOME="${ELASTOS_CHAT_LOCAL_SMOKE_HOME:-$(mktemp -d /tmp/elastos-chat-local-smoke-XXXXXX)}"
+OUTPUT_LOG="${TEST_HOME}/chat-demo.log"
 SKIP_BUILD=0
 
 usage() {
     cat <<'EOF'
 Usage:
-  bash scripts/irc-demo-local-smoke.sh
-  bash scripts/irc-demo-local-smoke.sh --skip-build
+  bash scripts/chat-demo-local-smoke.sh
+  bash scripts/chat-demo-local-smoke.sh --skip-build
 
 What it proves:
-  1. Runs the source-local packaged IRC microVM path on a KVM-capable host
-  2. Observes the full-screen IRC banner in a real PTY
+  1. Runs the source-local packaged full-screen chat microVM path on a KVM-capable host
+  2. Observes the full-screen chat banner in a real PTY
   3. Exits cleanly via /quit
 
 This is the source/KVM proof for WSL or another KVM-capable Linux host.
@@ -40,8 +40,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ! -e /dev/kvm ]]; then
-    echo "[irc-demo-local-smoke] /dev/kvm is not available on this host." >&2
-    echo "[irc-demo-local-smoke] Run this smoke on WSL or another KVM-capable Linux host." >&2
+    echo "[chat-demo-local-smoke] /dev/kvm is not available on this host." >&2
+    echo "[chat-demo-local-smoke] Run this smoke on WSL or another KVM-capable Linux host." >&2
     exit 2
 fi
 
@@ -50,7 +50,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[irc-demo-local-smoke] home: ${TEST_HOME}"
+echo "[chat-demo-local-smoke] home: ${TEST_HOME}"
 
 if ! ROOT="$ROOT" TEST_HOME="$TEST_HOME" OUTPUT_LOG="$OUTPUT_LOG" SKIP_BUILD="$SKIP_BUILD" \
     timeout 240 python3 - <<'PY'
@@ -69,7 +69,7 @@ skip_build = os.environ["SKIP_BUILD"] == "1"
 
 cmd = [
     "bash",
-    "scripts/irc-demo-local.sh",
+    "scripts/chat-demo-local.sh",
     "--home",
     test_home,
     "--nick",
@@ -108,7 +108,7 @@ while time.time() < deadline:
             break
         captured.extend(chunk)
         text = captured.decode("utf-8", errors="ignore")
-        if "ElastOS IRC v" in text and "smoke | #general" in text and not quit_sent:
+        if "ElastOS Chat v" in text and "smoke | #general" in text and not quit_sent:
             os.write(master, b"/quit\r")
             quit_sent = True
             banner_seen = True
@@ -130,24 +130,24 @@ finally:
         fh.write(captured)
 
 if not banner_seen:
-    sys.stderr.write("[irc-demo-local-smoke] did not observe IRC banner before timeout\n")
+    sys.stderr.write("[chat-demo-local-smoke] did not observe chat banner before timeout\n")
     sys.exit(1)
 
 if proc.returncode not in (0, None):
-    sys.stderr.write(f"[irc-demo-local-smoke] unexpected exit code: {proc.returncode}\n")
+    sys.stderr.write(f"[chat-demo-local-smoke] unexpected exit code: {proc.returncode}\n")
     sys.exit(1)
 PY
 then
-    echo "[irc-demo-local-smoke] launch failed. Output:" >&2
+    echo "[chat-demo-local-smoke] launch failed. Output:" >&2
     cat "$OUTPUT_LOG" >&2
     exit 1
 fi
 
-grep -q "launch IRC microVM chat" "$OUTPUT_LOG" \
-    || { echo "[irc-demo-local-smoke] missing microVM launch marker" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
-grep -q "ElastOS IRC v" "$OUTPUT_LOG" \
-    || { echo "[irc-demo-local-smoke] missing IRC banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
+grep -q "launch full-screen chat microVM" "$OUTPUT_LOG" \
+    || { echo "[chat-demo-local-smoke] missing microVM launch marker" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
+grep -q "ElastOS Chat v" "$OUTPUT_LOG" \
+    || { echo "[chat-demo-local-smoke] missing chat banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
 grep -q "smoke | #general" "$OUTPUT_LOG" \
-    || { echo "[irc-demo-local-smoke] missing explicit nick in IRC banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
+    || { echo "[chat-demo-local-smoke] missing explicit nick in chat banner" >&2; cat "$OUTPUT_LOG" >&2; exit 1; }
 
-echo "[irc-demo-local-smoke] pass"
+echo "[chat-demo-local-smoke] pass"

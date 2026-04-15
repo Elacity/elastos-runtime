@@ -2,17 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEMO_HOME="${ELASTOS_DEMO_HOME:-/tmp/elastos-irc-demo}"
+DEMO_HOME="${ELASTOS_DEMO_HOME:-/tmp/elastos-chat-demo}"
 SKIP_BUILD=0
-NICK="${ELASTOS_IRC_NICK:-demo}"
+NICK="${ELASTOS_CHAT_NICK:-demo}"
 
 usage() {
     cat <<'EOF'
 Usage:
-  bash scripts/irc-demo-local.sh
-  bash scripts/irc-demo-local.sh --skip-build
-  bash scripts/irc-demo-local.sh --home /tmp/elastos-irc-demo
-  bash scripts/irc-demo-local.sh --nick demo
+  bash scripts/chat-demo-local.sh
+  bash scripts/chat-demo-local.sh --skip-build
+  bash scripts/chat-demo-local.sh --home /tmp/elastos-chat-demo
+  bash scripts/chat-demo-local.sh --nick demo
 
 What it does:
   1. Prepares a clean local temp-home via pc2-demo-local.sh
@@ -54,17 +54,17 @@ if [[ "$SKIP_BUILD" -eq 1 ]]; then
     PREP_ARGS+=(--skip-build)
 fi
 
-echo "[irc-demo-local] prepare local demo home"
+echo "[chat-demo-local] prepare local demo home"
 bash "$ROOT/scripts/pc2-demo-local.sh" "${PREP_ARGS[@]}"
 
 if [[ ! -e /dev/kvm ]]; then
-    echo "[irc-demo-local] /dev/kvm is not available on this host." >&2
-    echo "[irc-demo-local] IRC microVM proof requires a KVM-capable Linux host." >&2
+    echo "[chat-demo-local] /dev/kvm is not available on this host." >&2
+    echo "[chat-demo-local] Full-screen chat microVM proof requires a KVM-capable Linux host." >&2
     exit 2
 fi
 
 echo
-echo "[irc-demo-local] launch IRC microVM chat"
+echo "[chat-demo-local] launch full-screen chat microVM"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$DEMO_HOME/xdg-data" \
 ELASTOS_DATA_DIR="$DEMO_HOME/xdg-data/elastos" \

@@ -34,11 +34,57 @@ s.close()
 PY
 )"
 
-cleanup() {
-    if [[ -n "${SERVE_PID:-}" ]] && kill -0 "${SERVE_PID}" 2>/dev/null; then
-        kill "${SERVE_PID}" 2>/dev/null || true
-        wait "${SERVE_PID}" 2>/dev/null || true
+stop_source_runtime() {
+    if [[ -z "${SERVE_PID:-}" ]]; then
+        rm -f "${RUNTIME_COORDS:-}"
+        return 0
     fi
+
+    if ! kill -0 "${SERVE_PID}" 2>/dev/null; then
+        wait "${SERVE_PID}" 2>/dev/null || true
+        rm -f "${RUNTIME_COORDS:-}"
+        unset SERVE_PID
+        return 0
+    fi
+
+    kill -- "-${SERVE_PID}" 2>/dev/null || kill "${SERVE_PID}" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        if ! kill -0 "${SERVE_PID}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if kill -0 "${SERVE_PID}" 2>/dev/null; then
+        kill -KILL -- "-${SERVE_PID}" 2>/dev/null || kill -KILL "${SERVE_PID}" 2>/dev/null || true
+    fi
+    rm -f "${RUNTIME_COORDS:-}"
+    unset SERVE_PID
+}
+
+kill_temp_processes() {
+    local root="$1"
+    local skip_pid="${2:-}"
+    mapfile -t pids < <(pgrep -f "$root" || true)
+    for pid in "${pids[@]}"; do
+        [[ "$pid" == "$$" ]] && continue
+        [[ -n "${skip_pid}" && "$pid" == "${skip_pid}" ]] && continue
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+    for pid in "${pids[@]}"; do
+        [[ "$pid" == "$$" ]] && continue
+        [[ -n "${skip_pid}" && "$pid" == "${skip_pid}" ]] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    return 0
+}
+
+cleanup() {
+    stop_source_runtime
+    kill_temp_processes "${TEST_ROOT}"
+    return 0
 }
 trap cleanup EXIT
 
@@ -132,12 +178,36 @@ PY
 echo "[local-carrier-setup] staged local artifacts into ${ARTIFACTS_DIR}"
 
 mkdir -p "${DATA_DIR}"
-(
-    cd "${ELASTOS_ROOT}"
+SERVE_PID="$(
+    ELASTOS_ROOT="${ELASTOS_ROOT}" \
+    ELASTOS_BIN="${ELASTOS_BIN}" \
     XDG_DATA_HOME="${XDG_DATA_HOME}" \
-    "${ELASTOS_BIN}" serve --addr "127.0.0.1:${API_PORT}" >"${LOG_PATH}" 2>&1
-) &
-SERVE_PID=$!
+    API_PORT="${API_PORT}" \
+    LOG_PATH="${LOG_PATH}" \
+    python3 - <<'PY'
+import os
+import subprocess
+
+env = os.environ.copy()
+with open(os.environ["LOG_PATH"], "ab") as log:
+    proc = subprocess.Popen(
+        [
+            os.environ["ELASTOS_BIN"],
+            "serve",
+            "--addr",
+            f'127.0.0.1:{os.environ["API_PORT"]}',
+        ],
+        cwd=os.environ["ELASTOS_ROOT"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+        close_fds=True,
+    )
+print(proc.pid)
+PY
+)"
 
 RUNTIME_COORDS="${DATA_DIR}/runtime-coords.json"
 for _ in $(seq 1 60); do
@@ -254,6 +324,8 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \
     "${ELASTOS_BIN}" setup
 )
+
+stop_source_runtime
 
 for installed in \
     "${DATA_DIR}/bin/shell" \
