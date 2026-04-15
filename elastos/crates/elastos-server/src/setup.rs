@@ -324,7 +324,11 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
         // Installed layout
         dirs::data_dir().map(|d| d.join("elastos/components.json")),
         // Exe-relative (release tarball)
-        exe_path.and_then(|p| p.parent().map(|d| d.join("components.json"))),
+        exe_path
+            .as_deref()
+            .and_then(|p| p.parent().map(|d| d.join("components.json"))),
+        // Source checkout layout: <repo>/elastos/target/{debug,release}/elastos
+        exe_path.as_deref().and_then(source_checkout_manifest_path),
     ];
 
     for path in installed_paths.iter().flatten() {
@@ -336,11 +340,7 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
         }
     }
 
-    anyhow::bail!(
-        "components.json not found. Searched:\n  \
-         ~/.local/share/elastos/components.json\n  \
-         <exe-dir>/components.json"
-    )
+    anyhow::bail!("{}", missing_manifest_message())
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
@@ -351,6 +351,47 @@ fn data_dir() -> anyhow::Result<PathBuf> {
             PathBuf::from(home).join(".local/share/elastos")
         });
     Ok(dir)
+}
+
+fn source_checkout_manifest_path(exe_path: &Path) -> Option<PathBuf> {
+    let exe_dir = exe_path.parent()?;
+    let parent = exe_dir.parent()?;
+    let grandparent = parent.parent()?;
+    let great_grandparent = grandparent.parent()?;
+
+    if parent.file_name()?.to_str()? == "target" && grandparent.file_name()?.to_str()? == "elastos"
+    {
+        return Some(great_grandparent.join("components.json"));
+    }
+
+    if exe_dir.file_name()?.to_str()? == "deps"
+        && grandparent.file_name()?.to_str()? == "target"
+        && great_grandparent.file_name()?.to_str()? == "elastos"
+    {
+        return Some(great_grandparent.parent()?.join("components.json"));
+    }
+
+    None
+}
+
+fn missing_manifest_message() -> String {
+    "components.json not found. Searched:\n  \
+     ~/.local/share/elastos/components.json\n  \
+     <exe-dir>/components.json\n  \
+     <source-checkout>/components.json\n\n\
+     Source-built binaries are not self-contained installs.\n\
+     Use the published installer, run the binary from the repo checkout,\n\
+     or place components.json next to the binary or in ~/.local/share/elastos/."
+        .to_string()
+}
+
+fn missing_trusted_source_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "No trusted source configured.\n\
+         `elastos setup` installs first-party artifacts from a trusted source over Carrier.\n\
+         For a published install, run the stamped installer first.\n\
+         For a source checkout, create your own trusted source or add one with `elastos source add ...`."
+    )
 }
 
 fn set_local_copy_permissions(source: &Path, dest: &Path) {
@@ -1217,7 +1258,7 @@ pub(crate) async fn fetch_first_party_component_via_carrier(
     let source = crate::sources::load_trusted_sources(data_dir)?
         .default_source()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("No trusted source configured"))?;
+        .ok_or_else(missing_trusted_source_error)?;
     crate::carrier::fetch_file_from_trusted_source(&source, release_path, 15, 30).await
 }
 
@@ -1702,6 +1743,41 @@ mod tests {
     fn test_normalize_profile_name_preserves_chat_profile() {
         assert_eq!(normalize_profile_name("chat"), "chat");
         assert_eq!(normalize_profile_name("pc2"), "pc2");
+    }
+
+    #[test]
+    fn test_source_checkout_manifest_path_from_release_binary_layout() {
+        let path = PathBuf::from("/tmp/elastos-runtime/elastos/target/release/elastos");
+        let manifest = source_checkout_manifest_path(&path).unwrap();
+        assert_eq!(
+            manifest,
+            PathBuf::from("/tmp/elastos-runtime/components.json")
+        );
+    }
+
+    #[test]
+    fn test_source_checkout_manifest_path_from_test_binary_layout() {
+        let path = PathBuf::from("/tmp/elastos-runtime/elastos/target/debug/deps/elastos-server");
+        let manifest = source_checkout_manifest_path(&path).unwrap();
+        assert_eq!(
+            manifest,
+            PathBuf::from("/tmp/elastos-runtime/components.json")
+        );
+    }
+
+    #[test]
+    fn test_missing_manifest_message_mentions_source_checkout() {
+        let message = missing_manifest_message();
+        assert!(message.contains("<source-checkout>/components.json"));
+        assert!(message.contains("Source-built binaries are not self-contained installs."));
+    }
+
+    #[test]
+    fn test_missing_trusted_source_error_mentions_source_add() {
+        let err = missing_trusted_source_error();
+        let message = err.to_string();
+        assert!(message.contains("elastos setup"));
+        assert!(message.contains("elastos source add"));
     }
 
     #[test]

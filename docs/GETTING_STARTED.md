@@ -214,6 +214,19 @@ Verify the built binary:
 elastos/target/release/elastos --version
 ```
 
+### Source-built setup notes
+
+The built binary is not a self-contained install.
+
+- Run it from the repo checkout if you want `elastos setup --list` to read the repo `components.json`.
+- `elastos setup` still requires a trusted source before it can fetch first-party artifacts.
+- A GitHub checkout gives you source plus the manifest. It does not stamp `sources.json` for you.
+- If you want published-install behavior in a clean home, use the installer path from [INSTALL.md](INSTALL.md).
+- If you want to wire in your own source, start with `elastos source add --help`.
+- If you want repo-native proof that the current checkout works, run `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
+
+Copying a raw source-built binary into `~/.local/bin` is not the canonical source-developer path.
+
 ## First Source Runs
 
 ### Native chat

@@ -21,6 +21,12 @@ runtime automatically.
 - Users should not need to know a HEAD CID to install or update normally.
 - Native chat does not require crosvm, vmlinux, kubo, or sudo.
 
+Source checkout note:
+
+- A GitHub clone gives you source plus `components.json`. It does not stamp a trusted source into `sources.json`.
+- Source-built binaries can inspect setup profiles from the checkout, but `elastos setup` still needs either a published install or an explicitly created/added trusted source.
+- Start with `elastos source add --help` if you are wiring your own source by hand.
+
 `elastos setup` is intentionally narrow:
 
 - it provisions the core PC2/chat profile

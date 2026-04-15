@@ -54,6 +54,15 @@ Or manually:
 cd elastos && cargo build --workspace --release
 ```
 
+Source-built setup notes:
+
+- The built binary is a source artifact, not a self-contained install.
+- When you run the built binary from the repo checkout, `elastos setup --list` can read the repo `components.json`.
+- `elastos setup` still needs a trusted source in `~/.local/share/elastos/sources.json` before it can fetch first-party artifacts.
+- For published-install behavior, use the installer in [docs/INSTALL.md](docs/INSTALL.md).
+- For source proof of the current checkout, use `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
+- If you want to add your own source manually, start with `elastos source add --help`.
+
 ## Run
 
 Normal user lane:
