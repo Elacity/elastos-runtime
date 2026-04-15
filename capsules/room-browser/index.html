@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Room Browser</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main id="app-shell" class="shell">
+    <header class="hero">
+      <p class="eyebrow">ElastOS Room Beta</p>
+      <h1>Room Browser</h1>
+      <p class="intro">
+        Approve this browser from room controls, then talk in one small private room.
+      </p>
+    </header>
+
+    <section class="card status-card">
+      <div class="status-row">
+        <span id="status-badge" class="badge">Loading</span>
+        <span id="status-detail" class="detail">Checking local session state…</span>
+      </div>
+      <p id="error-text" class="error" hidden></p>
+    </section>
+
+    <section id="pair-card" class="card">
+      <h2>Join from this browser</h2>
+      <p class="copy">
+        Use a clear name so the room approval screen can identify you quickly.
+      </p>
+      <form id="pair-form" class="stack">
+        <label>
+          <span>Name</span>
+          <input id="display-name" type="text" maxlength="48" autocomplete="nickname" placeholder="Alice" />
+        </label>
+        <label>
+          <span>Device</span>
+          <input id="device-label" type="text" maxlength="64" autocomplete="off" placeholder="Phone browser" />
+        </label>
+        <button id="pair-submit" type="submit">Request pairing</button>
+      </form>
+      <div class="pair-actions">
+        <button id="reset-button" type="button" class="secondary" hidden>Start over</button>
+      </div>
+    </section>
+
+    <section id="chat-card" class="card chat-card" hidden>
+      <div class="chat-header">
+        <div class="chat-title">
+          <h2>Room</h2>
+          <p id="session-text" class="copy">Session inactive.</p>
+        </div>
+        <div class="chat-actions">
+          <button id="participant-toggle" type="button" class="secondary participant-toggle">People</button>
+          <button id="leave-button" type="button" class="secondary">Leave room</button>
+        </div>
+      </div>
+      <div id="participant-scrim" class="participant-scrim" hidden></div>
+      <section class="conversation-card">
+        <ol id="message-list" class="messages"></ol>
+        <div class="emoji-strip" aria-label="Quick emoji">
+          <button id="emoji-wave" type="button" class="emoji-chip">👋</button>
+          <button id="emoji-fire" type="button" class="emoji-chip">🔥</button>
+          <button id="emoji-party" type="button" class="emoji-chip">🎉</button>
+          <button id="emoji-clap" type="button" class="emoji-chip">👏</button>
+          <button id="emoji-heart" type="button" class="emoji-chip">❤️</button>
+          <button id="emoji-eyes" type="button" class="emoji-chip">👀</button>
+        </div>
+        <form id="composer-form" class="composer">
+          <input id="message-input" type="text" maxlength="2000" autocomplete="off" placeholder="Say something" />
+          <div class="composer-actions">
+            <input id="attachment-input" type="file" hidden />
+            <button id="attach-button" type="button" class="secondary">Attach</button>
+            <button id="send-button" type="submit">Send</button>
+          </div>
+        </form>
+      </section>
+      <section class="presence-card">
+        <div class="roster-head">
+          <div>
+            <h3>In this room</h3>
+            <p id="participant-count" class="copy">No one here yet</p>
+          </div>
+          <button id="participant-close" type="button" class="secondary roster-close">Close</button>
+        </div>
+        <ol id="participant-list" class="participants"></ol>
+      </section>
+    </section>
+  </main>
+
+  <script type="module">
+    import init from "./room_browser_ui.js";
+    init();
+  </script>
+</body>
+</html>
