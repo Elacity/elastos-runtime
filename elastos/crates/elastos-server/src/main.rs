@@ -12,6 +12,7 @@ mod node_cmd;
 mod pc2_cmd;
 mod publish;
 mod release_cmd;
+mod room_cmd;
 mod run_cmd;
 mod security_cmd;
 mod serve_cmd;
@@ -375,6 +376,10 @@ enum Commands {
     #[command(subcommand)]
     Webspace(WebspaceCommand),
 
+    /// Manage room membership and browser access
+    #[command(subcommand)]
+    Room(RoomCommand),
+
     /// Manage operator peers and safe remote node actions
     #[command(subcommand)]
     Node(NodeCommand),
@@ -407,9 +412,9 @@ enum Commands {
         publish: Option<PathBuf>,
     },
 
-    /// Install external components (kubo, cloudflared, llama-server, models)
+    /// Install the default runtime profile or an explicit setup profile
     Setup {
-        /// Profile name (recommended: pc2, demo, irc; advanced: minimal, public-gateway, agent-local-ai, full)
+        /// Profile name. Default is `pc2`. Use `demo` for site/share/browser extras, or `irc` for the packaged microVM chat path.
         #[arg(long)]
         profile: Option<String>,
 
@@ -543,6 +548,9 @@ pub(crate) enum NodeCommand {
     /// Manage known operator peers and local allowlists
     #[command(subcommand)]
     Peer(NodePeerCommand),
+    /// Read or drive explicit remote room operations on an operator peer
+    #[command(subcommand)]
+    Room(NodeRoomCommand),
     /// Read safe remote node status from an allowed peer
     Status {
         /// Target runtime DID
@@ -603,6 +611,65 @@ pub(crate) enum NodePeerCommand {
         /// Peer runtime DID
         #[arg(long)]
         did: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum NodeRoomCommand {
+    /// Show sovereign room state from an allowed peer
+    Show {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List pending browser pairing requests from an allowed peer
+    Pending {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a pending browser pairing request on an allowed peer
+    Approve {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Pending request ID. Omit to approve the oldest pending request.
+        request_id: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deny a pending browser pairing request on an allowed peer
+    Deny {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Pending request ID. Omit to deny the oldest pending request.
+        request_id: Option<String>,
+        /// Optional denial reason for the browser session
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start or reuse the remote runtime gateway and print room URLs
+    Open {
+        /// Target runtime DID
+        #[arg(long)]
+        peer: String,
+        /// Address to bind the room gateway to
+        #[arg(short, long, default_value = "0.0.0.0:8090")]
+        addr: String,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -718,6 +785,116 @@ pub(crate) enum WebspaceCommand {
     Resolve {
         /// Moniker or handle path, for example: Elastos or Elastos/content/<cid>
         target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RoomCommand {
+    /// Show current room state and access policy
+    Show {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List pending browser pairing requests for this room
+    Pending {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Seed the local runtime as the room owner
+    Seed {
+        /// Room title to store in control state
+        #[arg(long, default_value = "Room")]
+        title: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a sovereign member invite for another DID
+    Invite {
+        /// DID to invite into the room
+        did: String,
+        /// Role to grant to the invited runtime
+        #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
+        role: room_cmd::RoomInviteRoleArg,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create and sign a deliverable sovereign member invite envelope
+    InviteExport {
+        /// DID to invite into the room
+        did: String,
+        /// Role to grant to the invited runtime
+        #[arg(long, value_enum, default_value_t = room_cmd::RoomInviteRoleArg::Member)]
+        role: room_cmd::RoomInviteRoleArg,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a signed sovereign member invite envelope from another runtime
+    InviteImport {
+        /// Path to invite envelope JSON, or omit/read '-' for stdin
+        path: Option<PathBuf>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a pending sovereign member invite on this runtime
+    Accept {
+        /// Pending invite ID
+        invite_id: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a signed room acceptance envelope after local invite acceptance
+    AcceptExport {
+        /// Accepted invite ID
+        invite_id: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a signed room acceptance envelope on the owner runtime
+    AcceptImport {
+        /// Path to acceptance envelope JSON, or omit/read '-' for stdin
+        path: Option<PathBuf>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a pending browser pairing request
+    Approve {
+        /// Pending request ID. Omit to approve the oldest pending request.
+        request_id: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deny a pending browser pairing request
+    Deny {
+        /// Pending request ID. Omit to deny the oldest pending request.
+        request_id: Option<String>,
+        /// Optional denial reason for the browser session
+        #[arg(long)]
+        reason: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start the local gateway focused on the room browser app
+    Open {
+        /// Address to bind the room gateway to
+        #[arg(short, long, default_value = "127.0.0.1:8090")]
+        addr: String,
+    },
+    /// Reset live room activity while preserving room authority and policy
+    Reset {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
@@ -975,6 +1152,10 @@ async fn main() -> anyhow::Result<()> {
             return webspace_cmd::run(cmd).await;
         }
 
+        Commands::Room(cmd) => {
+            return room_cmd::run_room(cmd).await;
+        }
+
         Commands::Node(cmd) => {
             return node_cmd::run_node(cmd).await;
         }
@@ -1108,7 +1289,7 @@ fn print_first_run_welcome(data_dir: &std::path::Path) {
     println!();
     println!("  Shell policy:    cli (interactive) with TTY, agent (rules) without");
     println!("  User path:       elastos chat auto-starts after setup");
-    println!("  Operator path:   elastos serve, then elastos node / run / agent / capsule");
+    println!("  Operator path:   elastos serve, then elastos run / agent / capsule");
     println!();
 }
 

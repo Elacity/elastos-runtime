@@ -28,7 +28,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # HTTP client (for IPFS operations)
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 
 # CLI
 clap = { version = "4.0", features = ["derive"] }
@@ -55,6 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Crypto (for content hashing in publish/sign commands)
 sha2 = "0.10"
 hex = "0.4"
+rand = "0.8"
 
 # URL parsing (used by identity HTTP handlers)
 url = "2.5"

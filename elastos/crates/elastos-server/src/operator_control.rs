@@ -20,11 +20,23 @@ use crate::crypto::{
 };
 use crate::local_http::LoopbackHttpBaseUrl;
 use crate::sources::{load_trusted_sources, TrustedSource};
+use crate::{
+    browser_app_hosts::load_browser_app_hosted_endpoint,
+    notifications::sync_room_notifications,
+    room_service::{
+        approve_next_request, approve_request, deny_next_request, deny_request, load_summary,
+        local_runtime_access, room_slug, ApprovalOutcome, DenyOutcome, RoomSummary,
+    },
+};
 
 pub const OPERATOR_ALPN: &[u8] = b"elastos/operator/1";
 pub const OPERATOR_ACTION_STATUS_READ: &str = "status.read";
 pub const OPERATOR_ACTION_UPDATE_CHECK: &str = "update.check";
 pub const OPERATOR_ACTION_UPDATE_APPLY: &str = "update.apply";
+pub const OPERATOR_ACTION_ROOM_READ: &str = "room.read";
+pub const OPERATOR_ACTION_ROOM_APPROVE: &str = "room.approve";
+pub const OPERATOR_ACTION_ROOM_DENY: &str = "room.deny";
+pub const OPERATOR_ACTION_ROOM_OPEN: &str = "room.open";
 
 const OPERATOR_CONFIG_SCHEMA: &str = "elastos.operator-control/v1";
 const OPERATOR_REQUEST_DOMAIN: &str = "elastos.operator.request.v1";
@@ -130,6 +142,42 @@ pub struct OperatorUpdateApply {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OperatorRoomOpen {
+    pub bind_addr: String,
+    #[serde(default)]
+    pub open_urls: Vec<String>,
+    #[serde(default)]
+    pub room_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OperatorRoomApproveArgs {
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct OperatorRoomDenyArgs {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OperatorRoomOpenArgs {
+    addr: String,
+}
+
+impl Default for OperatorRoomOpenArgs {
+    fn default() -> Self {
+        Self {
+            addr: "0.0.0.0:8090".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeCoords {
     api_url: String,
@@ -215,6 +263,15 @@ struct CapsuleInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct SupervisorStartGatewayOutput {
+    status: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PeerProviderEnvelope {
     data: serde_json::Value,
 }
@@ -263,6 +320,10 @@ pub fn supported_actions() -> &'static [&'static str] {
         OPERATOR_ACTION_STATUS_READ,
         OPERATOR_ACTION_UPDATE_CHECK,
         OPERATOR_ACTION_UPDATE_APPLY,
+        OPERATOR_ACTION_ROOM_READ,
+        OPERATOR_ACTION_ROOM_APPROVE,
+        OPERATOR_ACTION_ROOM_DENY,
+        OPERATOR_ACTION_ROOM_OPEN,
     ]
 }
 
@@ -392,48 +453,44 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
             anyhow::anyhow!("Trusted source '{}' has no publisher DID", source.name)
         })?;
 
-    let ordered_gateways = crate::update::ordered_update_gateways(&source.gateways);
     let current_version = source.installed_version.clone();
-    let mut discovery = String::new();
-    let mut working_gateway = None;
-    let mut head_cid = None;
-    let mut head_bytes = None;
-
-    if let Ok(client) = crate::carrier::CarrierClient::connect_trusted_source(
+    let client = crate::carrier::CarrierClient::connect_trusted_source(
         &source,
         OPERATOR_CONNECT_TIMEOUT_SECS,
     )
     .await
-    {
-        if let Ok(Some(release)) = client.release_head().await {
-            head_cid = release
-                .get("head_cid")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-                .filter(|value| !value.is_empty());
-            if let Ok(bytes) = client.fetch_file("release-head.json").await {
-                head_bytes = Some(bytes);
-                discovery = "Carrier".to_string();
-            }
-        }
-    }
-
-    if head_bytes.is_none() && !ordered_gateways.is_empty() {
-        if let Some((_release_cid, bytes, gateway)) =
-            crate::update::try_gateway_head_discovery(&ordered_gateways, &primary_publisher).await
-        {
-            head_bytes = Some(bytes);
-            discovery = "gateway".to_string();
-            working_gateway = Some(gateway);
-        }
-    }
-
-    let head_bytes = head_bytes.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Could not discover updates from trusted source '{}' via Carrier or configured gateways",
+    .with_context(|| {
+        format!(
+            "Carrier connection to trusted source '{}' failed. Remote operator update check stays Carrier-only.",
             source.name
         )
     })?;
+    let release = client.release_head().await.with_context(|| {
+        format!(
+            "Carrier discovery from trusted source '{}' failed to return a release head.",
+            source.name
+        )
+    })?;
+    let release = release.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Carrier discovery from trusted source '{}' returned no release head.",
+            source.name
+        )
+    })?;
+    let head_cid = release
+        .get("head_cid")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
+    let head_bytes = client
+        .fetch_file("release-head.json")
+        .await
+        .with_context(|| {
+            format!(
+                "Carrier fetch of release-head.json from trusted source '{}' failed.",
+                source.name
+            )
+        })?;
 
     let head = verify_release_envelope(&head_bytes, "elastos.release.head.v1", &primary_publisher)?;
     let latest_version = head["payload"]["version"]
@@ -452,8 +509,8 @@ pub async fn gather_local_update_check(data_dir: &Path) -> Result<OperatorUpdate
         current_version,
         latest_version: latest_version.clone(),
         update_available: latest_version != source.installed_version,
-        discovery,
-        working_gateway,
+        discovery: "Carrier".to_string(),
+        working_gateway: None,
         head_cid,
         release_cid,
     })
@@ -482,7 +539,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
     let platform = crate::update::detect_release_platform().to_string();
     let fetch_counter = Arc::new(AtomicUsize::new(0));
     let carrier_for_fetch = carrier_client.clone();
-    let fetch_fn: crate::update::FetchFn = Box::new(move |cid, gateways| {
+    let fetch_fn: crate::update::FetchFn = Box::new(move |_cid, _gateways| {
         let client = carrier_for_fetch.clone();
         let counter = fetch_counter.clone();
         let platform = platform.clone();
@@ -495,13 +552,7 @@ pub async fn apply_local_update(data_dir: &Path) -> Result<OperatorUpdateApply> 
                 3 => format!("components-{}.json", platform),
                 _ => return Err(anyhow::anyhow!("unexpected operator update fetch #{}", n)),
             };
-            match client.fetch_file(&path).await {
-                Ok(bytes) => Ok(bytes),
-                Err(_err) if !gateways.is_empty() => {
-                    crate::update::fetch_cid_via_gateways(&cid, &gateways).await
-                }
-                Err(err) => Err(err),
-            }
+            client.fetch_file(&path).await
         })
     });
 
@@ -576,6 +627,56 @@ pub async fn request_remote_update_apply(
     request_remote_typed(data_dir, peer, OPERATOR_ACTION_UPDATE_APPLY).await
 }
 
+pub async fn request_remote_room_read(data_dir: &Path, peer: &OperatorPeer) -> Result<RoomSummary> {
+    request_remote_typed(data_dir, peer, OPERATOR_ACTION_ROOM_READ).await
+}
+
+pub async fn request_remote_room_approve(
+    data_dir: &Path,
+    peer: &OperatorPeer,
+    request_id: Option<&str>,
+) -> Result<Option<ApprovalOutcome>> {
+    request_remote_typed_with_args(
+        data_dir,
+        peer,
+        OPERATOR_ACTION_ROOM_APPROVE,
+        serde_json::json!({ "request_id": request_id }),
+    )
+    .await
+}
+
+pub async fn request_remote_room_deny(
+    data_dir: &Path,
+    peer: &OperatorPeer,
+    request_id: Option<&str>,
+    reason: &str,
+) -> Result<Option<DenyOutcome>> {
+    request_remote_typed_with_args(
+        data_dir,
+        peer,
+        OPERATOR_ACTION_ROOM_DENY,
+        serde_json::json!({
+            "request_id": request_id,
+            "reason": reason,
+        }),
+    )
+    .await
+}
+
+pub async fn request_remote_room_open(
+    data_dir: &Path,
+    peer: &OperatorPeer,
+    addr: &str,
+) -> Result<OperatorRoomOpen> {
+    request_remote_typed_with_args(
+        data_dir,
+        peer,
+        OPERATOR_ACTION_ROOM_OPEN,
+        serde_json::json!({ "addr": addr }),
+    )
+    .await
+}
+
 fn validate_action(action: &str) -> Result<()> {
     if supported_actions().contains(&action) {
         Ok(())
@@ -615,7 +716,13 @@ fn action_allowed(peer: &OperatorPeer, action: &str) -> bool {
 }
 
 fn is_mutating_action(action: &str) -> bool {
-    action == OPERATOR_ACTION_UPDATE_APPLY
+    matches!(
+        action,
+        OPERATOR_ACTION_UPDATE_APPLY
+            | OPERATOR_ACTION_ROOM_APPROVE
+            | OPERATOR_ACTION_ROOM_DENY
+            | OPERATOR_ACTION_ROOM_OPEN
+    )
 }
 
 fn default_runtime_kind() -> String {
@@ -916,6 +1023,15 @@ async fn request_remote_typed<T: DeserializeOwned>(
     peer: &OperatorPeer,
     action: &str,
 ) -> Result<T> {
+    request_remote_typed_with_args(data_dir, peer, action, serde_json::Value::Null).await
+}
+
+async fn request_remote_typed_with_args<T: DeserializeOwned>(
+    data_dir: &Path,
+    peer: &OperatorPeer,
+    action: &str,
+    args: serde_json::Value,
+) -> Result<T> {
     validate_action(action)?;
     let client = OperatorClient::connect(peer, OPERATOR_CONNECT_TIMEOUT_SECS).await?;
     let (signing_key, requester_did) = elastos_identity::load_or_create_did(data_dir)?;
@@ -926,7 +1042,7 @@ async fn request_remote_typed<T: DeserializeOwned>(
         target_did: peer.did.clone(),
         ts: now_ts(),
         action: action.to_string(),
-        args: serde_json::Value::Null,
+        args,
     };
     let request = sign_envelope(&signing_key, OPERATOR_REQUEST_DOMAIN, &request_payload)?;
     let response_bytes = client.send_request(&request).await?;
@@ -1136,6 +1252,64 @@ async fn build_operator_response(
             ),
             Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
         },
+        OPERATOR_ACTION_ROOM_READ => match gather_local_room_summary(&ctx.data_dir, &ctx.local_did)
+        {
+            Ok(summary) => success_response(
+                &ctx.local_did,
+                request_id.clone(),
+                serde_json::to_value(summary),
+            ),
+            Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+        },
+        OPERATOR_ACTION_ROOM_APPROVE => {
+            match parse_operator_args::<OperatorRoomApproveArgs>(&request.args) {
+                Ok(args) => {
+                    match approve_local_room_request(&ctx.data_dir, args.request_id.as_deref())
+                        .await
+                    {
+                        Ok(outcome) => success_response(
+                            &ctx.local_did,
+                            request_id.clone(),
+                            serde_json::to_value(outcome),
+                        ),
+                        Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+                    }
+                }
+                Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+            }
+        }
+        OPERATOR_ACTION_ROOM_DENY => {
+            match parse_operator_args::<OperatorRoomDenyArgs>(&request.args) {
+                Ok(args) => match deny_local_room_request(
+                    &ctx.data_dir,
+                    args.request_id.as_deref(),
+                    args.reason.as_deref(),
+                )
+                .await
+                {
+                    Ok(outcome) => success_response(
+                        &ctx.local_did,
+                        request_id.clone(),
+                        serde_json::to_value(outcome),
+                    ),
+                    Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+                },
+                Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+            }
+        }
+        OPERATOR_ACTION_ROOM_OPEN => {
+            match parse_operator_args::<OperatorRoomOpenArgs>(&request.args) {
+                Ok(args) => match start_local_room_gateway(&ctx.data_dir, &args.addr).await {
+                    Ok(opened) => success_response(
+                        &ctx.local_did,
+                        request_id.clone(),
+                        serde_json::to_value(opened),
+                    ),
+                    Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+                },
+                Err(err) => error_response(&ctx.local_did, request_id.clone(), err),
+            }
+        }
         _ => denied_response(&ctx.local_did, request_id, "unsupported operator action"),
     };
 
@@ -1143,6 +1317,129 @@ async fn build_operator_response(
         finalize_reserved_request(&ctx.data_dir, &request, &response);
     }
     response
+}
+
+fn parse_operator_args<T>(args: &serde_json::Value) -> Result<T>
+where
+    T: DeserializeOwned + Default,
+{
+    if args.is_null() {
+        Ok(T::default())
+    } else {
+        serde_json::from_value(args.clone())
+            .map_err(|err| anyhow::anyhow!("invalid operator action args: {}", err))
+    }
+}
+
+fn room_capsule_installed(data_dir: &Path) -> bool {
+    data_dir
+        .join("capsules")
+        .join(room_slug())
+        .join("capsule.json")
+        .exists()
+}
+
+fn gather_local_room_summary(data_dir: &Path, local_did: &str) -> Result<RoomSummary> {
+    let mut summary = load_summary(data_dir)?;
+    let access = local_runtime_access(data_dir, Some(local_did))?;
+    let hosted = load_browser_app_hosted_endpoint(data_dir, room_slug())?;
+    summary.local_runtime_did = Some(local_did.to_string());
+    summary.local_runtime_role = access.member_role;
+    summary.pairing_allowed = access.pairing_allowed;
+    summary.pairing_block_reason = access.block_reason;
+    summary.canonical_hosted_guest_url = hosted.canonical_url;
+    summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
+    Ok(summary)
+}
+
+async fn approve_local_room_request(
+    data_dir: &Path,
+    request_id: Option<&str>,
+) -> Result<Option<ApprovalOutcome>> {
+    let outcome = match request_id {
+        Some(request_id) => approve_request(data_dir, request_id)?,
+        None => approve_next_request(data_dir)?,
+    };
+    let summary =
+        gather_local_room_summary(data_dir, &elastos_identity::load_or_create_did(data_dir)?.1)?;
+    sync_room_notifications(data_dir, &summary)?;
+    Ok(outcome)
+}
+
+async fn deny_local_room_request(
+    data_dir: &Path,
+    request_id: Option<&str>,
+    reason: Option<&str>,
+) -> Result<Option<DenyOutcome>> {
+    let reason = reason.unwrap_or("Denied from remote operator CLI");
+    let outcome = match request_id {
+        Some(request_id) => deny_request(data_dir, request_id, reason)?,
+        None => deny_next_request(data_dir, reason)?,
+    };
+    let summary =
+        gather_local_room_summary(data_dir, &elastos_identity::load_or_create_did(data_dir)?.1)?;
+    sync_room_notifications(data_dir, &summary)?;
+    Ok(outcome)
+}
+
+pub async fn start_local_room_gateway(data_dir: &Path, addr: &str) -> Result<OperatorRoomOpen> {
+    if !room_capsule_installed(data_dir) {
+        anyhow::bail!(
+            "Room browser capsule is not installed. Run `elastos setup --profile demo` first."
+        );
+    }
+
+    let coords = read_runtime_coords(data_dir).await.ok_or_else(|| {
+        anyhow::anyhow!("no active local runtime. Start `elastos serve` on the target and retry.")
+    })?;
+    let client = build_http_client(10)?;
+    let shell_token = attach_shell_token(&client, &coords).await?;
+    let api_base = LoopbackHttpBaseUrl::parse(&coords.api_url)?;
+    let response = client
+        .post(api_base.join("/api/supervisor/start-gateway")?)
+        .header("Authorization", format!("Bearer {}", shell_token))
+        .json(&serde_json::json!({
+            "addr": addr,
+            "cache_dir": serde_json::Value::Null,
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        let message = body.trim();
+        if message.is_empty() {
+            anyhow::bail!("failed to start room gateway at {}", addr);
+        }
+        anyhow::bail!("{}", message);
+    }
+    let response: SupervisorStartGatewayOutput = serde_json::from_str(&body).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid start-gateway response from {}: {} ({})",
+            addr,
+            err,
+            body
+        )
+    })?;
+    if response.status != "ok" {
+        anyhow::bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "failed to start room gateway".to_string())
+        );
+    }
+    let bind_addr = response.path.unwrap_or_else(|| addr.to_string());
+    let open_urls = crate::api::gateway::advertised_gateway_urls(&bind_addr);
+    let room_urls = open_urls
+        .iter()
+        .map(|url| format!("{}apps/{}/", url, room_slug()))
+        .collect();
+    Ok(OperatorRoomOpen {
+        bind_addr,
+        open_urls,
+        room_urls,
+    })
 }
 
 fn success_response(

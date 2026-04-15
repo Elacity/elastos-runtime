@@ -207,7 +207,24 @@ where
         std::time::Duration::from_secs(90),
     )
     .await?;
-    println!("Public URL: {}", url);
+    let public_base = format!("{}/", url.trim_end_matches('/'));
+    let canonical = crate::browser_app_hosts::load_browser_app_hosted_endpoint(
+        &data_dir,
+        crate::room_service::room_slug(),
+    )
+    .ok()
+    .and_then(|summary| summary.canonical_url);
+    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_url(
+        &data_dir,
+        crate::room_service::room_slug(),
+        Some(&public_base),
+    );
+    if let Some(canonical) = canonical.as_deref() {
+        println!("Hosted URL: {}", canonical);
+    }
+    println!("Public URL: {}", public_base);
+    println!("Room URL:   {}apps/room-browser/", public_base);
+    println!("Open the Room URL in your browser, then approve pairing from PC2.");
 
     if let Some(ref publish_path) = publish {
         match publish_to_ipfs(&control_plane.provider_registry, publish_path).await {
@@ -216,14 +233,14 @@ where
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "file".to_string());
-                let install_url = format!("{}/s/{}/{}", url, cid, filename);
+                let install_url = format!("{}s/{}/{}", public_base, cid, filename);
 
                 println!();
                 println!("Install:   curl -fsSL {} | bash", install_url);
             }
             Err(e) => {
                 eprintln!("[gateway] failed to publish {:?}: {}", publish_path, e);
-                println!("Installer URL template: {}/s/<cid>/install.sh", url);
+                println!("Installer URL template: {}s/<cid>/install.sh", public_base);
             }
         }
     }
@@ -238,6 +255,11 @@ where
             })
             .await;
     }
+    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_url(
+        &data_dir,
+        crate::room_service::room_slug(),
+        None,
+    );
 
     Ok(())
 }

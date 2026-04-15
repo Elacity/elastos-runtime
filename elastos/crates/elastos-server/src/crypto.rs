@@ -42,10 +42,10 @@ pub fn domain_separated_sign(
     (hex::encode(sig.to_bytes()), did)
 }
 
-/// Verify a signed release envelope `{ payload, signature, signer_did }`.
-/// The `domain` is the domain separator used when signing (e.g. "elastos.release.head.v1").
+/// Verify a signed JSON envelope `{ payload, signature, signer_did }`.
+/// The `domain` is the domain separator used when signing.
 /// Returns the parsed JSON value and signer DID on success.
-pub fn verify_release_envelope_against_dids(
+pub fn verify_signed_json_envelope_against_dids(
     envelope_bytes: &[u8],
     domain: &str,
     expected_dids: &[String],
@@ -91,9 +91,20 @@ pub fn verify_release_envelope_against_dids(
 
     verifying_key
         .verify(&digest, &sig)
-        .map_err(|_| anyhow::anyhow!("Release envelope signature verification failed"))?;
+        .map_err(|_| anyhow::anyhow!("Signed envelope signature verification failed"))?;
 
     Ok((envelope, signer_did))
+}
+
+/// Verify a signed release envelope `{ payload, signature, signer_did }`.
+/// The `domain` is the domain separator used when signing (e.g. "elastos.release.head.v1").
+/// Returns the parsed JSON value and signer DID on success.
+pub fn verify_release_envelope_against_dids(
+    envelope_bytes: &[u8],
+    domain: &str,
+    expected_dids: &[String],
+) -> anyhow::Result<(serde_json::Value, String)> {
+    verify_signed_json_envelope_against_dids(envelope_bytes, domain, expected_dids)
 }
 
 pub fn verify_release_envelope(
