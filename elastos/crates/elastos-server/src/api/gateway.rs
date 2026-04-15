@@ -50,6 +50,18 @@ pub fn gateway_router(state: GatewayState) -> Router {
             get(serve_site_head_document),
         )
         .route("/artifacts/*path", get(serve_artifact_file))
+        .route(
+            "/apps/:app",
+            get(super::browser_capsules::redirect_browser_capsule_root),
+        )
+        .route(
+            "/apps/:app/",
+            get(super::browser_capsules::serve_browser_capsule_index),
+        )
+        .route(
+            "/apps/:app/*path",
+            get(super::browser_capsules::serve_browser_capsule_asset),
+        )
         .route("/s/:cid", get(redirect_cid_root))
         .route("/s/:cid/", get(serve_cid_root))
         .route("/s/:cid/*path", get(serve_cid_file))
@@ -706,7 +718,7 @@ async fn fetch_file_inline(state: &GatewayState, cid: &str, path: &str) -> anyho
 // ---------------------------------------------------------------------------
 
 /// Validate a request file path — reject traversal, absolute paths, backslashes.
-fn validate_file_path(path: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_file_path(path: &str) -> Result<(), &'static str> {
     // Reject absolute paths
     if path.starts_with('/') || path.starts_with('\\') {
         return Err("Absolute paths not allowed");
@@ -786,7 +798,7 @@ async fn send_ipfs_raw(
 // MIME types
 // ---------------------------------------------------------------------------
 
-fn content_type(path: &str) -> &'static str {
+pub(crate) fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
         Some("css") => "text/css",
@@ -930,6 +942,82 @@ mod tests {
         assert!(validate_file_path("%2E%2E/etc/passwd").is_err());
         assert!(validate_file_path("foo%2F..%2Fetc/passwd").is_err());
         assert!(validate_file_path("foo/%2e%2e/bar").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_browser_capsule_root_redirects_to_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = gateway_router(test_state(dir.path()));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/apps/gba-emulator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/apps/gba-emulator/")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_browser_capsule_routes_serve_gba_emulator_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = gateway_router(test_state(dir.path()));
+
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apps/gba-emulator/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(
+            index
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            index
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        let wasm = app
+            .oneshot(
+                Request::builder()
+                    .uri("/apps/gba-emulator/mgba.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wasm.status(), StatusCode::OK);
+        assert_eq!(
+            wasm.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/wasm")
+        );
+        assert_eq!(
+            wasm.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
     }
 
     #[tokio::test]

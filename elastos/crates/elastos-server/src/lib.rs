@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod binaries;
+pub mod browser_app_hosts;
 pub mod carrier;
 pub mod carrier_bridge;
 pub mod carrier_service;

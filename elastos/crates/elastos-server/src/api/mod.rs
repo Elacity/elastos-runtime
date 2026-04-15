@@ -5,6 +5,7 @@
 //! - Capability request/grant/deny flow
 //! - Health and status endpoints
 
+pub mod browser_capsules;
 pub mod gateway;
 pub mod handlers;
 pub mod middleware;
