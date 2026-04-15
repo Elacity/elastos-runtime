@@ -61,7 +61,7 @@ Source-built setup notes:
 - `elastos setup` still needs a trusted source in `~/.local/share/elastos/sources.json` before it can fetch first-party artifacts.
 - For published-install behavior, use the installer in [docs/INSTALL.md](docs/INSTALL.md).
 - For source proof of the current checkout, use `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
-- If you want to add your own source manually, start with `elastos source add --help`.
+- For one concrete `source add` example, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#source-built-trusted-source-example).
 
 ## Run
 

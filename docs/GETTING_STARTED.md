@@ -222,10 +222,38 @@ The built binary is not a self-contained install.
 - `elastos setup` still requires a trusted source before it can fetch first-party artifacts.
 - A GitHub checkout gives you source plus the manifest. It does not stamp `sources.json` for you.
 - If you want published-install behavior in a clean home, use the installer path from [INSTALL.md](INSTALL.md).
-- If you want to wire in your own source, start with `elastos source add --help`.
+- If you want to wire in your own source manually, add one explicitly with `elastos source add ...`.
 - If you want repo-native proof that the current checkout works, run `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
 
 Copying a raw source-built binary into `~/.local/bin` is not the canonical source-developer path.
+
+### Source-built trusted source example
+
+If you already control a trusted source runtime, add it explicitly before running `setup`:
+
+```bash
+elastos source add \
+  --name local-dev \
+  --publisher <did:key:...> \
+  --connect-ticket <ticket> \
+  --publisher-node-id <node-id> \
+  --install-path ~/.local/bin/elastos
+
+elastos source show
+elastos setup --profile operator
+```
+
+What those values mean:
+
+- `--publisher` is the trusted publisher DID for the source you intend to follow.
+- `--connect-ticket` and `--publisher-node-id` come from the source runtime you control.
+- `--install-path` should point at the `elastos` binary you want future updates to target.
+
+Important boundary:
+
+- `source add` adds an existing trusted source. It does not create one from the checkout.
+- Today the supported source-local proof path is still `just local-carrier-setup-smoke` or `just pc2-frontdoor-smoke`.
+- Reusing someone else's live `sources.json` is not the general contract. Add a source you control, or use the stamped installer path.
 
 ## First Source Runs
 

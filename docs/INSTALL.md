@@ -25,7 +25,7 @@ Source checkout note:
 
 - A GitHub clone gives you source plus `components.json`. It does not stamp a trusted source into `sources.json`.
 - Source-built binaries can inspect setup profiles from the checkout, but `elastos setup` still needs either a published install or an explicitly created/added trusted source.
-- Start with `elastos source add --help` if you are wiring your own source by hand.
+- For a concrete source-checkout `source add` example, see [GETTING_STARTED.md](GETTING_STARTED.md#source-built-trusted-source-example).
 
 `elastos setup` is intentionally narrow:
 
