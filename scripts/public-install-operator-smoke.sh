@@ -131,7 +131,7 @@ update = json.loads(os.environ["UPDATE_JSON"])
 assert status["runtime_running"] is True, status
 assert status["runtime_kind"] == "operator", status
 assert update["discovery"] == "Carrier", update
-assert update["channel"] == "jetson-test", update
+assert update["channel"] == "stable", update
 assert update["current_version"] == "0.1.2", update
 assert update["latest_version"] == "0.1.2", update
 assert update["update_available"] is False, update
