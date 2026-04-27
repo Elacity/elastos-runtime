@@ -9,8 +9,8 @@ mod types;
 
 pub use error::{ElastosError, Result};
 pub use manifest::{
-    CapsuleManifest, CapsuleRequirement, CapsuleType, MicroVmConfig, Permissions, RequirementKind,
-    ResourceLimits, SCHEMA_V1,
+    CapsuleManifest, CapsuleRequirement, CapsuleRole, CapsuleType, MicroVmConfig, Permissions,
+    RequirementKind, ResourceLimits, SCHEMA_V1,
 };
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};
 pub use types::{CapsuleId, CapsuleStatus};

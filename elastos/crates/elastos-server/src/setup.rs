@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const DEFAULT_SETUP_PROFILE: &str = "pc2";
+const DEFAULT_SETUP_PROFILE: &str = "home";
 const CACHED_CID_FILE: &str = ".elastos-cid";
 const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 
@@ -120,7 +120,7 @@ pub async fn run(
 
     if profile.is_none() && with.is_empty() {
         println!(
-            "Using default setup profile: {} (managed PC2 home + native Carrier chat).",
+            "Using default setup profile: {} (managed Home + native Carrier chat).",
             DEFAULT_SETUP_PROFILE
         );
         println!("Use `--profile demo` for site/share/browser demo surfaces.");
@@ -129,12 +129,12 @@ pub async fn run(
         println!();
     } else if let Some(selected_profile) = selected_profile {
         match selected_profile {
-            "pc2" => {
-                println!("Selected profile: pc2 (managed PC2 home + native Carrier chat)");
+            "home" => {
+                println!("Selected profile: home (managed Home + native Carrier chat)");
                 println!();
             }
             "demo" => {
-                println!("Selected profile: demo (PC2 + site/share/browser demo surfaces)");
+                println!("Selected profile: demo (Home + site/share/browser demo surfaces)");
                 println!();
             }
             "chat" => {
@@ -433,28 +433,15 @@ pub fn verify_installed_component_binary(
     name: &str,
     path: &Path,
 ) -> anyhow::Result<String> {
-    let installed_bin = data_dir.join("bin").join(name);
-    let installed_capsule = data_dir.join("capsules").join(name).join(name);
-    let exe_relative = std::env::current_exe().ok().and_then(|exe| {
-        exe.parent()
-            .map(|dir| dir.join("../share/elastos/bin").join(name))
-    });
-
-    let is_installed_path = path == installed_bin
-        || path == installed_capsule
-        || exe_relative
-            .as_deref()
-            .is_some_and(|candidate| candidate == path);
-
-    if !is_installed_path {
+    let Some(install_root) = installed_component_root_for_path(data_dir, name, path) else {
         anyhow::bail!(
             "{} must resolve from an installed runtime path, got dev/override path {}",
             name,
             path.display()
         );
-    }
+    };
 
-    let manifest_path = data_dir.join("components.json");
+    let manifest_path = install_root.join("components.json");
     let manifest_bytes = fs::read(&manifest_path).map_err(|e| {
         anyhow::anyhow!(
             "cannot verify installed component '{}' at {}: failed to read {}: {}",
@@ -513,6 +500,46 @@ pub fn verify_installed_component_binary(
     }
 
     Ok(checksum.to_string())
+}
+
+fn installed_component_root_for_path(data_dir: &Path, name: &str, path: &Path) -> Option<PathBuf> {
+    let installed_bin = data_dir.join("bin").join(name);
+    if path == installed_bin {
+        return Some(data_dir.to_path_buf());
+    }
+
+    let installed_capsule = data_dir.join("capsules").join(name).join(name);
+    if path == installed_capsule {
+        return Some(data_dir.to_path_buf());
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let exe_root = exe_dir.join("../share/elastos");
+            if path == exe_root.join("bin").join(name) {
+                return Some(exe_root);
+            }
+        }
+    }
+
+    if path.file_name().and_then(|value| value.to_str()) != Some(name) {
+        return None;
+    }
+
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|value| value.to_str()) == Some("bin") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+
+    let capsule_dir = parent;
+    if capsule_dir.file_name().and_then(|value| value.to_str()) != Some(name) {
+        return None;
+    }
+    let capsules_root = capsule_dir.parent()?;
+    if capsules_root.file_name().and_then(|value| value.to_str()) != Some("capsules") {
+        return None;
+    }
+    capsules_root.parent().map(Path::to_path_buf)
 }
 
 // ── Component status ────────────────────────────────────────────────
@@ -965,15 +992,15 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
 
     println!();
     println!("Quick start:");
-    println!("  elastos setup                # default pc2 profile");
-    println!("  elastos setup --profile demo # pc2 + site/share/browser demo surfaces");
+    println!("  elastos setup                # default home profile");
+    println!("  elastos setup --profile demo # Home + site/share/browser demo surfaces");
     println!("  elastos setup --profile chat # packaged full-screen chat");
     println!("  elastos setup --profile operator # explicit serve/node/run/agent runtime");
     println!();
     print_profile_section(
         "Recommended profiles:",
         manifest,
-        &["pc2", "demo", "chat", "operator"],
+        &["home", "demo", "chat", "operator"],
     );
     print_profile_section(
         "Advanced profiles:",
@@ -982,7 +1009,7 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     );
 
     let listed = [
-        "pc2",
+        "home",
         "demo",
         "chat",
         "operator",
@@ -1733,7 +1760,7 @@ mod tests {
         std::env::remove_var("XDG_DATA_HOME");
 
         assert!(manifest.external.contains_key("kubo"));
-        assert!(manifest.profiles.contains_key("pc2"));
+        assert!(manifest.profiles.contains_key("home"));
         assert!(manifest.profiles.contains_key("chat"));
         assert!(manifest.profiles.contains_key("operator"));
         assert!(manifest.profiles.contains_key("full"));
@@ -1742,7 +1769,7 @@ mod tests {
     #[test]
     fn test_normalize_profile_name_preserves_chat_profile() {
         assert_eq!(normalize_profile_name("chat"), "chat");
-        assert_eq!(normalize_profile_name("pc2"), "pc2");
+        assert_eq!(normalize_profile_name("home"), "home");
     }
 
     #[test]
@@ -1932,20 +1959,24 @@ mod tests {
     #[test]
     fn test_component_install_state_detects_stale_extracted_bundle_metadata() {
         let tmp = tempfile::tempdir().unwrap();
-        let install_root = tmp.path().join("capsules/pc2");
+        let install_root = tmp.path().join("capsules/home-cli");
         fs::create_dir_all(&install_root).unwrap();
-        fs::write(install_root.join("capsule.json"), b"{\"name\":\"pc2\"}").unwrap();
+        fs::write(
+            install_root.join("capsule.json"),
+            b"{\"name\":\"home-cli\"}",
+        )
+        .unwrap();
 
         let mut platforms = HashMap::new();
         platforms.insert(
             "linux-amd64".to_string(),
             PlatformInfo {
                 url: None,
-                cid: Some("QmNewPc2".to_string()),
-                release_path: Some("pc2-linux-amd64.tar.gz".to_string()),
-                checksum: Some("sha256:new-pc2-archive".to_string()),
-                extract_path: Some("pc2".to_string()),
-                install_path: Some("capsules/pc2".to_string()),
+                cid: Some("QmNewHomeCli".to_string()),
+                release_path: Some("home-cli.tar.gz".to_string()),
+                checksum: Some("sha256:new-home-cli-archive".to_string()),
+                extract_path: Some("home-cli".to_string()),
+                install_path: Some("capsules/home-cli".to_string()),
                 strategy: None,
                 source: None,
                 note: None,
@@ -1954,23 +1985,23 @@ mod tests {
         );
         let component = Component {
             version: Some("0.1.0".to_string()),
-            install_path: Some("capsules/pc2".to_string()),
+            install_path: Some("capsules/home-cli".to_string()),
             size_mb: None,
             description: None,
             platforms,
         };
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
-                "pc2": {
+                "home-cli": {
                     "version": "0.1.0",
-                    "install_path": "capsules/pc2",
+                    "install_path": "capsules/home-cli",
                     "platforms": {
                         "linux-amd64": {
-                            "cid": "QmNewPc2",
-                            "release_path": "pc2-linux-amd64.tar.gz",
-                            "checksum": "sha256:new-pc2-archive",
-                            "extract_path": "pc2",
-                            "install_path": "capsules/pc2"
+                            "cid": "QmNewHomeCli",
+                            "release_path": "home-cli.tar.gz",
+                            "checksum": "sha256:new-home-cli-archive",
+                            "extract_path": "home-cli",
+                            "install_path": "capsules/home-cli"
                         }
                     }
                 }
@@ -1984,7 +2015,7 @@ mod tests {
             component_install_state_for_name(
                 &manifest,
                 tmp.path(),
-                "pc2",
+                "home-cli",
                 &component,
                 resolve_platform_info(&component, "linux-amd64")
             ),

@@ -261,19 +261,19 @@ pub async fn run_chat(nick: Option<String>, connect: Option<String>) -> anyhow::
     //
     // One-terminal bootstrap: if no runtime is running, starts a managed
     // background runtime with a chat-safe policy. Requires `elastos setup`
-    // to have provisioned the first-party PC2 core first.
+    // to have provisioned the first-party Home core first.
     let data_dir = default_data_dir();
     let connect = resolve_chat_bootstrap(connect, &data_dir);
     let _logging_guard = LoggingSuppressionGuard::enter();
 
-    let coords = crate::shell_cmd::ensure_runtime_for_chat(&data_dir).await?;
+    let coords = crate::runtime_control::ensure_runtime_for_chat(&data_dir).await?;
     run_native_chat_with_runtime(nick, connect, coords).await
 }
 
-pub(crate) async fn run_chat_from_pc2(
+pub(crate) async fn run_chat_from_home(
     nick: Option<String>,
     connect: Option<String>,
-    coords: crate::shell_cmd::RuntimeCoords,
+    coords: crate::runtime_control::RuntimeCoords,
 ) -> anyhow::Result<()> {
     let data_dir = default_data_dir();
     let connect = resolve_chat_bootstrap(connect, &data_dir);
@@ -285,11 +285,11 @@ pub(crate) async fn run_chat_from_pc2(
 async fn run_native_chat_with_runtime(
     requested_nick: Option<String>,
     connect: Option<ChatBootstrap>,
-    coords: crate::shell_cmd::RuntimeCoords,
+    coords: crate::runtime_control::RuntimeCoords,
 ) -> anyhow::Result<()> {
     eprintln!("Connected to local runtime.");
 
-    let tokens = crate::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::new();
     let api = &coords.api_url;
     let client_token = &tokens.client_token;
@@ -708,7 +708,7 @@ async fn run_native_chat_with_runtime(
         eprintln!("[chat] cleanup failed: {}", err);
     }
 
-    return_to_pc2_if_requested(home_requested)?;
+    return_to_home_if_requested(home_requested)?;
     Ok(())
 }
 
@@ -1293,7 +1293,7 @@ fn should_render_incoming_message(
 fn native_chat_tty_loop(ctx: &NativeChatCtx<'_>, ui: &ChatTerminalUi) -> bool {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
-    let _raw_mode = crate::shell_cmd::enable_host_raw_mode_pub();
+    let _raw_mode = crate::runtime_control::enable_host_raw_mode_pub();
     native_chat_tty_loop_from_io(ctx, &mut stdin, ui)
 }
 
@@ -1519,7 +1519,7 @@ fn native_chat_debug_tty() -> bool {
 }
 
 fn native_chat_prefers_controlling_tty_for_surface(parent_surface: Option<&str>) -> bool {
-    parent_surface == Some("pc2")
+    parent_surface == Some("home")
 }
 
 #[cfg(unix)]
@@ -1801,18 +1801,18 @@ async fn list_topic_peers(
         .unwrap_or_default())
 }
 
-fn return_to_pc2_if_requested(home_requested: bool) -> anyhow::Result<()> {
+fn return_to_home_if_requested(home_requested: bool) -> anyhow::Result<()> {
     if !home_requested {
         return Ok(());
     }
-    if std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("pc2") {
+    if std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("home") {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
-    let status = std::process::Command::new(exe).arg("pc2").status()?;
+    let status = std::process::Command::new(exe).arg("home").status()?;
     if !status.success() {
         anyhow::bail!(
-            "failed to return to PC2 (exit {})",
+            "failed to return Home (exit {})",
             status
                 .code()
                 .map(|code| code.to_string())
@@ -1823,10 +1823,10 @@ fn return_to_pc2_if_requested(home_requested: bool) -> anyhow::Result<()> {
 }
 
 fn native_chat_exit_hint(parent_surface: Option<&str>) -> &'static str {
-    if parent_surface == Some("pc2") {
-        "Type /home to return to PC2, or /quit to leave chat and return to PC2."
+    if parent_surface == Some("home") {
+        "Type /home to return Home, or /quit to leave chat and return Home."
     } else {
-        "Type /home to return to PC2, or /quit to exit to the terminal."
+        "Type /home to return Home, or /quit to exit to the terminal."
     }
 }
 
@@ -2229,10 +2229,10 @@ mod tests {
     }
 
     #[test]
-    fn native_chat_exit_hint_is_explicit_for_pc2_launch() {
+    fn native_chat_exit_hint_is_explicit_for_home_launch() {
         assert_eq!(
-            native_chat_exit_hint(Some("pc2")),
-            "Type /home to return to PC2, or /quit to leave chat and return to PC2."
+            native_chat_exit_hint(Some("home")),
+            "Type /home to return Home, or /quit to leave chat and return Home."
         );
     }
 
@@ -2240,7 +2240,7 @@ mod tests {
     fn native_chat_exit_hint_is_explicit_for_terminal_launch() {
         assert_eq!(
             native_chat_exit_hint(None),
-            "Type /home to return to PC2, or /quit to exit to the terminal."
+            "Type /home to return Home, or /quit to exit to the terminal."
         );
     }
 
@@ -2281,8 +2281,10 @@ mod tests {
     }
 
     #[test]
-    fn pc2_parent_surface_prefers_controlling_tty() {
-        assert!(native_chat_prefers_controlling_tty_for_surface(Some("pc2")));
+    fn home_parent_surface_prefers_controlling_tty() {
+        assert!(native_chat_prefers_controlling_tty_for_surface(Some(
+            "home"
+        )));
         assert!(!native_chat_prefers_controlling_tty_for_surface(Some(
             "shell"
         )));

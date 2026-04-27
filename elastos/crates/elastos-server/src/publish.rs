@@ -386,8 +386,8 @@ async fn discover_source_connect_ticket() -> anyhow::Result<Option<String>> {
 
 async fn discover_source_connect_ticket_from_runtime() -> anyhow::Result<Option<String>> {
     let data_dir = elastos_server::sources::default_data_dir();
-    let coords_path = super::shell_cmd::runtime_coord_path(&data_dir);
-    let Some(coords) = super::shell_cmd::read_runtime_coords(&coords_path).await else {
+    let coords_path = super::runtime_control::runtime_coord_path(&data_dir);
+    let Some(coords) = super::runtime_control::read_runtime_coords(&coords_path).await else {
         return Ok(None);
     };
 
@@ -410,7 +410,7 @@ async fn discover_source_connect_ticket_from_runtime() -> anyhow::Result<Option<
         );
     }
 
-    let tokens = super::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = super::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
@@ -1251,8 +1251,8 @@ fn print_release_diff_summary(
 /// No peer-provider process spawn — Carrier is built into the runtime.
 async fn announce_release_head(entry: &ReleaseLedgerEntry) -> anyhow::Result<Vec<String>> {
     let data_dir = elastos_server::sources::default_data_dir();
-    let coords_path = super::shell_cmd::runtime_coord_path(&data_dir);
-    let coords = super::shell_cmd::read_runtime_coords(&coords_path)
+    let coords_path = super::runtime_control::runtime_coord_path(&data_dir);
+    let coords = super::runtime_control::read_runtime_coords(&coords_path)
         .await
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -1260,7 +1260,7 @@ async fn announce_release_head(entry: &ReleaseLedgerEntry) -> anyhow::Result<Vec
             )
         })?;
 
-    let tokens = super::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = super::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -1455,6 +1455,7 @@ mod tests {
             name: name.to_string(),
             description: None,
             author: None,
+            role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::MicroVM,
             entrypoint: "rootfs.ext4".to_string(),
             requires: capsule_requires

@@ -16,13 +16,13 @@ use elastos_common::localhost::{
 };
 use elastos_server::sources::{default_data_dir, load_trusted_sources};
 
-use crate::shell_cmd;
+use crate::runtime_control;
 
 const LOBBY_VERSION: &str = env!("ELASTOS_VERSION");
-const PC2_CAPSULE_NAME: &str = "pc2";
-const PC2_SESSION_ROOT: &str = "Local/SharedByLocalUsersAndBots/PC2/sessions";
+const HOME_CLI_CAPSULE_NAME: &str = "home-cli";
+const HOME_SESSION_ROOT: &str = "Local/SharedByLocalUsersAndBots/Home/sessions";
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Home", &["pc2", "chat"]),
+    ("Home", &["home", "chat"]),
     (
         "Spaces",
         &["share", "open", "shares", "attest", "site", "webspace"],
@@ -61,12 +61,12 @@ const COMPONENTS: &[(&str, &str)] = &[
 
 const PLATFORM_LAYERS: &[(&str, &str)] = &[
     (
-        "PC2 Home",
+        "Home",
         "The front door of your sovereign local computer.",
     ),
     (
         "Apps",
-        "Things you launch from PC2, such as chat, sharing, and site tools.",
+        "Things you launch from Home, such as chat, sharing, and site tools.",
     ),
     (
         "ElastOS",
@@ -74,7 +74,7 @@ const PLATFORM_LAYERS: &[(&str, &str)] = &[
     ),
     (
         "Carrier",
-        "The network between PC2s for elastos:// discovery, messaging, and content exchange.",
+        "The network between ElastOS homes for elastos:// discovery, messaging, and content exchange.",
     ),
     (
         "Home Session",
@@ -85,7 +85,7 @@ const PLATFORM_LAYERS: &[(&str, &str)] = &[
 const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     SystemServiceSpec {
         name: "Home Session",
-        role: "Keeps PC2 home persistent while launched apps return back here when they exit.",
+        role: "Keeps Home persistent while launched apps return back here when they exit.",
         backing: &["shell"],
     },
     SystemServiceSpec {
@@ -95,7 +95,7 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     },
     SystemServiceSpec {
         name: "Identity",
-        role: "Provides the DID identity of this PC2 and signs local identity operations.",
+        role: "Provides the DID identity of this Home and signs local identity operations.",
         backing: &["did-provider"],
     },
     SystemServiceSpec {
@@ -105,7 +105,7 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     },
     SystemServiceSpec {
         name: "Content Exchange",
-        role: "Moves shared content when this PC2 needs transport or verification.",
+        role: "Moves shared content when this Home needs transport or verification.",
         backing: &["ipfs-provider", "kubo"],
     },
     SystemServiceSpec {
@@ -130,7 +130,7 @@ const CORE_ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: "identity-nickname-set",
         label: "Set nickname",
-        description: "Set the DID-backed local nickname used by Chat and shown in PC2.",
+        description: "Set the DID-backed local nickname used by Chat and shown in Home.",
         args: &["identity", "nickname", "set"],
         core: true,
     },
@@ -143,15 +143,15 @@ const CORE_ACTIONS: &[ActionSpec] = &[
     },
     ActionSpec {
         id: "room-approve",
-        label: "Approve browser pairing",
-        description: "Approve the next pending room browser request.",
+        label: "Approve browser access",
+        description: "Approve the next pending Chat Room browser access request.",
         args: &[],
         core: false,
     },
     ActionSpec {
         id: "room-deny",
-        label: "Deny browser pairing",
-        description: "Deny the next pending room browser request.",
+        label: "Deny browser access",
+        description: "Deny the next pending Chat Room browser access request.",
         args: &[],
         core: false,
     },
@@ -179,7 +179,7 @@ const CORE_ACTIONS: &[ActionSpec] = &[
     ActionSpec {
         id: "shares-list",
         label: "Shared",
-        description: "Open files and folders this PC2 already shared, then return here.",
+        description: "Open files and folders this Home already shared, then return here.",
         args: &["shares", "list"],
         core: true,
     },
@@ -193,7 +193,7 @@ const CORE_ACTIONS: &[ActionSpec] = &[
 ];
 
 /// Names of capsules that are service providers, not user-launchable apps.
-/// These are hidden from the PC2 launch list even when installed.
+/// These are hidden from the Home launch list even when installed.
 const PROVIDER_CAPSULE_NAMES: &[&str] = &[
     "shell",
     "localhost-provider",
@@ -204,12 +204,11 @@ const PROVIDER_CAPSULE_NAMES: &[&str] = &[
     "ai-provider",
     "llama-provider",
     "webspace-provider",
-    "md-viewer",
-    "pc2",
+    "home",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pc2Snapshot {
+struct HomeSnapshot {
     version: String,
     user: String,
     nickname: Option<String>,
@@ -290,9 +289,9 @@ struct RoomStatus {
     #[serde(default)]
     ephemeral_hosted_guest_url: Option<String>,
     #[serde(default)]
-    pairing_allowed: bool,
+    browser_access_allowed: bool,
     #[serde(default)]
-    pairing_block_reason: Option<String>,
+    browser_access_block_reason: Option<String>,
     #[serde(default)]
     pending_count: usize,
     #[serde(default)]
@@ -505,13 +504,13 @@ enum ActionReadiness {
 }
 
 #[derive(Debug, Clone)]
-struct Pc2Session {
+struct HomeSession {
     uri_root: String,
     path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct Pc2Intent {
+struct HomeIntent {
     action: String,
 }
 
@@ -631,13 +630,13 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
     let data_dir = default_data_dir();
     let _logging_guard = LoggingSuppressionGuard::enter();
     let _quiet_runtime_notices = ScopedEnvVar::set("ELASTOS_QUIET_RUNTIME_NOTICES", "1");
-    let coords_override = data_dir.join("pc2-runtime-coords.json");
+    let coords_override = data_dir.join("home-runtime-coords.json");
     std::env::set_var("ELASTOS_RUNTIME_COORDS_FILE", &coords_override);
-    let coords = shell_cmd::ensure_runtime_for_pc2(&data_dir).await?;
+    let coords = runtime_control::ensure_runtime_for_home(&data_dir).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
-    let tokens = shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = runtime_control::attach_to_runtime(&coords).await?;
     let session = create_session(&data_dir)?;
     let access =
         create_session_access(&client, &coords.api_url, &tokens.client_token, &session).await?;
@@ -674,7 +673,7 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
             }
         });
         let capsule_result =
-            run_pc2_capsule(&data_dir, &coords.api_url, &tokens.client_token, &session).await;
+            run_home_capsule(&data_dir, &coords.api_url, &tokens.client_token, &session).await;
         let _ = stop_tx.send(true);
         let _ = updater.await;
         capsule_result?;
@@ -710,13 +709,13 @@ async fn run_managed_dashboard() -> anyhow::Result<()> {
     result
 }
 
-async fn gather_snapshot() -> anyhow::Result<Pc2Snapshot> {
+async fn gather_snapshot() -> anyhow::Result<HomeSnapshot> {
     gather_snapshot_with_site_preview(None).await
 }
 
 async fn gather_snapshot_with_site_preview(
     site_local_url: Option<&str>,
-) -> anyhow::Result<Pc2Snapshot> {
+) -> anyhow::Result<HomeSnapshot> {
     let data_dir = default_data_dir();
     let did = load_existing_did(&data_dir);
     let source = load_default_source(&data_dir)?;
@@ -730,7 +729,7 @@ async fn gather_snapshot_with_site_preview(
     let notification_summary =
         elastos_server::notifications::load_summary(&data_dir).unwrap_or_default();
 
-    let mut snapshot = Pc2Snapshot {
+    let mut snapshot = HomeSnapshot {
         version: LOBBY_VERSION.to_string(),
         user: current_user(),
         nickname,
@@ -783,8 +782,8 @@ async fn gather_snapshot_with_site_preview(
             }),
             canonical_hosted_guest_url: room_summary.canonical_hosted_guest_url,
             ephemeral_hosted_guest_url: room_summary.ephemeral_hosted_guest_url,
-            pairing_allowed: room_summary.pairing_allowed,
-            pairing_block_reason: room_summary.pairing_block_reason,
+            browser_access_allowed: room_summary.browser_access_allowed,
+            browser_access_block_reason: room_summary.browser_access_block_reason,
             pending_count: room_summary.pending_count,
             active_session_count: room_summary.active_session_count,
             latest_request_name: room_summary.latest_request_name,
@@ -938,30 +937,30 @@ fn count_site_releases(data_dir: &Path) -> usize {
         .count()
 }
 
-fn create_session(data_dir: &Path) -> anyhow::Result<Pc2Session> {
+fn create_session(data_dir: &Path) -> anyhow::Result<HomeSession> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let id = format!("{}-{}", std::process::id(), stamp);
-    let local_root = format!("{}/{}", PC2_SESSION_ROOT, id);
+    let local_root = format!("{}/{}", HOME_SESSION_ROOT, id);
     let uri_root = format!("localhost://{}", local_root);
     let path = data_dir
         .join("Local")
         .join("Shared")
-        .join("PC2")
+        .join("Home")
         .join("sessions")
         .join(&id);
     fs::create_dir_all(&path)?;
 
-    Ok(Pc2Session { uri_root, path })
+    Ok(HomeSession { uri_root, path })
 }
 
 async fn create_session_access(
     client: &reqwest::Client,
     api_url: &str,
     client_token: &str,
-    session: &Pc2Session,
+    session: &HomeSession,
 ) -> anyhow::Result<SessionAccess> {
     let session_scope = format!("{}/*", session.uri_root.trim_end_matches('/'));
     let read_cap =
@@ -982,8 +981,8 @@ async fn create_session_access(
 
 async fn write_snapshot(
     access: &SessionAccess,
-    session: &Pc2Session,
-    snapshot: &Pc2Snapshot,
+    session: &HomeSession,
+    snapshot: &HomeSnapshot,
 ) -> anyhow::Result<()> {
     let data = serde_json::to_vec_pretty(snapshot)?;
     write_localhost_file(
@@ -995,7 +994,7 @@ async fn write_snapshot(
     Ok(())
 }
 
-async fn clear_intent(access: &SessionAccess, session: &Pc2Session) -> anyhow::Result<()> {
+async fn clear_intent(access: &SessionAccess, session: &HomeSession) -> anyhow::Result<()> {
     let path = format!("{}/intent.json", session.uri_root.trim_end_matches('/'));
     if !localhost_exists(access, &path).await? {
         return Ok(());
@@ -1005,28 +1004,28 @@ async fn clear_intent(access: &SessionAccess, session: &Pc2Session) -> anyhow::R
 
 async fn read_intent(
     access: &SessionAccess,
-    session: &Pc2Session,
-) -> anyhow::Result<Option<Pc2Intent>> {
+    session: &HomeSession,
+) -> anyhow::Result<Option<HomeIntent>> {
     let path = format!("{}/intent.json", session.uri_root.trim_end_matches('/'));
     if !localhost_exists(access, &path).await? {
         return Ok(None);
     }
     let data = read_localhost_file(access, &path).await?;
-    let intent: Pc2Intent = serde_json::from_slice(&data)?;
+    let intent: HomeIntent = serde_json::from_slice(&data)?;
     Ok(Some(intent))
 }
 
-async fn run_pc2_capsule(
+async fn run_home_capsule(
     data_dir: &Path,
     api_url: &str,
     client_token: &str,
-    session: &Pc2Session,
+    session: &HomeSession,
 ) -> anyhow::Result<()> {
-    let capsule_dir = resolve_pc2_capsule_dir(data_dir)?;
+    let capsule_dir = resolve_home_capsule_dir(data_dir)?;
     let runtime_storage = data_dir
         .join("Local")
         .join("Shared")
-        .join("PC2")
+        .join("Home")
         .join("bootstrap-storage");
     fs::create_dir_all(&runtime_storage)?;
 
@@ -1043,20 +1042,20 @@ async fn run_pc2_capsule(
     }));
 
     let mut scoped_env = Vec::new();
-    // The PC2 capsule owns startup-input settle logic for the front-door path.
-    // Do not pre-flush stdin here, or PC2 and chat end up competing over input repair.
-    let raw_mode = shell_cmd::enable_host_raw_mode_pub();
+    // The Home capsule owns startup-input settle logic for the front-door path.
+    // Do not pre-flush stdin here, or Home and chat end up competing over input repair.
+    let raw_mode = runtime_control::enable_host_raw_mode_pub();
     if raw_mode.is_some() {
         if let Some((cols, rows)) = current_terminal_size() {
             scoped_env.push(ScopedEnvVar::set("ELASTOS_TERM_COLS", cols.to_string()));
             scoped_env.push(ScopedEnvVar::set("ELASTOS_TERM_ROWS", rows.to_string()));
         }
-        scoped_env.push(ScopedEnvVar::set("ELASTOS_PC2_TUI", "1"));
+        scoped_env.push(ScopedEnvVar::set("ELASTOS_HOME_TUI", "1"));
     } else {
-        scoped_env.push(ScopedEnvVar::set("ELASTOS_PC2_TUI", "0"));
-        if pc2_debug_tty() {
+        scoped_env.push(ScopedEnvVar::set("ELASTOS_HOME_TUI", "0"));
+        if home_debug_tty() {
             eprintln!(
-                "[pc2-tty] raw mode unavailable (stdin_tty={} stdout_tty={}); falling back to line dashboard",
+                "[home-tty] raw mode unavailable (stdin_tty={} stdout_tty={}); falling back to line dashboard",
                 std::io::stdin().is_terminal(),
                 std::io::stdout().is_terminal(),
             );
@@ -1067,54 +1066,54 @@ async fn run_pc2_capsule(
     runtime
         .run_local(&capsule_dir, vec![session.uri_root.clone()])
         .await
-        .map_err(|e| anyhow::anyhow!("PC2 WASM dashboard failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Home WASM dashboard failed: {}", e))?;
 
     Ok(())
 }
 
-fn resolve_pc2_capsule_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    let dev = source_capsule_dir(PC2_CAPSULE_NAME);
+fn resolve_home_capsule_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dev = source_capsule_dir(HOME_CLI_CAPSULE_NAME);
     let dev_target = dev
         .join("target")
         .join("wasm32-wasip1")
         .join("release")
-        .join("pc2.wasm");
-    let dev_entry = dev.join("pc2.wasm");
+        .join("home-cli.wasm");
+    let dev_entry = dev.join("home-cli.wasm");
     if dev_target.is_file() {
         fs::copy(&dev_target, &dev_entry).with_context(|| {
             format!(
-                "failed to stage local PC2 WASM artifact from {}",
+                "failed to stage local Home WASM artifact from {}",
                 dev_target.display()
             )
         })?;
     }
     if dev.join("capsule.json").is_file()
-        && dev.join("pc2.wasm").is_file()
-        && prefer_dev_pc2_capsule()
+        && dev.join("home-cli.wasm").is_file()
+        && prefer_dev_home_capsule()
     {
         return Ok(dev);
     }
 
-    let installed = data_dir.join("capsules").join(PC2_CAPSULE_NAME);
-    if installed.join("capsule.json").is_file() && installed.join("pc2.wasm").is_file() {
+    let installed = data_dir.join("capsules").join(HOME_CLI_CAPSULE_NAME);
+    if installed.join("capsule.json").is_file() && installed.join("home-cli.wasm").is_file() {
         return Ok(installed);
     }
 
-    if dev.join("capsule.json").is_file() && dev.join("pc2.wasm").is_file() {
+    if dev.join("capsule.json").is_file() && dev.join("home-cli.wasm").is_file() {
         return Ok(dev);
     }
 
-    if prefer_dev_pc2_capsule() {
+    if prefer_dev_home_capsule() {
         anyhow::bail!(
-            "pc2 capsule not built yet.\n\nBuild it first:\n\n  cd {}\n  cargo build --target wasm32-wasip1 --release\n\nOr install the published PC2 home with:\n\n  elastos setup",
+            "home capsule not built yet.\n\nBuild it first:\n\n  cd {}\n  cargo build --target wasm32-wasip1 --release\n\nOr install the published Home surface with:\n\n  elastos setup",
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../capsules")
-                .join(PC2_CAPSULE_NAME)
+                .join(HOME_CLI_CAPSULE_NAME)
                 .display()
         );
     }
 
-    anyhow::bail!("pc2 home is not installed yet.\n\nRun:\n\n  elastos setup");
+    anyhow::bail!("Home is not installed yet.\n\nRun:\n\n  elastos setup");
 }
 
 fn source_capsule_dir(capsule_name: &str) -> PathBuf {
@@ -1123,7 +1122,7 @@ fn source_capsule_dir(capsule_name: &str) -> PathBuf {
         .join(capsule_name)
 }
 
-fn prefer_dev_pc2_capsule() -> bool {
+fn prefer_dev_home_capsule() -> bool {
     std::env::current_exe()
         .ok()
         .map(|path| {
@@ -1135,8 +1134,8 @@ fn prefer_dev_pc2_capsule() -> bool {
 
 async fn dispatch_action(
     action_id: &str,
-    snapshot: &Pc2Snapshot,
-    coords: &shell_cmd::RuntimeCoords,
+    snapshot: &HomeSnapshot,
+    coords: &runtime_control::RuntimeCoords,
     dashboard: &mut DashboardContext,
 ) -> anyhow::Result<String> {
     // Handle dynamically discovered capsule actions.
@@ -1160,7 +1159,7 @@ async fn dispatch_action(
         return match elastos_server::room_service::approve_request(&default_data_dir(), request_id)?
         {
             Some(outcome) => Ok(format!(
-                "Approved room browser pairing for {} on {}.",
+                "Approved Chat Room browser access for {} on {}.",
                 outcome.display_name, outcome.device_label
             )),
             None => Ok("That room browser request is no longer pending.".to_string()),
@@ -1170,10 +1169,10 @@ async fn dispatch_action(
         return match elastos_server::room_service::deny_request(
             &default_data_dir(),
             request_id,
-            "Denied in PC2",
+            "Denied in Home",
         )? {
             Some(outcome) => Ok(format!(
-                "Denied room browser pairing for {} on {}.",
+                "Denied Chat Room browser access for {} on {}.",
                 outcome.display_name, outcome.device_label
             )),
             None => Ok("That room browser request is no longer pending.".to_string()),
@@ -1284,7 +1283,7 @@ async fn dispatch_action(
     }
 
     let Some(action) = action_spec(action_id) else {
-        anyhow::bail!("Unknown PC2 action: {}", action_id);
+        anyhow::bail!("Unknown Home action: {}", action_id);
     };
 
     match action_readiness(action_id, snapshot) {
@@ -1320,8 +1319,8 @@ enum ActionLaunch {
 
 async fn run_action(
     action: ActionSpec,
-    snapshot: &Pc2Snapshot,
-    coords: &shell_cmd::RuntimeCoords,
+    snapshot: &HomeSnapshot,
+    coords: &runtime_control::RuntimeCoords,
     dashboard: &mut DashboardContext,
 ) -> anyhow::Result<String> {
     match action_launch(action, snapshot) {
@@ -1329,19 +1328,19 @@ async fn run_action(
             let nickname =
                 crate::identity_cmd::set_local_nickname(&default_data_dir(), None).await?;
             Ok(format!(
-                "Saved DID nickname as '{}'. You are back at PC2 home.",
+                "Saved DID nickname as '{}'. You are back at Home.",
                 nickname
             ))
         }
         ActionLaunch::ManagedChat => {
-            let _parent_surface = ScopedEnvVar::set("ELASTOS_PARENT_SURFACE", "pc2");
-            crate::chat_cmd::run_chat_from_pc2(None, None, coords.clone()).await?;
+            let _parent_surface = ScopedEnvVar::set("ELASTOS_PARENT_SURFACE", "home");
+            crate::chat_cmd::run_chat_from_home(None, None, coords.clone()).await?;
             Ok(format!("Returned home from {}.", action.label))
         }
         ActionLaunch::ManagedRoomApprove => {
             match elastos_server::room_service::approve_next_request(&default_data_dir())? {
                 Some(outcome) => Ok(format!(
-                    "Approved room browser pairing for {} on {}.",
+                    "Approved Chat Room browser access for {} on {}.",
                     outcome.display_name, outcome.device_label
                 )),
                 None => Ok("No pending room browser requests.".to_string()),
@@ -1350,10 +1349,10 @@ async fn run_action(
         ActionLaunch::ManagedRoomDeny => {
             match elastos_server::room_service::deny_next_request(
                 &default_data_dir(),
-                "Denied in PC2",
+                "Denied in Home",
             )? {
                 Some(outcome) => Ok(format!(
-                    "Denied room browser pairing for {} on {}.",
+                    "Denied Chat Room browser access for {} on {}.",
                     outcome.display_name, outcome.device_label
                 )),
                 None => Ok("No pending room browser requests.".to_string()),
@@ -1440,12 +1439,12 @@ async fn run_action(
             }
         }
         ActionLaunch::ManagedSharesList => Ok(render_share_notice(&snapshot.shares)),
-        ActionLaunch::ManagedUpdateCheck => run_pc2_update_check(snapshot).await,
+        ActionLaunch::ManagedUpdateCheck => run_home_update_check(snapshot).await,
         ActionLaunch::External(args) => {
             let exe = std::env::current_exe().context("current exe unavailable")?;
             let status = Command::new(exe)
                 .args(args)
-                .env("ELASTOS_PARENT_SURFACE", "pc2")
+                .env("ELASTOS_PARENT_SURFACE", "home")
                 .status()?;
             let exit = status
                 .code()
@@ -1455,7 +1454,7 @@ async fn run_action(
                 Ok(format!("Returned home from {}.", action.label))
             } else {
                 Ok(format!(
-                    "{} ended with exit {}. You are back at PC2 home.",
+                    "{} ended with exit {}. You are back at Home.",
                     action.label, exit
                 ))
             }
@@ -1477,7 +1476,7 @@ async fn run_capsule_action(
             "interactive",
             "--interactive",
         ])
-        .env("ELASTOS_PARENT_SURFACE", "pc2")
+        .env("ELASTOS_PARENT_SURFACE", "home")
         .status()?;
     if status.success() {
         Ok(format!("Returned home from {}.", capsule_name))
@@ -1487,19 +1486,19 @@ async fn run_capsule_action(
             .map(|code| code.to_string())
             .unwrap_or_else(|| "signal".to_string());
         Ok(format!(
-            "{} ended with exit {}. You are back at PC2 home.",
+            "{} ended with exit {}. You are back at Home.",
             capsule_name, exit
         ))
     }
 }
 
-fn action_launch(action: ActionSpec, snapshot: &Pc2Snapshot) -> ActionLaunch {
+fn action_launch(action: ActionSpec, snapshot: &HomeSnapshot) -> ActionLaunch {
     action_launch_with_kvm(action, snapshot, elastos_crosvm::is_supported())
 }
 
 fn action_launch_with_kvm(
     action: ActionSpec,
-    snapshot: &Pc2Snapshot,
+    snapshot: &HomeSnapshot,
     kvm_supported: bool,
 ) -> ActionLaunch {
     if action.id == "identity-nickname-set" {
@@ -1531,46 +1530,46 @@ fn action_launch_with_kvm(
 
 fn action_args_with_kvm(
     action: ActionSpec,
-    snapshot: &Pc2Snapshot,
+    snapshot: &HomeSnapshot,
     kvm_supported: bool,
 ) -> &'static [&'static str] {
     let _ = (snapshot, kvm_supported);
     action.args
 }
 
-fn action_command(action: ActionSpec, snapshot: &Pc2Snapshot) -> String {
+fn action_command(action: ActionSpec, snapshot: &HomeSnapshot) -> String {
     action_command_with_kvm(action, snapshot, elastos_crosvm::is_supported())
 }
 
 fn action_command_with_kvm(
     action: ActionSpec,
-    snapshot: &Pc2Snapshot,
+    snapshot: &HomeSnapshot,
     kvm_supported: bool,
 ) -> String {
     if action.id == "identity-nickname-set" {
-        return "pc2: set the local DID profile nickname used across chat and people surfaces"
+        return "home: set the local DID profile nickname used across chat and people surfaces"
             .to_string();
     }
     if action.id == "site-local" {
-        return "pc2: open localhost://MyWebSite in browser".to_string();
+        return "home: open localhost://MyWebSite in browser".to_string();
     }
     if action.id == "room-approve" {
-        return "pc2: approve the next pending room browser request".to_string();
+        return "home: approve the next pending room browser request".to_string();
     }
     if action.id == "room-deny" {
-        return "pc2: deny the next pending room browser request".to_string();
+        return "home: deny the next pending room browser request".to_string();
     }
     if action.id == "room-revoke-all" {
-        return "pc2: revoke all active room browser sessions".to_string();
+        return "home: revoke all active room browser sessions".to_string();
     }
     if action.id == "site-ephemeral" {
-        return "pc2: open a temporary HTTPS URL for MyWebSite and return home".to_string();
+        return "home: open a temporary HTTPS URL for MyWebSite and return home".to_string();
     }
     if action.id == "update-check" {
-        return "pc2: check trusted release status on the configured trusted source".to_string();
+        return "home: check trusted release status on the configured trusted source".to_string();
     }
     if action.id == "shares-list" {
-        return "pc2: review current shared channels and open URLs".to_string();
+        return "home: review current shared channels and open URLs".to_string();
     }
     format!(
         "elastos {}",
@@ -1640,7 +1639,7 @@ fn gather_share_status() -> ShareStatus {
 
 fn render_share_notice(shares: &ShareStatus) -> String {
     if shares.channel_count == 0 {
-        return "Shared has nothing yet. Run `elastos share <path>` to publish a file or folder, then open it again from PC2."
+        return "Shared has nothing yet. Run `elastos share <path>` to publish a file or folder, then open it again from Home."
             .to_string();
     }
 
@@ -1672,19 +1671,19 @@ fn render_share_notice(shares: &ShareStatus) -> String {
     summary
 }
 
-fn render_site_local_blocked_notice(snapshot: &Pc2Snapshot, reason: &str) -> String {
+fn render_site_local_blocked_notice(snapshot: &HomeSnapshot, reason: &str) -> String {
     if !snapshot.site.staged {
-        return "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from PC2 to preview or go public."
+        return "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from Home to preview or go public."
             .to_string();
     }
     if !component_available_in(&snapshot.components, "site-provider") {
-        return "MyWebSite is staged at localhost://MyWebSite. Run `elastos setup --profile demo` to install site-provider, then reopen MyWebSite from PC2."
+        return "MyWebSite is staged at localhost://MyWebSite. Run `elastos setup --profile demo` to install site-provider, then reopen MyWebSite from Home."
             .to_string();
     }
     format!("MyWebSite unavailable: {}", reason)
 }
 
-fn render_site_public_blocked_notice(snapshot: &Pc2Snapshot, reason: &str) -> String {
+fn render_site_public_blocked_notice(snapshot: &HomeSnapshot, reason: &str) -> String {
     if !snapshot.site.staged {
         return "MyWebSite needs a staged directory before it can go public. Run `elastos site stage <dir>` first."
             .to_string();
@@ -1801,9 +1800,9 @@ fn current_terminal_size() -> Option<(u16, u16)> {
     }
 }
 
-fn pc2_debug_tty() -> bool {
+fn home_debug_tty() -> bool {
     matches!(
-        std::env::var("ELASTOS_PC2_DEBUG_TTY").ok().as_deref(),
+        std::env::var("ELASTOS_HOME_DEBUG_TTY").ok().as_deref(),
         Some("1" | "true" | "yes")
     )
 }
@@ -1960,8 +1959,8 @@ fn gather_capsule_actions(data_dir: &Path) -> Vec<ActionInfo> {
 }
 
 async fn gather_runtime_status(data_dir: &Path) -> RuntimeStatus {
-    let coords_path = shell_cmd::runtime_coord_path(data_dir);
-    let Some(coords) = shell_cmd::read_runtime_coords(&coords_path).await else {
+    let coords_path = runtime_control::runtime_coord_path(data_dir);
+    let Some(coords) = runtime_control::read_runtime_coords(&coords_path).await else {
         return RuntimeStatus {
             running: false,
             kind: None,
@@ -2057,7 +2056,7 @@ async fn fetch_runtime_version(client: &reqwest::Client, api_url: &str) -> Optio
 
 async fn attach_client(
     client: &reqwest::Client,
-    coords: &shell_cmd::RuntimeCoords,
+    coords: &runtime_control::RuntimeCoords,
 ) -> anyhow::Result<String> {
     let resp = client
         .post(format!("{}/api/auth/attach", coords.api_url))
@@ -2284,9 +2283,9 @@ async fn delete_localhost_file(access: &SessionAccess, path: &str) -> anyhow::Re
     Ok(())
 }
 
-fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
+fn print_status(snapshot: &HomeSnapshot) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
-    writeln!(out, "ElastOS PC2")?;
+    writeln!(out, "ElastOS Home")?;
     writeln!(out, "  Version:   {}", snapshot.version)?;
     writeln!(out, "  User:      {}", snapshot.user)?;
     writeln!(
@@ -2327,7 +2326,7 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
         "  Network:   {}",
         match snapshot.runtime.peer_count {
             Some(0) if snapshot.runtime.ticket.is_some() =>
-                "Carrier bootstrap ready; waiting for another PC2".to_string(),
+                "Carrier bootstrap ready; waiting for another Home".to_string(),
             Some(0) => "starting up".to_string(),
             Some(1) => "1 Carrier peer reachable".to_string(),
             Some(peers) => format!("{} Carrier peers reachable", peers),
@@ -2351,7 +2350,7 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
         ) {
             (Some(name), Some(device)) => format!("{} on {}", name, device),
             (Some(name), None) => name.to_string(),
-            _ => "browser approval needed".to_string(),
+            _ => "browser access approval needed".to_string(),
         };
         writeln!(
             out,
@@ -2412,7 +2411,7 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
         out,
         "  Delivery:  {}",
         if snapshot.runtime.peer_count.unwrap_or_default() == 0 {
-            "local only until another PC2 joins Chat"
+            "local only until another Home joins Chat"
         } else {
             "open Chat and send a line to confirm room delivery"
         }
@@ -2477,7 +2476,7 @@ fn print_status(snapshot: &Pc2Snapshot) -> anyhow::Result<()> {
     }
     writeln!(out)?;
 
-    writeln!(out, "Launch From PC2")?;
+    writeln!(out, "Launch From Home")?;
     for action in &snapshot.actions {
         writeln!(
             out,
@@ -2507,7 +2506,7 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
             "localhost://AppCapsules/Ela.city",
         ),
         "ElastOS" => (
-            "Local trust, update, service, and system registry state for this PC2.",
+            "Local trust, update, service, and system registry state for this Home.",
             "localhost://ElastOS/SystemRegistry",
         ),
         "Local" => (
@@ -2515,7 +2514,7 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
             "localhost://Local/Shared",
         ),
         "MyWebSite" => (
-            "Browser-facing site root for the current sovereign PC2, with preview, releases, and live channels.",
+            "Browser-facing site root for the current sovereign Home, with preview, releases, and live channels.",
             "localhost://MyWebSite/index.html",
         ),
         "PC2Host" => (
@@ -2531,18 +2530,18 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
             "localhost://Users/self/.AppData/LocalHost/Chat",
         ),
         "UsersAI" => (
-            "Resident AI home directories mirroring Users for sovereign agent surfaces in this PC2.",
+            "Resident AI home directories mirroring Users for sovereign agent surfaces in this Home.",
             "localhost://UsersAI/Codex",
         ),
         "WebSpaces" => (
             "Named handles that resolve into content, peers, identity, and AI surfaces without exposing raw provider details.",
             "localhost://WebSpaces/Elastos",
         ),
-        _ => ("Local PC2 root.", "localhost://"),
+        _ => ("Local Home root.", "localhost://"),
     }
 }
 
-fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness {
+fn action_readiness(action_id: &str, snapshot: &HomeSnapshot) -> ActionReadiness {
     if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
         return if snapshot
             .room
@@ -2552,7 +2551,7 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
         {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Blocked("browser pairing request is no longer pending".to_string())
+            ActionReadiness::Blocked("browser access request is no longer pending".to_string())
         };
     }
     if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
@@ -2564,7 +2563,7 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
         {
             ActionReadiness::Ready
         } else {
-            ActionReadiness::Blocked("browser pairing request is no longer pending".to_string())
+            ActionReadiness::Blocked("browser access request is no longer pending".to_string())
         };
     }
     if let Some(token) = action_id.strip_prefix("room-revoke-session:") {
@@ -2593,7 +2592,7 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
         ),
         "room-approve" | "room-deny" => {
             if snapshot.room.pending_count == 0 {
-                ActionReadiness::Blocked("no browser pairing requests pending".to_string())
+                ActionReadiness::Blocked("no browser access requests pending".to_string())
             } else {
                 ActionReadiness::Ready
             }
@@ -2677,7 +2676,7 @@ fn action_readiness(action_id: &str, snapshot: &Pc2Snapshot) -> ActionReadiness 
     }
 }
 
-fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
+fn gather_room_actions(snapshot: &HomeSnapshot) -> Vec<ActionInfo> {
     let mut actions = Vec::new();
     if room_admin_role(snapshot) {
         actions.push(ActionInfo {
@@ -2692,7 +2691,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
             } else {
                 "Allow new browser guests to request access on the hosted room URL.".to_string()
             },
-            command: "pc2: toggle hosted guest access for this room".to_string(),
+            command: "home: toggle hosted guest access for this room".to_string(),
             ready: true,
             reason: None,
         });
@@ -2704,11 +2703,11 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                 "Open sovereign member invites".to_string()
             },
             description: if snapshot.room.allow_member_invites {
-                "Stop issuing new sovereign PC2 member invites for this room.".to_string()
+                "Stop issuing new sovereign Home member invites for this room.".to_string()
             } else {
-                "Allow new sovereign PC2 member invites for this room.".to_string()
+                "Allow new sovereign Home member invites for this room.".to_string()
             },
-            command: "pc2: toggle sovereign member invites for this room".to_string(),
+            command: "home: toggle sovereign member invites for this room".to_string(),
             ready: true,
             reason: None,
         });
@@ -2724,7 +2723,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
             } else {
                 "Allow ordinary members to host browser guests from their runtimes.".to_string()
             },
-            command: "pc2: toggle whether ordinary members may host browser guests".to_string(),
+            command: "home: toggle whether ordinary members may host browser guests".to_string(),
             ready: true,
             reason: None,
         });
@@ -2737,7 +2736,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                     label: format!("Join as {} member", invite.role),
                     description: "Accept this sovereign member invite on the local runtime."
                         .to_string(),
-                    command: "pc2: accept this sovereign room invite on the local runtime"
+                    command: "home: accept this sovereign room invite on the local runtime"
                         .to_string(),
                     ready: true,
                     reason: None,
@@ -2751,7 +2750,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                 id: format!("room-revoke-invite:{}", invite.invite_id),
                 label: format!("Revoke invite for {}", invite.invited_did),
                 description: format!("Revoke this pending sovereign {} invite.", invite.role),
-                command: "pc2: revoke this specific sovereign member invite".to_string(),
+                command: "home: revoke this specific sovereign member invite".to_string(),
                 ready: true,
                 reason: None,
             });
@@ -2768,7 +2767,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                     id: format!("room-remove-member:{}", member.member_did),
                     label: format!("Remove {}", member.member_did),
                     description: format!("Remove this sovereign {} from the room.", member.role),
-                    command: "pc2: remove this sovereign member from the room".to_string(),
+                    command: "home: remove this sovereign member from the room".to_string(),
                     ready: true,
                     reason: None,
                 });
@@ -2783,7 +2782,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                 request.display_name, request.device_label
             ),
             description: "Approve this specific room browser request.".to_string(),
-            command: "pc2: approve this specific room browser request".to_string(),
+            command: "home: approve this specific room browser request".to_string(),
             ready: true,
             reason: None,
         });
@@ -2791,7 +2790,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
             id: format!("room-deny-request:{}", request.request_id),
             label: format!("Deny {} on {}", request.display_name, request.device_label),
             description: "Deny this specific room browser request.".to_string(),
-            command: "pc2: deny this specific room browser request".to_string(),
+            command: "home: deny this specific room browser request".to_string(),
             ready: true,
             reason: None,
         });
@@ -2804,7 +2803,7 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
                 session.display_name, session.device_label
             ),
             description: "Disconnect this specific room browser session.".to_string(),
-            command: "pc2: disconnect this specific room browser session".to_string(),
+            command: "home: disconnect this specific room browser session".to_string(),
             ready: true,
             reason: None,
         });
@@ -2812,14 +2811,14 @@ fn gather_room_actions(snapshot: &Pc2Snapshot) -> Vec<ActionInfo> {
     actions
 }
 
-fn room_admin_role(snapshot: &Pc2Snapshot) -> bool {
+fn room_admin_role(snapshot: &HomeSnapshot) -> bool {
     matches!(
         snapshot.room.local_runtime_role.as_deref(),
         Some("owner" | "admin")
     )
 }
 
-fn can_manage_member(snapshot: &Pc2Snapshot, member: &RoomMemberStatus) -> bool {
+fn can_manage_member(snapshot: &HomeSnapshot, member: &RoomMemberStatus) -> bool {
     match snapshot.room.local_runtime_role.as_deref() {
         Some("owner") => member.role != "owner",
         Some("admin") => member.role == "member",
@@ -2827,7 +2826,7 @@ fn can_manage_member(snapshot: &Pc2Snapshot, member: &RoomMemberStatus) -> bool 
     }
 }
 
-fn require_room_admin_actor(snapshot: &Pc2Snapshot) -> anyhow::Result<String> {
+fn require_room_admin_actor(snapshot: &HomeSnapshot) -> anyhow::Result<String> {
     if !room_admin_role(snapshot) {
         anyhow::bail!("only owners and admins may change room access policy");
     }
@@ -2853,7 +2852,7 @@ fn format_room_participants(participants: &[RoomParticipantStatus]) -> String {
         .join(", ")
 }
 
-async fn run_pc2_update_check(snapshot: &Pc2Snapshot) -> anyhow::Result<String> {
+async fn run_home_update_check(snapshot: &HomeSnapshot) -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("current exe unavailable")?;
     let mut command = Command::new(exe);
     command.arg("update").arg("--check");
@@ -2863,13 +2862,13 @@ async fn run_pc2_update_check(snapshot: &Pc2Snapshot) -> anyhow::Result<String> 
         .stderr(Stdio::piped());
 
     let output = command.output().context("failed to run update check")?;
-    Ok(summarize_pc2_update_check(
+    Ok(summarize_home_update_check(
         &output,
         snapshot.source.as_ref(),
     ))
 }
 
-fn summarize_pc2_update_check(output: &Output, source: Option<&SourceStatus>) -> String {
+fn summarize_home_update_check(output: &Output, source: Option<&SourceStatus>) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}\n{}", stdout, stderr);
@@ -2932,7 +2931,7 @@ fn summarize_pc2_update_check(output: &Output, source: Option<&SourceStatus>) ->
         .find_map(|line| line.strip_prefix("Error: ").map(ToString::to_string))
     {
         return format!(
-            "Updates could not complete the trusted-source check: {}. You are back at PC2 home.",
+            "Updates could not complete the trusted-source check: {}. You are back at Home.",
             error
         );
     }
@@ -2951,13 +2950,13 @@ fn summarize_pc2_update_check(output: &Output, source: Option<&SourceStatus>) ->
             .unwrap_or_else(|| "signal".to_string());
         let tail = lines.last().copied().unwrap_or("update check failed");
         format!(
-            "Updates failed with exit {}: {}. You are back at PC2 home.",
+            "Updates failed with exit {}: {}. You are back at Home.",
             exit, tail
         )
     }
 }
 
-fn require_components(snapshot: &Pc2Snapshot, required: &[&str], hint: &str) -> ActionReadiness {
+fn require_components(snapshot: &HomeSnapshot, required: &[&str], hint: &str) -> ActionReadiness {
     let missing: Vec<String> = required
         .iter()
         .filter_map(|name| {
@@ -2992,7 +2991,7 @@ fn component_available_in(components: &[ComponentStatus], name: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn sample_snapshot_with_components(names: &[&str]) -> Pc2Snapshot {
+    fn sample_snapshot_with_components(names: &[&str]) -> HomeSnapshot {
         let components = names
             .iter()
             .map(|name| ComponentStatus {
@@ -3006,7 +3005,7 @@ mod tests {
             })
             .collect();
 
-        Pc2Snapshot {
+        HomeSnapshot {
             version: "test".to_string(),
             user: "tester".to_string(),
             nickname: Some("tester".to_string()),
@@ -3182,7 +3181,7 @@ mod tests {
     }
 
     #[test]
-    fn room_actions_require_pending_pairing() {
+    fn room_actions_require_pending_browser_access_request() {
         let mut snapshot = sample_snapshot_with_components(&[]);
         assert!(matches!(
             action_readiness("room-approve", &snapshot),
@@ -3252,7 +3251,7 @@ mod tests {
                 &snapshot,
                 "stage a site first with `elastos site stage <dir>`",
             ),
-            "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from PC2 to preview or go public."
+            "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from Home to preview or go public."
         );
     }
 
@@ -3265,7 +3264,7 @@ mod tests {
                 &snapshot,
                 "missing site-provider — run: elastos setup --profile demo",
             ),
-            "MyWebSite is staged at localhost://MyWebSite. Run `elastos setup --profile demo` to install site-provider, then reopen MyWebSite from PC2."
+            "MyWebSite is staged at localhost://MyWebSite. Run `elastos setup --profile demo` to install site-provider, then reopen MyWebSite from Home."
         );
     }
 
@@ -3273,6 +3272,6 @@ mod tests {
     fn provider_capsules_excluded_from_dynamic_actions() {
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"shell"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"did-provider"));
-        assert!(PROVIDER_CAPSULE_NAMES.contains(&"pc2"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"home"));
     }
 }

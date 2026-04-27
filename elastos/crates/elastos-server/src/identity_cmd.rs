@@ -48,7 +48,7 @@ pub(crate) async fn set_local_nickname(
 ) -> anyhow::Result<String> {
     let current = load_identity_profile(data_dir).await.unwrap_or_default();
     let value = resolve_nickname_input(value, current.nickname.as_deref())?;
-    validate_nickname(&value)?;
+    let value = elastos_identity::validate_nickname(&value)?;
     elastos_identity::save_nickname(data_dir, &value)?;
     Ok(value)
 }
@@ -113,38 +113,24 @@ fn prompt_for_nickname(current: Option<&str>) -> anyhow::Result<String> {
     Ok(trimmed)
 }
 
-fn validate_nickname(nickname: &str) -> anyhow::Result<()> {
-    let trimmed = nickname.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("nickname must not be empty");
-    }
-    if trimmed.chars().count() > 32 {
-        anyhow::bail!("nickname must be 32 characters or fewer");
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        anyhow::bail!("nickname must not contain control characters");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{prompt_for_nickname, validate_nickname};
+    use super::prompt_for_nickname;
     use std::io::IsTerminal;
 
     #[test]
     fn nickname_validation_rejects_empty() {
-        assert!(validate_nickname("   ").is_err());
+        assert!(elastos_identity::validate_nickname("   ").is_err());
     }
 
     #[test]
     fn nickname_validation_rejects_control_chars() {
-        assert!(validate_nickname("bad\nnick").is_err());
+        assert!(elastos_identity::validate_nickname("bad\nnick").is_err());
     }
 
     #[test]
     fn nickname_validation_accepts_simple_value() {
-        assert!(validate_nickname("anders").is_ok());
+        assert!(elastos_identity::validate_nickname("anders").is_ok());
     }
 
     #[test]

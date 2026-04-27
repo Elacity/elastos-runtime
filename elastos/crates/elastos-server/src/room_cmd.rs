@@ -419,7 +419,7 @@ async fn run_approve(
             device_label,
             expires_at,
         }) => {
-            println!("Approved room browser pairing.");
+            println!("Approved room browser access.");
             println!("Request:    {}", request_id);
             println!("Browser:    {} on {}", display_name, device_label);
             println!("Expires:    {}", expires_at);
@@ -465,7 +465,7 @@ async fn run_deny(
             device_label,
             reason,
         }) => {
-            println!("Denied room browser pairing.");
+            println!("Denied room browser access.");
             println!("Request:    {}", request_id);
             println!("Browser:    {} on {}", display_name, device_label);
             println!("Reason:     {}", reason);
@@ -531,7 +531,7 @@ async fn run_reset(data_dir: &Path, json: bool) -> anyhow::Result<()> {
 async fn require_local_did(data_dir: &Path) -> anyhow::Result<String> {
     load_room_runtime_did(data_dir).await.map_err(|e| {
         anyhow::anyhow!(
-            "local room DID is not available yet; initialize identity first or reopen PC2: {}",
+            "local room DID is not available yet; initialize identity first or reopen Home: {}",
             e
         )
     })
@@ -544,8 +544,8 @@ async fn load_room_summary_with_local_context(data_dir: &Path) -> anyhow::Result
     let hosted = load_browser_app_hosted_endpoint(data_dir, room_slug())?;
     summary.local_runtime_did = access.runtime_did;
     summary.local_runtime_role = access.member_role;
-    summary.pairing_allowed = access.pairing_allowed;
-    summary.pairing_block_reason = access.block_reason;
+    summary.browser_access_allowed = access.browser_access_allowed;
+    summary.browser_access_block_reason = access.block_reason;
     summary.canonical_hosted_guest_url = hosted.canonical_url;
     summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
     Ok(summary)

@@ -88,7 +88,7 @@ pub async fn run_share(
         cid
     );
     println!(
-        "  Open elsewhere:  after `elastos setup --with kubo --with ipfs-provider --with md-viewer`, run `elastos open elastos://{} --browser`",
+        "  Open elsewhere:  after `elastos setup --with kubo --with ipfs-provider --with documents`, run `elastos open elastos://{} --browser`",
         cid
     );
     println!(

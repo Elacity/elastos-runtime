@@ -19,7 +19,7 @@ const ESCAPE_SEQUENCE_MAX_BYTES: usize = 8;
 const LIVE_REFRESH_POLL_MS: i32 = 300;
 
 #[derive(Debug, Clone, Deserialize)]
-struct Pc2Snapshot {
+struct HomeSnapshot {
     version: String,
     user: String,
     nickname: Option<String>,
@@ -97,9 +97,9 @@ struct RoomStatus {
     #[serde(default)]
     ephemeral_hosted_guest_url: Option<String>,
     #[serde(default)]
-    pairing_allowed: bool,
+    browser_access_allowed: bool,
     #[serde(default)]
-    pairing_block_reason: Option<String>,
+    browser_access_block_reason: Option<String>,
     #[serde(default)]
     pending_count: usize,
     #[serde(default)]
@@ -249,7 +249,7 @@ struct ActionInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct Pc2Intent<'a> {
+struct HomeIntent<'a> {
     action: &'a str,
 }
 
@@ -321,7 +321,7 @@ const APP_SURFACES: &[AppSurfaceSpec] = &[
         action_ids: &["chat"],
         label: "Chat",
         category: "Communication",
-        description: "Talk to people and connected PC2s from this local world.",
+        description: "Talk to people and connected ElastOS homes from this local world.",
         command: "elastos chat",
     },
     AppSurfaceSpec {
@@ -329,7 +329,7 @@ const APP_SURFACES: &[AppSurfaceSpec] = &[
         action_ids: &["capsule-chat-wasm", "capsule-chat"],
         label: "Full-screen Chat",
         category: "Communication",
-        description: "Open the packaged full-screen Carrier chat surface from PC2.",
+        description: "Open the packaged full-screen Carrier chat surface from Home.",
         command: "elastos capsule chat-wasm --lifecycle interactive --interactive",
     },
     AppSurfaceSpec {
@@ -454,7 +454,7 @@ fn storage_write(token: &str, path: &str, content: Vec<u8>) -> Result<()> {
 fn main() -> Result<()> {
     let session_root = std::env::args()
         .nth(1)
-        .ok_or_else(|| anyhow!("pc2 capsule missing session root argument"))?;
+        .ok_or_else(|| anyhow!("Home CLI capsule missing session root argument"))?;
     let session_scope = format!("{}/*", session_root.trim_end_matches('/'));
     let read_token = request_capability(&session_scope, "read")?;
     let write_token = request_capability(&session_scope, "write")?;
@@ -471,7 +471,7 @@ fn main() -> Result<()> {
     )
 }
 
-fn load_snapshot(read_token: &str, snapshot_path: &str) -> Result<Pc2Snapshot> {
+fn load_snapshot(read_token: &str, snapshot_path: &str) -> Result<HomeSnapshot> {
     Ok(serde_json::from_slice(&storage_read(
         read_token,
         snapshot_path,
@@ -481,7 +481,7 @@ fn load_snapshot(read_token: &str, snapshot_path: &str) -> Result<Pc2Snapshot> {
 fn dashboard_loop(
     read_token: &str,
     snapshot_path: &str,
-    snapshot: Pc2Snapshot,
+    snapshot: HomeSnapshot,
     write_token: &str,
     intent_path: &str,
 ) -> Result<()> {
@@ -505,7 +505,7 @@ fn dashboard_loop(
 }
 
 fn should_use_tui() -> bool {
-    if let Ok(mode) = std::env::var("ELASTOS_PC2_TUI") {
+    if let Ok(mode) = std::env::var("ELASTOS_HOME_TUI") {
         return matches!(mode.as_str(), "1" | "true" | "yes");
     }
 
@@ -519,7 +519,7 @@ fn should_use_tui() -> bool {
 fn dashboard_tui_loop(
     read_token: &str,
     snapshot_path: &str,
-    mut snapshot: Pc2Snapshot,
+    mut snapshot: HomeSnapshot,
     write_token: &str,
     intent_path: &str,
 ) -> Result<()> {
@@ -714,7 +714,7 @@ fn startup_home_enter_decision(
 fn dashboard_line_loop(
     read_token: &str,
     snapshot_path: &str,
-    mut snapshot: Pc2Snapshot,
+    mut snapshot: HomeSnapshot,
     write_token: &str,
     intent_path: &str,
 ) -> Result<()> {
@@ -787,16 +787,16 @@ fn dashboard_line_loop(
 }
 
 fn write_intent(write_token: &str, intent_path: &str, action: &str) -> Result<()> {
-    let data = serde_json::to_vec_pretty(&Pc2Intent { action })?;
+    let data = serde_json::to_vec_pretty(&HomeIntent { action })?;
     storage_write(write_token, intent_path, data)
 }
 
-fn render_line_dashboard(snapshot: &Pc2Snapshot) -> Result<()> {
+fn render_line_dashboard(snapshot: &HomeSnapshot) -> Result<()> {
     print!("\x1B[2J\x1B[H");
-    println!("ElastOS PC2");
+    println!("ElastOS Home");
     println!("A small-device home for people, spaces, apps, and system trust.");
     println!(
-        "Version: runtime {}  pc2 {}  installed {}",
+        "Version: runtime {}  home {}  installed {}",
         snapshot.version,
         DASHBOARD_VERSION,
         snapshot
@@ -901,17 +901,17 @@ fn render_line_dashboard(snapshot: &Pc2Snapshot) -> Result<()> {
     }
 
     println!();
-    println!("Choose an action number, `r` to refresh, `q` to exit PC2 home, `?` for help.");
+    println!("Choose an action number, `r` to refresh, `q` to exit Home, `?` for help.");
     io::stdout().flush()?;
     Ok(())
 }
 
 fn print_line_help() -> Result<()> {
     println!();
-    println!("PC2 Dashboard Commands");
+    println!("Home Commands");
     println!("  <number>    Launch a quick action and return home afterward");
     println!("  r           Refresh the sovereign snapshot");
-    println!("  q           Leave PC2 home");
+    println!("  q           Leave Home");
     println!("  ?           Show this help");
     wait_for_enter()
 }
@@ -954,7 +954,7 @@ impl TuiState {
         };
     }
 
-    fn move_prev(&mut self, snapshot: &Pc2Snapshot) {
+    fn move_prev(&mut self, snapshot: &HomeSnapshot) {
         match self.tab {
             Tab::Home => {
                 if !home_action_indices(snapshot).is_empty() {
@@ -985,7 +985,7 @@ impl TuiState {
         }
     }
 
-    fn move_next(&mut self, snapshot: &Pc2Snapshot) {
+    fn move_next(&mut self, snapshot: &HomeSnapshot) {
         match self.tab {
             Tab::Home => {
                 let items = home_action_indices(snapshot);
@@ -1021,7 +1021,7 @@ impl TuiState {
         }
     }
 
-    fn activate<'a>(&self, snapshot: &'a Pc2Snapshot) -> Option<&'a str> {
+    fn activate<'a>(&self, snapshot: &'a HomeSnapshot) -> Option<&'a str> {
         match self.tab {
             Tab::Home => selected_action(snapshot, &home_action_indices(snapshot), self.home_index)
                 .map(|action| action.id.as_str()),
@@ -1082,8 +1082,8 @@ fn read_ui_key() -> Result<UiKey> {
         _ => UiKey::None,
     };
 
-    if pc2_debug_keys() {
-        eprintln!("[pc2-keys] byte={byte} parsed={key:?}");
+    if home_debug_keys() {
+        eprintln!("[home-keys] byte={byte} parsed={key:?}");
     }
 
     Ok(key)
@@ -1101,8 +1101,8 @@ fn read_escape_sequence() -> Result<UiKey> {
     }
 
     let key = parse_escape_sequence_bytes(&seq);
-    if pc2_debug_keys() {
-        eprintln!("[pc2-keys] esc-seq={seq:?} parsed={key:?}");
+    if home_debug_keys() {
+        eprintln!("[home-keys] esc-seq={seq:?} parsed={key:?}");
     }
     Ok(key)
 }
@@ -1128,7 +1128,7 @@ fn is_escape_sequence_terminator(byte: u8) -> bool {
     matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'~')
 }
 
-fn render_tui(snapshot: &Pc2Snapshot, state: &TuiState) -> Result<()> {
+fn render_tui(snapshot: &HomeSnapshot, state: &TuiState) -> Result<()> {
     let cols = term_cols();
     let rows = term_rows();
     let screen = build_tui_screen(snapshot, state, cols, rows);
@@ -1138,7 +1138,7 @@ fn render_tui(snapshot: &Pc2Snapshot, state: &TuiState) -> Result<()> {
     Ok(())
 }
 
-fn build_tui_screen(snapshot: &Pc2Snapshot, state: &TuiState, cols: usize, rows: usize) -> String {
+fn build_tui_screen(snapshot: &HomeSnapshot, state: &TuiState, cols: usize, rows: usize) -> String {
     let body_width = cols.saturating_sub(4);
     let mut screen = String::new();
     // Steady-state redraws repaint from the home position and clear to the end of the
@@ -1164,7 +1164,7 @@ fn build_tui_screen(snapshot: &Pc2Snapshot, state: &TuiState, cols: usize, rows:
         push_screen_blank(&mut screen);
         push_screen_line(&mut screen, &section_title("Help", cols));
         for line in wrap_text(
-            "Arrows or hjkl move, Tab switches sections, Enter runs the selected action, digits 1-9 quick-launch actions, m marks an inbox entry read, d dismisses it, r refreshes the snapshot, q leaves PC2 home.",
+            "Arrows or hjkl move, Tab switches sections, Enter runs the selected action, digits 1-9 quick-launch actions, m marks an inbox entry read, d dismisses it, r refreshes the snapshot, q leaves Home.",
             body_width,
         ) {
             push_screen_line(&mut screen, &format!("  {}", line));
@@ -1211,7 +1211,7 @@ fn trim_trailing_screen_newline(screen: &mut String) {
     }
 }
 
-fn render_home_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+fn render_home_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
     let text_width = total_width.saturating_sub(2);
     let primary_actions = quick_launch_action_indices(snapshot);
@@ -1233,7 +1233,7 @@ fn render_home_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
     }
 }
 
-fn render_inbox_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+fn render_inbox_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
     let column_width = column_width(total_width);
     let mut left = Vec::new();
@@ -1297,7 +1297,7 @@ fn render_inbox_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, 
     render_two_columns(buf, &left, &right, total_width);
 }
 
-fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
     let column_width = column_width(total_width);
     let mut left = Vec::new();
@@ -1319,7 +1319,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         you.extend(wrap_with_label(
             "Ticket",
             &format!(
-                "Share this with another PC2 to connect directly: {}",
+                "Share this with another Home to connect directly: {}",
                 truncate(ticket, column_width.saturating_sub(44).max(16))
             ),
             column_width,
@@ -1364,7 +1364,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         ),
     ];
     connections.push(
-        "Mode       Native chat is the current first-class PC2 conversation path.".to_string(),
+        "Mode       Native chat is the current first-class Home conversation path.".to_string(),
     );
     push_section_lines(&mut right, "Connections", &connections);
 
@@ -1396,10 +1396,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
             "only owners and admins may host browser guests"
         }
     ));
-    room.push(format!(
-        "Invites    {}",
-        snapshot.room.pending_invite_count
-    ));
+    room.push(format!("Invites    {}", snapshot.room.pending_invite_count));
     if let Some(url) = snapshot.room.canonical_hosted_guest_url.as_deref() {
         room.push(format!(
             "Hosted     {}",
@@ -1413,7 +1410,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         ));
     }
     if snapshot.room.pending_requests.is_empty() {
-        room.push("Requests   no browser pairing requests pending".to_string());
+        room.push("Requests   no browser access requests pending".to_string());
     } else {
         for request in snapshot.room.pending_requests.iter().take(4) {
             room.push(format!(
@@ -1440,10 +1437,9 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
         ));
     }
     room.push(
-        "Control    Open Apps -> Room Browser for targeted browser approve, deny, and disconnect."
-            .to_string(),
+        "Control    Open Apps -> Chat Room to review browser access and disconnect.".to_string(),
     );
-    push_section_lines(&mut right, "Room Browser", &room);
+    push_section_lines(&mut right, "Chat Room", &room);
 
     if let Some(action) = selected_action(snapshot, &people_actions, state.people_index) {
         let mut profile = vec![
@@ -1465,7 +1461,7 @@ fn render_people_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
     render_two_columns(buf, &left, &right, total_width);
 }
 
-fn render_spaces_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+fn render_spaces_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
     let column_width = column_width(total_width);
     let mut left = Vec::new();
@@ -1506,7 +1502,7 @@ fn render_spaces_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState,
     render_two_columns(buf, &left, &right, total_width);
 }
 
-fn render_apps_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, width: usize) {
+fn render_apps_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState, width: usize) {
     let total_width = width.max(60);
     let column_width = column_width(total_width);
     let mut left = Vec::new();
@@ -1517,8 +1513,8 @@ fn render_apps_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
     push_section_lines(&mut left, "Apps", &list);
 
     if let Some(entry) = entries.get(state.app_index.min(entries.len().saturating_sub(1))) {
-        let mut details = if entry.action_id == "room-browser" {
-            room_browser_app_detail_lines(snapshot, entry, column_width)
+        let mut details = if entry.action_id == "chat-room" {
+            chat_room_app_detail_lines(snapshot, entry, column_width)
         } else {
             let mut details = vec![
                 format!("Surface    {}", entry.name),
@@ -1538,25 +1534,25 @@ fn render_apps_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
                 details.push(if entry.is_control {
                     "Enter      run this room action and return here".to_string()
                 } else {
-                    "Enter      launch from PC2".to_string()
+                    "Enter      launch from Home".to_string()
                 });
             } else {
                 details.push(if entry.is_control {
                     "Enter      room action not ready yet".to_string()
                 } else {
-                    "Enter      not ready from PC2 yet".to_string()
+                    "Enter      not ready from Home yet".to_string()
                 });
                 if let Some(reason) = &action.reason {
                     details.extend(wrap_with_label("Setup", reason, column_width));
                 }
             }
-        } else if entry.action_id == "room-browser" {
+        } else if entry.action_id == "chat-room" {
             details.push(
                 "Enter      no direct launch; review the room controls listed below in Apps"
                     .to_string(),
             );
         } else {
-            details.push("Enter      no direct launch from PC2 yet".to_string());
+            details.push("Enter      no direct launch from Home yet".to_string());
         }
         push_section_lines(&mut right, &entry.label, &details);
     }
@@ -1564,7 +1560,7 @@ fn render_apps_tab(buf: &mut String, snapshot: &Pc2Snapshot, state: &TuiState, w
     render_two_columns(buf, &left, &right, total_width);
 }
 
-fn render_system_tab(buf: &mut String, snapshot: &Pc2Snapshot, width: usize) {
+fn render_system_tab(buf: &mut String, snapshot: &HomeSnapshot, width: usize) {
     let total_width = width.max(60);
     let lines = compact_system_lines(snapshot);
     for line in lines {
@@ -1677,7 +1673,7 @@ fn selected_marker(selected: bool) -> &'static str {
     }
 }
 
-fn people_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
+fn people_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("You        {}", snapshot.user),
         format!("Nick       {}", display_name(snapshot)),
@@ -1708,7 +1704,7 @@ fn people_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
     lines
 }
 
-fn spaces_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
+fn spaces_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     vec![
         format!("MyWebSite  {}", website_summary(snapshot)),
         format!(
@@ -1725,7 +1721,7 @@ fn spaces_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
     ]
 }
 
-fn apps_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
+fn apps_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let entries = app_entries(snapshot)
         .into_iter()
         .filter(|entry| !entry.is_control)
@@ -1742,7 +1738,7 @@ fn apps_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
     lines
 }
 
-fn compact_system_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
+fn compact_system_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let ready = snapshot
         .system_services
         .iter()
@@ -1774,7 +1770,7 @@ fn compact_system_summary_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
     ]
 }
 
-fn compact_system_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
+fn compact_system_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let mut lines = compact_system_summary_lines(snapshot);
     let not_ready: Vec<&SystemServiceStatus> = snapshot
         .system_services
@@ -1798,22 +1794,22 @@ fn compact_system_lines(snapshot: &Pc2Snapshot) -> Vec<String> {
         "PC2Host    {}",
         root_example(snapshot, "PC2Host", "localhost://PC2Host/AdaptationLayer")
     ));
-    lines.push("Next       elastos pc2 --status for full detail".to_string());
+    lines.push("Next       elastos home --status for full detail".to_string());
     lines
 }
 
-fn root_example(snapshot: &Pc2Snapshot, name: &str, fallback: &str) -> String {
+fn root_example(snapshot: &HomeSnapshot, name: &str, default_example: &str) -> String {
     snapshot
         .roots
         .iter()
         .find(|root| root.name == name)
         .map(|root| root.example.as_str())
         .filter(|example| !example.is_empty())
-        .unwrap_or(fallback)
+        .unwrap_or(default_example)
         .to_string()
 }
 
-fn header_summary_line(snapshot: &Pc2Snapshot) -> String {
+fn header_summary_line(snapshot: &HomeSnapshot) -> String {
     let identity = if snapshot.did.is_some() {
         "identity ready"
     } else {
@@ -1850,7 +1846,7 @@ fn truncate_did(did: &str) -> String {
     truncate(did, 36)
 }
 
-fn network_summary(snapshot: &Pc2Snapshot) -> String {
+fn network_summary(snapshot: &HomeSnapshot) -> String {
     if !snapshot.runtime.running {
         return "home session not running yet".to_string();
     }
@@ -1869,7 +1865,7 @@ fn network_summary(snapshot: &Pc2Snapshot) -> String {
     }
 }
 
-fn website_status_label(snapshot: &Pc2Snapshot) -> &'static str {
+fn website_status_label(snapshot: &HomeSnapshot) -> &'static str {
     if snapshot.site.active_release.is_some() {
         "site live"
     } else if snapshot.site.local_url.is_some() {
@@ -1883,7 +1879,7 @@ fn website_status_label(snapshot: &Pc2Snapshot) -> &'static str {
     }
 }
 
-fn identity_summary(snapshot: &Pc2Snapshot) -> String {
+fn identity_summary(snapshot: &HomeSnapshot) -> String {
     snapshot
         .did
         .as_deref()
@@ -1891,7 +1887,7 @@ fn identity_summary(snapshot: &Pc2Snapshot) -> String {
         .unwrap_or_else(|| "not initialized yet".to_string())
 }
 
-fn display_name(snapshot: &Pc2Snapshot) -> String {
+fn display_name(snapshot: &HomeSnapshot) -> String {
     snapshot
         .nickname
         .as_deref()
@@ -1900,7 +1896,7 @@ fn display_name(snapshot: &Pc2Snapshot) -> String {
         .to_string()
 }
 
-fn website_summary(snapshot: &Pc2Snapshot) -> String {
+fn website_summary(snapshot: &HomeSnapshot) -> String {
     let mut parts = Vec::new();
     if let Some(url) = snapshot.site.local_url.as_deref() {
         parts.push(format!("preview at {}", url.trim_end_matches('/')));
@@ -1935,7 +1931,7 @@ fn website_summary(snapshot: &Pc2Snapshot) -> String {
     parts.join(" · ")
 }
 
-fn source_label(snapshot: &Pc2Snapshot) -> String {
+fn source_label(snapshot: &HomeSnapshot) -> String {
     match &snapshot.source {
         Some(source) => {
             let name = if source.name == "default" {
@@ -1962,11 +1958,11 @@ fn source_label(snapshot: &Pc2Snapshot) -> String {
     }
 }
 
-fn banner_line(snapshot: &Pc2Snapshot, cols: usize) -> String {
+fn banner_line(snapshot: &HomeSnapshot, cols: usize) -> String {
     let title = if snapshot.runtime.running {
-        "ElastOS PC2"
+        "ElastOS Home"
     } else {
-        "ElastOS PC2 (offline)"
+        "ElastOS Home (offline)"
     };
     fit_line(title, cols)
 }
@@ -1975,7 +1971,7 @@ fn section_title(title: &str, cols: usize) -> String {
     fit_line(title, cols)
 }
 
-fn home_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+fn home_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     let mut indices = prioritized_action_indices(
         snapshot,
         &[
@@ -2002,27 +1998,27 @@ fn home_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
     indices
 }
 
-fn people_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+fn people_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     prioritized_action_indices(snapshot, &["identity-nickname-set", "chat"])
 }
 
-fn notification_entries(snapshot: &Pc2Snapshot) -> &[NotificationEntryStatus] {
+fn notification_entries(snapshot: &HomeSnapshot) -> &[NotificationEntryStatus] {
     &snapshot.notifications.entries
 }
 
-fn notification_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+fn notification_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     (0..notification_entries(snapshot).len()).collect()
 }
 
-fn space_root_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+fn space_root_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     root_indices_by_priority(snapshot, &["MyWebSite", "Public", "Local", "WebSpaces"])
 }
 
-fn quick_launch_action_indices(snapshot: &Pc2Snapshot) -> Vec<usize> {
+fn quick_launch_action_indices(snapshot: &HomeSnapshot) -> Vec<usize> {
     home_action_indices(snapshot)
 }
 
-fn prioritized_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec<usize> {
+fn prioritized_action_indices(snapshot: &HomeSnapshot, ids: &[&str]) -> Vec<usize> {
     let mut indices = Vec::new();
     for id in ids {
         if let Some(idx) = snapshot.actions.iter().position(|action| action.id == *id) {
@@ -2034,7 +2030,7 @@ fn prioritized_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec<usize
     indices
 }
 
-fn prioritized_ready_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec<usize> {
+fn prioritized_ready_action_indices(snapshot: &HomeSnapshot, ids: &[&str]) -> Vec<usize> {
     prioritized_action_indices(snapshot, ids)
         .into_iter()
         .filter(|idx| {
@@ -2047,7 +2043,7 @@ fn prioritized_ready_action_indices(snapshot: &Pc2Snapshot, ids: &[&str]) -> Vec
         .collect()
 }
 
-fn root_indices_by_priority(snapshot: &Pc2Snapshot, names: &[&str]) -> Vec<usize> {
+fn root_indices_by_priority(snapshot: &HomeSnapshot, names: &[&str]) -> Vec<usize> {
     let mut indices = Vec::new();
     for name in names {
         if let Some(idx) = snapshot.roots.iter().position(|root| root.name == *name) {
@@ -2058,7 +2054,7 @@ fn root_indices_by_priority(snapshot: &Pc2Snapshot, names: &[&str]) -> Vec<usize
 }
 
 fn selected_action<'a>(
-    snapshot: &'a Pc2Snapshot,
+    snapshot: &'a HomeSnapshot,
     indices: &[usize],
     selected: usize,
 ) -> Option<&'a ActionInfo> {
@@ -2066,19 +2062,22 @@ fn selected_action<'a>(
     snapshot.actions.get(*idx)
 }
 
-fn selected_root<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Option<&'a RootStatus> {
+fn selected_root<'a>(snapshot: &'a HomeSnapshot, selected: usize) -> Option<&'a RootStatus> {
     let indices = space_root_indices(snapshot);
     let idx = indices.get(selected.min(indices.len().saturating_sub(1)))?;
     snapshot.roots.get(*idx)
 }
 
-fn selected_space_action<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Option<&'a ActionInfo> {
+fn selected_space_action<'a>(
+    snapshot: &'a HomeSnapshot,
+    selected: usize,
+) -> Option<&'a ActionInfo> {
     let root = selected_root(snapshot, selected)?;
     space_action_for_root(snapshot, &root.name)
 }
 
 fn selected_notification<'a>(
-    snapshot: &'a Pc2Snapshot,
+    snapshot: &'a HomeSnapshot,
     selected: usize,
 ) -> Option<&'a NotificationEntryStatus> {
     let entries = notification_entries(snapshot);
@@ -2086,7 +2085,7 @@ fn selected_notification<'a>(
 }
 
 fn selected_notification_action<'a>(
-    snapshot: &'a Pc2Snapshot,
+    snapshot: &'a HomeSnapshot,
     selected: usize,
 ) -> Option<&'a ActionInfo> {
     let entry = selected_notification(snapshot, selected)?;
@@ -2097,18 +2096,18 @@ fn selected_notification_action<'a>(
     action_by_id(snapshot, action_id)
 }
 
-fn selected_app_action<'a>(snapshot: &'a Pc2Snapshot, selected: usize) -> Option<&'a ActionInfo> {
+fn selected_app_action<'a>(snapshot: &'a HomeSnapshot, selected: usize) -> Option<&'a ActionInfo> {
     let entries = app_entries(snapshot);
     let entry = entries.get(selected.min(entries.len().saturating_sub(1)))?;
     action_by_id(snapshot, &entry.action_id)
 }
 
-fn action_by_id<'a>(snapshot: &'a Pc2Snapshot, id: &str) -> Option<&'a ActionInfo> {
+fn action_by_id<'a>(snapshot: &'a HomeSnapshot, id: &str) -> Option<&'a ActionInfo> {
     snapshot.actions.iter().find(|action| action.id == id)
 }
 
 fn first_action_by_id<'a>(
-    snapshot: &'a Pc2Snapshot,
+    snapshot: &'a HomeSnapshot,
     action_ids: &[&str],
 ) -> Option<&'a ActionInfo> {
     action_ids
@@ -2116,7 +2115,10 @@ fn first_action_by_id<'a>(
         .find_map(|action_id| action_by_id(snapshot, action_id))
 }
 
-fn space_action_for_root<'a>(snapshot: &'a Pc2Snapshot, root_name: &str) -> Option<&'a ActionInfo> {
+fn space_action_for_root<'a>(
+    snapshot: &'a HomeSnapshot,
+    root_name: &str,
+) -> Option<&'a ActionInfo> {
     let action_id = match root_name {
         "MyWebSite" => "site-local",
         "Public" => "shares-list",
@@ -2125,7 +2127,7 @@ fn space_action_for_root<'a>(snapshot: &'a Pc2Snapshot, root_name: &str) -> Opti
     action_by_id(snapshot, action_id)
 }
 
-fn space_state_label(root: &RootStatus, snapshot: &Pc2Snapshot) -> &'static str {
+fn space_state_label(root: &RootStatus, snapshot: &HomeSnapshot) -> &'static str {
     match root.name.as_str() {
         "MyWebSite" => {
             if snapshot.site.local_url.is_some() {
@@ -2187,7 +2189,7 @@ fn next_step_command(reason: &str) -> Option<&str> {
 }
 
 fn render_home_actions(
-    snapshot: &Pc2Snapshot,
+    snapshot: &HomeSnapshot,
     indices: &[usize],
     selected: usize,
     width: usize,
@@ -2216,7 +2218,7 @@ fn render_home_actions(
     lines
 }
 
-fn home_action_state<'a>(action: &'a ActionInfo, snapshot: &Pc2Snapshot) -> &'a str {
+fn home_action_state<'a>(action: &'a ActionInfo, snapshot: &HomeSnapshot) -> &'a str {
     match action.id.as_str() {
         "site-local" => {
             if snapshot.site.local_url.is_some() {
@@ -2258,8 +2260,8 @@ fn home_action_summary(action: &ActionInfo) -> &str {
 fn action_display_label<'a>(action: &'a ActionInfo) -> &'a str {
     match action.id.as_str() {
         "chat" => "Chat",
-        "room-approve" => "Approve pairing",
-        "room-deny" => "Deny pairing",
+        "room-approve" => "Approve access",
+        "room-deny" => "Deny access",
         "room-revoke-all" => "Disconnect browsers",
         "site-local" => "MyWebSite",
         "site-ephemeral" => "Go public",
@@ -2269,11 +2271,11 @@ fn action_display_label<'a>(action: &'a ActionInfo) -> &'a str {
     }
 }
 
-fn current_notice<'a>(state: &'a TuiState, snapshot: &'a Pc2Snapshot) -> Option<&'a str> {
+fn current_notice<'a>(state: &'a TuiState, snapshot: &'a HomeSnapshot) -> Option<&'a str> {
     state.notice.as_deref().or(snapshot.notice.as_deref())
 }
 
-fn alerts_lines(snapshot: &Pc2Snapshot, width: usize, notice: Option<&str>) -> Vec<String> {
+fn alerts_lines(snapshot: &HomeSnapshot, width: usize, notice: Option<&str>) -> Vec<String> {
     let mut alerts = Vec::new();
     if snapshot.did.is_none() {
         alerts.push(
@@ -2298,7 +2300,7 @@ fn alerts_lines(snapshot: &Pc2Snapshot, width: usize, notice: Option<&str>) -> V
     }
     if snapshot.room.active_session_count > 0 {
         alerts.push(format!(
-            "Room Browser has {} active browser session(s): {}.",
+            "Chat Room has {} active browser session(s): {}.",
             snapshot.room.active_session_count,
             format_room_participants(&snapshot.room.active_participants)
         ));
@@ -2347,7 +2349,7 @@ fn format_room_participants(participants: &[RoomParticipantStatus]) -> String {
         .join(", ")
 }
 
-fn runtime_state_label(snapshot: &Pc2Snapshot) -> String {
+fn runtime_state_label(snapshot: &HomeSnapshot) -> String {
     if !snapshot.runtime.running {
         return "offline".to_string();
     }
@@ -2361,13 +2363,12 @@ fn runtime_state_label(snapshot: &Pc2Snapshot) -> String {
 fn should_render_notice(notice: &str) -> bool {
     let trimmed = notice.trim();
     !trimmed.is_empty()
-        && trimmed
-            != "PC2 home is live. Launch an app and you return here automatically when it exits."
+        && trimmed != "Home is live. Launch an app and you return here automatically when it exits."
         && trimmed != "Snapshot refreshed from live local state."
         && !trimmed.starts_with("Returned home from ")
 }
 
-fn space_detail_lines(root: &RootStatus, snapshot: &Pc2Snapshot, width: usize) -> Vec<String> {
+fn space_detail_lines(root: &RootStatus, snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
     let mut details = vec![
         format!("Group      {}", root_group_name(&root.name)),
         format!("Kind       {}", root.kind),
@@ -2415,7 +2416,7 @@ fn space_detail_lines(root: &RootStatus, snapshot: &Pc2Snapshot, width: usize) -
             details.push("Public     Home -> Go public gives a temporary HTTPS URL".to_string());
             details.extend(wrap_with_label(
                 "Commands",
-                "elastos site stage <dir> · Go public in PC2 · elastos site publish --release <name> · elastos site activate --channel live · elastos site rollback --target publisher",
+                "elastos site stage <dir> · Go public in Home · elastos site publish --release <name> · elastos site activate --channel live · elastos site rollback --target publisher",
                 width,
             ));
         }
@@ -2473,7 +2474,7 @@ fn space_detail_lines(root: &RootStatus, snapshot: &Pc2Snapshot, width: usize) -
     details
 }
 
-fn app_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
+fn app_entries(snapshot: &HomeSnapshot) -> Vec<AppEntry> {
     let mut entries = Vec::new();
 
     for spec in APP_SURFACES {
@@ -2504,7 +2505,7 @@ fn app_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
         });
 
         if action.id == "chat" {
-            if let Some(entry) = room_browser_app_entry(snapshot) {
+            if let Some(entry) = chat_room_app_entry(snapshot) {
                 entries.push(entry);
                 entries.extend(room_control_entries(snapshot));
             }
@@ -2513,7 +2514,7 @@ fn app_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
     entries
 }
 
-fn room_browser_app_entry(snapshot: &Pc2Snapshot) -> Option<AppEntry> {
+fn chat_room_app_entry(snapshot: &HomeSnapshot) -> Option<AppEntry> {
     if snapshot.room.room_slug.is_empty()
         && snapshot.room.pending_count == 0
         && snapshot.room.active_session_count == 0
@@ -2527,31 +2528,29 @@ fn room_browser_app_entry(snapshot: &Pc2Snapshot) -> Option<AppEntry> {
         "attention"
     } else if snapshot.room.active_session_count > 0 {
         "active"
-    } else if !snapshot.room.pairing_allowed {
+    } else if !snapshot.room.browser_access_allowed {
         "restricted"
-    } else if snapshot.room.member_count > 0
-        || snapshot.room.local_runtime_role.is_some()
-    {
+    } else if snapshot.room.member_count > 0 || snapshot.room.local_runtime_role.is_some() {
         "ready"
     } else {
         "idle"
     };
 
     Some(AppEntry {
-        name: "room-browser".to_string(),
-        action_id: "room-browser".to_string(),
-        label: "Room Browser".to_string(),
+        name: "chat-room".to_string(),
+        action_id: "chat-room".to_string(),
+        label: "Chat Room".to_string(),
         category: "Communication",
         description:
-            "Hosted guest room plus sovereign PC2 member room control, with per-browser session approval."
+            "Hosted guest room plus sovereign Home member room control, with per-browser session approval."
                 .to_string(),
-        command: "PC2 room control stays local to this runtime.".to_string(),
+        command: "Home room control stays local to this runtime.".to_string(),
         state: state.to_string(),
         is_control: false,
     })
 }
 
-fn room_control_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
+fn room_control_entries(snapshot: &HomeSnapshot) -> Vec<AppEntry> {
     let mut entries = Vec::new();
     for action in &snapshot.actions {
         let is_room_control = action.id.starts_with("room-approve-request:")
@@ -2570,7 +2569,7 @@ fn room_control_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
             continue;
         }
         entries.push(AppEntry {
-            name: "room-browser".to_string(),
+            name: "chat-room".to_string(),
             action_id: action.id.clone(),
             label: action.label.clone(),
             category: "Communication",
@@ -2587,8 +2586,8 @@ fn room_control_entries(snapshot: &Pc2Snapshot) -> Vec<AppEntry> {
     entries
 }
 
-fn room_browser_app_detail_lines(
-    snapshot: &Pc2Snapshot,
+fn chat_room_app_detail_lines(
+    snapshot: &HomeSnapshot,
     entry: &AppEntry,
     width: usize,
 ) -> Vec<String> {
@@ -2624,14 +2623,9 @@ fn room_browser_app_detail_lines(
     }
     details.push(format!(
         "Members    {} total · {} active · {} admin",
-        snapshot.room.member_count,
-        snapshot.room.active_member_count,
-        snapshot.room.admin_count
+        snapshot.room.member_count, snapshot.room.active_member_count, snapshot.room.admin_count
     ));
-    details.push(format!(
-        "Key epoch  {}",
-        snapshot.room.current_key_epoch
-    ));
+    details.push(format!("Key epoch  {}", snapshot.room.current_key_epoch));
     details.push(format!(
         "Guests     {}",
         if snapshot.room.allow_guest_invites {
@@ -2704,18 +2698,18 @@ fn room_browser_app_detail_lines(
         }
     }
 
-    if !snapshot.room.pairing_allowed {
-        if let Some(reason) = snapshot.room.pairing_block_reason.as_deref() {
-            details.extend(wrap_with_label("Pairing", reason, width));
+    if !snapshot.room.browser_access_allowed {
+        if let Some(reason) = snapshot.room.browser_access_block_reason.as_deref() {
+            details.extend(wrap_with_label("Browser", reason, width));
         } else {
-            details.push("Pairing    blocked on this runtime".to_string());
+            details.push("Browser    access blocked on this runtime".to_string());
         }
     } else {
-        details.push("Pairing    allowed for this runtime".to_string());
+        details.push("Browser    access allowed for this runtime".to_string());
     }
 
     if snapshot.room.pending_requests.is_empty() {
-        details.push("Pending    no browser pairing requests".to_string());
+        details.push("Pending    no browser access requests".to_string());
     } else {
         details.push(format!(
             "Pending    {} browser request(s)",
@@ -2759,7 +2753,7 @@ fn room_browser_app_detail_lines(
     details
 }
 
-fn app_surface_active(snapshot: &Pc2Snapshot, spec: &AppSurfaceSpec, action: &ActionInfo) -> bool {
+fn app_surface_active(snapshot: &HomeSnapshot, spec: &AppSurfaceSpec, action: &ActionInfo) -> bool {
     if action.id == "site-local" {
         return snapshot.site.local_url.is_some();
     }
@@ -2866,8 +2860,8 @@ fn count_screen_lines(screen: &str) -> usize {
     screen.matches("\r\n").count()
 }
 
-fn pc2_debug_keys() -> bool {
-    std::env::var("ELASTOS_PC2_DEBUG_KEYS")
+fn home_debug_keys() -> bool {
+    std::env::var("ELASTOS_HOME_DEBUG_KEYS")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
@@ -2971,8 +2965,8 @@ fn visible_text_width(text: &str) -> usize {
 mod tests {
     use super::*;
 
-    fn sample_snapshot() -> Pc2Snapshot {
-        Pc2Snapshot {
+    fn sample_snapshot() -> HomeSnapshot {
+        HomeSnapshot {
             version: "0.1.0".to_string(),
             user: "anders".to_string(),
             nickname: Some("anders".to_string()),
@@ -3000,7 +2994,7 @@ mod tests {
             },
             shares: ShareStatus::default(),
             room: RoomStatus {
-                room_slug: "room-browser".to_string(),
+                room_slug: "chat-room".to_string(),
                 title: "Room".to_string(),
                 owner_did: Some("did:key:z6Mkowner".to_string()),
                 current_key_epoch: 1,
@@ -3014,11 +3008,11 @@ mod tests {
                 local_runtime_did: Some("did:key:z6MkhExample".to_string()),
                 local_runtime_role: Some("owner".to_string()),
                 canonical_hosted_guest_url: Some(
-                    "https://elastos.elacitylabs.com/apps/room-browser/".to_string(),
+                    "https://elastos.elacitylabs.com/apps/chat-room/".to_string(),
                 ),
                 ephemeral_hosted_guest_url: None,
-                pairing_allowed: true,
-                pairing_block_reason: None,
+                browser_access_allowed: true,
+                browser_access_block_reason: None,
                 pending_count: 0,
                 active_session_count: 0,
                 active_participants: Vec::new(),
@@ -3308,11 +3302,11 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.label == "GBA UCity"));
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Room Browser" && entry.state == "ready"));
+            .any(|entry| entry.label == "Chat Room" && entry.state == "ready"));
         assert!(!entries.iter().any(|entry| entry.label == "Shared"));
         assert!(!entries.iter().any(|entry| entry.label == "Codex"));
         assert!(!entries.iter().any(|entry| entry.label == "Mystery Capsule"));
-        assert!(!entries.iter().any(|entry| entry.label == "PC2 Home"));
+        assert!(!entries.iter().any(|entry| entry.label == "Home CLI"));
         assert!(!entries.iter().any(|entry| entry.label == "GBA Viewer"));
         assert!(!entries.iter().any(|entry| entry.label == "IPFS Provider"));
     }
@@ -3362,17 +3356,17 @@ mod tests {
     }
 
     #[test]
-    fn pending_pairing_surfaces_approval_actions_on_home() {
+    fn pending_browser_access_surfaces_approval_actions_on_home() {
         let mut snapshot = sample_snapshot();
         snapshot.room.pending_count = 1;
         snapshot.notifications.entries = vec![NotificationEntryStatus {
             id: "room-pair-request:req-1".to_string(),
-            source_app: "room-browser".to_string(),
+            source_app: "chat-room".to_string(),
             kind: "room_pair_request".to_string(),
-            title: "Alice wants to pair".to_string(),
-            body: "Alice on Phone wants to join Room.".to_string(),
+            title: "Alice requests room access".to_string(),
+            body: "Alice on Phone requests browser access to Room.".to_string(),
             action_ref: Some(NotificationActionRefStatus {
-                app: "room-browser".to_string(),
+                app: "chat-room".to_string(),
                 action_id: "room-approve-request:req-1".to_string(),
             }),
             read: false,
@@ -3384,9 +3378,9 @@ mod tests {
             1,
             ActionInfo {
                 id: "room-approve".to_string(),
-                label: "Approve browser pairing".to_string(),
+                label: "Approve browser access".to_string(),
                 description: String::new(),
-                command: "pc2 approve".to_string(),
+                command: "home approve".to_string(),
                 ready: true,
                 reason: None,
             },
@@ -3395,9 +3389,9 @@ mod tests {
             2,
             ActionInfo {
                 id: "room-deny".to_string(),
-                label: "Deny browser pairing".to_string(),
+                label: "Deny browser access".to_string(),
                 description: String::new(),
-                command: "pc2 deny".to_string(),
+                command: "home deny".to_string(),
                 ready: true,
                 reason: None,
             },
@@ -3420,7 +3414,7 @@ mod tests {
         let alerts = alerts_lines(&snapshot, 120, None);
         assert!(alerts
             .iter()
-            .any(|line| line.contains("Alice on Phone wants to join Room.")));
+            .any(|line| line.contains("Alice on Phone requests browser access to Room.")));
     }
 
     #[test]
@@ -3443,7 +3437,7 @@ mod tests {
                 id: "room-revoke-all".to_string(),
                 label: "Disconnect browsers".to_string(),
                 description: String::new(),
-                command: "pc2 revoke".to_string(),
+                command: "home revoke".to_string(),
                 ready: true,
                 reason: None,
             },
@@ -3455,12 +3449,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![
-                "chat",
-                "room-revoke-all",
-                "site-local",
-                "update-check"
-            ]
+            vec!["chat", "room-revoke-all", "site-local", "update-check"]
         );
 
         let alerts = alerts_lines(&snapshot, 120, None);
@@ -3488,7 +3477,7 @@ mod tests {
             id: "room-approve-request:req-1".to_string(),
             label: "Approve Alice on Phone".to_string(),
             description: String::new(),
-            command: "pc2 approve specific".to_string(),
+            command: "home approve specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3496,7 +3485,7 @@ mod tests {
             id: "room-deny-request:req-1".to_string(),
             label: "Deny Alice on Phone".to_string(),
             description: String::new(),
-            command: "pc2 deny specific".to_string(),
+            command: "home deny specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3504,7 +3493,7 @@ mod tests {
             id: "room-revoke-session:tok-1".to_string(),
             label: "Disconnect Bob on Safari".to_string(),
             description: String::new(),
-            command: "pc2 disconnect specific".to_string(),
+            command: "home disconnect specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3517,7 +3506,7 @@ mod tests {
 
         let mut buf = String::new();
         render_people_tab(&mut buf, &snapshot, &TuiState::default(), 120);
-        assert!(buf.contains("Room Browser"));
+        assert!(buf.contains("Chat Room"));
         assert!(buf.contains("Request    Alice on Phone"));
         assert!(buf.contains("Browser    Bob on Safari"));
     }
@@ -3526,7 +3515,7 @@ mod tests {
     fn apps_tab_surfaces_room_control_details() {
         let mut snapshot = sample_snapshot();
         snapshot.room.title = "Room".to_string();
-        snapshot.room.room_slug = "room-browser".to_string();
+        snapshot.room.room_slug = "chat-room".to_string();
         snapshot.room.local_runtime_role = Some("owner".to_string());
         snapshot.room.owner_did = Some("did:key:z6Mkowner".to_string());
         snapshot.room.current_key_epoch = 3;
@@ -3564,7 +3553,7 @@ mod tests {
 
         let entry_index = app_entries(&snapshot)
             .iter()
-            .position(|entry| entry.label == "Room Browser")
+            .position(|entry| entry.label == "Chat Room")
             .expect("room entry missing");
 
         let mut state = TuiState::default();
@@ -3573,18 +3562,17 @@ mod tests {
 
         let mut buf = String::new();
         render_apps_tab(&mut buf, &snapshot, &state, 120);
-        assert!(buf.contains("Room Browser"));
+        assert!(buf.contains("Chat Room"));
         assert!(buf.contains("Role       owner"));
         assert!(buf.contains("Members    4 total"));
         assert!(buf.contains("Request    Alice on Phone"));
         assert!(buf.contains("Browser    Bob on Safari"));
 
         let detail_lines =
-            room_browser_app_detail_lines(&snapshot, &app_entries(&snapshot)[entry_index], 120);
-        assert!(detail_lines
-            .iter()
-            .any(|line| line
-                .contains("Hosted URL https://elastos.elacitylabs.com/apps/room-browser/")));
+            chat_room_app_detail_lines(&snapshot, &app_entries(&snapshot)[entry_index], 120);
+        assert!(detail_lines.iter().any(
+            |line| line.contains("Hosted URL https://elastos.elacitylabs.com/apps/chat-room/")
+        ));
         assert!(detail_lines
             .iter()
             .any(|line| line.contains("Invite     did:key:z6invitee as member")));
@@ -3625,15 +3613,15 @@ mod tests {
             label: "Close hosted guest access".to_string(),
             description: "Stop new browser guests from requesting access on the hosted room URL."
                 .to_string(),
-            command: "pc2 toggle hosted guest access".to_string(),
+            command: "home toggle hosted guest access".to_string(),
             ready: true,
             reason: None,
         });
         snapshot.actions.push(ActionInfo {
             id: "room-policy-toggle-members".to_string(),
             label: "Open sovereign member invites".to_string(),
-            description: "Allow new sovereign PC2 member invites for this room.".to_string(),
-            command: "pc2 toggle sovereign member invites".to_string(),
+            description: "Allow new sovereign Home member invites for this room.".to_string(),
+            command: "home toggle sovereign member invites".to_string(),
             ready: true,
             reason: None,
         });
@@ -3641,7 +3629,7 @@ mod tests {
             id: "room-revoke-invite:inv-1".to_string(),
             label: "Revoke invite for did:key:z6member".to_string(),
             description: "Revoke this specific sovereign member invite".to_string(),
-            command: "pc2 revoke invite".to_string(),
+            command: "home revoke invite".to_string(),
             ready: true,
             reason: None,
         });
@@ -3649,7 +3637,7 @@ mod tests {
             id: "room-remove-member:did:key:z6member".to_string(),
             label: "Remove did:key:z6member".to_string(),
             description: "Remove this sovereign member".to_string(),
-            command: "pc2 remove member".to_string(),
+            command: "home remove member".to_string(),
             ready: true,
             reason: None,
         });
@@ -3657,7 +3645,7 @@ mod tests {
             id: "room-approve-request:req-1".to_string(),
             label: "Approve Alice on Phone".to_string(),
             description: "Approve this browser".to_string(),
-            command: "pc2 approve specific".to_string(),
+            command: "home approve specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3665,7 +3653,7 @@ mod tests {
             id: "room-deny-request:req-1".to_string(),
             label: "Deny Alice on Phone".to_string(),
             description: "Deny this browser".to_string(),
-            command: "pc2 deny specific".to_string(),
+            command: "home deny specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3673,7 +3661,7 @@ mod tests {
             id: "room-revoke-session:tok-1".to_string(),
             label: "Disconnect Bob on Safari".to_string(),
             description: "Disconnect this browser".to_string(),
-            command: "pc2 disconnect specific".to_string(),
+            command: "home disconnect specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3681,7 +3669,7 @@ mod tests {
         let entries = app_entries(&snapshot);
         assert!(entries
             .iter()
-            .any(|entry| entry.label == "Room Browser" && !entry.is_control));
+            .any(|entry| entry.label == "Chat Room" && !entry.is_control));
         assert!(entries
             .iter()
             .any(|entry| entry.label == "Close hosted guest access" && entry.is_control));
@@ -3722,12 +3710,12 @@ mod tests {
         snapshot.notifications.attention_count = 1;
         snapshot.notifications.entries = vec![NotificationEntryStatus {
             id: "room-pair-request:req-1".to_string(),
-            source_app: "room-browser".to_string(),
+            source_app: "chat-room".to_string(),
             kind: "room_pair_request".to_string(),
-            title: "Alice wants to pair".to_string(),
-            body: "Alice on Phone wants to join Room.".to_string(),
+            title: "Alice requests room access".to_string(),
+            body: "Alice on Phone requests browser access to Room.".to_string(),
             action_ref: Some(NotificationActionRefStatus {
-                app: "room-browser".to_string(),
+                app: "chat-room".to_string(),
                 action_id: "room-approve-request:req-1".to_string(),
             }),
             read: false,
@@ -3737,7 +3725,7 @@ mod tests {
             id: "room-approve-request:req-1".to_string(),
             label: "Approve Alice on Phone".to_string(),
             description: "Approve this browser".to_string(),
-            command: "pc2 approve specific".to_string(),
+            command: "home approve specific".to_string(),
             ready: true,
             reason: None,
         });
@@ -3747,7 +3735,7 @@ mod tests {
 
         let mut buf = String::new();
         render_inbox_tab(&mut buf, &snapshot, &state, 120);
-        assert!(buf.contains("Alice wants to pair"));
+        assert!(buf.contains("Alice requests room access"));
         assert!(buf.contains("Approve Alice on Phone"));
         assert_eq!(
             state.activate(&snapshot),
@@ -3845,7 +3833,7 @@ mod tests {
             &snapshot,
             &TuiState {
                 notice: Some(
-                    "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from PC2 to preview or go public.".to_string(),
+                    "MyWebSite is empty. Stage a local directory with `elastos site stage <dir>`. Then reopen MyWebSite from Home to preview or go public.".to_string(),
                 ),
                 ..TuiState::default()
             },

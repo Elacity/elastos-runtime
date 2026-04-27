@@ -488,11 +488,7 @@ build_support_binary() {
     echo "$binary"
 }
 
-build_md_viewer_archive() {
-    build_static_capsule_archive "$1" "md-viewer"
-}
-
-build_static_capsule_archive() {
+build_packaged_capsule_archive() {
     local platform="$1"
     local capsule_name="$2"
     local capsule_dir stage_root archive
@@ -504,7 +500,7 @@ build_static_capsule_archive() {
 
     case "$capsule_name" in
         md-viewer)
-            required_files=(index.html)
+            required_files=(capsule.json index.html)
             ;;
         chat-wasm)
             required_files=(chat-stdio.wasm)
@@ -516,7 +512,7 @@ build_static_capsule_archive() {
             required_files=(ucity.gba)
             ;;
         room-browser)
-            required_files=(index.html style.css room_browser_ui.js room_browser_ui_bg.wasm)
+            required_files=(capsule.json index.html style.css room_browser_ui.js room_browser_ui_bg.wasm)
             ;;
         *)
             die "Unsupported static capsule archive request: ${capsule_name}"
@@ -531,32 +527,33 @@ build_static_capsule_archive() {
     archive="${TMPDIR}/support-assets-${platform}/${capsule_name}.tar.gz"
     rm -rf "$stage_root"
     mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")"
-    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/"
     for file in "${required_files[@]}"; do
-        cp "${capsule_dir}/${file}" "${stage_root}/${capsule_name}/"
+        mkdir -p "${stage_root}/${capsule_name}/$(dirname "$file")"
+        cp "${capsule_dir}/${file}" "${stage_root}/${capsule_name}/${file}"
     done
     tar -czf "$archive" -C "$stage_root" "$capsule_name"
     echo "$archive"
 }
 
-build_pc2_archive() {
+build_home_cli_archive() {
     local platform="$1"
-    local pc2_dir stage_root archive
-    pc2_dir=$(resolve_capsule_dir "pc2" || true)
-    [[ -n "$pc2_dir" ]] || die "pc2 source directory not found"
-    [[ -f "${pc2_dir}/capsule.json" ]] || die "pc2 capsule manifest not found at ${pc2_dir}/capsule.json"
+    local home_cli_dir stage_root archive
+    home_cli_dir=$(resolve_capsule_dir "home-cli" || true)
+    [[ -n "$home_cli_dir" ]] || die "home-cli source directory not found"
+    [[ -f "${home_cli_dir}/capsule.json" ]] || die "home-cli capsule manifest not found at ${home_cli_dir}/capsule.json"
 
-    info "  Building pc2 (wasm32-wasip1)..." >&2
-    (cd "$pc2_dir" && cargo build --target wasm32-wasip1 --release) >&2
-    [[ -f "${pc2_dir}/target/wasm32-wasip1/release/pc2.wasm" ]] || die "pc2.wasm missing after build"
+    ensure_rust_target_installed "wasm32-wasip1"
+    info "  Building home-cli (wasm32-wasip1)..." >&2
+    (cd "$home_cli_dir" && cargo build --target wasm32-wasip1 --release) >&2
+    [[ -f "${home_cli_dir}/target/wasm32-wasip1/release/home-cli.wasm" ]] || die "home-cli.wasm missing after build"
 
     stage_root="${TMPDIR}/support-assets-${platform}"
-    archive="${stage_root}/pc2.tar.gz"
-    rm -rf "${stage_root}/pc2"
-    mkdir -p "${stage_root}/pc2"
-    cp "${pc2_dir}/capsule.json" "${stage_root}/pc2/"
-    cp "${pc2_dir}/target/wasm32-wasip1/release/pc2.wasm" "${stage_root}/pc2/"
-    tar -czf "$archive" -C "$stage_root" pc2
+    archive="${stage_root}/home-cli.tar.gz"
+    rm -rf "${stage_root}/home-cli"
+    mkdir -p "${stage_root}/home-cli"
+    cp "${home_cli_dir}/capsule.json" "${stage_root}/home-cli/"
+    cp "${home_cli_dir}/target/wasm32-wasip1/release/home-cli.wasm" "${stage_root}/home-cli/"
+    tar -czf "$archive" -C "$stage_root" home-cli
     echo "$archive"
 }
 
@@ -586,163 +583,46 @@ build_chat_archive() {
     echo "$archive"
 }
 
-build_supported_direct_assets() {
-    local platform="$1"
-    local setup_platform="$2"
-    local target="${3:-}"
-    local use_cross="${4:-false}"
-    local stage_dir updates_json name binary staged cid checksum size install_path release_path
+record_direct_asset() {
+    local updates_json="$1"
+    local name="$2"
+    local staged="$3"
+    local install_path="$4"
+    local release_path="$5"
+    local extract_path="${6:-}"
+    local cid checksum size
 
-    stage_dir="${TMPDIR}/supported-assets-${platform}"
-    mkdir -p "$stage_dir"
-    updates_json='{}'
+    cid=$(ipfs_add "$staged")
+    checksum=$(sha256 "$staged")
+    size=$(file_size "$staged")
 
-    for name in "${SUPPORT_BINARY_ASSETS[@]}"; do
-        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross")
-        release_path="${name}-${setup_platform}"
-        staged="${stage_dir}/${release_path}"
-        cp "$binary" "$staged"
-        cid=$(ipfs_add "$staged")
-        checksum=$(sha256 "$staged")
-        size=$(file_size "$staged")
-        install_path="bin/${name}"
-        updates_json=$(echo "$updates_json" | jq \
+    if [[ -n "$extract_path" ]]; then
+        echo "$updates_json" | jq \
+            --arg name "$name" \
+            --arg cid "$cid" \
+            --arg checksum "sha256:${checksum}" \
+            --arg install_path "$install_path" \
+            --arg extract_path "$extract_path" \
+            --arg release_path "$release_path" \
+            --argjson size "$size" \
+            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}'
+    else
+        echo "$updates_json" | jq \
             --arg name "$name" \
             --arg cid "$cid" \
             --arg checksum "sha256:${checksum}" \
             --arg install_path "$install_path" \
             --arg release_path "$release_path" \
             --argjson size "$size" \
-            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}')
-    done
+            '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, release_path: $release_path}'
+    fi
+}
 
-    local md_archive md_staged md_cid md_checksum md_size
-    md_archive=$(build_md_viewer_archive "$platform")
-    release_path="md-viewer-${setup_platform}.tar.gz"
-    md_staged="${stage_dir}/${release_path}"
-    cp "$md_archive" "$md_staged"
-    md_cid=$(ipfs_add "$md_staged")
-    md_checksum=$(sha256 "$md_staged")
-    md_size=$(file_size "$md_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "md-viewer" \
-        --arg cid "$md_cid" \
-        --arg checksum "sha256:${md_checksum}" \
-        --arg install_path "capsules/md-viewer" \
-        --arg extract_path "md-viewer" \
-        --arg release_path "$release_path" \
-        --argjson size "$md_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
+stamp_direct_assets() {
+    local platform_key="$1"
+    local updates_json="$2"
 
-    local chat_wasm_archive chat_wasm_staged chat_wasm_cid chat_wasm_checksum chat_wasm_size
-    chat_wasm_archive=$(build_static_capsule_archive "$platform" "chat-wasm")
-    release_path="chat-wasm-${setup_platform}.tar.gz"
-    chat_wasm_staged="${stage_dir}/${release_path}"
-    cp "$chat_wasm_archive" "$chat_wasm_staged"
-    chat_wasm_cid=$(ipfs_add "$chat_wasm_staged")
-    chat_wasm_checksum=$(sha256 "$chat_wasm_staged")
-    chat_wasm_size=$(file_size "$chat_wasm_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "chat-wasm" \
-        --arg cid "$chat_wasm_cid" \
-        --arg checksum "sha256:${chat_wasm_checksum}" \
-        --arg install_path "capsules/chat-wasm" \
-        --arg extract_path "chat-wasm" \
-        --arg release_path "$release_path" \
-        --argjson size "$chat_wasm_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    local chat_archive chat_staged chat_cid chat_checksum chat_size
-    chat_archive=$(build_chat_archive "$platform" "$use_cross")
-    release_path="chat-${setup_platform}.tar.gz"
-    chat_staged="${stage_dir}/${release_path}"
-    cp "$chat_archive" "$chat_staged"
-    chat_cid=$(ipfs_add "$chat_staged")
-    chat_checksum=$(sha256 "$chat_staged")
-    chat_size=$(file_size "$chat_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "chat" \
-        --arg cid "$chat_cid" \
-        --arg checksum "sha256:${chat_checksum}" \
-        --arg install_path "capsules/chat" \
-        --arg extract_path "chat" \
-        --arg release_path "$release_path" \
-        --argjson size "$chat_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    local gba_emulator_archive gba_emulator_staged gba_emulator_cid gba_emulator_checksum gba_emulator_size
-    gba_emulator_archive=$(build_static_capsule_archive "$platform" "gba-emulator")
-    release_path="gba-emulator-${setup_platform}.tar.gz"
-    gba_emulator_staged="${stage_dir}/${release_path}"
-    cp "$gba_emulator_archive" "$gba_emulator_staged"
-    gba_emulator_cid=$(ipfs_add "$gba_emulator_staged")
-    gba_emulator_checksum=$(sha256 "$gba_emulator_staged")
-    gba_emulator_size=$(file_size "$gba_emulator_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "gba-emulator" \
-        --arg cid "$gba_emulator_cid" \
-        --arg checksum "sha256:${gba_emulator_checksum}" \
-        --arg install_path "capsules/gba-emulator" \
-        --arg extract_path "gba-emulator" \
-        --arg release_path "$release_path" \
-        --argjson size "$gba_emulator_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    local gba_ucity_archive gba_ucity_staged gba_ucity_cid gba_ucity_checksum gba_ucity_size
-    gba_ucity_archive=$(build_static_capsule_archive "$platform" "gba-ucity")
-    release_path="gba-ucity-${setup_platform}.tar.gz"
-    gba_ucity_staged="${stage_dir}/${release_path}"
-    cp "$gba_ucity_archive" "$gba_ucity_staged"
-    gba_ucity_cid=$(ipfs_add "$gba_ucity_staged")
-    gba_ucity_checksum=$(sha256 "$gba_ucity_staged")
-    gba_ucity_size=$(file_size "$gba_ucity_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "gba-ucity" \
-        --arg cid "$gba_ucity_cid" \
-        --arg checksum "sha256:${gba_ucity_checksum}" \
-        --arg install_path "capsules/gba-ucity" \
-        --arg extract_path "gba-ucity" \
-        --arg release_path "$release_path" \
-        --argjson size "$gba_ucity_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    local room_archive room_staged room_cid room_checksum room_size
-    room_archive=$(build_static_capsule_archive "$platform" "room-browser")
-    release_path="room-browser-${setup_platform}.tar.gz"
-    room_staged="${stage_dir}/${release_path}"
-    cp "$room_archive" "$room_staged"
-    room_cid=$(ipfs_add "$room_staged")
-    room_checksum=$(sha256 "$room_staged")
-    room_size=$(file_size "$room_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "room-browser" \
-        --arg cid "$room_cid" \
-        --arg checksum "sha256:${room_checksum}" \
-        --arg install_path "capsules/room-browser" \
-        --arg extract_path "room-browser" \
-        --arg release_path "$release_path" \
-        --argjson size "$room_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    local pc2_archive pc2_staged pc2_cid pc2_checksum pc2_size
-    pc2_archive=$(build_pc2_archive "$platform")
-    release_path="pc2-${setup_platform}.tar.gz"
-    pc2_staged="${stage_dir}/${release_path}"
-    cp "$pc2_archive" "$pc2_staged"
-    pc2_cid=$(ipfs_add "$pc2_staged")
-    pc2_checksum=$(sha256 "$pc2_staged")
-    pc2_size=$(file_size "$pc2_staged")
-    updates_json=$(echo "$updates_json" | jq \
-        --arg name "pc2" \
-        --arg cid "$pc2_cid" \
-        --arg checksum "sha256:${pc2_checksum}" \
-        --arg install_path "capsules/pc2" \
-        --arg extract_path "pc2" \
-        --arg release_path "$release_path" \
-        --argjson size "$pc2_size" \
-        '.[$name] = {cid: $cid, checksum: $checksum, size: $size, install_path: $install_path, extract_path: $extract_path, release_path: $release_path}')
-
-    DIRECT_SETUP_PLATFORM="$setup_platform" DIRECT_UPDATES_JSON="$updates_json" python3 - <<'PY'
+    DIRECT_SETUP_PLATFORM="$platform_key" DIRECT_UPDATES_JSON="$updates_json" python3 - <<'PY'
 import copy
 import json
 import os
@@ -762,6 +642,67 @@ for name, platform_meta in updates.items():
 
 print(json.dumps({"external": external}))
 PY
+}
+
+build_supported_direct_assets() {
+    local platform="$1"
+    local setup_platform="$2"
+    local target="${3:-}"
+    local use_cross="${4:-false}"
+    local stage_dir updates_json name binary staged install_path release_path
+
+    stage_dir="${TMPDIR}/supported-assets-${platform}"
+    mkdir -p "$stage_dir"
+    updates_json='{}'
+
+    for name in "${SUPPORT_BINARY_ASSETS[@]}"; do
+        binary=$(build_support_binary "$name" "$platform" "$target" "$use_cross")
+        release_path="${name}-${setup_platform}"
+        staged="${stage_dir}/${release_path}"
+        cp "$binary" "$staged"
+        install_path="bin/${name}"
+        updates_json=$(record_direct_asset "$updates_json" "$name" "$staged" "$install_path" "$release_path")
+    done
+
+    local chat_archive chat_staged
+    chat_archive=$(build_chat_archive "$platform" "$use_cross")
+    release_path="chat-${setup_platform}.tar.gz"
+    chat_staged="${stage_dir}/${release_path}"
+    cp "$chat_archive" "$chat_staged"
+    updates_json=$(record_direct_asset "$updates_json" "chat" "$chat_staged" "capsules/chat" "$release_path" "chat")
+
+    stamp_direct_assets "$setup_platform" "$updates_json"
+}
+
+build_platform_independent_direct_assets() {
+    local platform="$1"
+    local stage_dir updates_json release_path
+    local archive staged capsule
+
+    stage_dir="${TMPDIR}/supported-assets-universal"
+    mkdir -p "$stage_dir"
+    updates_json='{}'
+
+    for capsule in md-viewer chat-wasm gba-emulator gba-ucity room-browser; do
+        archive=$(build_packaged_capsule_archive "$platform" "$capsule")
+        release_path="${capsule}.tar.gz"
+        staged="${stage_dir}/${release_path}"
+        cp "$archive" "$staged"
+        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule")
+    done
+
+    local home_cli_archive home_cli_staged
+    home_cli_archive=$(build_home_cli_archive "$platform")
+    release_path="home-cli.tar.gz"
+    home_cli_staged="${stage_dir}/${release_path}"
+    cp "$home_cli_archive" "$home_cli_staged"
+    updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
+
+    stamp_direct_assets "*" "$updates_json"
+}
+
+merge_direct_assets() {
+    jq -s '.[0] * .[1]' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 }
 
 runtime_tunnel_url() {
@@ -1468,10 +1409,13 @@ if [[ -n "$CROSS_ARCH" && -d "${CROSS_ARTIFACTS_DIR:-/nonexistent}" ]]; then
 fi
 
 info "Publishing direct share/open support assets..."
-HOST_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$HOST_RUST_TARGET" false)
+UNIVERSAL_DIRECT_ASSETS=$(build_platform_independent_direct_assets "$PLATFORM")
+HOST_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$PLATFORM" "$SETUP_PLATFORM" "$HOST_RUST_TARGET" false)
+HOST_DIRECT_ASSETS=$(merge_direct_assets "$HOST_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 CROSS_DIRECT_ASSETS="{}"
 if [[ -n "$CROSS_ARCH" ]]; then
-    CROSS_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+    CROSS_PLATFORM_DIRECT_ASSETS=$(build_supported_direct_assets "$CROSS_PLATFORM" "$CROSS_SETUP_PLATFORM" "$CROSS_RUST_TARGET" true)
+    CROSS_DIRECT_ASSETS=$(merge_direct_assets "$CROSS_PLATFORM_DIRECT_ASSETS" "$UNIVERSAL_DIRECT_ASSETS")
 fi
 
 # ── Step 5: Generate components.json with real CIDs ──────────────────
@@ -1959,7 +1903,7 @@ if [[ "${PUBLISH_PUBLIC_URL}" == true ]]; then
     # Kill any orphaned publish cloudflared tunnels
     pkill -f "cloudflared tunnel.*--no-autoupdate" 2>/dev/null || true
     # Kill only the old publish gateway bound to this exact port.
-    # Do not kill unrelated `elastos gateway` instances such as the browser-app host.
+    # Do not kill unrelated `elastos gateway` instances.
     pkill -f "elastos gateway --addr ${GATEWAY_ADDR}" 2>/dev/null || true
     sleep 1
 
@@ -2156,8 +2100,8 @@ if [[ -n "$CROSS_BINARY_CID" ]]; then
 fi
 echo -e "${DIM}  Capsule artifacts published: ${TOTAL_ARTIFACTS} (${#CAPSULES[@]} capsules × $([ -n "$CROSS_BINARY_CID" ] && echo "2 platforms" || echo "1 platform"))${NC}"
 echo -e "${DIM}  Installer downloads: binary + components.json (2 files, platform-specific)${NC}"
-echo -e "${DIM}  First-party setup assets: shell + localhost-provider + did-provider + webspace-provider + pc2 are stamped into components.json${NC}"
-echo -e "${DIM}  Direct share/open/public-share assets: ipfs-provider + tunnel-provider + md-viewer are stamped into components.json${NC}"
+echo -e "${DIM}  Native setup assets are stamped per platform in components.json${NC}"
+echo -e "${DIM}  Browser/static/WASM capsule assets are stamped once under '*' in components.json${NC}"
 echo -e "${DIM}  Capsules downloaded on-demand by supervisor${NC}"
 echo ""
 

@@ -77,6 +77,21 @@ pub fn load_nickname(data_dir: &Path) -> anyhow::Result<Option<String>> {
     load_nickname_with_device_key(data_dir, &device_key)
 }
 
+/// Validate and normalize a local DID nickname/handle.
+pub fn validate_nickname(nickname: &str) -> anyhow::Result<String> {
+    let nickname = nickname.trim();
+    if nickname.is_empty() {
+        anyhow::bail!("nickname must not be empty");
+    }
+    if nickname.chars().count() > 32 {
+        anyhow::bail!("nickname must be 32 characters or fewer");
+    }
+    if nickname.chars().any(|ch| ch.is_control()) {
+        anyhow::bail!("nickname must not contain control characters");
+    }
+    Ok(nickname.to_string())
+}
+
 /// Load the locally persisted DID nickname using an explicit device key.
 pub fn load_nickname_with_device_key(
     data_dir: &Path,
@@ -110,10 +125,7 @@ pub fn save_nickname_with_device_key(
     device_key: &[u8; 32],
     nickname: &str,
 ) -> anyhow::Result<()> {
-    let nickname = nickname.trim();
-    if nickname.is_empty() {
-        anyhow::bail!("nickname must not be empty");
-    }
+    let nickname = validate_nickname(nickname)?;
 
     let path = nickname_path(data_dir);
     if let Some(parent) = path.parent() {

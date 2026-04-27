@@ -13,9 +13,20 @@ pub async fn run_serve(
     cid: Option<String>,
 ) -> anyhow::Result<()> {
     let data_dir = crate::default_data_dir();
-    let _host_guard =
-        elastos_server::host_lock::acquire_host_process_lock(&data_dir, "serve", &addr)?;
-    elastos_server::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "serve");
+    let subordinate_host = std::env::var("ELASTOS_ALLOW_SUBORDINATE_RUNTIME_HOST")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let _host_guard = if subordinate_host {
+        None
+    } else {
+        Some(elastos_server::host_lock::acquire_host_process_lock(
+            &data_dir, "serve", &addr,
+        )?)
+    };
+    if !subordinate_host {
+        elastos_server::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "serve");
+    }
     let (_runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
     if is_first_run {
         crate::print_first_run_welcome(&data_dir);
@@ -366,29 +377,27 @@ pub async fn run_serve(
     let runtime_kind = std::env::var("ELASTOS_RUNTIME_KIND")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| crate::shell_cmd::RUNTIME_KIND_OPERATOR.to_string());
+        .unwrap_or_else(|| crate::runtime_control::RUNTIME_KIND_OPERATOR.to_string());
     let binary_sha256 = match std::env::var("ELASTOS_RUNTIME_BINARY_SHA256") {
         Ok(value) if !value.trim().is_empty() => value,
         _ => current_binary_sha256().unwrap_or_default(),
     };
     let policy_sha256 = std::env::var("ELASTOS_RUNTIME_POLICY_SHA256").unwrap_or_default();
-    let coords = crate::shell_cmd::RuntimeCoords {
+    let coords = crate::runtime_control::RuntimeCoords {
         api_url: format!(
             "http://127.0.0.1:{}",
             addr.rsplit(':').next().unwrap_or("3000")
         ),
         attach_secret: attach_secret.clone(),
-        shell_token: String::new(),
-        client_token: String::new(),
         pid: std::process::id(),
         runtime_kind: runtime_kind.clone(),
         binary_sha256,
         policy_sha256,
     };
-    let coords_path = crate::shell_cmd::runtime_coord_path(&data_dir);
-    if let Err(e) = crate::shell_cmd::write_runtime_coords(&coords_path, &coords) {
+    let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
+    if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {
         eprintln!("[serve] Warning: failed to write runtime coords: {}", e);
-    } else if runtime_kind == crate::shell_cmd::RUNTIME_KIND_MANAGED_CHAT {
+    } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
         eprintln!("[serve] Managed chat runtime ready");
     } else {
         eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");

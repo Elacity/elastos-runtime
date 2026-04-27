@@ -94,6 +94,19 @@ impl IpfsBridge {
         self.extract_cid(&resp)
     }
 
+    pub async fn unpin(&self, cid: &str) -> anyhow::Result<()> {
+        let req = serde_json::json!({
+            "op": "unpin",
+            "cid": cid,
+        });
+        let resp = self
+            .bridge
+            .send_raw(&req)
+            .await
+            .map_err(|e| anyhow::anyhow!("ipfs-provider bridge error: {}", e))?;
+        self.ensure_success(&resp, "ipfs unpin")
+    }
+
     // ── Read ops ────────────────────────────────────────────────
 
     pub async fn cat(&self, cid: &str) -> anyhow::Result<Vec<u8>> {
@@ -263,6 +276,19 @@ impl IpfsBridge {
         base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|e| anyhow::anyhow!("Invalid base64 from ipfs-provider: {}", e))
+    }
+
+    fn ensure_success(&self, resp: &serde_json::Value, operation: &str) -> anyhow::Result<()> {
+        if let Some(status) = resp.get("status").and_then(|s| s.as_str()) {
+            if status == "error" {
+                let msg = resp
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("{} failed: {}", operation, msg);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -534,7 +560,7 @@ pub fn find_viewer_dir(name: &str) -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!(
         "Viewer '{}' not installed.\n\n\
          Run first:\n\n\
-         \x20 elastos setup --with md-viewer\n\n\
+         \x20 elastos setup --with documents\n\n\
          Then try again.",
         name
     )
@@ -578,7 +604,7 @@ mod tests {
     #[test]
     fn viewer_root_accepts_index_html_only_layout() {
         let tmp = tempfile::tempdir().unwrap();
-        let viewer = tmp.path().join("capsules/md-viewer");
+        let viewer = tmp.path().join("capsules/documents");
         std::fs::create_dir_all(&viewer).unwrap();
         std::fs::write(viewer.join("index.html"), "<html></html>").unwrap();
 

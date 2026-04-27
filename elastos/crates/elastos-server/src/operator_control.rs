@@ -43,7 +43,6 @@ const OPERATOR_REQUEST_DOMAIN: &str = "elastos.operator.request.v1";
 const OPERATOR_RESPONSE_DOMAIN: &str = "elastos.operator.response.v1";
 const OPERATOR_AUDIT_FILE: &str = "operator-control-audit.jsonl";
 const OPERATOR_REQUEST_LOG_FILE: &str = "operator-control-requests.jsonl";
-const OPERATOR_RUNTIME_KIND: &str = "operator";
 const OPERATOR_CONNECT_TIMEOUT_SECS: u64 = 10;
 const OPERATOR_TS_SKEW_SECS: u64 = 5 * 60;
 const REQUEST_STATE_RESERVED: &str = "reserved";
@@ -176,19 +175,6 @@ impl Default for OperatorRoomOpenArgs {
             addr: "0.0.0.0:8090".to_string(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RuntimeCoords {
-    api_url: String,
-    attach_secret: String,
-    #[serde(default)]
-    shell_token: String,
-    #[serde(default)]
-    client_token: String,
-    pid: u32,
-    #[serde(default = "default_runtime_kind")]
-    runtime_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,17 +711,6 @@ fn is_mutating_action(action: &str) -> bool {
     )
 }
 
-fn default_runtime_kind() -> String {
-    OPERATOR_RUNTIME_KIND.to_string()
-}
-
-fn runtime_coord_path(data_dir: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("ELASTOS_RUNTIME_COORDS_FILE") {
-        return PathBuf::from(path);
-    }
-    data_dir.join("runtime-coords.json")
-}
-
 fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -743,58 +718,15 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .map_err(Into::into)
 }
 
-async fn read_runtime_coords(data_dir: &Path) -> Option<RuntimeCoords> {
-    let path = runtime_coord_path(data_dir);
-    let data = std::fs::read(path).ok()?;
-    let coords: RuntimeCoords = serde_json::from_slice(&data).ok()?;
-    if !PathBuf::from(format!("/proc/{}", coords.pid)).exists() {
-        return None;
-    }
-
-    let api_base = LoopbackHttpBaseUrl::parse(&coords.api_url).ok()?;
-    let client = build_http_client(2).ok()?;
-    let healthy = client
-        .get(api_base.join("/api/health").ok()?)
-        .send()
-        .await
-        .ok()
-        .is_some_and(|response| response.status().is_success());
-    if !healthy {
-        return None;
-    }
-
-    if !attach_secret_matches(&client, &api_base, &coords.attach_secret).await {
-        return None;
-    }
-
-    Some(coords)
+async fn read_runtime_coords(data_dir: &Path) -> Option<crate::runtime_control::RuntimeCoords> {
+    let path = crate::runtime_control::runtime_coord_path(data_dir);
+    crate::runtime_control::read_operator_runtime_coords(&path).await
 }
 
-async fn attach_secret_matches(
+async fn attach_shell_token(
     client: &reqwest::Client,
-    api_base: &LoopbackHttpBaseUrl,
-    attach_secret: &str,
-) -> bool {
-    if attach_secret.is_empty() {
-        return true;
-    }
-
-    client
-        .post(match api_base.join("/api/auth/attach") {
-            Ok(url) => url,
-            Err(_) => return false,
-        })
-        .json(&serde_json::json!({
-            "secret": attach_secret,
-            "scope": "client",
-        }))
-        .send()
-        .await
-        .ok()
-        .is_some_and(|response| response.status().is_success())
-}
-
-async fn attach_shell_token(client: &reqwest::Client, coords: &RuntimeCoords) -> Result<String> {
+    coords: &crate::runtime_control::RuntimeCoords,
+) -> Result<String> {
     let api_base = LoopbackHttpBaseUrl::parse(&coords.api_url)?;
     let response = client
         .post(api_base.join("/api/auth/attach")?)
@@ -1345,8 +1277,8 @@ fn gather_local_room_summary(data_dir: &Path, local_did: &str) -> Result<RoomSum
     let hosted = load_browser_app_hosted_endpoint(data_dir, room_slug())?;
     summary.local_runtime_did = Some(local_did.to_string());
     summary.local_runtime_role = access.member_role;
-    summary.pairing_allowed = access.pairing_allowed;
-    summary.pairing_block_reason = access.block_reason;
+    summary.browser_access_allowed = access.browser_access_allowed;
+    summary.browser_access_block_reason = access.block_reason;
     summary.canonical_hosted_guest_url = hosted.canonical_url;
     summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
     Ok(summary)

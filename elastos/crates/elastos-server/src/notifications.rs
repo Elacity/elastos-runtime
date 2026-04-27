@@ -14,9 +14,10 @@ const NOTIFICATIONS_FILE: &str = "notifications.json";
 const NOTIFICATION_EVENTS_FILE: &str = "events.json";
 const NATIVE_CHAT_RELAY_STATE_FILE: &str = "native-chat-relay.json";
 const NATIVE_CHAT_ROOT_URI: &str = "localhost://Users/self/.AppData/LocalHost/Chat";
-const NATIVE_CHAT_RELAY_CHANNEL: &str = "!pc2";
-const ROOM_PAIR_REQUEST_KIND: &str = "room_pair_request";
-const ROOM_PAIRING_TTL_SECS: u64 = 10 * 60;
+const NATIVE_CHAT_RELAY_CHANNEL: &str = "!home";
+const ROOM_ACCESS_REQUEST_KIND: &str = "room_access_request";
+const ROOM_ACCESS_REQUEST_ID_PREFIX: &str = "room-access-request:";
+const ROOM_ACCESS_REQUEST_TTL_SECS: u64 = 10 * 60;
 const NOTIFICATION_EVENTS_SCHEMA: &str = "elastos.notification-events/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -165,11 +166,11 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
     let managed_ids = summary
         .pending_requests
         .iter()
-        .map(|request| format!("room-pair-request:{}", request.request_id))
+        .map(|request| room_access_request_notification_id(&request.request_id))
         .collect::<Vec<_>>();
 
     store.entries.retain(|entry| {
-        if entry.kind != ROOM_PAIR_REQUEST_KIND {
+        if entry.kind != ROOM_ACCESS_REQUEST_KIND {
             return entry.expires_at.is_none_or(|expires_at| expires_at > now);
         }
         managed_ids.iter().any(|id| id == &entry.id)
@@ -183,12 +184,12 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
     };
 
     for request in &summary.pending_requests {
-        let id = format!("room-pair-request:{}", request.request_id);
-        let expires_at = Some(request.requested_at + ROOM_PAIRING_TTL_SECS);
+        let id = room_access_request_notification_id(&request.request_id);
+        let expires_at = Some(request.requested_at + ROOM_ACCESS_REQUEST_TTL_SECS);
         if let Some(existing) = store.entries.iter_mut().find(|entry| entry.id == id) {
-            existing.title = format!("{} wants to pair", request.display_name);
+            existing.title = format!("{} requests room access", request.display_name);
             existing.body = format!(
-                "{} on {} wants to join {}.",
+                "{} on {} requests browser access to {}.",
                 request.display_name, request.device_label, room_title
             );
             existing.action_ref = Some(NotificationActionRef {
@@ -204,10 +205,10 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
         store.entries.push(NotificationEntryRecord {
             id: id.clone(),
             source_app: summary.room_slug.clone(),
-            kind: ROOM_PAIR_REQUEST_KIND.to_string(),
-            title: format!("{} wants to pair", request.display_name),
+            kind: ROOM_ACCESS_REQUEST_KIND.to_string(),
+            title: format!("{} requests room access", request.display_name),
             body: format!(
-                "{} on {} wants to join {}.",
+                "{} on {} requests browser access to {}.",
                 request.display_name, request.device_label, room_title
             ),
             action_ref: Some(NotificationActionRef {
@@ -228,9 +229,9 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
                     id: format!("appeared:{id}"),
                     notification_id: id.clone(),
                     source_app: summary.room_slug.clone(),
-                    title: format!("{} wants to pair", request.display_name),
+                    title: format!("{} requests room access", request.display_name),
                     body: format!(
-                        "{} on {} wants to join {}.",
+                        "{} on {} requests browser access to {}.",
                         request.display_name, request.device_label, room_title
                     ),
                     action_ref: Some(NotificationActionRef {
@@ -479,11 +480,15 @@ fn sync_native_chat_relay(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn room_access_request_notification_id(request_id: &str) -> String {
+    format!("{ROOM_ACCESS_REQUEST_ID_PREFIX}{request_id}")
+}
+
 fn render_native_chat_event(event: &NotificationEventRecord) -> ChatHistoryMessage {
     let content = match event.disposition {
         NotificationEventDisposition::Appeared => {
             format!(
-                "[{}] {} Open PC2 Inbox to review.",
+                "[{}] {} Open Inbox to review.",
                 source_label(&event.source_app),
                 event.body
             )
@@ -495,7 +500,7 @@ fn render_native_chat_event(event: &NotificationEventRecord) -> ChatHistoryMessa
                 .map(|resolution| format!(" ({resolution})"))
                 .unwrap_or_default();
             format!(
-                "[{}] {} Resolved in PC2{}.",
+                "[{}] {} Resolved in Home{}.",
                 source_label(&event.source_app),
                 event.title,
                 suffix
@@ -516,7 +521,7 @@ fn render_native_chat_event(event: &NotificationEventRecord) -> ChatHistoryMessa
 
 fn source_label(source_app: &str) -> &str {
     if source_app.trim().is_empty() {
-        "PC2"
+        "Home"
     } else {
         source_app
     }
@@ -569,7 +574,7 @@ mod tests {
 
     fn sample_summary() -> RoomSummary {
         RoomSummary {
-            room_slug: "room-browser".to_string(),
+            room_slug: "chat-room".to_string(),
             room_control: RoomControlSummary {
                 title: "Exec Room".to_string(),
                 ..Default::default()
@@ -579,6 +584,7 @@ mod tests {
                 display_name: "Alice".to_string(),
                 device_label: "Phone".to_string(),
                 requested_at: now_ts(),
+                capabilities: crate::room_service::room_access_capabilities(),
             }],
             ..Default::default()
         }
@@ -591,8 +597,9 @@ mod tests {
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.unread_count, 1);
         assert_eq!(summary.attention_count, 1);
-        assert_eq!(summary.entries[0].source_app, "room-browser");
-        assert_eq!(summary.entries[0].kind, ROOM_PAIR_REQUEST_KIND);
+        assert_eq!(summary.entries[0].source_app, "chat-room");
+        assert_eq!(summary.entries[0].id, "room-access-request:req-1");
+        assert_eq!(summary.entries[0].kind, ROOM_ACCESS_REQUEST_KIND);
         assert_eq!(
             summary.entries[0]
                 .action_ref
@@ -626,7 +633,7 @@ mod tests {
     fn mark_read_updates_entry_state() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = mark_read(tmp.path(), "room-pair-request:req-1").unwrap();
+        let updated = mark_read(tmp.path(), "room-access-request:req-1").unwrap();
         assert!(updated);
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.unread_count, 0);
@@ -637,7 +644,7 @@ mod tests {
     fn dismiss_hides_entry() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = dismiss(tmp.path(), "room-pair-request:req-1").unwrap();
+        let updated = dismiss(tmp.path(), "room-access-request:req-1").unwrap();
         assert!(updated);
         let summary = load_summary(tmp.path()).unwrap();
         assert!(summary.entries.is_empty());
@@ -656,9 +663,9 @@ mod tests {
             .any(|channel| channel == NATIVE_CHAT_RELAY_CHANNEL));
 
         let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!pc2.json")).unwrap();
+            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
         assert_eq!(history.len(), 1);
-        assert!(history[0].content.contains("Open PC2 Inbox to review."));
+        assert!(history[0].content.contains("Open Inbox to review."));
     }
 
     #[test]
@@ -669,7 +676,7 @@ mod tests {
 
         let chat_root = native_chat_root_dir(tmp.path()).unwrap();
         let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!pc2.json")).unwrap();
+            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
         assert_eq!(history.len(), 1);
     }
 
@@ -677,14 +684,14 @@ mod tests {
     fn dismiss_relays_resolution_into_native_chat_channel() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = dismiss(tmp.path(), "room-pair-request:req-1").unwrap();
+        let updated = dismiss(tmp.path(), "room-access-request:req-1").unwrap();
         assert!(updated);
 
         let chat_root = native_chat_root_dir(tmp.path()).unwrap();
         let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!pc2.json")).unwrap();
+            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
         assert_eq!(history.len(), 2);
-        assert!(history[1].content.contains("Resolved in PC2"));
+        assert!(history[1].content.contains("Resolved in Home"));
         assert!(history[1].content.contains("dismissed"));
     }
 
@@ -700,14 +707,17 @@ mod tests {
             events.entries[0].disposition,
             NotificationEventDisposition::Appeared
         );
-        assert_eq!(events.entries[0].notification_id, "room-pair-request:req-1");
+        assert_eq!(
+            events.entries[0].notification_id,
+            "room-access-request:req-1"
+        );
     }
 
     #[test]
     fn dismiss_records_resolved_event() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        dismiss(tmp.path(), "room-pair-request:req-1").unwrap();
+        dismiss(tmp.path(), "room-access-request:req-1").unwrap();
 
         let events: NotificationEventStore =
             read_json_or_default(&notification_events_path(tmp.path()).unwrap()).unwrap();

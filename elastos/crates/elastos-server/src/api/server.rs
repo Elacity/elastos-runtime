@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, head, post, put},
     Extension, Router,
 };
+use elastos_runtime::primitives::audit::AuditLog;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -78,6 +79,7 @@ pub async fn start_server_with_capsules(
     addr: &str,
     capsule_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let audit_log = Arc::new(AuditLog::new());
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -89,6 +91,7 @@ pub async fn start_server_with_capsules(
         .route("/api/capsules", post(routes::launch_capsule))
         .route("/api/capsules/:id", delete(routes::stop_capsule))
         .layer(cors.clone())
+        .layer(Extension(audit_log))
         .layer(Extension(runtime));
 
     // Add static file serving for web capsules if directory is provided
@@ -224,6 +227,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         capability_manager: capability_manager.clone(),
         policy_evaluator,
     };
+    let capsule_audit_log = audit_log
+        .clone()
+        .unwrap_or_else(|| Arc::new(AuditLog::new()));
 
     // Rate limiters: 100 req/s general, 5 req/s for identity endpoints
     let general_rate_limiter = Arc::new(RateLimiter::new(100.0));
@@ -504,6 +510,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             api_state.clone(),
             auth_middleware,
         ))
+        .layer(Extension(capsule_audit_log))
         .layer(Extension(runtime));
 
     // Combine all routes

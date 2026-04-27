@@ -16,11 +16,32 @@ pub fn find_installed_provider_binary(name: &str) -> Option<PathBuf> {
         return Some(installed_capsule);
     }
 
+    if let Some(global_data_dir) = dirs::data_dir().map(|dir| dir.join("elastos")) {
+        let global_component = global_data_dir.join("bin").join(name);
+        if global_component.is_file() {
+            return Some(global_component);
+        }
+
+        let global_capsule = global_data_dir.join("capsules").join(name).join(name);
+        if global_capsule.is_file() {
+            return Some(global_capsule);
+        }
+    }
+
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let from_exe = exe_dir.join("../share/elastos/bin").join(name);
             if from_exe.is_file() {
                 return Some(from_exe);
+            }
+        }
+    }
+
+    if let Some(path_dirs) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_dirs) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
             }
         }
     }

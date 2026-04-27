@@ -934,7 +934,7 @@ fn load_site_history(target: &str) -> anyhow::Result<Vec<SiteHeadEnvelope>> {
 }
 
 fn write_site_head(target: &str, payload: SiteHeadPayload) -> anyhow::Result<SiteHeadEnvelope> {
-    let canonical = serde_json::to_string(&payload)?;
+    let canonical = serde_json::to_string(&serde_json::to_value(&payload)?)?;
     let signing_key = load_or_create_share_key()?;
     let (signature, signer_did) =
         domain_separated_sign(&signing_key, SITE_HEAD_DOMAIN, canonical.as_bytes());

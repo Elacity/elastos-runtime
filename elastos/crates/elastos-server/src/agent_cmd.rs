@@ -4,6 +4,7 @@ use anyhow::Context;
 
 use elastos_server::sources::default_data_dir;
 
+use crate::runtime_control;
 use crate::shell_cmd;
 
 pub async fn run_agent(
@@ -39,7 +40,7 @@ async fn run_host_codex_agent(
 ) -> anyhow::Result<()> {
     let data_dir = default_data_dir();
     let (coords, client_token) =
-        shell_cmd::attach_client_token_to_operator_runtime(&data_dir).await?;
+        runtime_control::attach_client_token_to_operator_runtime(&data_dir).await?;
 
     let agent_bin = crate::resolve_verified_provider_binary(
         "agent",

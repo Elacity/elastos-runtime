@@ -155,6 +155,25 @@ pub fn build_share_bundle(
     prev_cid: Option<&str>,
     author_did: Option<&str>,
 ) -> anyhow::Result<(tempfile::TempDir, ShareMeta)> {
+    let viewer_dir = find_viewer_dir("documents")?;
+    build_share_bundle_with_viewer_dir(
+        input_path,
+        share_id,
+        version,
+        prev_cid,
+        author_did,
+        &viewer_dir,
+    )
+}
+
+pub fn build_share_bundle_with_viewer_dir(
+    input_path: &std::path::Path,
+    share_id: &str,
+    version: u64,
+    prev_cid: Option<&str>,
+    author_did: Option<&str>,
+    viewer_dir: &std::path::Path,
+) -> anyhow::Result<(tempfile::TempDir, ShareMeta)> {
     if !input_path.exists() {
         anyhow::bail!("Share path not found: {}", input_path.display());
     }
@@ -163,7 +182,6 @@ pub fn build_share_bundle(
         .prefix("elastos-share-")
         .tempdir()?;
 
-    let viewer_dir = find_viewer_dir("md-viewer")?;
     std::fs::copy(
         viewer_dir.join("index.html"),
         bundle_dir.path().join("index.html"),
@@ -228,6 +246,7 @@ pub fn build_share_bundle(
         "version": "0.1.0",
         "name": share_id,
         "description": format!("{} — shared documents", share_id),
+        "role": "content",
         "type": "data",
         "entrypoint": "index.html",
         "requires": [],

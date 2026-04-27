@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use elastos_common::localhost::{ensure_file_backed_roots, file_backed_prefixes};
 use elastos_runtime::{capability, content, namespace, primitives, provider, session};
+use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
 use elastos_server::{api, fetcher, ownership};
 
@@ -63,6 +64,12 @@ async fn setup_server_infrastructure_impl(
 
     ensure_file_backed_roots(&data_dir).ok();
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
+    provider_registry
+        .register(Arc::new(DocumentsProvider::new(
+            data_dir.clone(),
+            Arc::downgrade(&provider_registry),
+        )))
+        .await;
     let device_key = elastos_identity::load_or_create_device_key(&data_dir)?;
     let mut provider_cid = "sha256:unavailable".to_string();
     if spawn_host_providers {

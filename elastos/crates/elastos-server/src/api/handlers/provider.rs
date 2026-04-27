@@ -192,11 +192,11 @@ mod tests {
     #[test]
     fn test_non_ai_resource() {
         let request =
-            serde_json::json!({"op": "read", "path": "Local/SharedByLocalUsersAndBots/PC2/demo"});
+            serde_json::json!({"op": "read", "path": "Local/SharedByLocalUsersAndBots/Home/demo"});
         let result = build_capability_resource("localhost", "read", &request);
         assert_eq!(
             result.unwrap(),
-            "localhost://Local/SharedByLocalUsersAndBots/PC2/demo"
+            "localhost://Local/SharedByLocalUsersAndBots/Home/demo"
         );
     }
 

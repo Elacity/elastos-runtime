@@ -39,16 +39,17 @@ where
     let data_dir = default_data_dir();
     let _host_guard = crate::host_lock::acquire_host_process_lock(&data_dir, "gateway", &addr)?;
     crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway");
-    let ipfs_binary = find_installed_provider_binary("ipfs-provider");
-    if ipfs_binary.is_none() {
-        eprintln!("[gateway] Warning: ipfs-provider not found. IPFS fetch will fail.");
-        eprintln!("[gateway] Install with: elastos setup --with ipfs-provider");
-    }
-
     let cache_path = cache_dir.unwrap_or_else(|| data_dir.join("gateway-cache"));
     std::fs::create_dir_all(&cache_path)?;
+    let control_plane = setup_control_plane().await?;
 
-    api::gateway::start_gateway_server(&addr, ipfs_binary, None, cache_path, data_dir).await
+    api::gateway::start_gateway_server(
+        &addr,
+        Some(control_plane.provider_registry),
+        cache_path,
+        data_dir,
+    )
+    .await
 }
 
 async fn run_gateway_public<F, Fut>(
@@ -208,23 +209,27 @@ where
     )
     .await?;
     let public_base = format!("{}/", url.trim_end_matches('/'));
-    let canonical = crate::browser_app_hosts::load_browser_app_hosted_endpoint(
+    let public_apps = api::browser_capsules::list_launchable_browser_capsules(&data_dir)
+        .into_iter()
+        .map(|app| app.name)
+        .collect::<Vec<_>>();
+    let hosted_apps = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
         &data_dir,
-        crate::room_service::room_slug(),
-    )
-    .ok()
-    .and_then(|summary| summary.canonical_url);
-    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_url(
-        &data_dir,
-        crate::room_service::room_slug(),
+        public_apps.iter().map(String::as_str),
         Some(&public_base),
-    );
-    if let Some(canonical) = canonical.as_deref() {
-        println!("Hosted URL: {}", canonical);
-    }
+    )
+    .unwrap_or_default();
     println!("Public URL: {}", public_base);
-    println!("Room URL:   {}apps/room-browser/", public_base);
-    println!("Open the Room URL in your browser, then approve pairing from PC2.");
+    for hosted in hosted_apps
+        .iter()
+        .filter(|hosted| hosted.canonical_url.is_some())
+    {
+        println!(
+            "Hosted app: {} {}",
+            hosted.app,
+            hosted.canonical_url.as_deref().unwrap_or_default()
+        );
+    }
 
     if let Some(ref publish_path) = publish {
         match publish_to_ipfs(&control_plane.provider_registry, publish_path).await {
@@ -255,9 +260,9 @@ where
             })
             .await;
     }
-    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_url(
+    let _ = crate::browser_app_hosts::record_ephemeral_browser_app_urls(
         &data_dir,
-        crate::room_service::room_slug(),
+        public_apps.iter().map(String::as_str),
         None,
     );
 

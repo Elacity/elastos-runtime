@@ -11,11 +11,12 @@ use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use url::Url;
 
 const STATE_SCHEMA: &str = "elastos.room.state.v1";
-const ROOM_SLUG: &str = "room-browser";
-const ROOM_ROOT_URI: &str = "localhost://Local/Shared/AppCapsules/room-browser";
+const ROOM_SLUG: &str = "chat-room";
+const ROOM_ROOT_URI: &str = "localhost://Local/Shared/AppCapsules/chat-room";
 const ROOM_SHARED_DIR: &str = "room";
 const ROOM_LOCAL_DIR: &str = "local";
 const ROOM_META_FILE: &str = "room.json";
@@ -23,7 +24,7 @@ const ROOM_CONTROL_FILE: &str = "control.json";
 const ROOM_MEMBERS_FILE: &str = "members.json";
 const ROOM_INVITES_FILE: &str = "invites.json";
 const ROOM_KEY_EPOCHS_FILE: &str = "key-epochs.json";
-const ROOM_PAIR_REQUESTS_FILE: &str = "pair-requests.json";
+const BROWSER_ACCESS_REQUESTS_FILE: &str = "browser-access-requests.json";
 const ROOM_SESSIONS_FILE: &str = "sessions.json";
 const ROOM_OBJECTS_FILE: &str = "objects.json";
 const ROOM_UPLOADS_FILE: &str = "uploads.json";
@@ -35,7 +36,7 @@ const ROOM_INVITE_ENVELOPE_DOMAIN: &str = "elastos.room.invite.v1";
 const ROOM_ACCEPT_ENVELOPE_SCHEMA: &str = "elastos.room.accept.v1";
 const ROOM_ACCEPT_ENVELOPE_DOMAIN: &str = "elastos.room.accept.v1";
 const ROOM_OBJECT_ENVELOPE_SCHEMA: &str = "elastos.room.object.v1";
-const PAIRING_TTL_SECS: u64 = 10 * 60;
+const BROWSER_ACCESS_REQUEST_TTL_SECS: u64 = 10 * 60;
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const UPLOAD_TTL_SECS: u64 = 15 * 60;
 const INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -44,6 +45,7 @@ const MAX_TRANSPORT_SYNC_OBJECTS: usize = 64;
 const MAX_OBJECT_BODY_LEN: usize = 2_000;
 const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const ATTACHMENT_UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+pub const ROOM_ACCESS_CAPABILITY: &str = "room.access";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomSummary {
@@ -68,24 +70,26 @@ pub struct RoomSummary {
     pub canonical_hosted_guest_url: Option<String>,
     #[serde(default)]
     pub ephemeral_hosted_guest_url: Option<String>,
-    #[serde(default = "summary_pairing_allowed_default")]
-    pub pairing_allowed: bool,
+    #[serde(default = "summary_browser_access_allowed_default")]
+    pub browser_access_allowed: bool,
     #[serde(default)]
-    pub pairing_block_reason: Option<String>,
+    pub browser_access_block_reason: Option<String>,
     #[serde(default)]
     pub transport: RoomTransportView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairRequestOutput {
+pub struct BrowserAccessRequestOutput {
     pub request_id: String,
     pub room_slug: String,
     pub status: String,
     pub requested_at: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairStatusOutput {
+pub struct BrowserAccessStatusOutput {
     pub request_id: String,
     pub room_slug: String,
     pub status: String,
@@ -95,6 +99,17 @@ pub struct PairStatusOutput {
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub denial_reason: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalRuntimeSessionOutput {
+    pub token: String,
+    pub display_name: String,
+    pub expires_at: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +118,8 @@ pub struct SessionView {
     pub display_name: String,
     pub expires_at: u64,
     pub latest_seq: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub participants: Vec<ParticipantView>,
 }
@@ -113,6 +130,8 @@ pub struct ConversationObjectView {
     pub sender: String,
     #[serde(default)]
     pub sender_member_did: Option<String>,
+    #[serde(default)]
+    pub from_current_session: bool,
     pub kind: ConversationObjectKind,
     #[serde(default)]
     pub body: Option<String>,
@@ -143,6 +162,8 @@ pub struct ParticipantView {
     pub role: Option<RoomRole>,
     #[serde(default)]
     pub local_session_count: usize,
+    #[serde(default)]
+    pub is_current_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,16 +172,21 @@ pub struct PendingRequestView {
     pub display_name: String,
     pub device_label: String,
     pub requested_at: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveSessionView {
+    pub session_id: String,
     pub token: String,
     pub display_name: String,
     pub device_label: String,
     pub approved_at: u64,
     pub expires_at: u64,
     pub last_seen_at: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     #[serde(default)]
     pub member_did: Option<String>,
 }
@@ -345,10 +371,11 @@ pub struct AttachmentUploadChunkOutput {
 }
 
 #[derive(Debug, Clone)]
-pub struct PairRequestInput {
+pub struct BrowserAccessRequestInput {
     pub display_name: String,
     pub device_label: String,
-    pub member_did: Option<String>,
+    pub host_member_did: Option<String>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,7 +384,7 @@ pub struct LocalRuntimeAccess {
     pub runtime_did: Option<String>,
     #[serde(default)]
     pub member_role: Option<RoomRole>,
-    pub pairing_allowed: bool,
+    pub browser_access_allowed: bool,
     #[serde(default)]
     pub block_reason: Option<String>,
 }
@@ -592,7 +619,7 @@ struct RoomState {
     #[serde(default)]
     key_epochs: Vec<RoomKeyEpochRecord>,
     #[serde(default)]
-    pending_requests: Vec<PairRequestRecord>,
+    pending_requests: Vec<BrowserAccessRequestRecord>,
     #[serde(default)]
     sessions: Vec<SessionRecord>,
     #[serde(default)]
@@ -602,15 +629,17 @@ struct RoomState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PairRequestRecord {
+struct BrowserAccessRequestRecord {
     request_id: String,
     display_name: String,
     device_label: String,
     #[serde(default)]
-    member_did: Option<String>,
+    host_member_did: Option<String>,
+    #[serde(default = "default_room_access_capabilities")]
+    capabilities: Vec<String>,
     requested_at: u64,
     expires_at: u64,
-    status: PairStatus,
+    status: BrowserAccessStatus,
     #[serde(default)]
     denial_reason: Option<String>,
     #[serde(default)]
@@ -621,7 +650,7 @@ struct PairRequestRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum PairStatus {
+enum BrowserAccessStatus {
     Pending,
     Approved,
     Denied,
@@ -631,10 +660,14 @@ enum PairStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionRecord {
     token: String,
+    #[serde(default)]
+    actor_id: String,
     display_name: String,
     device_label: String,
     #[serde(default)]
     member_did: Option<String>,
+    #[serde(default = "default_room_access_capabilities")]
+    capabilities: Vec<String>,
     approved_at: u64,
     expires_at: u64,
     last_seen_at: u64,
@@ -648,6 +681,8 @@ struct ConversationObjectRecord {
     sender: String,
     #[serde(default)]
     sender_member_did: Option<String>,
+    #[serde(default)]
+    sender_actor_id: String,
     kind: ConversationObjectKind,
     #[serde(default)]
     body: Option<String>,
@@ -672,6 +707,12 @@ struct UploadRecord {
     expires_at: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CurrentSessionIdentity {
+    actor_id: String,
+    member_did: Option<String>,
+}
+
 impl Default for RoomState {
     fn default() -> Self {
         Self {
@@ -688,6 +729,14 @@ impl Default for RoomState {
             uploads: Vec::new(),
         }
     }
+}
+
+pub fn room_access_capabilities() -> Vec<String> {
+    default_room_access_capabilities()
+}
+
+fn default_room_access_capabilities() -> Vec<String> {
+    vec![ROOM_ACCESS_CAPABILITY.to_string()]
 }
 
 #[derive(Debug, Clone)]
@@ -720,13 +769,13 @@ pub fn room_root_uri() -> &'static str {
 pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
     with_locked_state(data_dir, |_, state| {
         let next_pending = next_pending_request(state);
-        let active_participants = participant_views_from_state(state);
+        let active_participants = participant_views_from_state(state, None);
         Ok(RoomSummary {
             room_slug: state.room_slug.clone(),
             pending_count: state
                 .pending_requests
                 .iter()
-                .filter(|item| item.status == PairStatus::Pending)
+                .filter(|item| item.status == BrowserAccessStatus::Pending)
                 .count(),
             active_session_count: state.sessions.len(),
             latest_request_name: next_pending.map(|item| item.display_name.clone()),
@@ -739,8 +788,8 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<RoomSummary> {
             local_runtime_role: None,
             canonical_hosted_guest_url: None,
             ephemeral_hosted_guest_url: None,
-            pairing_allowed: true,
-            pairing_block_reason: None,
+            browser_access_allowed: true,
+            browser_access_block_reason: None,
             transport: RoomTransportView::default(),
         })
     })
@@ -1336,61 +1385,177 @@ pub fn reset_room(data_dir: &Path) -> anyhow::Result<RoomResetOutput> {
     })
 }
 
-pub fn request_pairing(
+pub fn request_browser_access(
     data_dir: &Path,
-    input: PairRequestInput,
-) -> anyhow::Result<PairRequestOutput> {
+    input: BrowserAccessRequestInput,
+) -> anyhow::Result<BrowserAccessRequestOutput> {
     let display_name = normalize_display_name(&input.display_name)?;
     let device_label = normalize_device_label(&input.device_label);
-    let member_did = input
-        .member_did
+    let capabilities = normalize_browser_session_capabilities(&input.capabilities)?;
+    let host_member_did = input
+        .host_member_did
         .as_deref()
         .filter(|did| !did.trim().is_empty())
         .map(normalize_member_did)
         .transpose()?;
 
     with_locked_state(data_dir, |_, state| {
-        ensure_pairing_allowed_for_member(state, member_did.as_deref())?;
+        ensure_browser_access_allowed_for_member(state, host_member_did.as_deref())?;
         let now = now_ts();
-        let request = PairRequestRecord {
+        let request = BrowserAccessRequestRecord {
             request_id: random_hex(16),
             display_name,
             device_label,
-            member_did,
+            host_member_did,
+            capabilities: capabilities.clone(),
             requested_at: now,
-            expires_at: now + PAIRING_TTL_SECS,
-            status: PairStatus::Pending,
+            expires_at: now + BROWSER_ACCESS_REQUEST_TTL_SECS,
+            status: BrowserAccessStatus::Pending,
             denial_reason: None,
             session_token: None,
             session_expires_at: None,
         };
-        let out = PairRequestOutput {
+        let out = BrowserAccessRequestOutput {
             request_id: request.request_id.clone(),
             room_slug: state.room_slug.clone(),
             status: "pending".to_string(),
             requested_at: request.requested_at,
+            capabilities,
         };
         state.pending_requests.push(request);
         Ok(out)
     })
 }
 
-pub fn pairing_status(data_dir: &Path, request_id: &str) -> anyhow::Result<PairStatusOutput> {
+pub fn browser_access_status(
+    data_dir: &Path,
+    request_id: &str,
+) -> anyhow::Result<BrowserAccessStatusOutput> {
     with_locked_state(data_dir, |_, state| {
         let request = state
             .pending_requests
             .iter()
             .find(|item| item.request_id == request_id)
-            .ok_or_else(|| anyhow::anyhow!("pairing request not found"))?;
+            .ok_or_else(|| anyhow::anyhow!("browser access request not found"))?;
 
-        Ok(PairStatusOutput {
+        Ok(BrowserAccessStatusOutput {
             request_id: request.request_id.clone(),
             room_slug: state.room_slug.clone(),
-            status: pair_status_label(&request.status).to_string(),
+            status: browser_access_status_label(&request.status).to_string(),
             token: request.session_token.clone(),
             expires_at: request.session_expires_at,
             denial_reason: request.denial_reason.clone(),
+            capabilities: request.capabilities.clone(),
         })
+    })
+}
+
+pub fn start_local_runtime_session(
+    data_dir: &Path,
+    member_did: &str,
+    display_name: &str,
+    device_label: &str,
+) -> anyhow::Result<LocalRuntimeSessionOutput> {
+    let member_did = normalize_member_did(member_did)?;
+    let display_name = normalize_display_name(display_name)?;
+    let device_label = normalize_device_label(device_label);
+
+    with_locked_state(data_dir, |_, state| {
+        let local_access = local_runtime_access_from_state(state, Some(&member_did));
+        if local_access.member_role.is_none() && !local_access.browser_access_allowed {
+            anyhow::bail!(
+                "{}",
+                local_access.block_reason.unwrap_or_else(|| {
+                    "local runtime is not an active member of this room".to_string()
+                })
+            );
+        }
+
+        let session_member_did = Some(member_did.clone());
+        let capabilities = room_access_capabilities();
+
+        if let Some(session_member_did) = session_member_did.as_deref() {
+            if active_member_record(state, session_member_did).is_none()
+                && room_requires_active_membership(state)
+            {
+                anyhow::bail!("local runtime is not an active member of this room");
+            }
+        }
+        let now = now_ts();
+        let canonical_local_token = state
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.member_did.as_deref() == Some(member_did.as_str())
+                    || (session.member_did.is_none() && session.device_label == device_label)
+            })
+            .max_by_key(|session| {
+                (
+                    session.member_did.is_some(),
+                    session.last_seen_at,
+                    session.expires_at,
+                )
+            })
+            .map(|session| session.token.clone());
+
+        if let Some(token) = canonical_local_token {
+            state.sessions.retain(|session| {
+                !(session.member_did.as_deref() == Some(member_did.as_str())
+                    || (session.member_did.is_none() && session.device_label == device_label))
+                    || session.token == token
+            });
+            let existing = state
+                .sessions
+                .iter_mut()
+                .find(|session| session.token == token)
+                .expect("canonical local runtime session");
+            existing.display_name = display_name.clone();
+            existing.device_label = device_label.clone();
+            existing.member_did = session_member_did.clone();
+            existing.capabilities = capabilities.clone();
+            existing.last_seen_at = now;
+            existing.expires_at = now + SESSION_TTL_SECS;
+            return Ok(LocalRuntimeSessionOutput {
+                token: existing.token.clone(),
+                display_name: existing.display_name.clone(),
+                expires_at: existing.expires_at,
+                capabilities: existing.capabilities.clone(),
+            });
+        }
+
+        let had_existing_member_session = session_member_did
+            .as_deref()
+            .is_some_and(|did| active_local_session_count(state, did) > 0);
+        let session = create_session_record(
+            &display_name,
+            &device_label,
+            session_member_did.clone(),
+            capabilities.clone(),
+            now,
+        );
+        let output = LocalRuntimeSessionOutput {
+            token: session.token.clone(),
+            display_name: session.display_name.clone(),
+            expires_at: session.expires_at,
+            capabilities,
+        };
+        state.sessions.push(session);
+        match session_member_did.as_deref() {
+            Some(member_did) if !had_existing_member_session => {
+                push_member_system_object(
+                    state,
+                    member_did,
+                    display_name,
+                    "joined the room".to_string(),
+                    now,
+                );
+            }
+            None => {
+                push_system_object(state, display_name, "joined the room".to_string(), now);
+            }
+            _ => {}
+        }
+        Ok(output)
     })
 }
 
@@ -1399,7 +1564,7 @@ pub fn approve_next_request(data_dir: &Path) -> anyhow::Result<Option<ApprovalOu
         let Some(request_index) = state
             .pending_requests
             .iter()
-            .position(|item| item.status == PairStatus::Pending)
+            .position(|item| item.status == BrowserAccessStatus::Pending)
         else {
             return Ok(None);
         };
@@ -1413,11 +1578,9 @@ pub fn approve_request(
     request_id: &str,
 ) -> anyhow::Result<Option<ApprovalOutcome>> {
     with_locked_state(data_dir, |_, state| {
-        let Some(request_index) = state
-            .pending_requests
-            .iter()
-            .position(|item| item.status == PairStatus::Pending && item.request_id == request_id)
-        else {
+        let Some(request_index) = state.pending_requests.iter().position(|item| {
+            item.status == BrowserAccessStatus::Pending && item.request_id == request_id
+        }) else {
             return Ok(None);
         };
 
@@ -1430,62 +1593,44 @@ fn approve_request_at_index(
     request_index: usize,
 ) -> anyhow::Result<ApprovalOutcome> {
     let now = now_ts();
-    let expires_at = now + SESSION_TTL_SECS;
-    let token = random_hex(32);
-    let request_member_did = state.pending_requests[request_index].member_did.clone();
+    let host_member_did = state.pending_requests[request_index]
+        .host_member_did
+        .clone();
     if room_requires_active_membership(state) {
-        let member_did = request_member_did
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("pairing request is not bound to a room member DID"))?;
+        let member_did = host_member_did.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("browser access request is not bound to a host room member DID")
+        })?;
         if active_member_record(state, member_did).is_none() {
-            anyhow::bail!("pairing request member DID is no longer active in this room");
+            anyhow::bail!(
+                "browser access request host member DID is no longer active in this room"
+            );
         }
     }
-    let (request_id, display_name, device_label, member_did) = {
+    let (request_id, display_name, device_label, capabilities) = {
         let request = &mut state.pending_requests[request_index];
         let request_id = request.request_id.clone();
         let display_name = request.display_name.clone();
         let device_label = request.device_label.clone();
-        let member_did = request.member_did.clone();
-        request.status = PairStatus::Approved;
-        request.session_token = Some(token.clone());
-        request.session_expires_at = Some(expires_at);
+        let capabilities = request.capabilities.clone();
+        request.status = BrowserAccessStatus::Approved;
         request.denial_reason = None;
-        (request_id, display_name, device_label, member_did)
+        (request_id, display_name, device_label, capabilities)
     };
-    let had_existing_member_session = member_did
-        .as_deref()
-        .is_some_and(|did| active_local_session_count(state, did) > 0);
-
-    state.sessions.push(SessionRecord {
-        token,
-        display_name: display_name.clone(),
-        device_label: device_label.clone(),
-        member_did: member_did.clone(),
-        approved_at: now,
-        expires_at,
-        last_seen_at: now,
-    });
-    match member_did.as_deref() {
-        Some(member_did) if !had_existing_member_session => {
-            push_member_system_object(
-                state,
-                member_did,
-                display_name.clone(),
-                "joined the room".to_string(),
-                now,
-            );
-        }
-        None => {
-            push_system_object(
-                state,
-                display_name.clone(),
-                "joined the room".to_string(),
-                now,
-            );
-        }
-        _ => {}
+    let session = create_session_record(&display_name, &device_label, None, capabilities, now);
+    let expires_at = session.expires_at;
+    {
+        let request = &mut state.pending_requests[request_index];
+        request.session_token = Some(session.token.clone());
+        request.session_expires_at = Some(expires_at);
     }
+
+    state.sessions.push(session);
+    push_system_object(
+        state,
+        display_name.clone(),
+        "joined the room".to_string(),
+        now,
+    );
 
     Ok(ApprovalOutcome {
         request_id,
@@ -1495,13 +1640,46 @@ fn approve_request_at_index(
     })
 }
 
+fn create_session_record(
+    display_name: &str,
+    device_label: &str,
+    member_did: Option<String>,
+    capabilities: Vec<String>,
+    now: u64,
+) -> SessionRecord {
+    SessionRecord {
+        token: random_hex(32),
+        actor_id: random_hex(16),
+        display_name: display_name.to_string(),
+        device_label: device_label.to_string(),
+        member_did,
+        capabilities,
+        approved_at: now,
+        expires_at: now + SESSION_TTL_SECS,
+        last_seen_at: now,
+    }
+}
+
+fn ensure_session_actor_id(session: &mut SessionRecord) {
+    if session.actor_id.trim().is_empty() {
+        session.actor_id = random_hex(16);
+    }
+}
+
+fn current_session_identity(session: &SessionRecord) -> CurrentSessionIdentity {
+    CurrentSessionIdentity {
+        actor_id: session.actor_id.clone(),
+        member_did: session.member_did.clone(),
+    }
+}
+
 pub fn deny_next_request(data_dir: &Path, reason: &str) -> anyhow::Result<Option<DenyOutcome>> {
     let reason = normalize_denial_reason(reason);
     with_locked_state(data_dir, |_, state| {
         let Some(request_index) = state
             .pending_requests
             .iter()
-            .position(|item| item.status == PairStatus::Pending)
+            .position(|item| item.status == BrowserAccessStatus::Pending)
         else {
             return Ok(None);
         };
@@ -1517,11 +1695,9 @@ pub fn deny_request(
 ) -> anyhow::Result<Option<DenyOutcome>> {
     let reason = normalize_denial_reason(reason);
     with_locked_state(data_dir, |_, state| {
-        let Some(request_index) = state
-            .pending_requests
-            .iter()
-            .position(|item| item.status == PairStatus::Pending && item.request_id == request_id)
-        else {
+        let Some(request_index) = state.pending_requests.iter().position(|item| {
+            item.status == BrowserAccessStatus::Pending && item.request_id == request_id
+        }) else {
             return Ok(None);
         };
 
@@ -1535,7 +1711,7 @@ fn deny_request_at_index(
     reason: String,
 ) -> DenyOutcome {
     let request = &mut state.pending_requests[request_index];
-    request.status = PairStatus::Denied;
+    request.status = BrowserAccessStatus::Denied;
     request.denial_reason = Some(reason.clone());
     request.session_token = None;
     request.session_expires_at = None;
@@ -1577,6 +1753,7 @@ pub fn revoke_all_sessions(data_dir: &Path) -> anyhow::Result<Option<RevokeOutco
                         .and_then(|did| active_member_record(state, did))
                         .map(|member| member.role.clone()),
                     local_session_count: 1,
+                    is_current_session: false,
                 };
                 match session.member_did.as_deref() {
                     Some(member_did) => {
@@ -1590,7 +1767,7 @@ pub fn revoke_all_sessions(data_dir: &Path) -> anyhow::Result<Option<RevokeOutco
                                 state,
                                 member_did,
                                 session.display_name,
-                                "was removed from the room in PC2".to_string(),
+                                "was removed from the room in Home".to_string(),
                                 now,
                             );
                         }
@@ -1599,7 +1776,7 @@ pub fn revoke_all_sessions(data_dir: &Path) -> anyhow::Result<Option<RevokeOutco
                         push_system_object(
                             state,
                             session.display_name,
-                            "was removed from the room in PC2".to_string(),
+                            "was removed from the room in Home".to_string(),
                             now,
                         );
                     }
@@ -1643,7 +1820,7 @@ pub fn revoke_session(
                     state,
                     member_did,
                     session.display_name.clone(),
-                    "was removed from the room in PC2".to_string(),
+                    "was removed from the room in Home".to_string(),
                     now,
                 );
             }
@@ -1651,7 +1828,7 @@ pub fn revoke_session(
                 push_system_object(
                     state,
                     session.display_name.clone(),
-                    "was removed from the room in PC2".to_string(),
+                    "was removed from the room in Home".to_string(),
                     now,
                 );
             }
@@ -1665,19 +1842,60 @@ pub fn revoke_session(
     })
 }
 
+pub fn revoke_guest_session_by_id(
+    data_dir: &Path,
+    session_id: &str,
+) -> anyhow::Result<Option<RevokeSessionOutcome>> {
+    let session_id = normalize_session_id(session_id)?;
+    with_locked_state(data_dir, |paths, state| {
+        let Some(session_index) = state
+            .sessions
+            .iter()
+            .position(|session| session_public_id(&session.token) == session_id)
+        else {
+            return Ok(None);
+        };
+        if state.sessions[session_index].member_did.is_some() {
+            anyhow::bail!("runtime node sessions must be blocked by removing the member DID");
+        }
+
+        let now = now_ts();
+        let session = state.sessions.remove(session_index);
+        invalidate_approved_requests(state, std::slice::from_ref(&session.token));
+        remove_uploads_for_tokens(paths, state, std::slice::from_ref(&session.token));
+        push_system_object(
+            state,
+            session.display_name.clone(),
+            "was removed from the room in Home".to_string(),
+            now,
+        );
+        Ok(Some(RevokeSessionOutcome {
+            token: session.token,
+            display_name: session.display_name,
+            device_label: session.device_label,
+        }))
+    })
+}
+
 pub fn session_view(data_dir: &Path, token: &str) -> anyhow::Result<SessionView> {
     with_locked_state(data_dir, |_, state| {
         let room_slug = state.room_slug.clone();
-        let (display_name, expires_at) = {
+        let (display_name, expires_at, capabilities, current_session) = {
             let session = validate_session(state, token)?;
-            (session.display_name.clone(), session.expires_at)
+            (
+                session.display_name.clone(),
+                session.expires_at,
+                session.capabilities.clone(),
+                current_session_identity(session),
+            )
         };
-        let participants = participant_views_from_state(state);
+        let participants = participant_views_from_state(state, Some(&current_session));
         Ok(SessionView {
             room_slug,
             display_name,
             expires_at,
             latest_seq: state.objects.last().map(|item| item.seq).unwrap_or(0),
+            capabilities,
             participants,
         })
     })
@@ -1716,7 +1934,7 @@ pub fn leave_session(data_dir: &Path, token: &str) -> anyhow::Result<Conversatio
                 now,
             ),
         };
-        Ok(object_view_from_record(object))
+        Ok(object_view_from_record(object, None))
     })
 }
 
@@ -1726,22 +1944,16 @@ pub fn conversation_feed(
     since: u64,
 ) -> anyhow::Result<ConversationFeed> {
     with_locked_state(data_dir, |_, state| {
-        let _ = validate_session(state, token)?;
+        let current_session = {
+            let session = validate_session(state, token)?;
+            current_session_identity(session)
+        };
         let objects = state
             .objects
             .iter()
             .filter(|item| item.seq > since)
-            .map(|item| ConversationObjectView {
-                seq: item.seq,
-                sender: item.sender.clone(),
-                sender_member_did: item.sender_member_did.clone(),
-                kind: item.kind.clone(),
-                body: item.body.clone(),
-                emoji: item.emoji.clone(),
-                link: item.link.clone(),
-                attachment: item.attachment.clone(),
-                created_at: item.created_at,
-            })
+            .cloned()
+            .map(|item| object_view_from_record(item, Some(&current_session)))
             .collect::<Vec<_>>();
         Ok(ConversationFeed {
             room_slug: state.room_slug.clone(),
@@ -1754,18 +1966,22 @@ pub fn conversation_feed(
 pub fn room_poll(data_dir: &Path, token: &str, since: u64) -> anyhow::Result<RoomPollView> {
     with_locked_state(data_dir, |_, state| {
         let room_slug = state.room_slug.clone();
-        let (display_name, expires_at) = {
+        let (display_name, expires_at, current_session) = {
             let session = validate_session(state, token)?;
             session.last_seen_at = now_ts();
-            (session.display_name.clone(), session.expires_at)
+            (
+                session.display_name.clone(),
+                session.expires_at,
+                current_session_identity(session),
+            )
         };
-        let participants = participant_views_from_state(state);
+        let participants = participant_views_from_state(state, Some(&current_session));
         let objects = state
             .objects
             .iter()
             .filter(|item| item.seq > since)
             .cloned()
-            .map(object_view_from_record)
+            .map(|item| object_view_from_record(item, Some(&current_session)))
             .collect::<Vec<_>>();
         Ok(RoomPollView {
             room_slug,
@@ -1794,10 +2010,15 @@ pub fn append_object_with_transport(
 ) -> anyhow::Result<AppendedConversationObject> {
     let draft = classify_object_body(body)?;
     with_locked_state(data_dir, |paths, state| {
-        let (sender, sender_member_did) = {
+        let (sender, sender_member_did, sender_actor_id, current_session) = {
             let session = validate_session(state, token)?;
             session.last_seen_at = now_ts();
-            (session.display_name.clone(), session.member_did.clone())
+            (
+                session.display_name.clone(),
+                session.member_did.clone(),
+                session.actor_id.clone(),
+                current_session_identity(session),
+            )
         };
         let created_at = now_ts();
         let object = push_object(
@@ -1807,6 +2028,7 @@ pub fn append_object_with_transport(
                 event_id: new_object_event_id(),
                 sender,
                 sender_member_did: sender_member_did.clone(),
+                sender_actor_id,
                 kind: draft.kind,
                 body: draft.body,
                 emoji: draft.emoji,
@@ -1817,7 +2039,7 @@ pub fn append_object_with_transport(
         );
         let transport_envelope = transport_envelope_from_record(paths, state, &object);
         Ok(AppendedConversationObject {
-            object: object_view_from_record(object),
+            object: object_view_from_record(object, Some(&current_session)),
             sender_member_did,
             transport_envelope,
         })
@@ -1886,6 +2108,7 @@ pub fn ingest_room_object_envelope(
                 event_id,
                 sender: normalize_display_name(&envelope.sender)?,
                 sender_member_did: Some(sender_member_did),
+                sender_actor_id: String::new(),
                 kind,
                 body,
                 emoji,
@@ -1894,7 +2117,7 @@ pub fn ingest_room_object_envelope(
                 created_at: envelope.created_at,
             },
         );
-        Ok(Some(object_view_from_record(object)))
+        Ok(Some(object_view_from_record(object, None)))
     })
 }
 
@@ -1928,10 +2151,15 @@ pub fn append_attachment_object_with_transport(
     }
 
     with_locked_state(data_dir, |paths, state| {
-        let (sender, sender_member_did) = {
+        let (sender, sender_member_did, sender_actor_id, current_session) = {
             let session = validate_session(state, token)?;
             session.last_seen_at = now_ts();
-            (session.display_name.clone(), session.member_did.clone())
+            (
+                session.display_name.clone(),
+                session.member_did.clone(),
+                session.actor_id.clone(),
+                current_session_identity(session),
+            )
         };
         let created_at = now_ts();
         let object = append_attachment_record(
@@ -1940,6 +2168,7 @@ pub fn append_attachment_object_with_transport(
             AttachmentRecordInput {
                 sender,
                 sender_member_did: sender_member_did.clone(),
+                sender_actor_id,
                 created_at,
                 file_name: &file_name,
                 mime_type: &mime_type,
@@ -1948,7 +2177,7 @@ pub fn append_attachment_object_with_transport(
         )?;
         let transport_envelope = transport_envelope_from_record(paths, state, &object);
         Ok(AppendedConversationObject {
-            object: object_view_from_record(object),
+            object: object_view_from_record(object, Some(&current_session)),
             sender_member_did,
             transport_envelope,
         })
@@ -2061,10 +2290,15 @@ pub fn finish_attachment_upload(
     upload_id: &str,
 ) -> anyhow::Result<AppendedConversationObject> {
     with_locked_state(data_dir, |paths, state| {
-        let (sender, sender_member_did) = {
+        let (sender, sender_member_did, sender_actor_id, current_session) = {
             let session = validate_session(state, token)?;
             session.last_seen_at = now_ts();
-            (session.display_name.clone(), session.member_did.clone())
+            (
+                session.display_name.clone(),
+                session.member_did.clone(),
+                session.actor_id.clone(),
+                current_session_identity(session),
+            )
         };
         let upload_index = state
             .uploads
@@ -2090,6 +2324,7 @@ pub fn finish_attachment_upload(
             AttachmentRecordInput {
                 sender,
                 sender_member_did: sender_member_did.clone(),
+                sender_actor_id,
                 created_at: now_ts(),
                 file_name: &upload.file_name,
                 mime_type: &upload.mime_type,
@@ -2098,7 +2333,7 @@ pub fn finish_attachment_upload(
         )?;
         let transport_envelope = transport_envelope_from_record(paths, state, &object);
         Ok(AppendedConversationObject {
-            object: object_view_from_record(object),
+            object: object_view_from_record(object, Some(&current_session)),
             sender_member_did,
             transport_envelope,
         })
@@ -2130,14 +2365,26 @@ fn validate_session<'a>(
     state: &'a mut RoomState,
     token: &str,
 ) -> anyhow::Result<&'a mut SessionRecord> {
-    state
+    let session = state
         .sessions
         .iter_mut()
         .find(|item| item.token == token)
-        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))
+        .ok_or_else(|| anyhow::anyhow!("invalid or expired session"))?;
+    ensure_session_actor_id(session);
+    if !session
+        .capabilities
+        .iter()
+        .any(|capability| capability == ROOM_ACCESS_CAPABILITY)
+    {
+        anyhow::bail!("session is not approved for room access");
+    }
+    Ok(session)
 }
 
-fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
+fn participant_views_from_state(
+    state: &RoomState,
+    current_session: Option<&CurrentSessionIdentity>,
+) -> Vec<ParticipantView> {
     #[derive(Debug, Clone)]
     struct ParticipantAggregate {
         display_name: String,
@@ -2147,6 +2394,7 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
         role: Option<RoomRole>,
         local_session_count: usize,
         active_in_room: bool,
+        is_current_session: bool,
     }
 
     let mut members = BTreeMap::<String, ParticipantAggregate>::new();
@@ -2165,11 +2413,11 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
             members
                 .entry(member_did.to_string())
                 .or_insert_with(|| ParticipantAggregate {
-                    display_name: fallback_member_display_name(
+                    display_name: default_member_display_name(
                         member_did,
                         active_member_record(state, member_did).map(|member| &member.role),
                     ),
-                    device_label: fallback_member_device_label(
+                    device_label: default_member_device_label(
                         active_member_record(state, member_did).map(|member| &member.role),
                     ),
                     last_seen_at: 0,
@@ -2177,6 +2425,9 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
                     role: active_member_record(state, member_did).map(|member| member.role.clone()),
                     local_session_count: 0,
                     active_in_room: false,
+                    is_current_session: current_session
+                        .and_then(|session| session.member_did.as_deref())
+                        .is_some_and(|did| did == member_did),
                 });
 
         if !object.sender.trim().is_empty() {
@@ -2186,7 +2437,7 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
             ConversationObjectKind::System => {
                 if matches!(
                     object.body.as_deref(),
-                    Some("left the room") | Some("was removed from the room in PC2")
+                    Some("left the room") | Some("was removed from the room in Home")
                 ) {
                     participant.active_in_room = false;
                 } else if matches!(object.body.as_deref(), Some("joined the room")) {
@@ -2218,6 +2469,9 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
                 member_did: None,
                 role: None,
                 local_session_count: 1,
+                is_current_session: current_session
+                    .map(|current| current.actor_id == session.actor_id)
+                    .unwrap_or(false),
             });
             continue;
         };
@@ -2233,10 +2487,19 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
                     role: active_member_record(state, member_did).map(|member| member.role.clone()),
                     local_session_count: 0,
                     active_in_room: false,
+                    is_current_session: current_session
+                        .and_then(|session| session.member_did.as_deref())
+                        .is_some_and(|did| did == member_did),
                 });
 
         participant.local_session_count += 1;
         participant.active_in_room = true;
+        if current_session
+            .map(|current| current.actor_id == session.actor_id)
+            .unwrap_or(false)
+        {
+            participant.is_current_session = true;
+        }
         if session.last_seen_at >= participant.last_seen_at || participant.local_session_count == 1
         {
             participant.display_name = session.display_name.clone();
@@ -2255,6 +2518,7 @@ fn participant_views_from_state(state: &RoomState) -> Vec<ParticipantView> {
             member_did: participant.member_did,
             role: participant.role,
             local_session_count: participant.local_session_count,
+            is_current_session: participant.is_current_session,
         })
         .collect::<Vec<_>>();
     participants.extend(guests);
@@ -2282,7 +2546,7 @@ fn participant_role_rank(role: Option<&RoomRole>) -> u8 {
     }
 }
 
-fn fallback_member_display_name(member_did: &str, role: Option<&RoomRole>) -> String {
+fn default_member_display_name(member_did: &str, role: Option<&RoomRole>) -> String {
     match role {
         Some(RoomRole::Owner) => "Owner".to_string(),
         Some(RoomRole::Admin) => format!("Admin {}", short_did_suffix(member_did)),
@@ -2291,7 +2555,7 @@ fn fallback_member_display_name(member_did: &str, role: Option<&RoomRole>) -> St
     }
 }
 
-fn fallback_member_device_label(role: Option<&RoomRole>) -> String {
+fn default_member_device_label(role: Option<&RoomRole>) -> String {
     match role {
         Some(RoomRole::Owner) => "owner runtime".to_string(),
         Some(RoomRole::Admin) => "admin runtime".to_string(),
@@ -2315,12 +2579,13 @@ fn pending_request_views_from_state(state: &RoomState) -> Vec<PendingRequestView
     let mut items = state
         .pending_requests
         .iter()
-        .filter(|item| item.status == PairStatus::Pending)
+        .filter(|item| item.status == BrowserAccessStatus::Pending)
         .map(|item| PendingRequestView {
             request_id: item.request_id.clone(),
             display_name: item.display_name.clone(),
             device_label: item.device_label.clone(),
             requested_at: item.requested_at,
+            capabilities: item.capabilities.clone(),
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
@@ -2337,12 +2602,14 @@ fn active_session_views_from_state(state: &RoomState) -> Vec<ActiveSessionView> 
         .sessions
         .iter()
         .map(|session| ActiveSessionView {
+            session_id: session_public_id(&session.token),
             token: session.token.clone(),
             display_name: session.display_name.clone(),
             device_label: session.device_label.clone(),
             approved_at: session.approved_at,
             expires_at: session.expires_at,
             last_seen_at: session.last_seen_at,
+            capabilities: session.capabilities.clone(),
             member_did: session.member_did.clone(),
         })
         .collect::<Vec<_>>();
@@ -2355,6 +2622,19 @@ fn active_session_views_from_state(state: &RoomState) -> Vec<ActiveSessionView> 
     items
 }
 
+fn session_public_id(token: &str) -> String {
+    let digest = sha2::Sha256::digest(format!("elastos.room.session.v1:{token}").as_bytes());
+    hex::encode(digest)[..32].to_string()
+}
+
+fn normalize_session_id(input: &str) -> anyhow::Result<String> {
+    let value = input.trim().to_ascii_lowercase();
+    if value.len() != 32 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid room session id");
+    }
+    Ok(value)
+}
+
 fn local_runtime_access_from_state(
     state: &RoomState,
     runtime_did: Option<&str>,
@@ -2365,7 +2645,7 @@ fn local_runtime_access_from_state(
             member_role: runtime_did
                 .and_then(|did| active_member_record(state, did))
                 .map(|member| member.role.clone()),
-            pairing_allowed: false,
+            browser_access_allowed: false,
             block_reason: Some("Hosted guest access is disabled for this room.".to_string()),
         };
     }
@@ -2374,7 +2654,7 @@ fn local_runtime_access_from_state(
         return LocalRuntimeAccess {
             runtime_did: runtime_did.map(|did| did.to_string()),
             member_role: None,
-            pairing_allowed: true,
+            browser_access_allowed: true,
             block_reason: None,
         };
     }
@@ -2383,7 +2663,7 @@ fn local_runtime_access_from_state(
         return LocalRuntimeAccess {
             runtime_did: None,
             member_role: None,
-            pairing_allowed: false,
+            browser_access_allowed: false,
             block_reason: Some(
                 "This runtime has no active room member DID available for pairing.".to_string(),
             ),
@@ -2396,7 +2676,7 @@ fn local_runtime_access_from_state(
             return LocalRuntimeAccess {
                 runtime_did: Some(runtime_did.to_string()),
                 member_role: Some(role),
-                pairing_allowed: false,
+                browser_access_allowed: false,
                 block_reason: Some(
                     "This room only allows owners and admins to host browser guests.".to_string(),
                 ),
@@ -2405,14 +2685,14 @@ fn local_runtime_access_from_state(
         LocalRuntimeAccess {
             runtime_did: Some(runtime_did.to_string()),
             member_role: Some(role),
-            pairing_allowed: true,
+            browser_access_allowed: true,
             block_reason: None,
         }
     } else {
         LocalRuntimeAccess {
             runtime_did: Some(runtime_did.to_string()),
             member_role: None,
-            pairing_allowed: false,
+            browser_access_allowed: false,
             block_reason: Some(
                 "This runtime is not an active member of this exclusive room.".to_string(),
             ),
@@ -2424,19 +2704,19 @@ fn room_requires_active_membership(state: &RoomState) -> bool {
     state.control.owner_did.is_some() || state.members.iter().any(|member| member.active)
 }
 
-fn ensure_pairing_allowed_for_member(
+fn ensure_browser_access_allowed_for_member(
     state: &RoomState,
     member_did: Option<&str>,
 ) -> anyhow::Result<()> {
     let access = local_runtime_access_from_state(state, member_did);
-    if access.pairing_allowed {
+    if access.browser_access_allowed {
         Ok(())
     } else {
         anyhow::bail!(
             "{}",
             access
                 .block_reason
-                .unwrap_or_else(|| "pairing is not allowed for this runtime".to_string())
+                .unwrap_or_else(|| "browser access is not allowed for this runtime".to_string())
         )
     }
 }
@@ -2650,7 +2930,7 @@ fn room_access_policy_enabled_default() -> bool {
     true
 }
 
-fn summary_pairing_allowed_default() -> bool {
+fn summary_browser_access_allowed_default() -> bool {
     true
 }
 
@@ -2666,11 +2946,11 @@ fn find_upload_mut<'a>(
         .ok_or_else(|| anyhow::anyhow!("upload not found"))
 }
 
-fn next_pending_request(state: &RoomState) -> Option<&PairRequestRecord> {
+fn next_pending_request(state: &RoomState) -> Option<&BrowserAccessRequestRecord> {
     state
         .pending_requests
         .iter()
-        .find(|item| item.status == PairStatus::Pending)
+        .find(|item| item.status == BrowserAccessStatus::Pending)
 }
 
 fn invalidate_approved_requests(state: &mut RoomState, tokens: &[String]) {
@@ -2682,8 +2962,8 @@ fn invalidate_approved_requests(state: &mut RoomState, tokens: &[String]) {
             .session_token
             .as_ref()
             .is_some_and(|token| tokens.iter().any(|candidate| candidate == token));
-        if request.status == PairStatus::Approved && matches_token {
-            request.status = PairStatus::Expired;
+        if request.status == BrowserAccessStatus::Approved && matches_token {
+            request.status = BrowserAccessStatus::Expired;
             request.session_token = None;
             request.session_expires_at = None;
             request.denial_reason = None;
@@ -2725,6 +3005,7 @@ fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
 struct AttachmentRecordInput<'a> {
     sender: String,
     sender_member_did: Option<String>,
+    sender_actor_id: String,
     created_at: u64,
     file_name: &'a str,
     mime_type: &'a str,
@@ -2755,6 +3036,7 @@ fn append_attachment_record(
             event_id: new_object_event_id(),
             sender: input.sender,
             sender_member_did: input.sender_member_did,
+            sender_actor_id: input.sender_actor_id,
             kind: ConversationObjectKind::Attachment,
             body: None,
             emoji: None,
@@ -2779,6 +3061,7 @@ fn push_system_object(
             event_id: new_object_event_id(),
             sender,
             sender_member_did: None,
+            sender_actor_id: String::new(),
             kind: ConversationObjectKind::System,
             body: Some(body),
             emoji: None,
@@ -2803,6 +3086,7 @@ fn push_member_system_object(
             event_id: new_object_event_id(),
             sender,
             sender_member_did: Some(member_did.to_string()),
+            sender_actor_id: String::new(),
             kind: ConversationObjectKind::System,
             body: Some(body),
             emoji: None,
@@ -2830,11 +3114,29 @@ fn push_object(
     object
 }
 
-fn object_view_from_record(object: ConversationObjectRecord) -> ConversationObjectView {
+fn object_view_from_record(
+    object: ConversationObjectRecord,
+    current_session: Option<&CurrentSessionIdentity>,
+) -> ConversationObjectView {
+    let from_current_session = current_session
+        .map(|session| {
+            if !object.sender_actor_id.trim().is_empty() {
+                object.sender_actor_id == session.actor_id
+            } else {
+                object
+                    .sender_member_did
+                    .as_deref()
+                    .zip(session.member_did.as_deref())
+                    .map(|(left, right)| left == right)
+                    .unwrap_or(false)
+            }
+        })
+        .unwrap_or(false);
     ConversationObjectView {
         seq: object.seq,
         sender: object.sender,
         sender_member_did: object.sender_member_did,
+        from_current_session,
         kind: object.kind,
         body: object.body,
         emoji: object.emoji,
@@ -2949,7 +3251,8 @@ fn load_split_state(paths: &RoomPaths) -> anyhow::Result<RoomState> {
     let members: Vec<RoomMemberRecord> = read_json_or_default(&paths.members_path)?;
     let invites: Vec<RoomInviteRecord> = read_json_or_default(&paths.invites_path)?;
     let key_epochs: Vec<RoomKeyEpochRecord> = read_json_or_default(&paths.key_epochs_path)?;
-    let pending_requests: Vec<PairRequestRecord> = read_json_or_default(&paths.pair_requests_path)?;
+    let pending_requests: Vec<BrowserAccessRequestRecord> =
+        read_json_or_default(&paths.pair_requests_path)?;
     let sessions: Vec<SessionRecord> = read_json_or_default(&paths.sessions_path)?;
     let objects: Vec<ConversationObjectRecord> = read_json_or_default(&paths.objects_path)?;
     let uploads: Vec<UploadRecord> = read_json_or_default(&paths.uploads_path)?;
@@ -3003,17 +3306,17 @@ fn save_state(paths: &RoomPaths, state: &RoomState) -> anyhow::Result<()> {
 fn prune_state(paths: &RoomPaths, state: &mut RoomState) {
     let now = now_ts();
     for request in &mut state.pending_requests {
-        if request.status == PairStatus::Pending && request.expires_at <= now {
-            request.status = PairStatus::Expired;
+        if request.status == BrowserAccessStatus::Pending && request.expires_at <= now {
+            request.status = BrowserAccessStatus::Expired;
             request.session_token = None;
             request.session_expires_at = None;
         }
-        if request.status == PairStatus::Approved
+        if request.status == BrowserAccessStatus::Approved
             && request
                 .session_expires_at
                 .is_some_and(|expires_at| expires_at <= now)
         {
-            request.status = PairStatus::Expired;
+            request.status = BrowserAccessStatus::Expired;
             request.session_token = None;
         }
     }
@@ -3057,7 +3360,7 @@ fn storage_paths(data_dir: &Path) -> anyhow::Result<RoomPaths> {
         members_path: room_dir.join(ROOM_MEMBERS_FILE),
         invites_path: room_dir.join(ROOM_INVITES_FILE),
         key_epochs_path: room_dir.join(ROOM_KEY_EPOCHS_FILE),
-        pair_requests_path: local_dir.join(ROOM_PAIR_REQUESTS_FILE),
+        pair_requests_path: local_dir.join(BROWSER_ACCESS_REQUESTS_FILE),
         sessions_path: local_dir.join(ROOM_SESSIONS_FILE),
         objects_path: room_dir.join(ROOM_OBJECTS_FILE),
         uploads_path: local_dir.join(ROOM_UPLOADS_FILE),
@@ -3116,7 +3419,7 @@ fn normalize_state_defaults(state: &mut RoomState) {
     }
     for object in &mut state.objects {
         if object.event_id.trim().is_empty() {
-            object.event_id = format!("legacy-{}", object.seq.max(1));
+            object.event_id = format!("event-{}", object.seq.max(1));
         }
     }
 }
@@ -3243,10 +3546,33 @@ fn normalize_device_label(input: &str) -> String {
     }
 }
 
+fn normalize_browser_session_capabilities(input: &[String]) -> anyhow::Result<Vec<String>> {
+    if input.is_empty() {
+        anyhow::bail!("browser session capabilities must not be empty");
+    }
+    let mut capabilities = input
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if capabilities.is_empty() {
+        anyhow::bail!("browser session capabilities must not be empty");
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    for capability in &capabilities {
+        if capability != ROOM_ACCESS_CAPABILITY {
+            anyhow::bail!("unsupported browser session capability: {}", capability);
+        }
+    }
+    Ok(capabilities)
+}
+
 fn normalize_denial_reason(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        "Denied in PC2".to_string()
+        "Denied in Home".to_string()
     } else {
         trimmed.chars().take(120).collect()
     }
@@ -3518,7 +3844,7 @@ fn normalize_transport_system_body(input: &str) -> anyhow::Result<String> {
     let body = normalize_object_body(input)?;
     if matches!(
         body.as_str(),
-        "joined the room" | "left the room" | "was removed from the room in PC2"
+        "joined the room" | "left the room" | "was removed from the room in Home"
     ) {
         Ok(body)
     } else {
@@ -3539,6 +3865,19 @@ fn classify_link_object(input: &str) -> Option<LinkPreviewView> {
         return None;
     }
     let parsed = Url::parse(input).ok()?;
+    if parsed.scheme() == "elastos" {
+        let cid = parsed.host_str()?.to_string();
+        let mut title = "Published document".to_string();
+        if !cid.trim().is_empty() {
+            title.push_str(" / ");
+            title.push_str(&short_link_label(&cid));
+        }
+        return Some(LinkPreviewView {
+            url: input.to_string(),
+            host: "Documents".to_string(),
+            title,
+        });
+    }
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
@@ -3554,6 +3893,14 @@ fn classify_link_object(input: &str) -> Option<LinkPreviewView> {
         host,
         title,
     })
+}
+
+fn short_link_label(value: &str) -> String {
+    if value.len() <= 18 {
+        value.to_string()
+    } else {
+        format!("{}…{}", &value[..10], &value[value.len() - 6..])
+    }
 }
 
 fn is_emoji_only_message(input: &str) -> bool {
@@ -3584,12 +3931,12 @@ fn is_emoji_scalar(ch: char) -> bool {
     )
 }
 
-fn pair_status_label(status: &PairStatus) -> &'static str {
+fn browser_access_status_label(status: &BrowserAccessStatus) -> &'static str {
     match status {
-        PairStatus::Pending => "pending",
-        PairStatus::Approved => "approved",
-        PairStatus::Denied => "denied",
-        PairStatus::Expired => "expired",
+        BrowserAccessStatus::Pending => "pending",
+        BrowserAccessStatus::Approved => "approved",
+        BrowserAccessStatus::Denied => "denied",
+        BrowserAccessStatus::Expired => "expired",
     }
 }
 
@@ -3617,45 +3964,37 @@ fn unlock_file(file: &fs::File) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn browser_request(
+        display_name: &str,
+        device_label: &str,
+        host_member_did: Option<&str>,
+    ) -> BrowserAccessRequestInput {
+        BrowserAccessRequestInput {
+            display_name: display_name.to_string(),
+            device_label: device_label.to_string(),
+            host_member_did: host_member_did.map(str::to_string),
+            capabilities: room_access_capabilities(),
+        }
+    }
+
     #[test]
-    fn pair_request_round_trip() {
+    fn browser_access_request_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.pending_count, 1);
-        let status = pairing_status(tmp.path(), &request.request_id).unwrap();
+        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
         assert_eq!(status.status, "pending");
     }
 
     #[test]
     fn summary_surfaces_same_pending_request_that_approve_will_use() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
-        let _second = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Bob".to_string(),
-                device_label: "Safari".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let first =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let _second =
+            request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.latest_request_name.as_deref(), Some("Alice"));
@@ -3669,65 +4008,37 @@ mod tests {
     #[test]
     fn approve_request_targets_specific_pending_request() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
-        let second = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Bob".to_string(),
-                device_label: "Safari".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let first =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let second =
+            request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
 
         let approved = approve_request(tmp.path(), &second.request_id)
             .unwrap()
             .unwrap();
         assert_eq!(approved.request_id, second.request_id);
-        let first_status = pairing_status(tmp.path(), &first.request_id).unwrap();
+        let first_status = browser_access_status(tmp.path(), &first.request_id).unwrap();
         assert_eq!(first_status.status, "pending");
     }
 
     #[test]
     fn revoke_session_targets_one_browser_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
-        let second = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Bob".to_string(),
-                device_label: "Safari".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let first =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let second =
+            request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
         let _ = approve_request(tmp.path(), &first.request_id)
             .unwrap()
             .unwrap();
         let _ = approve_request(tmp.path(), &second.request_id)
             .unwrap()
             .unwrap();
-        let first_token = pairing_status(tmp.path(), &first.request_id)
+        let first_token = browser_access_status(tmp.path(), &first.request_id)
             .unwrap()
             .token
             .unwrap();
-        let second_token = pairing_status(tmp.path(), &second.request_id)
+        let second_token = browser_access_status(tmp.path(), &second.request_id)
             .unwrap()
             .token
             .unwrap();
@@ -3738,13 +4049,13 @@ mod tests {
         assert_eq!(summary.active_session_count, 1);
         assert_eq!(summary.active_sessions[0].display_name, "Bob");
         assert_eq!(
-            pairing_status(tmp.path(), &first.request_id)
+            browser_access_status(tmp.path(), &first.request_id)
                 .unwrap()
                 .status,
             "expired"
         );
         assert_eq!(
-            pairing_status(tmp.path(), &second.request_id)
+            browser_access_status(tmp.path(), &second.request_id)
                 .unwrap()
                 .token,
             Some(second_token)
@@ -3752,28 +4063,48 @@ mod tests {
     }
 
     #[test]
+    fn revoke_guest_session_by_public_id_never_revokes_runtime_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
+        let _ = approve_request(tmp.path(), &request.request_id)
+            .unwrap()
+            .unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        let guest_session_id = summary.active_sessions[0].session_id.clone();
+
+        let revoked = revoke_guest_session_by_id(tmp.path(), &guest_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(revoked.display_name, "Alice");
+        assert!(load_summary(tmp.path()).unwrap().active_sessions.is_empty());
+
+        let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
+        let _ = start_local_runtime_session(tmp.path(), &did, "Local runtime", "ElastOS shell")
+            .unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        let runtime_session_id = summary.active_sessions[0].session_id.clone();
+        let err = revoke_guest_session_by_id(tmp.path(), &runtime_session_id).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("runtime node sessions must be blocked"));
+    }
+
+    #[test]
     fn storage_uses_localhost_root_documents() {
         let tmp = tempfile::tempdir().unwrap();
-        request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
 
         let paths = storage_paths(tmp.path()).unwrap();
         assert!(paths
             .root_dir
-            .ends_with("Local/Shared/AppCapsules/room-browser"));
+            .ends_with("Local/Shared/AppCapsules/chat-room"));
         assert!(paths
             .room_dir
-            .ends_with("Local/Shared/AppCapsules/room-browser/room"));
+            .ends_with("Local/Shared/AppCapsules/chat-room/room"));
         assert!(paths
             .local_dir
-            .ends_with("Local/Shared/AppCapsules/room-browser/local"));
+            .ends_with("Local/Shared/AppCapsules/chat-room/local"));
         assert!(paths.room_meta_path.is_file());
         assert!(paths.control_path.is_file());
         assert!(paths.members_path.is_file());
@@ -4108,22 +4439,10 @@ mod tests {
         )
         .unwrap();
 
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "wsl".to_string(),
-                device_label: "laptop".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
-        )
-        .unwrap();
-        let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let session =
+            start_local_runtime_session(tmp.path(), "did:key:z6owner", "wsl", "laptop").unwrap();
 
-        let poll = room_poll(tmp.path(), &token, 0).unwrap();
+        let poll = room_poll(tmp.path(), &session.token, 0).unwrap();
         assert_eq!(poll.participants.len(), 1);
         assert!(poll.participants.iter().any(|participant| {
             participant.member_did.as_deref() == Some("did:key:z6owner")
@@ -4216,7 +4535,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_room_requires_active_member_did_for_pairing() {
+    fn seeded_room_requires_active_member_did_for_browser_access() {
         let tmp = tempfile::tempdir().unwrap();
         let _ = seed_room_owner(
             tmp.path(),
@@ -4227,39 +4546,24 @@ mod tests {
         )
         .unwrap();
 
-        let missing = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap_err();
+        let missing = request_browser_access(tmp.path(), browser_request("Alice", "Phone", None))
+            .unwrap_err();
         assert!(missing
             .to_string()
             .contains("no active room member DID available"));
 
-        let non_member = request_pairing(
+        let non_member = request_browser_access(
             tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: Some("did:key:z6stranger".to_string()),
-            },
+            browser_request("Alice", "Phone", Some("did:key:z6stranger")),
         )
         .unwrap_err();
         assert!(non_member
             .to_string()
             .contains("not an active member of this exclusive room"));
 
-        let allowed = request_pairing(
+        let allowed = request_browser_access(
             tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
+            browser_request("Alice", "Phone", Some("did:key:z6owner")),
         )
         .unwrap();
         assert!(!allowed.request_id.is_empty());
@@ -4304,13 +4608,9 @@ mod tests {
         )
         .unwrap();
 
-        let err = request_pairing(
+        let err = request_browser_access(
             tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: Some("did:key:z6member".to_string()),
-            },
+            browser_request("Alice", "Phone", Some("did:key:z6member")),
         )
         .unwrap_err();
         assert!(err
@@ -4321,17 +4621,10 @@ mod tests {
     #[test]
     fn approval_creates_session_and_object_flow() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let status = pairing_status(tmp.path(), &request.request_id).unwrap();
+        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
         let token = status.token.unwrap();
         assert_eq!(status.status, "approved");
         assert_eq!(status.expires_at, Some(approved.expires_at));
@@ -4354,7 +4647,113 @@ mod tests {
     }
 
     #[test]
-    fn member_pairing_emits_transportable_join_system_object() {
+    fn open_room_allows_local_runtime_session_without_active_membership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
+
+        let session =
+            start_local_runtime_session(tmp.path(), &did, "Local runtime", "ElastOS shell")
+                .unwrap();
+        let session_view = session_view(tmp.path(), &session.token).unwrap();
+        assert_eq!(session_view.display_name, "Local runtime");
+        assert_eq!(session_view.participants.len(), 1);
+        assert_eq!(session_view.participants[0].display_name, "Local runtime");
+        assert_eq!(
+            session_view.participants[0].member_did.as_deref(),
+            Some(did.as_str())
+        );
+
+        let joined = conversation_feed(tmp.path(), &session.token, 0).unwrap();
+        assert_eq!(joined.objects.len(), 1);
+        assert_eq!(joined.objects[0].kind, ConversationObjectKind::System);
+        assert_eq!(joined.objects[0].body.as_deref(), Some("joined the room"));
+        assert_eq!(
+            joined.objects[0].sender_member_did.as_deref(),
+            Some(did.as_str())
+        );
+    }
+
+    #[test]
+    fn local_runtime_session_handle_change_reuses_single_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
+
+        let first = start_local_runtime_session(tmp.path(), &did, "Local runtime", "ElastOS shell")
+            .unwrap();
+        let second =
+            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+
+        assert_eq!(first.token, second.token);
+        assert_eq!(second.display_name, "anders");
+
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.active_session_count, 1);
+        assert_eq!(summary.active_participants.len(), 1);
+        assert_eq!(summary.active_participants[0].display_name, "anders");
+        assert_eq!(
+            summary.active_participants[0].member_did.as_deref(),
+            Some(did.as_str())
+        );
+    }
+
+    #[test]
+    fn guest_poll_does_not_claim_local_runtime_messages_as_current_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
+
+        let local =
+            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+        let _ = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
+
+        let request =
+            request_browser_access(tmp.path(), browser_request("Guest", "Browser", None)).unwrap();
+        let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
+        let guest_token = browser_access_status(tmp.path(), &request.request_id)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let poll = room_poll(tmp.path(), &guest_token, 0).unwrap();
+        assert!(poll.participants.iter().any(
+            |participant| participant.display_name == "Guest" && participant.is_current_session
+        ));
+        assert!(poll
+            .participants
+            .iter()
+            .any(|participant| participant.display_name == "anders"
+                && !participant.is_current_session));
+        assert!(poll
+            .objects
+            .iter()
+            .any(|object| object.body.as_deref() == Some("hello from shell")
+                && !object.from_current_session));
+    }
+
+    #[test]
+    fn local_runtime_poll_marks_runtime_messages_as_current_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, did) = elastos_identity::load_or_create_did(tmp.path()).unwrap();
+
+        let local =
+            start_local_runtime_session(tmp.path(), &did, "anders", "ElastOS shell").unwrap();
+        let sent = append_object(tmp.path(), &local.token, "hello from shell").unwrap();
+        assert!(sent.from_current_session);
+
+        let poll = room_poll(tmp.path(), &local.token, 0).unwrap();
+        assert!(poll
+            .participants
+            .iter()
+            .any(|participant| participant.display_name == "anders"
+                && participant.is_current_session));
+        assert!(poll
+            .objects
+            .iter()
+            .any(|object| object.body.as_deref() == Some("hello from shell")
+                && object.from_current_session));
+    }
+
+    #[test]
+    fn member_browser_access_does_not_emit_duplicate_join_system_object() {
         let tmp = tempfile::tempdir().unwrap();
         let _ = seed_room_owner(
             tmp.path(),
@@ -4364,27 +4763,56 @@ mod tests {
             },
         )
         .unwrap();
-        let request = request_pairing(
+        let request = request_browser_access(
             tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Laptop".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
+            browser_request("Alice", "Laptop", Some("did:key:z6owner")),
         )
         .unwrap();
         let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let _token = pairing_status(tmp.path(), &request.request_id)
+        let _token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
 
         let backlog = room_transport_backlog(tmp.path(), "did:key:z6owner", None).unwrap();
-        assert!(backlog.iter().any(|object| {
+        assert!(!backlog.iter().any(|object| {
             object.kind == ConversationObjectKind::System
                 && object.sender_member_did == "did:key:z6owner"
-                && object.sender == "Alice"
                 && object.body.as_deref() == Some("joined the room")
+        }));
+    }
+
+    #[test]
+    fn hosted_browser_guest_does_not_inherit_host_member_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = seed_room_owner(
+            tmp.path(),
+            RoomOwnerSeedInput {
+                owner_did: "did:key:z6owner".to_string(),
+                title: "Exec Room".to_string(),
+            },
+        )
+        .unwrap();
+        let request = request_browser_access(
+            tmp.path(),
+            browser_request("Guest", "Browser", Some("did:key:z6owner")),
+        )
+        .unwrap();
+        let _ = approve_next_request(tmp.path()).unwrap().unwrap();
+        let token = browser_access_status(tmp.path(), &request.request_id)
+            .unwrap()
+            .token
+            .unwrap();
+
+        let appended = append_object_with_transport(tmp.path(), &token, "guest hello").unwrap();
+        assert!(appended.sender_member_did.is_none());
+        assert!(appended.transport_envelope.is_none());
+
+        let poll = room_poll(tmp.path(), &token, 0).unwrap();
+        assert!(poll.participants.iter().any(|participant| {
+            participant.display_name == "Guest"
+                && participant.member_did.is_none()
+                && participant.is_current_session
         }));
     }
 
@@ -4399,22 +4827,11 @@ mod tests {
             },
         )
         .unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
-        )
-        .unwrap();
-        let _ = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let session =
+            start_local_runtime_session(tmp.path(), "did:key:z6owner", "Alice", "Phone").unwrap();
 
-        let appended = append_object_with_transport(tmp.path(), &token, "hello world").unwrap();
+        let appended =
+            append_object_with_transport(tmp.path(), &session.token, "hello world").unwrap();
         assert_eq!(
             appended.sender_member_did.as_deref(),
             Some("did:key:z6owner")
@@ -4524,6 +4941,18 @@ mod tests {
         assert_eq!(link.kind, ConversationObjectKind::Link);
         assert_eq!(link.link.unwrap().host, "elastos.net");
 
+        let document = classify_object_body(
+            "elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        )
+        .unwrap();
+        assert_eq!(document.kind, ConversationObjectKind::Link);
+        let document_link = document.link.unwrap();
+        assert_eq!(document_link.host, "Documents");
+        assert_eq!(
+            document_link.title,
+            "Published document / bafybeigdy…5fbzdi"
+        );
+
         let emoji = classify_object_body("🔥").unwrap();
         assert_eq!(emoji.kind, ConversationObjectKind::Emoji);
         assert_eq!(emoji.emoji.as_deref(), Some("🔥"));
@@ -4532,17 +4961,10 @@ mod tests {
     #[test]
     fn attachment_object_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
@@ -4566,17 +4988,10 @@ mod tests {
     #[test]
     fn attachment_object_classifies_audio_and_video() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
@@ -4601,17 +5016,10 @@ mod tests {
     #[test]
     fn leave_session_removes_participant_and_appends_system_object() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "iPhone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
@@ -4622,7 +5030,7 @@ mod tests {
 
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let status = pairing_status(tmp.path(), &request.request_id).unwrap();
+        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
         assert_eq!(status.status, "expired");
         assert!(status.token.is_none());
     }
@@ -4638,22 +5046,10 @@ mod tests {
             },
         )
         .unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Laptop".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
-        )
-        .unwrap();
-        let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
-            .unwrap()
-            .token
-            .unwrap();
+        let session =
+            start_local_runtime_session(tmp.path(), "did:key:z6owner", "Alice", "Laptop").unwrap();
 
-        let left = leave_session(tmp.path(), &token).unwrap();
+        let left = leave_session(tmp.path(), &session.token).unwrap();
         assert_eq!(left.kind, ConversationObjectKind::System);
         assert_eq!(left.body.as_deref(), Some("left the room"));
         assert_eq!(left.sender_member_did.as_deref(), Some("did:key:z6owner"));
@@ -4671,18 +5067,11 @@ mod tests {
     #[test]
     fn deny_marks_request_denied() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Bob".to_string(),
-                device_label: "Safari".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Bob", "Safari", None)).unwrap();
         let denied = deny_next_request(tmp.path(), "No").unwrap().unwrap();
         assert_eq!(denied.display_name, "Bob");
-        let status = pairing_status(tmp.path(), &request.request_id).unwrap();
+        let status = browser_access_status(tmp.path(), &request.request_id).unwrap();
         assert_eq!(status.status, "denied");
         assert_eq!(status.denial_reason.as_deref(), Some("No"));
     }
@@ -4690,17 +5079,10 @@ mod tests {
     #[test]
     fn summary_includes_active_participants() {
         let tmp = tempfile::tempdir().unwrap();
-        let request = request_pairing(
-            tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: None,
-            },
-        )
-        .unwrap();
+        let request =
+            request_browser_access(tmp.path(), browser_request("Alice", "Phone", None)).unwrap();
         let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-        let _token = pairing_status(tmp.path(), &request.request_id)
+        let _token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();
@@ -4716,18 +5098,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut request_ids = Vec::new();
         for (display_name, device_label) in [("Alice", "Phone"), ("Bob", "Safari")] {
-            let request = request_pairing(
+            let request = request_browser_access(
                 tmp.path(),
-                PairRequestInput {
-                    display_name: display_name.to_string(),
-                    device_label: device_label.to_string(),
-                    member_did: None,
-                },
+                browser_request(display_name, device_label, None),
             )
             .unwrap();
             request_ids.push(request.request_id.clone());
             let _approved = approve_next_request(tmp.path()).unwrap().unwrap();
-            let _token = pairing_status(tmp.path(), &request.request_id)
+            let _token = browser_access_status(tmp.path(), &request.request_id)
                 .unwrap()
                 .token
                 .unwrap();
@@ -4737,10 +5115,10 @@ mod tests {
         assert_eq!(revoked.revoked_count, 2);
         let summary = load_summary(tmp.path()).unwrap();
         assert_eq!(summary.active_session_count, 0);
-        let first_status = pairing_status(tmp.path(), &request_ids[0]).unwrap();
+        let first_status = browser_access_status(tmp.path(), &request_ids[0]).unwrap();
         assert_eq!(first_status.status, "expired");
         assert!(first_status.token.is_none());
-        let second_status = pairing_status(tmp.path(), &request_ids[1]).unwrap();
+        let second_status = browser_access_status(tmp.path(), &request_ids[1]).unwrap();
         assert_eq!(second_status.status, "expired");
         assert!(second_status.token.is_none());
 
@@ -4752,7 +5130,7 @@ mod tests {
         .unwrap();
         assert!(objects
             .iter()
-            .any(|item| item.body.as_deref() == Some("was removed from the room in PC2")));
+            .any(|item| item.body.as_deref() == Some("was removed from the room in Home")));
     }
 
     #[test]
@@ -4775,19 +5153,15 @@ mod tests {
             },
         )
         .unwrap();
-        let request = request_pairing(
+        let request = request_browser_access(
             tmp.path(),
-            PairRequestInput {
-                display_name: "Alice".to_string(),
-                device_label: "Phone".to_string(),
-                member_did: Some("did:key:z6owner".to_string()),
-            },
+            browser_request("Alice", "Phone", Some("did:key:z6owner")),
         )
         .unwrap();
         let _ = approve_request(tmp.path(), &request.request_id)
             .unwrap()
             .unwrap();
-        let token = pairing_status(tmp.path(), &request.request_id)
+        let token = browser_access_status(tmp.path(), &request.request_id)
             .unwrap()
             .token
             .unwrap();

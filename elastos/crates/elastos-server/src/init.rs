@@ -43,6 +43,7 @@ pub fn init_capsule(name: &str) -> anyhow::Result<()> {
         "name": name,
         "description": format!("A {} capsule", name),
         "author": "",
+        "role": "app",
         "type": "wasm",
         "entrypoint": format!("{}.wasm", name),
         "requires": [],
@@ -142,7 +143,7 @@ fn main() {
     Ok(())
 }
 
-/// Scaffold a new content capsule (markdown documents with md-viewer).
+/// Scaffold a new content capsule (markdown documents with Documents).
 pub fn init_content_capsule(name: &str) -> anyhow::Result<()> {
     let dir = PathBuf::from(name);
     if dir.exists() {
@@ -157,9 +158,10 @@ pub fn init_content_capsule(name: &str) -> anyhow::Result<()> {
         "version": "0.1.0",
         "name": name,
         "description": format!("{} — shared documents", name),
+        "role": "content",
         "type": "data",
         "entrypoint": "index.html",
-        "viewer": "md-viewer",
+        "viewer": "documents",
         "requires": [],
         "capabilities": [],
         "resources": { "memory_mb": 16, "cpu_shares": 50 },

@@ -395,6 +395,7 @@ mod tests {
             version: "0.1.0".to_string(),
             description: None,
             author: None,
+            role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
             entrypoint: "main.wasm".to_string(),
             requires: Vec::new(),

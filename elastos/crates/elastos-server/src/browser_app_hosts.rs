@@ -98,6 +98,19 @@ pub fn record_ephemeral_browser_app_url(
     Ok(())
 }
 
+pub fn record_ephemeral_browser_app_urls<'a>(
+    data_dir: &Path,
+    apps: impl IntoIterator<Item = &'a str>,
+    ephemeral_url: Option<&str>,
+) -> anyhow::Result<Vec<BrowserAppHostedEndpointSummary>> {
+    let mut summaries = Vec::new();
+    for app in apps {
+        record_ephemeral_browser_app_url(data_dir, app, ephemeral_url)?;
+        summaries.push(load_browser_app_hosted_endpoint(data_dir, app)?);
+    }
+    Ok(summaries)
+}
+
 fn canonical_browser_app_url(data_dir: &Path, app: &str) -> Option<String> {
     let env_gateway = std::env::var("ELASTOS_CANONICAL_PUBLISHER_GATEWAY")
         .ok()
@@ -195,5 +208,25 @@ mod tests {
             Some("https://demo.trycloudflare.com/")
         );
         assert!(summary.updated_at.is_some());
+    }
+
+    #[test]
+    fn recording_ephemeral_browser_app_urls_updates_each_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let summaries = record_ephemeral_browser_app_urls(
+            tmp.path(),
+            ["chat-room", "home"],
+            Some("https://demo.trycloudflare.com"),
+        )
+        .unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        for app in ["chat-room", "home"] {
+            let summary = load_browser_app_hosted_endpoint(tmp.path(), app).unwrap();
+            assert_eq!(
+                summary.ephemeral_url.as_deref(),
+                Some("https://demo.trycloudflare.com/")
+            );
+        }
     }
 }

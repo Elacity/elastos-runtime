@@ -1,11 +1,12 @@
 {
   "schema": "elastos.capsule/v1",
-  "name": "pc2",
+  "name": "home-cli",
   "version": "0.1.0",
-  "description": "Local sovereign PC2 dashboard over rooted localhost state",
+  "description": "Local sovereign Home dashboard over rooted localhost state",
   "author": "elastos",
+  "role": "shell",
   "type": "wasm",
-  "entrypoint": "pc2.wasm",
+  "entrypoint": "home-cli.wasm",
   "requires": [],
   "resources": {
     "memory_mb": 64,

@@ -182,25 +182,17 @@
         }
       }
     },
-    "pc2": {
-      "install_path": "capsules/pc2",
-      "description": "First-party PC2 home capsule required for the default elastos home surface",
+    "home-cli": {
+      "install_path": "capsules/home-cli",
+      "description": "First-party Home CLI capsule required for the default elastos surface",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "pc2-linux-amd64.tar.gz",
-          "extract_path": "pc2",
-          "install_path": "capsules/pc2"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "pc2-linux-arm64.tar.gz",
-          "extract_path": "pc2",
-          "install_path": "capsules/pc2"
+          "release_path": "home-cli.tar.gz",
+          "extract_path": "home-cli",
+          "install_path": "capsules/home-cli"
         }
       }
     },
@@ -230,19 +222,11 @@
       "install_path": "capsules/chat-wasm",
       "description": "Packaged WASM chat bundle for the non-KVM full-screen Carrier chat path",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "chat-wasm-linux-amd64.tar.gz",
-          "extract_path": "chat-wasm",
-          "install_path": "capsules/chat-wasm"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "chat-wasm-linux-arm64.tar.gz",
+          "release_path": "chat-wasm.tar.gz",
           "extract_path": "chat-wasm",
           "install_path": "capsules/chat-wasm"
         }
@@ -312,19 +296,11 @@
       "install_path": "capsules/md-viewer",
       "description": "Markdown viewer assets required for direct share/open flows",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "md-viewer-linux-amd64.tar.gz",
-          "extract_path": "md-viewer",
-          "install_path": "capsules/md-viewer"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "md-viewer-linux-arm64.tar.gz",
+          "release_path": "md-viewer.tar.gz",
           "extract_path": "md-viewer",
           "install_path": "capsules/md-viewer"
         }
@@ -332,21 +308,13 @@
     },
     "gba-emulator": {
       "install_path": "capsules/gba-emulator",
-      "description": "Browser GBA viewer bundle used by PC2 and elastos run",
+      "description": "Browser GBA viewer bundle used by Home and explicit elastos run",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "gba-emulator-linux-amd64.tar.gz",
-          "extract_path": "gba-emulator",
-          "install_path": "capsules/gba-emulator"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "gba-emulator-linux-arm64.tar.gz",
+          "release_path": "gba-emulator.tar.gz",
           "extract_path": "gba-emulator",
           "install_path": "capsules/gba-emulator"
         }
@@ -356,19 +324,11 @@
       "install_path": "capsules/gba-ucity",
       "description": "Bundled uCity demo cartridge for the browser GBA viewer",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "gba-ucity-linux-amd64.tar.gz",
-          "extract_path": "gba-ucity",
-          "install_path": "capsules/gba-ucity"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "gba-ucity-linux-arm64.tar.gz",
+          "release_path": "gba-ucity.tar.gz",
           "extract_path": "gba-ucity",
           "install_path": "capsules/gba-ucity"
         }
@@ -378,19 +338,11 @@
       "install_path": "capsules/room-browser",
       "description": "Hosted browser capsule for the sovereign room service",
       "platforms": {
-        "linux-amd64": {
+        "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "room-browser-linux-amd64.tar.gz",
-          "extract_path": "room-browser",
-          "install_path": "capsules/room-browser"
-        },
-        "linux-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "room-browser-linux-arm64.tar.gz",
+          "release_path": "room-browser.tar.gz",
           "extract_path": "room-browser",
           "install_path": "capsules/room-browser"
         }
@@ -517,24 +469,24 @@
         "vmlinux"
       ]
     },
-    "pc2": {
-      "description": "Managed PC2 home plus native Carrier chat",
+    "home": {
+      "description": "Managed Home plus native Carrier chat",
       "components": [
         "shell",
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "pc2"
+        "home-cli"
       ]
     },
     "demo": {
-      "description": "PC2 demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
+      "description": "Home demo path with native chat, room, full-screen chat, site, sharing, GBA, and browser capsule surfaces",
       "components": [
         "shell",
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "pc2",
+        "home-cli",
         "chat",
         "chat-wasm",
         "gba-emulator",
@@ -574,7 +526,7 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "pc2",
+        "home-cli",
         "kubo",
         "ipfs-provider",
         "md-viewer",
@@ -589,7 +541,7 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "pc2",
+        "home-cli",
         "kubo",
         "ipfs-provider",
         "site-provider",
@@ -605,7 +557,7 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "pc2",
+        "home-cli",
         "chat",
         "chat-wasm",
         "gba-emulator",

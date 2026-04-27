@@ -176,6 +176,7 @@ mod tests {
             name: "test-capsule".into(),
             description: Some("Test".into()),
             author: Some("Test Author".into()),
+            role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
             entrypoint: "main.wasm".into(),
             requires: Vec::new(),

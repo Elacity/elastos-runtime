@@ -1,12 +1,12 @@
 [package]
-name = "pc2"
+name = "home-cli"
 version = "0.1.0"
 edition = "2021"
-description = "ElastOS PC2 Lobby Alpha - local sovereign home dashboard"
+description = "ElastOS Home dashboard"
 license = "MIT"
 
 [[bin]]
-name = "pc2"
+name = "home-cli"
 path = "src/main.rs"
 
 [dependencies]

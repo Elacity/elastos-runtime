@@ -21,6 +21,7 @@ pub struct CapsuleManifest {
     pub description: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
+    pub role: CapsuleRole,
 
     #[serde(rename = "type")]
     pub capsule_type: CapsuleType,
@@ -115,8 +116,15 @@ impl CapsuleManifest {
             return Err("manifest name must not be empty".to_string());
         }
 
+        if self.role == CapsuleRole::Content && self.capsule_type != CapsuleType::Data {
+            return Err("content capsules must use type=data".to_string());
+        }
+
         // Reject path traversal in viewer field (same rules as entrypoint)
         if let Some(viewer) = &self.viewer {
+            if self.role != CapsuleRole::Content {
+                return Err("viewer is only valid on content capsules".to_string());
+            }
             if viewer.contains("..") {
                 return Err(format!(
                     "viewer \"{}\" contains path traversal (\"..\" is not allowed)",
@@ -177,6 +185,29 @@ pub enum CapsuleType {
     Oci,
     Media,
     Data,
+}
+
+/// Product role of a capsule.
+///
+/// This is distinct from the execution substrate (`type`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CapsuleRole {
+    Shell,
+    App,
+    Viewer,
+    Provider,
+    Content,
+}
+
+impl CapsuleRole {
+    pub fn is_shell_launchable(&self) -> bool {
+        matches!(self, Self::Shell | Self::App | Self::Viewer)
+    }
+
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content)
+    }
 }
 
 /// Resource limits for a capsule
@@ -285,6 +316,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test-capsule",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -304,6 +336,7 @@ mod tests {
             "name": "full-capsule",
             "description": "A test capsule",
             "author": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm",
             "resources": {
@@ -326,7 +359,8 @@ mod tests {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
-            "name": "puter-shell",
+            "name": "fixture-microvm",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "resources": {
@@ -344,7 +378,7 @@ mod tests {
         }"#;
 
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.name, "puter-shell");
+        assert_eq!(manifest.name, "fixture-microvm");
         assert_eq!(manifest.capsule_type, CapsuleType::MicroVM);
         assert_eq!(manifest.entrypoint, "rootfs.ext4");
         assert_eq!(manifest.resources.memory_mb, 512);
@@ -364,7 +398,8 @@ mod tests {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
-            "name": "puter-shell-cid",
+            "name": "fixture-microvm-cid",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "resources": {
@@ -379,7 +414,7 @@ mod tests {
         }"#;
 
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.name, "puter-shell-cid");
+        assert_eq!(manifest.name, "fixture-microvm-cid");
         assert_eq!(manifest.capsule_type, CapsuleType::MicroVM);
 
         let microvm = manifest.microvm.unwrap();
@@ -399,7 +434,8 @@ mod tests {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
-            "name": "puter-shell",
+            "name": "fixture-microvm",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "microvm": {
@@ -420,6 +456,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test-capsule",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "providers": {
@@ -440,6 +477,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test-capsule",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -454,6 +492,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "microvm": {
@@ -472,6 +511,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "gba-ucity",
+            "role": "content",
             "type": "data",
             "entrypoint": "ucity.gba",
             "viewer": "gba-emulator",
@@ -491,6 +531,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "evil",
+            "role": "content",
             "type": "data",
             "entrypoint": "data.bin",
             "viewer": "../../../etc/passwd"
@@ -505,11 +546,43 @@ mod tests {
     }
 
     #[test]
+    fn test_viewer_rejected_for_non_content_role() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-viewer",
+            "role": "viewer",
+            "type": "data",
+            "entrypoint": "index.html",
+            "viewer": "documents"
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("viewer is only valid on content capsules"));
+    }
+
+    #[test]
+    fn test_content_role_requires_data_type() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-content",
+            "role": "content",
+            "type": "wasm",
+            "entrypoint": "main.wasm"
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("content capsules must use type=data"));
+    }
+
+    #[test]
     fn test_parse_manifest_without_viewer() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -523,6 +596,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -536,6 +610,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "   ",
             "name": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -549,6 +624,7 @@ mod tests {
         let json = r#"{
             "version": "0.1.0",
             "name": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "main.wasm"
         }"#;
@@ -562,6 +638,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "evil",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "../../../etc/passwd"
         }"#;
@@ -576,6 +653,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "evil",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "/etc/passwd"
         }"#;
@@ -590,6 +668,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "test",
+            "role": "app",
             "type": "wasm",
             "entrypoint": "my-capsule.wasm"
         }"#;
@@ -605,6 +684,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "ipfs-provider",
             "version": "0.1.0",
+            "role": "provider",
             "type": "microvm",
             "entrypoint": "ipfs-provider",
             "requires": [{"name":"kubo","kind":"external"}],
@@ -641,6 +721,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "llama-provider",
             "version": "0.1.0",
+            "role": "provider",
             "type": "microvm",
             "entrypoint": "llama-provider",
             "resources": { "memory_mb": 4096, "gpu": true }
@@ -656,6 +737,7 @@ mod tests {
             "schema": "elastos.capsule/v99",
             "name": "test",
             "version": "0.1.0",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "test"
         }"#;
@@ -671,6 +753,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "bad-provides",
             "version": "0.1.0",
+            "role": "provider",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "provides": "https://example.com/*"
@@ -687,6 +770,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "bad-capability",
             "version": "0.1.0",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "capabilities": ["ftp://example.com/resource"]
@@ -703,6 +787,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "minimal",
             "version": "0.1.0",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "minimal"
         }"#;
@@ -721,6 +806,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "name": "bad",
             "version": "0.1.0",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "bad",
             "dependencies": ["kubo"]
@@ -735,6 +821,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "chat",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4"
         }"#;
@@ -748,6 +835,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "my-provider",
+            "role": "provider",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "provides": "elastos://my/*",
@@ -765,6 +853,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "chat",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "permissions": {
@@ -782,6 +871,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "chat",
+            "role": "app",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "permissions": {
@@ -806,6 +896,7 @@ mod tests {
             "schema": "elastos.capsule/v1",
             "version": "0.1.0",
             "name": "localhost-provider",
+            "role": "provider",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "provides": "localhost://Users/*",

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Extension, Json};
+use elastos_runtime::primitives::audit::{AuditLog, TrustLevel};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::Runtime;
@@ -69,16 +70,25 @@ pub struct LaunchResponse {
 
 pub async fn launch_capsule(
     Extension(runtime): Extension<Arc<Runtime>>,
+    Extension(audit_log): Extension<Arc<AuditLog>>,
     Json(req): Json<LaunchRequest>,
 ) -> Result<Json<LaunchResponse>, (StatusCode, String)> {
     let path = std::path::Path::new(&req.path);
 
     match runtime.run_local(path, vec![]).await {
-        Ok(handle) => Ok(Json(LaunchResponse {
-            id: handle.id.0,
-            name: handle.manifest.name,
-            status: "running".into(),
-        })),
+        Ok(handle) => {
+            audit_log.capsule_launch(
+                &handle.id.0,
+                &handle.manifest.name,
+                None,
+                TrustLevel::Untrusted,
+            );
+            Ok(Json(LaunchResponse {
+                id: handle.id.0,
+                name: handle.manifest.name,
+                status: "launched".into(),
+            }))
+        }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }

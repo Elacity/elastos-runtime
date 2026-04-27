@@ -6,10 +6,10 @@ mod capsule_publish_cmd;
 mod chat_cmd;
 mod config_cmd;
 mod gateway_entry;
+mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
 mod node_cmd;
-mod pc2_cmd;
 mod publish;
 mod release_cmd;
 mod room_cmd;
@@ -19,7 +19,6 @@ mod serve_cmd;
 mod server_infra;
 mod share_cmd;
 mod shares_cmd;
-mod shell_cmd;
 mod site_cmd;
 mod trust_cmd;
 mod webspace_cmd;
@@ -40,6 +39,7 @@ pub(crate) use elastos_server::binaries::{
     find_installed_provider_binary, resolve_verified_provider_binary, verify_component_binary,
 };
 use elastos_server::{api, runtime, setup};
+pub(crate) use elastos_server::{runtime_control, shell_cmd, sources};
 
 use runtime::Runtime;
 
@@ -59,7 +59,7 @@ fn is_interactive_frontdoor_command(argv: &[String]) -> bool {
 
     matches!(
         argv.first().map(String::as_str),
-        None | Some("pc2") | Some("chat") | Some("run")
+        None | Some("home") | Some("chat") | Some("run")
     )
 }
 
@@ -70,8 +70,8 @@ fn should_isolate_process_group(argv: &[String]) -> bool {
 
 #[derive(Parser)]
 #[command(name = "elastos")]
-#[command(about = "ElastOS - sovereign PC2 home and runtime\n\n\
-    Run `elastos` with no subcommand to open your local PC2 home.\n\
+#[command(about = "ElastOS - sovereign Home and runtime\n\n\
+    Run `elastos` with no subcommand to open Home.\n\
     Use `elastos serve` for operator-runtime commands.\n\
     All resource access is capability-gated by the local control plane.")]
 #[command(version = ELASTOS_VERSION)]
@@ -223,7 +223,7 @@ enum Commands {
         allow_no_bootstrap: bool,
     },
 
-    /// Share a file or directory via IPFS (on a fresh install add `--with kubo --with ipfs-provider --with md-viewer`)
+    /// Share a file or directory via IPFS (on a fresh install add `--with kubo --with ipfs-provider --with documents`)
     Share {
         /// File or directory to share (e.g., README.md, docs/)
         path: PathBuf,
@@ -264,8 +264,8 @@ enum Commands {
         connect: Option<String>,
     },
 
-    /// Launch the PC2 home surface
-    Pc2 {
+    /// Launch Home
+    Home {
         /// Print a plain CLI summary instead of the managed WASM dashboard
         #[arg(long)]
         status: bool,
@@ -315,12 +315,12 @@ enum Commands {
         /// Name of the capsule to create
         name: String,
 
-        /// Capsule type: wasm (default) or content (markdown viewer)
+        /// Capsule type: wasm (default) or content/data object
         #[arg(long, default_value = "wasm")]
         r#type: String,
     },
 
-    /// Open a shared capsule by URI (on a fresh install add `--with kubo --with ipfs-provider --with md-viewer`)
+    /// Open a shared capsule by URI (on a fresh install add `--with kubo --with ipfs-provider --with documents`)
     Open {
         /// elastos://<cid>, bare CID, https://gateway/ipfs/<cid>/, or localhost://MyWebSite
         uri: String,
@@ -414,7 +414,7 @@ enum Commands {
 
     /// Install the default runtime profile or an explicit setup profile
     Setup {
-        /// Profile name. Default is `pc2`. Use `demo` for site/share/browser extras, or `chat` for the packaged full-screen chat path.
+        /// Profile name. Default is `home`. Use `demo` for site/share/browser extras, or `chat` for the packaged full-screen chat path.
         #[arg(long)]
         profile: Option<String>,
 
@@ -628,7 +628,7 @@ pub(crate) enum NodeRoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List pending browser pairing requests from an allowed peer
+    /// List pending browser access requests from an allowed peer
     Pending {
         /// Target runtime DID
         #[arg(long)]
@@ -637,7 +637,7 @@ pub(crate) enum NodeRoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Approve a pending browser pairing request on an allowed peer
+    /// Approve a pending browser access request on an allowed peer
     Approve {
         /// Target runtime DID
         #[arg(long)]
@@ -648,7 +648,7 @@ pub(crate) enum NodeRoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Deny a pending browser pairing request on an allowed peer
+    /// Deny a pending browser access request on an allowed peer
     Deny {
         /// Target runtime DID
         #[arg(long)]
@@ -799,7 +799,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List pending browser pairing requests for this room
+    /// List pending browser access requests for this room
     Pending {
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -868,7 +868,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Approve a pending browser pairing request
+    /// Approve a pending browser access request
     Approve {
         /// Pending request ID. Omit to approve the oldest pending request.
         request_id: Option<String>,
@@ -876,7 +876,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Deny a pending browser pairing request
+    /// Deny a pending browser access request
     Deny {
         /// Pending request ID. Omit to deny the oldest pending request.
         request_id: Option<String>,
@@ -887,7 +887,7 @@ pub(crate) enum RoomCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Start the local gateway focused on the room browser app
+    /// Start the local gateway focused on browser room access
     Open {
         /// Address to bind the room gateway to
         #[arg(short, long, default_value = "127.0.0.1:8090")]
@@ -1034,7 +1034,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Pc2 {
+    let command = cli.command.unwrap_or(Commands::Home {
         status: false,
         json: false,
     });
@@ -1094,8 +1094,8 @@ async fn main() -> anyhow::Result<()> {
             return chat_cmd::run_chat(nick, connect).await;
         }
 
-        Commands::Pc2 { status, json } => {
-            return pc2_cmd::run(status, json).await;
+        Commands::Home { status, json } => {
+            return home_cmd::run(status, json).await;
         }
 
         Commands::Agent {
@@ -1274,7 +1274,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Scaffold a new capsule project.
-use elastos_server::sources::{self, default_data_dir};
+use elastos_server::sources::default_data_dir;
 
 use elastos_server::shares::{verify_channel_head, ChannelStatus, ShareMeta};
 /// Print a welcome message on first run.

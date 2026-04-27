@@ -515,6 +515,7 @@ mod tests {
             name: "test".into(),
             description: None,
             author: None,
+            role: elastos_common::CapsuleRole::App,
             capsule_type: CapsuleType::Wasm,
             entrypoint: "missing.wasm".into(),
             requires: Vec::new(),

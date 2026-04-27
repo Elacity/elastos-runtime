@@ -4,14 +4,15 @@
 //! runtime-owned state (`MyWebSite`, `ElastOS/SystemServices/Publisher`, and
 //! `ElastOS/SystemServices/Edge`) plus read-only CID content.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::documents::DocumentsClient;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{
     header::{AUTHORIZATION, COOKIE, SET_COOKIE},
     HeaderMap, HeaderValue, StatusCode,
@@ -22,30 +23,40 @@ use axum::Json;
 use axum::Router;
 use base64::Engine as _;
 use elastos_common::localhost::{
-    edge_binding_path, edge_site_head_path, publisher_artifacts_path,
+    edge_binding_path, edge_site_head_path, my_website_root_path, publisher_artifacts_path,
     publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
-    rooted_localhost_fs_path, MY_WEBSITE_URI,
+    publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
+use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
 use elastos_runtime::provider::ProviderRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use url::form_urlencoded;
 
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
 const GATEWAY_VERSION: &str = env!("ELASTOS_VERSION");
 pub(crate) const ROOM_SESSION_COOKIE: &str = "room-session";
+pub(crate) const BROWSER_SESSION_COOKIE: &str = "browser-session";
+pub(crate) const HOME_SESSION_COOKIE: &str = "home-session";
 const ROOM_SYNC_CONSUMER_ID: &str = "room-sync";
+const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v1";
+const HOME_LAUNCH_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
+const DOCUMENTS_CAPSULE_ID: &str = "documents";
+const LIBRARY_CAPSULE_ID: &str = "library";
+const INBOX_CAPSULE_ID: &str = "inbox";
+const SYSTEM_CAPSULE_ID: &str = "system";
+const SYSTEM_ROUTE: &str = "/apps/system/";
+const CHAT_ROOM_CAPSULE_ID: &str = "chat-room";
+pub(crate) const HOME_CAPSULE_ID: &str = "home";
+const HOME_ROUTE: &str = "/apps/home/";
 
 #[derive(Clone)]
 pub struct GatewayState {
-    pub ipfs_provider_binary: Option<PathBuf>,
     pub provider_registry: Option<Arc<ProviderRegistry>>,
     pub cache_dir: PathBuf,
     /// Runtime data directory backing rooted Publisher/Edge/MyWebSite state.
     pub data_dir: PathBuf,
-    /// Cached ipfs-provider bridge (lazily initialized, reused across fetches).
-    pub ipfs_bridge: Arc<Mutex<Option<Arc<elastos_runtime::provider::ProviderBridge>>>>,
 }
 
 pub fn gateway_router(state: GatewayState) -> Router {
@@ -53,13 +64,14 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/", get(serve_public_root))
         .route("/healthz", get(healthz))
         .route(
-            "/api/browser/session/pair",
-            post(super::browser_sessions::browser_session_pair),
+            "/api/browser/session/request",
+            post(super::browser_sessions::browser_session_request),
         )
         .route(
-            "/api/browser/session/status",
-            post(super::browser_sessions::browser_session_status),
+            "/api/browser/session/request/:request_id",
+            get(super::browser_sessions::browser_session_request_status),
         )
+        .route("/api/provider/:scheme/:op", post(gateway_provider_proxy))
         .route("/release.json", get(serve_release_manifest))
         .route("/release-head.json", get(serve_release_head))
         .route("/install.sh", get(serve_install_script))
@@ -68,43 +80,114 @@ pub fn gateway_router(state: GatewayState) -> Router {
             get(serve_site_head_document),
         )
         .route("/artifacts/*path", get(serve_artifact_file))
-        .route("/api/apps/room-browser/summary", get(room_service_summary))
+        .route("/api/apps/system/summary", get(system_summary))
         .route(
-            "/api/apps/room-browser/session/leave",
+            "/api/apps/system/identity/handle",
+            post(system_handle_update),
+        )
+        .route(
+            "/api/apps/system/appearance/background-image",
+            post(system_background_image_update)
+                .delete(system_background_image_reset)
+                .layer(DefaultBodyLimit::max(
+                    HOME_BACKGROUND_IMAGE_TRANSPORT_MAX_BYTES,
+                )),
+        )
+        .route(
+            "/api/apps/system/appearance/background-overlay",
+            post(system_background_overlay_update),
+        )
+        .route("/api/apps/home/summary", get(home_summary))
+        .route(
+            "/api/apps/home/appearance/background-image",
+            get(home_background_image),
+        )
+        .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
+        .route("/api/apps/home/launch", post(home_launch))
+        .route("/api/apps/inbox/summary", get(inbox_summary))
+        .route("/api/apps/inbox/actions", post(inbox_action))
+        .route("/api/apps/chat-room/summary", get(chat_room_summary))
+        .route(
+            "/api/apps/chat-room/requests/:request_id/approve",
+            post(chat_room_request_approve),
+        )
+        .route(
+            "/api/apps/chat-room/requests/:request_id/deny",
+            post(chat_room_request_deny),
+        )
+        .route(
+            "/api/apps/chat-room/guests/:session_id/kick",
+            post(chat_room_guest_kick),
+        )
+        .route(
+            "/api/apps/chat-room/access-policy",
+            post(chat_room_access_policy_update),
+        )
+        .route(
+            "/api/apps/chat-room/members/invite",
+            post(chat_room_member_invite),
+        )
+        .route(
+            "/api/apps/chat-room/members/remove",
+            post(chat_room_member_remove),
+        )
+        .route(
+            "/api/apps/chat-room/invites/revoke",
+            post(chat_room_invite_revoke),
+        )
+        .route(
+            "/api/apps/chat-room/session/start",
+            post(chat_room_session_start),
+        )
+        .route(
+            "/api/apps/chat-room/session/leave",
             post(room_service_session_leave),
         )
-        .route("/api/apps/room-browser/poll", post(room_service_poll))
+        .route("/api/apps/chat-room/poll", post(room_service_poll))
         .route(
-            "/api/apps/room-browser/objects/send",
+            "/api/apps/chat-room/objects/send",
             post(room_service_objects_send),
         )
         .route(
-            "/api/apps/room-browser/upload/start",
+            "/api/apps/chat-room/upload/start",
             post(room_service_upload_start),
         )
         .route(
-            "/api/apps/room-browser/upload/:upload_id/chunk",
+            "/api/apps/chat-room/upload/:upload_id/chunk",
             post(room_service_upload_chunk),
         )
         .route(
-            "/api/apps/room-browser/upload/:upload_id/finish",
+            "/api/apps/chat-room/upload/:upload_id/finish",
             post(room_service_upload_finish),
         )
         .route(
-            "/api/apps/room-browser/attachments/:attachment_id",
+            "/api/apps/chat-room/attachments/:attachment_id",
             get(room_service_attachment_get),
         )
         .route(
+            "/api/viewers/:viewer/library",
+            get(super::viewer_gateway::viewer_library_summary),
+        )
+        .route(
+            "/api/viewers/:viewer/content/:capsule",
+            get(super::viewer_gateway::viewer_content),
+        )
+        .route(
+            "/api/viewers/:viewer/storage/:capsule/:scope/:name",
+            get(super::viewer_gateway::viewer_storage_get)
+                .put(super::viewer_gateway::viewer_storage_put),
+        )
+        .route(
             "/apps/:app",
-            get(super::browser_capsules::redirect_browser_capsule_root),
+            get(super::browser_capsules::serve_browser_app_root),
         )
         .route(
             "/apps/:app/",
-            get(super::browser_capsules::serve_browser_capsule_index),
+            get(super::browser_capsules::serve_browser_app_index),
         )
         .route(
             "/apps/:app/*path",
-            get(super::browser_capsules::serve_browser_capsule_asset),
+            get(super::browser_capsules::serve_browser_app_asset),
         )
         .route("/s/:cid", get(redirect_cid_root))
         .route("/s/:cid/", get(serve_cid_root))
@@ -260,6 +343,1795 @@ async fn landing_page() -> Html<String> {
     ))
 }
 
+#[derive(Serialize)]
+struct HomeSummaryResponse {
+    home: HomeRouteInfo,
+    app: HomeCapsuleIdentity,
+    identity: HomeIdentitySummary,
+    appearance: HomeAppearanceSummary,
+    runtime: HomeRuntimeSummary,
+    site: HomeSiteSummary,
+    room: HomeRoomSummary,
+    notifications: HomeNotificationsSummary,
+    targets: Vec<HomeTargetSummary>,
+}
+
+#[derive(Serialize)]
+struct HomeRouteInfo {
+    route: String,
+    attach_kind: String,
+}
+
+#[derive(Serialize)]
+struct HomeIdentitySummary {
+    device_did: Option<String>,
+    handle: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SystemHandleUpdateRequest {
+    handle: String,
+}
+
+#[derive(Deserialize)]
+struct SystemBackgroundOverlayRequest {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "home_background_overlay_opacity_default")]
+    opacity: f64,
+}
+
+#[derive(Serialize)]
+struct HomeCapsuleIdentity {
+    id: String,
+    route: String,
+}
+
+#[derive(Serialize)]
+struct SystemSummaryResponse {
+    identity: HomeIdentitySummary,
+    home: HomeCapsuleIdentity,
+    app: SystemCapsuleIdentity,
+    appearance: HomeAppearanceSummary,
+    runtime: HomeRuntimeSummary,
+    storage: SystemStorageSummary,
+    runtime_log: SystemRuntimeLogSummary,
+}
+
+#[derive(Serialize)]
+struct SystemCapsuleIdentity {
+    id: String,
+    route: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct HomeAppearanceSummary {
+    #[serde(default)]
+    background_image_url: Option<String>,
+    background_overlay_enabled: bool,
+    background_overlay_opacity: f64,
+}
+
+#[derive(Serialize)]
+struct InboxSummaryResponse {
+    app: HomeCapsuleIdentity,
+    notifications: HomeNotificationsSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct SystemStorageSummary {
+    available: bool,
+    #[serde(default)]
+    documents_count: usize,
+    #[serde(default)]
+    drafts_count: usize,
+    #[serde(default)]
+    published_count: usize,
+    #[serde(default)]
+    objects_root: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct SystemRuntimeLogSummary {
+    available: bool,
+    #[serde(default)]
+    total_in_memory: Option<usize>,
+    #[serde(default)]
+    current_epoch: Option<u64>,
+    #[serde(default)]
+    events: Vec<SystemRuntimeEventSummary>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SystemRuntimeEventSummary {
+    kind: String,
+    #[serde(default)]
+    at: Option<u64>,
+    summary: String,
+}
+
+const SYSTEM_RUNTIME_ACTIVITY_FETCH_LIMIT: usize = 32;
+const SYSTEM_RUNTIME_ACTIVITY_DISPLAY_LIMIT: usize = 4;
+const HOME_BACKGROUND_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const HOME_BACKGROUND_IMAGE_TRANSPORT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const HOME_BACKGROUND_OVERLAY_FILE: &str = "background-overlay.json";
+const HOME_BACKGROUND_OVERLAY_DEFAULT: bool = false;
+const HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT: f64 = 0.55;
+const HOME_BACKGROUND_OVERLAY_OPACITY_MAX: f64 = 0.8;
+const HOME_BACKGROUND_IMAGE_FILES: &[(&str, &str)] = &[
+    ("background-image.png", "image/png"),
+    ("background-image.jpg", "image/jpeg"),
+    ("background-image.webp", "image/webp"),
+    ("background-image.gif", "image/gif"),
+];
+
+#[derive(Debug, Clone, Default)]
+struct GatewayRuntimeLaunchOutcome {
+    status: String,
+    capsule_id: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GatewayRuntimeLaunchResponse {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayAuditLogResponse {
+    events: Vec<elastos_runtime::primitives::audit::AuditEvent>,
+    total_in_memory: usize,
+    current_epoch: u64,
+}
+
+#[derive(Default, Serialize)]
+struct HomeRuntimeSummary {
+    running: bool,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    api_url: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    running_capsules: Vec<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HomeSiteSummary {
+    staged: bool,
+    root_uri: String,
+    path: String,
+    #[serde(default)]
+    active_release: Option<String>,
+    #[serde(default)]
+    active_channel: Option<String>,
+    #[serde(default)]
+    active_bundle_cid: Option<String>,
+    release_count: usize,
+}
+
+impl Default for HomeSiteSummary {
+    fn default() -> Self {
+        Self {
+            staged: false,
+            root_uri: MY_WEBSITE_URI.to_string(),
+            path: String::new(),
+            active_release: None,
+            active_channel: None,
+            active_bundle_cid: None,
+            release_count: 0,
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct HomePendingRequestSummary {
+    request_id: String,
+    display_name: String,
+    device_label: String,
+    requested_at: u64,
+}
+
+#[derive(Default, Serialize)]
+struct HomeActiveSessionSummary {
+    display_name: String,
+    device_label: String,
+    approved_at: u64,
+    last_seen_at: u64,
+}
+
+#[derive(Serialize)]
+struct HomeRoomSummary {
+    room_slug: String,
+    title: String,
+    member_count: usize,
+    active_member_count: usize,
+    pending_count: usize,
+    active_session_count: usize,
+    #[serde(default)]
+    latest_request_name: Option<String>,
+    #[serde(default)]
+    latest_request_device: Option<String>,
+    #[serde(default)]
+    local_runtime_did: Option<String>,
+    #[serde(default)]
+    local_runtime_role: Option<String>,
+    #[serde(default)]
+    canonical_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    ephemeral_hosted_guest_url: Option<String>,
+    browser_access_allowed: bool,
+    #[serde(default)]
+    browser_access_block_reason: Option<String>,
+    #[serde(default)]
+    pending_requests: Vec<HomePendingRequestSummary>,
+    #[serde(default)]
+    active_sessions: Vec<HomeActiveSessionSummary>,
+}
+
+impl Default for HomeRoomSummary {
+    fn default() -> Self {
+        Self {
+            room_slug: crate::room_service::room_slug().to_string(),
+            title: String::new(),
+            member_count: 0,
+            active_member_count: 0,
+            pending_count: 0,
+            active_session_count: 0,
+            latest_request_name: None,
+            latest_request_device: None,
+            local_runtime_did: None,
+            local_runtime_role: None,
+            canonical_hosted_guest_url: None,
+            ephemeral_hosted_guest_url: None,
+            browser_access_allowed: true,
+            browser_access_block_reason: None,
+            pending_requests: Vec::new(),
+            active_sessions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct HomeNotificationsSummary {
+    unread_count: usize,
+    attention_count: usize,
+    #[serde(default)]
+    entries: Vec<HomeNotificationEntrySummary>,
+}
+
+#[derive(Default, Serialize)]
+struct HomeNotificationEntrySummary {
+    id: String,
+    source_app: String,
+    kind: String,
+    title: String,
+    body: String,
+    #[serde(default)]
+    action_ref: Option<HomeNotificationActionSummary>,
+    severity: String,
+    read: bool,
+    created_at: u64,
+}
+
+#[derive(Default, Serialize)]
+struct HomeNotificationActionSummary {
+    app: String,
+    action_id: String,
+}
+
+#[derive(Default)]
+struct HomeState {
+    site: HomeSiteSummary,
+    room: HomeRoomSummary,
+    notifications: HomeNotificationsSummary,
+}
+
+#[derive(Clone, Serialize)]
+struct HomeTargetSummary {
+    target: String,
+    title: String,
+    description: String,
+    route: String,
+    attach_kind: String,
+    role: CapsuleRole,
+    target_kind: HomeTargetKind,
+}
+
+#[derive(Deserialize)]
+struct HomeLaunchRequest {
+    target: String,
+    #[serde(default)]
+    query: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct InboxActionRequest {
+    action_id: String,
+}
+
+#[derive(Serialize)]
+struct InboxActionResponse {
+    message: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum HomeTargetKind {
+    App,
+    Object,
+}
+
+#[derive(Serialize)]
+struct HomeLaunchResponse {
+    target: String,
+    title: String,
+    route: String,
+    attach_kind: String,
+    role: CapsuleRole,
+    target_kind: HomeTargetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capsule_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HomeLaunchTokenPayload {
+    schema: String,
+    app: String,
+    exp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HomeLaunchTokenEnvelope {
+    payload: HomeLaunchTokenPayload,
+    signature: String,
+    signer_did: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRoomSessionStartResponse {
+    status: String,
+    display_name: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayRoomSummary {
+    room_slug: String,
+    pending_count: usize,
+    active_session_count: usize,
+    #[serde(default)]
+    latest_request_name: Option<String>,
+    #[serde(default)]
+    latest_request_device: Option<String>,
+    #[serde(default)]
+    active_participants: Vec<crate::room_service::ParticipantView>,
+    #[serde(default)]
+    pending_requests: Vec<crate::room_service::PendingRequestView>,
+    #[serde(default)]
+    active_sessions: Vec<GatewayActiveSessionSummary>,
+    #[serde(default)]
+    room_control: crate::room_service::RoomControlSummary,
+    #[serde(default)]
+    local_runtime_did: Option<String>,
+    #[serde(default)]
+    local_runtime_role: Option<crate::room_service::RoomRole>,
+    #[serde(default)]
+    canonical_hosted_guest_url: Option<String>,
+    #[serde(default)]
+    ephemeral_hosted_guest_url: Option<String>,
+    browser_access_allowed: bool,
+    #[serde(default)]
+    browser_access_block_reason: Option<String>,
+    #[serde(default)]
+    transport: crate::room_service::RoomTransportView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GatewayActiveSessionSummary {
+    session_id: String,
+    display_name: String,
+    device_label: String,
+    approved_at: u64,
+    expires_at: u64,
+    last_seen_at: u64,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    member_did: Option<String>,
+}
+
+impl From<crate::room_service::RoomSummary> for GatewayRoomSummary {
+    fn from(summary: crate::room_service::RoomSummary) -> Self {
+        Self {
+            room_slug: summary.room_slug,
+            pending_count: summary.pending_count,
+            active_session_count: summary.active_session_count,
+            latest_request_name: summary.latest_request_name,
+            latest_request_device: summary.latest_request_device,
+            active_participants: summary.active_participants,
+            pending_requests: summary.pending_requests,
+            active_sessions: summary
+                .active_sessions
+                .into_iter()
+                .map(GatewayActiveSessionSummary::from)
+                .collect(),
+            room_control: summary.room_control,
+            local_runtime_did: summary.local_runtime_did,
+            local_runtime_role: summary.local_runtime_role,
+            canonical_hosted_guest_url: summary.canonical_hosted_guest_url,
+            ephemeral_hosted_guest_url: summary.ephemeral_hosted_guest_url,
+            browser_access_allowed: summary.browser_access_allowed,
+            browser_access_block_reason: summary.browser_access_block_reason,
+            transport: summary.transport,
+        }
+    }
+}
+
+impl From<crate::room_service::ActiveSessionView> for GatewayActiveSessionSummary {
+    fn from(session: crate::room_service::ActiveSessionView) -> Self {
+        Self {
+            session_id: session.session_id,
+            display_name: session.display_name,
+            device_label: session.device_label,
+            approved_at: session.approved_at,
+            expires_at: session.expires_at,
+            last_seen_at: session.last_seen_at,
+            capabilities: session.capabilities,
+            member_did: session.member_did,
+        }
+    }
+}
+
+async fn home_summary(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_home_token(&state.data_dir, &headers) {
+        return home_error_response(err);
+    }
+
+    let identity = load_gateway_identity_summary(&state.data_dir);
+    let data_dir = state.data_dir.clone();
+    let (runtime, home_state) = tokio::join!(home_runtime_summary(&state.data_dir), async move {
+        tokio::task::spawn_blocking(move || home_state(&data_dir))
+            .await
+            .unwrap_or_default()
+    });
+
+    Json(HomeSummaryResponse {
+        home: HomeRouteInfo {
+            route: HOME_ROUTE.to_string(),
+            attach_kind: "iframe".to_string(),
+        },
+        app: HomeCapsuleIdentity {
+            id: HOME_CAPSULE_ID.to_string(),
+            route: HOME_ROUTE.to_string(),
+        },
+        identity,
+        appearance: home_appearance_summary(&state.data_dir),
+        runtime,
+        site: home_state.site,
+        room: home_state.room,
+        notifications: home_state.notifications,
+        targets: home_targets(&state.data_dir),
+    })
+    .into_response()
+}
+
+async fn home_runtime_ensure(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_home_token(&state.data_dir, &headers) {
+        return home_error_response(err);
+    }
+
+    Json(ensure_home_runtime(&state.data_dir).await).into_response()
+}
+
+async fn system_summary(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        return system_error_response(err);
+    }
+
+    let (runtime, storage, runtime_log) = tokio::join!(
+        home_runtime_summary(&state.data_dir),
+        system_storage_summary(state.provider_registry.as_ref().cloned()),
+        system_runtime_log(&state.data_dir)
+    );
+    Json(SystemSummaryResponse {
+        identity: load_gateway_identity_summary(&state.data_dir),
+        home: HomeCapsuleIdentity {
+            id: HOME_CAPSULE_ID.to_string(),
+            route: HOME_ROUTE.to_string(),
+        },
+        app: SystemCapsuleIdentity {
+            id: SYSTEM_CAPSULE_ID.to_string(),
+            route: SYSTEM_ROUTE.to_string(),
+        },
+        appearance: home_appearance_summary(&state.data_dir),
+        runtime,
+        storage,
+        runtime_log,
+    })
+    .into_response()
+}
+
+async fn system_storage_summary(
+    provider_registry: Option<Arc<ProviderRegistry>>,
+) -> SystemStorageSummary {
+    let Some(registry) = provider_registry else {
+        return SystemStorageSummary {
+            available: false,
+            note: Some("Document provider unavailable.".to_string()),
+            ..SystemStorageSummary::default()
+        };
+    };
+    match DocumentsClient::new(registry).summary().await {
+        Ok(documents) => {
+            let published_count = documents
+                .iter()
+                .filter(|item| {
+                    !item
+                        .latest_published_cid
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                })
+                .count();
+            let documents_count = documents.len();
+            SystemStorageSummary {
+                available: true,
+                documents_count,
+                drafts_count: documents_count.saturating_sub(published_count),
+                published_count,
+                objects_root: Some("localhost://ElastOS/Documents/".to_string()),
+                note: Some("Documents stay local until published.".to_string()),
+            }
+        }
+        Err(err) => SystemStorageSummary {
+            available: false,
+            note: Some(err.to_string()),
+            ..SystemStorageSummary::default()
+        },
+    }
+}
+
+fn home_appearance_summary(data_dir: &std::path::Path) -> HomeAppearanceSummary {
+    let (overlay_enabled, overlay_opacity) = home_background_overlay_settings(data_dir);
+    HomeAppearanceSummary {
+        background_image_url: home_background_image_entry(data_dir).map(
+            |(_path, _content_type, modified)| {
+                format!("/api/apps/home/appearance/background-image?v={modified}")
+            },
+        ),
+        background_overlay_enabled: overlay_enabled,
+        background_overlay_opacity: overlay_opacity,
+    }
+}
+
+fn home_appearance_root(data_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    rooted_localhost_fs_path(data_dir, "ElastOS/System/Appearance")
+        .ok_or_else(|| anyhow::anyhow!("invalid appearance root"))
+}
+
+fn home_background_image_entry(data_dir: &std::path::Path) -> Option<(PathBuf, &'static str, u64)> {
+    let root = home_appearance_root(data_dir).ok()?;
+    for (file_name, content_type) in HOME_BACKGROUND_IMAGE_FILES {
+        let path = root.join(file_name);
+        if !path.is_file() {
+            continue;
+        }
+        let modified = path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_else(now_ts);
+        return Some((path, *content_type, modified));
+    }
+    None
+}
+
+fn home_background_overlay_opacity_default() -> f64 {
+    HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT
+}
+
+fn home_clamp_background_overlay_opacity(opacity: f64) -> f64 {
+    if !opacity.is_finite() {
+        return HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT;
+    }
+    opacity.clamp(0.0, HOME_BACKGROUND_OVERLAY_OPACITY_MAX)
+}
+
+fn home_background_overlay_settings(data_dir: &std::path::Path) -> (bool, f64) {
+    let Ok(root) = home_appearance_root(data_dir) else {
+        return (
+            HOME_BACKGROUND_OVERLAY_DEFAULT,
+            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+        );
+    };
+    let path = root.join(HOME_BACKGROUND_OVERLAY_FILE);
+    if !path.is_file() {
+        return (
+            HOME_BACKGROUND_OVERLAY_DEFAULT,
+            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+        );
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return (
+            HOME_BACKGROUND_OVERLAY_DEFAULT,
+            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+        );
+    };
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (
+            HOME_BACKGROUND_OVERLAY_DEFAULT,
+            HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT,
+        );
+    };
+    let enabled = payload
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(HOME_BACKGROUND_OVERLAY_DEFAULT);
+    let opacity = payload
+        .get("opacity")
+        .and_then(|value| value.as_f64())
+        .map(home_clamp_background_overlay_opacity)
+        .unwrap_or(HOME_BACKGROUND_OVERLAY_OPACITY_DEFAULT);
+    (enabled, opacity)
+}
+
+fn home_save_background_overlay(
+    data_dir: &std::path::Path,
+    enabled: bool,
+    opacity: f64,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    let root = home_appearance_root(data_dir)?;
+    std::fs::create_dir_all(&root)?;
+    let payload = serde_json::json!({
+        "enabled": enabled,
+        "opacity": home_clamp_background_overlay_opacity(opacity),
+    });
+    std::fs::write(
+        root.join(HOME_BACKGROUND_OVERLAY_FILE),
+        serde_json::to_vec_pretty(&payload)?,
+    )?;
+    Ok(home_appearance_summary(data_dir))
+}
+
+fn home_save_background_image(
+    data_dir: &std::path::Path,
+    file_name: &'static str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    let root = home_appearance_root(data_dir)?;
+    std::fs::create_dir_all(&root)?;
+    remove_home_background_images(&root)?;
+    std::fs::write(root.join(file_name), bytes)?;
+    Ok(home_appearance_summary(data_dir))
+}
+
+fn home_reset_background_image(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<HomeAppearanceSummary> {
+    let root = home_appearance_root(data_dir)?;
+    remove_home_background_images(&root)?;
+    Ok(home_appearance_summary(data_dir))
+}
+
+fn remove_home_background_images(root: &std::path::Path) -> anyhow::Result<()> {
+    for (file_name, _content_type) in HOME_BACKGROUND_IMAGE_FILES {
+        let path = root.join(file_name);
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn parse_background_image_upload(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> anyhow::Result<(&'static str, Vec<u8>)> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+    let file_name = match content_type {
+        "image/png" => "background-image.png",
+        "image/jpeg" => "background-image.jpg",
+        "image/webp" => "background-image.webp",
+        "image/gif" => "background-image.gif",
+        _ => anyhow::bail!("background image must be PNG, JPEG, WebP, or GIF"),
+    };
+    if body.is_empty() {
+        anyhow::bail!("background image is empty");
+    }
+    if body.len() > HOME_BACKGROUND_IMAGE_MAX_BYTES {
+        anyhow::bail!("background image is larger than 5 MB");
+    }
+    Ok((file_name, body.to_vec()))
+}
+
+async fn system_handle_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<SystemHandleUpdateRequest>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        return system_error_response(err);
+    }
+
+    match elastos_identity::save_nickname(&state.data_dir, &req.handle) {
+        Ok(()) => Json(load_gateway_identity_summary(&state.data_dir)).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+async fn system_background_image_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        return system_error_response(err);
+    }
+
+    let upload = match parse_background_image_upload(&headers, &body) {
+        Ok(upload) => upload,
+        Err(err) => return system_error_response(err),
+    };
+
+    match home_save_background_image(&state.data_dir, upload.0, upload.1) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+async fn system_background_image_reset(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        return system_error_response(err);
+    }
+
+    match home_reset_background_image(&state.data_dir) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+async fn system_background_overlay_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<SystemBackgroundOverlayRequest>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+        return system_error_response(err);
+    }
+
+    match home_save_background_overlay(&state.data_dir, req.enabled, req.opacity) {
+        Ok(summary) => Json(summary).into_response(),
+        Err(err) => system_error_response(err),
+    }
+}
+
+async fn home_background_image(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_home_token(&state.data_dir, &headers) {
+        return home_error_response(err);
+    }
+
+    let Some((path, content_type, _modified)) = home_background_image_entry(&state.data_dir) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut response = bytes.into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static(content_type),
+            );
+            response
+        }
+        Err(err) => home_error_response(anyhow::anyhow!(err)),
+    }
+}
+
+async fn gateway_provider_proxy(
+    State(state): State<GatewayState>,
+    Path((scheme, op)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if scheme != "documents" {
+        return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response();
+    }
+    let allowed_apps: &[&str] = match op.as_str() {
+        "summary" | "get" => &[DOCUMENTS_CAPSULE_ID, LIBRARY_CAPSULE_ID],
+        _ => &[DOCUMENTS_CAPSULE_ID],
+    };
+    if let Err(err) = require_home_launch_token_for_any(&state.data_dir, &headers, allowed_apps) {
+        return documents_error_response(err);
+    }
+    let registry = match state.provider_registry.as_ref().cloned() {
+        Some(registry) => registry,
+        None => return documents_error_response(anyhow::anyhow!("documents provider unavailable")),
+    };
+    let mut request = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "provider request body must be a JSON object",
+                )
+                    .into_response();
+            }
+            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        }
+    };
+    request["op"] = serde_json::Value::String(op.clone());
+
+    let response = match registry.send_raw("documents", &request).await {
+        Ok(value) => value,
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "code": "provider_error",
+            "message": err.to_string(),
+        }),
+    };
+
+    Json(response).into_response()
+}
+
+async fn inbox_summary(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
+        return inbox_error_response(err);
+    }
+
+    let home_state = home_state(&state.data_dir);
+    Json(InboxSummaryResponse {
+        app: HomeCapsuleIdentity {
+            id: INBOX_CAPSULE_ID.to_string(),
+            route: "/apps/inbox/".to_string(),
+        },
+        notifications: home_state.notifications,
+    })
+    .into_response()
+}
+
+async fn inbox_action(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
+        return inbox_error_response(err);
+    }
+
+    match parse_inbox_action_request(&headers, &body)
+        .map_err(anyhow::Error::msg)
+        .and_then(|req| dispatch_inbox_action(&state.data_dir, &req.action_id))
+    {
+        Ok(message) => Json(InboxActionResponse { message }).into_response(),
+        Err(err) => inbox_error_response(err),
+    }
+}
+
+fn parse_inbox_action_request(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<InboxActionRequest, String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if content_type.starts_with("application/json") {
+        serde_json::from_slice(body).map_err(|err| format!("invalid inbox action body: {err}"))
+    } else if content_type.starts_with("application/x-www-form-urlencoded") {
+        let action_id = form_urlencoded::parse(body.as_ref())
+            .find_map(|(key, value)| (key == "action_id").then(|| value.into_owned()))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "missing action_id".to_string())?;
+        Ok(InboxActionRequest { action_id })
+    } else {
+        Err("unsupported inbox action content type".to_string())
+    }
+}
+
+fn dispatch_inbox_action(data_dir: &std::path::Path, action_id: &str) -> anyhow::Result<String> {
+    if let Some(notification_id) = action_id.strip_prefix("notification-read:") {
+        return Ok(
+            match crate::notifications::mark_read(data_dir, notification_id)? {
+                true => "Marked inbox entry read.".to_string(),
+                false => "That inbox entry was already read or is no longer present.".to_string(),
+            },
+        );
+    }
+    if let Some(notification_id) = action_id.strip_prefix("notification-dismiss:") {
+        return Ok(
+            match crate::notifications::dismiss(data_dir, notification_id)? {
+                true => "Dismissed inbox entry.".to_string(),
+                false => "That inbox entry is already gone.".to_string(),
+            },
+        );
+    }
+    if let Some(request_id) = action_id.strip_prefix("room-approve-request:") {
+        let message = match crate::room_service::approve_request(data_dir, request_id)? {
+            Some(outcome) => format!(
+                "Approved Chat Room browser access for {} on {}.",
+                outcome.display_name, outcome.device_label
+            ),
+            None => "That browser access request is no longer pending.".to_string(),
+        };
+        let summary = crate::room_service::load_summary(data_dir)?;
+        let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok(message);
+    }
+    if let Some(request_id) = action_id.strip_prefix("room-deny-request:") {
+        let message =
+            match crate::room_service::deny_request(data_dir, request_id, "Denied from Inbox.")? {
+                Some(outcome) => format!(
+                    "Denied Chat Room browser access for {} on {}.",
+                    outcome.display_name, outcome.device_label
+                ),
+                None => "That browser access request is no longer pending.".to_string(),
+            };
+        let summary = crate::room_service::load_summary(data_dir)?;
+        let _ = crate::notifications::sync_room_notifications(data_dir, &summary);
+        let _ = crate::notifications::mark_acted_for_action(data_dir, action_id);
+        return Ok(message);
+    }
+    anyhow::bail!("unknown inbox action");
+}
+
+async fn home_launch(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<HomeLaunchRequest>,
+) -> Result<Json<HomeLaunchResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if let Err(err) = require_home_token(&state.data_dir, &headers) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        ));
+    }
+
+    let target = req.target.trim();
+    if target.is_empty() || target == HOME_CAPSULE_ID {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid Home target" })),
+        ));
+    }
+
+    let Some(target_summary) = home_targets(&state.data_dir)
+        .into_iter()
+        .find(|candidate| candidate.target == target)
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Home target not found" })),
+        ));
+    };
+
+    let launch =
+        launch_runtime_backed_home_target(&state.data_dir, target_summary.target.as_str()).await;
+    let route = append_home_launch_token(
+        &state.data_dir,
+        &target_summary.route,
+        target_summary.target.as_str(),
+        &req.query,
+    )
+    .map_err(gateway_internal_error)?;
+
+    Ok(Json(HomeLaunchResponse {
+        target: target_summary.target,
+        title: target_summary.title,
+        route,
+        attach_kind: target_summary.attach_kind,
+        role: target_summary.role,
+        target_kind: target_summary.target_kind,
+        launch_status: launch.as_ref().map(|summary| summary.status.clone()),
+        launch_detail: launch.as_ref().and_then(|summary| summary.detail.clone()),
+        capsule_id: launch.and_then(|summary| summary.capsule_id),
+    }))
+}
+
+fn append_home_launch_token(
+    data_dir: &std::path::Path,
+    route: &str,
+    target: &str,
+    query: &BTreeMap<String, String>,
+) -> anyhow::Result<String> {
+    let token = issue_home_launch_token(data_dir, target)?;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("home_token", &token);
+    for (key, value) in query {
+        if key.trim().is_empty() {
+            continue;
+        }
+        serializer.append_pair(key, value);
+    }
+    let encoded = serializer.finish();
+    let separator = if route.contains('?') { '&' } else { '?' };
+    Ok(format!("{route}{separator}{encoded}"))
+}
+
+fn home_targets(data_dir: &std::path::Path) -> Vec<HomeTargetSummary> {
+    let mut targets: Vec<_> = super::browser_capsules::list_launchable_browser_capsules(data_dir)
+        .into_iter()
+        .filter(|app| app.name != HOME_CAPSULE_ID)
+        .map(|app| {
+            let target_kind = home_target_kind(&app.name);
+            HomeTargetSummary {
+                route: format!("/apps/{}/", app.name),
+                title: app_shell_title(&app.name),
+                description: app_shell_description(&app.name, app.description),
+                target: app.name,
+                attach_kind: "iframe".to_string(),
+                role: app.role,
+                target_kind,
+            }
+        })
+        .collect();
+    targets.extend(
+        super::browser_capsules::list_all_viewer_bound_capsules(data_dir)
+            .into_iter()
+            .map(|capsule| HomeTargetSummary {
+                route: format!("/apps/{}/?capsule={}", capsule.viewer, capsule.name),
+                title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
+                description: viewer_object_shell_description(
+                    &capsule.viewer,
+                    capsule.description.as_deref(),
+                ),
+                target: capsule.name,
+                attach_kind: "iframe".to_string(),
+                role: CapsuleRole::Content,
+                target_kind: HomeTargetKind::Object,
+            }),
+    );
+    targets.sort_by(|left, right| left.title.cmp(&right.title));
+    targets
+}
+
+fn home_target_kind(name: &str) -> HomeTargetKind {
+    match name {
+        LIBRARY_CAPSULE_ID => HomeTargetKind::Object,
+        _ => HomeTargetKind::App,
+    }
+}
+
+fn load_gateway_identity_summary(data_dir: &std::path::Path) -> HomeIdentitySummary {
+    let device_did = elastos_identity::load_or_create_did(data_dir)
+        .ok()
+        .map(|(_, did)| did)
+        .filter(|did| !did.trim().is_empty());
+    let handle = elastos_identity::load_nickname(data_dir)
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
+
+    HomeIdentitySummary { device_did, handle }
+}
+
+fn apply_room_access(
+    summary: &mut crate::room_service::RoomSummary,
+    access: crate::room_service::LocalRuntimeAccess,
+) {
+    summary.local_runtime_did = access.runtime_did;
+    summary.local_runtime_role = access.member_role;
+    summary.browser_access_allowed = access.browser_access_allowed;
+    summary.browser_access_block_reason = access.block_reason;
+}
+
+async fn launch_runtime_backed_home_target(
+    data_dir: &FsPath,
+    target: &str,
+) -> Option<GatewayRuntimeLaunchOutcome> {
+    let capsule_dir = resolve_capsule_dir(data_dir, target)?;
+    let manifest = load_capsule_manifest(&capsule_dir, target)?;
+    if !manifest.role.is_shell_launchable() || manifest.capsule_type == CapsuleType::Data {
+        return None;
+    }
+
+    Some(match launch_runtime_capsule(data_dir, &capsule_dir).await {
+        Ok(outcome) => outcome,
+        Err(err) => GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some(err.to_string()),
+        },
+    })
+}
+
+async fn launch_runtime_capsule(
+    data_dir: &FsPath,
+    capsule_dir: &FsPath,
+) -> anyhow::Result<GatewayRuntimeLaunchOutcome> {
+    let coords = load_live_runtime_coords(data_dir)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("local runtime is not running"))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let home_token =
+        gateway_attach_runtime_token(&client, &coords.api_url, &coords.attach_secret, "shell")
+            .await?;
+    let response = client
+        .post(format!("{}/api/capsules", coords.api_url))
+        .header(AUTHORIZATION, format!("Bearer {home_token}"))
+        .json(&serde_json::json!({
+            "path": capsule_dir.display().to_string(),
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("runtime launch failed ({}): {}", status, text.trim());
+    }
+    let payload = response.json::<GatewayRuntimeLaunchResponse>().await?;
+    Ok(GatewayRuntimeLaunchOutcome {
+        status: "launched".to_string(),
+        capsule_id: Some(payload.id),
+        detail: None,
+    })
+}
+
+async fn system_runtime_log(data_dir: &FsPath) -> SystemRuntimeLogSummary {
+    let Some(coords) = load_live_runtime_coords(data_dir).await else {
+        return SystemRuntimeLogSummary {
+            available: false,
+            total_in_memory: None,
+            current_epoch: None,
+            events: Vec::new(),
+            note: Some("Local runtime is not running.".to_string()),
+        };
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return SystemRuntimeLogSummary {
+                available: false,
+                total_in_memory: None,
+                current_epoch: None,
+                events: Vec::new(),
+                note: Some(format!("Runtime client unavailable: {err}")),
+            }
+        }
+    };
+
+    let home_token = match gateway_attach_runtime_token(
+        &client,
+        &coords.api_url,
+        &coords.attach_secret,
+        "shell",
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            return SystemRuntimeLogSummary {
+                available: false,
+                total_in_memory: None,
+                current_epoch: None,
+                events: Vec::new(),
+                note: Some(format!("Runtime attach failed: {err}")),
+            }
+        }
+    };
+
+    let response = match client
+        .get(format!(
+            "{}/api/audit?limit={}",
+            coords.api_url, SYSTEM_RUNTIME_ACTIVITY_FETCH_LIMIT
+        ))
+        .header(AUTHORIZATION, format!("Bearer {home_token}"))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return SystemRuntimeLogSummary {
+                available: false,
+                total_in_memory: None,
+                current_epoch: None,
+                events: Vec::new(),
+                note: Some(format!("Runtime log unavailable: {err}")),
+            }
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return SystemRuntimeLogSummary {
+            available: false,
+            total_in_memory: None,
+            current_epoch: None,
+            events: Vec::new(),
+            note: Some(format!(
+                "Runtime log unavailable ({}): {}",
+                status,
+                text.trim()
+            )),
+        };
+    }
+
+    let payload = match response.json::<GatewayAuditLogResponse>().await {
+        Ok(payload) => payload,
+        Err(err) => {
+            return SystemRuntimeLogSummary {
+                available: false,
+                total_in_memory: None,
+                current_epoch: None,
+                events: Vec::new(),
+                note: Some(format!("Runtime log could not be decoded: {err}")),
+            }
+        }
+    };
+
+    SystemRuntimeLogSummary {
+        available: true,
+        total_in_memory: Some(payload.total_in_memory),
+        current_epoch: Some(payload.current_epoch),
+        events: system_runtime_activity_summaries(payload.events),
+        note: None,
+    }
+}
+
+fn system_runtime_activity_summaries(
+    events: Vec<elastos_runtime::primitives::audit::AuditEvent>,
+) -> Vec<SystemRuntimeEventSummary> {
+    let mut summaries = events
+        .into_iter()
+        .filter_map(system_runtime_event_summary)
+        .collect::<Vec<_>>();
+    summaries.sort_by_key(|event| std::cmp::Reverse(event.at.unwrap_or_default()));
+    summaries.truncate(SYSTEM_RUNTIME_ACTIVITY_DISPLAY_LIMIT);
+    summaries
+}
+
+fn system_runtime_event_summary(
+    event: elastos_runtime::primitives::audit::AuditEvent,
+) -> Option<SystemRuntimeEventSummary> {
+    use elastos_runtime::primitives::audit::{AuditEvent, StopReason};
+
+    let kind = event.event_type_name().to_string();
+    let at = match &event {
+        AuditEvent::RuntimeStart { timestamp, .. }
+        | AuditEvent::RuntimeStop { timestamp }
+        | AuditEvent::CapsuleLaunch { timestamp, .. }
+        | AuditEvent::CapsuleStop { timestamp, .. }
+        | AuditEvent::CapabilityGrant { timestamp, .. }
+        | AuditEvent::CapabilityRevoke { timestamp, .. }
+        | AuditEvent::CapabilityUse { timestamp, .. }
+        | AuditEvent::ContentFetch { timestamp, .. }
+        | AuditEvent::AuthAttempt { timestamp, .. }
+        | AuditEvent::EpochAdvance { timestamp, .. }
+        | AuditEvent::ConfigChange { timestamp, .. }
+        | AuditEvent::SecurityWarning { timestamp, .. }
+        | AuditEvent::SessionCreated { timestamp, .. }
+        | AuditEvent::SessionDestroyed { timestamp, .. }
+        | AuditEvent::CapabilityRequested { timestamp, .. }
+        | AuditEvent::CapabilityDenied { timestamp, .. }
+        | AuditEvent::IdentityRegistered { timestamp, .. }
+        | AuditEvent::StorageAccess { timestamp, .. }
+        | AuditEvent::MessageSent { timestamp, .. }
+        | AuditEvent::PolicyProposal { timestamp, .. }
+        | AuditEvent::PolicyDecisionMade { timestamp, .. }
+        | AuditEvent::PolicyDivergence { timestamp, .. } => Some(timestamp.unix_secs),
+        AuditEvent::Custom { .. } => None,
+    };
+
+    let summary = match event {
+        AuditEvent::RuntimeStart { version, .. } => format!("Runtime started ({version})"),
+        AuditEvent::RuntimeStop { .. } => "Runtime stopped".to_string(),
+        AuditEvent::CapsuleLaunch { capsule_name, .. } => {
+            format!("Opened {capsule_name}")
+        }
+        AuditEvent::CapsuleStop {
+            capsule_id, reason, ..
+        } => match reason {
+            StopReason::Requested | StopReason::Completed => {
+                format!("Stopped {capsule_id}")
+            }
+            StopReason::Error(detail) => format!("Stopped {capsule_id} — error: {detail}"),
+            StopReason::ResourceLimit(detail) => {
+                format!("Stopped {capsule_id} — resource limit: {detail}")
+            }
+            StopReason::SecurityViolation(detail) => {
+                format!("Stopped {capsule_id} — security violation: {detail}")
+            }
+        },
+        AuditEvent::CapabilityGrant { .. } => return None,
+        AuditEvent::CapabilityRevoke { reason, .. } => format!("Capability revoked — {reason}"),
+        AuditEvent::CapabilityUse { .. } => return None,
+        AuditEvent::ContentFetch { cid, success, .. } => {
+            if success {
+                return None;
+            }
+            format!("Content fetch failed — {cid}")
+        }
+        AuditEvent::AuthAttempt {
+            identity,
+            success,
+            method,
+            ..
+        } => {
+            if success {
+                return None;
+            }
+            format!("Authentication failed for {identity} via {method}")
+        }
+        AuditEvent::EpochAdvance {
+            new_epoch, reason, ..
+        } => format!("Capability epoch advanced to {new_epoch} — {reason}"),
+        AuditEvent::ConfigChange { setting, .. } => format!("Changed {setting}"),
+        AuditEvent::SecurityWarning {
+            warning_type,
+            details,
+            ..
+        } => format!("Security warning — {warning_type}: {details}"),
+        AuditEvent::SessionCreated { .. } => return None,
+        AuditEvent::SessionDestroyed { .. } => return None,
+        AuditEvent::CapabilityRequested { .. } => return None,
+        AuditEvent::CapabilityDenied { reason, .. } => format!("Capability denied — {reason}"),
+        AuditEvent::IdentityRegistered {
+            user_id, method, ..
+        } => format!("Registered identity {user_id} via {method}"),
+        AuditEvent::StorageAccess {
+            uri,
+            action,
+            success,
+            ..
+        } => {
+            if success {
+                return None;
+            }
+            format!("Storage access failed — {action} {uri}")
+        }
+        AuditEvent::MessageSent { .. } => return None,
+        AuditEvent::PolicyProposal { .. } => return None,
+        AuditEvent::PolicyDecisionMade { .. } => return None,
+        AuditEvent::PolicyDivergence {
+            real_outcome,
+            shadow_outcome,
+            ..
+        } => format!("Policy divergence — real {real_outcome}, shadow {shadow_outcome}"),
+        AuditEvent::Custom { event_type, .. } => format!("Custom event — {event_type}"),
+    };
+
+    Some(SystemRuntimeEventSummary { kind, at, summary })
+}
+
+fn resolve_capsule_dir(data_dir: &FsPath, app: &str) -> Option<PathBuf> {
+    for candidate in super::browser_capsules::capsule_dir_candidates(data_dir, app) {
+        if let Some(manifest) = load_capsule_manifest(&candidate, app) {
+            if manifest.name == app {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn load_capsule_manifest(dir: &FsPath, expected_name: &str) -> Option<CapsuleManifest> {
+    let manifest_path = dir.join("capsule.json");
+    if !manifest_path.is_file() {
+        return None;
+    }
+    let Ok(bytes) = std::fs::read(&manifest_path) else {
+        return None;
+    };
+    let Ok(manifest) = serde_json::from_slice::<CapsuleManifest>(&bytes) else {
+        return None;
+    };
+    if manifest.validate().is_ok() && manifest.name == expected_name {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
+fn now_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn title_case_capsule_name(name: &str) -> String {
+    name.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn app_shell_title(name: &str) -> String {
+    match name {
+        DOCUMENTS_CAPSULE_ID => "Documents".to_string(),
+        CHAT_ROOM_CAPSULE_ID => "Chat Room".to_string(),
+        LIBRARY_CAPSULE_ID => "Library".to_string(),
+        INBOX_CAPSULE_ID => "Inbox".to_string(),
+        SYSTEM_CAPSULE_ID => "System".to_string(),
+        "gba-emulator" => "GBA Emulator".to_string(),
+        _ => title_case_capsule_name(name),
+    }
+}
+
+fn app_shell_description(name: &str, manifest_description: Option<String>) -> String {
+    match name {
+        DOCUMENTS_CAPSULE_ID => {
+            "Create, edit, and publish markdown documents from this device.".to_string()
+        }
+        CHAT_ROOM_CAPSULE_ID => {
+            "Open the local sovereign room from this runtime inside ElastOS.".to_string()
+        }
+        LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
+        INBOX_CAPSULE_ID => "Review requests and approvals for this Home.".to_string(),
+        SYSTEM_CAPSULE_ID => {
+            "Open System to view this device identity and runtime state.".to_string()
+        }
+        "gba-emulator" => "Launch the browser-based mGBA frontend.".to_string(),
+        _ => manifest_description
+            .unwrap_or_else(|| format!("Open {} from Home.", app_shell_title(name))),
+    }
+}
+
+pub(super) fn viewer_object_shell_title(name: &str, description: Option<&str>) -> String {
+    let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) else {
+        return title_case_capsule_name(name);
+    };
+    for separator in [" - ", " — ", ": "] {
+        if let Some((title, _)) = description.split_once(separator) {
+            let title = title.trim();
+            if !title.is_empty() && title.len() <= 48 {
+                return title.to_string();
+            }
+        }
+    }
+    title_case_capsule_name(name)
+}
+
+pub(super) fn viewer_object_shell_description(viewer: &str, description: Option<&str>) -> String {
+    description
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("Open this object in {}.", app_shell_title(viewer)))
+}
+
+fn home_state(data_dir: &std::path::Path) -> HomeState {
+    let site = home_site_summary(data_dir);
+
+    let identity = room_service_runtime_identity_profile(data_dir);
+    let mut room_summary = crate::room_service::load_summary(data_dir).unwrap_or_default();
+    if let Ok(hosted) = crate::browser_app_hosts::load_browser_app_hosted_endpoint(
+        data_dir,
+        crate::room_service::room_slug(),
+    ) {
+        room_summary.canonical_hosted_guest_url = hosted.canonical_url;
+        room_summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
+    }
+    if let Ok(access) = crate::room_service::local_runtime_access(data_dir, identity.did.as_deref())
+    {
+        apply_room_access(&mut room_summary, access);
+    }
+    let _ = crate::notifications::sync_room_notifications(data_dir, &room_summary);
+    let notifications = crate::notifications::load_summary(data_dir).unwrap_or_default();
+
+    HomeState {
+        site,
+        room: home_room_summary(room_summary),
+        notifications: home_notifications_summary(notifications),
+    }
+}
+
+fn home_site_summary(data_dir: &std::path::Path) -> HomeSiteSummary {
+    let site_root = my_website_root_path(data_dir);
+    let active_head = std::fs::read(edge_site_head_path(data_dir, MY_WEBSITE_URI))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SiteHeadEnvelope>(&bytes).ok());
+    let release_count = std::fs::read_dir(publisher_site_releases_dir(data_dir, MY_WEBSITE_URI))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+
+    HomeSiteSummary {
+        staged: site_root.join("index.html").exists(),
+        root_uri: MY_WEBSITE_URI.to_string(),
+        path: site_root.display().to_string(),
+        active_release: active_head
+            .as_ref()
+            .and_then(|head| head.payload.release_name.clone()),
+        active_channel: active_head
+            .as_ref()
+            .and_then(|head| head.payload.channel_name.clone()),
+        active_bundle_cid: active_head
+            .as_ref()
+            .and_then(|head| head.payload.bundle_cid.clone()),
+        release_count,
+    }
+}
+
+fn home_room_summary(summary: crate::room_service::RoomSummary) -> HomeRoomSummary {
+    HomeRoomSummary {
+        room_slug: summary.room_slug,
+        title: summary.room_control.title,
+        member_count: summary.room_control.member_count,
+        active_member_count: summary.room_control.active_member_count,
+        pending_count: summary.pending_count,
+        active_session_count: summary.active_session_count,
+        latest_request_name: summary.latest_request_name,
+        latest_request_device: summary.latest_request_device,
+        local_runtime_did: summary.local_runtime_did,
+        local_runtime_role: summary.local_runtime_role.map(home_room_role_label),
+        canonical_hosted_guest_url: summary.canonical_hosted_guest_url,
+        ephemeral_hosted_guest_url: summary.ephemeral_hosted_guest_url,
+        browser_access_allowed: summary.browser_access_allowed,
+        browser_access_block_reason: summary.browser_access_block_reason,
+        pending_requests: summary
+            .pending_requests
+            .into_iter()
+            .map(|request| HomePendingRequestSummary {
+                request_id: request.request_id,
+                display_name: request.display_name,
+                device_label: request.device_label,
+                requested_at: request.requested_at,
+            })
+            .collect(),
+        active_sessions: summary
+            .active_sessions
+            .into_iter()
+            .map(|session| HomeActiveSessionSummary {
+                display_name: session.display_name,
+                device_label: session.device_label,
+                approved_at: session.approved_at,
+                last_seen_at: session.last_seen_at,
+            })
+            .collect(),
+    }
+}
+
+fn home_room_role_label(role: crate::room_service::RoomRole) -> String {
+    match role {
+        crate::room_service::RoomRole::Owner => "owner",
+        crate::room_service::RoomRole::Admin => "admin",
+        crate::room_service::RoomRole::Member => "member",
+    }
+    .to_string()
+}
+
+fn home_notifications_summary(
+    summary: crate::notifications::NotificationSummary,
+) -> HomeNotificationsSummary {
+    HomeNotificationsSummary {
+        unread_count: summary.unread_count,
+        attention_count: summary.attention_count,
+        entries: summary
+            .entries
+            .into_iter()
+            .map(|entry| HomeNotificationEntrySummary {
+                id: entry.id,
+                source_app: entry.source_app,
+                kind: entry.kind,
+                title: entry.title,
+                body: entry.body,
+                action_ref: entry
+                    .action_ref
+                    .map(|action_ref| HomeNotificationActionSummary {
+                        app: action_ref.app,
+                        action_id: action_ref.action_id,
+                    }),
+                severity: home_notification_severity(entry.severity).to_string(),
+                read: entry.read,
+                created_at: entry.created_at,
+            })
+            .collect(),
+    }
+}
+
+fn home_notification_severity(
+    severity: crate::notifications::NotificationSeverity,
+) -> &'static str {
+    match severity {
+        crate::notifications::NotificationSeverity::Info => "info",
+        crate::notifications::NotificationSeverity::Attention => "attention",
+        crate::notifications::NotificationSeverity::Critical => "critical",
+    }
+}
+
+#[derive(Deserialize)]
+struct HomeAttachResponse {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct HomeCapsulesResponse {
+    capsules: Vec<HomeCapsuleInfo>,
+}
+
+#[derive(Deserialize)]
+struct HomeCapsuleInfo {
+    name: String,
+}
+
+async fn home_runtime_summary(data_dir: &std::path::Path) -> HomeRuntimeSummary {
+    let Some(coords) = load_live_runtime_coords(data_dir).await else {
+        return HomeRuntimeSummary {
+            running: false,
+            note: Some("No active local runtime".to_string()),
+            ..HomeRuntimeSummary::default()
+        };
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return HomeRuntimeSummary {
+                running: true,
+                kind: Some(coords.runtime_kind.clone()),
+                api_url: Some(coords.api_url.clone()),
+                pid: Some(coords.pid),
+                note: Some(format!("Runtime client unavailable: {err}")),
+                ..HomeRuntimeSummary::default()
+            };
+        }
+    };
+
+    let mut runtime = HomeRuntimeSummary {
+        running: true,
+        kind: Some(coords.runtime_kind.clone()),
+        version: home_fetch_runtime_version(&client, &coords.api_url).await,
+        api_url: Some(coords.api_url.clone()),
+        pid: Some(coords.pid),
+        running_capsules: Vec::new(),
+        note: None,
+    };
+
+    let home_token = match home_attach_shell(&client, &coords.api_url, &coords.attach_secret).await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            runtime.note = Some(format!("Runtime attach failed: {err}"));
+            return runtime;
+        }
+    };
+
+    match home_list_runtime_capsules(&client, &coords.api_url, &home_token).await {
+        Ok(capsules) => runtime.running_capsules = capsules,
+        Err(err) => {
+            runtime.note = Some(format!(
+                "Runtime attached, but capsule list is unavailable: {err}"
+            ))
+        }
+    }
+
+    runtime
+}
+
+async fn ensure_home_runtime(data_dir: &std::path::Path) -> HomeRuntimeSummary {
+    match crate::runtime_control::ensure_runtime_for_home(data_dir).await {
+        Ok(_) => home_runtime_summary(data_dir).await,
+        Err(err) => HomeRuntimeSummary {
+            running: false,
+            note: Some(format!("Managed local runtime could not start: {err}")),
+            ..HomeRuntimeSummary::default()
+        },
+    }
+}
+
+async fn load_live_runtime_coords(
+    data_dir: &std::path::Path,
+) -> Option<crate::runtime_control::RuntimeCoords> {
+    let path = crate::runtime_control::runtime_coord_path(data_dir);
+    crate::runtime_control::read_runtime_coords(&path).await
+}
+
+async fn home_fetch_runtime_version(client: &reqwest::Client, api_url: &str) -> Option<String> {
+    client
+        .get(format!("{}/api/health", api_url))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?
+        .get("version")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+async fn home_attach_shell(
+    client: &reqwest::Client,
+    api_url: &str,
+    attach_secret: &str,
+) -> anyhow::Result<String> {
+    gateway_attach_runtime_token(client, api_url, attach_secret, "shell").await
+}
+
+async fn gateway_attach_runtime_token(
+    client: &reqwest::Client,
+    api_url: &str,
+    attach_secret: &str,
+    scope: &str,
+) -> anyhow::Result<String> {
+    Ok(client
+        .post(format!("{}/api/auth/attach", api_url))
+        .json(&serde_json::json!({
+            "secret": attach_secret,
+            "scope": scope,
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<HomeAttachResponse>()
+        .await?
+        .token)
+}
+
+async fn home_list_runtime_capsules(
+    client: &reqwest::Client,
+    api_url: &str,
+    home_token: &str,
+) -> anyhow::Result<Vec<String>> {
+    let response = client
+        .get(format!("{}/api/capsules", api_url))
+        .header(AUTHORIZATION, format!("Bearer {home_token}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<HomeCapsulesResponse>()
+        .await?;
+    let mut names = response
+        .capsules
+        .into_iter()
+        .map(|capsule| capsule.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
 #[derive(Debug, Deserialize)]
 struct EdgeBinding {
     target: String,
@@ -305,6 +2177,37 @@ struct RoomSendBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChatRoomAccessPolicyBody {
+    allow_guest_invites: bool,
+    allow_member_invites: bool,
+    allow_members_to_host_guests: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRoomMemberInviteBody {
+    member_did: String,
+    #[serde(default)]
+    role: Option<crate::room_service::RoomRole>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRoomMemberRemoveBody {
+    member_did: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRoomInviteRevokeBody {
+    invite_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRoomGuestKickResponse {
+    status: String,
+    display_name: String,
+    device_label: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RoomUploadStartBody {
     file_name: String,
     #[serde(default)]
@@ -326,36 +2229,265 @@ async fn serve_public_root(State(state): State<GatewayState>, headers: HeaderMap
 
 async fn room_service_summary(State(state): State<GatewayState>) -> Response {
     let data_dir = state.data_dir.clone();
-    let identity = tokio::task::spawn_blocking({
-        let data_dir = data_dir.clone();
-        move || room_service_runtime_identity_profile(&data_dir)
-    })
-    .await;
-    let summary_result = tokio::task::spawn_blocking(move || {
-        let mut summary = crate::room_service::load_summary(&data_dir)?;
-        let hosted = crate::browser_app_hosts::load_browser_app_hosted_endpoint(
-            &data_dir,
-            crate::room_service::room_slug(),
-        )?;
-        let identity: GatewayIdentityProfile = identity.unwrap_or_default();
-        summary.canonical_hosted_guest_url = hosted.canonical_url;
-        summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
-        let access = crate::room_service::local_runtime_access(&data_dir, identity.did.as_deref())?;
-        summary.local_runtime_did = access.runtime_did;
-        summary.local_runtime_role = access.member_role;
-        summary.pairing_allowed = access.pairing_allowed;
-        summary.pairing_block_reason = access.block_reason;
-        Ok::<_, anyhow::Error>(summary)
-    })
-    .await;
+    let summary_result =
+        tokio::task::spawn_blocking(move || load_room_summary_with_identity(&data_dir)).await;
     match summary_result {
         Ok(Ok(mut summary)) => {
             summary.transport = room_transport_view(&state, None).await;
-            Json(summary).into_response()
+            Json(GatewayRoomSummary::from(summary)).into_response()
         }
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
     }
+}
+
+async fn chat_room_summary(State(state): State<GatewayState>) -> Response {
+    room_service_summary(State(state)).await
+}
+
+async fn chat_room_session_start(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let secure = request_uses_tls(&headers);
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || start_chat_room_session(&data_dir)).await {
+        Ok(Ok(output)) => {
+            let mut response = Json(ChatRoomSessionStartResponse {
+                status: "connected".to_string(),
+                display_name: output.display_name,
+                expires_at: output.expires_at,
+            })
+            .into_response();
+            match set_room_session_cookie_header(&output.token, output.max_age_secs, secure) {
+                Ok(cookie) => {
+                    response.headers_mut().append(SET_COOKIE, cookie);
+                    response
+                }
+                Err(err) => room_service_error_response(err),
+            }
+        }
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_request_approve(
+    State(state): State<GatewayState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let outcome = crate::room_service::approve_request(&data_dir, &request_id)?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(outcome)
+    })
+    .await
+    {
+        Ok(Ok(Some(output))) => Json(output).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "browser access request not found").into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_request_deny(
+    State(state): State<GatewayState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let outcome =
+            crate::room_service::deny_request(&data_dir, &request_id, "Denied from Chat Room.")?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(outcome)
+    })
+    .await
+    {
+        Ok(Ok(Some(output))) => Json(output).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "browser access request not found").into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_guest_kick(
+    State(state): State<GatewayState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let outcome = crate::room_service::revoke_guest_session_by_id(&data_dir, &session_id)?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(outcome)
+    })
+    .await
+    {
+        Ok(Ok(Some(output))) => Json(ChatRoomGuestKickResponse {
+            status: "kicked".to_string(),
+            display_name: output.display_name,
+            device_label: output.device_label,
+        })
+        .into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "guest session not found").into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_access_policy_update(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomAccessPolicyBody>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let actor_did = ensure_local_room_owner_or_actor(&data_dir)?;
+        let output = crate::room_service::update_room_access_policy(
+            &data_dir,
+            crate::room_service::RoomAccessPolicyUpdateInput {
+                actor_did,
+                allow_guest_invites: body.allow_guest_invites,
+                allow_member_invites: body.allow_member_invites,
+                allow_members_to_host_guests: body.allow_members_to_host_guests,
+            },
+        )?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(output)
+    })
+    .await
+    {
+        Ok(Ok(output)) => Json(output).into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_member_invite(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomMemberInviteBody>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let actor_did = ensure_local_room_owner_or_actor(&data_dir)?;
+        let output = crate::room_service::invite_room_member(
+            &data_dir,
+            crate::room_service::RoomInviteInput {
+                actor_did,
+                invited_did: body.member_did,
+                role: body.role.unwrap_or(crate::room_service::RoomRole::Member),
+            },
+        )?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(output)
+    })
+    .await
+    {
+        Ok(Ok(output)) => Json(output).into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_member_remove(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomMemberRemoveBody>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let actor_did = ensure_local_room_owner_or_actor(&data_dir)?;
+        let output = crate::room_service::remove_room_member(
+            &data_dir,
+            crate::room_service::RoomMemberRemoveInput {
+                actor_did,
+                member_did: body.member_did,
+            },
+        )?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(output)
+    })
+    .await
+    {
+        Ok(Ok(Some(output))) => Json(output).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "room member not found").into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+async fn chat_room_invite_revoke(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<ChatRoomInviteRevokeBody>,
+) -> Response {
+    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, CHAT_ROOM_CAPSULE_ID) {
+        return room_service_error_response(err);
+    }
+    let data_dir = state.data_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        let actor_did = ensure_local_room_owner_or_actor(&data_dir)?;
+        let output =
+            crate::room_service::revoke_room_invite(&data_dir, &actor_did, &body.invite_id)?;
+        let summary = crate::room_service::load_summary(&data_dir).unwrap_or_default();
+        let _ = crate::notifications::sync_room_notifications(&data_dir, &summary);
+        Ok::<_, anyhow::Error>(output)
+    })
+    .await
+    {
+        Ok(Ok(Some(output))) => Json(output).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "room invite not found").into_response(),
+        Ok(Err(err)) => room_service_error_response(err),
+        Err(err) => room_service_join_error_response(err),
+    }
+}
+
+fn load_room_summary_with_identity(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<crate::room_service::RoomSummary> {
+    let identity = room_service_runtime_identity_profile(data_dir);
+    let mut summary = crate::room_service::load_summary(data_dir)?;
+    if let Ok(hosted) = crate::browser_app_hosts::load_browser_app_hosted_endpoint(
+        data_dir,
+        crate::room_service::room_slug(),
+    ) {
+        summary.canonical_hosted_guest_url = hosted.canonical_url;
+        summary.ephemeral_hosted_guest_url = hosted.ephemeral_url;
+    }
+    let access = crate::room_service::local_runtime_access(data_dir, identity.did.as_deref())?;
+    apply_room_access(&mut summary, access);
+    Ok(summary)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -396,6 +2528,238 @@ fn load_runtime_coords(data_dir: &std::path::Path) -> Option<GatewayRuntimeCoord
     let path = data_dir.join("runtime-coords.json");
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn gateway_internal_error(err: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": err.to_string() })),
+    )
+}
+
+fn documents_error_response(err: anyhow::Error) -> Response {
+    let text = err.to_string();
+    let status = if text.contains("home launch token") {
+        StatusCode::FORBIDDEN
+    } else if text.contains("documents provider unavailable") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if text.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if text.contains("invalid")
+        || text.contains("empty")
+        || text.contains("must not")
+        || text.contains("missing")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, text).into_response()
+}
+
+fn inbox_error_response(err: anyhow::Error) -> Response {
+    let text = err.to_string();
+    let status = if text.contains("home launch token") {
+        StatusCode::FORBIDDEN
+    } else if text.contains("unknown inbox action") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, text).into_response()
+}
+
+fn system_error_response(err: anyhow::Error) -> Response {
+    let text = err.to_string();
+    let status = if text.contains("home launch token") {
+        StatusCode::FORBIDDEN
+    } else if text.contains("nickname must")
+        || text.contains("missing")
+        || text.contains("background image")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, text).into_response()
+}
+
+fn home_error_response(err: anyhow::Error) -> Response {
+    let text = err.to_string();
+    let status = if text.contains("home launch token") || text.contains("gateway identity") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, text).into_response()
+}
+
+pub(crate) fn home_session_cookie_header(
+    data_dir: &std::path::Path,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    let token = issue_home_launch_token(data_dir, HOME_CAPSULE_ID)?;
+    home_launch_cookie_header(
+        HOME_SESSION_COOKIE,
+        &token,
+        HOME_LAUNCH_TOKEN_TTL_SECS,
+        "/api/apps/home",
+        secure,
+    )
+}
+
+fn home_launch_cookie_header(
+    name: &str,
+    token: &str,
+    max_age_secs: u64,
+    path: &str,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    let mut value =
+        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Lax");
+    if secure {
+        value.push_str("; Secure");
+    }
+    HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+fn issue_home_launch_token(data_dir: &std::path::Path, app: &str) -> anyhow::Result<String> {
+    let (signing_key, _did) = elastos_identity::load_or_create_did(data_dir)?;
+    let envelope = HomeLaunchTokenEnvelope {
+        payload: HomeLaunchTokenPayload {
+            schema: "elastos.home.launch-token/v1".to_string(),
+            app: app.to_string(),
+            exp: now_ts() + HOME_LAUNCH_TOKEN_TTL_SECS,
+        },
+        signature: String::new(),
+        signer_did: String::new(),
+    };
+    let canonical = serde_json::to_string(&serde_json::to_value(&envelope.payload)?)?;
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        &signing_key,
+        HOME_LAUNCH_TOKEN_DOMAIN,
+        canonical.as_bytes(),
+    );
+    let envelope = HomeLaunchTokenEnvelope {
+        signature,
+        signer_did,
+        ..envelope
+    };
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope)?))
+}
+
+pub(super) fn require_home_launch_token(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    expected_app: &str,
+) -> anyhow::Result<()> {
+    require_home_launch_token_for_any(data_dir, headers, &[expected_app]).map(|_| ())
+}
+
+pub(super) fn require_home_launch_token_for_any(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<String> {
+    require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)
+}
+
+fn require_home_token(data_dir: &std::path::Path, headers: &HeaderMap) -> anyhow::Result<()> {
+    require_home_launch_token_for_any_from(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID],
+        Some(HOME_SESSION_COOKIE),
+    )
+    .map(|_| ())
+}
+
+fn require_home_launch_token_for_any_from(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+    cookie_name: Option<&str>,
+) -> anyhow::Result<String> {
+    let token = headers
+        .get("x-elastos-home-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| cookie_name.and_then(|name| cookie_value_from_headers(headers, name)))
+        .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.as_str())
+        .map_err(|_| anyhow::anyhow!("invalid home launch token encoding"))?;
+    let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid home launch token payload"))?;
+    if envelope.payload.schema != "elastos.home.launch-token/v1" {
+        anyhow::bail!("unsupported home launch token schema");
+    }
+    let local_did = load_existing_gateway_runtime_did(data_dir)
+        .ok_or_else(|| anyhow::anyhow!("gateway identity is unavailable"))?;
+    let expected_dids = vec![local_did];
+    crate::crypto::verify_signed_json_envelope_against_dids(
+        &bytes,
+        HOME_LAUNCH_TOKEN_DOMAIN,
+        &expected_dids,
+    )
+    .map_err(|err| anyhow::anyhow!("invalid home launch token: {}", err))?;
+    if !allowed_apps.iter().any(|app| envelope.payload.app == *app) {
+        anyhow::bail!("home launch token is not authorized for this provider");
+    }
+    if envelope.payload.exp <= now_ts() {
+        anyhow::bail!("home launch token expired");
+    }
+    Ok(envelope.payload.app)
+}
+
+struct ChatRoomSessionGrant {
+    token: String,
+    display_name: String,
+    expires_at: u64,
+    max_age_secs: u64,
+}
+
+fn start_chat_room_session(data_dir: &std::path::Path) -> anyhow::Result<ChatRoomSessionGrant> {
+    let identity = load_gateway_identity_summary(data_dir);
+    let did = identity
+        .device_did
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("local runtime DID is unavailable"))?;
+    let handle = identity
+        .handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Local runtime");
+    let session =
+        crate::room_service::start_local_runtime_session(data_dir, did, handle, "ElastOS shell")?;
+    Ok(ChatRoomSessionGrant {
+        max_age_secs: session.expires_at.saturating_sub(now_ts()),
+        token: session.token,
+        display_name: session.display_name,
+        expires_at: session.expires_at,
+    })
+}
+
+fn ensure_local_room_owner_or_actor(data_dir: &std::path::Path) -> anyhow::Result<String> {
+    let identity = load_gateway_identity_summary(data_dir);
+    let did = identity
+        .device_did
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("local runtime DID is unavailable"))?;
+    let control = crate::room_service::load_room_control(data_dir)?;
+    if control.owner_did.is_none() {
+        let _ = crate::room_service::seed_room_owner(
+            data_dir,
+            crate::room_service::RoomOwnerSeedInput {
+                owner_did: did.clone(),
+                title: "Chat Room".to_string(),
+            },
+        )?;
+    }
+    Ok(did)
 }
 
 fn attach_client_token_blocking(
@@ -881,24 +3245,30 @@ async fn room_service_session_leave(
     headers: HeaderMap,
 ) -> Response {
     let secure = request_uses_tls(&headers);
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || crate::room_service::leave_session(&data_dir, &token))
         .await
     {
         Ok(Ok(output)) => {
             let _ = room_transport_view(&state, None).await;
             let mut response = Json(output).into_response();
-            match clear_room_session_cookie_header(secure) {
-                Ok(value) => {
-                    response.headers_mut().append(SET_COOKIE, value);
-                    response
-                }
-                Err(err) => room_service_error_response(err),
-            }
+            let clear_room_cookie = match clear_room_session_cookie_header(secure) {
+                Ok(value) => value,
+                Err(err) => return room_service_error_response(err),
+            };
+            let clear_browser_cookie = match clear_browser_session_cookie_header(secure) {
+                Ok(value) => value,
+                Err(err) => return room_service_error_response(err),
+            };
+            response.headers_mut().append(SET_COOKIE, clear_room_cookie);
+            response
+                .headers_mut()
+                .append(SET_COOKIE, clear_browser_cookie);
+            response
         }
         Ok(Err(err)) => room_service_error_response(err),
         Err(err) => room_service_join_error_response(err),
@@ -910,11 +3280,11 @@ async fn room_service_poll(
     headers: HeaderMap,
     Json(body): Json<RoomPollBody>,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     let transport = room_transport_view(&state, None).await;
     match tokio::task::spawn_blocking(move || {
         crate::room_service::room_poll(&data_dir, &token, body.since)
@@ -935,11 +3305,11 @@ async fn room_service_objects_send(
     headers: HeaderMap,
     Json(body): Json<RoomSendBody>,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         crate::room_service::append_object_with_transport(&data_dir, &token, &body.body)
     })
@@ -959,11 +3329,11 @@ async fn room_service_upload_start(
     headers: HeaderMap,
     Json(body): Json<RoomUploadStartBody>,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         crate::room_service::start_attachment_upload(
             &data_dir,
@@ -987,7 +3357,8 @@ async fn room_service_upload_chunk(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
@@ -996,7 +3367,6 @@ async fn room_service_upload_chunk(
         Err(err) => return room_service_error_response(err),
     };
     let bytes = body.to_vec();
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         crate::room_service::append_attachment_upload_chunk(
             &data_dir, &token, &upload_id, offset, &bytes,
@@ -1015,11 +3385,11 @@ async fn room_service_upload_finish(
     Path(upload_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         crate::room_service::finish_attachment_upload(&data_dir, &token, &upload_id)
     })
@@ -1039,11 +3409,11 @@ async fn room_service_attachment_get(
     Path(attachment_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let token = match room_session_token_from_headers(&headers) {
+    let data_dir = state.data_dir.clone();
+    let token = match chat_room_access_token_from_headers(&data_dir, &headers) {
         Ok(token) => token,
         Err(err) => return room_service_error_response(err),
     };
-    let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         crate::room_service::read_attachment(&data_dir, &token, &attachment_id)
     })
@@ -1088,10 +3458,30 @@ pub(crate) fn request_uses_tls(headers: &HeaderMap) -> bool {
         return true;
     }
 
-    headers
+    if headers
         .get("forwarded")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("proto=https"))
+    {
+        return true;
+    }
+
+    request_host(headers).is_some_and(|host| !request_host_is_local(&host))
+}
+
+fn request_host_is_local(host: &str) -> bool {
+    let host = host
+        .trim()
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let host = if host == "::1" {
+        host.as_str()
+    } else {
+        host.split(':').next().unwrap_or(host.as_str())
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
 }
 
 pub(crate) fn set_room_session_cookie_header(
@@ -1108,8 +3498,30 @@ pub(crate) fn set_room_session_cookie_header(
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
 }
 
+pub(crate) fn set_browser_session_cookie_header(
+    token: &str,
+    max_age_secs: u64,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    let mut value = format!(
+        "{BROWSER_SESSION_COOKIE}={token}; Max-Age={max_age_secs}; Path=/; HttpOnly; SameSite=Lax"
+    );
+    if secure {
+        value.push_str("; Secure");
+    }
+    HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
 pub(crate) fn clear_room_session_cookie_header(secure: bool) -> anyhow::Result<HeaderValue> {
     let mut value = format!("{ROOM_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+    if secure {
+        value.push_str("; Secure");
+    }
+    HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+pub(crate) fn clear_browser_session_cookie_header(secure: bool) -> anyhow::Result<HeaderValue> {
+    let mut value = format!("{BROWSER_SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
     if secure {
         value.push_str("; Secure");
     }
@@ -1123,12 +3535,26 @@ fn room_session_token_from_headers(headers: &HeaderMap) -> anyhow::Result<String
     if let Some(token) = cookie_value_from_headers(headers, ROOM_SESSION_COOKIE) {
         return Ok(token);
     }
+    if let Some(token) = cookie_value_from_headers(headers, BROWSER_SESSION_COOKIE) {
+        return Ok(token);
+    }
     anyhow::bail!(
-        "missing room session. Expected Authorization: Bearer <token> or room session cookie"
+        "missing room session. Expected Authorization: Bearer <token> or room/browser session cookie"
     )
 }
 
-fn cookie_value_from_headers(headers: &HeaderMap, name: &str) -> Option<String> {
+fn chat_room_access_token_from_headers(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<String> {
+    if headers.contains_key("x-elastos-home-token") {
+        require_home_launch_token(data_dir, headers, CHAT_ROOM_CAPSULE_ID)?;
+        return Ok(start_chat_room_session(data_dir)?.token);
+    }
+    room_session_token_from_headers(headers)
+}
+
+pub(crate) fn cookie_value_from_headers(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -1168,8 +3594,13 @@ fn room_service_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("not found") {
         StatusCode::NOT_FOUND
-    } else if text.contains("invalid or expired session") || text.contains("missing room session") {
+    } else if text.contains("invalid or expired session")
+        || text.contains("missing room session")
+        || text.contains("home launch token")
+    {
         StatusCode::UNAUTHORIZED
+    } else if text.contains("not an active member") || text.contains("cannot pair") {
+        StatusCode::FORBIDDEN
     } else if text.contains("must not be empty")
         || text.contains("characters or fewer")
         || text.contains("exceeds")
@@ -1407,6 +3838,11 @@ async fn serve_ipfs_cid_root(
             bytes,
         )
             .into_response();
+    }
+
+    let cached_index = state.cache_dir.join(&cid).join("index.html");
+    if cached_index.is_file() {
+        return serve_directory_root(&state, &cid).await;
     }
 
     match fetch_file_inline(&state, &cid, "").await {
@@ -1672,54 +4108,19 @@ pub(super) fn validate_file_path(path: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Get or create a cached ipfs-provider bridge.
-async fn get_or_create_bridge(
-    state: &GatewayState,
-) -> anyhow::Result<Arc<elastos_runtime::provider::ProviderBridge>> {
-    let mut guard = state.ipfs_bridge.lock().await;
-    if let Some(ref bridge) = *guard {
-        return Ok(Arc::clone(bridge));
-    }
-
-    let ipfs_binary = state.ipfs_provider_binary.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "ipfs-provider not found. Build: cd capsules/ipfs-provider && cargo build --release"
-        )
-    })?;
-
-    let bridge = Arc::new(
-        elastos_runtime::provider::ProviderBridge::spawn(
-            ipfs_binary,
-            elastos_runtime::provider::BridgeProviderConfig::default(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?,
-    );
-
-    *guard = Some(Arc::clone(&bridge));
-    Ok(bridge)
-}
-
 /// Send a raw request to ipfs-provider.
-///
-/// Preferred path: use runtime provider registry (VM-backed provider route).
-/// Fallback path: spawn/hold a direct ProviderBridge from ipfs-provider binary.
 async fn send_ipfs_raw(
     state: &GatewayState,
     request: &serde_json::Value,
 ) -> anyhow::Result<serde_json::Value> {
-    if let Some(registry) = state.provider_registry.as_ref() {
-        return registry
-            .send_raw("ipfs", request)
-            .await
-            .map_err(|e| anyhow::anyhow!("provider registry ipfs request failed: {}", e));
-    }
-
-    let bridge = get_or_create_bridge(state).await?;
-    bridge
-        .send_raw(request)
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("gateway provider registry unavailable"))?;
+    registry
+        .send_raw("ipfs", request)
         .await
-        .map_err(|e| anyhow::anyhow!("ipfs-provider bridge error: {}", e))
+        .map_err(|e| anyhow::anyhow!("provider registry ipfs request failed: {}", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,9 +4133,11 @@ pub(super) fn content_type(path: &str) -> &'static str {
         Some("css") => "text/css",
         Some("js") => "application/javascript",
         Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
         Some("md") => "text/markdown; charset=utf-8",
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
         Some("svg") => "image/svg+xml",
         Some("wasm") => "application/wasm",
         Some("gif") => "image/gif",
@@ -1758,17 +4161,14 @@ fn is_valid_cid(s: &str) -> bool {
 
 pub async fn start_gateway_server(
     addr: &str,
-    ipfs_provider_binary: Option<PathBuf>,
     provider_registry: Option<Arc<ProviderRegistry>>,
     cache_dir: PathBuf,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
     let state = GatewayState {
-        ipfs_provider_binary,
         provider_registry,
         cache_dir,
         data_dir,
-        ipfs_bridge: Arc::new(Mutex::new(None)),
     };
     let app = gateway_router(state);
     let listener = TcpListener::bind(addr).await?;
@@ -1777,14 +4177,14 @@ pub async fn start_gateway_server(
     println!("  Bind:      http://{}", addr);
     if let Some(primary) = advertised.first() {
         println!("  Open:      {}", primary);
-        println!("  Room:      {}apps/room-browser/", primary);
+        println!("  Room:      {}apps/chat-room/", primary);
         println!("  Content:   {}s/<cid>/", primary);
         for extra in advertised.iter().skip(1) {
             println!("  Also:      {}", extra);
         }
     } else {
         println!("  Open:      http://{}", addr);
-        println!("  Room:      http://{}/apps/room-browser/", addr);
+        println!("  Room:      http://{}/apps/chat-room/", addr);
         println!("  Content:   http://{}/s/<cid>/", addr);
     }
     println!();
@@ -1898,2247 +4298,5 @@ async fn shutdown_signal() {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
-    use axum::body::Body;
-    use axum::extract::{Path as AxumPath, State as AxumState};
-    use axum::http::Request;
-    use axum::routing::post;
-    use axum::Json as AxumJson;
-    use ed25519_dalek::{Signer as _, Verifier as _};
-    use serde_json::json;
-    use std::collections::{BTreeSet, HashMap};
-    use tokio::net::TcpListener;
-    use tokio::sync::Mutex as TokioMutex;
-    use tower::ServiceExt;
-
-    // Real CIDs that pass cid crate validation
-    const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
-    const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
-
-    fn test_state(cache_dir: &std::path::Path) -> GatewayState {
-        GatewayState {
-            ipfs_provider_binary: None,
-            provider_registry: None,
-            cache_dir: cache_dir.to_path_buf(),
-            data_dir: cache_dir.to_path_buf(),
-            ipfs_bridge: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn room_cookie_header(response: &Response) -> String {
-        response
-            .headers()
-            .get(SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::to_string)
-            .expect("room session cookie header")
-    }
-
-    #[derive(Default)]
-    struct FakePeerBus {
-        topic_members: HashMap<String, BTreeSet<String>>,
-        topic_messages: HashMap<String, Vec<serde_json::Value>>,
-        cursors: HashMap<(String, String, String), usize>,
-    }
-
-    #[derive(Clone)]
-    struct FakeRuntimeState {
-        did: String,
-        signing_key: ed25519_dalek::SigningKey,
-        attach_secret: String,
-        peer_id: String,
-        bus: Arc<TokioMutex<FakePeerBus>>,
-    }
-
-    struct FakeRuntimeHandle {
-        api_url: String,
-        _task: tokio::task::JoinHandle<()>,
-    }
-
-    fn verifying_key_from_did(did: &str) -> Option<ed25519_dalek::VerifyingKey> {
-        let multibase = did.strip_prefix("did:key:z")?;
-        let bytes = bs58::decode(multibase).into_vec().ok()?;
-        if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
-            return None;
-        }
-        let key_bytes: [u8; 32] = bytes[2..34].try_into().ok()?;
-        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).ok()
-    }
-
-    async fn start_fake_runtime(
-        data_dir: &std::path::Path,
-        bus: Arc<TokioMutex<FakePeerBus>>,
-        peer_id: &str,
-    ) -> FakeRuntimeHandle {
-        let (signing_key, did) = elastos_identity::load_or_create_did(data_dir).unwrap();
-        let state = FakeRuntimeState {
-            did,
-            signing_key,
-            attach_secret: format!("attach-{peer_id}"),
-            peer_id: peer_id.to_string(),
-            bus,
-        };
-        let app = Router::new()
-            .route("/api/auth/attach", post(fake_runtime_attach))
-            .route(
-                "/api/capability/request",
-                post(fake_runtime_capability_request),
-            )
-            .route("/api/provider/:scheme/:op", post(fake_runtime_provider))
-            .with_state(state.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let api_url = format!("http://{}", addr);
-        std::fs::write(
-            data_dir.join("runtime-coords.json"),
-            serde_json::to_vec_pretty(&json!({
-                "api_url": api_url,
-                "attach_secret": state.attach_secret,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        FakeRuntimeHandle {
-            api_url,
-            _task: task,
-        }
-    }
-
-    async fn fake_runtime_attach(
-        AxumState(state): AxumState<FakeRuntimeState>,
-        AxumJson(body): AxumJson<serde_json::Value>,
-    ) -> Response {
-        let secret = body
-            .get("secret")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        if secret != state.attach_secret {
-            return (StatusCode::FORBIDDEN, "bad attach secret").into_response();
-        }
-        AxumJson(json!({
-            "token": format!("client-{}", state.peer_id),
-        }))
-        .into_response()
-    }
-
-    async fn fake_runtime_capability_request(
-        AxumState(state): AxumState<FakeRuntimeState>,
-        AxumJson(body): AxumJson<serde_json::Value>,
-    ) -> Response {
-        let resource = body
-            .get("resource")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let token = if resource.starts_with("elastos://did/") {
-            format!("did-cap-{}", state.peer_id)
-        } else if resource.starts_with("elastos://peer/") {
-            format!("peer-cap-{}", state.peer_id)
-        } else {
-            format!("cap-{}", state.peer_id)
-        };
-        AxumJson(json!({ "token": token })).into_response()
-    }
-
-    async fn fake_runtime_provider(
-        AxumPath((scheme, op)): AxumPath<(String, String)>,
-        AxumState(state): AxumState<FakeRuntimeState>,
-        AxumJson(body): AxumJson<serde_json::Value>,
-    ) -> Response {
-        match (scheme.as_str(), op.as_str()) {
-            ("did", "get_did") => AxumJson(json!({
-                "status": "ok",
-                "data": { "did": state.did }
-            }))
-            .into_response(),
-            ("did", "sign") => {
-                let data = body
-                    .get("data")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let Ok(bytes) = hex::decode(data) else {
-                    return AxumJson(json!({"status":"error","message":"invalid hex payload"}))
-                        .into_response();
-                };
-                let signature = state.signing_key.sign(&bytes);
-                AxumJson(json!({
-                    "status": "ok",
-                    "data": { "signature": hex::encode(signature.to_bytes()) }
-                }))
-                .into_response()
-            }
-            ("did", "verify") => {
-                let did = body
-                    .get("did")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let data = body
-                    .get("data")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let signature = body
-                    .get("signature")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let valid = {
-                    let Ok(bytes) = hex::decode(data) else {
-                        return AxumJson(json!({"status":"error","message":"invalid hex payload"}))
-                            .into_response();
-                    };
-                    let Ok(sig_bytes) = hex::decode(signature) else {
-                        return AxumJson(json!({"status":"error","message":"invalid signature"}))
-                            .into_response();
-                    };
-                    let Ok(sig) = ed25519_dalek::Signature::try_from(sig_bytes.as_slice()) else {
-                        return AxumJson(json!({"status":"error","message":"invalid signature"}))
-                            .into_response();
-                    };
-                    verifying_key_from_did(did)
-                        .map(|key| key.verify(&bytes, &sig).is_ok())
-                        .unwrap_or(false)
-                };
-                AxumJson(json!({
-                    "status": "ok",
-                    "data": { "valid": valid }
-                }))
-                .into_response()
-            }
-            ("peer", "gossip_join") => {
-                let topic = body
-                    .get("topic")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let mut bus = state.bus.lock().await;
-                bus.topic_members
-                    .entry(topic.to_string())
-                    .or_default()
-                    .insert(state.peer_id.clone());
-                AxumJson(json!({
-                    "status": "ok",
-                    "data": { "topic": topic }
-                }))
-                .into_response()
-            }
-            ("peer", "list_topic_peers") => {
-                let topic = body
-                    .get("topic")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let bus = state.bus.lock().await;
-                let peers = bus
-                    .topic_members
-                    .get(topic)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|peer| peer != &state.peer_id)
-                    .collect::<Vec<_>>();
-                AxumJson(json!({
-                    "status": "ok",
-                    "data": { "topic": topic, "peers": peers }
-                }))
-                .into_response()
-            }
-            ("peer", "gossip_send") => {
-                let topic = body
-                    .get("topic")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let mut bus = state.bus.lock().await;
-                let peers = bus.topic_members.get(topic).cloned().unwrap_or_default();
-                bus.topic_messages
-                    .entry(topic.to_string())
-                    .or_default()
-                    .push(json!({
-                        "sender_id": body.get("sender_id").cloned().unwrap_or(serde_json::Value::Null),
-                        "sender_nick": body.get("sender").cloned().unwrap_or(serde_json::Value::Null),
-                        "content": body.get("message").cloned().unwrap_or(serde_json::Value::Null),
-                        "ts": body.get("ts").cloned().unwrap_or(serde_json::Value::from(0u64)),
-                        "signature": body.get("signature").cloned().unwrap_or(serde_json::Value::Null),
-                    }));
-                let mut response = json!({ "status": "ok" });
-                if peers.iter().filter(|peer| *peer != &state.peer_id).count() == 0 {
-                    response["broadcast"] = serde_json::Value::String("local_only".to_string());
-                }
-                AxumJson(response).into_response()
-            }
-            ("peer", "gossip_recv") => {
-                let topic = body
-                    .get("topic")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let consumer_id = body
-                    .get("consumer_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("default");
-                let limit = body
-                    .get("limit")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(50);
-                let skip_sender_id = body
-                    .get("skip_sender_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let mut bus = state.bus.lock().await;
-                let cursor_key = (
-                    state.peer_id.clone(),
-                    topic.to_string(),
-                    consumer_id.to_string(),
-                );
-                let start = *bus.cursors.get(&cursor_key).unwrap_or(&0);
-                let all = bus.topic_messages.get(topic).cloned().unwrap_or_default();
-                let count = all.len().saturating_sub(start).min(limit as usize);
-                let selected = all
-                    .into_iter()
-                    .skip(start)
-                    .take(limit as usize)
-                    .filter(|message| {
-                        skip_sender_id.is_empty()
-                            || message
-                                .get("sender_id")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("")
-                                != skip_sender_id
-                    })
-                    .collect::<Vec<_>>();
-                bus.cursors.insert(cursor_key, start + count);
-                AxumJson(json!({
-                    "status": "ok",
-                    "data": { "messages": selected }
-                }))
-                .into_response()
-            }
-            _ => AxumJson(json!({
-                "status": "error",
-                "message": format!("unsupported fake runtime operation {scheme}/{op}"),
-            }))
-            .into_response(),
-        }
-    }
-
-    #[test]
-    fn test_content_type_mapping() {
-        assert_eq!(content_type("index.html"), "text/html; charset=utf-8");
-        assert_eq!(content_type("style.css"), "text/css");
-        assert_eq!(content_type("app.js"), "application/javascript");
-        assert_eq!(content_type("data.json"), "application/json");
-        assert_eq!(content_type("README.md"), "text/markdown; charset=utf-8");
-        assert_eq!(content_type("image.png"), "image/png");
-        assert_eq!(content_type("photo.jpg"), "image/jpeg");
-        assert_eq!(content_type("photo.jpeg"), "image/jpeg");
-        assert_eq!(content_type("icon.svg"), "image/svg+xml");
-        assert_eq!(content_type("module.wasm"), "application/wasm");
-        assert_eq!(content_type("unknown.xyz"), "application/octet-stream");
-        assert_eq!(content_type("noext"), "application/octet-stream");
-    }
-
-    #[test]
-    fn test_validate_file_path() {
-        assert!(validate_file_path("index.html").is_ok());
-        assert!(validate_file_path("sub/dir/file.js").is_ok());
-        assert!(validate_file_path("a.b.c.txt").is_ok());
-
-        assert!(validate_file_path("../etc/passwd").is_err());
-        assert!(validate_file_path("foo/../../etc/passwd").is_err());
-        assert!(validate_file_path("/absolute/path").is_err());
-        assert!(validate_file_path("foo\\bar").is_err());
-        assert!(validate_file_path("\\windows\\path").is_err());
-    }
-
-    #[test]
-    fn test_validate_file_path_encoded() {
-        assert!(validate_file_path("%2e%2e/etc/passwd").is_err());
-        assert!(validate_file_path("%2E%2E/etc/passwd").is_err());
-        assert!(validate_file_path("foo%2F..%2Fetc/passwd").is_err());
-        assert!(validate_file_path("foo/%2e%2e/bar").is_err());
-    }
-
-    #[test]
-    fn test_advertised_gateway_urls_for_specific_host() {
-        let urls = advertised_gateway_urls("77.42.19.31:18090");
-        assert_eq!(urls, vec!["http://77.42.19.31:18090/"]);
-    }
-
-    #[test]
-    fn test_advertised_gateway_urls_for_wildcard_bind_starts_with_loopback() {
-        let urls = advertised_gateway_urls("0.0.0.0:18090");
-        assert_eq!(
-            urls.first().map(String::as_str),
-            Some("http://127.0.0.1:18090/")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_landing_page_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("ElastOS Gateway"));
-    }
-
-    #[tokio::test]
-    async fn test_root_serves_mywebsite_when_staged() {
-        let dir = tempfile::tempdir().unwrap();
-        let site_root = elastos_common::localhost::my_website_root_path(dir.path());
-        std::fs::create_dir_all(&site_root).unwrap();
-        std::fs::write(site_root.join("index.html"), "<html>pc2 site</html>").unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get("x-elastos-site-origin")
-                .and_then(|v| v.to_str().ok()),
-            Some("localhost://MyWebSite")
-        );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"<html>pc2 site</html>");
-    }
-
-    #[tokio::test]
-    async fn test_healthz_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_invalid_cid_400() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/s/not-a-cid/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_cid_without_trailing_slash_redirects() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/s/{}", TEST_CIDV1))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
-        let location = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(location, format!("/s/{}/", TEST_CIDV1));
-    }
-
-    #[tokio::test]
-    async fn test_ipfs_cid_root_serves_cached_raw_file_without_redirect() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(format!("{}.raw", TEST_CIDV1)),
-            b"raw-binary",
-        )
-        .unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/ipfs/{}", TEST_CIDV1))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "application/octet-stream");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"raw-binary");
-    }
-
-    #[tokio::test]
-    async fn test_ipfs_cid_root_falls_back_to_cached_directory_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let cid_dir = dir.path().join(TEST_CIDV1);
-        std::fs::create_dir_all(&cid_dir).unwrap();
-        std::fs::write(cid_dir.join("index.html"), "<html>ok</html>").unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/ipfs/{}", TEST_CIDV1))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "text/html; charset=utf-8");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"<html>ok</html>");
-    }
-
-    #[tokio::test]
-    async fn test_traversal_400() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/s/{}/../etc/passwd", TEST_CIDV0))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_missing_file_404() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pre-populate cache so we don't need IPFS
-        let cid_dir = dir.path().join(TEST_CIDV1);
-        std::fs::create_dir_all(&cid_dir).unwrap();
-        std::fs::write(cid_dir.join("index.html"), "<html></html>").unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/s/{}/no-such-file.txt", TEST_CIDV1))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_release_head_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let head = r#"{"payload":{"schema":"elastos.release.head/v1"}}"#;
-        let publisher_root = publisher_release_head_path(dir.path());
-        std::fs::create_dir_all(publisher_root.parent().unwrap()).unwrap();
-        std::fs::write(publisher_root, head).unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/release-head.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "application/json");
-    }
-
-    #[tokio::test]
-    async fn test_release_head_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/release-head.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_release_json_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let release = r#"{"payload":{"schema":"elastos.release/v1"}}"#;
-        let publisher_root = publisher_release_manifest_path(dir.path());
-        std::fs::create_dir_all(publisher_root.parent().unwrap()).unwrap();
-        std::fs::write(publisher_root, release).unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/release.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "application/json");
-    }
-
-    #[tokio::test]
-    async fn test_install_sh_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let install_path = publisher_install_script_path(dir.path());
-        std::fs::create_dir_all(install_path.parent().unwrap()).unwrap();
-        std::fs::write(install_path, "#!/bin/bash\necho hi").unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/install.sh")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "text/x-shellscript");
-    }
-
-    #[tokio::test]
-    async fn test_install_sh_404() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/install.sh")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_artifact_file_200() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifacts_dir = publisher_artifacts_path(dir.path());
-        std::fs::create_dir_all(&artifacts_dir).unwrap();
-        std::fs::write(artifacts_dir.join("components-linux-amd64.json"), "{}").unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/artifacts/components-linux-amd64.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert_eq!(ct, "application/json");
-    }
-
-    #[tokio::test]
-    async fn test_domain_binding_serves_bound_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let public_site = dir.path().join("Public").join("docs");
-        std::fs::create_dir_all(&public_site).unwrap();
-        std::fs::write(public_site.join("index.html"), "<html>bound site</html>").unwrap();
-
-        let binding_path = edge_binding_path(dir.path(), "docs.example.com");
-        std::fs::create_dir_all(binding_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &binding_path,
-            r#"{"domain":"docs.example.com","target":"localhost://Public/docs"}"#,
-        )
-        .unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .header("host", "docs.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get("x-elastos-site-origin")
-                .and_then(|v| v.to_str().ok()),
-            Some("localhost://Public/docs")
-        );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"<html>bound site</html>");
-    }
-
-    #[tokio::test]
-    async fn test_site_head_document_and_headers() {
-        let dir = tempfile::tempdir().unwrap();
-        let site_root = elastos_common::localhost::my_website_root_path(dir.path());
-        std::fs::create_dir_all(&site_root).unwrap();
-        std::fs::write(site_root.join("index.html"), "<html>pc2 site</html>").unwrap();
-        let cached_bundle = dir.path().join(TEST_CIDV1);
-        std::fs::create_dir_all(&cached_bundle).unwrap();
-        std::fs::write(
-            cached_bundle.join("index.html"),
-            "<html>published bundle</html>",
-        )
-        .unwrap();
-
-        let head_path = edge_site_head_path(dir.path(), MY_WEBSITE_URI);
-        std::fs::create_dir_all(head_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &head_path,
-            r#"{"payload":{"schema":"elastos.site.head.v1","target":"localhost://MyWebSite","bundle_cid":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi","release_name":"v1","channel_name":"live","content_digest":"sha256:abc123","entry_count":1,"total_bytes":21,"activated_at":123},"signature":"deadbeef","signer_did":"did:key:z6Mkexample"}"#,
-        )
-        .unwrap();
-
-        let state = test_state(dir.path());
-        let app = gateway_router(state);
-
-        let root_resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(root_resp.status(), StatusCode::OK);
-        assert_eq!(
-            root_resp
-                .headers()
-                .get("x-elastos-site-head-schema")
-                .and_then(|v| v.to_str().ok()),
-            Some("elastos.site.head.v1")
-        );
-        assert_eq!(
-            root_resp
-                .headers()
-                .get("x-elastos-site-head-digest")
-                .and_then(|v| v.to_str().ok()),
-            Some("sha256:abc123")
-        );
-        assert_eq!(
-            root_resp
-                .headers()
-                .get("x-elastos-site-head-cid")
-                .and_then(|v| v.to_str().ok()),
-            Some(TEST_CIDV1)
-        );
-        assert_eq!(
-            root_resp
-                .headers()
-                .get("x-elastos-site-head-release")
-                .and_then(|v| v.to_str().ok()),
-            Some("v1")
-        );
-        assert_eq!(
-            root_resp
-                .headers()
-                .get("x-elastos-site-head-channel")
-                .and_then(|v| v.to_str().ok()),
-            Some("live")
-        );
-
-        let head_resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/elastos/site-head.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(head_resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(head_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("\"schema\":\"elastos.site.head.v1\""));
-        assert!(text.contains("\"target\":\"localhost://MyWebSite\""));
-        assert!(text.contains(&format!("\"bundle_cid\":\"{}\"", TEST_CIDV1)));
-        assert!(text.contains("\"release_name\":\"v1\""));
-        assert!(text.contains("\"channel_name\":\"live\""));
-    }
-
-    #[tokio::test]
-    async fn test_active_site_head_prefers_bundle_cid() {
-        let dir = tempfile::tempdir().unwrap();
-        let site_root = elastos_common::localhost::my_website_root_path(dir.path());
-        std::fs::create_dir_all(&site_root).unwrap();
-        std::fs::write(site_root.join("index.html"), "<html>working tree</html>").unwrap();
-
-        let cached_bundle = dir.path().join(TEST_CIDV1);
-        std::fs::create_dir_all(&cached_bundle).unwrap();
-        std::fs::write(
-            cached_bundle.join("index.html"),
-            "<html>published bundle</html>",
-        )
-        .unwrap();
-
-        let head_path = edge_site_head_path(dir.path(), MY_WEBSITE_URI);
-        std::fs::create_dir_all(head_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &head_path,
-            format!(
-                r#"{{"payload":{{"schema":"elastos.site.head.v1","target":"localhost://MyWebSite","bundle_cid":"{}","release_name":"v2","channel_name":"live","content_digest":"sha256:abc123","entry_count":1,"total_bytes":28,"activated_at":123}},"signature":"deadbeef","signer_did":"did:key:z6Mkexample"}}"#,
-                TEST_CIDV1
-            ),
-        )
-        .unwrap();
-
-        let app = gateway_router(test_state(dir.path()));
-        let resp = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get("x-elastos-site-head-cid")
-                .and_then(|v| v.to_str().ok()),
-            Some(TEST_CIDV1)
-        );
-        assert_eq!(
-            resp.headers()
-                .get("x-elastos-site-head-release")
-                .and_then(|v| v.to_str().ok()),
-            Some("v2")
-        );
-        assert_eq!(
-            resp.headers()
-                .get("x-elastos-site-head-channel")
-                .and_then(|v| v.to_str().ok()),
-            Some("live")
-        );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"<html>published bundle</html>");
-    }
-
-    #[tokio::test]
-    async fn test_room_service_assets_serve() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/apps/room-browser/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("text/html; charset=utf-8")
-        );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("Room Browser"));
-
-        let wasm = app
-            .oneshot(
-                Request::builder()
-                    .uri("/apps/room-browser/room_browser_ui_bg.wasm")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(wasm.status(), StatusCode::OK);
-        assert_eq!(
-            wasm.headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("application/wasm")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_room_service_summary_omits_display_name_suggestion() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/apps/room-browser/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("suggested_display_name").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_room_service_summary_does_not_create_identity_on_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/apps/room-browser/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(!dir.path().join("identity").join("device.key").exists());
-    }
-
-    #[tokio::test]
-    async fn test_room_service_summary_includes_hosted_guest_urls() {
-        let dir = tempfile::tempdir().unwrap();
-        save_trusted_sources(
-            dir.path(),
-            &TrustedSourcesConfig {
-                schema: "elastos.trusted-sources/v1".to_string(),
-                default_source: "default".to_string(),
-                sources: vec![TrustedSource {
-                    name: "default".to_string(),
-                    publisher_dids: vec![],
-                    channel: "stable".to_string(),
-                    discovery_uri: String::new(),
-                    connect_ticket: String::new(),
-                    gateways: vec!["https://elastos.elacitylabs.com".to_string()],
-                    install_path: String::new(),
-                    installed_version: String::new(),
-                    head_cid: String::new(),
-                    publisher_node_id: String::new(),
-                    ipns_name: String::new(),
-                }],
-            },
-        )
-        .unwrap();
-        crate::browser_app_hosts::record_ephemeral_browser_app_url(
-            dir.path(),
-            crate::room_service::room_slug(),
-            Some("https://quick.trycloudflare.com"),
-        )
-        .unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/apps/room-browser/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["canonical_hosted_guest_url"].as_str(),
-            Some("https://elastos.elacitylabs.com/apps/room-browser/")
-        );
-        assert_eq!(
-            json["ephemeral_hosted_guest_url"].as_str(),
-            Some("https://quick.trycloudflare.com/")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_room_service_summary_blocks_pairing_when_seeded_room_has_no_runtime_member() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::room_service::seed_room_owner(
-            dir.path(),
-            crate::room_service::RoomOwnerSeedInput {
-                owner_did: "did:key:z6owner".to_string(),
-                title: "Exec Room".to_string(),
-            },
-        )
-        .unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/apps/room-browser/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["pairing_allowed"].as_bool(), Some(false));
-        assert_eq!(json["owner_did"].as_str(), None);
-        assert!(json["pairing_block_reason"]
-            .as_str()
-            .unwrap()
-            .contains("no active room member DID available"));
-    }
-
-    #[tokio::test]
-    async fn test_browser_session_pair_and_status_routes_room_browser() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(pair_resp.status(), StatusCode::OK);
-        let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let pair_json: serde_json::Value = serde_json::from_slice(&pair_body).unwrap();
-        let request_id = pair_json["request_id"].as_str().unwrap().to_string();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(status_resp.status(), StatusCode::OK);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert_eq!(status_json["status"].as_str(), Some("pending"));
-    }
-
-    #[tokio::test]
-    async fn test_browser_session_pair_is_forbidden_when_seeded_room_has_no_runtime_member() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::room_service::seed_room_owner(
-            dir.path(),
-            crate::room_service::RoomOwnerSeedInput {
-                owner_did: "did:key:z6owner".to_string(),
-                title: "Exec Room".to_string(),
-            },
-        )
-        .unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(pair_resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_room_service_pairing_and_object_flow() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(pair_resp.status(), StatusCode::OK);
-        let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let pair_json: serde_json::Value = serde_json::from_slice(&pair_body).unwrap();
-        let request_id = pair_json["request_id"].as_str().unwrap().to_string();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(status_resp.status(), StatusCode::OK);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert_eq!(status_json["status"].as_str(), Some("pending"));
-
-        let approved = crate::room_service::approve_next_request(dir.path())
-            .unwrap()
-            .unwrap();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(status_resp.status(), StatusCode::OK);
-        let room_cookie = room_cookie_header(&status_resp);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert_eq!(status_json["status"].as_str(), Some("approved"));
-        assert!(status_json["token"].is_null());
-
-        let send_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/objects/send")
-                    .header("cookie", &room_cookie)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"body":"Hello room"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(send_resp.status(), StatusCode::OK);
-
-        let feed_resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header("cookie", &room_cookie)
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(feed_resp.status(), StatusCode::OK);
-        let feed_body = axum::body::to_bytes(feed_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let feed_json: serde_json::Value = serde_json::from_slice(&feed_body).unwrap();
-        assert_eq!(feed_json["latest_seq"].as_u64(), Some(2));
-        assert_eq!(feed_json["objects"][0]["kind"].as_str(), Some("system"));
-        assert_eq!(
-            feed_json["objects"][0]["body"].as_str(),
-            Some("joined the room")
-        );
-        assert_eq!(feed_json["objects"][1]["body"].as_str(), Some("Hello room"));
-        assert_eq!(feed_json["objects"][1]["sender"].as_str(), Some("Alice"));
-        assert_eq!(feed_json["objects"][1]["kind"].as_str(), Some("text"));
-        assert_eq!(approved.display_name, "Alice");
-    }
-
-    #[tokio::test]
-    async fn test_room_service_attachment_upload_and_fetch() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let pair_json: serde_json::Value = serde_json::from_slice(&pair_body).unwrap();
-        let request_id = pair_json["request_id"].as_str().unwrap().to_string();
-
-        crate::room_service::approve_next_request(dir.path())
-            .unwrap()
-            .unwrap();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let room_cookie = room_cookie_header(&status_resp);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert!(status_json["token"].is_null());
-
-        let upload_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/upload/start")
-                    .header("cookie", &room_cookie)
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"file_name":"photo.png","mime_type":"image/png","size_bytes":{}}}"#,
-                        b"png-data".len()
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(upload_resp.status(), StatusCode::OK);
-        let upload_body = axum::body::to_bytes(upload_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let upload_json: serde_json::Value = serde_json::from_slice(&upload_body).unwrap();
-        let upload_id = upload_json["upload_id"].as_str().unwrap();
-
-        let chunk_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/apps/room-browser/upload/{}/chunk", upload_id))
-                    .header("cookie", &room_cookie)
-                    .header("x-elastos-upload-offset", "0")
-                    .header("content-type", "application/octet-stream")
-                    .body(Body::from("png-data"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(chunk_resp.status(), StatusCode::OK);
-
-        let finish_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/api/apps/room-browser/upload/{}/finish",
-                        upload_id
-                    ))
-                    .header("cookie", &room_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(finish_resp.status(), StatusCode::OK);
-        let finish_body = axum::body::to_bytes(finish_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let finish_json: serde_json::Value = serde_json::from_slice(&finish_body).unwrap();
-        assert_eq!(finish_json["kind"].as_str(), Some("attachment"));
-        let attachment_id = finish_json["attachment"]["attachment_id"].as_str().unwrap();
-
-        let fetch_resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/apps/room-browser/attachments/{}",
-                        attachment_id
-                    ))
-                    .header("cookie", &room_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(fetch_resp.status(), StatusCode::OK);
-        assert_eq!(
-            fetch_resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok()),
-            Some("image/png")
-        );
-        let bytes = axum::body::to_bytes(fetch_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&bytes[..], b"png-data");
-    }
-
-    #[tokio::test]
-    async fn test_room_service_audio_attachment_upload_is_inline_media() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let pair_json: serde_json::Value = serde_json::from_slice(&pair_body).unwrap();
-        let request_id = pair_json["request_id"].as_str().unwrap().to_string();
-
-        crate::room_service::approve_next_request(dir.path())
-            .unwrap()
-            .unwrap();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let room_cookie = room_cookie_header(&status_resp);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert!(status_json["token"].is_null());
-
-        let upload_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/upload/start")
-                    .header("cookie", &room_cookie)
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"file_name":"voice.ogg","mime_type":"audio/ogg","size_bytes":{}}}"#,
-                        b"ogg-data".len()
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(upload_resp.status(), StatusCode::OK);
-        let upload_body = axum::body::to_bytes(upload_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let upload_json: serde_json::Value = serde_json::from_slice(&upload_body).unwrap();
-        let upload_id = upload_json["upload_id"].as_str().unwrap();
-
-        let chunk_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/apps/room-browser/upload/{}/chunk", upload_id))
-                    .header("cookie", &room_cookie)
-                    .header("x-elastos-upload-offset", "0")
-                    .header("content-type", "application/octet-stream")
-                    .body(Body::from("ogg-data"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(chunk_resp.status(), StatusCode::OK);
-
-        let finish_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!(
-                        "/api/apps/room-browser/upload/{}/finish",
-                        upload_id
-                    ))
-                    .header("cookie", &room_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(finish_resp.status(), StatusCode::OK);
-        let finish_body = axum::body::to_bytes(finish_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let finish_json: serde_json::Value = serde_json::from_slice(&finish_body).unwrap();
-        assert_eq!(finish_json["attachment"]["is_audio"].as_bool(), Some(true));
-        let attachment_id = finish_json["attachment"]["attachment_id"].as_str().unwrap();
-
-        let fetch_resp = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/apps/room-browser/attachments/{}",
-                        attachment_id
-                    ))
-                    .header("cookie", &room_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(fetch_resp.status(), StatusCode::OK);
-        assert_eq!(
-            fetch_resp
-                .headers()
-                .get("content-disposition")
-                .and_then(|v| v.to_str().ok()),
-            Some("inline; filename=\"voice.ogg\"")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_room_service_session_leave_appends_system_object() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = gateway_router(test_state(dir.path()));
-
-        let pair_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/pair")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"app":"room-browser","display_name":"Alice","device_label":"Phone"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let pair_body = axum::body::to_bytes(pair_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let pair_json: serde_json::Value = serde_json::from_slice(&pair_body).unwrap();
-        let request_id = pair_json["request_id"].as_str().unwrap().to_string();
-
-        crate::room_service::approve_next_request(dir.path())
-            .unwrap()
-            .unwrap();
-
-        let status_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/browser/session/status")
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(
-                        r#"{{"app":"room-browser","request_id":"{}"}}"#,
-                        request_id
-                    )))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let room_cookie = room_cookie_header(&status_resp);
-        let status_body = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
-        assert!(status_json["token"].is_null());
-
-        let leave_resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/session/leave")
-                    .header("cookie", &room_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(leave_resp.status(), StatusCode::OK);
-        let leave_body = axum::body::to_bytes(leave_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let leave_json: serde_json::Value = serde_json::from_slice(&leave_body).unwrap();
-        assert_eq!(leave_json["kind"].as_str(), Some("system"));
-        assert_eq!(leave_json["body"].as_str(), Some("left the room"));
-
-        let summary = crate::room_service::load_summary(dir.path()).unwrap();
-        assert_eq!(summary.active_session_count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_room_service_cross_runtime_room_syncs_over_carrier() {
-        let owner_dir = tempfile::tempdir().unwrap();
-        let guest_dir = tempfile::tempdir().unwrap();
-        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-        let owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-        let guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-        assert!(owner_runtime.api_url.starts_with("http://127.0.0.1:"));
-        assert!(guest_runtime.api_url.starts_with("http://127.0.0.1:"));
-
-        let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-            .unwrap()
-            .1;
-        let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-            .unwrap()
-            .1;
-
-        let _ = crate::room_service::seed_room_owner(
-            owner_dir.path(),
-            crate::room_service::RoomOwnerSeedInput {
-                owner_did: owner_did.clone(),
-                title: "Exec Room".to_string(),
-            },
-        )
-        .unwrap();
-        let invite = crate::room_service::export_room_invite_envelope(
-            owner_dir.path(),
-            crate::room_service::RoomInviteInput {
-                actor_did: owner_did.clone(),
-                invited_did: guest_did.clone(),
-                role: crate::room_service::RoomRole::Member,
-            },
-        )
-        .unwrap();
-        let invite_json = serde_json::to_vec(&invite).unwrap();
-        crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-        crate::room_service::accept_room_invite(
-            guest_dir.path(),
-            crate::room_service::RoomInviteAcceptInput {
-                actor_did: guest_did.clone(),
-                invite_id: invite.payload.invite_id.clone(),
-            },
-        )
-        .unwrap();
-        let acceptance = crate::room_service::export_room_acceptance_envelope(
-            guest_dir.path(),
-            &invite.payload.invite_id,
-        )
-        .unwrap();
-        let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-        crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-            .unwrap();
-
-        let owner_request = crate::room_service::request_pairing(
-            owner_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Owner".to_string(),
-                device_label: "WSL".to_string(),
-                member_did: Some(owner_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(owner_dir.path())
-            .unwrap()
-            .unwrap();
-        let owner_token =
-            crate::room_service::pairing_status(owner_dir.path(), &owner_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let guest_request = crate::room_service::request_pairing(
-            guest_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Guest".to_string(),
-                device_label: "Jetson".to_string(),
-                member_did: Some(guest_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(guest_dir.path())
-            .unwrap()
-            .unwrap();
-        let guest_token =
-            crate::room_service::pairing_status(guest_dir.path(), &guest_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let owner_gateway = gateway_router(test_state(owner_dir.path()));
-        let guest_gateway = gateway_router(test_state(guest_dir.path()));
-
-        let send_response = owner_gateway
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/objects/send")
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"body":"hello across runtimes"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(send_response.status(), StatusCode::OK);
-
-        let poll_response = guest_gateway
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(poll_response.status(), StatusCode::OK);
-        let poll_body = axum::body::to_bytes(poll_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let poll: serde_json::Value = serde_json::from_slice(&poll_body).unwrap();
-        assert_eq!(poll["transport"]["connected_peer_count"].as_u64(), Some(1));
-        assert!(poll["transport"]["status"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Carrier room sync connected to 1 runtime"));
-        let participants = poll["participants"].as_array().cloned().unwrap_or_default();
-        assert_eq!(participants.len(), 2);
-        assert!(participants.iter().any(|participant| {
-            participant["member_did"].as_str() == Some(owner_did.as_str())
-                && participant["display_name"].as_str() == Some("Owner")
-        }));
-        assert!(participants.iter().any(|participant| {
-            participant["member_did"].as_str() == Some(guest_did.as_str())
-                && participant["display_name"].as_str() == Some("Guest")
-        }));
-        let objects = poll["objects"].as_array().cloned().unwrap_or_default();
-        assert!(objects
-            .iter()
-            .any(|object| object["body"].as_str() == Some("hello across runtimes")));
-    }
-
-    #[tokio::test]
-    async fn test_room_service_cross_runtime_attachment_syncs_over_carrier() {
-        let owner_dir = tempfile::tempdir().unwrap();
-        let guest_dir = tempfile::tempdir().unwrap();
-        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-        let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-        let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-        let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-            .unwrap()
-            .1;
-        let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-            .unwrap()
-            .1;
-
-        let _ = crate::room_service::seed_room_owner(
-            owner_dir.path(),
-            crate::room_service::RoomOwnerSeedInput {
-                owner_did: owner_did.clone(),
-                title: "Exec Room".to_string(),
-            },
-        )
-        .unwrap();
-        let invite = crate::room_service::export_room_invite_envelope(
-            owner_dir.path(),
-            crate::room_service::RoomInviteInput {
-                actor_did: owner_did.clone(),
-                invited_did: guest_did.clone(),
-                role: crate::room_service::RoomRole::Member,
-            },
-        )
-        .unwrap();
-        let invite_json = serde_json::to_vec(&invite).unwrap();
-        crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-        crate::room_service::accept_room_invite(
-            guest_dir.path(),
-            crate::room_service::RoomInviteAcceptInput {
-                actor_did: guest_did.clone(),
-                invite_id: invite.payload.invite_id.clone(),
-            },
-        )
-        .unwrap();
-        let acceptance = crate::room_service::export_room_acceptance_envelope(
-            guest_dir.path(),
-            &invite.payload.invite_id,
-        )
-        .unwrap();
-        let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-        crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-            .unwrap();
-
-        let owner_request = crate::room_service::request_pairing(
-            owner_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Owner".to_string(),
-                device_label: "WSL".to_string(),
-                member_did: Some(owner_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(owner_dir.path())
-            .unwrap()
-            .unwrap();
-        let owner_token =
-            crate::room_service::pairing_status(owner_dir.path(), &owner_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let guest_request = crate::room_service::request_pairing(
-            guest_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Guest".to_string(),
-                device_label: "Jetson".to_string(),
-                member_did: Some(guest_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(guest_dir.path())
-            .unwrap()
-            .unwrap();
-        let guest_token =
-            crate::room_service::pairing_status(guest_dir.path(), &guest_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let owner_gateway = gateway_router(test_state(owner_dir.path()));
-        let guest_gateway = gateway_router(test_state(guest_dir.path()));
-
-        let start_response = owner_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/upload/start")
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"file_name":"photo.png","mime_type":"image/png","size_bytes":8}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(start_response.status(), StatusCode::OK);
-        let start_body = axum::body::to_bytes(start_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let start_json: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
-        let upload_id = start_json["upload_id"].as_str().unwrap().to_string();
-
-        let chunk_response = owner_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/apps/room-browser/upload/{upload_id}/chunk"))
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("x-elastos-upload-offset", "0")
-                    .body(Body::from(Vec::from(&b"png-data"[..])))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(chunk_response.status(), StatusCode::OK);
-
-        let finish_response = owner_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/apps/room-browser/upload/{upload_id}/finish"))
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(finish_response.status(), StatusCode::OK);
-
-        let poll_response = guest_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(poll_response.status(), StatusCode::OK);
-        let poll_body = axum::body::to_bytes(poll_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let poll: serde_json::Value = serde_json::from_slice(&poll_body).unwrap();
-        let attachment_object = poll["objects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|object| object["kind"].as_str() == Some("attachment"))
-            .cloned()
-            .expect("attachment object");
-        let attachment_id = attachment_object["attachment"]["attachment_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            attachment_object["attachment"]["file_name"].as_str(),
-            Some("photo.png")
-        );
-        assert_eq!(
-            attachment_object["attachment"]["mime_type"].as_str(),
-            Some("image/png")
-        );
-
-        let attachment_response = guest_gateway
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/api/apps/room-browser/attachments/{attachment_id}"
-                    ))
-                    .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(attachment_response.status(), StatusCode::OK);
-        assert_eq!(
-            attachment_response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok()),
-            Some("image/png")
-        );
-        let attachment_body = axum::body::to_bytes(attachment_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(attachment_body.as_ref(), b"png-data");
-    }
-
-    #[tokio::test]
-    async fn test_room_service_cross_runtime_presence_syncs_join_and_leave() {
-        let owner_dir = tempfile::tempdir().unwrap();
-        let guest_dir = tempfile::tempdir().unwrap();
-        let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-        let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-        let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-        let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-            .unwrap()
-            .1;
-        let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-            .unwrap()
-            .1;
-
-        let _ = crate::room_service::seed_room_owner(
-            owner_dir.path(),
-            crate::room_service::RoomOwnerSeedInput {
-                owner_did: owner_did.clone(),
-                title: "Exec Room".to_string(),
-            },
-        )
-        .unwrap();
-        let invite = crate::room_service::export_room_invite_envelope(
-            owner_dir.path(),
-            crate::room_service::RoomInviteInput {
-                actor_did: owner_did.clone(),
-                invited_did: guest_did.clone(),
-                role: crate::room_service::RoomRole::Member,
-            },
-        )
-        .unwrap();
-        let invite_json = serde_json::to_vec(&invite).unwrap();
-        crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-        crate::room_service::accept_room_invite(
-            guest_dir.path(),
-            crate::room_service::RoomInviteAcceptInput {
-                actor_did: guest_did.clone(),
-                invite_id: invite.payload.invite_id.clone(),
-            },
-        )
-        .unwrap();
-        let acceptance = crate::room_service::export_room_acceptance_envelope(
-            guest_dir.path(),
-            &invite.payload.invite_id,
-        )
-        .unwrap();
-        let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-        crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-            .unwrap();
-
-        let owner_request = crate::room_service::request_pairing(
-            owner_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Owner".to_string(),
-                device_label: "WSL".to_string(),
-                member_did: Some(owner_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(owner_dir.path())
-            .unwrap()
-            .unwrap();
-        let owner_token =
-            crate::room_service::pairing_status(owner_dir.path(), &owner_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let guest_request = crate::room_service::request_pairing(
-            guest_dir.path(),
-            crate::room_service::PairRequestInput {
-                display_name: "Guest".to_string(),
-                device_label: "Jetson".to_string(),
-                member_did: Some(guest_did.clone()),
-            },
-        )
-        .unwrap();
-        crate::room_service::approve_next_request(guest_dir.path())
-            .unwrap()
-            .unwrap();
-        let guest_token =
-            crate::room_service::pairing_status(guest_dir.path(), &guest_request.request_id)
-                .unwrap()
-                .token
-                .unwrap();
-
-        let owner_gateway = gateway_router(test_state(owner_dir.path()));
-        let guest_gateway = gateway_router(test_state(guest_dir.path()));
-
-        let owner_first_poll = owner_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(owner_first_poll.status(), StatusCode::OK);
-
-        let guest_first_poll = guest_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(guest_first_poll.status(), StatusCode::OK);
-        let guest_body = axum::body::to_bytes(guest_first_poll.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let guest_poll: serde_json::Value = serde_json::from_slice(&guest_body).unwrap();
-        let guest_objects = guest_poll["objects"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert!(guest_objects.iter().any(|object| {
-            object["kind"].as_str() == Some("system")
-                && object["sender"].as_str() == Some("Owner")
-                && object["body"].as_str() == Some("joined the room")
-        }));
-        let guest_participants = guest_poll["participants"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(guest_participants.len(), 2);
-
-        let owner_second_poll = owner_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(owner_second_poll.status(), StatusCode::OK);
-        let owner_body = axum::body::to_bytes(owner_second_poll.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let owner_poll: serde_json::Value = serde_json::from_slice(&owner_body).unwrap();
-        let owner_objects = owner_poll["objects"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert!(owner_objects.iter().any(|object| {
-            object["kind"].as_str() == Some("system")
-                && object["sender"].as_str() == Some("Guest")
-                && object["body"].as_str() == Some("joined the room")
-        }));
-        let owner_participants = owner_poll["participants"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(owner_participants.len(), 2);
-
-        let guest_leave = guest_gateway
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/session/leave")
-                    .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(guest_leave.status(), StatusCode::OK);
-
-        let owner_after_leave = owner_gateway
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/room-browser/poll")
-                    .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(owner_after_leave.status(), StatusCode::OK);
-        let owner_after_leave_body =
-            axum::body::to_bytes(owner_after_leave.into_body(), usize::MAX)
-                .await
-                .unwrap();
-        let owner_after_leave_json: serde_json::Value =
-            serde_json::from_slice(&owner_after_leave_body).unwrap();
-        let owner_after_leave_objects = owner_after_leave_json["objects"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            owner_after_leave_objects.iter().any(|object| {
-                object["kind"].as_str() == Some("system")
-                    && object["sender"].as_str() == Some("Guest")
-                    && object["body"].as_str() == Some("left the room")
-            }),
-            "owner after leave poll: {owner_after_leave_json}"
-        );
-        let owner_after_leave_participants = owner_after_leave_json["participants"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(owner_after_leave_participants.len(), 1);
-        assert!(owner_after_leave_participants.iter().any(|participant| {
-            participant["member_did"].as_str() == Some(owner_did.as_str())
-                && participant["display_name"].as_str() == Some("Owner")
-        }));
-    }
-}
+#[path = "gateway_tests.rs"]
+mod gateway_tests;

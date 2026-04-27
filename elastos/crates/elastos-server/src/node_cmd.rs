@@ -487,7 +487,7 @@ fn print_remote_room_approve(
 ) {
     match outcome {
         Some(outcome) => {
-            println!("Approved remote room browser pairing.");
+            println!("Approved remote room browser access.");
             println!("Peer DID:       {}", peer_did);
             println!("Request:        {}", outcome.request_id);
             println!(
@@ -516,7 +516,7 @@ fn print_remote_room_deny(
 ) {
     match outcome {
         Some(outcome) => {
-            println!("Denied remote room browser pairing.");
+            println!("Denied remote room browser access.");
             println!("Peer DID:       {}", peer_did);
             println!("Request:        {}", outcome.request_id);
             println!(

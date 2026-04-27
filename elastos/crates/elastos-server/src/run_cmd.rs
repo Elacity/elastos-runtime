@@ -80,12 +80,12 @@ async fn load_valid_manifest_if_present(
     Ok(Some(manifest))
 }
 
-async fn operator_runtime_coords() -> anyhow::Result<crate::shell_cmd::RuntimeCoords> {
+async fn operator_runtime_coords() -> anyhow::Result<crate::runtime_control::RuntimeCoords> {
     let data_dir = crate::default_data_dir();
-    let coords_path = crate::shell_cmd::runtime_coord_path(&data_dir);
-    crate::shell_cmd::read_operator_runtime_coords(&coords_path)
+    let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
+    crate::runtime_control::read_operator_runtime_coords(&coords_path)
         .await
-        .ok_or_else(|| anyhow::anyhow!(crate::shell_cmd::OPERATOR_RUNTIME_REQUIRED_MESSAGE))
+        .ok_or_else(|| anyhow::anyhow!(crate::runtime_control::OPERATOR_RUNTIME_REQUIRED_MESSAGE))
 }
 
 async fn run_microvm_via_operator_runtime(
@@ -95,7 +95,7 @@ async fn run_microvm_via_operator_runtime(
     let coords = operator_runtime_coords().await?;
     eprintln!("[run] Attaching to runtime at {}", coords.api_url);
 
-    let tokens = crate::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::new();
     let _ = client
         .post(format!("{}/api/supervisor/ensure-capsule", coords.api_url))
@@ -128,7 +128,7 @@ async fn run_microvm_via_operator_runtime(
 
     let handle = body["handle"].as_str().unwrap_or("?").to_string();
     eprintln!("[run] MicroVM '{}' launched: {}", manifest.name, handle);
-    let saved = crate::shell_cmd::enable_host_raw_mode_pub();
+    let saved = crate::runtime_control::enable_host_raw_mode_pub();
     tokio::signal::ctrl_c().await?;
     drop(saved);
     let _ = client
@@ -151,7 +151,7 @@ async fn run_wasm_via_operator_runtime(
     );
 
     let runtime = crate::create_runtime("/tmp/elastos/storage").await?;
-    let tokens = crate::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let api_url = coords.api_url.clone();
     let client_token = tokens.client_token;
     runtime.set_wasm_bridge_spawner(std::sync::Arc::new(move |pipes| {
@@ -162,7 +162,7 @@ async fn run_wasm_via_operator_runtime(
         );
     }));
 
-    let _saved_termios = crate::shell_cmd::enable_host_raw_mode_pub();
+    let _saved_termios = crate::runtime_control::enable_host_raw_mode_pub();
     let _term_env = ScopedTerminalEnv::capture();
     let handle = runtime
         .run_local(capsule_dir, capsule_args)

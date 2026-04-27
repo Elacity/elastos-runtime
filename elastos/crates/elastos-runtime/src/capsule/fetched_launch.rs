@@ -197,6 +197,7 @@ mod tests {
                     "schema": "elastos.capsule/v1",
                     "version": "1.2.3",
                     "name": "chat",
+                    "role": "app",
                     "type": "wasm",
                     "entrypoint": "chat.wasm"
                 }"#,

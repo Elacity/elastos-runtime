@@ -1474,7 +1474,6 @@ impl Supervisor {
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
-                    None,
                     Some(registry),
                     cache_path,
                     data_dir,

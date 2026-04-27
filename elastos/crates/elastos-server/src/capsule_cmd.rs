@@ -24,28 +24,28 @@ fn parse_config_object(
 
 async fn runtime_for_capsule(
     interactive_surface: bool,
-) -> anyhow::Result<crate::shell_cmd::RuntimeCoords> {
+) -> anyhow::Result<crate::runtime_control::RuntimeCoords> {
     let data_dir = default_data_dir();
-    let coords_path = crate::shell_cmd::runtime_coord_path(&data_dir);
+    let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
 
     if interactive_surface {
-        if let Some(coords) = crate::shell_cmd::read_runtime_coords(&coords_path).await {
+        if let Some(coords) = crate::runtime_control::read_runtime_coords(&coords_path).await {
             if coords.is_operator_runtime()
                 || matches!(
                     coords.runtime_kind.as_str(),
-                    crate::shell_cmd::RUNTIME_KIND_MANAGED_CHAT
-                        | crate::shell_cmd::RUNTIME_KIND_MANAGED_PC2
+                    crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT
+                        | crate::runtime_control::RUNTIME_KIND_MANAGED_HOME
                 )
             {
                 return Ok(coords);
             }
         }
-        return crate::shell_cmd::ensure_runtime_for_pc2(&data_dir).await;
+        return crate::runtime_control::ensure_runtime_for_home(&data_dir).await;
     }
 
-    crate::shell_cmd::read_operator_runtime_coords(&coords_path)
+    crate::runtime_control::read_operator_runtime_coords(&coords_path)
         .await
-        .ok_or_else(|| anyhow!(crate::shell_cmd::OPERATOR_RUNTIME_REQUIRED_MESSAGE))
+        .ok_or_else(|| anyhow!(crate::runtime_control::OPERATOR_RUNTIME_REQUIRED_MESSAGE))
 }
 
 async fn supervisor_post(
@@ -164,7 +164,7 @@ impl Drop for ScopedTerminalEnv {
 
 async fn run_wasm_capsule(
     capsule_dir: PathBuf,
-    coords: &crate::shell_cmd::RuntimeCoords,
+    coords: &crate::runtime_control::RuntimeCoords,
     client_token: String,
     config: &serde_json::Map<String, serde_json::Value>,
     interactive: bool,
@@ -185,7 +185,7 @@ async fn run_wasm_capsule(
     let _command_env = ScopedEnvVar::set("ELASTOS_COMMAND", &config_text);
     let _command_b64_env = ScopedEnvVar::set("ELASTOS_COMMAND_B64", &config_b64);
     let _term_env = ScopedTerminalEnv::capture();
-    let _saved_termios = interactive.then(crate::shell_cmd::enable_host_raw_mode_pub);
+    let _saved_termios = interactive.then(crate::runtime_control::enable_host_raw_mode_pub);
 
     runtime
         .run_local(&capsule_dir, Vec::new())
@@ -204,7 +204,7 @@ pub async fn run_capsule(
     let interactive_surface = interactive || lifecycle.trim().eq_ignore_ascii_case("interactive");
     let target_name = name.clone();
     let coords = runtime_for_capsule(interactive_surface).await?;
-    let tokens = crate::shell_cmd::attach_to_runtime(&coords).await?;
+    let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
 
     let client = reqwest::Client::new();
     let resolve = supervisor_post(
