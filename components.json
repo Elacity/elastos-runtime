@@ -320,17 +320,17 @@
         }
       }
     },
-    "md-viewer": {
-      "install_path": "capsules/md-viewer",
-      "description": "Markdown viewer assets required for direct share/open flows",
+    "documents": {
+      "install_path": "capsules/documents",
+      "description": "Documents capsule for local markdown editing and published revisions",
       "platforms": {
         "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "md-viewer.tar.gz",
-          "extract_path": "md-viewer",
-          "install_path": "capsules/md-viewer"
+          "release_path": "documents.tar.gz",
+          "extract_path": "documents",
+          "install_path": "capsules/documents"
         }
       }
     },
@@ -506,7 +506,8 @@
         "webspace-provider",
         "home-cli",
         "home",
-        "system"
+        "system",
+        "documents"
       ]
     },
     "demo": {
@@ -529,7 +530,7 @@
         "cloudflared",
         "kubo",
         "ipfs-provider",
-        "md-viewer"
+        "documents"
       ]
     },
     "chat": {
@@ -563,7 +564,7 @@
         "system",
         "kubo",
         "ipfs-provider",
-        "md-viewer",
+        "documents",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -582,7 +583,7 @@
         "ipfs-provider",
         "site-provider",
         "tunnel-provider",
-        "md-viewer",
+        "documents",
         "cloudflared"
       ]
     },
@@ -604,7 +605,7 @@
         "ipfs-provider",
         "site-provider",
         "tunnel-provider",
-        "md-viewer",
+        "documents",
         "crosvm",
         "vmlinux",
         "kubo",

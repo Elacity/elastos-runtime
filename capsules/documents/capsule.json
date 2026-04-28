@@ -1,13 +1,14 @@
 {
   "schema": "elastos.capsule/v1",
-  "name": "md-viewer",
+  "name": "documents",
   "version": "0.1.0",
-  "description": "Renders markdown files with a clean stylesheet",
+  "description": "Create, edit, and publish markdown documents",
+  "role": "viewer",
   "type": "data",
   "author": "elastos",
   "entrypoint": "index.html",
   "resources": {
-    "memory_mb": 16,
+    "memory_mb": 24,
     "gpu": false
   }
 }
