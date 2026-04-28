@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "system",
+  "version": "0.1.0",
+  "description": "Runtime-launched System surface for identity and runtime state",
+  "author": "elastos",
+  "role": "app",
+  "type": "wasm",
+  "entrypoint": "system.wasm",
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}

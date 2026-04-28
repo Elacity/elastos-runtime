@@ -725,12 +725,13 @@ build_platform_independent_direct_assets() {
     cp "$home_cli_archive" "$home_cli_staged"
     updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
 
-    local home_archive home_staged
-    home_archive=$(build_browser_wasm_capsule_archive "$platform" "home")
-    release_path="home.tar.gz"
-    home_staged="${stage_dir}/${release_path}"
-    cp "$home_archive" "$home_staged"
-    updates_json=$(record_direct_asset "$updates_json" "home" "$home_staged" "capsules/home" "$release_path" "home")
+    for capsule in home system; do
+        archive=$(build_browser_wasm_capsule_archive "$platform" "$capsule")
+        release_path="${capsule}.tar.gz"
+        staged="${stage_dir}/${release_path}"
+        cp "$archive" "$staged"
+        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule")
+    done
 
     stamp_direct_assets "*" "$updates_json"
 }

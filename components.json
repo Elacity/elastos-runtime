@@ -210,6 +210,20 @@
         }
       }
     },
+    "system": {
+      "install_path": "capsules/system",
+      "description": "Runtime-launched System capsule for identity, runtime, storage, and appearance state",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "system.tar.gz",
+          "extract_path": "system",
+          "install_path": "capsules/system"
+        }
+      }
+    },
     "chat": {
       "install_path": "capsules/chat",
       "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
@@ -491,7 +505,8 @@
         "did-provider",
         "webspace-provider",
         "home-cli",
-        "home"
+        "home",
+        "system"
       ]
     },
     "demo": {
@@ -503,6 +518,7 @@
         "webspace-provider",
         "home-cli",
         "home",
+        "system",
         "chat",
         "chat-wasm",
         "gba-emulator",
@@ -544,6 +560,7 @@
         "webspace-provider",
         "home-cli",
         "home",
+        "system",
         "kubo",
         "ipfs-provider",
         "md-viewer",
@@ -560,6 +577,7 @@
         "webspace-provider",
         "home-cli",
         "home",
+        "system",
         "kubo",
         "ipfs-provider",
         "site-provider",
@@ -577,6 +595,7 @@
         "webspace-provider",
         "home-cli",
         "home",
+        "system",
         "chat",
         "chat-wasm",
         "gba-emulator",
