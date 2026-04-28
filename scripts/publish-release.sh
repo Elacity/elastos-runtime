@@ -499,7 +499,7 @@ build_packaged_capsule_archive() {
     [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
 
     case "$capsule_name" in
-        documents)
+        documents|library)
             required_files=(capsule.json index.html)
             ;;
         chat-wasm)
@@ -710,7 +710,7 @@ build_platform_independent_direct_assets() {
     mkdir -p "$stage_dir"
     updates_json='{}'
 
-    for capsule in documents chat-wasm gba-emulator gba-ucity room-browser; do
+    for capsule in documents library chat-wasm gba-emulator gba-ucity room-browser; do
         archive=$(build_packaged_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"

@@ -334,6 +334,20 @@
         }
       }
     },
+    "library": {
+      "install_path": "capsules/library",
+      "description": "Library capsule for browsing local document objects",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "library.tar.gz",
+          "extract_path": "library",
+          "install_path": "capsules/library"
+        }
+      }
+    },
     "gba-emulator": {
       "install_path": "capsules/gba-emulator",
       "description": "Browser GBA viewer bundle used by Home and explicit elastos run",
@@ -507,7 +521,8 @@
         "home-cli",
         "home",
         "system",
-        "documents"
+        "documents",
+        "library"
       ]
     },
     "demo": {
@@ -530,7 +545,8 @@
         "cloudflared",
         "kubo",
         "ipfs-provider",
-        "documents"
+        "documents",
+        "library"
       ]
     },
     "chat": {
@@ -565,6 +581,7 @@
         "kubo",
         "ipfs-provider",
         "documents",
+        "library",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -584,6 +601,7 @@
         "site-provider",
         "tunnel-provider",
         "documents",
+        "library",
         "cloudflared"
       ]
     },
@@ -606,6 +624,7 @@
         "site-provider",
         "tunnel-provider",
         "documents",
+        "library",
         "crosvm",
         "vmlinux",
         "kubo",
