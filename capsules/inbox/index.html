@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inbox · ElastOS</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #edf1fb;
+      --bg-strong: #e3e9fb;
+      --panel: rgba(255, 255, 255, 0.9);
+      --panel-strong: #ffffff;
+      --panel-soft: #eef2ff;
+      --line: rgba(83, 103, 164, 0.14);
+      --line-strong: rgba(83, 103, 164, 0.22);
+      --ink: #1d2438;
+      --muted: #66708a;
+      --brand: #f6921a;
+      --brand-soft: #fff1dc;
+      --accent: #5f76d8;
+      --accent-soft: #e8edff;
+      --accent-deep: #3c53a7;
+      --danger: #b14c5a;
+      --self: #edf2ff;
+      --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+      --border: var(--line);
+      --border-strong: var(--line-strong);
+      --text: var(--ink);
+      --radius-xl: 26px;
+      --radius-lg: 18px;
+      --radius-md: 14px;
+      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100dvh;
+      background:
+        radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
+        linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+      color: var(--text);
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .locked-shell {
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .locked-card,
+    .sidebar,
+    .main {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .locked-card {
+      max-width: 500px;
+      padding: 30px;
+    }
+
+    .shell {
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: grid;
+      grid-template-columns: minmax(240px, 290px) minmax(0, 1fr);
+      gap: 24px;
+      padding: 24px;
+    }
+
+    .sidebar,
+    .main {
+      min-width: 0;
+      padding: 22px;
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .main {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      font-size: 0.82rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    h1,
+    h2,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 6vw, 3.4rem);
+      letter-spacing: -0.05em;
+      line-height: 0.95;
+    }
+
+    h2 {
+      font-size: clamp(1.4rem, 3vw, 2.2rem);
+      letter-spacing: -0.035em;
+    }
+
+    .subtitle,
+    .muted {
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .summary-stack {
+      display: grid;
+      gap: 10px;
+      margin-top: auto;
+    }
+
+    .summary-card {
+      padding: 14px;
+      border: 1px solid rgba(83, 103, 164, 0.1);
+      border-radius: var(--radius-lg);
+      background: rgba(255, 255, 255, 0.7);
+    }
+
+    .summary-card strong {
+      display: block;
+      font-size: 1.45rem;
+      letter-spacing: -0.04em;
+    }
+
+    .summary-card span {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid rgba(83, 103, 164, 0.1);
+    }
+
+    .action-secondary,
+    .entry-action {
+      min-height: 38px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      padding: 8px 14px;
+      background: rgba(255, 255, 255, 0.8);
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 700;
+      transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+    }
+
+    .action-secondary:hover,
+    .action-secondary:focus-visible,
+    .entry-action:hover,
+    .entry-action:focus-visible {
+      border-color: var(--border-strong);
+      background: #f8fbff;
+      outline: none;
+      transform: translateY(-1px);
+    }
+
+    .entry-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .entry {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      padding: 18px;
+      border: 1px solid rgba(83, 103, 164, 0.1);
+      border-radius: var(--radius-lg);
+      background: var(--panel-strong);
+      box-shadow: 0 14px 34px rgba(34, 49, 88, 0.08);
+    }
+
+    .entry[data-severity="attention"] {
+      border-color: rgba(95, 118, 216, 0.28);
+      background:
+        linear-gradient(135deg, rgba(95, 118, 216, 0.1), transparent 42%),
+        var(--panel-strong);
+    }
+
+    .entry-copy {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .entry-title-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .entry-title {
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .entry-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 23px;
+      padding: 0 9px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 0.72rem;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .entry-time {
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .entry-body {
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .entry-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      align-content: flex-start;
+      gap: 8px;
+      min-width: 200px;
+    }
+
+    .entry-action.primary {
+      background: var(--text);
+      border-color: var(--text);
+      color: #f8fbff;
+    }
+
+    .entry-action.danger {
+      color: var(--danger);
+      border-color: rgba(177, 76, 90, 0.24);
+      background: rgba(177, 76, 90, 0.08);
+    }
+
+    .entry-action:disabled {
+      cursor: wait;
+      opacity: 0.55;
+      transform: none;
+    }
+
+    .empty-state {
+      min-height: 260px;
+      display: grid;
+      place-items: center;
+      padding: 28px;
+      border: 1px dashed rgba(83, 103, 164, 0.18);
+      border-radius: var(--radius-xl);
+      background: rgba(255, 255, 255, 0.55);
+      text-align: center;
+    }
+
+    .status {
+      min-height: 1.5em;
+      color: var(--muted);
+    }
+
+    @media (max-width: 900px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .summary-stack {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 640px) {
+      .shell {
+        gap: 8px;
+        padding: 4px;
+      }
+
+      .locked-shell {
+        padding: 4px;
+      }
+
+      .locked-card,
+      .sidebar,
+      .main {
+        border-radius: 14px;
+        box-shadow: 0 10px 26px rgba(34, 49, 88, 0.08);
+      }
+
+      .locked-card,
+      .sidebar,
+      .main {
+        padding: 8px;
+      }
+
+      .toolbar,
+      .entry {
+        grid-template-columns: 1fr;
+      }
+
+      .toolbar {
+        display: grid;
+        gap: 8px;
+      }
+
+      .entry {
+        gap: 8px;
+        padding: 8px;
+      }
+
+      .entry-actions {
+        justify-content: flex-start;
+        min-width: 0;
+      }
+
+      .summary-stack {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <section id="locked-shell" class="locked-shell hidden">
+    <div class="locked-card">
+      <p class="eyebrow">ElastOS</p>
+      <h1>Open from Home</h1>
+      <p class="subtitle">Review Home requests.</p>
+    </div>
+  </section>
+
+  <section id="inbox-shell" class="shell hidden">
+    <aside class="sidebar">
+      <div>
+        <p class="eyebrow">Inbox</p>
+      </div>
+      <div class="summary-stack" aria-label="Inbox summary">
+        <article class="summary-card">
+          <strong id="pending-count">0</strong>
+          <span>Pending</span>
+        </article>
+        <article class="summary-card">
+          <strong id="review-count">0</strong>
+          <span>Review</span>
+        </article>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="toolbar">
+        <div>
+          <p class="eyebrow">Requests</p>
+          <p id="status-text" class="status">Loading...</p>
+        </div>
+        <button id="refresh" class="action-secondary" type="button">Refresh</button>
+      </div>
+
+      <section id="entry-list" class="entry-list" aria-live="polite"></section>
+      <section id="empty-state" class="empty-state hidden">
+        <div>
+          <h2>No requests</h2>
+        </div>
+      </section>
+    </main>
+  </section>
+
+  <script>
+    const state = {
+      homeToken: new URLSearchParams(window.location.search).get("home_token") || "",
+      entries: [],
+    };
+
+    const elements = {
+      lockedShell: document.getElementById("locked-shell"),
+      inboxShell: document.getElementById("inbox-shell"),
+      statusText: document.getElementById("status-text"),
+      pendingCount: document.getElementById("pending-count"),
+      reviewCount: document.getElementById("review-count"),
+      refresh: document.getElementById("refresh"),
+      entryList: document.getElementById("entry-list"),
+      emptyState: document.getElementById("empty-state"),
+    };
+
+    function showLocked() {
+      elements.lockedShell.classList.remove("hidden");
+      elements.inboxShell.classList.add("hidden");
+    }
+
+    function showInbox() {
+      elements.lockedShell.classList.add("hidden");
+      elements.inboxShell.classList.remove("hidden");
+    }
+
+    function setStatus(text) {
+      elements.statusText.textContent = text;
+    }
+
+    function notifyHome() {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          type: "home:refresh-summary",
+          homeToken: state.homeToken,
+        }, window.location.origin);
+      }
+    }
+
+    async function api(path, options) {
+      const request = Object.assign({ method: "GET" }, options || {});
+      request.headers = Object.assign({}, request.headers || {}, {
+        "x-elastos-home-token": state.homeToken,
+      });
+      if (request.body && !request.headers["content-type"]) {
+        request.headers["content-type"] = "application/json";
+      }
+      const response = await fetch(path, request);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "Request failed: " + response.status);
+      }
+      return response.json();
+    }
+
+    async function inboxAction(actionId) {
+      return api("/api/apps/inbox/actions", {
+        method: "POST",
+        body: JSON.stringify({ action_id: actionId }),
+      });
+    }
+
+    async function loadInbox() {
+      const payload = await api("/api/apps/inbox/summary");
+      const notifications = payload.notifications || {};
+      state.entries = Array.isArray(notifications.entries) ? notifications.entries : [];
+      renderInbox(notifications);
+      markVisibleRead(notifications);
+      notifyHome();
+    }
+
+    function renderInbox(notifications) {
+      const entries = state.entries;
+      const attentionCount = Number(notifications.attention_count || 0);
+      elements.pendingCount.textContent = String(entries.length);
+      elements.reviewCount.textContent = String(attentionCount);
+      elements.entryList.replaceChildren();
+      for (const entry of entries) {
+        elements.entryList.appendChild(createEntry(entry));
+      }
+      elements.emptyState.classList.toggle("hidden", entries.length !== 0);
+      setStatus(entries.length === 0 ? "" : `${entries.length} pending.`);
+    }
+
+    function createEntry(entry) {
+      const article = document.createElement("article");
+      article.className = "entry";
+      article.dataset.notificationId = entry.id || "";
+      article.dataset.severity = entry.severity || "info";
+
+      const copy = document.createElement("div");
+      copy.className = "entry-copy";
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "entry-title-row";
+      const title = document.createElement("div");
+      title.className = "entry-title";
+      title.textContent = entry.title || "Request";
+      titleRow.appendChild(title);
+      if (entry.severity === "attention") {
+        const badge = document.createElement("span");
+        badge.className = "entry-badge";
+        badge.textContent = "Review";
+        titleRow.appendChild(badge);
+      }
+      if (!entry.read) {
+        const badge = document.createElement("span");
+        badge.className = "entry-badge";
+        badge.textContent = "New";
+        titleRow.appendChild(badge);
+      }
+
+      const time = document.createElement("time");
+      time.className = "entry-time";
+      if (entry.created_at) {
+        time.dateTime = new Date(entry.created_at * 1000).toISOString();
+        time.textContent = formatInboxTime(entry.created_at);
+      }
+
+      const body = document.createElement("p");
+      body.className = "entry-body";
+      body.textContent = entry.body || "";
+
+      copy.append(titleRow, time, body);
+
+      const actions = document.createElement("div");
+      actions.className = "entry-actions";
+      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
+        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
+      }
+
+      const actionId = entry.action_ref && entry.action_ref.action_id;
+      if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
+      }
+
+      actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
+      article.append(copy, actions);
+      return article;
+    }
+
+    function createButton(label, onClick, className) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "entry-action" + (className ? " " + className : "");
+      button.textContent = label;
+      button.addEventListener("click", () => {
+        Promise.resolve(onClick(button)).catch((error) => {
+          setStatus(error.message || "Action failed.");
+        });
+      });
+      return button;
+    }
+
+    function createActionButton(label, actionId, className) {
+      const button = createButton(label, () => runAction(actionId), className);
+      button.dataset.actionId = actionId;
+      return button;
+    }
+
+    async function runAction(actionId) {
+      setButtonsDisabled(true);
+      try {
+        await inboxAction(actionId);
+        await loadInbox();
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    function setButtonsDisabled(disabled) {
+      for (const button of elements.entryList.querySelectorAll("button")) {
+        button.disabled = disabled;
+      }
+      elements.refresh.disabled = disabled;
+    }
+
+    function openSource(sourceApp) {
+      const target = typeof sourceApp === "string" ? sourceApp.trim() : "";
+      if (!target || !window.parent || window.parent === window) {
+        return;
+      }
+      window.parent.postMessage({
+        type: "home:open-target",
+        target,
+        query: {},
+        homeToken: state.homeToken,
+      }, window.location.origin);
+    }
+
+    function markVisibleRead(notifications) {
+      const unreadIds = state.entries
+        .filter((entry) => entry && entry.id && !entry.read)
+        .map((entry) => entry.id);
+      if (unreadIds.length === 0) {
+        return;
+      }
+      Promise.all(
+        unreadIds.map((id) => inboxAction("notification-read:" + id).catch(() => null)),
+      ).then(() => {
+        for (const entry of state.entries) {
+          entry.read = true;
+        }
+        renderInbox(Object.assign({}, notifications, { unread_count: 0 }));
+        notifyHome();
+      });
+    }
+
+    function formatInboxTime(createdAt) {
+      const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000) - Number(createdAt || 0));
+      if (ageSeconds < 60) {
+        return "just now";
+      }
+      if (ageSeconds < 3600) {
+        return Math.floor(ageSeconds / 60) + "m ago";
+      }
+      if (ageSeconds < 86400) {
+        return Math.floor(ageSeconds / 3600) + "h ago";
+      }
+      return new Intl.DateTimeFormat([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      }).format(new Date(Number(createdAt) * 1000));
+    }
+
+    elements.refresh.addEventListener("click", () => {
+      setButtonsDisabled(true);
+      loadInbox()
+        .catch((error) => setStatus(error.message || "Could not refresh."))
+        .finally(() => setButtonsDisabled(false));
+    });
+
+    if (!state.homeToken) {
+      showLocked();
+    } else {
+      showInbox();
+      loadInbox().catch((error) => setStatus(error.message || "Could not load inbox."));
+    }
+  </script>
+</body>
+</html>

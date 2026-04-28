@@ -348,6 +348,20 @@
         }
       }
     },
+    "inbox": {
+      "install_path": "capsules/inbox",
+      "description": "Inbox capsule for reviewing Home requests",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "inbox.tar.gz",
+          "extract_path": "inbox",
+          "install_path": "capsules/inbox"
+        }
+      }
+    },
     "gba-emulator": {
       "install_path": "capsules/gba-emulator",
       "description": "Browser GBA viewer bundle used by Home and explicit elastos run",
@@ -522,7 +536,8 @@
         "home",
         "system",
         "documents",
-        "library"
+        "library",
+        "inbox"
       ]
     },
     "demo": {
@@ -546,7 +561,8 @@
         "kubo",
         "ipfs-provider",
         "documents",
-        "library"
+        "library",
+        "inbox"
       ]
     },
     "chat": {
@@ -582,6 +598,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "inbox",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -602,6 +619,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "inbox",
         "cloudflared"
       ]
     },
@@ -625,6 +643,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "inbox",
         "crosvm",
         "vmlinux",
         "kubo",
