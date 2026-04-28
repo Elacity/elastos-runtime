@@ -511,9 +511,6 @@ build_packaged_capsule_archive() {
         gba-ucity)
             required_files=(ucity.gba)
             ;;
-        room-browser)
-            required_files=(capsule.json index.html style.css room_browser_ui.js room_browser_ui_bg.wasm)
-            ;;
         *)
             die "Unsupported static capsule archive request: ${capsule_name}"
             ;;
@@ -710,7 +707,7 @@ build_platform_independent_direct_assets() {
     mkdir -p "$stage_dir"
     updates_json='{}'
 
-    for capsule in documents library inbox chat-wasm gba-emulator gba-ucity room-browser; do
+    for capsule in documents library inbox chat-wasm gba-emulator gba-ucity; do
         archive=$(build_packaged_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
@@ -725,7 +722,7 @@ build_platform_independent_direct_assets() {
     cp "$home_cli_archive" "$home_cli_staged"
     updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
 
-    for capsule in home system; do
+    for capsule in home system chat-room; do
         archive=$(build_browser_wasm_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"

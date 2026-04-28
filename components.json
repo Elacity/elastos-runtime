@@ -390,17 +390,17 @@
         }
       }
     },
-    "room-browser": {
-      "install_path": "capsules/room-browser",
-      "description": "Hosted browser capsule for the sovereign room service",
+    "chat-room": {
+      "install_path": "capsules/chat-room",
+      "description": "Runtime-launched Chat Room capsule",
       "platforms": {
         "*": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "room-browser.tar.gz",
-          "extract_path": "room-browser",
-          "install_path": "capsules/room-browser"
+          "release_path": "chat-room.tar.gz",
+          "extract_path": "chat-room",
+          "install_path": "capsules/chat-room"
         }
       }
     },
@@ -554,7 +554,7 @@
         "chat-wasm",
         "gba-emulator",
         "gba-ucity",
-        "room-browser",
+        "chat-room",
         "site-provider",
         "tunnel-provider",
         "cloudflared",
@@ -637,7 +637,7 @@
         "chat-wasm",
         "gba-emulator",
         "gba-ucity",
-        "room-browser",
+        "chat-room",
         "ipfs-provider",
         "site-provider",
         "tunnel-provider",

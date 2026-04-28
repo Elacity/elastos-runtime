@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "chat-room",
+  "version": "0.1.0",
+  "description": "Runtime-launched chat room capsule with a web surface adapter",
+  "role": "app",
+  "type": "wasm",
+  "author": "elastos",
+  "entrypoint": "chat-room.wasm",
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}
