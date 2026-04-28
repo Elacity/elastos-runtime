@@ -1,0 +1,15 @@
+[package]
+name = "home"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Home capsule"
+license = "MIT"
+
+[dependencies]
+elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

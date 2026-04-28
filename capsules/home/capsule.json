@@ -1,0 +1,19 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "home",
+  "version": "0.1.0",
+  "description": "Runtime-owned Home surface for ElastOS",
+  "author": "elastos",
+  "role": "shell",
+  "type": "wasm",
+  "entrypoint": "home.wasm",
+  "requires": [],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": [],
+    "messaging": []
+  }
+}

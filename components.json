@@ -196,6 +196,20 @@
         }
       }
     },
+    "home": {
+      "install_path": "capsules/home",
+      "description": "Runtime-owned Home browser shell capsule",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "home.tar.gz",
+          "extract_path": "home",
+          "install_path": "capsules/home"
+        }
+      }
+    },
     "chat": {
       "install_path": "capsules/chat",
       "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
@@ -476,7 +490,8 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
-        "home-cli"
+        "home-cli",
+        "home"
       ]
     },
     "demo": {
@@ -487,6 +502,7 @@
         "did-provider",
         "webspace-provider",
         "home-cli",
+        "home",
         "chat",
         "chat-wasm",
         "gba-emulator",
@@ -527,6 +543,7 @@
         "did-provider",
         "webspace-provider",
         "home-cli",
+        "home",
         "kubo",
         "ipfs-provider",
         "md-viewer",
@@ -542,6 +559,7 @@
         "did-provider",
         "webspace-provider",
         "home-cli",
+        "home",
         "kubo",
         "ipfs-provider",
         "site-provider",
@@ -558,6 +576,7 @@
         "did-provider",
         "webspace-provider",
         "home-cli",
+        "home",
         "chat",
         "chat-wasm",
         "gba-emulator",

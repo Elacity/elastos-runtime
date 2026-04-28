@@ -557,6 +557,33 @@ build_home_cli_archive() {
     echo "$archive"
 }
 
+build_browser_wasm_capsule_archive() {
+    local platform="$1"
+    local capsule_name="$2"
+    local capsule_dir wasm_name stage_root archive
+
+    capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
+    [[ -n "$capsule_dir" ]] || die "${capsule_name} source directory not found"
+    [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
+    [[ -d "${capsule_dir}/browser" ]] || die "${capsule_name} browser assets missing at ${capsule_dir}/browser"
+
+    wasm_name="${capsule_name}.wasm"
+    ensure_rust_target_installed "wasm32-wasip1"
+    info "  Building ${capsule_name} (wasm32-wasip1)..." >&2
+    (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release) >&2
+    [[ -f "${capsule_dir}/target/wasm32-wasip1/release/${wasm_name}" ]] || die "${wasm_name} missing after build"
+
+    stage_root="${TMPDIR}/support-assets-${platform}"
+    archive="${stage_root}/${capsule_name}.tar.gz"
+    rm -rf "${stage_root}/${capsule_name}"
+    mkdir -p "${stage_root}/${capsule_name}"
+    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/"
+    cp "${capsule_dir}/target/wasm32-wasip1/release/${wasm_name}" "${stage_root}/${capsule_name}/"
+    cp -R "${capsule_dir}/browser" "${stage_root}/${capsule_name}/browser"
+    tar -czf "$archive" -C "$stage_root" "$capsule_name"
+    echo "$archive"
+}
+
 build_chat_archive() {
     local platform="$1"
     local use_cross="${2:-false}"
@@ -697,6 +724,13 @@ build_platform_independent_direct_assets() {
     home_cli_staged="${stage_dir}/${release_path}"
     cp "$home_cli_archive" "$home_cli_staged"
     updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
+
+    local home_archive home_staged
+    home_archive=$(build_browser_wasm_capsule_archive "$platform" "home")
+    release_path="home.tar.gz"
+    home_staged="${stage_dir}/${release_path}"
+    cp "$home_archive" "$home_staged"
+    updates_json=$(record_direct_asset "$updates_json" "home" "$home_staged" "capsules/home" "$release_path" "home")
 
     stamp_direct_assets "*" "$updates_json"
 }
