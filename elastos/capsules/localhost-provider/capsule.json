@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Localhost provider - secure access to local machine resources",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "provides": "localhost://*",

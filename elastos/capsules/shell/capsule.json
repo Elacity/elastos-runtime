@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "ElastOS shell - orchestrates capability grants and capsule lifecycle",
   "author": "elastos",
+  "role": "shell",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "resources": {

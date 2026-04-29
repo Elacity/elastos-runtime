@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Capability-aware note storage",
   "author": "elastos",
+  "role": "app",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "capabilities": ["localhost://Users/self/Documents/Notes/*"],

@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "IPFS operations via managed Kubo daemon",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [

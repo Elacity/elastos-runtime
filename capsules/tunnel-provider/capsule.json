@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Carrier network provider for elastos://tunnel/ (public cloudflared quick tunnels)",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [

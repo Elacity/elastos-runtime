@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "DID identity provider - device-backed did:key identity",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "provides": "elastos://did/*",

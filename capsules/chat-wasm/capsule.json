@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "P2P chat client - WASM stdio variant (same wire format as microVM chat)",
   "author": "elastos",
+  "role": "app",
   "type": "wasm",
   "entrypoint": "chat-stdio.wasm",
   "requires": [],

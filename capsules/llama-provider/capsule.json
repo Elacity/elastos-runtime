@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Local LLM inference via llama-server",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [

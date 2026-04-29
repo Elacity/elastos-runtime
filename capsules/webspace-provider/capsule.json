@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Dynamic WebSpace resolver for localhost://WebSpaces/<moniker>/...",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "capabilities": ["localhost://WebSpaces/*"],

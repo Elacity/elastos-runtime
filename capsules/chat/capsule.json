@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "P2P chat client - mIRC/IRSSI-style terminal interface",
   "author": "elastos",
+  "role": "app",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [],

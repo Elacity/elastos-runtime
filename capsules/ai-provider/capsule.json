@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "AI provider - routes LLM requests to local llama, Venice, or local Codex CLI",
   "author": "elastos",
+  "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [

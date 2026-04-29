@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "AI chat agent - joins P2P channels and responds via LLM",
   "author": "elastos",
+  "role": "app",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [
