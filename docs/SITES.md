@@ -131,17 +131,17 @@ For a higher-availability hosted/public front door that proxies or mirrors the s
 Examples:
 
 - active proxy / supernode fronting a local site
-- hosted reverse-proxy path coordinated with the broader PC2 / domain-registration work
+- hosted reverse-proxy path coordinated with the broader Home / domain-registration work
 
 This is the path that can later map cleanly onto:
 
 - `runtime.ela.city`
 - `carrier.ela.city`
-- broader PC2-hosted site surfaces
+- broader Home-hosted site surfaces
 
 ## Design Rules
 
-1. No silent fallback.
+1. No silent alternate path.
    Local site publication must not quietly escape to arbitrary web hosting.
 
 2. The local root stays primary.

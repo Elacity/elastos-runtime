@@ -69,7 +69,7 @@ Return a shareable ticket string for manual peer connection.
 
 ### connect
 
-Connect to a peer using their ticket string (manual fallback when DHT is unavailable).
+Connect to a peer using their ticket string when DHT discovery is unavailable.
 
 ```json
 // Request

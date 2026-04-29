@@ -43,7 +43,7 @@ cargo test --workspace
 ./target/release/elastos serve
 ```
 
-`elastos run` is the explicit path/CID launch surface. It is not part of the normal install → setup → PC2 user path, and it expects a built capsule directory or CID plus an already-running operator runtime.
+`elastos run` is the explicit path/CID launch surface. It is not part of the normal install -> setup -> Home user path, and it expects a built capsule directory or CID plus an already-running operator runtime.
 
 ## Project Structure
 

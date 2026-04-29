@@ -51,7 +51,7 @@ Preferred examples:
 - `0.21.0-rc.4`
 - `0.21.0-beta.3`
 
-Legacy compatibility examples still accepted by the ceremony for now:
+Legacy compatibility examples still accepted by release validation for now:
 
 - `0.20.0-rc31`
 - `0.20.0-beta3`
@@ -98,7 +98,7 @@ The release channel and the version are related but not identical:
 - channels decide where a release head points: `stable`, `canary`, `jetson-test`
 - the version string describes the release artifact itself
 
-Do not invent ad hoc suffixes. If a new prerelease class is needed, update this policy and the ceremony together.
+Do not invent ad hoc suffixes. If a new prerelease class is needed, update this policy and the checked publish flow together.
 
 ## Source vs Published Identity
 
@@ -148,9 +148,9 @@ Before publish:
 
 Current enforcement:
 
-- `scripts/publish-ceremony.sh` validates the version string before any publish work
-- `scripts/publish-release.sh` validates the version string before low-level publish logic
-- the ceremony also stamps `ELASTOS_RELEASE_VERSION` into published runtime/provider/capsule builds so installed artifacts report the coordinated release line instead of raw local package metadata
+- `elastos publish-release` is the preferred command surface for the checked publish flow
+- `scripts/publish-release.sh` is the low-level implementation and validates the version string before publish logic
+- the checked publish flow stamps `ELASTOS_RELEASE_VERSION` into published runtime/provider/capsule builds so installed artifacts report the coordinated release line instead of raw local package metadata
 
 ## Tagging Recommendation
 

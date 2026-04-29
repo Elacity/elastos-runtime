@@ -174,7 +174,7 @@ The ElastOS principle says "everything is a capsule." Carrier is the exception b
 
 2. **Gossip provider** — the `elastos://peer/*` scheme for chat and agent. This shares the same iroh endpoint as the bootstrap transport. Extracting it to a capsule would mean either two iroh endpoints (wasteful) or a shared-endpoint mechanism between runtime and capsule (complex).
 
-The legacy `peer-provider` capsule was the capsule form of this. It was superseded when Carrier was integrated into the runtime for reliability and simplicity. The capsule is archived at `archive/capsules/peer-provider/`.
+The earlier `peer-provider` capsule was the capsule form of this. It was superseded when Carrier was integrated into the runtime for reliability and simplicity, and it is no longer part of the active tree.
 
 **Future:** When the gossip protocol stabilizes, the gossip provider portion of Carrier could be extracted back into a capsule, using the runtime's iroh endpoint via a shared-endpoint API. This is tracked as a later task, not a current priority.
 

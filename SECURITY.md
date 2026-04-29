@@ -4,9 +4,29 @@
 
 If you find a security vulnerability, please report it privately via [GitHub Security Advisories](https://github.com/Elacity/elastos-runtime/security/advisories/new). Do not open a public issue.
 
-## Known Issues
+## Open Findings
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
+
+### No replay protection in chat signatures
+
+**Severity:** Medium
+**Files:** `capsules/chat/src/session.rs`, `capsules/chat/src/app.rs`
+**Status:** Open
+
+The signing payload is `SHA256(sender_id:ts:content)` with no nonce, topic binding, or timestamp freshness validation. The same signed message is valid on any channel and can be replayed indefinitely.
+
+### Empty capability tokens in carrier service
+
+**Severity:** Medium
+**Files:** `elastos/crates/elastos-server/src/carrier_service.rs`
+**Status:** Open
+
+Host-plane Carrier service providers receive empty capability tokens on all requests. This is by design for trusted host-plane code, but it means this provider class does not use the same token-forwarding path as ordinary app capsules. The trust-domain distinction needs to stay explicit in docs, manifests, and audit output.
+
+## Resolved Findings
+
+These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
 
 ### Chat message verification enforcement
 
@@ -16,7 +36,7 @@ The following security-relevant findings remain open in the current runtime and 
 
 All chat surfaces (native, WASM, agent) now sign outgoing messages via the DID provider and verify incoming messages. Unknown senders with unverified or unsigned messages are dropped before display, nick recording, or peer attachment. The shared verification logic lives in `elastos_common::chat_protocol`.
 
-**Residual risk:** Chat is still a pre-release surface. The signing payload lacks replay protection (see below).
+**Residual risk:** Chat is still a pre-release surface. The signing payload lacks replay protection (see open finding above).
 
 ### Presence announcement signing
 
@@ -28,14 +48,6 @@ Presence announcements are now signed via the DID provider. Unsigned presence me
 
 **Residual risk:** No freshness check on presence signatures — replay of valid presence is still possible.
 
-### No replay protection in chat signatures
-
-**Severity:** Medium
-**Files:** `capsules/chat/src/session.rs`, `capsules/chat/src/app.rs`
-**Status:** Fixing
-
-The signing payload is `SHA256(sender_id:ts:content)` with no nonce, topic binding, or timestamp freshness validation. The same signed message is valid on any channel and can be replayed indefinitely.
-
 ### Bridge line length limits
 
 **Severity:** Low (reduced from Medium)
@@ -43,15 +55,6 @@ The signing payload is `SHA256(sender_id:ts:content)` with no nonce, topic bindi
 **Status:** Fixed (2026-03-28)
 
 Bridge paths now enforce a 1MB maximum line length. Oversized requests are rejected before parsing.
-
-### Empty capability tokens in carrier service
-
-**Severity:** Medium
-**Files:** `elastos/crates/elastos-server/src/carrier_service.rs`
-**Status:** Investigating
-
-Host-plane carrier service providers receive empty capability tokens on all requests. This is by design (carrier services are trusted host-plane code), but it means the capability model is bypassed for this provider class. Needs explicit documentation or real token forwarding.
-
 
 ## Architecture
 

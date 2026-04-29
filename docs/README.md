@@ -34,7 +34,3 @@ These should stay narrower than the canonical current docs. If they repeat the s
 
 - [VERSIONING.md](VERSIONING.md) — runtime release versioning policy
 - [SHARE_VERSIONING.md](SHARE_VERSIONING.md) — share lifecycle and versioning model
-
-## Supplemental Notes
-
-- [JETSON_AARCH64_BASELINE.md](JETSON_AARCH64_BASELINE.md) — Jetson microVM baseline

@@ -18,6 +18,7 @@ This enables repeatable publishing while preserving content-addressed integrity.
 - Allow old versions to discover newer versions without mutating old content
 - Support safe lifecycle states: active, archived, revoked
 - Make local cleanup possible without pretending global deletion exists on IPFS
+- Treat publish as pinning a CID through the IPFS provider; unpublish removes the local pin and clears the local latest pointer without pretending the CID can be globally erased
 
 ## Non-Goals (for v0.3)
 
@@ -111,7 +112,7 @@ enum ChannelStatus { Active, Archived, Revoked }
 
 All struct fields use `#[serde(default)]` for backward-compatible deserialization. Legacy channels (where `latest_version == 0` but `latest_cid` is non-empty) are automatically backfilled to `latest_version = 1` with a synthetic history entry on load.
 
-Catalog writes use atomic tmp-then-rename to prevent corruption on crash or power loss (with Windows backup fallback).
+Catalog writes use atomic tmp-then-rename to prevent corruption on crash or power loss, with a Windows backup path where rename semantics differ.
 
 ### 3) Provenance attestation (`provenance.json`, Phase 2.5)
 
@@ -371,9 +372,9 @@ Phase 2 (implemented):
 - `elastos open <uri>` command (URI parsing, ephemeral port, catalog status warnings)
 - Lifecycle commands: `delete-local`, `archive`, `unarchive`, `revoke`
 - Updated `shares list` with STATUS column and truncated DID
-- md-viewer version badge (channel name, version tag, date, optional DID, prev link)
+- Documents shared-revision badge (channel name, version tag, date, optional DID, prev link)
 - Prev link derivation from current origin (path + subdomain gateways, no hardcoded URLs)
-- Atomic catalog writes (tmp-then-rename, Windows backup fallback)
+- Atomic catalog writes (tmp-then-rename, Windows backup path)
 - Legacy channel backfill on load (pre-versioning entries)
 - Migration tests for old catalog shapes and URI parser
 
@@ -400,7 +401,7 @@ Phase 3 (implemented):
 - `elastos share` auto-publishes head; `--no-head` to skip (independent of `--no-attest`)
 - Lifecycle commands (`archive`, `unarchive`, `revoke`) publish signed heads
 - `elastos shares head <channel>` for fetch + verify
-- `elastos open` signed head verification with trust check (signed-preferred, unsigned-fallback)
+- `elastos open` signed head verification with trust check, then local catalog status warnings when no signed head is available
 - `[head]` indicator in `shares list`
 - Embedded CID validation in `verify_channel_head`
 - 13 new unit tests
