@@ -730,7 +730,7 @@ info "Installing components.json to ${DATA_DIR}/..."
 cp "${TMPDIR}/components.json" "${DATA_DIR}/components.json"
 
 stop_stale_runtime_if_needed "${DATA_DIR}/runtime-coords.json" "runtime" "${BINARY_SHA256}"
-stop_stale_runtime_if_needed "${DATA_DIR}/pc2-runtime-coords.json" "PC2 runtime" "${BINARY_SHA256}"
+stop_stale_runtime_if_needed "${DATA_DIR}/home-runtime-coords.json" "Home runtime" "${BINARY_SHA256}"
 stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room open
 stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
@@ -828,7 +828,7 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 fi
 
 echo -e "  Setup home:     elastos setup"
-echo -e "  Open PC2 home:  elastos"
+echo -e "  Open Home:      elastos"
 echo -e "  Check source:   elastos source show"
 echo -e "  Check updates:  elastos update --check"
 echo -e "  Optional chat:  elastos chat --nick $(whoami)"

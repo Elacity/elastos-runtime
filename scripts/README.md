@@ -19,7 +19,7 @@ Top-level directly-invoked entrypoints stay at the root:
 - `gba.sh` — launch the GBA demo
 - `install.sh` — signed installer
 - `notepad.sh` — launch the notepad demo
-- `pc2-demo-local.sh` — prepare and launch the local source-based PC2 demo in a clean temp home
+- `home-demo-local.sh` — prepare and launch the local source-based Home demo in a clean temp home
 - `publish-release.sh` — low-level release publisher
 - `resolve-binary.sh` — shared binary resolver sourced by root launchers
 - `setup-crosvm.sh` — install runtime VM prerequisites
@@ -35,10 +35,15 @@ Proof, smoke, and audit helpers also currently live at the root. Common examples
 - `installed-command-audit.sh`
 - `local-carrier-chat-smoke.sh`
 - `local-carrier-setup-smoke.sh`
-- `pc2-frontdoor-smoke.sh`
+- `home-frontdoor-smoke.sh`
+- `system-camofox-smoke.sh`
+- `chat-room-gateway-camofox-smoke.sh`
+- `chat-room-session-reuse-camofox-smoke.sh`
+- `chat-room-guest-identity-camofox-smoke.sh`
+- `chat-room-runtime-activity-smoke.sh`
 - `public-install-identity-smoke.sh`
 - `public-install-operator-smoke.sh`
-- `public-install-pc2-frontdoor-smoke.sh`
+- `public-install-home-frontdoor-smoke.sh`
 
 These are review and release helpers, not automatically part of the stable
 end-user command contract. The `public-install-*.sh` helpers can target a

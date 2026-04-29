@@ -87,10 +87,10 @@ run_case() {
 }
 
 run_case ok "version" "" "$ELASTOS_BIN" --version
-run_case ok "root help exposes pc2" "pc2" "$ELASTOS_BIN" --help
+run_case ok "root help exposes home" "home" "$ELASTOS_BIN" --help
 run_case ok "root help exposes webspace" "webspace" "$ELASTOS_BIN" --help
 run_case ok "root help exposes identity" "identity" "$ELASTOS_BIN" --help
-run_case ok "pc2 help" "" "$ELASTOS_BIN" pc2 --help
+run_case ok "home help" "" "$ELASTOS_BIN" home --help
 run_case ok "identity help" "" "$ELASTOS_BIN" identity --help
 run_case ok "identity nickname help" "" "$ELASTOS_BIN" identity nickname --help
 run_case ok "webspace help" "" "$ELASTOS_BIN" webspace --help

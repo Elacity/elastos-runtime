@@ -51,6 +51,6 @@ cleanup_elastos_runtime_home() {
     local home_dir="$1"
     local data_dir="${2:-${home_dir}/xdg-data/elastos}"
 
-    stop_runtime_from_coords "${data_dir}/pc2-runtime-coords.json"
+    stop_runtime_from_coords "${data_dir}/home-runtime-coords.json"
     stop_runtime_from_coords "${data_dir}/runtime-coords.json"
 }

@@ -20,9 +20,9 @@ Usage:
 
 What it proves:
   1. clean-home install from the stamped installer with live Carrier bootstrap
-  2. source-local `setup --profile pc2`
+  2. source-local `setup --profile home`
   3. DID nickname set/get/show
-  4. PC2 status snapshot reflects the same nickname
+  4. Home status snapshot reflects the same nickname
   5. `chat` defaults to the DID nickname
   6. a named agent persona resolves to a DID distinct from the root DID
 EOF
@@ -115,13 +115,13 @@ ELASTOS_SOURCE_CONNECT_TICKET="${SOURCE_CONNECT_TICKET}" \
 ELASTOS_PUBLISHER_NODE_ID="${SOURCE_NODE_ID}" \
 bash "${ROOT}/scripts/install.sh" >/tmp/elastos-local-identity-install.log
 
-echo "[local-identity-profile] setup pc2 profile from source"
+echo "[local-identity-profile] setup home profile from source"
 mkdir -p "${HOME_DIR}/xdg-data/elastos"
 cp "${SOURCE_COMPONENTS_MANIFEST}" "${HOME_DIR}/xdg-data/elastos/components.json"
 HOME="${HOME_DIR}" \
 XDG_DATA_HOME="${HOME_DIR}/xdg-data" \
 ELASTOS_DATA_DIR="${HOME_DIR}/xdg-data/elastos" \
-"${ELASTOS_BIN}" setup --profile pc2 >/tmp/elastos-local-identity-setup.log
+"${ELASTOS_BIN}" setup --profile home >/tmp/elastos-local-identity-setup.log
 
 echo "[local-identity-profile] prove DID-backed identity contract"
 ELASTOS_BIN="${ELASTOS_BIN}" \

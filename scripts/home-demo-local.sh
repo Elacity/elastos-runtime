@@ -24,13 +24,13 @@ host_shell() {
 usage() {
     cat <<'EOF'
 Usage:
-  bash scripts/pc2-demo-local.sh
-  bash scripts/pc2-demo-local.sh --prepare-only
-  bash scripts/pc2-demo-local.sh --skip-build
-  bash scripts/pc2-demo-local.sh --home /tmp/elastos-demo-fixed
+  bash scripts/home-demo-local.sh
+  bash scripts/home-demo-local.sh --prepare-only
+  bash scripts/home-demo-local.sh --skip-build
+  bash scripts/home-demo-local.sh --home /tmp/elastos-demo-fixed
 
 What it does:
-  1. Builds the repo-local elastos binary and pc2.wasm (unless --skip-build)
+  1. Builds the repo-local elastos binary and home-cli.wasm (unless --skip-build)
   2. Builds a local full-screen chat microVM bundle and stages it into the temp home
   3. Installs into a clean temp home using the canonical maintainer DID + gateway
   4. Generates a local override manifest so `setup --profile demo` and
@@ -39,7 +39,7 @@ What it does:
   5. Reuses host-installed `crosvm` / `vmlinux` when available
   6. Runs `setup --profile demo` and `setup --profile chat`
   7. Stages a tiny MyWebSite demo page
-  8. Launches repo-local `elastos` into PC2 (unless --prepare-only)
+  8. Launches repo-local `elastos` into Home (unless --prepare-only)
 
 When it finishes preparing, it prints the demo HOME path so you can reuse it.
 EOF
@@ -97,13 +97,13 @@ case "$(uname -m)" in
         ;;
 esac
 
-echo "[pc2-demo-local] root:      $ROOT"
-echo "[pc2-demo-local] home:      $DEMO_HOME"
-echo "[pc2-demo-local] xdg-data:  $XDG_DATA_HOME"
-echo "[pc2-demo-local] host-home: $HOST_HOME"
+echo "[home-demo-local] root:      $ROOT"
+echo "[home-demo-local] home:      $DEMO_HOME"
+echo "[home-demo-local] xdg-data:  $XDG_DATA_HOME"
+echo "[home-demo-local] host-home: $HOST_HOME"
 
 if [[ -z "$HOST_SOURCE_CONNECT_TICKET" || -z "$HOST_PUBLISHER_NODE_ID" ]]; then
-    echo "[pc2-demo-local] load canonical trusted-source bootstrap"
+    echo "[home-demo-local] load canonical trusted-source bootstrap"
     mapfile -t _source_fields < <(
         python3 - "$HOST_HOME/.local/share/elastos/sources.json" <<'PY'
 import json
@@ -134,26 +134,26 @@ PY
 fi
 
 if [[ -z "$HOST_SOURCE_CONNECT_TICKET" || -z "$HOST_PUBLISHER_NODE_ID" ]]; then
-    echo "[pc2-demo-local] missing live trusted-source Carrier bootstrap in host sources." >&2
-    echo "[pc2-demo-local] refresh the canonical install first, then rerun this proof." >&2
+    echo "[home-demo-local] missing live trusted-source Carrier bootstrap in host sources." >&2
+    echo "[home-demo-local] refresh the canonical install first, then rerun this proof." >&2
     exit 1
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    echo "[pc2-demo-local] build elastos binary"
+    echo "[home-demo-local] build elastos binary"
     host_cargo build --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server
 
-    echo "[pc2-demo-local] build pc2 wasm"
-    host_cargo build --manifest-path "$ROOT/capsules/pc2/Cargo.toml" --target wasm32-wasip1 --release
-    cp "$ROOT/capsules/pc2/target/wasm32-wasip1/release/pc2.wasm" "$ROOT/capsules/pc2/pc2.wasm"
+    echo "[home-demo-local] build Home CLI wasm"
+    host_cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --target wasm32-wasip1 --release
+    cp "$ROOT/capsules/home-cli/target/wasm32-wasip1/release/home-cli.wasm" "$ROOT/capsules/home-cli/home-cli.wasm"
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 || ! -f "$ROOT/artifacts/chat.capsule.tar.gz" ]]; then
-    echo "[pc2-demo-local] build full-screen chat microVM bundle"
+    echo "[home-demo-local] build full-screen chat microVM bundle"
     host_shell bash "$ROOT/scripts/build/build-rootfs.sh" chat --output "$ROOT/artifacts"
 fi
 
-echo "[pc2-demo-local] install clean temp-home runtime"
+echo "[home-demo-local] install clean temp-home runtime"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
@@ -164,7 +164,7 @@ ELASTOS_PUBLISHER_NODE_ID="$HOST_PUBLISHER_NODE_ID" \
 ELASTOS_IPNS_NAME="$HOST_IPNS_NAME" \
 bash "$ROOT/scripts/install.sh"
 
-echo "[pc2-demo-local] stage local chat bundle"
+echo "[home-demo-local] stage local chat bundle"
 CHAT_ARTIFACT_RAW="$ROOT/artifacts/chat.capsule.tar.gz"
 CHAT_ARTIFACT_STAGE="$DEMO_HOME/.chat-artifact-stage"
 CHAT_ARTIFACT="$DEMO_HOME/chat-${SETUP_PLATFORM}.tar.gz"
@@ -187,7 +187,7 @@ tar -xzf "$CHAT_ARTIFACT" -C "$CHAT_DIR"
 printf '%s\n' "$CHAT_CID" > "$CHAT_DIR/.elastos-cid"
 printf '%s\n' "$CHAT_SHA" > "$CHAT_DIR/.elastos-artifact-sha256"
 
-echo "[pc2-demo-local] stage host KVM assets when available"
+echo "[home-demo-local] stage host KVM assets when available"
 mkdir -p "$XDG_DATA_HOME/elastos/bin"
 HOST_CROSVM_PATH=""
 HOST_CROSVM_SHA=""
@@ -208,7 +208,7 @@ if [[ -f "$HOST_HOME/.local/share/elastos/bin/vmlinux" ]]; then
     HOST_VMLINUX_SIZE="$(stat -c '%s' "$HOST_VMLINUX_PATH")"
 fi
 
-echo "[pc2-demo-local] write override components manifest"
+echo "[home-demo-local] write override components manifest"
 LOCAL_MANIFEST="$DEMO_HOME/components.local.json"
 export HOST_CROSVM_PATH HOST_CROSVM_SHA HOST_CROSVM_SIZE
 export HOST_VMLINUX_PATH HOST_VMLINUX_SHA HOST_VMLINUX_SIZE
@@ -290,13 +290,13 @@ with open(output_path, "w", encoding="utf-8") as f:
 PY
 cp "$LOCAL_MANIFEST" "$XDG_DATA_HOME/elastos/components.json"
 
-echo "[pc2-demo-local] setup demo profile"
+echo "[home-demo-local] setup demo profile"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
 "$ROOT/elastos/target/debug/elastos" setup --profile demo
 
-echo "[pc2-demo-local] setup chat profile"
+echo "[home-demo-local] setup chat profile"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
@@ -306,19 +306,19 @@ mkdir -p "$SITE_SRC"
 cat > "$SITE_SRC/index.html" <<'HTML'
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"><title>PC2 Demo</title></head>
-  <body><h1>PC2 Demo Site</h1></body>
+  <head><meta charset="utf-8"><title>Home Demo</title></head>
+  <body><h1>Home Demo Site</h1></body>
 </html>
 HTML
 
-echo "[pc2-demo-local] stage demo site"
+echo "[home-demo-local] stage demo site"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
 "$ROOT/elastos/target/debug/elastos" site stage "$SITE_SRC"
 
 echo
-echo "[pc2-demo-local] ready"
+echo "[home-demo-local] ready"
 echo "  home: $DEMO_HOME"
 echo "  installed manifest: $XDG_DATA_HOME/elastos/components.json"
 echo "  rerun elastos manually with:"
@@ -326,7 +326,7 @@ echo "    HOME=\"$DEMO_HOME\" XDG_DATA_HOME=\"$XDG_DATA_HOME\" \"$ROOT/elastos/t
 
 if [[ "$LAUNCH" -eq 1 ]]; then
     echo
-    echo "[pc2-demo-local] launch PC2"
+    echo "[home-demo-local] launch Home"
     HOME="$DEMO_HOME" \
     XDG_DATA_HOME="$XDG_DATA_HOME" \
     ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \

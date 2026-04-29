@@ -51,7 +51,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}Component setup:${NC}"
     echo "  elastos setup --list          List available external components"
-    echo "  elastos setup                 Install the default PC2/chat core"
+    echo "  elastos setup                 Install the default Home/chat core"
     echo "  elastos setup --with kubo     Install a specific component"
     echo ""
     exit 0

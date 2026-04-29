@@ -18,7 +18,7 @@ Usage:
 What it proves:
   1. `elastos identity nickname set` persists the DID-backed nickname
   2. `identity show` and `identity nickname get` return the same profile data
-  3. `pc2 --status --json` exposes the same nickname and People action
+  3. `home --status --json` exposes the same nickname and People action
   4. `chat` starts with the DID nickname by default when `--nick` is omitted
   5. the `codex` agent persona resolves to a DID distinct from the root profile DID
 EOF
@@ -92,14 +92,14 @@ if ! grep -q "^Nickname:[[:space:]]\+${PROFILE_NICK}$" <<<"${SHOW_OUT}"; then
     exit 1
 fi
 
-echo "[identity-profile-smoke] prove PC2 snapshot sees the same nickname"
-PC2_JSON="$(run_elastos pc2 --status --json)"
+echo "[identity-profile-smoke] prove Home snapshot sees the same nickname"
+HOME_JSON="$(run_elastos home --status --json)"
 PROFILE_NICK="${PROFILE_NICK}" jq -e '
     .nickname == env.PROFILE_NICK
     and (.actions | any(.id == "identity-nickname-set"))
-' >/dev/null <<<"${PC2_JSON}" || {
-    echo "[identity-profile-smoke] pc2 status json did not reflect the DID nickname/action" >&2
-    echo "${PC2_JSON}" >&2
+' >/dev/null <<<"${HOME_JSON}" || {
+    echo "[identity-profile-smoke] home status json did not reflect the DID nickname/action" >&2
+    echo "${HOME_JSON}" >&2
     exit 1
 }
 

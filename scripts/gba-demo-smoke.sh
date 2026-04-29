@@ -22,7 +22,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[gba-demo] prepare clean temp-home demo"
-bash "$ROOT/scripts/pc2-demo-local.sh" --prepare-only "${BUILD_ARGS[@]}" --home "$DEMO_HOME" >/tmp/elastos-gba-demo-prepare.log
+bash "$ROOT/scripts/home-demo-local.sh" --prepare-only "${BUILD_ARGS[@]}" --home "$DEMO_HOME" >/tmp/elastos-gba-demo-prepare.log
 
 ADDR="$(python3 - <<'PY'
 import socket

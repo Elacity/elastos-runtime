@@ -2,11 +2,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HOME_DIR="$(mktemp -d /tmp/elastos-pc2-frontdoor-XXXXXX)"
+HOME_DIR="$(mktemp -d /tmp/elastos-home-frontdoor-XXXXXX)"
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
 MAINTAINER_DID="${ELASTOS_MAINTAINER_DID:-did:key:z6MkrFPDgDi98Ek6AFHM3VT9bVJytnDf5mfHAV6gyrD5frYj}"
-SOURCE_PC2_DIR="$ROOT/capsules/pc2"
-SOURCE_PC2_WASM="$SOURCE_PC2_DIR/target/wasm32-wasip1/release/pc2.wasm"
+SOURCE_HOME_CLI_DIR="$ROOT/capsules/home-cli"
+SOURCE_HOME_CLI_WASM="$SOURCE_HOME_CLI_DIR/target/wasm32-wasip1/release/home-cli.wasm"
+SOURCE_HOME_DIR="$ROOT/capsules/home"
+SOURCE_SYSTEM_DIR="$ROOT/capsules/system"
+SOURCE_DOCUMENTS_DIR="$ROOT/capsules/documents"
+SOURCE_LIBRARY_DIR="$ROOT/capsules/library"
+SOURCE_INBOX_DIR="$ROOT/capsules/inbox"
 SOURCE_COMPONENTS_MANIFEST="$ROOT/components.json"
 SOURCE_RUNTIME_HOME="${HOME_DIR}/source-runtime"
 SOURCE_RUNTIME_XDG="${SOURCE_RUNTIME_HOME}/xdg-data"
@@ -50,7 +55,7 @@ PY2
 discover_source_bootstrap() {
     local coords_file="$1"
     if [[ ! -f "$coords_file" ]]; then
-        echo "[pc2-frontdoor] runtime coords missing: $coords_file" >&2
+        echo "[home-frontdoor] runtime coords missing: $coords_file" >&2
         return 1
     fi
 
@@ -96,32 +101,36 @@ host_platform() {
             printf '%s\n' "linux-arm64"
             ;;
         *)
-            echo "[pc2-frontdoor] unsupported host platform: $(uname -s)-$(uname -m)" >&2
+            echo "[home-frontdoor] unsupported host platform: $(uname -s)-$(uname -m)" >&2
             exit 1
             ;;
     esac
 }
 
-echo "[pc2-frontdoor] build elastos binary"
+echo "[home-frontdoor] build elastos binary"
 cargo build --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server >/dev/null
 
-echo "[pc2-frontdoor] build first-party setup artifacts"
+echo "[home-frontdoor] build first-party setup artifacts"
 cargo build --manifest-path "$ROOT/elastos/capsules/shell/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/elastos/capsules/localhost-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/did-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/webspace-provider/Cargo.toml" --release >/dev/null
 
-echo "[pc2-frontdoor] build pc2 wasm"
-cargo build --manifest-path "$ROOT/capsules/pc2/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
-cp "$SOURCE_PC2_WASM" "$SOURCE_PC2_DIR/pc2.wasm"
+echo "[home-frontdoor] build Home CLI wasm"
+cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
+cp "$SOURCE_HOME_CLI_WASM" "$SOURCE_HOME_CLI_DIR/home-cli.wasm"
 
-echo "[pc2-frontdoor] stage source-local trusted source"
+echo "[home-frontdoor] build Home and System browser capsule wasm"
+cargo build --manifest-path "$ROOT/capsules/home/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
+cargo build --manifest-path "$ROOT/capsules/system/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
+
+echo "[home-frontdoor] stage source-local trusted source"
 SOURCE_API_PORT="$(free_port)"
 SETUP_PLATFORM="$(host_platform)"
 mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
 install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
 
-COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" PC2_DIR="$SOURCE_PC2_DIR" python3 - <<'PY2'
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" python3 - <<'PY2'
 import hashlib
 import json
 import os
@@ -137,6 +146,14 @@ artifacts_dir.mkdir(parents=True, exist_ok=True)
 platform = os.environ["SETUP_PLATFORM"]
 
 manifest = json.loads(components_src.read_text())
+
+def platform_info(name):
+    platforms = manifest["external"][name].get("platforms") or {}
+    info = platforms.get(platform) or platforms.get("*")
+    if not info:
+        raise SystemExit(f"{name} missing release metadata for {platform}")
+    return info
+
 mapping = {
     "shell": pathlib.Path(os.environ["SHELL_BIN"]),
     "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
@@ -147,7 +164,7 @@ mapping = {
 for name, src in mapping.items():
     if not src.is_file():
         raise SystemExit(f"missing built artifact for {name}: {src}")
-    info = manifest["external"][name]["platforms"][platform]
+    info = platform_info(name)
     release_path = info.get("release_path")
     if not release_path:
         raise SystemExit(f"{name} missing release_path for {platform}")
@@ -157,21 +174,60 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
-pc2_dir = pathlib.Path(os.environ["PC2_DIR"])
-pc2_manifest = manifest["external"]["pc2"]["platforms"][platform]
-pc2_release_path = pc2_manifest.get("release_path")
-if not pc2_release_path:
-    raise SystemExit(f"pc2 missing release_path for {platform}")
-pc2_archive = artifacts_dir / pc2_release_path
-with tarfile.open(pc2_archive, "w:gz") as tar:
-    tar.add(pc2_dir / "capsule.json", arcname="pc2/capsule.json")
+home_cli_dir = pathlib.Path(os.environ["HOME_CLI_DIR"])
+home_cli_manifest = platform_info("home-cli")
+home_cli_release_path = home_cli_manifest.get("release_path")
+if not home_cli_release_path:
+    raise SystemExit(f"home-cli missing release_path for {platform}")
+home_cli_archive = artifacts_dir / home_cli_release_path
+with tarfile.open(home_cli_archive, "w:gz") as tar:
+    tar.add(home_cli_dir / "capsule.json", arcname="home-cli/capsule.json")
     tar.add(
-        pc2_dir / "target/wasm32-wasip1/release/pc2.wasm",
-        arcname="pc2/pc2.wasm",
+        home_cli_dir / "target/wasm32-wasip1/release/home-cli.wasm",
+        arcname="home-cli/home-cli.wasm",
     )
-pc2_data = pc2_archive.read_bytes()
-pc2_manifest["checksum"] = "sha256:" + hashlib.sha256(pc2_data).hexdigest()
-pc2_manifest["size"] = len(pc2_data)
+home_cli_data = home_cli_archive.read_bytes()
+home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
+home_cli_manifest["size"] = len(home_cli_data)
+
+browser_capsules = {
+    "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
+    "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+}
+for name, capsule_dir in browser_capsules.items():
+    info = platform_info(name)
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    archive = artifacts_dir / release_path
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
+        tar.add(
+            capsule_dir / "target/wasm32-wasip1/release" / f"{name}.wasm",
+            arcname=f"{name}/{name}.wasm",
+        )
+        tar.add(capsule_dir / "browser", arcname=f"{name}/browser")
+    data = archive.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
+
+data_capsules = {
+    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
+    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+}
+for name, capsule_dir in data_capsules.items():
+    info = platform_info(name)
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    archive = artifacts_dir / release_path
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
+        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+    data = archive.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -185,7 +241,7 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 if [[ ! -f "$SOURCE_RUNTIME_COORDS" ]]; then
-    echo "[pc2-frontdoor] source runtime coords missing. See $SOURCE_RUNTIME_LOG" >&2
+    echo "[home-frontdoor] source runtime coords missing. See $SOURCE_RUNTIME_LOG" >&2
     exit 1
 fi
 
@@ -196,7 +252,7 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 if ! curl -fsS --max-time 2 "http://127.0.0.1:${SOURCE_API_PORT}/api/health" >/dev/null 2>&1; then
-    echo "[pc2-frontdoor] source runtime never became healthy. See $SOURCE_RUNTIME_LOG" >&2
+    echo "[home-frontdoor] source runtime never became healthy. See $SOURCE_RUNTIME_LOG" >&2
     exit 1
 fi
 
@@ -204,29 +260,43 @@ mapfile -t SOURCE_BOOTSTRAP < <(discover_source_bootstrap "$SOURCE_RUNTIME_COORD
 SOURCE_CONNECT_TICKET="${SOURCE_BOOTSTRAP[0]:-}"
 SOURCE_NODE_ID="${SOURCE_BOOTSTRAP[1]:-}"
 if [[ -z "$SOURCE_CONNECT_TICKET" || -z "$SOURCE_NODE_ID" ]]; then
-    echo "[pc2-frontdoor] failed to discover source-local trusted-source Carrier bootstrap. See $SOURCE_RUNTIME_LOG" >&2
+    echo "[home-frontdoor] failed to discover source-local trusted-source Carrier bootstrap. See $SOURCE_RUNTIME_LOG" >&2
     exit 1
 fi
 
-HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" ELASTOS_MAINTAINER_DID="$MAINTAINER_DID" ELASTOS_SOURCE_CONNECT_TICKET="$SOURCE_CONNECT_TICKET" ELASTOS_PUBLISHER_NODE_ID="$SOURCE_NODE_ID" bash "$ROOT/scripts/install.sh" >/tmp/elastos-pc2-frontdoor-install.log
+HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" ELASTOS_MAINTAINER_DID="$MAINTAINER_DID" ELASTOS_SOURCE_CONNECT_TICKET="$SOURCE_CONNECT_TICKET" ELASTOS_PUBLISHER_NODE_ID="$SOURCE_NODE_ID" bash "$ROOT/scripts/install.sh" >/tmp/elastos-home-frontdoor-install.log
 
 if [[ ! -f "$SOURCE_COMPONENTS_MANIFEST" ]]; then
-    echo "[pc2-frontdoor] source components manifest missing: $SOURCE_COMPONENTS_MANIFEST" >&2
+    echo "[home-frontdoor] source components manifest missing: $SOURCE_COMPONENTS_MANIFEST" >&2
     exit 1
 fi
 
-echo "[pc2-frontdoor] setup pc2 profile"
+echo "[home-frontdoor] setup home profile"
 cp "$SOURCE_COMPONENTS_MANIFEST" "$HOME_DIR/xdg-data/elastos/components.json"
-HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" "$ROOT/elastos/target/debug/elastos" setup --profile pc2 >/tmp/elastos-pc2-frontdoor-setup.log
+HOME="$HOME_DIR" XDG_DATA_HOME="$HOME_DIR/xdg-data" "$ROOT/elastos/target/debug/elastos" setup --profile home >/tmp/elastos-home-frontdoor-setup.log
 
-INSTALLED_PC2_DIR="$HOME_DIR/xdg-data/elastos/capsules/pc2"
-if [[ ! -d "$INSTALLED_PC2_DIR" ]]; then
-    echo "[pc2-frontdoor] installed pc2 capsule missing after setup: $INSTALLED_PC2_DIR" >&2
+INSTALLED_HOME_CLI_DIR="$HOME_DIR/xdg-data/elastos/capsules/home-cli"
+if [[ ! -d "$INSTALLED_HOME_CLI_DIR" ]]; then
+    echo "[home-frontdoor] installed Home CLI capsule missing after setup: $INSTALLED_HOME_CLI_DIR" >&2
     exit 1
 fi
-mv "$INSTALLED_PC2_DIR" "${INSTALLED_PC2_DIR}.installed"
+for installed in \
+    "$HOME_DIR/xdg-data/elastos/capsules/home/home.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/system/system.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/system/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/documents/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/inbox/index.html"
+do
+    if [[ ! -f "$installed" ]]; then
+        echo "[home-frontdoor] installed first-party browser capsule asset missing after setup: $installed" >&2
+        exit 1
+    fi
+done
+mv "$INSTALLED_HOME_CLI_DIR" "${INSTALLED_HOME_CLI_DIR}.installed"
 
-echo "[pc2-frontdoor] prove current source elastos + current source pc2.wasm against clean-home data"
+echo "[home-frontdoor] prove current source elastos + current source home-cli.wasm against clean-home data"
 HOME_DIR="$HOME_DIR" ROOT="$ROOT" SOURCE_COMPONENTS_MANIFEST="$SOURCE_COMPONENTS_MANIFEST" python3 - <<'PY'
 import os
 import pty
@@ -240,7 +310,7 @@ root = os.environ["ROOT"]
 env = os.environ.copy()
 env["HOME"] = home
 env["XDG_DATA_HOME"] = f"{home}/xdg-data"
-# Keep the smoke hermetic: chat launched from PC2 must stay on the slave PTY
+# Keep the smoke hermetic: chat launched from Home must stay on the slave PTY
 # instead of probing the caller's controlling terminal via /dev/tty.
 env["ELASTOS_CHAT_FORCE_STDIN"] = "1"
 cmd = [f"{root}/elastos/target/debug/elastos"]
@@ -302,7 +372,7 @@ def shutdown(master: int, proc: subprocess.Popen) -> None:
 def run_chat_case(label: str, payload: bytes) -> None:
     master, proc = launch_pty()
     try:
-        read_until(label, master, lambda text: "ElastOS PC2" in text, 10.0)
+        read_until(label, master, lambda text: "ElastOS Home" in text, 10.0)
         send(master, b"\r\n")
         after_enter1 = read_until(
             label,
@@ -310,7 +380,8 @@ def run_chat_case(label: str, payload: bytes) -> None:
             lambda text: "Press Enter again to launch Chat" in text,
             6.0,
         )
-        send(master, b"\r", 0.8)
+        time.sleep(0.8)
+        send(master, b"\r")
         after_enter2 = read_until(
             label,
             master,
@@ -324,11 +395,11 @@ def run_chat_case(label: str, payload: bytes) -> None:
         after_exit = read_until(
             label,
             master,
-            lambda text: "ElastOS PC2" in text,
+            lambda text: "ElastOS Home" in text,
             8.0,
         )
-        if "ElastOS PC2" not in after_exit:
-            raise SystemExit(f"{label}: exit input did not return to PC2:\n{after_exit}")
+        if "ElastOS Home" not in after_exit:
+            raise SystemExit(f"{label}: exit input did not return Home:\n{after_exit}")
     finally:
         shutdown(master, proc)
 
@@ -342,7 +413,7 @@ def run_navigation_case() -> None:
             10.0,
         )
         if "\x1b[30;46;1m Home \x1b[0m" not in initial:
-            raise SystemExit(f"nav: pc2 home did not start on Home:\n{initial}")
+            raise SystemExit(f"nav: Home did not start on Home:\n{initial}")
         send(master, b"\x1b[C", 0.4)
         after_right = read_until(
             "nav",
@@ -383,7 +454,7 @@ def run_down_navigation_case() -> None:
             10.0,
         )
         if "> 1 Chat [ready]" not in initial:
-            raise SystemExit(f"nav-down: pc2 home did not highlight Chat first:\n{initial}")
+            raise SystemExit(f"nav-down: Home did not highlight Chat first:\n{initial}")
         send(master, b"\x1b[B", 0.4)
         after_down = read_until(
             "nav-down",
@@ -396,9 +467,9 @@ def run_down_navigation_case() -> None:
     finally:
         shutdown(master, proc)
 
-def run_pc2_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
+def run_home_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
     proc = subprocess.run(
-        cmd + ["pc2"],
+        cmd + ["home"],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -407,7 +478,7 @@ def run_pc2_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]
     )
     output = proc.stdout.decode("utf-8", "replace")
     if proc.returncode != 0:
-        raise SystemExit(f"{label}: pc2 command failed:\n{output}")
+        raise SystemExit(f"{label}: home command failed:\n{output}")
     if not any(fragment in output for fragment in expected_fragments):
         joined = "\n".join(expected_fragments)
         raise SystemExit(f"{label}: expected one of:\n{joined}\n\nactual output:\n{output}")
@@ -417,7 +488,7 @@ run_down_navigation_case()
 run_chat_case("esc", b"\x1b")
 run_chat_case("home", b"/home\r")
 run_chat_case("quit", b"/quit\r")
-run_pc2_case(
+run_home_case(
     "mywebsite",
     b"2\n\nq\n",
     (
@@ -426,7 +497,7 @@ run_pc2_case(
         "MyWebSite is not ready: missing site-provider",
     ),
 )
-run_pc2_case(
+run_home_case(
     "updates",
     b"3\nq\n",
     (
@@ -437,5 +508,5 @@ run_pc2_case(
     ),
 )
 
-print("[pc2-frontdoor] OK")
+print("[home-frontdoor] OK")
 PY

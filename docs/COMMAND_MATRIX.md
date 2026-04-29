@@ -4,13 +4,13 @@ Every `elastos` command has exactly one runtime expectation. No command may hang
 
 For the narrower interactive front-door contract, see [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md).
 
-Single-host rule: one ElastOS home may have one live host owner at a time. Managed dashboard paths own the managed PC2 lane, `elastos serve` owns the explicit operator lane, and `elastos room open` is the explicit helper that reuses the live operator lane instead of starting a second host.
+Single-host rule: one ElastOS home may have one live host owner at a time. Managed dashboard paths own the managed Home lane, `elastos serve` owns the explicit operator lane, and `elastos room open` is the explicit helper that reuses the live operator lane instead of starting a second host.
 
 ## Runtime Classes
 
 | Class | Description | Auto-start |
 |-------|-------------|------------|
-| **No Runtime** | Runs without a daemon. May spawn local helpers (IPFS bridge, etc.) | No |
+| **No Runtime** | Runs without a daemon. May call explicit provider/helper components such as `ipfs-provider` when installed. | No |
 | **Managed Dashboard Runtime** | Auto-starts/reuses a dedicated local runtime for the dashboard/home surface | Yes |
 | **Managed User Runtime** | Auto-starts/reuses background runtime | Yes |
 | **Operator Runtime** | Requires explicit `elastos serve` running | No |
@@ -22,8 +22,8 @@ Not every interactive command is equally product-facing.
 
 - First-class public front door:
   - `elastos`
-  - `elastos pc2`
-  - `PC2 -> Chat`
+  - `elastos home`
+  - `Home -> System/Documents/Library/Inbox`
 - Secondary supported shortcut:
   - `elastos chat`
 - Secondary packaged surface path:
@@ -55,18 +55,18 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | `elastos publish-release` | Spawns own pipeline |
 | `elastos config *` | Local config file |
 | `elastos emergency *` | Key rotation |
-| `elastos room show|pending|seed|invite-*|accept-*|approve|deny|reset` | Local sovereign room control, summary, pending browser-pair review, and signed invite/accept envelope flow. `room show/pending/approve/deny` can drive pairing from the CLI without a live runtime. |
+| `elastos room show|pending|seed|invite-*|accept-*|approve|deny|reset` | Local sovereign room control, summary, pending browser-access review, and signed invite/accept envelope flow. `room show/pending/approve/deny` can review and resolve browser access from the CLI without a live runtime. |
 | `elastos node info` | Local operator-node identity and route snapshot; no local runtime required |
 | `elastos node peer add|list|remove` | Local operator peer config; no local runtime required |
 | `elastos node status --peer <did>` | Source-side operator command; the target peer should be prepared with `elastos setup --profile operator` and running explicit `elastos serve` |
-| `elastos node room * --peer <did>` | Source-side explicit remote room control over Carrier. Reads room state, reviews pending browser pair requests, approves/denies them, and starts/reuses the remote room gateway. The target peer must explicitly allow `room.read`, `room.approve`, `room.deny`, and/or `room.open`. |
+| `elastos node room * --peer <did>` | Source-side explicit remote room control over Carrier. Reads room state, reviews pending browser access requests, approves/denies them, and starts/reuses the remote room gateway. The target peer must explicitly allow `room.read`, `room.approve`, `room.deny`, and/or `room.open`. |
 | `elastos node update --peer <did> --check` | Source-side operator command; the target peer should be prepared with `elastos setup --profile operator` and running explicit `elastos serve` |
 | `elastos node update --peer <did> --apply --yes` | Source-side operator command; mutating remote trusted-source update; target restart is still manual and the target peer should be prepared with `elastos setup --profile operator` |
-| `elastos share` | Bundles content + direct IPFS bridge; exits immediately. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with md-viewer` |
-| `elastos share --public` | Bundles content + direct IPFS bridge + direct tunnel-provider public edge; keeps the immediate public link alive until Ctrl+C |
-| `elastos open` | Direct IPFS bridge + local web serve. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with md-viewer` |
-| `elastos shares *` | Local catalog + direct IPFS bridge |
-| `elastos attest` | Provenance signing + direct IPFS bridge |
+| `elastos share` | Host-side content bundle using `ipfs-provider`; exits immediately. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
+| `elastos share --public` | Host-side content bundle using `ipfs-provider` plus explicit tunnel-provider public edge; keeps the immediate public link alive until Ctrl+C |
+| `elastos open` | Host-side `ipfs-provider` fetch + local web serve. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
+| `elastos shares *` | Local catalog plus host-side `ipfs-provider` access |
+| `elastos attest` | Provenance signing plus host-side `ipfs-provider` access |
 | `elastos site stage` | Stages a static site into `localhost://MyWebSite` |
 | `elastos site path` | Prints the staged local root and filesystem path |
 | `elastos site publish [--release <name>]` | Packages the current site root as an immutable CID-backed site bundle, prints `elastos://<cid>`, and can store a friendly named release alias under `localhost://ElastOS/SystemServices/Publisher/SiteReleases/...`. On a fresh installed layout, add `elastos setup --with kubo --with ipfs-provider` first |
@@ -80,29 +80,29 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | `elastos webspace list [path]` | Queries the dynamic `localhost://WebSpaces/<moniker>/...` resolver surface directly. Today `Elastos` exposes typed children such as `content`, `peer`, `did`, and `ai`; deeper `peer` / `did` / `ai` traversal fails closed until richer resolver semantics exist |
 | `elastos webspace resolve <target>` | Resolves a mounted WebSpace moniker or deeper handle path into a typed local handle. Current contract: `resolve` is handle-only; `content/<cid>` resolves to a file endpoint, `peer/<id>`, `did/<did>`, and `ai/<backend>` resolve to one typed folder handle, and `_meta.json` is a metadata file view for `read` / `stat`, not another handle |
 | `elastos run` (Data) | Power-user explicit path/CID launch. Data capsules are served in-process. |
-| `elastos pc2 --status` | Host-side snapshot of the sovereign PC2 world |
-| `elastos pc2 --json` | Machine-readable host-side snapshot of the sovereign PC2 world |
+| `elastos home --status` | Host-side snapshot of Home state |
+| `elastos home --json` | Machine-readable host-side snapshot of Home state |
 
 ### Managed Dashboard Runtime
 
 | Command | Notes |
 |---------|-------|
-| `elastos` | Default user entrypoint. Opens the sovereign PC2 home surface with no subcommand. |
-| `elastos pc2` | Explicit alias for the sovereign PC2 home surface. Auto-starts/reuses a dedicated managed `pc2` runtime on loopback, renders the local `pc2` WASM capsule, and returns home after launched actions exit. |
-| `elastos capsule <name> --lifecycle interactive --interactive` | Interactive packaged capsule path. Reuses a compatible active runtime when one is already running; otherwise uses the managed `pc2` runtime. |
+| `elastos` | Default user entrypoint. Opens Home with no subcommand. |
+| `elastos home` | Explicit compatibility alias for Home. Auto-starts/reuses a dedicated managed Home runtime on loopback, renders the local Home surface, and returns Home after launched actions exit. |
+| `elastos capsule <name> --lifecycle interactive --interactive` | Interactive packaged capsule path. Reuses a compatible active runtime when one is already running; otherwise uses the managed Home runtime. |
 
 ### Managed User Runtime (auto-start)
 
 | Command | Policy needed | Notes |
 |---------|---------------|-------|
-| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed `pc2` runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
+| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed Home runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
 
 ### Operator Runtime (requires `elastos serve`)
 
 | Command | Notes |
 |---------|-------|
 | `elastos agent` | Shell/supervisor orchestration via forward_to_shell; chat-managed runtime does not satisfy this |
-| `elastos room open` | Requires a running operator runtime in the same home. Reuses the live `elastos serve` runtime and opens the hosted room gateway through it; it does not start a second host. The browser surface it exposes comes from `elastos setup --profile demo`. |
+| `elastos room open` | Requires a running operator runtime in the same home. Reuses the live `elastos serve` runtime and opens the hosted room gateway through it; it does not start a second host. The browser-hosted adapter it exposes comes from `elastos setup --profile demo`. |
 | `elastos run` (MicroVM) | Supervisor capsule launch; chat-managed runtime does not satisfy this |
 | `elastos run` (WASM) | Attaches to running runtime for provider bridge; chat-managed runtime does not satisfy this |
 | `elastos capsule` (non-interactive) | Supervisor capsule management that is not an interactive packaged app surface still requires `elastos serve` |
@@ -119,8 +119,8 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 
 1. **No command may hang.** If a path cannot complete, it must timeout or fail fast.
 2. If a command is "No Runtime" — it never reads runtime-coords.json.
-3. `elastos pc2 --status` and `--json` are host-side probes; they never auto-start a runtime.
-4. If a command is "Managed Dashboard Runtime" — it auto-starts if prerequisites are met, reuses its dedicated managed dashboard runtime if running, and keeps the user model centered on PC2/home rather than raw runtime nouns. Launched actions should return to the same home session automatically.
+3. `elastos home --status` and `--json` are host-side probes; they never auto-start a runtime.
+4. If a command is "Managed Dashboard Runtime" — it auto-starts if prerequisites are met, reuses its dedicated managed dashboard runtime if running, and keeps the user model centered on Home rather than raw runtime nouns. Launched actions should return to the same Home session automatically.
 5. If a command is "Managed User Runtime" — it auto-starts if prerequisites met, reuses if running.
 6. If a command is "Operator Runtime" — it fails fast with:
    ```
@@ -130,8 +130,9 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 
    Then run this command again.
    ```
-7. `elastos run` is the explicit power-user path for arbitrary path/CID capsules. Data capsules run in-process; WASM and MicroVM paths require a running operator runtime.
-8. `elastos` and `elastos serve` are different lanes for the same home. They do not currently merge into one shared live session. `elastos room open` is the one explicit helper that reuses the live operator lane.
+7. Host-side provider bridge commands are explicit operator tooling, not app-capsule authority. Normal app/viewer/content capsules still go through runtime capabilities and provider/Carrier contracts.
+8. `elastos run` is the explicit power-user path for arbitrary path/CID capsules. Data capsules run in-process; WASM and MicroVM paths require a running operator runtime.
+9. `elastos` and `elastos serve` are different lanes for the same home. They do not currently merge into one shared live session. `elastos room open` is the one explicit helper that reuses the live operator lane.
 
 ## Future: Expanding Managed Runtime
 

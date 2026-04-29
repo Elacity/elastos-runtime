@@ -89,14 +89,16 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
-echo "[local-carrier-setup] building current binary and first-party PC2 core assets"
+echo "[local-carrier-setup] building current binary and first-party Home core assets"
 
 (cd "${ELASTOS_ROOT}" && cargo build -p elastos-server)
 (cd "${REPO_ROOT}/elastos/capsules/shell" && cargo build --release)
 (cd "${REPO_ROOT}/elastos/capsules/localhost-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/did-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
-(cd "${REPO_ROOT}/capsules/pc2" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/home" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/system" && cargo build --target wasm32-wasip1 --release)
 
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
@@ -117,7 +119,12 @@ SHELL_BIN="${REPO_ROOT}/elastos/target/release/shell" \
 LOCALHOST_PROVIDER_BIN="${REPO_ROOT}/elastos/target/release/localhost-provider" \
 DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider" \
 WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/webspace-provider" \
-PC2_DIR="${REPO_ROOT}/capsules/pc2" \
+HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
+HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
+SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
+DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
+LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
+INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -135,6 +142,14 @@ artifacts_dir.mkdir(parents=True, exist_ok=True)
 platform = os.environ["SETUP_PLATFORM"]
 
 manifest = json.loads(components_src.read_text())
+
+def platform_info(name):
+    platforms = manifest["external"][name].get("platforms") or {}
+    info = platforms.get(platform) or platforms.get("*")
+    if not info:
+        raise SystemExit(f"{name} missing release metadata for {platform}")
+    return info
+
 mapping = {
     "shell": pathlib.Path(os.environ["SHELL_BIN"]),
     "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
@@ -145,7 +160,7 @@ mapping = {
 for name, src in mapping.items():
     if not src.is_file():
         raise SystemExit(f"missing built artifact for {name}: {src}")
-    info = manifest["external"][name]["platforms"][platform]
+    info = platform_info(name)
     release_path = info.get("release_path")
     if not release_path:
         raise SystemExit(f"{name} missing release_path for {platform}")
@@ -155,21 +170,60 @@ for name, src in mapping.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
-pc2_dir = pathlib.Path(os.environ["PC2_DIR"])
-pc2_manifest = manifest["external"]["pc2"]["platforms"][platform]
-pc2_release_path = pc2_manifest.get("release_path")
-if not pc2_release_path:
-    raise SystemExit(f"pc2 missing release_path for {platform}")
-pc2_archive = artifacts_dir / pc2_release_path
-with tarfile.open(pc2_archive, "w:gz") as tar:
-    tar.add(pc2_dir / "capsule.json", arcname="pc2/capsule.json")
+home_cli_dir = pathlib.Path(os.environ["HOME_CLI_DIR"])
+home_cli_manifest = platform_info("home-cli")
+home_cli_release_path = home_cli_manifest.get("release_path")
+if not home_cli_release_path:
+    raise SystemExit(f"home-cli missing release_path for {platform}")
+home_cli_archive = artifacts_dir / home_cli_release_path
+with tarfile.open(home_cli_archive, "w:gz") as tar:
+    tar.add(home_cli_dir / "capsule.json", arcname="home-cli/capsule.json")
     tar.add(
-        pc2_dir / "target/wasm32-wasip1/release/pc2.wasm",
-        arcname="pc2/pc2.wasm",
+        home_cli_dir / "target/wasm32-wasip1/release/home-cli.wasm",
+        arcname="home-cli/home-cli.wasm",
     )
-pc2_data = pc2_archive.read_bytes()
-pc2_manifest["checksum"] = "sha256:" + hashlib.sha256(pc2_data).hexdigest()
-pc2_manifest["size"] = len(pc2_data)
+home_cli_data = home_cli_archive.read_bytes()
+home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
+home_cli_manifest["size"] = len(home_cli_data)
+
+browser_capsules = {
+    "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
+    "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+}
+for name, capsule_dir in browser_capsules.items():
+    info = platform_info(name)
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    archive = artifacts_dir / release_path
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
+        tar.add(
+            capsule_dir / "target/wasm32-wasip1/release" / f"{name}.wasm",
+            arcname=f"{name}/{name}.wasm",
+        )
+        tar.add(capsule_dir / "browser", arcname=f"{name}/browser")
+    data = archive.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
+
+data_capsules = {
+    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
+    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+}
+for name, capsule_dir in data_capsules.items():
+    info = platform_info(name)
+    release_path = info.get("release_path")
+    if not release_path:
+        raise SystemExit(f"{name} missing release_path for {platform}")
+    archive = artifacts_dir / release_path
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
+        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+    data = archive.read_bytes()
+    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    info["size"] = len(data)
 
 components_dest.parent.mkdir(parents=True, exist_ok=True)
 components_dest.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -332,8 +386,15 @@ for installed in \
     "${DATA_DIR}/bin/localhost-provider" \
     "${DATA_DIR}/bin/did-provider" \
     "${DATA_DIR}/bin/webspace-provider" \
-    "${DATA_DIR}/capsules/pc2/pc2.wasm" \
-    "${DATA_DIR}/capsules/pc2/capsule.json"
+    "${DATA_DIR}/capsules/home-cli/home-cli.wasm" \
+    "${DATA_DIR}/capsules/home-cli/capsule.json" \
+    "${DATA_DIR}/capsules/home/home.wasm" \
+    "${DATA_DIR}/capsules/home/browser/index.html" \
+    "${DATA_DIR}/capsules/system/system.wasm" \
+    "${DATA_DIR}/capsules/system/browser/index.html" \
+    "${DATA_DIR}/capsules/documents/index.html" \
+    "${DATA_DIR}/capsules/library/index.html" \
+    "${DATA_DIR}/capsules/inbox/index.html"
 do
     if [[ ! -f "${installed}" ]]; then
         echo "expected installed file missing: ${installed}" >&2
@@ -341,25 +402,25 @@ do
     fi
 done
 
-STATUS_OUT="${TEST_ROOT}/pc2-status.txt"
+STATUS_OUT="${TEST_ROOT}/home-status.txt"
 (
     cd "${ELASTOS_ROOT}"
     XDG_DATA_HOME="${XDG_DATA_HOME}" \
-    "${ELASTOS_BIN}" pc2 --status >"${STATUS_OUT}"
+    "${ELASTOS_BIN}" home --status >"${STATUS_OUT}"
 )
-grep -q "ElastOS PC2" "${STATUS_OUT}" || {
-    echo "expected pc2 status output missing from ${STATUS_OUT}" >&2
+grep -q "ElastOS Home" "${STATUS_OUT}" || {
+    echo "expected home status output missing from ${STATUS_OUT}" >&2
     exit 1
 }
 
-HOME_OUT="${TEST_ROOT}/pc2-home.txt"
+HOME_OUT="${TEST_ROOT}/home.txt"
 (
     cd "${ELASTOS_ROOT}"
     printf 'q\n' | XDG_DATA_HOME="${XDG_DATA_HOME}" \
     "${ELASTOS_BIN}" >"${HOME_OUT}"
 )
-grep -q "ElastOS PC2" "${HOME_OUT}" || {
-    echo "expected pc2 home output missing from ${HOME_OUT}" >&2
+grep -q "ElastOS Home" "${HOME_OUT}" || {
+    echo "expected home output missing from ${HOME_OUT}" >&2
     exit 1
 }
 

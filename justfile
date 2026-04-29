@@ -59,23 +59,23 @@ verify:
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:
     just verify
-    just pc2-frontdoor-smoke
+    just home-frontdoor-smoke
 
-# Fail-closed check for rooted-localhost and PC2-first contract drift
+# Fail-closed check for rooted-localhost and Home-first contract drift
 alignment-check:
     ./scripts/check-wci-alignment.sh
 
-# Real-PTY source proof: current target-built elastos + current pc2.wasm against clean-home data
-pc2-frontdoor-smoke:
-    ./scripts/pc2-frontdoor-smoke.sh
+# Real-PTY source proof: current target-built elastos + current home-cli.wasm against clean-home data
+home-frontdoor-smoke:
+    ./scripts/home-frontdoor-smoke.sh
 
 # Clean-home setup proof for the current local trusted-source path
 local-carrier-setup-smoke:
     ./scripts/local-carrier-setup-smoke.sh
 
-# Prepare and launch a clean temp-home local PC2 demo from source
-pc2-demo-local *args:
-    ./scripts/pc2-demo-local.sh {{args}}
+# Prepare and launch a clean temp-home local Home demo from source
+home-demo-local *args:
+    ./scripts/home-demo-local.sh {{args}}
 
 # Audit an installed-style elastos binary on a clean home
 installed-command-audit bin="":

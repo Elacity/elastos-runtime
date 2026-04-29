@@ -69,10 +69,10 @@ for source in data.get("sources", []):
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-echo "[public-identity] run Carrier-only setup --profile pc2"
+echo "[public-identity] run Carrier-only setup --profile home"
 HOME="${HOME_DIR}" \
 XDG_DATA_HOME="${HOME_DIR}/xdg-data" \
-"${RUN_BIN}" setup --profile pc2 >/tmp/elastos-public-identity-setup.log
+"${RUN_BIN}" setup --profile home >/tmp/elastos-public-identity-setup.log
 
 echo "[public-identity] prove DID-backed identity contract"
 ELASTOS_BIN="${RUN_BIN}" \

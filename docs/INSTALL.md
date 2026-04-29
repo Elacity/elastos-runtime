@@ -8,11 +8,10 @@ elastos setup
 elastos
 ```
 
-After setup, `elastos` opens the sovereign PC2 home surface. From there you can
-launch chat and the other local surfaces without learning runtime nouns first.
-Direct `elastos chat` remains a shortcut and auto-starts a local runtime — no
-separate `elastos serve` terminal needed. Subsequent runs reuse the running
-runtime automatically.
+After setup, `elastos` opens Home. From there you can open System, Documents,
+Library, and Inbox without learning runtime nouns first. Direct `elastos chat`
+remains a shortcut and auto-starts a local runtime — no separate `elastos serve`
+terminal needed. Subsequent runs reuse the running runtime automatically.
 
 - The gateway-hosted installer carries the maintainer DID, signed release head,
   and publisher discovery metadata automatically.
@@ -29,7 +28,7 @@ Source checkout note:
 
 `elastos setup` is intentionally narrow:
 
-- it provisions the core PC2/chat profile
+- it provisions the core Home profile; native chat is part of the runtime binary
 - it does not silently provision every share/site/operator dependency
 - broader surfaces require explicit extras or an operator profile
 
@@ -37,7 +36,7 @@ Useful extras:
 
 ```bash
 # direct share/open
-elastos setup --with kubo --with ipfs-provider --with md-viewer
+elastos setup --with kubo --with ipfs-provider --with documents
 
 # local site serving / browser preview helper
 elastos setup --with site-provider
@@ -78,10 +77,10 @@ Prerequisites: Jetson Linux.
 # Install (auto-detects aarch64)
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
 
-# Setup (provisions the core PC2/chat prerequisites — no crosvm/vmlinux needed for native chat)
+# Setup (provisions the core Home profile — no crosvm/vmlinux needed for native chat)
 ~/.local/bin/elastos setup
 
-# Open PC2 home
+# Open Home
 ~/.local/bin/elastos
 
 # Or jump straight to chat
@@ -125,13 +124,15 @@ These are the default paths when XDG variables are unset. Runtime data honors `X
 | `${XDG_DATA_HOME:-~/.local/share}/elastos/components.json` | Capsule registry |
 | `${XDG_DATA_HOME:-~/.local/share}/elastos/sources.json` | Trusted source config (for updates) |
 
-Capsules are **not** pre-installed. They are downloaded on-demand by the
-supervisor when a command needs them (e.g., `elastos chat` downloads
-chat + its provider dependencies automatically).
+`elastos setup` installs the components selected by the active profile. The
+default `home` profile installs the Home front door plus first-party Home,
+System, Documents, Library, Inbox, localhost, did, and webspace assets. Broader
+demo/operator components are installed only when you choose their profile or add
+them with `--with`.
 
-## Shell Policy
+## Policy Capsule
 
-The shell capsule enforces capability policy. The default is secure:
+The Home/orchestrator capsule enforces capability policy. The default is secure:
 
 - **With terminal** (interactive): `cli` mode — operator approves/denies each request
 - **Without terminal** (daemon): `agent` mode — policy-file rules, built-in defaults cover standard capsules

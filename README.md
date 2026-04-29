@@ -8,7 +8,7 @@ Pre-release and unstable. Verified on Linux `x86_64` and `aarch64`. Not for prod
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-# Core PC2 front door only
+# Core Home front door only
 elastos setup
 
 # Same front door, broader demo/test surfaces
@@ -19,18 +19,18 @@ elastos
 
 This installs the signed `elastos` binary.
 
-- `elastos setup` provisions the core PC2 front door.
-- `elastos setup --profile demo` provisions the broader demo/test surface, including the hosted room browser capsule.
+- `elastos setup` provisions the core Home front door.
+- `elastos setup --profile demo` provisions the broader demo/test surface, including the hosted `chat-room` web surface.
 - `elastos setup --profile operator` prepares the explicit operator lane used by `elastos serve`, `elastos node ...`, `elastos agent`, and `elastos run`.
-- Hosted room browser access currently needs both: `setup --profile demo` installs the browser surface, and `setup --profile operator` prepares the explicit runtime lane that `elastos room open` reuses.
+- Hosted `chat-room` access currently needs both: `setup --profile demo` installs the shared web surface, and `setup --profile operator` prepares the explicit runtime lane that `elastos room open` reuses.
 
-Then `elastos` opens the PC2 home surface.
+Then `elastos` opens Home.
 
 ## Choose A Lane
 
 One ElastOS home may have only one live host owner at a time.
 
-- PC2 lane: `elastos setup` or `elastos setup --profile demo`, then `elastos`.
+- Home lane: `elastos setup` or `elastos setup --profile demo`, then `elastos`.
 - Operator lane: `elastos setup --profile operator`, then `elastos serve`.
 - Hosted room/browser lane on the installed path: `elastos setup --profile demo`, `elastos setup --profile operator`, `elastos serve`, then `elastos room open`.
 - `elastos room open` is not a second host. It reuses the live `elastos serve` runtime and opens the room gateway through it.
@@ -60,7 +60,7 @@ Source-built setup notes:
 - When you run the built binary from the repo checkout, `elastos setup --list` can read the repo `components.json`.
 - `elastos setup` still needs a trusted source in `~/.local/share/elastos/sources.json` before it can fetch first-party artifacts.
 - For published-install behavior, use the installer in [docs/INSTALL.md](docs/INSTALL.md).
-- For source proof of the current checkout, use `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
+- For source proof of the current checkout, use `just local-carrier-setup-smoke` and `just home-frontdoor-smoke`.
 - For one concrete `source add` example, see [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#source-built-trusted-source-example).
 
 ## Run
@@ -68,7 +68,7 @@ Source-built setup notes:
 Normal user lane:
 
 ```bash
-# Open the PC2 home surface
+# Open Home
 elastos
 
 # P2P chat
@@ -86,7 +86,7 @@ elastos room show
 elastos room pending
 elastos room approve
 elastos room open --addr 0.0.0.0:8090
-# then open http://127.0.0.1:8090/apps/room-browser/
+# then open http://127.0.0.1:8090/apps/chat-room/
 
 # Operator peer control
 elastos node info
@@ -97,7 +97,7 @@ No-runtime content-plane and site commands:
 
 ```bash
 # One-time extras for direct share/open
-elastos setup --with kubo --with ipfs-provider --with md-viewer
+elastos setup --with kubo --with ipfs-provider --with documents
 
 # Share a file over the IPFS-backed content path
 elastos share README.md
@@ -111,17 +111,18 @@ elastos --help
 
 Important:
 
-- `elastos room show` works without a live runtime, but `elastos room open` requires a running `elastos serve` in the same home plus the hosted room browser surface from `elastos setup --profile demo`.
-- `elastos` is the PC2 front door. It does not currently attach to an already-running operator runtime in the same home.
-- The hosted room route is `/apps/room-browser/`. `/apps/room/` is not a public route.
+- `elastos room show` works without a live runtime, but `elastos room open` requires a running `elastos serve` in the same home plus the hosted `chat-room` web surface from `elastos setup --profile demo`.
+- `elastos` is the Home front door. It does not currently attach to an already-running operator runtime in the same home.
+- The hosted room route is `/apps/chat-room/`. `/apps/room/` is not a public route. Inside Home, that same surface stays under Home-scoped authority; outside Home it uses browser-session capability policy.
 
-Direct `share`/`open` are content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only PC2 core profile.
+Direct `share`/`open` are content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only Home profile.
 
 Power-user paths such as `elastos run` require an explicit runtime and the correct working directory. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for source builds, capsule development, and explicit runtime workflows.
 
 The interactive product contract is narrower than the full command surface:
 
-- first-class: `elastos`, `elastos pc2`, `PC2 -> Chat`
+- first-class: `elastos`, `elastos home`, `Home -> System/Documents/Library/Inbox`
+- demo profile: `Home -> Chat Room`, `Home -> GBA UCity`, and MyWebSite/public-edge helpers when their components are installed
 - secondary shortcut: `elastos chat`
 - secondary packaged path: `elastos capsule <name> --lifecycle interactive --interactive`
 - operator/developer-only: `elastos agent`, `elastos node`, `elastos run`, non-interactive `elastos capsule`
@@ -137,8 +138,8 @@ See [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md)
 └─────────────────────────────────────────────────────┘
                         │
 ┌─────────────────────────────────────────────────────┐
-│  Shell (capsule with orchestrator capability)       │
-│  Permission prompts · Capsule orchestration         │
+│  Home / policy capsule with orchestrator capability │
+│  Permission prompts · App orchestration             │
 └─────────────────────────────────────────────────────┘
                         │
 ┌─────────────────────────────────────────────────────┐
@@ -147,13 +148,13 @@ See [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md)
 └─────────────────────────────────────────────────────┘
 ```
 
-The runtime is the small trusted base. Everything above it — including the shell — runs as a sandboxed capsule with explicit capability tokens. Humans and AI agents use the same capability model.
+The runtime is the small trusted base. Everything above it, including Home and System, runs as sandboxed capsules with explicit capability tokens. Humans and AI agents use the same capability model and the same action contracts. See [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) for the current first-party surface palette and interaction rules.
 
 ## What Works Today
 
-- fresh install → setup → PC2 home
+- fresh install → setup → Home
 - native P2P chat, plus local/source proof for WASM chat interop
-- sovereign room membership/invite flow, hosted room-browser access under the explicit operator lane, and local cross-runtime Carrier room sync proof
+- sovereign room membership/invite flow, hosted chat-room access under the explicit operator lane, and local cross-runtime Carrier room sync proof
 - signed publish, install, and update flow
 - operator-only remote node status and trusted-source update control over Carrier via `elastos node ...`
 - explicit operator runtime prep via `elastos setup --profile operator`
@@ -171,9 +172,9 @@ Every command has one runtime expectation. No command may hang.
 
 | Class | Commands | Contract |
 |---|---|---|
-| Managed dashboard | `elastos`, `elastos pc2` | Auto-starts or reuses the managed `pc2` runtime for the first-class PC2 front door |
-| Managed packaged interactive | `elastos capsule <name> --lifecycle interactive --interactive` | Secondary packaged path; reuses a compatible active runtime or the managed `pc2` runtime when needed |
-| Managed user | `elastos chat` | Native chat shortcut; reuses a healthy PC2 runtime first, otherwise managed chat runtime |
+| Managed dashboard | `elastos`, `elastos home` | Auto-starts or reuses the managed Home runtime for the first-class Home front door |
+| Managed packaged interactive | `elastos capsule <name> --lifecycle interactive --interactive` | Secondary packaged path; reuses a compatible active runtime or the managed Home runtime when needed |
+| Managed user | `elastos chat` | Native chat shortcut; reuses a healthy managed Home runtime first, otherwise managed chat runtime |
 | No runtime | `elastos share`, `elastos open`, `elastos shares *`, `elastos attest`, `elastos update`, `elastos setup`, `elastos site *` | Runs direct |
 | Operator | `elastos room open`, `elastos agent`, non-interactive `elastos capsule`, `elastos run` | Requires one explicit live runtime owner per home (`elastos serve`) |
 | Starts own service | `elastos serve`, `elastos gateway`, `elastos site serve` | Starts its own daemon |

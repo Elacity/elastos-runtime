@@ -15,7 +15,7 @@ Usage:
   bash scripts/chat-demo-local.sh --nick demo
 
 What it does:
-  1. Prepares a clean local temp-home via pc2-demo-local.sh
+  1. Prepares a clean local temp-home via home-demo-local.sh
   2. Requires a KVM-capable host
   3. Launches repo-local `elastos capsule chat --lifecycle interactive --interactive`
 EOF
@@ -55,7 +55,7 @@ if [[ "$SKIP_BUILD" -eq 1 ]]; then
 fi
 
 echo "[chat-demo-local] prepare local demo home"
-bash "$ROOT/scripts/pc2-demo-local.sh" "${PREP_ARGS[@]}"
+bash "$ROOT/scripts/home-demo-local.sh" "${PREP_ARGS[@]}"
 
 if [[ ! -e /dev/kvm ]]; then
     echo "[chat-demo-local] /dev/kvm is not available on this host." >&2

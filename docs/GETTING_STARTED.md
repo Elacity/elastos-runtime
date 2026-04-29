@@ -15,13 +15,15 @@ elastos setup
 elastos
 ```
 
-After setup, `elastos` opens the sovereign PC2 home surface. From there you can launch chat and inspect your rooted localhost world. PC2 is the front door. No separate `elastos serve` terminal is needed for the normal user path.
+After setup, `elastos` opens Home. From there you can open System, Documents,
+Library, and Inbox, and inspect your rooted localhost world. No separate
+`elastos serve` terminal is needed for the normal user path.
 
 ### Choose One Lane Per Home
 
 One ElastOS home may have only one live host owner at a time.
 
-- PC2 lane:
+- Home lane:
   - `elastos setup` or `elastos setup --profile demo`
   - then `elastos`
 - Operator lane:
@@ -32,17 +34,17 @@ One ElastOS home may have only one live host owner at a time.
   - `elastos setup --profile operator`
   - then `elastos serve`
   - then `elastos room open --addr 0.0.0.0:8090`
-- Treat hosted room as a lane switch after PC2 checks, not as something that merges into a still-running `elastos` session in the same home.
+- Treat hosted room as a lane switch after Home checks, not as something that merges into a still-running `elastos` session in the same home.
 - `elastos room open` is not a second host. It reuses the live `elastos serve` runtime and opens the room gateway through it.
 - Do not run `elastos` and `elastos serve` side by side in the same home and expect them to merge. Stop one first or use separate homes if you intentionally need both.
 - If `elastos serve` already owns the home, `elastos` will not start in that same home until you stop `serve`.
 
 What this gives you today:
 
-- a local PC2 home surface
+- a local Home surface
 - one-terminal native chat
 - signed `elastos update`
-- first-party Carrier-backed setup for the default PC2 core profile
+- first-party Carrier-backed setup for the default Home core profile
 
 Useful next commands after plain `elastos setup`:
 
@@ -51,7 +53,7 @@ elastos chat --nick alice
 elastos update
 ```
 
-If you want the same PC2 front door plus the broader demo/test surfaces:
+If you want the same Home front door plus the broader demo/test surfaces:
 
 ```bash
 elastos setup --profile demo
@@ -60,12 +62,12 @@ elastos
 
 `setup --profile demo` adds more shipped surfaces. It does not change the single-host rule above.
 
-For the hosted room browser path, `setup --profile demo` is the piece that installs the shipped room browser surface.
+For hosted `chat-room` access, `setup --profile demo` installs the shipped `chat-room` web surface.
 
-If you want direct share/open on top of the default PC2 core profile, add the explicit extras first:
+If you want direct share/open on top of the default Home core profile, add the explicit extras first:
 
 ```bash
-elastos setup --with kubo --with ipfs-provider --with md-viewer
+elastos setup --with kubo --with ipfs-provider --with documents
 elastos share README.md
 elastos open elastos://<cid>
 elastos share --public README.md
@@ -75,7 +77,7 @@ Important boundary:
 
 - `chat` is the only standalone managed user-runtime command
 - `setup` stays first-party and Carrier-only by default
-- direct share/open/site/public-edge tooling is explicit extra setup, not part of the default PC2 core profile
+- direct share/open/site/public-edge tooling is explicit extra setup, not part of the default Home core profile
 - `agent`, `capsule`, WASM/microVM `run`, and `room open` remain explicit operator-runtime surfaces
 
 See [INTERACTIVE_RUNTIME_CONTRACT.md](INTERACTIVE_RUNTIME_CONTRACT.md) for the blessed interactive contract and [COMMAND_MATRIX.md](COMMAND_MATRIX.md) for the full command/runtime table.
@@ -86,8 +88,8 @@ Current status by intent:
 
 - first-class public path:
   - `elastos`
-  - `elastos pc2`
-  - `PC2 -> Chat`
+  - `elastos home`
+  - `Home -> System/Documents/Library/Inbox`
 - secondary shortcut:
   - `elastos chat`
 - secondary packaged surface path:
@@ -97,17 +99,17 @@ Current status by intent:
   - `elastos run ...`
   - non-interactive `elastos capsule ...`
 
-The public product contract is intentionally centered on the PC2 front door, not on direct packaged-surface launches.
+The public product contract is intentionally centered on Home, not on direct packaged-surface launches.
 
 ## Direct Chat Shortcuts
 
-If you want to jump straight into chat without going through PC2 home:
+If you want to jump straight into chat without going through Home:
 
 ```bash
 elastos chat --nick alice
 ```
 
-`elastos chat` is a shortcut to the same native chat surface used from PC2. On the current native terminal path, `Esc` or `/home` returns to PC2; `/quit` exits to the invoking terminal.
+`elastos chat` is a direct native chat shortcut. On the current native terminal path, `Esc` or `/home` returns Home; `/quit` exits to the invoking terminal.
 
 There are also packaged chat-family paths, but they are secondary today rather than the main product contract:
 
@@ -125,7 +127,7 @@ elastos capsule chat-wasm --lifecycle interactive --interactive --config '{"nick
 
 Important honesty rule for those packaged paths:
 
-- when launched from PC2, they can return to PC2
+- when launched from Home, they can return Home
 - when launched directly from the terminal, both `/home` and `/quit` return to the invoking terminal
 - they should not be documented as the boring default path unless they are explicitly surfaced and proven on the installed route
 
@@ -223,7 +225,7 @@ The built binary is not a self-contained install.
 - A GitHub checkout gives you source plus the manifest. It does not stamp `sources.json` for you.
 - If you want published-install behavior in a clean home, use the installer path from [INSTALL.md](INSTALL.md).
 - If you want to wire in your own source manually, add one explicitly with `elastos source add ...`.
-- If you want repo-native proof that the current checkout works, run `just local-carrier-setup-smoke` and `just pc2-frontdoor-smoke`.
+- If you want repo-native proof that the current checkout works, run `just local-carrier-setup-smoke` and `just home-frontdoor-smoke`.
 
 Copying a raw source-built binary into `~/.local/bin` is not the canonical source-developer path.
 
@@ -252,7 +254,7 @@ What those values mean:
 Important boundary:
 
 - `source add` adds an existing trusted source. It does not create one from the checkout.
-- Today the supported source-local proof path is still `just local-carrier-setup-smoke` or `just pc2-frontdoor-smoke`.
+- Today the supported source-local proof path is still `just local-carrier-setup-smoke` or `just home-frontdoor-smoke`.
 - Reusing someone else's live `sources.json` is not the general contract. Add a source you control, or use the stamped installer path.
 
 ## First Source Runs
@@ -294,8 +296,8 @@ elastos run ...
 Hosted room note:
 
 - `elastos room open` needs the explicit operator runtime from `setup --profile operator`.
-- The browser surface it exposes comes from `setup --profile demo`.
-- The canonical local route is `http://127.0.0.1:8090/apps/room-browser/`.
+- The browser-hosted adapter it exposes comes from `setup --profile demo`.
+- The canonical local route is `http://127.0.0.1:8090/apps/chat-room/`.
 
 Rule:
 
@@ -341,8 +343,8 @@ The current preview is exercised on Linux `x86_64` and `aarch64`.
 Current honest proof scope is narrower than that platform list:
 
 - the live public x86_64 outsider path is proven
-- full installed `elastos -> PC2 -> Chat -> home` is still a manual target-machine acceptance item on additional hosts
-- installed hosted room-browser validation is still a manual operator-lane acceptance item
+- full installed `elastos -> Home -> System/Documents/Library/Inbox -> Home` is still a manual target-machine acceptance item on additional hosts
+- installed hosted chat-room validation is still a manual operator-lane acceptance item
 
 See [state.md](../state.md) for the factual current evidence level.
 

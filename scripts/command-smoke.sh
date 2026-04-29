@@ -74,11 +74,11 @@ run_fail_fast() {
   fi
 }
 
-run_expect_output "root help exposes pc2" "pc2" "${ELASTOS_CMD[@]}" --help
+run_expect_output "root help exposes home" "home" "${ELASTOS_CMD[@]}" --help
 run_expect_output "root help exposes webspace" "webspace" "${ELASTOS_CMD[@]}" --help
 run_expect_output "root help exposes identity" "identity" "${ELASTOS_CMD[@]}" --help
 run_ok "run help" "${ELASTOS_CMD[@]}" run --help
-run_ok "pc2 help" "${ELASTOS_CMD[@]}" pc2 --help
+run_ok "home help" "${ELASTOS_CMD[@]}" home --help
 run_ok "identity help" "${ELASTOS_CMD[@]}" identity --help
 run_ok "identity nickname help" "${ELASTOS_CMD[@]}" identity nickname --help
 run_ok "webspace help" "${ELASTOS_CMD[@]}" webspace --help
@@ -92,7 +92,7 @@ run_expect_output "shares list on empty home is explicit" "No shares yet" "${ELA
 run_expect_failure_output \
   "run wasm without operator runtime fails clearly" \
   "This command requires a running runtime" \
-  "${ELASTOS_CMD[@]}" run "$ROOT/capsules/pc2"
+  "${ELASTOS_CMD[@]}" run "$ROOT/capsules/home-cli"
 run_fail_fast "open missing bundle CID" "${ELASTOS_CMD[@]}" open elastos://QmU8x9HMWetGzfnXLe4CriiocGuzvSLr9NJ1RwDp6MaWX6
 
 echo "[command-smoke] OK"

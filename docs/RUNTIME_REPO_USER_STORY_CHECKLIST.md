@@ -10,10 +10,10 @@ Rules:
 - installed target hosts only count on the installed path: `install.sh` or `elastos update`
 - seed-node source proofs do not close installed-host acceptance by themselves
 - `just verify` is the dev/source gate, should stay hermetic to the worktree under test, and `just verify-release` is the canonical-publisher release-trust gate
-- if a PC2 surface is shipped, it must be installed, launchable, and useful
+- if a Home surface is shipped, it must be installed, launchable, and useful
 - if a story is not proven, hide or demote the surface instead of overclaiming
 - if a dedicated smoke script no longer exists, say so explicitly instead of pointing reviewers at dead commands
-- the older dedicated `scripts/public-install-update-smoke.sh` and `scripts/public-linux-runtime-portability-smoke.sh` proofs are not separate active scripts on this line; their concerns are now covered by the `scripts/public-install-*.sh` acceptance helpers, rerunning those helpers against a published gateway via `ELASTOS_PUBLISHER_GATEWAY=<url>`, and `just verify-release`
+- installed update and portability proof lives in the current public-install helpers, rerunning those helpers against a published gateway via `ELASTOS_PUBLISHER_GATEWAY=<url>`, `scripts/audit-linux-runtime-portability.sh`, and `just verify-release`
 
 ## Host Roles
 
@@ -32,15 +32,15 @@ Rules:
 |---|---|---|---|---|---|
 | RS-00 | Repo gates are green | `just verify` | Inspect failures, keep worktree clean enough to trust gates | n/a | n/a |
 | RS-01 | Trusted install/update path works | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | Verify source host serves the expected signer/trusted source | `install.sh` or `elastos update`, then `elastos source show` and `elastos update --check` | same as installed x86_64 |
-| RS-02 | DID-backed identity works | `scripts/public-install-identity-smoke.sh` and `scripts/local-identity-profile-smoke.sh` | `elastos identity show`, `nickname set/get`, PC2 People | same on installed path | same on installed path |
-| RS-03 | PC2 front door works | `scripts/local-carrier-setup-smoke.sh`, `scripts/pc2-frontdoor-smoke.sh`, `scripts/public-install-pc2-frontdoor-smoke.sh` | launch `elastos`, enter/exit Chat and MyWebSite, return home | `elastos` -> PC2 -> Chat/MyWebSite -> home | same as installed x86_64 |
+| RS-02 | DID-backed identity works | `scripts/public-install-identity-smoke.sh` and `scripts/local-identity-profile-smoke.sh` | `elastos identity show`, `nickname set/get`, Home identity surfaces | same on installed path | same on installed path |
+| RS-03 | Home front door works | `scripts/local-carrier-setup-smoke.sh`, `scripts/home-frontdoor-smoke.sh`, `scripts/public-install-home-frontdoor-smoke.sh` | launch `elastos`, open System/Documents/Library/Inbox, return Home | `elastos` -> Home -> System/Documents/Library/Inbox -> Home | same as installed x86_64 |
 | RS-04 | Native chat works | `scripts/local-carrier-chat-smoke.sh` where applicable | open Chat locally, verify send/receive and `/home` / `/quit` | `elastos` -> Chat, exchange messages with another installed host | same as installed x86_64 |
 | RS-05 | Chat WASM works | `scripts/chat-wasm-local-smoke.sh`, `scripts/chat-wasm-native-interop-smoke.sh`, `scripts/shared-runtime-gossip-proof.sh` | run `elastos capsule chat-wasm --lifecycle interactive --interactive` or local dev path and exchange with native chat | n/a unless explicitly shipped there | n/a unless explicitly shipped there |
 | RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts; installed-path proof is manual on this line | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct packaged chat | same as installed x86_64 |
-| RS-07 | MyWebSite is useful | covered partly by PC2 frontdoor smokes | preview opens, `Go public` gives URL, return to PC2 home | preview from PC2 works, notice is useful | same as installed x86_64 |
-| RS-08 | Shared is useful | `scripts/command-smoke.sh` | `elastos shares list` returns meaningful state | open Shared from PC2 and confirm it is not misleading | same as installed x86_64 |
-| RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from PC2 or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed PC2, verify launch and usefulness | same as installed x86_64 |
-| RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | PC2 Updates action returns useful status | same as installed x86_64 |
+| RS-07 | MyWebSite is useful | covered partly by Home frontdoor smokes and site command tests | staged preview opens, `Go public`/ephemeral exposure gives a URL when installed, and any surfaced Home action is truthful | same as seed node on installed path | same as installed x86_64 |
+| RS-08 | Documents and Library are useful | `scripts/home-camofox-smoke.sh`, `cargo test -p elastos-server --lib documents -- --nocapture` | create/save/publish a document, then open it from Library | same as seed node on installed Home | same as installed x86_64 |
+| RS-09 | GBA UCity is useful | `scripts/gba-demo-smoke.sh` | launch from Home or direct path, verify viewer, ROM, save/load persistence | if surfaced in installed Home, verify launch and usefulness | same as installed x86_64 |
+| RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | CLI update status is truthful; compare any surfaced Home/System update action only if visible | same as installed x86_64 |
 | RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
 | RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
 
@@ -56,7 +56,7 @@ just verify
 
 Pass when:
 - `alignment-check`
-- clean-home PC2 setup plus front door smokes
+- clean-home setup plus Home front door smokes
 - command smoke
 - fmt
 - clippy
@@ -109,28 +109,31 @@ elastos
 Pass when:
 - DID exists
 - nickname persists
-- PC2 People reflects the same nickname
+- Home identity surfaces reflect the same nickname
 
-### RS-03 PC2 front door works
+### RS-03 Home front door works
 
 Automatic:
 ```bash
 cd <repo-root>
 bash scripts/local-carrier-setup-smoke.sh
-bash scripts/pc2-frontdoor-smoke.sh
-bash scripts/public-install-pc2-frontdoor-smoke.sh
+bash scripts/home-frontdoor-smoke.sh
+bash scripts/public-install-home-frontdoor-smoke.sh
 ```
 
 Manual on installed hosts:
 1. Run `elastos`
-2. Confirm PC2 home renders
-3. Open `Chat`
-4. Return with `Esc`, `/home`, and `/quit`
-5. Open `MyWebSite`
-6. Return home
+2. Confirm Home renders
+3. Open `System`
+4. Open `Documents`
+5. Create and save a note
+6. Open `Library`
+7. Open the note from Library
+8. Open `Inbox`
+9. Return Home after each app
 
 Pass when:
-- PC2 opens cleanly
+- Home opens cleanly
 - child surfaces return home cleanly
 - notices are useful, not misleading
 
@@ -194,36 +197,44 @@ Pass when:
 ### RS-07 MyWebSite is useful
 
 Automatic:
-- covered partially by PC2 frontdoor smokes
+- covered partially by Home frontdoor smokes
 
 Manual on seed and installed hosts:
 1. Stage a simple site
-2. Open `MyWebSite` from PC2
-3. Confirm local preview URL is useful
-4. Trigger `Go public`
-5. Confirm temporary HTTPS URL works
+2. Open the local preview with `elastos open localhost://MyWebSite`
+3. Confirm the local preview URL is useful
+4. If the Home UI surfaces MyWebSite actions, confirm they match the CLI state
+5. Trigger `Go public` or `elastos site serve --mode ephemeral` when the required components are installed
+6. Confirm temporary HTTPS URL works
 
 Pass when:
 - preview opens
 - public URL path is clear
-- PC2 notice tells the user what to do next
+- any visible Home notice tells the user what to do next
 
-### RS-08 Shared is useful
+### RS-08 Documents and Library are useful
 
 Automatic:
 ```bash
 cd <repo-root>
-bash scripts/command-smoke.sh
+bash scripts/home-camofox-smoke.sh
+cd elastos && cargo test -p elastos-server --lib documents -- --nocapture
 ```
 
 Manual on seed and installed hosts:
-1. Create at least one share
-2. Open `Shared` from PC2
-3. Confirm the screen reflects real channels/next steps
+1. Open `Documents` from Home
+2. Create a document
+3. Save it
+4. Publish it
+5. Open `Library`
+6. Confirm the document appears as content, not a raw path
+7. Open the document from Library
+8. Copy the `elastos://<cid>` link and open it from Chat Room or Documents where available
 
 Pass when:
-- Shared is not empty theater
-- if empty, it explains what to do next
+- Documents and Library use the same document identity and provider contract
+- published revisions open as immutable `elastos://<cid>` objects
+- drafts are clearly local until published
 
 ### RS-09 GBA UCity is useful
 
@@ -258,11 +269,11 @@ ELASTOS_PUBLISHER_GATEWAY=<published-url> bash scripts/public-install-operator-s
 
 Manual on installed hosts:
 1. Run `elastos update --check`
-2. Open `Updates` from PC2
+2. If Home or System exposes an update action, open it
 3. Compare the message
 
 Pass when:
-- PC2 and CLI tell the same story
+- CLI and any surfaced UI tell the same story
 - no fake `ready/current` message when trusted-source check failed
 
 ### RS-11 Sovereign room sync works
@@ -374,10 +385,11 @@ elastos serve
 
 Manual checks:
 - People / identity
-- Chat
-- MyWebSite
-- Updates
-- Room browser after `setup --profile demo` plus `setup --profile operator`
+- System / Documents / Library / Inbox
+- Native chat shortcut
+- MyWebSite command path, plus any surfaced Home action if visible
+- CLI update status, plus any surfaced Home/System action if visible
+- Chat Room after `setup --profile demo` plus `setup --profile operator`
 - Full-screen Chat only if you are explicitly closing RS-06 on this host
 
 ### Installed arm64 host
@@ -395,8 +407,9 @@ elastos serve
 
 Manual checks:
 - People / identity
-- Chat
-- MyWebSite
-- Updates
-- Room browser after `setup --profile demo` plus `setup --profile operator`
+- System / Documents / Library / Inbox
+- Native chat shortcut
+- MyWebSite command path, plus any surfaced Home action if visible
+- CLI update status, plus any surfaced Home/System action if visible
+- Chat Room after `setup --profile demo` plus `setup --profile operator`
 - Full-screen Chat only if you are explicitly closing RS-06 on this host

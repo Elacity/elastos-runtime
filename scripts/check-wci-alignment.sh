@@ -112,16 +112,16 @@ check_forbidden 'Contacts publisher gateway directly' 'command docs should not d
 check_forbidden 'alias /var/www/elastos/' 'nginx should not own published application objects directly'
 check_forbidden 'proxy_pass http://127\.0\.0\.1:8081' 'public nginx edge should not route the canonical site through the preview site service'
 
-check_required 'PC2 home' README.md 'README must teach PC2 home'
+check_required 'Home front door' README.md 'README must teach Home front door'
 check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
 check_required 'Carrier First Off-Box' PRINCIPLES.md 'principles file must codify Carrier-first off-box transport'
 check_required 'audit-linux-runtime-portability\.sh' scripts/publish-release.sh 'publish release must audit Linux runtime portability before publishing'
 check_forbidden_in_path 'using default: \$ELASTOS' scripts/publish-release.sh 'public Linux runtime publish must not silently fall back to the glibc host binary'
-check_required 'PC2 home' docs/GETTING_STARTED.md 'Getting Started must teach PC2 home'
-check_required 'Open PC2 home:' scripts/install.sh 'installer banner must teach PC2 home'
+check_required 'opens Home' docs/GETTING_STARTED.md 'Getting Started must teach Home front door'
+check_required 'Open Home:' scripts/install.sh 'installer banner must teach Home'
 check_required 'localhost://UsersAI' docs/NAMESPACES.md 'namespace docs must teach UsersAI rooted localhost'
 check_required 'localhost://ElastOS' docs/NAMESPACES.md 'namespace docs must teach ElastOS rooted localhost'
-check_required 'SharedByLocalUsersAndBots' elastos/crates/elastos-server/src/pc2_cmd.rs 'pc2 session code must use the shared Local workspace path'
+check_required 'SharedByLocalUsersAndBots' elastos/crates/elastos-server/src/home_cmd.rs 'Home session code must use the shared Local workspace path'
 check_required 'route\("/release\.json"' elastos/crates/elastos-server/src/api/gateway.rs 'gateway must serve release.json'
 check_required 'route\("/artifacts/\*path"' elastos/crates/elastos-server/src/api/gateway.rs 'gateway must serve published artifacts'
 check_required 'X-Elastos-Site-Origin' elastos/crates/elastos-server/src/api/gateway.rs 'gateway must stamp public site responses with rooted origin'
@@ -139,16 +139,16 @@ check_required 'site activate' docs/SITES.md 'site docs must teach signed site a
 check_required 'site history' docs/SITES.md 'site docs must teach site history'
 check_required 'site rollback' docs/SITES.md 'site docs must teach site rollback'
 check_required 'site promote' docs/SITES.md 'site docs must teach site promotion'
-check_required 'public-install-update-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the stamped-install update proof'
+check_required 'public-install-operator-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the installed operator/update proof'
 check_required 'public-install-identity-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the DID/profile proof contract'
-check_required 'public-linux-runtime-portability-smoke\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the public Linux runtime portability proof'
+check_required 'audit-linux-runtime-portability\.sh' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the public Linux runtime portability proof'
 check_required 'just verify-release' docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md 'runtime repo checklist must record the canonical release-trust gate'
-check_required 'public-install-update-smoke\.sh' state.md 'state ledger must record the explicit stamped-install update proof'
+check_required 'public-install-operator-smoke\.sh' state.md 'state ledger must record the explicit installed operator/update proof'
 check_required 'local-identity-profile-smoke\.sh|public-install-identity-smoke\.sh' state.md 'state ledger must record the DID/profile proof path'
-check_required 'public-linux-runtime-portability-smoke\.sh' state.md 'state ledger must record the explicit public Linux runtime portability proof'
-check_required 'public-install-update-smoke\.sh' TASKS.md 'tasks must keep the stamped-install update proof in scope'
+check_required 'audit-linux-runtime-portability\.sh' state.md 'state ledger must record the explicit public Linux runtime portability proof'
+check_required 'public-install-operator-smoke\.sh' TASKS.md 'tasks must keep the installed operator/update proof in scope'
 check_required 'public-install-identity-smoke\.sh|DID-backed People/profile contract' TASKS.md 'tasks must keep the DID/profile public proof in scope'
-check_required 'public-linux-runtime-portability-smoke\.sh' TASKS.md 'tasks must keep the public Linux runtime portability proof in scope'
+check_required 'audit-linux-runtime-portability\.sh' TASKS.md 'tasks must keep the public Linux runtime portability proof in scope'
 check_required 'BindDomain' elastos/crates/elastos-server/src/main.rs 'site command surface must expose bind-domain'
 check_required 'Publish' elastos/crates/elastos-server/src/main.rs 'site command surface must expose publish'
 check_required 'Releases' elastos/crates/elastos-server/src/main.rs 'site command surface must expose releases'
@@ -162,7 +162,7 @@ check_required 'edge_site_head_path' elastos/crates/elastos-server/src/api/gatew
 check_required 'publisher_site_release_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist named releases under Publisher state'
 check_required 'edge_release_channel_path' elastos/crates/elastos-server/src/site_cmd.rs 'site command surface must persist release channels under Edge state'
 check_required 'publisher_release_manifest_path' elastos/crates/elastos-server/src/api/gateway.rs 'gateway must read release manifests from Publisher state'
-check_forbidden_in_path 'default chat profile' docs/GETTING_STARTED.md 'onboarding must teach the default PC2 profile, not the old chat profile'
+check_forbidden_in_path 'default chat profile' docs/GETTING_STARTED.md 'onboarding must teach the default Home profile, not the old chat profile'
 check_forbidden_in_path 'darwin\)' scripts/install.sh 'public installer must stay Linux-only until update/install support macOS coherently'
 check_forbidden_in_path 'http://' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider-registry tests/docs must not preserve http:// parity assumptions'
 check_forbidden_in_path 'localhost:// = ' README.md 'public docs must not flatten localhost:// into a single-root slogan'
@@ -172,23 +172,39 @@ check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/el
 check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/elastos-server/src/ipfs.rs 'viewer resolution must not auto-enable repo asset lookup just because the binary runs from target/'
 check_forbidden_in_path 'Legacy TCP fallback' elastos/crates/elastos-server/src/vm_provider.rs 'vm provider bridge must not describe generic TCP fallback as a normal contract'
 check_forbidden_in_path 'guest_from_fallback' elastos/crates/elastos-server/src/init.rs 'init should name guest dependency source explicitly instead of treating registry dependency as an unnamed fallback'
-check_required 'managed dashboard runtime' docs/OVERVIEW.md 'overview must teach PC2 home as the front door'
+check_required 'managed dashboard runtime' docs/OVERVIEW.md 'overview must teach Home as the front door'
 
 python3 - <<'PY'
 import json, sys
 from pathlib import Path
 
 components = json.loads(Path("components.json").read_text())
-pc2 = components["profiles"]["pc2"]["components"]
-forbidden = {"kubo", "ipfs-provider", "site-provider", "tunnel-provider", "md-viewer", "cloudflared"}
-bad = sorted(forbidden.intersection(pc2))
+
+def platform_info(component, platform):
+    platforms = component.get("platforms") or {}
+    return platforms.get(platform) or platforms.get("*")
+
+home = components["profiles"]["home"]["components"]
+forbidden = {"kubo", "ipfs-provider", "site-provider", "tunnel-provider", "cloudflared"}
+bad = sorted(forbidden.intersection(home))
 if bad:
-    print("[alignment] pc2 profile includes non-default off-box/public-edge components:", ", ".join(bad))
+    print("[alignment] home profile includes non-default off-box/public-edge components:", ", ".join(bad))
     sys.exit(1)
-required = {"shell", "localhost-provider", "did-provider", "webspace-provider", "pc2"}
-missing = sorted(required.difference(pc2))
+required = {
+    "shell",
+    "localhost-provider",
+    "did-provider",
+    "webspace-provider",
+    "home-cli",
+    "home",
+    "system",
+    "documents",
+    "library",
+    "inbox",
+}
+missing = sorted(required.difference(home))
 if missing:
-    print("[alignment] pc2 profile missing required first-party core components:", ", ".join(missing))
+    print("[alignment] home profile missing required first-party core components:", ", ".join(missing))
     sys.exit(1)
 demo = components["profiles"].get("demo")
 if not demo:
@@ -200,12 +216,17 @@ required_demo = {
     "localhost-provider",
     "did-provider",
     "webspace-provider",
-    "pc2",
+    "home-cli",
+    "home",
+    "system",
     "kubo",
     "ipfs-provider",
     "site-provider",
     "tunnel-provider",
-    "md-viewer",
+    "documents",
+    "library",
+    "inbox",
+    "chat-room",
     "cloudflared",
 }
 missing_demo = sorted(required_demo.difference(demo_components))
@@ -246,18 +267,31 @@ for platform in ("linux-amd64", "linux-arm64"):
     if not info.get("release_path"):
         print(f"[alignment] webspace-provider missing {platform} release_path")
         sys.exit(1)
-pc2_component = components["external"].get("pc2")
-if not pc2_component:
-    print("[alignment] pc2 home capsule is missing from external components")
+home_cli_component = components["external"].get("home-cli")
+if not home_cli_component:
+    print("[alignment] home-cli capsule is missing from external components")
     sys.exit(1)
 for platform in ("linux-amd64", "linux-arm64"):
-    info = (pc2_component.get("platforms") or {}).get(platform)
+    info = platform_info(home_cli_component, platform)
     if not info:
-        print(f"[alignment] pc2 home capsule missing {platform} release metadata")
+        print(f"[alignment] home-cli capsule missing {platform} release metadata")
         sys.exit(1)
     if not info.get("release_path"):
-        print(f"[alignment] pc2 home capsule missing {platform} release_path")
+        print(f"[alignment] home-cli capsule missing {platform} release_path")
         sys.exit(1)
+for name in ("home", "system", "documents", "library", "inbox"):
+    component = components["external"].get(name)
+    if not component:
+        print(f"[alignment] {name} capsule is missing from external components")
+        sys.exit(1)
+    for platform in ("linux-amd64", "linux-arm64"):
+        info = platform_info(component, platform)
+        if not info:
+            print(f"[alignment] {name} capsule missing {platform} release metadata")
+            sys.exit(1)
+        if not info.get("release_path") or not info.get("extract_path"):
+            print(f"[alignment] {name} capsule missing {platform} archive metadata")
+            sys.exit(1)
 PY
 
 if [[ "$failed" -ne 0 ]]; then

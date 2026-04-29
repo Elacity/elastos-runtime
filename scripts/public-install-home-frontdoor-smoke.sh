@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/runtime-cleanup.sh"
 
 PUBLISHER_GATEWAY="${ELASTOS_PUBLISHER_GATEWAY:-https://elastos.elacitylabs.com}"
-HOME_DIR="$(mktemp -d /tmp/elastos-public-pc2-XXXXXX)"
+HOME_DIR="$(mktemp -d /tmp/elastos-public-home-XXXXXX)"
 
 cleanup() {
     cleanup_elastos_runtime_home "$HOME_DIR"
@@ -13,26 +13,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[public-pc2-frontdoor] install from public gateway"
+echo "[public-home-frontdoor] install from public gateway"
 HOME="$HOME_DIR" \
 XDG_DATA_HOME="$HOME_DIR/xdg-data" \
 ELASTOS_PUBLISHER_GATEWAY="$PUBLISHER_GATEWAY" \
 bash -lc 'curl -fsSL "${ELASTOS_PUBLISHER_GATEWAY%/}/install.sh" | bash' \
-    >/tmp/elastos-public-pc2-install.log
+    >/tmp/elastos-public-home-install.log
 
 INSTALLED_BIN="$HOME_DIR/.local/bin/elastos"
 RUN_BIN="${ELASTOS_BIN_OVERRIDE:-$INSTALLED_BIN}"
 SOURCES_PATH="$HOME_DIR/xdg-data/elastos/sources.json"
 if [[ ! -x "$INSTALLED_BIN" ]]; then
-    echo "[public-pc2-frontdoor] installed binary missing: $INSTALLED_BIN" >&2
+    echo "[public-home-frontdoor] installed binary missing: $INSTALLED_BIN" >&2
     exit 1
 fi
 if [[ ! -x "$RUN_BIN" ]]; then
-    echo "[public-pc2-frontdoor] run binary missing: $RUN_BIN" >&2
+    echo "[public-home-frontdoor] run binary missing: $RUN_BIN" >&2
     exit 1
 fi
 
-echo "[public-pc2-frontdoor] prove stamped trusted source"
+echo "[public-home-frontdoor] prove stamped trusted source"
 SOURCE_OUTPUT="$(
     HOME="$HOME_DIR" \
     XDG_DATA_HOME="$HOME_DIR/xdg-data" \
@@ -40,15 +40,15 @@ SOURCE_OUTPUT="$(
 )"
 echo "$SOURCE_OUTPUT"
 if ! grep -q "Bootstrap: peer ticket configured" <<<"$SOURCE_OUTPUT"; then
-    echo "[public-pc2-frontdoor] expected stamped Carrier bootstrap ticket missing from source show" >&2
+    echo "[public-home-frontdoor] expected stamped Carrier bootstrap ticket missing from source show" >&2
     exit 1
 fi
 if grep -q "Node ID:   none" <<<"$SOURCE_OUTPUT"; then
-    echo "[public-pc2-frontdoor] expected stamped publisher node id missing from source show" >&2
+    echo "[public-home-frontdoor] expected stamped publisher node id missing from source show" >&2
     exit 1
 fi
 
-echo "[public-pc2-frontdoor] remove gateway override and direct addrs to force relay-only Carrier setup"
+echo "[public-home-frontdoor] remove gateway override and direct addrs to force relay-only Carrier setup"
 SOURCES_PATH="$SOURCES_PATH" python3 - <<'PY'
 import json
 import os
@@ -74,12 +74,12 @@ for source in data.get("sources", []):
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
-echo "[public-pc2-frontdoor] setup pc2 profile"
+echo "[public-home-frontdoor] setup home profile"
 HOME="$HOME_DIR" \
 XDG_DATA_HOME="$HOME_DIR/xdg-data" \
-"$RUN_BIN" setup --profile pc2 >/tmp/elastos-public-pc2-setup.log
+"$RUN_BIN" setup --profile home >/tmp/elastos-public-home-setup.log
 
-echo "[public-pc2-frontdoor] prove installed elastos -> pc2 -> chat -> home/quit/esc -> pc2"
+echo "[public-home-frontdoor] prove installed elastos -> home -> chat -> home/quit/esc -> home"
 HOME_DIR="$HOME_DIR" RUN_BIN="$RUN_BIN" python3 - <<'PY'
 import os
 import pty
@@ -93,7 +93,7 @@ run_bin = os.environ["RUN_BIN"]
 env = os.environ.copy()
 env["HOME"] = home
 env["XDG_DATA_HOME"] = f"{home}/xdg-data"
-# Keep the smoke hermetic: chat launched from PC2 must stay on the slave PTY
+# Keep the smoke hermetic: chat launched from Home must stay on the slave PTY
 # instead of probing the caller's controlling terminal via /dev/tty.
 env["ELASTOS_CHAT_FORCE_STDIN"] = "1"
 cmd = [run_bin]
@@ -155,7 +155,7 @@ def shutdown(master: int, proc: subprocess.Popen) -> None:
 def run_chat_case(label: str, payload: bytes) -> None:
     master, proc = launch_pty()
     try:
-        read_until(label, master, lambda text: "ElastOS PC2" in text, 10.0)
+        read_until(label, master, lambda text: "ElastOS Home" in text, 10.0)
         send(master, b"\r\n")
         after_enter1 = read_until(
             label,
@@ -163,7 +163,8 @@ def run_chat_case(label: str, payload: bytes) -> None:
             lambda text: "Press Enter again to launch Chat" in text,
             6.0,
         )
-        send(master, b"\r", 0.8)
+        time.sleep(0.8)
+        send(master, b"\r")
         after_enter2 = read_until(
             label,
             master,
@@ -179,11 +180,11 @@ def run_chat_case(label: str, payload: bytes) -> None:
         after_exit = read_until(
             label,
             master,
-            lambda text: "ElastOS PC2" in text,
+            lambda text: "ElastOS Home" in text,
             8.0,
         )
-        if "ElastOS PC2" not in after_exit:
-            raise SystemExit(f"{label}: installed exit input did not return to PC2:\n{after_exit}")
+        if "ElastOS Home" not in after_exit:
+            raise SystemExit(f"{label}: installed exit input did not return Home:\n{after_exit}")
     finally:
         shutdown(master, proc)
 
@@ -197,7 +198,7 @@ def run_navigation_case() -> None:
             10.0,
         )
         if "\x1b[30;46;1m Home \x1b[0m" not in initial:
-            raise SystemExit(f"nav: installed pc2 home did not start on Home:\n{initial}")
+            raise SystemExit(f"nav: installed Home did not start on Home:\n{initial}")
         send(master, b"\x1b[C", 0.4)
         after_right = read_until(
             "nav",
@@ -229,7 +230,7 @@ def run_down_navigation_case() -> None:
             10.0,
         )
         if "> 1 Chat [ready]" not in initial:
-            raise SystemExit(f"nav-down: installed pc2 home did not highlight Chat first:\n{initial}")
+            raise SystemExit(f"nav-down: installed Home did not highlight Chat first:\n{initial}")
         send(master, b"\x1b[B", 0.4)
         after_down = read_until(
             "nav-down",
@@ -242,9 +243,9 @@ def run_down_navigation_case() -> None:
     finally:
         shutdown(master, proc)
 
-def run_pc2_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
+def run_home_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]) -> None:
     proc = subprocess.run(
-        cmd + ["pc2"],
+        cmd + ["home"],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -253,7 +254,7 @@ def run_pc2_case(label: str, payload: bytes, expected_fragments: tuple[str, ...]
     )
     output = proc.stdout.decode("utf-8", "replace")
     if proc.returncode != 0:
-        raise SystemExit(f"{label}: installed pc2 command failed:\n{output}")
+        raise SystemExit(f"{label}: installed home command failed:\n{output}")
     if not any(fragment in output for fragment in expected_fragments):
         joined = "\n".join(expected_fragments)
         raise SystemExit(f"{label}: expected one of:\n{joined}\n\nactual output:\n{output}")
@@ -263,7 +264,7 @@ run_down_navigation_case()
 run_chat_case("esc", b"\x1b")
 run_chat_case("home", b"/home\r")
 run_chat_case("quit", b"/quit\r")
-run_pc2_case(
+run_home_case(
     "mywebsite",
     b"2\n\nq\n",
     (
@@ -272,7 +273,7 @@ run_pc2_case(
         "MyWebSite is not ready: missing site-provider",
     ),
 )
-run_pc2_case(
+run_home_case(
     "updates",
     b"3\nq\n",
     (
@@ -283,5 +284,5 @@ run_pc2_case(
     ),
 )
 
-print("[public-pc2-frontdoor] OK")
+print("[public-home-frontdoor] OK")
 PY
