@@ -20,7 +20,7 @@ pub enum Command {
     List,
     /// Show help
     Help,
-    /// Return to the PC2 home surface
+    /// Return Home
     Home,
     /// Quit chat
     Quit,
@@ -87,19 +87,19 @@ pub fn parse(input: &str) -> Command {
     }
 }
 
-pub fn launched_from_pc2() -> bool {
-    std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("pc2")
+pub fn launched_from_home() -> bool {
+    std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("home")
 }
 
 /// Help text for all commands.
-pub fn help_text(from_pc2: bool) -> String {
-    let home_line = if from_pc2 {
-        " /home            Return to PC2"
+pub fn help_text(from_home: bool) -> String {
+    let home_line = if from_home {
+        " /home            Return Home"
     } else {
         " /home            Exit chat to terminal"
     };
-    let quit_line = if from_pc2 {
-        " /quit            Leave chat and return to PC2"
+    let quit_line = if from_home {
+        " /quit            Leave chat and return Home"
     } else {
         " /quit            Exit chat to terminal"
     };
@@ -190,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn help_text_is_explicit_for_pc2_launch() {
+    fn help_text_is_explicit_for_home_launch() {
         let help = help_text(true);
-        assert!(help.contains("/home            Return to PC2"));
-        assert!(help.contains("/quit            Leave chat and return to PC2"));
+        assert!(help.contains("/home            Return Home"));
+        assert!(help.contains("/quit            Leave chat and return Home"));
     }
 
     #[test]

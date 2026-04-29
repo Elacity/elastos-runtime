@@ -72,7 +72,7 @@ prepare_home() {
     echo "[installed-native-chat] setup ${name}"
     HOME="${HOME_DIR[$name]}" \
     XDG_DATA_HOME="${XDG_DIR[$name]}" \
-    "${BIN_PATH[$name]}" setup --profile pc2 \
+    "${BIN_PATH[$name]}" setup --profile home \
         >/tmp/elastos-installed-native-chat-setup-"${name}".log 2>&1
 }
 

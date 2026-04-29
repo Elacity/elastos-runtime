@@ -68,7 +68,7 @@ pub struct App {
     pub status: String,
     /// Whether to quit
     pub should_quit: bool,
-    /// Whether chat should return to the PC2 home surface on exit
+    /// Whether chat should return Home on exit
     pub return_home_requested: bool,
     /// Deduplication set: SHA-256 of (sender_id + ts + content)
     seen_messages: HashSet<[u8; 32]>,
@@ -422,10 +422,10 @@ mod tests {
         app.join_channel("#general");
         app.join_channel("#random");
         assert_eq!(app.active_channel_name(), "#random");
-        assert!(app.ensure_channel("!pc2"));
+        assert!(app.ensure_channel("!home"));
         assert_eq!(app.active_channel_name(), "#random");
         assert_eq!(app.channels.len(), 3);
-        assert!(!app.ensure_channel("!pc2"));
+        assert!(!app.ensure_channel("!home"));
     }
 
     #[test]

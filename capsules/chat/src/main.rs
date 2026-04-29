@@ -362,7 +362,7 @@ fn request_home_exit(app: &mut App, args: &Args) {
 }
 
 fn signal_home_exit() -> ! {
-    if std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("pc2") {
+    if std::env::var("ELASTOS_PARENT_SURFACE").ok().as_deref() == Some("home") {
         std::process::exit(0);
     }
     std::process::exit(CHAT_RETURN_HOME_EXIT_CODE);
@@ -592,7 +592,7 @@ fn handle_key(app: &mut App, key: KeyEvent, args: &Args) -> Result<()> {
                     }
                 }
                 Command::Help => {
-                    for line in command::help_text(command::launched_from_pc2()).lines() {
+                    for line in command::help_text(command::launched_from_home()).lines() {
                         app.system_message(line);
                     }
                 }

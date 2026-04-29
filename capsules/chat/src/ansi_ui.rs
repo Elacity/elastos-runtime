@@ -83,7 +83,7 @@ impl AnsiUi {
         );
 
         let footer = if app.status.is_empty() {
-            default_footer_text(crate::command::launched_from_pc2())
+            default_footer_text(crate::command::launched_from_home())
         } else {
             app.status.as_str()
         };
@@ -114,9 +114,9 @@ impl Drop for AnsiUi {
     }
 }
 
-fn default_footer_text(from_pc2: bool) -> &'static str {
-    if from_pc2 {
-        " Esc /home to PC2 | /quit leave chat to PC2 | Tab switch channel "
+fn default_footer_text(from_home: bool) -> &'static str {
+    if from_home {
+        " Esc /home to Home | /quit leave chat to Home | Tab switch channel "
     } else {
         " Esc /home to exit | /quit exit to terminal | Tab switch channel "
     }
