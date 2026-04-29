@@ -8,79 +8,159 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="gba-shell">
-    <div class="shoulder-buttons">
-      <button id="btn-l" class="shoulder-btn" data-key="l">L</button>
-      <button id="btn-r" class="shoulder-btn" data-key="r">R</button>
-    </div>
-    
-    <div class="shell-content">
-      <div class="screen-section">
-        <div id="screen-bezel">
+  <script>
+    const accessMode = new URLSearchParams(window.location.search).has("home_token")
+      ? "shell"
+      : "gateway";
+    const hostMode = window.self === window.top ? "standalone" : "embedded";
+    document.body.setAttribute("data-emulator-access-mode", accessMode);
+    document.body.setAttribute("data-emulator-host-mode", hostMode);
+    document.body.setAttribute("data-shell-window-fit", hostMode === "embedded" ? "fixed" : "auto");
+  </script>
+  <main id="app-shell" class="shell">
+    <section id="emulator-card" class="emulator-card">
+      <section class="screen-card">
+        <div id="screen-bezel" class="screen-frame">
           <div id="screen-container">
             <canvas id="canvas" width="240" height="160"></canvas>
             <div id="drop-zone">
-              <div class="icon">&#127918;</div>
-              <p>Drop a .gba ROM here or click to browse</p>
-              <input type="file" id="file-input" accept=".gba,.gbc,.gb,.zip">
+              <div class="drop-zone-copy">
+                <div class="icon">&#127918;</div>
+                <p id="drop-zone-copy">Insert Game</p>
+              </div>
+              <div id="rom-library" class="rom-library" hidden>
+                <div class="rom-library-head">
+                  <span>Installed ROMs</span>
+                </div>
+                <div id="rom-library-list" class="rom-library-list"></div>
+              </div>
+              <input type="file" id="file-input" accept=".gba,.gbc,.gb,.zip" aria-label="Choose ROM file">
             </div>
           </div>
-          <div id="power-led"></div>
+          <p id="status" class="screen-status" aria-live="polite" hidden></p>
         </div>
-      </div>
-      
-      <div id="controls-bar">
-        <div class="control-group">
-          <button id="btn-dpad-up" class="dpad-btn" data-key="up">
-            <span class="arrow">&#9650;</span>
-          </button>
-          <div class="dpad-row">
-            <button id="btn-dpad-left" class="dpad-btn" data-key="left">
-              <span class="arrow">&#9664;</span>
+
+        <div id="controls-bar" class="touch-controls">
+          <div class="shoulder-buttons">
+            <button id="btn-l" class="shoulder-btn" data-key="l" aria-label="L button, keyboard A">
+              <span class="button-label">L</span>
+              <span class="key-hint">A</span>
             </button>
-            <button id="btn-dpad-center" class="dpad-btn dpad-center"></button>
-            <button id="btn-dpad-right" class="dpad-btn" data-key="right">
-              <span class="arrow">&#9654;</span>
+            <button id="btn-r" class="shoulder-btn" data-key="r" aria-label="R button, keyboard S">
+              <span class="button-label">R</span>
+              <span class="key-hint">S</span>
             </button>
           </div>
-          <button id="btn-dpad-down" class="dpad-btn" data-key="down">
-            <span class="arrow">&#9660;</span>
+
+          <div class="controls-row">
+            <div class="control-group">
+              <button id="btn-dpad-up" class="dpad-btn" data-key="up" aria-label="D-pad up, keyboard Arrow Up">
+                <span class="arrow">&#9650;</span>
+              </button>
+              <div class="dpad-row">
+                <button id="btn-dpad-left" class="dpad-btn" data-key="left" aria-label="D-pad left, keyboard Arrow Left">
+                  <span class="arrow">&#9664;</span>
+                </button>
+                <button id="btn-dpad-center" class="dpad-btn dpad-center" type="button" tabindex="-1" aria-hidden="true"></button>
+                <button id="btn-dpad-right" class="dpad-btn" data-key="right" aria-label="D-pad right, keyboard Arrow Right">
+                  <span class="arrow">&#9654;</span>
+                </button>
+              </div>
+              <button id="btn-dpad-down" class="dpad-btn" data-key="down" aria-label="D-pad down, keyboard Arrow Down">
+                <span class="arrow">&#9660;</span>
+              </button>
+            </div>
+
+            <div class="center-buttons">
+              <button id="btn-select" class="small-btn" data-key="select" aria-label="Select button, keyboard Backspace">
+                <span class="button-label">Select</span>
+                <span class="key-hint">Back</span>
+              </button>
+              <button id="btn-start" class="small-btn" data-key="start" aria-label="Start button, keyboard Enter">
+                <span class="button-label">Start</span>
+                <span class="key-hint">Enter</span>
+              </button>
+            </div>
+
+            <div class="action-buttons">
+              <button id="btn-b" class="action-btn" data-key="b" aria-label="B button, keyboard Z">
+                <span class="button-label">B</span>
+                <span class="key-hint">Z</span>
+              </button>
+              <button id="btn-a" class="action-btn" data-key="a" aria-label="A button, keyboard X">
+                <span class="button-label">A</span>
+                <span class="key-hint">X</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="utility-card">
+        <div class="utility-card-head">
+          <h2 class="utility-title">Options</h2>
+          <button id="utility-toggle" class="utility-toggle" type="button" aria-expanded="true" aria-controls="utility-panel" aria-label="Collapse sidebar" title="Collapse sidebar">
+            <span class="utility-toggle-label">Hide</span>
           </button>
         </div>
-        
-        <div class="center-buttons">
-          <button id="btn-select" class="small-btn" data-key="select">SELECT</button>
-          <button id="btn-start" class="small-btn" data-key="start">START</button>
-        </div>
-        
-        <div class="action-buttons">
-          <button id="btn-b" class="action-btn" data-key="b">B</button>
-          <button id="btn-a" class="action-btn" data-key="a">A</button>
-        </div>
-      </div>
-    </div>
-  </div>
+        <div id="utility-panel" class="utility-panel">
+          <section class="utility-section">
+            <div id="emulator-controls">
+              <button id="btn-pause" class="icon-button" type="button" aria-label="Pause" title="Pause" disabled>
+                <span class="icon-glyph" aria-hidden="true">❚❚</span>
+              </button>
+              <button id="btn-ff" class="icon-button" type="button" aria-label="Fast Forward" title="Fast Forward" disabled>
+                <span class="icon-glyph" aria-hidden="true">≫</span>
+              </button>
+              <button id="btn-fullscreen" class="icon-button" type="button" aria-label="Fullscreen" title="Fullscreen">
+                <span class="icon-glyph" aria-hidden="true">⛶</span>
+              </button>
+            </div>
+            <div id="volume-group">
+              <label for="volume-slider">Volume</label>
+              <input type="range" id="volume-slider" min="0" max="100" value="50" aria-label="Volume">
+            </div>
+          </section>
 
-  <div id="emulator-controls">
-    <button id="btn-pause" disabled>Pause</button>
-    <button id="btn-ff" disabled>FF</button>
-    <button id="btn-fullscreen">FS</button>
-    <div class="separator"></div>
-    <button id="btn-save1" disabled>Save 1</button>
-    <button id="btn-save2" disabled>Save 2</button>
-    <button id="btn-save3" disabled>Save 3</button>
-    <div class="separator"></div>
-    <button id="btn-load1" disabled>Load 1</button>
-    <button id="btn-load2" disabled>Load 2</button>
-    <button id="btn-load3" disabled>Load 3</button>
-    <div class="separator"></div>
-    <div id="volume-group">
-      <label for="volume-slider">Vol</label>
-      <input type="range" id="volume-slider" min="0" max="100" value="50">
-    </div>
-  </div>
-
-  <div id="status"></div>
+          <section class="utility-section">
+            <h2>States</h2>
+            <div class="state-grid">
+              <div class="state-slot">
+                <div class="state-slot-head">
+                  <span class="state-slot-name">Slot 1</span>
+                  <span id="slot-status1" class="state-slot-status">Empty</span>
+                </div>
+                <div class="state-actions">
+                  <button id="btn-save1" aria-label="Save state slot 1" disabled>Save</button>
+                  <button id="btn-load1" aria-label="Load state slot 1" disabled>Load</button>
+                </div>
+              </div>
+              <div class="state-slot">
+                <div class="state-slot-head">
+                  <span class="state-slot-name">Slot 2</span>
+                  <span id="slot-status2" class="state-slot-status">Empty</span>
+                </div>
+                <div class="state-actions">
+                  <button id="btn-save2" aria-label="Save state slot 2" disabled>Save</button>
+                  <button id="btn-load2" aria-label="Load state slot 2" disabled>Load</button>
+                </div>
+              </div>
+              <div class="state-slot">
+                <div class="state-slot-head">
+                  <span class="state-slot-name">Slot 3</span>
+                  <span id="slot-status3" class="state-slot-status">Empty</span>
+                </div>
+                <div class="state-actions">
+                  <button id="btn-save3" aria-label="Save state slot 3" disabled>Save</button>
+                  <button id="btn-load3" aria-label="Load state slot 3" disabled>Load</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </section>
+  </main>
 
   <script type="module" src="emulator.js"></script>
 </body>

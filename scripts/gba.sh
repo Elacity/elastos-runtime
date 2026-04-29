@@ -2,7 +2,7 @@
 #
 # ElastOS GBA Emulator
 #
-# Runs the Game Boy Advance emulator as an ElastOS data capsule.
+# Runs the GBA emulator as an ElastOS data capsule.
 # Lists available ROM capsules and lets you pick one, or runs the
 # standalone emulator for drag-and-drop. When tunnel-provider and
 # cloudflared are installed, `elastos run` prints a public preview URL
@@ -38,7 +38,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}ElastOS GBA Emulator${NC}"
     echo ""
-    echo "  Runs Game Boy Advance games as ElastOS data capsules."
+    echo "  Runs GBA games as ElastOS data capsules."
     echo "  Uses mGBA compiled to WebAssembly, served through the runtime."
     echo "  Save states persist to ElastOS capability-gated storage."
     echo "  When tunnel-provider + cloudflared are installed, launch prints"
@@ -53,8 +53,8 @@ show_help() {
     echo ""
     echo -e "${BOLD}Controls:${NC}"
     echo "  Arrow keys     D-pad"
-    echo "  Z              A button"
-    echo "  X              B button"
+    echo "  X              A button"
+    echo "  Z              B button"
     echo "  Enter          Start"
     echo "  Backspace      Select"
     echo "  A / S          L / R shoulder"
