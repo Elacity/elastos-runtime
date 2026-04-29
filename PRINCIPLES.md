@@ -7,7 +7,7 @@ It is the set of constraints that should decide ambiguous implementation choices
 
 ## 1. Local First
 
-The primary user-visible world is the local sovereign PC2 world.
+The primary user-visible world is the local sovereign Home world.
 
 That means:
 - `localhost://...` is the local object model
@@ -37,7 +37,7 @@ That means:
 Off-box Elastos communication should default to Carrier and trusted-source paths, not public-web convenience.
 
 That means:
-- ordinary public-web fallback is a bug unless explicitly approved
+- ordinary public-web substitutes are a bug unless explicitly approved
 - bootstrap exceptions must stay narrow and visible
 - trusted-source, signature, and content identity matter more than web location
 
@@ -68,6 +68,8 @@ That means:
 - `Users/...` and `UsersAI/...` are parallel concepts
 - capabilities, audit, and resource boundaries should apply to both
 - automation should be more explicit, not more ambient
+- every visible user action should map to the same capability-scoped operation an agent would use
+- pointer, keyboard, API, and Home-message paths must enforce the same authority boundary
 
 ## 8. WebSpaces Are Dynamic, Not Fake Storage
 
@@ -86,10 +88,11 @@ That means:
 - gateway/edge owns public route meaning
 - nginx/Caddy/etc. should be dumb front-door plumbing
 - application/publication truth must live in rooted ElastOS state
+- the same capsule may have multiple access paths, but only one product identity
 
 ## 10. One Canonical Path Per Operation
 
-The repo should not hide multiple competing behaviors behind soft fallback.
+The repo should not hide multiple competing behaviors behind soft alternate paths.
 
 That means:
 - one runtime expectation per command
@@ -101,7 +104,7 @@ That means:
 The system should prefer explicit failure over quiet degradation.
 
 That means:
-- no silent fallback to weaker trust paths
+- no silent downgrade to weaker trust paths
 - no pretending a feature is supported when it is only half-implemented
 - error messages should explain what is missing and what the correct path is
 
@@ -115,12 +118,63 @@ That means:
 - operator workflows should not depend on hidden exceptions
 - drift should be treated as a bug
 
+## 13. Objects, Capsules, And Spaces Must Stay Distinct
+
+ElastOS should not collapse user things, software packages, and namespaces into one blurry noun.
+
+That means:
+- objects are the user's things: documents, songs, photos, games, sites, identities, revisions
+- capsules are software roles that operate on objects: app, viewer, provider, shell, content
+- spaces are where objects and services resolve: `localhost://...`, `elastos://...`, WebSpaces
+- user-facing product surfaces should lead with human nouns such as `Home`, `Inbox`, `Library`, `Documents`, and `System`, not internal runtime jargon
+
+## 14. Public Names Should Match Human Mental Models
+
+The product should speak in words ordinary people can predict, not in internal runtime terms.
+
+That means:
+- `Apps` is the public term; `capsules` is the internal and developer term
+- `System` is the operating surface; `Settings` and `Storage` are sections inside it
+- raw paths, providers, and transport details should stay secondary to object identity
+- one visible concept should have one primary name
+
+## 15. Trust And Access Must Travel With Signed Content
+
+Installable capsules and published objects should prove what they are and who may open them.
+
+That means:
+- trust should anchor in DID, CID, hash, and signature, not gateway location or host path
+- encrypted content should be normal, not a special exception
+- decryption and license policy should be mediated by an explicit provider, not reimplemented inside every app
+- the right abstraction is a capability-checked access/decryption plane that can use local storage, Carrier, or other substrates underneath without changing the capsule contract
+
+## 16. UI Surfaces Must Not Be Authority
+
+Opening a page and holding a capability are different things.
+
+That means:
+- Home may mint app launch capabilities only after the Home context itself has Home authority
+- app, viewer, and provider APIs must require the capability for that surface, not trust route shape or iframe placement
+- browser-frame messages into Home are orchestration requests, not capsule-to-capsule IPC; Home must bind them to the launched frame and its app-scoped capability before acting
+- browser pairing grants a browser principal, not the native Home identity
+- public summaries can show safe state but must not expose bearer tokens or mutation handles
+
+## 17. Design Tokens Are Product Contracts
+
+Visual consistency is part of system coherence, not decoration.
+
+That means:
+- Home owns the wallpaper and ElastOS brand layer
+- first-party capsules share one light token set unless a functional surface needs a scoped exception
+- colors should be named by role, not scattered as one-off literals
+- UI copy, color, and action semantics should stay aligned across Home, System, Inbox, Library, Documents, Chat Room, and games
+
 ## Decision Rule
 
 When two choices both work technically, prefer the one that:
 
 1. strengthens rooted local and content identity
 2. reduces ambient authority
-3. removes fallback and hidden transport assumptions
+3. removes hidden alternate-path and transport assumptions
 4. keeps the trusted core smaller
 5. makes the user model clearer

@@ -11,13 +11,20 @@ Key terms used in the ElastOS codebase and documentation.
 
 **Naming convention:** "ElastOS" (two capitals) is this runtime. "Elastos" is the broader ecosystem and foundation. `elastos` (lowercase) is the binary, crate names, and URI scheme.
 
+## ElastOS Four Quadrants
+
+The planning frame for balancing the system: **PC2/Home**, **Runtime**,
+**Carrier**, and **Blockchain**. The quadrants are responsibility boundaries, not
+separate products. See [ARCHITECTURE.md](ARCHITECTURE.md#elastos-four-quadrants)
+for the canonical definition.
+
 ## Runtime
 
 The minimal trusted base (`elastos` binary). Enforces isolation, signatures, and capabilities. Everything outside the runtime is a capsule.
 
 ## Digital Capsule
 
-The umbrella software or data object model in ElastOS. A Digital Capsule is signed, portable, capability-governed, and explicitly described. It may be an app capsule, provider capsule, shell capsule, agent capsule, or data capsule. See [CAPSULE_MODEL.md](CAPSULE_MODEL.md) for the full model.
+The portable signed package model in ElastOS. A Digital Capsule is capability-governed and explicitly described. It may be an app capsule, provider capsule, shell capsule, agent capsule, or sealed data/content capsule. User objects such as documents remain first-class objects; they become data capsules only when packaged with capsule metadata and provenance. See [CAPSULE_MODEL.md](CAPSULE_MODEL.md) for the full model.
 
 ## Capsule
 
@@ -41,7 +48,7 @@ Mutable state associated with a capsule instance or user, kept separate from the
 
 ## Shell
 
-A capsule with orchestrator capability. The shell decides whether to grant or deny capability requests from other capsules. Can be a CLI, TUI, or web desktop (PC2).
+A capsule with orchestrator capability. The shell decides whether to grant or deny capability requests from other capsules. Can be a CLI, TUI, or Home surface.
 
 ## Provider
 

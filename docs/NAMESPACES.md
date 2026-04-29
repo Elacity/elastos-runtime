@@ -4,7 +4,7 @@
 
 The current rooted-space contract is:
 
-- your local PC2 world is expressed through rooted `localhost://...` paths
+- your local Home world is expressed through rooted `localhost://...` paths
 - `elastos://` = decentralized identities, peer/provider surfaces, and signed shared content
 
 File-backed localhost roots currently exposed by the runtime:
@@ -32,8 +32,24 @@ Current namespace contract:
 - `elastos://...` = decentralized identities and provider-routed resources between nodes
 - `localhost://WebSpaces/<moniker>/...` = local mounted resolver view of a broader dynamic named space
 
+For documents, the intended identity split is:
+
+- `localhost://ElastOS/Documents/<doc-did>` = canonical mutable document object
+- `localhost://Users/self/Documents/<file>.md` = local working-copy storage for markdown bytes
+- `elastos://<cid>` = immutable published/shared revision pinned through the IPFS provider
+
+For Home appearance, the current identity split is:
+
+- `capsules/home/browser/wallpaper.webp` = signed capsule-bundled default wallpaper
+- `localhost://ElastOS/System/Appearance/background-image.{png,jpg,webp,gif}` = local user override for this runtime
+- `localhost://ElastOS/System/Appearance/background-overlay.json` = local overlay enabled/opacity preference for this runtime; overlay is off by default
+
+This is intentionally local system state today. The DID-aligned next step is a signed profile/settings object anchored to the user's DID that can sync through Carrier/provider policy and then materialize into this local `localhost://ElastOS/System/Appearance/...` projection on each trusted device.
+
 Useful current examples:
 
+- `localhost://ElastOS/Documents/<doc-did>`
+- `localhost://ElastOS/System/Appearance/background-overlay.json`
 - `localhost://Users/self/Documents/report.md`
 - `localhost://Public/manual.pdf`
 - `localhost://MyWebSite`

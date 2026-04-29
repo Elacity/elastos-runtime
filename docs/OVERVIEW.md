@@ -12,7 +12,7 @@ It provides:
 - localhost-rooted state, sharing, and provider routing
 - the local trust core for humans and AI
 
-It is not the entire SmartWeb stack. PC2, richer `localhost://` semantics, broader WebSpaces, blockchain/payment integration, and older Android-compatible runtime ideas converge later.
+It is not the entire SmartWeb stack. Home exists as the current front door, but richer Home object browsing, broader `localhost://` semantics, WebSpaces, blockchain/payment integration, and older Android-compatible runtime ideas converge later.
 
 Read this file as a high-level repo guide. For factual current behavior and proof levels, use [state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md).
 
@@ -37,13 +37,13 @@ Carrier owns networking semantics. Application capsules should consume provider 
 The current preview is grounded in code and recorded proof, but not every path has the same evidence level:
 
 - signed install from `https://elastos.elacitylabs.com/install.sh`
-- `elastos setup` for the core PC2 home profile
-- `elastos setup --profile demo` for the broader demo/test surface, including the hosted room-browser asset set
+- `elastos setup` for the core Home profile
+- `elastos setup --profile demo` for the broader demo/test surface, including the hosted chat-room asset set
 - `elastos setup --profile operator` for the explicit operator lane
-- `elastos` opens the sovereign PC2 home surface on the current live public `x86_64` line
-- `elastos pc2` is the explicit PC2 home alias
+- `elastos` opens Home on the current live public `x86_64` line
+- `elastos home` is the explicit Home alias
 - one-terminal native `elastos chat`
-- sovereign room invite/accept control plus hosted room-browser access on top of the explicit operator lane
+- sovereign room invite/accept control plus hosted chat-room access on top of the explicit operator lane
 - operator peer control over Carrier with `elastos node info`, `peer`, `status`, `room`, and `update` flows
 - direct `share`, `open`, `shares *`, and `attest` when the explicit extras are installed
 - immediate public sharing through `elastos share --public`
@@ -59,7 +59,7 @@ The current command split is intentional:
 
 - managed dashboard runtime
   - `elastos`
-  - `elastos pc2`
+  - `elastos home`
 - managed user runtime
   - `elastos chat`
 - no runtime
@@ -105,7 +105,7 @@ This keeps the normal user flow simple without silently widening all runtime-bac
 
 The current rooted-space contract is:
 
-- the user-visible local PC2 namespace is expressed through rooted `localhost://...` paths
+- the user-visible local Home namespace is expressed through rooted `localhost://...` paths
 - `elastos://` = decentralized identities, peer/provider surfaces, and signed shared content
 
 First-class file-backed localhost roots in the runtime today:
@@ -126,6 +126,7 @@ Reserved special root:
 
 Useful current examples:
 
+- `localhost://ElastOS/Documents/<doc-did>`
 - `localhost://Users/self/Documents/report.md`
 - `localhost://Public/manual.pdf`
 - `localhost://MyWebSite`
@@ -135,10 +136,16 @@ Useful current examples:
 
 The current relationship is:
 
-- rooted `localhost://...` paths = the local PC2 namespace
+- rooted `localhost://...` paths = the local Home namespace
 - `localhost://ElastOS/...` = runtime-owned local system state and services
 - `elastos://...` = decentralized identities, shared content, and provider-routed surfaces between nodes
 - `localhost://WebSpaces/<moniker>/...` = the local mounted/interpreted view of a broader dynamic named space
+
+For documents specifically:
+
+- `localhost://ElastOS/Documents/<doc-did>` = the mutable document object Home and Documents should open
+- `localhost://Users/self/Documents/<file>.md` = the local working-copy storage path for markdown bytes
+- `elastos://<cid>` = an immutable published revision of a document
 
 For browser-facing local sites, the root is:
 
@@ -168,9 +175,9 @@ The current target model is:
 
 - **AppCapsules** as the portable app/runtime objects
 - **WebSpaces** as named protocol/data spaces interpreted after `://`
-- a `localhost`-first user/developer experience where people and agents primarily live inside their own local PC2 world
+- a `localhost`-first user/developer experience where people and agents primarily live inside their own local Home world
 
-The longer-term direction is **content-first**: users navigate typed objects (photos, documents, music, models), not application launchers. Capsules act as viewers and editors for object types. The runtime resolves which capsule handles which type. PC2 evolves from "launch apps" to "browse your objects." See [../ROADMAP.md](../ROADMAP.md) for the full native object model direction.
+The longer-term direction is **content-first**: users navigate typed objects (photos, documents, music, models), not application launchers. Capsules act as viewers and editors for object types. The runtime resolves which capsule handles which type. Home evolves from "launch apps" to "browse your objects." See [../ROADMAP.md](../ROADMAP.md) for the full native object model direction.
 
 What is already true in code:
 
@@ -184,9 +191,10 @@ What remains open:
 
 - deeper `WebSpaces` daemon/object resolution beyond the initial `Elastos` handle and its first typed children
 - stronger root-aware substrate cleanup across the remaining internal tests/examples
-- broader system-service mapping and docs cleanup
+- broader system-service mapping
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [NAMESPACES.md](NAMESPACES.md), and [state.md](../state.md) for the current direction and proof boundary.
+See [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) for the shared first-party surface palette and human/agent interaction contract.
 
 ## Humans And AI
 
@@ -198,11 +206,12 @@ That means:
 - explicit capability requests
 - scoped access to local and provider resources
 - runtime-side validation and audit
+- the same capability-scoped operation behind visible user actions and agent calls
 
 What is proven today:
 
 - local operator proof for the explicit `elastos agent` path
-- the explicit operator lane as a real, separate surface from the PC2 front door
+- the explicit operator lane as a real, separate surface from Home
 
 What is not claimed today:
 

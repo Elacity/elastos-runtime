@@ -15,12 +15,12 @@ This document is the reference point for capsule language in this repo. It exist
 - the trusted **Node Core**
 - the decentralized **Carrier** substrate
 - the per-capsule **Capsule Runtime** (Rong Chen's "AppCapsule Runtime")
-- the **Digital Capsule** as the portable object model
+- the **Digital Capsule** as the portable signed package model
 
 ## Core Model
 
-- **Digital Capsule**: the umbrella object.
-  A signed, portable, capability-governed software or data object with explicit identity, interface, and lifecycle.
+- **Digital Capsule**: the portable signed package.
+  A capability-governed software role or sealed content package with explicit identity, interface, and lifecycle. It can carry a user object, but it is not the only way an object exists.
 - **Node Core / Runtime**: the trusted node-level control plane.
   It enforces capabilities, sessions, routing, audit, signatures, and lifecycle orchestration.
 - **Carrier**: the decentralized peer/content substrate hosted by the node.
@@ -35,7 +35,7 @@ Short form:
 - Node Core = trusted control plane
 - Carrier = decentralized communication/content substrate
 - Capsule Runtime = per-capsule execution substrate
-- Digital Capsule = portable app/service/data object
+- Digital Capsule = portable app/service/content package
 - WebSpace = native contract surface
 
 ## What A Digital Capsule Is
@@ -67,12 +67,16 @@ A Digital Capsule is not just "a process" and not just "a file." It has several 
 
 This separation is essential. If artifact, runtime, instance, and state are blurred together, capsules become hard to verify, move, share, and reason about.
 
+A document can be a mutable local object while the user edits it, an immutable
+published object when it has a CID, and a data capsule when it is sealed with
+capsule metadata, provenance, and a declared viewer/handler for distribution.
+
 ## Capsule Taxonomy
 
-Digital Capsule is the umbrella term. In this repo, capsules fall into these categories:
+Digital Capsule is the umbrella package term. In this repo, capsules fall into these categories:
 
 - **Executable capsules**
-  - **App capsule**: user-facing app such as chat or notepad
+  - **App capsule**: user-facing app such as Chat Room or Documents
   - **Provider capsule**: protocol implementation such as DID, localhost storage, tunnel, or AI
   - **Shell capsule**: orchestrator UI with policy authority via capability grants
   - **Agent capsule**: autonomous app capsule using the same capability model
@@ -278,7 +282,7 @@ Use these terms consistently:
 - **Node Core** or **Runtime** for the trusted base
 - **Carrier** for the decentralized substrate
 - **Capsule Runtime** as the short practical name for AppCapsule Runtime
-- **Digital Capsule** for the top-level object model
+- **Digital Capsule** for the portable signed package model
 
 Avoid:
 

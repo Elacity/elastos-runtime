@@ -21,10 +21,83 @@ This document uses the following terminology:
 - **Node Core / Runtime** = the trusted node-level control plane
 - **Carrier** = the decentralized peer/content substrate
 - **Capsule Runtime** = the per-capsule execution contract
-- **Digital Capsule** = the portable software/data object model
+- **Digital Capsule** = the portable signed package model for software or sealed content distribution
 
 [CAPSULE_MODEL.md](CAPSULE_MODEL.md) expands this terminology, but it is a
 supplemental note, not the primary behavior contract.
+
+## ElastOS Four Quadrants
+
+The four quadrants are the planning frame for balancing the ElastOS World
+Computer model. They are not four products and not four independent trusted
+cores. They describe which responsibility must be handled by which part of the
+system so the runtime does not become a protocol pile and apps do not regain
+ambient internet authority.
+
+| Quadrant | Responsibility | In this repo | Must not become |
+|----------|----------------|--------------|-----------------|
+| **PC2 / Home** | Human front door, object browser, spaces, people, app install/launch UX | Home, System, Inbox, Library, Documents, browser host adapters | trusted-core policy logic or protocol implementation |
+| **Runtime** | Isolation, verification, principals, sessions, capabilities, object routing, audit | `elastos` node core, capsule launch, provider routing, Home authority checks | app business logic, social-network bridge, wallet app, or storage backend |
+| **Carrier** | Authenticated object/message/stream plane, discovery, sync, replication, content delivery | Carrier abstraction and provider-facing transport contracts | chat-only transport, raw gossip exposed to apps, or replacement for capabilities |
+| **Blockchain** | DID/EID, wallet signing, provenance anchors, publisher identity, receipts/licensing hooks | Runtime-facing provider boundary for identity/provenance operations | app database, mandatory UX blocker, DeFi-first layer, or runtime business logic |
+
+The capsule-facing contract must be the same whether an effect is local or
+remote:
+
+`capsule -> runtime capability -> Carrier/provider plane -> object/service`
+
+That means app, viewer, and content capsules do not branch on "local file",
+"IPFS", "Telegram", "browser", or "internet". They request a capability-scoped
+operation against an object or service. The runtime authorizes and routes it.
+Carrier or a provider performs the effect. Protocol-specific code belongs in
+provider capsules or explicit system services, not in ordinary apps and not in
+the gateway edge.
+
+The near-term balancing sequence is:
+1. **Wallet-backed identity + WebConnect** to connect PC2/Home, Runtime, Carrier, and Blockchain around real principals and session-bound capabilities.
+2. **Spaces / network drives** to make Carrier a real object plane and PC2/Home a real object browser.
+3. **Capsule publish/install registry** to make signed software identity and install/update trust real before token or NFT mechanics.
+
+## Object-Oriented Personal OS Model
+
+ElastOS should behave like an object-oriented personal operating system.
+
+That requires three layers to stay distinct:
+
+| Layer | Meaning | Examples |
+|------|---------|----------|
+| **Objects** | The user's things | documents, songs, photos, games, sites, identities, published revisions |
+| **Capsules** | Software roles that operate on objects | app capsules, viewer capsules, provider capsules, shell capsules, content capsules |
+| **Spaces** | Namespaces and resolver surfaces where objects and services live | `localhost://...`, `elastos://...`, WebSpaces |
+
+The most important consequence is that not everything should be modeled as a capsule.
+Objects are first-class. Capsules open, render, transform, publish, and serve them.
+A content capsule can still be a useful packaging and transport form, but it should
+not replace the primary object-first user model.
+
+### Public Naming Contract
+
+Public UI should use the human-facing vocabulary:
+
+- `Home`
+- `Library`
+- `Documents`
+- `Directory`
+- `Marketplace`
+- `Messages`
+- `Profile`
+- `System`
+
+Internal runtime and developer docs can continue to use:
+
+- shell
+- capsule
+- provider
+- carrier
+- namespace
+
+`Apps` is the public term for user-facing interactive capsules. `Capsules` stays as
+the technical term for manifests, runtime roles, diagnostics, and developer docs.
 
 ---
 
@@ -35,8 +108,8 @@ supplemental note, not the primary behavior contract.
 │                         User / Browser                               │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│                    Shell (TUI / CLI / Web shell)                     │
-│                    (Capsule with orchestrator capability)            │
+│                    Home / Orchestrator                               │
+│                    (shell-role capsule with orchestration)           │
 │                                                                      │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
@@ -56,7 +129,7 @@ supplemental note, not the primary behavior contract.
 │  │                    Running Capsules                           │   │
 │  │                                                               │   │
 │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐            │   │
-│  │  │ Shell   │ │localhost│ │ App A   │ │ App B   │            │   │
+│  │  │ Home    │ │localhost│ │ App A   │ │ App B   │            │   │
 │  │  │(orchestr)│ │provider │ │         │ │         │            │   │
 │  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘            │   │
 │  └──────────────────────────────────────────────────────────────┘   │
@@ -79,15 +152,35 @@ the runtime contract is identical across platforms. What changes is the **host a
 
 | Mode | Host | How capsules appear |
 |------|------|---------------------|
-| Server / headless | Linux, any | Runtime proxies capsule HTTP. PC2 is a web dashboard. |
+| Server / headless | Linux, any | Runtime proxies capsule HTTP. Home is a web dashboard. |
 | Desktop | Linux, Windows, macOS | Capsules open in browser tabs or native windows. |
 | Mobile | Android, future iOS | Capsules render in embedded webviews. |
-| Kiosk | Jetson, appliance | Runtime owns the display. PC2 is the desktop. |
+| Kiosk | Jetson, appliance | Runtime owns the display. Home is the desktop. |
 
 Capsules do not know which host adapter is active. A capsule that serves HTML on
 its `http_port` works identically whether the host proxies it to a remote browser,
 opens a local tab, renders it in a webview, or displays it fullscreen. The Carrier
 bridge, provider access, and capability model are the same everywhere.
+
+The important split is therefore not "web surface" versus "native app". It is:
+- launch authority: who is allowed to start a capsule
+- session authority: what that caller is allowed to do once connected
+- surface adapter: how the capsule UI is rendered
+
+When this document says "web surface", it means a rendering adapter over HTTP/webview.
+It is not a separate product identity and it does not define trust or authority by itself.
+
+`chat-room` is the working example. Home launches it locally with orchestrator rights and its web surface keeps using Home-scoped authority for room operations. A public browser reaches the same capsule through the gateway with a browser session and explicit `room.access` capability instead of Home rights.
+
+Browser access is modeled around the browser principal, not around one-off per-app request forms:
+- the browser session identifies the remote browser
+- capabilities such as `room.access` are granted to that browser session
+- Home opens the Inbox app; Inbox reviews pending browser-access requests and approves or denies them
+- the same browser session can then reopen the same capsule surface without requesting access again, while a different browser context such as incognito starts with no session and must request access separately
+
+The host member DID is an approval boundary, not delegated identity. A paired browser guest may be admitted by a member runtime, but it does not inherit that member DID or gain member-signed Carrier transport rights.
+
+Home authority is also explicit. Serving `/apps/home/` mints a Home-scoped capability for that browser context. Home summary, runtime ensure, and app launch APIs require that capability; app-specific APIs such as Inbox and System require their own app-scoped launch token. Public summaries may expose counts, names, and pending request IDs, but never bearer session tokens. When the same browser has both a native Home room session and a paired browser session, the native Home room session wins so direct Chat Room access in that browser stays aligned with Home.
 
 ---
 
@@ -103,24 +196,24 @@ The minimal trusted computing base. Does only what MUST be trusted:
 | **Signatures** | Verifies Ed25519 capsule signatures |
 | **Capabilities** | Issues and validates capability tokens |
 | **elastos://** | Fetches content-addressed resources |
-| **Bootstrap** | Launches shell capsule at startup |
+| **Bootstrap** | Launches the Home/orchestrator capsule at startup |
 
 **Size target:** 5-7K lines of Rust (aspirational; currently ~16K across runtime + common crates). TCB reduction via capsule extraction — localhost-provider and did-provider are already separate processes. If it doesn't need to be here, it shouldn't be.
 
 This layer is the **Node Core**, not the Capsule Runtime. It is the trusted host-side enforcement authority. The current repo still carries more host-side orchestration than the end-state architecture described here.
 
-### Layer 2: Shell (Capsule)
+### Layer 2: Home / Orchestrator Capsule
 
-A capsule with the **orchestrator capability**. Handles all policy decisions:
+A shell-role capsule with the **orchestrator capability**. Handles user policy decisions:
 
 | Function | Description |
 |----------|-------------|
-| **Protocol registry** | Maps registered provider schemes and `elastos://` routes to provider capsules |
-| **Permission prompts** | Asks user, then requests capability tokens |
+| **Policy review** | Presents capability and access decisions in human terms |
+| **Launch orchestration** | Requests validated app/object launches from the runtime |
 | **Orchestration** | Launches/stops capsules, manages windows |
 | **Trust UI** | Shows warnings for untrusted capsules |
 
-**Key insight:** Shell is NOT privileged code. It runs in a sandbox like everything else. It holds the orchestrator capability, which grants it policy authority over other capsules, but it is still sandboxed and subject to runtime enforcement.
+**Key insight:** a shell-role capsule is NOT privileged code. It runs in a sandbox like everything else. It holds the orchestrator capability, which grants it policy authority over other capsules, but it is still sandboxed and subject to runtime enforcement.
 
 ## Architecture Decisions
 
@@ -129,7 +222,7 @@ These are the current architectural decisions that matter most when reading the 
 | Decision | Why |
 |----------|-----|
 | Runtime stays small and trusted | Isolation, capabilities, signatures, and content trust are the TCB |
-| Shell is a capsule, not part of the TCB | Policy can evolve without reclassifying UI code as trusted |
+| Shell-role surfaces are capsules, not part of the TCB | Policy can evolve without reclassifying UI code as trusted |
 | First-party provider UX converges under `elastos://` | The runtime should expose one native namespace, not a grab bag of unrelated top-level schemes |
 | Release trust is signature-based, not gateway-based | Transport can change; trust must come from signed artifacts and trusted publisher identity |
 | Carrier is a decentralized substrate, not the whole app contract | Capsules consume namespace/provider contracts, not implementation details like Kubo, QUIC, or cloudflared |
@@ -141,12 +234,12 @@ All user software, including providers:
 | Type | Examples |
 |------|----------|
 | **Providers** | localhost://<file-backed roots>/, elastos://did/, elastos://peer/, elastos://ai/ |
-| **Applications** | Chat, notepad, photo editor |
-| **Utilities** | File manager, settings, terminal |
+| **Applications** | Chat, editor, photo tool |
+| **Utilities** | Home, Library, System, terminal |
 
 **Zero ambient authority.** Every action requires a capability token.
 
-Under the broader Digital Capsule model, these are role variants of the same object model:
+Within the capsule packaging/runtime model, these are role variants of the same deployable unit:
 
 - app capsules
 - provider capsules
@@ -182,7 +275,7 @@ This keeps the abstraction boundary where it belongs: capsules express intent, a
 ## Actor Equality
 
 **Humans and AI agents use the same runtime model.** The runtime does not grant authority based on whether an actor is human or AI:
-- A human using a shell surface (TUI, CLI, or web shell)
+- A human using Home or another shell-role surface
 - An AI agent running as a capsule
 - An automation script
 - A background service
@@ -192,6 +285,13 @@ All actors:
 - Request capabilities through the same API
 - Receive the same token format
 - Are evaluated by the same capability machinery
+
+Interaction equality is part of the same rule. If a human can click a button,
+an authorized agent should be able to request the same capability-scoped
+operation through the runtime/provider plane. If an agent can invoke an action,
+the human surface should expose understandable state, labels, and review points
+for that action. Browser routes, DOM presence, and iframe placement are not
+authority.
 
 Role still matters:
 
@@ -224,6 +324,7 @@ Those are access paths and bridge protocols. They do not define trust; hashes, s
 protocol://path/to/resource
 
 elastos://Qm123abc              → Content-addressed (built-in)
+localhost://ElastOS/Documents/<doc-did>   → Mutable document object
 localhost://Users/self/Documents/report.pdf → Local user file
 localhost://MyWebSite/index.html            → Local browser-facing site root
 localhost://Public/manual.pdf               → Locally shared public file
@@ -248,6 +349,44 @@ This means:
 - Content survives provider deletion
 - Content can be shared without sharing credentials
 - Provider can be swapped without losing data
+
+## Trusted And Encrypted Content
+
+ElastOS should assume that many installable capsules and published objects are both
+signed and encrypted.
+
+The trust and access model should therefore be:
+
+- CID, DID, hash, and signature prove what the capsule or object is
+- encryption protects content at rest, in transit, and in shared storage
+- capability and policy decide who may decrypt or execute it
+
+The right architecture is not to embed custom license logic inside every app capsule.
+Instead, ElastOS should expose an explicit access/decryption provider that behaves
+like a rights gate:
+
+- the capsule or object is resolved by stable identity
+- the runtime verifies trust material
+- an access/decryption provider evaluates ownership, subscription, sharing policy,
+  or other rights against the caller's DID and granted capabilities
+- authorized callers receive a short-lived decryption capability, plaintext stream,
+  or derived working key for that session only
+
+This is conceptually similar to a Lit-style policy gate, but the product contract
+should stay ElastOS-native:
+
+- the capsule talks to the provider plane, not to a bespoke third-party license SDK
+- the provider hides whether the sealed bytes live locally, in Carrier-backed storage,
+  or behind another trusted source
+- Carrier transports encrypted blobs and remote updates; it does not replace policy
+  evaluation or capability checks
+
+That keeps the model clean:
+
+- objects remain object-first
+- capsules remain untrusted application roles
+- providers handle trust, policy, and decryption
+- transport remains an implementation detail under the provider plane
 
 ---
 
@@ -280,16 +419,15 @@ struct CapabilityToken {
 ### Flow
 
 ```
-1. Capsule → Shell: "I need to read localhost://Users/self/Pictures/cat.jpg"
-2. Shell → User: [Permission prompt]
-3. User approves
-4. Shell → localhost-provider: fetch("Users/self/Pictures/cat.jpg")
-5. Provider returns content (now has CID: elastos://Qm789)
-6. Shell → Runtime: grant(capsule, elastos://Qm789, read)
-7. Runtime: signs token, emits audit event
-8. Runtime → Shell: Token { signed }
-9. Shell → Capsule: content + token
-10. Capsule can re-read using token (until expiry/revocation)
+1. Capsule → Runtime: "I need to read localhost://Users/self/Pictures/cat.jpg"
+2. Runtime → Home/System/Inbox: capability request for review
+3. User or authorized agent approves
+4. Runtime → localhost-provider: scoped fetch through provider registry
+5. Provider returns content or object metadata
+6. Runtime grants the requesting capsule a scoped read token
+7. Runtime signs the token and emits audit events
+8. Runtime → Capsule: approved response + token
+9. Capsule can repeat the approved action until expiry, revocation, or use limit
 ```
 
 ### Token Validation (Runtime Enforced)
@@ -354,96 +492,96 @@ MITM impossible - content is self-authenticating
 ## Boot Sequence
 
 ```
-1. Load configuration
-   - User identity (Ed25519 keypair)
-   - Shell CID (default embedded, configurable)
-   - Trusted keys
+1. Load local runtime state
+   - data directory
+   - device DID / Ed25519 identity
+   - trusted source and installed component metadata
+   - persisted capability/session state where applicable
 
-2. ElastosRuntime::build(config, compute, fetcher)
-   - SecureTimeSource::with_persistence()   — monotonic counter (anti-backdating)
-   - AuditLog::with_file()                  — security event log
-   - MetricsManager::new()                  — rate limiting, telemetry
-   - CapabilityStore::with_persistence()    — persisted tokens
-   - CapabilityManager::load_or_generate()  — Ed25519 signing key
-   - CapsuleManager::new()                  — lifecycle management
-   - MessageChannel::new()                  — inter-capsule messaging
-   - ContentResolver::new()                 — elastos:// CID resolution
-   - RequestHandler::new()                  — protocol processing
-   - ShellManager::new()                    — shell bootstrap
+2. Start the trusted node core
+   - builds the provider registry
+   - registers built-in Carrier peer transport
+   - registers first-party providers such as localhost, did, webspace, documents,
+     and optional IPFS/tunnel/AI providers when installed
+   - starts the local API/gateway routes for Home and app-scoped capabilities
 
-3. ElastosRuntime::start()
-   - ShellManager::bootstrap()
-   - Spawns shell capsule (ELASTOS_API + ELASTOS_TOKEN env vars)
-   - Shell takes over user interaction
+3. Serve Home
+   - `/apps/home/` is the browser-hosted adapter for the `home` capsule
+   - Home receives a Home-scoped capability for its browser context
+   - app launches mint app-scoped launch tokens; child apps do not inherit Home authority
 
 4. Runtime waits
-   - Processes capability requests
-   - Manages capsule lifecycle
-   - Handles elastos:// fetches
+   - validates capability-scoped requests
+   - launches/stops capsules through explicit runtime contracts
+   - routes object/provider effects through Carrier or registered providers
 ```
 
 ---
 
 ## Runtime Interface
 
-### Request Protocol (`handler/protocol.rs`)
+The current implementation exposes this contract through several concrete
+bridges: HTTP API routes for Home and browser-hosted apps, provider registry
+calls for host-side providers, stdio/serial bridges for some capsule classes,
+and explicit CLI commands for operator workflows. Do not treat the sketches
+below as one generated API file. They describe the intended authority split that
+current and future bridges must preserve.
 
-All capsule↔runtime communication goes through `RequestHandler`. Operations are split by authority:
+Operations are split by authority:
 
-| Shell-only (orchestrator) | All capsules |
-|---------------------------|-------------|
-| ListCapsules | Ping, GetRuntimeInfo |
-| LaunchCapsule | SendMessage, ReceiveMessages |
-| StopCapsule | StorageRead, StorageWrite |
-| GrantCapability | FetchContent |
-| RevokeCapability | ResourceRequest (provider-routed) |
+| Orchestrator-role surfaces | Ordinary capsules |
+|---------------------------|-------------------|
+| list launchable objects/apps | request runtime info |
+| launch/focus/close capsules | send provider requests with a valid token |
+| mint app-scoped launch grants | read/write scoped localhost objects |
+| approve/deny capability prompts | fetch scoped `elastos://` / provider objects |
+| revoke or expire grants | send/receive authorized messages |
 
-### For Shell (Orchestrator)
+### For Orchestrator-Role Capsules
 
 ```rust
-// Capsule lifecycle
+// Conceptual lifecycle operations.
 fn launch(cid: ContentId, config: LaunchConfig) -> Result<CapsuleId>;
-fn stop(capsule: CapsuleId) -> Result<()>;  // Also clears capsule memory
+fn stop(capsule: CapsuleId) -> Result<()>;
 fn list() -> Vec<CapsuleInfo>;
 
-// Capability management
+// Conceptual capability management.
 fn grant(request: CapabilityRequest) -> Result<Token>;
 fn revoke(token: TokenId) -> Result<()>;
-fn revoke_all_before_epoch() -> Result<u64>;  // Returns new epoch
 ```
 
 ### For All Capsules
 
 ```rust
-// Use capabilities (with valid token)
+// Conceptual provider invocation with a valid token.
 fn invoke(token: Token, action: Action) -> Result<Response>;
 
 // Messaging (with messaging token)
 fn send(token: Token, to: CapsuleId, message: Bytes) -> Result<()>;
 fn recv(token: Token) -> Result<Option<Message>>;
 
-// Time (secure, runtime-controlled)
+// Runtime-controlled facts should be requested, not guessed.
 fn get_secure_time() -> SecureTimestamp;
 ```
 
 ### Built-in
 
 ```rust
-// Content-addressed fetch (elastos://)
+// Conceptual content/object fetch.
 fn fetch(cid: ContentId) -> Result<Content>;
 ```
 
 ### Internal (Not Exposed to Capsules)
 
 ```rust
-// Audit - runtime calls internally, capsules cannot access
-fn emit_audit_event(event: AuditEvent);  // Called at every security point
+// Runtime-owned audit; capsules cannot emit trusted audit facts directly.
+fn emit_audit_event(event: AuditEvent);
 
 // Metrics - runtime tracks, used for rate limiting
 fn record_metric(capsule: CapsuleId, metric: Metric);
 
-// Memory - runtime manages
-fn clear_capsule_memory(capsule: CapsuleId);  // Called on stop()
+// Lifecycle cleanup remains runtime-owned.
+fn clear_capsule_memory(capsule: CapsuleId);
 ```
 
 ---
@@ -458,6 +596,7 @@ fn clear_capsule_memory(capsule: CapsuleId);  // Called on stop()
   "description": "Simple photo editor",
   "author": "developer-key-id",
   "signature": "base64-ed25519-signature",
+  "role": "app",
 
   "type": "wasm",
   "entrypoint": "main.wasm",
@@ -479,16 +618,20 @@ fn clear_capsule_memory(capsule: CapsuleId);  // Called on stop()
 
 ### Capability Requests
 
-Capsules declare what they MIGHT need. Shell decides what to actually grant:
+Capsules declare what they might need. The orchestrator-policy surface decides what to actually grant:
 - User can deny any request
-- Shell can restrict scope (photos/* → photos/vacation/*)
+- the grant can restrict scope (photos/* -> photos/vacation/*)
 - Tokens have expiry (user chooses: once, session, always)
 
 ---
 
 ## Provider Capsule Interface
 
-Provider capsules handle protocol:// URIs via stdin/stdout JSON protocol:
+Provider capsules handle provider-scoped requests behind the runtime/provider
+registry. Some providers currently use line-delimited JSON over stdio or a VM
+bridge; browser-hosted apps and Home reach providers through token-gated runtime
+HTTP routes. The capsule-facing rule is the same: provider-specific behavior is
+behind the runtime boundary.
 
 ```rust
 trait Provider {
@@ -511,20 +654,22 @@ trait Provider {
 
 ---
 
-## Shell ↔ Runtime Communication
+## Orchestrator ↔ Runtime Communication
 
-Shell runs in sandbox but needs to call runtime:
+Home and other orchestrator-role surfaces run as capsules, but need to request
+runtime actions:
 
 ```
-Shell → Runtime: { "cmd": "launch", "cid": "Qm123..." }
-Runtime → Shell: { "ok": true, "capsule_id": "cap-1" }
+Home -> Runtime: { "cmd": "launch", "target": "documents" }
+Runtime -> Home: { "ok": true, "route": "/apps/documents/?home_token=..." }
 
-Shell → Runtime: { "cmd": "grant", "capsule": "cap-1", "resource": "..." }
-Runtime → Shell: { "ok": true, "token": "..." }
+Home -> Runtime: { "cmd": "grant", "capsule": "documents", "resource": "..." }
+Runtime -> Home: { "ok": true, "token": "..." }
 ```
 
-Provider capsules use the same line-delimited JSON over stdin/stdout or the
-equivalent VM/provider bridge. The transport is internal to Carrier.
+The exact transport can be HTTP, stdio, serial, or another host adapter. The
+authority model must not change: the runtime validates the caller and mints a
+scoped grant.
 
 ---
 
@@ -559,7 +704,7 @@ Capsule sees: content or error. Nothing about network state.
 ## Project Structure
 
 ```
-elastos-project/                        # Mono-repo root
+elastos-runtime/                        # Repo root
 │
 ├── elastos/                            # Core runtime (→ own repo later)
 │   ├── Cargo.toml                      # Workspace: crates/* + core capsules
@@ -569,7 +714,7 @@ elastos-project/                        # Mono-repo root
 │   │   ├── elastos-common/             # Shared types (CapsuleManifest, ContentId)
 │   │   ├── elastos-guest/              # Guest SDK for capsule developers
 │   │   ├── elastos-namespace/          # Content-addressed namespace manager
-│   │   ├── elastos-identity/           # WebAuthn/Passkey identity
+│   │   ├── elastos-identity/           # did:key / Ed25519 identity
 │   │   ├── elastos-tls/                # Self-signed CA + TLS certificates
 │   │   ├── elastos-storage/            # Storage providers (local, IPFS, cache)
 │   │   ├── elastos-compute/            # Compute provider (WASM sandbox)
@@ -580,27 +725,38 @@ elastos-project/                        # Mono-repo root
 │   └── tools/
 │       └── vsock-proxy/               # Guest bridge helper for Carrier control/network provider wiring
 │
-├── capsules/                           # Non-essential (→ own repos later)
-│   ├── chat/                           # P2P chat TUI (mIRC/IRSSI-style)
+├── capsules/                           # First-party and demo capsules
+│   ├── home/                           # Home browser shell-role capsule
+│   ├── home-cli/                       # Home CLI capsule
+│   ├── system/                         # System settings capsule
+│   ├── inbox/                          # Inbox capsule for requests and approvals
+│   ├── library/                        # Library capsule for object browsing and opening
+│   ├── documents/                      # Documents capsule for local markdown objects
+│   ├── chat-room/                      # Browser Chat Room app capsule
+│   ├── chat-room-ui/                   # Shared Chat Room browser UI assets
+│   ├── chat/                           # Native P2P chat capsule
+│   ├── chat-wasm/                      # WASM chat capsule variant
+│   ├── gba-emulator/                   # GBA emulator web capsule
+│   ├── gba-ucity/                      # Data capsule with included ROM
+│   ├── agent/                          # AI agent capsule
 │   ├── notepad/                        # Capability-aware CLI notepad
-│   ├── did-provider/                   # elastos://did/ — DID identity (did:key, Ed25519)
+│   ├── did-provider/                   # elastos://did/ identity provider
 │   ├── ipfs-provider/                  # IPFS operations via managed Kubo daemon
 │   ├── ai-provider/                    # elastos://ai/ LLM routing
 │   ├── llama-provider/                 # Local llama.cpp inference
-│   ├── tunnel-provider/                # elastos://tunnel/ — Carrier network provider for public tunnels
-│   ├── agent/                          # AI agent capsule
-│   ├── md-viewer/                      # Markdown viewer (data capsule, multi-doc sidebar)
-│   ├── gba-emulator/                   # GBA emulator web capsule (mGBA)
-│   └── gba-ucity/                      # Data capsule (open-source ROM included)
+│   ├── site-provider/                  # Local site serving provider
+│   ├── tunnel-provider/                # elastos://tunnel/ public tunnel provider
+│   └── webspace-provider/              # WebSpaces resolver provider
 │
 ├── scripts/                            # Dev convenience scripts
 │   ├── chat.sh                         # P2P chat launcher
 │   ├── notepad.sh                      # Notepad demo launcher
 │   ├── gba.sh                          # GBA emulator launcher
+│   ├── home-demo-local.sh              # Local Home demo launcher
+│   ├── home-smoke.sh                   # Home browser smoke test
 │   └── share-demo.sh                   # Content sharing demo
 │
-├── docs/, ROADMAP.md, TASKS.md, ...
-└── archive/
+└── docs/, ROADMAP.md, TASKS.md, ...
 ```
 
 ## Crate-to-Layer Mapping
@@ -624,7 +780,7 @@ This mapping is descriptive of the current codebase. It is not a statement that 
 ElastOS is built on six foundations:
 
 1. **Minimal runtime** - Only isolation, signatures, capabilities, elastos://
-2. **Shell as capsule** - Policy decisions in replaceable shell
+2. **Home as capsule** - Policy decisions in a replaceable shell-role capsule
 3. **Capability tokens** - Cryptographic proof of permission
 4. **Content addressing** - MITM-proof, offline-first
 5. **Actor equality** - Humans and AI use the same capability model; authority comes from assigned role
