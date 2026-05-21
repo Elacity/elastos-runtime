@@ -5,23 +5,33 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELASTOS_ROOT="${REPO_ROOT}/elastos"
 ELASTOS_BIN="${ELASTOS_ROOT}/target/debug/elastos"
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "local-carrier-setup-smoke currently supports Linux only." >&2
-    exit 1
-fi
+case "$(uname -s)" in
+    Linux)  OS_TOKEN="linux"  ;;
+    Darwin) OS_TOKEN="darwin" ;;
+    *)
+        echo "Unsupported OS for local-carrier-setup-smoke: $(uname -s)" >&2
+        exit 1
+        ;;
+esac
 
 case "$(uname -m)" in
-    x86_64) SETUP_PLATFORM="linux-amd64" ;;
-    aarch64|arm64) SETUP_PLATFORM="linux-arm64" ;;
+    x86_64)         ARCH_TOKEN="amd64" ;;
+    aarch64|arm64)  ARCH_TOKEN="arm64" ;;
     *)
         echo "Unsupported machine architecture: $(uname -m)" >&2
         exit 1
         ;;
 esac
 
+SETUP_PLATFORM="${OS_TOKEN}-${ARCH_TOKEN}"
+
 TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/elastos-local-carrier-setup.XXXXXX")}"
 XDG_DATA_HOME="${TEST_ROOT}/xdg-data"
 DATA_DIR="${XDG_DATA_HOME}/elastos"
+# `dirs::data_dir()` is platform-specific (Library/Application Support on
+# macOS, $XDG_DATA_HOME on Linux). Use ELASTOS_DATA_DIR for cross-platform
+# isolation so the smoke test never leaks into the user's real runtime.
+export ELASTOS_DATA_DIR="${DATA_DIR}"
 PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
 ARTIFACTS_DIR="${PUBLISHER_ROOT}/artifacts"
 LOG_PATH="${TEST_ROOT}/serve.log"
@@ -64,7 +74,15 @@ stop_source_runtime() {
 kill_temp_processes() {
     local root="$1"
     local skip_pid="${2:-}"
-    mapfile -t pids < <(pgrep -f "$root" || true)
+    # bash 3.2 (macOS default) has no mapfile/readarray. Read line-by-line and
+    # guard against empty arrays under `set -u` with the `${arr[@]+...}` form.
+    local pids=()
+    while IFS= read -r _pid; do
+        pids+=("$_pid")
+    done < <(pgrep -f "$root" || true)
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        return 0
+    fi
     for pid in "${pids[@]}"; do
         [[ "$pid" == "$$" ]] && continue
         [[ -n "${skip_pid}" && "$pid" == "${skip_pid}" ]] && continue
@@ -329,7 +347,11 @@ if [[ ! -f "${SOURCE_BOOTSTRAP_FILE}" ]]; then
     exit 1
 fi
 
-readarray -t SOURCE_BOOTSTRAP < "${SOURCE_BOOTSTRAP_FILE}"
+# bash 3.2 (macOS default) has no readarray; read line-by-line.
+SOURCE_BOOTSTRAP=()
+while IFS= read -r _line; do
+    SOURCE_BOOTSTRAP+=("$_line")
+done < "${SOURCE_BOOTSTRAP_FILE}"
 CONNECT_TICKET="${SOURCE_BOOTSTRAP[0]:-}"
 NODE_ID="${SOURCE_BOOTSTRAP[1]:-}"
 

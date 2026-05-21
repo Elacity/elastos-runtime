@@ -321,8 +321,8 @@ pub async fn run(
 fn load_manifest() -> anyhow::Result<ComponentsManifest> {
     let exe_path = std::env::current_exe().ok();
     let installed_paths = [
-        // Installed layout
-        dirs::data_dir().map(|d| d.join("elastos/components.json")),
+        // Installed layout (honors $ELASTOS_DATA_DIR override)
+        Some(crate::sources::default_data_dir().join("components.json")),
         // Exe-relative (release tarball)
         exe_path
             .as_deref()
@@ -344,13 +344,7 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
-    let dir = dirs::data_dir()
-        .map(|d| d.join("elastos"))
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/share/elastos")
-        });
-    Ok(dir)
+    Ok(crate::sources::default_data_dir())
 }
 
 fn source_checkout_manifest_path(exe_path: &Path) -> Option<PathBuf> {
@@ -411,8 +405,13 @@ fn set_local_copy_permissions(source: &Path, dest: &Path) {
 // ── Platform detection ──────────────────────────────────────────────
 
 pub fn detect_platform() -> String {
+    // `darwin` is the canonical OS token in Rust/llvm target triples (e.g.
+    // aarch64-apple-darwin); the runtime uses it across the
+    // setup/components/release surfaces.
     let os = if cfg!(target_os = "linux") {
         "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
     } else {
         "unknown"
     };
@@ -844,6 +843,10 @@ fn platform_aliases(platform: &str) -> impl Iterator<Item = &'static str> {
         "aarch64-linux" => &["linux-arm64"],
         "linux-amd64" => &["x86_64-linux"],
         "linux-arm64" => &["aarch64-linux"],
+        "x86_64-darwin" => &["darwin-amd64"],
+        "aarch64-darwin" => &["darwin-arm64"],
+        "darwin-amd64" => &["x86_64-darwin"],
+        "darwin-arm64" => &["aarch64-darwin"],
         _ => &[],
     };
     aliases.iter().copied()
@@ -1732,7 +1735,7 @@ mod tests {
     fn test_detect_platform() {
         let p = detect_platform();
         assert!(
-            p.contains("linux") || p.contains("unknown"),
+            p.contains("linux") || p.contains("darwin") || p.contains("unknown"),
             "Platform should contain os: {}",
             p
         );

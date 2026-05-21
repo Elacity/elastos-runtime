@@ -8,8 +8,23 @@ use crate::ownership;
 
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
-/// Default data directory: `$XDG_DATA_HOME/elastos` or `$HOME/.local/share/elastos`.
+/// Default data directory.
+///
+/// Resolution order:
+/// 1. `$ELASTOS_DATA_DIR` (when set and non-empty) — explicit override used by
+///    tests, smoke scripts, and isolated CI runs on platforms where the
+///    `dirs` crate's data-dir does not honor a portable env var.
+/// 2. `dirs::data_dir().join("elastos")` — platform-native location:
+///    - Linux:   `$XDG_DATA_HOME/elastos` or `$HOME/.local/share/elastos`
+///    - macOS:   `$HOME/Library/Application Support/elastos`
+///    - Windows: `{FOLDERID_RoamingAppData}/elastos`
+/// 3. `/tmp/elastos` — last-resort fallback if no data dir resolves.
 pub fn default_data_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("ELASTOS_DATA_DIR") {
+        if !override_dir.is_empty() {
+            return PathBuf::from(override_dir);
+        }
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("elastos")

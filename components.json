@@ -7,7 +7,9 @@
       "size": 0,
       "platforms": [
         "x86_64-linux",
-        "aarch64-linux"
+        "aarch64-linux",
+        "x86_64-darwin",
+        "aarch64-darwin"
       ]
     },
     "localhost-provider": {
@@ -16,7 +18,9 @@
       "size": 0,
       "platforms": [
         "x86_64-linux",
-        "aarch64-linux"
+        "aarch64-linux",
+        "x86_64-darwin",
+        "aarch64-darwin"
       ]
     },
     "chat": {
@@ -52,7 +56,9 @@
       "size": 0,
       "platforms": [
         "x86_64-linux",
-        "aarch64-linux"
+        "aarch64-linux",
+        "x86_64-darwin",
+        "aarch64-darwin"
       ]
     },
     "ipfs-provider": {
@@ -119,6 +125,20 @@
           "size": 0,
           "release_path": "shell-linux-arm64",
           "install_path": "bin/shell"
+        },
+        "darwin-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "shell-darwin-amd64",
+          "install_path": "bin/shell"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "shell-darwin-arm64",
+          "install_path": "bin/shell"
         }
       }
     },
@@ -138,6 +158,20 @@
           "checksum": "",
           "size": 0,
           "release_path": "localhost-provider-linux-arm64",
+          "install_path": "bin/localhost-provider"
+        },
+        "darwin-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "localhost-provider-darwin-amd64",
+          "install_path": "bin/localhost-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "localhost-provider-darwin-arm64",
           "install_path": "bin/localhost-provider"
         }
       }
@@ -159,6 +193,20 @@
           "size": 0,
           "release_path": "did-provider-linux-arm64",
           "install_path": "bin/did-provider"
+        },
+        "darwin-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "did-provider-darwin-amd64",
+          "install_path": "bin/did-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "did-provider-darwin-arm64",
+          "install_path": "bin/did-provider"
         }
       }
     },
@@ -178,6 +226,20 @@
           "checksum": "",
           "size": 0,
           "release_path": "webspace-provider-linux-arm64",
+          "install_path": "bin/webspace-provider"
+        },
+        "darwin-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "webspace-provider-darwin-amd64",
+          "install_path": "bin/webspace-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "webspace-provider-darwin-arm64",
           "install_path": "bin/webspace-provider"
         }
       }
