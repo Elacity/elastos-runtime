@@ -173,7 +173,39 @@ unchanged.
 
 ### Slice B — Critical providers available on non-Linux (Layer 2)
 
-**Status:** scope concretized; implementation open.
+> **Superseded (2026-05-22).** The original framing of Slice B —
+> *make MicroVM-typed providers available on non-Linux as in-process /
+> host-binary substitutes* — has been retired. After the exploratory
+> attempt landed in commit `a02045e`, review against
+> [`PRINCIPLES.md` #10 *One Canonical Path* and #11 *Fail Closed, Then
+> Explain*](../PRINCIPLES.md) concluded that running a `type: microvm`
+> capsule as an unsandboxed host subprocess on Mac silently downgrades
+> the isolation contract those capsules declare. The principled path is
+> to give Mac a real microVM substrate, not a soft alternate.
+>
+> **The replacement project is the Apple Virtualization.framework
+> backend** — [`docs/vz-backend/PLAN.md`](vz-backend/PLAN.md). It adds
+> `elastos-vz` as a sibling crate to
+> [`elastos-crosvm`](../elastos/crates/elastos-crosvm/) implementing the
+> same
+> [`ComputeProvider` trait](../elastos/crates/elastos-compute/src/traits.rs)
+> on Apple Vz. Linux code untouched; Mac gains identical hardware-isolated
+> microVM execution.
+>
+> **Pre-Work for that plan has reverted the misleading darwin entries**
+> added to [`components.json`](../components.json) in `a02045e` for
+> `shell`, `localhost-provider`, `did-provider`, and `webspace-provider`.
+> The daemon-portability improvements from the same commits
+> (`pid_is_alive`, `ELASTOS_DATA_DIR`, smoke-script Bash 3.2 portability,
+> the `elastos-crosvm` `cfg`-gated non-Linux build, the `darwin-arm64`
+> platform identity, and the universal-platform demo-capsule installs
+> `chat-room` / `gba-emulator` / `gba-ucity`) are kept — they do not
+> touch the Linux microVM substrate.
+>
+> The original Slice B prose below is preserved for historical context.
+
+**Status:** ~~scope concretized; implementation open.~~ Superseded — see
+[`vz-backend/PLAN.md`](vz-backend/PLAN.md).
 
 **Smallest shippable slice:** make `localhost-provider` available as an
 **in-process provider** on non-Linux. The runtime already registers
@@ -228,8 +260,10 @@ itself once; substrate selection is a runtime-policy detail bound to
   attributable.
 - A WASM substrate variant of these providers. Possibly correct
   long-term, but bigger than Layer 2. Layer 2 should not block on it.
-- An Apple Hypervisor.framework substrate. Out of scope here; tracked
-  separately.
+- ~~An Apple Hypervisor.framework substrate. Out of scope here; tracked
+  separately.~~ — now the **named replacement** for this slice's
+  intent. See [`vz-backend/PLAN.md`](vz-backend/PLAN.md). Apple
+  `Virtualization.framework`, not the older `Hypervisor.framework`.
 
 ### Slice C — Platform identity on macOS
 
@@ -332,9 +366,12 @@ ships until its gate passes.
 10. **Launcher Slice 2 + 3** as the underlying capsule and registry
     contracts harden
 
-Apple Hypervisor.framework substrate, dedicated browser capsule, and
-deeper Puter-derived UI deprecation are explicitly later. They should
-not distort the immediate sequence above.
+The Apple Virtualization.framework backend
+([`vz-backend/PLAN.md`](vz-backend/PLAN.md)) is the named replacement
+for Slice B's intent; its sequencing is owned by that plan and runs
+independently of the launcher slices above. Dedicated browser capsule
+and deeper Puter-derived UI deprecation are explicitly later. They
+should not distort the immediate sequence above.
 
 ## Decision Log Stub
 
@@ -347,3 +384,14 @@ Track decisions here when they pin down a previously open choice.
   `localhost-provider` only, not WASM-substrate provider rework.
   Driver: matches existing `documents-provider` in-process mechanism,
   fewer new concepts.
+- **2026-05-22** — Slice B retired in favour of a native Apple
+  Virtualization.framework backend ([`vz-backend/PLAN.md`](vz-backend/PLAN.md)).
+  Driver: running a `type: microvm` capsule as an unsandboxed host
+  subprocess violates [`PRINCIPLES.md` #10 and #11](../PRINCIPLES.md);
+  the principled fix is a real microVM substrate on Mac, not a soft
+  alternate. The Vz backend gives Mac identical hardware-enforced
+  isolation to Linux/KVM while leaving the
+  [`elastos-crosvm`](../elastos/crates/elastos-crosvm/) Linux code path
+  untouched. Pre-Work reverts the misleading darwin entries in
+  [`components.json`](../components.json) added by `a02045e`; the
+  daemon-portability improvements from that commit chain are kept.

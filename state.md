@@ -90,6 +90,17 @@ For direction, see [ROADMAP.md](ROADMAP.md).
 ## Support boundary
 
 - Linux is the truthful full-runtime baseline (x86_64 and aarch64).
-- macOS is not yet a truthful full runtime target on this branch.
+- macOS is not yet a truthful full runtime target on this branch. The
+  daemon code compiles and runs natively; `WASM` and `data` capsules run
+  natively; `type: microvm` capsules require Linux (KVM + `crosvm`) and
+  fail closed on Mac with a clear "not available for darwin-arm64"
+  message. See [docs/MAC.md](docs/MAC.md) for the full status, the
+  honest trust delta, and the named path to first-class support.
+- The named project that makes Mac a first-class ElastOS host with
+  identical microVM isolation is the **Apple Virtualization.framework
+  backend** — [docs/vz-backend/PLAN.md](docs/vz-backend/PLAN.md). It
+  adds `elastos-vz` as a sibling crate to
+  [`elastos-crosvm`](elastos/crates/elastos-crosvm/) without touching
+  Linux code.
 - The Home direction is being redirected so the default Home path does not depend on KVM or donor backend semantics; that is the condition for macOS to become a first-class front-door target later without faking Linux parity.
 - Home is the intended front door but not fully boring on every target machine yet.
