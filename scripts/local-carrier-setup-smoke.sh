@@ -117,6 +117,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/home" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/system" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/chat-room" && cargo build --target wasm32-wasip1 --release)
 
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
@@ -140,9 +141,12 @@ WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/we
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
+CHAT_ROOM_CAPSULE_DIR="${REPO_ROOT}/capsules/chat-room" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
+GBA_EMULATOR_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-emulator" \
+GBA_UCITY_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-ucity" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -204,9 +208,13 @@ home_cli_data = home_cli_archive.read_bytes()
 home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
 home_cli_manifest["size"] = len(home_cli_data)
 
+# Browser WASM capsules: capsule.json + {name}.wasm + browser/ assets.
+# chat-room follows the same shape (Cargo crate that builds chat-room.wasm
+# under target/wasm32-wasip1/release and a sibling browser/ dir).
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+    "chat-room": pathlib.Path(os.environ["CHAT_ROOM_CAPSULE_DIR"]),
 }
 for name, capsule_dir in browser_capsules.items():
     info = platform_info(name)
@@ -225,10 +233,17 @@ for name, capsule_dir in browser_capsules.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
+# Data capsules: tar every source-side file so multi-file viewers (e.g.
+# gba-emulator with its mgba.wasm + emulator.js + style.css) and content
+# capsules with non-`index.html` entrypoints (e.g. gba-ucity → ucity.gba)
+# both install correctly. Build artifacts and VCS metadata are excluded.
+_DATA_EXCLUDE_NAMES = {"target", "Cargo.lock", ".git", "node_modules", ".DS_Store"}
 data_capsules = {
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+    "gba-emulator": pathlib.Path(os.environ["GBA_EMULATOR_CAPSULE_DIR"]),
+    "gba-ucity": pathlib.Path(os.environ["GBA_UCITY_CAPSULE_DIR"]),
 }
 for name, capsule_dir in data_capsules.items():
     info = platform_info(name)
@@ -237,8 +252,10 @@ for name, capsule_dir in data_capsules.items():
         raise SystemExit(f"{name} missing release_path for {platform}")
     archive = artifacts_dir / release_path
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+        for child in sorted(capsule_dir.iterdir()):
+            if child.name in _DATA_EXCLUDE_NAMES:
+                continue
+            tar.add(child, arcname=f"{name}/{child.name}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -401,6 +418,20 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
     "${ELASTOS_BIN}" setup
 )
 
+# Layer the universal-platform browser/data capsules on top of the home profile
+# install. These are platform-agnostic (`platforms: ["*"]`) and run anywhere
+# the gateway runs, so they're the first natural extension beyond the home
+# profile on macOS.
+echo "[local-carrier-setup] installing universal demo capsules (chat-room, gba-emulator, gba-ucity)"
+(
+    cd "${ELASTOS_ROOT}"
+    XDG_DATA_HOME="${XDG_DATA_HOME}" \
+    "${ELASTOS_BIN}" setup \
+        --with chat-room \
+        --with gba-emulator \
+        --with gba-ucity
+)
+
 stop_source_runtime
 
 for installed in \
@@ -416,7 +447,13 @@ for installed in \
     "${DATA_DIR}/capsules/system/browser/index.html" \
     "${DATA_DIR}/capsules/documents/index.html" \
     "${DATA_DIR}/capsules/library/index.html" \
-    "${DATA_DIR}/capsules/inbox/index.html"
+    "${DATA_DIR}/capsules/inbox/index.html" \
+    "${DATA_DIR}/capsules/chat-room/chat-room.wasm" \
+    "${DATA_DIR}/capsules/chat-room/capsule.json" \
+    "${DATA_DIR}/capsules/gba-emulator/index.html" \
+    "${DATA_DIR}/capsules/gba-emulator/mgba.wasm" \
+    "${DATA_DIR}/capsules/gba-ucity/ucity.gba" \
+    "${DATA_DIR}/capsules/gba-ucity/capsule.json"
 do
     if [[ ! -f "${installed}" ]]; then
         echo "expected installed file missing: ${installed}" >&2
