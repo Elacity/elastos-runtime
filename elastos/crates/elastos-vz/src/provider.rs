@@ -179,11 +179,7 @@ impl VzProvider {
 
     /// Append boot arguments to a VM before start. Fails closed in
     /// Phase 1.
-    pub async fn append_boot_args_for_vm(
-        &self,
-        capsule_id: &CapsuleId,
-        _args: &str,
-    ) -> Result<()> {
+    pub async fn append_boot_args_for_vm(&self, capsule_id: &CapsuleId, _args: &str) -> Result<()> {
         Err(ElastosError::Compute(format!(
             "{} (append_boot_args_for_vm: capsule='{}')",
             PHASE_1_STUB_MESSAGE, capsule_id.0

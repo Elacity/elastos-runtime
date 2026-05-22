@@ -107,7 +107,10 @@ async fn vz_provider_load_for_microvm_fails_closed_with_phase_marker() {
         .unwrap_err();
 
     let msg = err.to_string();
-    assert!(msg.contains("Phase 2"), "expected Phase-2 marker, got: {msg}");
+    assert!(
+        msg.contains("Phase 2"),
+        "expected Phase-2 marker, got: {msg}"
+    );
     assert!(msg.contains("docs/vz-backend/PLAN.md"));
 }
 

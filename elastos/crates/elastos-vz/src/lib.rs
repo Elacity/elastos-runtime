@@ -128,7 +128,10 @@ mod tests {
 
         // Off-mac platforms must always return false.
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        assert!(!supported, "is_supported() must be false outside macOS arm64");
+        assert!(
+            !supported,
+            "is_supported() must be false outside macOS arm64"
+        );
     }
 
     #[test]

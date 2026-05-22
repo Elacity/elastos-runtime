@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Run on main and on Vz-backend working branches so Phase 1+ commits
+    # get verified on Linux without waiting for a PR. The `sash/**`
+    # pattern covers the current Vz development branch
+    # (`sash/local-test`) and any future Vz sub-branches.
+    branches: [main, "sash/**", "vz/**"]
   pull_request:
     branches: [main]
 

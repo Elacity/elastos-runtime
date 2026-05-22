@@ -251,10 +251,8 @@ impl VmConfig {
         // Default boot args use the Vz console device. The supervisor
         // may pass crosvm-style args through manifest overrides; the
         // `vz_boot_args` accessor rewrites them at construction time.
-        let default_boot_args = format!(
-            "console={} reboot=k panic=1 init=/init",
-            VZ_CONSOLE_DEVICE
-        );
+        let default_boot_args =
+            format!("console={} reboot=k panic=1 init=/init", VZ_CONSOLE_DEVICE);
         let base_boot_args = microvm
             .map(|m| rewrite_console_for_vz(&m.boot_args))
             .unwrap_or(default_boot_args);
@@ -437,7 +435,9 @@ mod tests {
             std::path::Path::new("/k/vmlinux"),
         );
         // Empty boot_args triggers the default branch.
-        assert!(config.boot_args.contains("console=hvc0") || config.boot_args.contains("init=/init"));
+        assert!(
+            config.boot_args.contains("console=hvc0") || config.boot_args.contains("init=/init")
+        );
     }
 
     #[test]
@@ -450,7 +450,9 @@ mod tests {
         )
         .with_session("abc12345", "http://127.0.0.1:3000");
         assert!(config.boot_args.contains("elastos.token=abc12345"));
-        assert!(config.boot_args.contains("elastos.api=http://127.0.0.1:3000"));
+        assert!(config
+            .boot_args
+            .contains("elastos.api=http://127.0.0.1:3000"));
     }
 
     #[test]

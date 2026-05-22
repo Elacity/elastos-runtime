@@ -122,11 +122,8 @@ mod tests {
     #[test]
     fn running_vm_new_captures_config_and_starts_stopped() {
         let m = manifest();
-        let config = VmConfig::from_manifest(
-            &m,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
+        let config =
+            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
         let vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
         assert!(matches!(vm.status, CapsuleStatus::Stopped));
         assert!(!vm.is_running());
@@ -135,11 +132,8 @@ mod tests {
     #[tokio::test]
     async fn running_vm_start_fails_closed_with_phase_1_stub() {
         let m = manifest();
-        let config = VmConfig::from_manifest(
-            &m,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
+        let config =
+            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
         let mut vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
 
         let err = vm.start().await.unwrap_err();
@@ -149,11 +143,8 @@ mod tests {
     #[tokio::test]
     async fn running_vm_stop_is_idempotent_in_phase_1() {
         let m = manifest();
-        let config = VmConfig::from_manifest(
-            &m,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
+        let config =
+            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
         let mut vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
 
         // Calling stop on a never-started VM must not error — same
@@ -165,11 +156,8 @@ mod tests {
     #[test]
     fn running_vm_http_port_passes_through_from_config() {
         let m = manifest();
-        let config = VmConfig::from_manifest(
-            &m,
-            std::path::Path::new("/c"),
-            std::path::Path::new("/k"),
-        );
+        let config =
+            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
         let vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
         assert_eq!(vm.http_port(), Some(4100));
     }
