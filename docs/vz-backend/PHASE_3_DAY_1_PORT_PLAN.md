@@ -1,5 +1,11 @@
 ## Phase 3 Day 1 — supervisor → VzProvider port plan
 
+> **Day 2 status:** every AG row in the audit table below is now
+> ported (commit on the head of `sash/local-test`). The Day-2
+> notes live in [`PHASE_3_DAY_2_NOTES.md`](PHASE_3_DAY_2_NOTES.md);
+> this document is preserved as the original audit + Day-1 plan
+> so future days can re-verify against the same line numbers.
+>
 > Audit-only document. Status as of `73cd293` on `sash/local-test`
 > (Phase 2 Day 5 complete + the host-portable fixture fix).
 >

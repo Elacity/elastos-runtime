@@ -30,6 +30,14 @@ use elastos_compute::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 use crate::config::{VmConfig, VzConfig};
 use crate::network::NetworkConfig;
 use crate::vm::RunningVm;
+// PHASE_1_STUB_MESSAGE is referenced from the non-macOS branch
+// of `load_with_vm_config` and from several `#[cfg(test)]`
+// regression tests that assert it is NEVER surfaced from a
+// post-Day-1 code path. On macOS-prod the non-test reference is
+// `cfg`-gated out, so the import is technically unused there —
+// the `allow` keeps clippy happy without losing the import in
+// the test build.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(unused_imports))]
 use crate::PHASE_1_STUB_MESSAGE;
 
 /// Apple Virtualization.framework compute provider.
@@ -263,17 +271,17 @@ impl VzProvider {
         }
     }
 
-    /// Configure session credentials for a VM **before** load.
+    /// **Deprecated by Phase 3 Day 2.** Apple's
+    /// `VZVirtualMachineConfiguration` is frozen post-init
+    /// (Phase 0 §D pitfall #9); no session credentials can be
+    /// applied after the VM has been loaded. The correct shape
+    /// is to bake session args into [`VmConfig::boot_args`] (use
+    /// [`VmConfig::with_session`]) **before** calling
+    /// [`Self::load_with_vm_config`].
     ///
-    /// Apple's `VZVirtualMachineConfiguration` is frozen the
-    /// moment `VZVirtualMachine::initWithConfiguration:queue:`
-    /// is invoked (Phase 0 audit §D pitfall #9 covers the
-    /// related "no late mutation" rule). Day 3 therefore keeps
-    /// the Phase 1 stub for this surface — the supervisor's
-    /// macOS path (still gated by Phase 1's bail) is the only
-    /// caller anyway. A later day will surface a different API
-    /// shape (set session **before** load) once we add the
-    /// supervisor-side route.
+    /// This method is intentionally kept to surface a clear,
+    /// typed migration message to any caller still on the
+    /// pre-Day-1 API. It always fails closed.
     pub async fn set_session_for_vm(
         &self,
         capsule_id: &CapsuleId,
@@ -281,22 +289,42 @@ impl VzProvider {
         _api_addr: &str,
     ) -> Result<()> {
         Err(ElastosError::Compute(format!(
-            "{} (set_session_for_vm: capsule='{}', see provider.rs comment)",
-            PHASE_1_STUB_MESSAGE, capsule_id.0
+            "vz: set_session_for_vm is unsupported — \
+             VZVirtualMachineConfiguration is frozen after load. \
+             Use VmConfig::with_session(token, api_addr) (or append \
+             `elastos.token=<t>` to VmConfig.boot_args directly) and call \
+             VzProvider::load_with_vm_config(vm_config, manifest) instead. \
+             (capsule='{}'; see docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)",
+            capsule_id.0
         )))
     }
 
-    /// Attach explicit guest-network TAP equivalent. Phase 3
-    /// wires this to `VZNATNetworkDeviceAttachment` with an
-    /// explicit subnet. Day 3: not implemented.
+    /// **Deprecated by Phase 3 Day 2.** Late-binding network
+    /// attachment is not possible on Vz because Apple's
+    /// `VZVirtualMachineConfiguration` is frozen after init.
+    /// The supervisor must compose the network configuration on
+    /// the `VmConfig` **before** calling [`Self::load_with_vm_config`].
+    ///
+    /// Note: Mac currently uses Vz NAT-only networking by
+    /// default (no Apple entitlement required). Bridged-mode
+    /// support is deferred to Phase 3 Day 4+ — see the port plan.
+    ///
+    /// This method always fails closed with a typed migration
+    /// message.
     pub async fn set_network_for_vm(
         &self,
         capsule_id: &CapsuleId,
         _network: NetworkConfig,
     ) -> Result<()> {
         Err(ElastosError::Compute(format!(
-            "{} (set_network_for_vm: capsule='{}')",
-            PHASE_1_STUB_MESSAGE, capsule_id.0
+            "vz: set_network_for_vm is unsupported — \
+             VZVirtualMachineConfiguration is frozen after load. \
+             Default Vz networking is NAT (no entitlement required) and is \
+             attached automatically by the builder. Bridged mode is Phase 3 \
+             Day 4+ work and requires the `com.apple.vm.networking` Apple \
+             entitlement. \
+             (capsule='{}'; see docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)",
+            capsule_id.0
         )))
     }
 
@@ -461,33 +489,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vz_provider_session_and_network_still_fail_closed_with_stub() {
-        // Day 3 contract: set_session_for_vm and set_network_for_vm
-        // still surface PHASE_1_STUB_MESSAGE. Phase 3 Day 1
-        // explicitly leaves them — Day 2 removes them entirely
-        // in favour of supervisor-side baking into VmConfig.
+    async fn vz_provider_set_session_for_vm_returns_typed_migration_error_after_phase3_day2() {
+        // Phase 3 Day 2 contract: the old mid-life-cycle
+        // set_session_for_vm shape is unsupported because
+        // VZVirtualMachineConfiguration is frozen after load.
+        // The method exists only to surface a typed migration
+        // message pointing callers at VmConfig::with_session +
+        // load_with_vm_config.
         let provider = VzProvider::new(VzConfig::default()).unwrap();
-        let capsule_id = CapsuleId::new("phase2-day3-session".to_string());
+        let capsule_id = CapsuleId::new("phase3-day2-session".to_string());
 
-        let session_err = provider
+        let err = provider
             .set_session_for_vm(&capsule_id, "abc12345", "http://127.0.0.1:3000")
             .await
             .unwrap_err();
-        let network_err = provider
-            .set_network_for_vm(&capsule_id, NetworkConfig::new("phase2-day3-session"))
+        let msg = err.to_string();
+
+        // Must NOT carry the old PHASE_1_STUB_MESSAGE.
+        assert!(
+            !msg.contains(PHASE_1_STUB_MESSAGE),
+            "set_session_for_vm should no longer use the Phase 1 stub message; got: {msg}"
+        );
+
+        // Must point at the correct new API and the port plan.
+        assert!(
+            msg.contains("VmConfig::with_session"),
+            "expected the error to name VmConfig::with_session, got: {msg}"
+        );
+        assert!(
+            msg.contains("load_with_vm_config"),
+            "expected the error to name load_with_vm_config, got: {msg}"
+        );
+        assert!(
+            msg.contains("VZVirtualMachineConfiguration is frozen"),
+            "expected the error to name Apple's constraint, got: {msg}"
+        );
+        assert!(
+            msg.contains(&capsule_id.0),
+            "expected the error to carry the capsule id, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vz_provider_set_network_for_vm_returns_typed_migration_error_after_phase3_day2() {
+        // Phase 3 Day 2 contract: late-binding network
+        // attachment is unsupported; default Vz networking is
+        // NAT (attached by the builder). Bridged mode is Phase 3
+        // Day 4+ and needs Apple's `com.apple.vm.networking`
+        // entitlement.
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let capsule_id = CapsuleId::new("phase3-day2-network".to_string());
+
+        let err = provider
+            .set_network_for_vm(&capsule_id, NetworkConfig::new("phase3-day2-network"))
             .await
             .unwrap_err();
+        let msg = err.to_string();
 
-        for (label, err) in [
-            ("set_session_for_vm", session_err),
-            ("set_network_for_vm", network_err),
-        ] {
-            let msg = err.to_string();
-            assert!(
-                msg.contains(PHASE_1_STUB_MESSAGE),
-                "{label}: expected stub message, got: {msg}"
-            );
-        }
+        assert!(
+            !msg.contains(PHASE_1_STUB_MESSAGE),
+            "set_network_for_vm should no longer use the Phase 1 stub message; got: {msg}"
+        );
+        assert!(
+            msg.contains("NAT"),
+            "expected the error to mention the default NAT path, got: {msg}"
+        );
+        assert!(
+            msg.contains("com.apple.vm.networking"),
+            "expected the error to name the entitlement required for bridged mode, got: {msg}"
+        );
+        assert!(
+            msg.contains(&capsule_id.0),
+            "expected the error to carry the capsule id, got: {msg}"
+        );
     }
 
     #[tokio::test]

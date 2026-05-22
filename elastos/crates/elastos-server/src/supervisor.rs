@@ -965,7 +965,7 @@ impl Supervisor {
             // (compiled but unreachable on Mac) byte-identical:
             // it still owns the original manifest and capsule_dir.
             return self
-                .start_capsule_vm_macos(name, manifest.clone(), capsule_dir.clone())
+                .start_capsule_vm_macos(name, manifest.clone(), capsule_dir.clone(), config)
                 .await;
         }
 
@@ -1208,44 +1208,82 @@ impl Supervisor {
         Ok((handle, cid))
     }
 
-    /// Phase 3 Day 1 — supervisor seam to `VzProvider`.
+    /// Phase 3 Day 2 — full substrate-agnostic prefix port for
+    /// the macOS arm of [`Self::launch_capsule`].
     ///
-    /// Replaces the pre-Day-1 `bail!()` that short-circuited the
-    /// macOS arm of [`Self::launch_capsule`] before any
-    /// substrate-agnostic launch step ran. **Day 1 deliberately
-    /// keeps scope minimal** ([`docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md`](../../../docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)):
+    /// Day 1 shipped the bare seam: `elastos start <microvm>` on
+    /// macOS reached `VzProvider::load_with_vm_config` but with
+    /// a *minimal* `VmConfig` — no session token, no command
+    /// payload, no capsule args, no Carrier bridge, no rootfs
+    /// overlay. Day 2 ports every AG step from
+    /// [`docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md`](../../../docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)
+    /// — the same operations the Linux arm runs in
+    /// `launch_capsule` L997-1174 — into this helper, in the
+    /// same order, so a capsule launched on Mac sees the same
+    /// boot-arg shape it sees on Linux.
     ///
-    /// 1. Validate `elastos_vz::is_supported()` (Apple Silicon, macOS 12+).
-    /// 2. Construct an `elastos_vz::VmConfig` from the manifest using
-    ///    the same shape as the Linux arm does for `elastos_crosvm::VmConfig`.
-    /// 3. Hand it to [`elastos_vz::VzProvider::load_with_vm_config`]
-    ///    + [`elastos_vz::VzProvider::start`].
-    /// 4. Return a typed, named error explaining the supervisor
-    ///    `RunningCapsule` registration is pending Day 2 — the VM
-    ///    boots (Day 5 evidence) but is **not** tracked by
-    ///    `elastos ps` / `elastos stop` yet.
+    /// **Mac-specific deltas** vs the Linux flow:
     ///
-    /// **Explicitly NOT ported by Day 1** (Day 2+ work, named in
-    /// the port plan): session token injection, command payload,
-    /// capsule args, Carrier bridge spawn, rootfs overlay, TAP
-    /// network, supervisor `running` map insertion.
+    /// - TAP networking is unsupported (NAT only). If the manifest
+    ///   requests `permissions.guest_network: true`, fail closed
+    ///   with a typed error pointing at Phase 3 Day 4+ bridged-mode
+    ///   work. NO silent downgrade.
+    /// - The Carrier console lives at `/dev/hvc1` on Vz because
+    ///   `/dev/hvc0` is the kernel console
+    ///   ([`elastos-vz/src/ffi/builder.rs`](../../../elastos/crates/elastos-vz/src/ffi/builder.rs)
+    ///   `setSerialPorts`/`setConsoleDevices`). Linux uses
+    ///   `/dev/hvc0` because crosvm only attaches the Carrier
+    ///   console. The boot arg differs accordingly.
+    /// - The Carrier socket listens correctly (Day 2), but the
+    ///   guest doesn't *yet* receive bytes through it because the
+    ///   Vz console attachment is still a placeholder (Day 4+).
+    ///   That's a Phase 3 Day 4 piece, named in the port plan.
+    ///
+    /// **Explicitly NOT ported by Day 2** (Day 3+ work):
+    ///
+    /// - `CapsuleBackend::VzVm` enum extension + the
+    ///   `RunningCapsule` insertion at the end of the Linux flow
+    ///   (Day 3).
+    /// - Real socketpair attachment on the Vz console (Day 4).
+    /// - Real vsock host listener bridging (Day 5).
+    ///
+    /// Day 2 therefore still exits with a typed fail-closed
+    /// error after `VzProvider::start` succeeds — same shape as
+    /// Day 1 but now naming Day 3 as the missing piece.
     ///
     /// The Linux launch path ([`Self::launch_capsule`] body below
     /// this method) is **byte-identical** to the pre-Day-1 commit.
-    /// The macOS arm now early-returns through this helper.
+    /// The macOS arm early-returns through this helper.
     #[cfg(target_os = "macos")]
     async fn start_capsule_vm_macos(
         &self,
         name: &str,
         manifest: elastos_common::CapsuleManifest,
         capsule_dir: std::path::PathBuf,
+        config: serde_json::Value,
     ) -> Result<(String, u32)> {
         use elastos_compute::ComputeProvider;
-        use elastos_vz::{VmConfig as VzVmConfig, VzConfig, VzProvider};
+        use elastos_vz::{VzConfig, VzProvider};
 
         if !elastos_vz::is_supported() {
             bail!(
                 "Apple Virtualization.framework not available — cannot launch capsule '{name}' on this host. Requires macOS 12+ on Apple Silicon."
+            );
+        }
+
+        // Phase 3 Day 4+ (Vz bridged networking) territory.
+        // NAT-only Vz networking is the Day 2 default — no
+        // Apple entitlement required, and it's what the Phase 0
+        // audit signed off on for unmodified dev installs.
+        if manifest.permissions.guest_network {
+            bail!(
+                "vz: capsule '{}' requests guest_network (TAP), but Vz bridged \
+                 networking requires the `com.apple.vm.networking` Apple entitlement \
+                 — deferred to Phase 3 Day 4+. NAT-only capsules launch normally on \
+                 macOS; this capsule needs to drop `permissions.guest_network` or \
+                 wait for the bridged-mode milestone. \
+                 See docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md.",
+                name
             );
         }
 
@@ -1257,28 +1295,45 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("failed to init VzProvider state dir: {e}"))?;
 
-        // Day 1 builds a MINIMAL VmConfig. Day 2 will bake in
-        // session tokens, command payload, capsule args, and
-        // Carrier path here. The port plan lists every chunk.
-        let vm_config = VzVmConfig::from_manifest(&manifest, &capsule_dir, &vz_config.kernel_path);
+        let (vm_config, handle, cid, carrier_socket) = self
+            .build_vm_config_for_mac(name, &manifest, &capsule_dir, config, &vz_config)
+            .await?;
 
-        // CID assignment so log lines stay diff-able across
-        // substrates. Apple doesn't let us hand this to Vz
-        // (Phase 0 §D pitfall #5); it's advisory only.
-        let cid = {
-            let mut next = self.next_cid.write().await;
-            let cid = *next;
-            *next += 1;
-            cid
-        };
-        let handle = Self::unique_handle(name, cid);
+        // Spawn the microVM Carrier bridge BEFORE starting the VM.
+        // Linux spawns this at supervisor.rs L1148-1174; Mac does
+        // the exact same call. The bridge listens on the Unix
+        // socket; the guest will only connect once the Vz console
+        // attachment is a real socketpair (Day 4+) — until then
+        // the listener exists but no bytes flow.
+        if let Some(ref registry) = self.provider_registry {
+            let session_token = self.shell_token.clone().unwrap_or_default();
+            let bridge_ctx = match (&self.capability_manager, &self.pending_store) {
+                (Some(cap_mgr), Some(pending)) => Some(crate::carrier_bridge::BridgeContext {
+                    provider_registry: registry.clone(),
+                    capability_manager: cap_mgr.clone(),
+                    pending_store: pending.clone(),
+                    capsule_id: format!("vm-{}", name),
+                }),
+                _ => None,
+            };
+            if let Err(e) = crate::carrier_bridge::spawn_carrier_bridge(
+                &carrier_socket,
+                registry.clone(),
+                session_token,
+                bridge_ctx,
+            )
+            .await
+            {
+                tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+            }
+        }
 
         tracing::info!(
             target: "supervisor",
             capsule = name,
             handle = %handle,
             cid = cid,
-            "phase 3 day 1: reaching VzProvider::load_with_vm_config"
+            "phase 3 day 2: reaching VzProvider::load_with_vm_config with baked VmConfig"
         );
 
         let capsule_handle = provider
@@ -1290,26 +1345,206 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("vz provider start failed for '{}': {}", name, e))?;
 
-        // Day 1 honest fail point: the VM is booting (Day 5
-        // evidence), but the supervisor's `RunningCapsule` map
-        // can't hold a Vz handle yet — `CapsuleBackend::Vm`
-        // wraps `Box<elastos_crosvm::vm::RunningVm>` and adding
-        // a `Vz` variant is Day 2 work. The VM keeps running
-        // (its `VzMachineHandle` is owned by `provider.vms`
-        // inside the local `provider`); it will be dropped when
-        // this function returns. That's deliberate: an
-        // un-registered VM would be invisible to `elastos ps`
-        // and `elastos stop`, which is a worse outcome than a
-        // fail-closed message naming the next milestone.
+        // Day 2 honest fail point: the VM is booting with the
+        // FULL substrate-agnostic prefix baked in (session token,
+        // command payload, capsule args, provider_port,
+        // carrier_path=/dev/hvc1), but the supervisor's
+        // `RunningCapsule` map can't hold a Vz handle yet —
+        // `CapsuleBackend::Vm` wraps `Box<elastos_crosvm::vm::RunningVm>`
+        // and adding a `Vz` variant is Day 3 work. The VM keeps
+        // running until `provider` drops below, at which point
+        // its `VzMachineHandle` stops it cleanly.
         drop(provider); // explicit: VM stops here.
         bail!(
-            "vz: capsule '{}' reached VzProvider::start (Phase 3 Day 1 seam), \
-             but supervisor RunningCapsule registration is pending Day 2 \
-             (needs CapsuleBackend::VzVm enum variant). \
+            "vz: capsule '{}' reached VzProvider::start with full Phase 3 Day 2 \
+             prefix (session token, command payload, capsule args, Carrier socket \
+             listener, rootfs overlay), but supervisor RunningCapsule registration \
+             is pending Day 3 (needs CapsuleBackend::VzVm enum variant). \
              VM was stopped cleanly. \
              See docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md.",
             name
         );
+    }
+
+    /// Phase 3 Day 2 — substrate-agnostic prefix builder for the
+    /// macOS launch path. Mirrors the Linux flow in
+    /// [`Self::launch_capsule`] L997-1144, but operates on
+    /// `elastos_vz::VmConfig` and uses `/dev/hvc1` for the
+    /// Carrier console boot arg.
+    ///
+    /// Returns the fully-baked `VmConfig`, the supervisor handle
+    /// string, the (advisory) vsock CID, and the carrier socket
+    /// path so the caller can spawn the Carrier bridge listener.
+    ///
+    /// Factored out from `start_capsule_vm_macos` for test
+    /// isolation: the AG prefix is pure data composition (apart
+    /// from the file-system side-effects for the rootfs overlay
+    /// and socket directory creation), so it can be unit-tested
+    /// without touching the Vz framework.
+    #[cfg(target_os = "macos")]
+    async fn build_vm_config_for_mac(
+        &self,
+        name: &str,
+        manifest: &elastos_common::CapsuleManifest,
+        capsule_dir: &std::path::Path,
+        mut launch_config: serde_json::Value,
+        vz_config: &elastos_vz::VzConfig,
+    ) -> Result<(elastos_vz::VmConfig, String, u32, std::path::PathBuf)> {
+        use elastos_vz::VmConfig as VzVmConfig;
+
+        // CID alloc — advisory only on Mac (Apple does not let
+        // us hand the CID to Vz, Phase 0 §D pitfall #5) but kept
+        // for log-line diffability with the Linux path.
+        let cid = {
+            let mut next = self.next_cid.write().await;
+            let cid = *next;
+            *next += 1;
+            cid
+        };
+        let handle = Self::unique_handle(name, cid);
+
+        // Normalize supervisor-reserved launch config keys.
+        // Mirrors supervisor.rs L997-1013.
+        let interactive_stdio = launch_config
+            .get("_elastos_interactive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let capsule_args: Vec<String> = launch_config
+            .get("_elastos_capsule_args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(obj) = launch_config.as_object_mut() {
+            obj.remove("_elastos_interactive");
+            obj.remove("_elastos_capsule_args");
+        }
+
+        // Build VmConfig. Mirrors supervisor.rs L1015-1024 but on
+        // the Vz type. `from_manifest` reuses the manifest's
+        // `microvm.kernel` if set, else falls back to
+        // `vz_config.kernel_path` (~/.local/share/elastos/bin/vmlinux).
+        let mut vm_config =
+            VzVmConfig::from_manifest(manifest, capsule_dir, &vz_config.kernel_path);
+        vm_config.vsock_cid = cid;
+        vm_config.boot_args = format!("{} elastos.data_dir=/opt/elastos", vm_config.boot_args);
+        vm_config.interactive_stdio = interactive_stdio;
+        // Apply the provider-wide initramfs default if set.
+        // VzConfig carries this for `vm-debug boot --initramfs`;
+        // real capsules typically don't need it but the seam
+        // stays consistent.
+        if vm_config.initramfs_path.is_none() {
+            if let Some(default_initramfs) = vz_config.initramfs_path.as_ref() {
+                vm_config.initramfs_path = Some(default_initramfs.clone());
+            }
+        }
+
+        // TERM/winsize for interactive VMs. TIOCGWINSZ + the
+        // TERM env var both work on Darwin; same code as Linux.
+        // Mirrors supervisor.rs L1035-1050.
+        if interactive_stdio {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+            if ok == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                vm_config.boot_args = format!(
+                    "{} elastos.term_cols={} elastos.term_rows={}",
+                    vm_config.boot_args, ws.ws_col, ws.ws_row
+                );
+            }
+            if let Ok(term) = std::env::var("TERM") {
+                if !term.is_empty() {
+                    vm_config.boot_args = format!("{} elastos.term={}", vm_config.boot_args, term);
+                }
+            }
+        }
+
+        // Session token injection — NAT-only path on Mac (the
+        // TAP path is fail-closed-above). Mirrors the no-TAP
+        // branch in supervisor.rs L1087-1091: token via boot
+        // args only, no `elastos.api=` (the capsule uses the
+        // microVM Carrier bridge, not HTTP).
+        if self.api_addr.is_some() {
+            let token = if name == "shell" {
+                self.shell_token.clone()
+            } else {
+                match &self.session_registry {
+                    Some(reg) => {
+                        let session = reg.create_session(SessionType::Capsule, None).await;
+                        Some(session.token)
+                    }
+                    None => {
+                        eprintln!(
+                            "[supervisor] Warning: no session registry, capsule '{}' gets no token",
+                            name
+                        );
+                        None
+                    }
+                }
+            };
+            if let Some(t) = token {
+                vm_config.boot_args = format!("{} elastos.token={}", vm_config.boot_args, t);
+            }
+        }
+
+        // Command payload base64. Mirrors supervisor.rs L1095-1101.
+        if !launch_config.is_null() {
+            use base64::Engine as _;
+            let json_bytes = serde_json::to_vec(&launch_config)?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
+            vm_config.boot_args = format!("{} elastos.command={}", vm_config.boot_args, encoded);
+        }
+
+        // Capsule args base64. Mirrors supervisor.rs L1107-1113.
+        if !capsule_args.is_empty() {
+            use base64::Engine as _;
+            let joined = capsule_args.join("\n");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(joined.as_bytes());
+            vm_config.boot_args =
+                format!("{} elastos.capsule_args={}", vm_config.boot_args, encoded);
+        }
+
+        // Provider port boot arg. Mirrors supervisor.rs L1117-1122.
+        if manifest.provides.is_some() {
+            vm_config.boot_args = format!(
+                "{} elastos.provider_port={}",
+                vm_config.boot_args, VM_PROVIDER_PORT
+            );
+        }
+
+        // Carrier socket setup. Mirrors supervisor.rs L1124-1133
+        // EXCEPT the kernel arg path: Mac uses `/dev/hvc1`
+        // because `/dev/hvc0` is the kernel console (see
+        // elastos-vz/src/ffi/builder.rs `setSerialPorts` vs
+        // `setConsoleDevices`). The socket directory is reused
+        // from `crosvm_config.socket_dir` — it's an OS-agnostic
+        // path under ~/.local/share/elastos/ and keeps the
+        // socket location diffable across substrates.
+        let socket_dir = &self.crosvm_config.socket_dir;
+        tokio::fs::create_dir_all(socket_dir).await?;
+        let carrier_socket = socket_dir.join(format!("{}-carrier.sock", handle));
+        vm_config.carrier_socket_path = Some(carrier_socket.clone());
+        vm_config.boot_args = format!("{} elastos.carrier_path=/dev/hvc1", vm_config.boot_args);
+
+        // Rootfs overlay. Mirrors supervisor.rs L1135-1144. The
+        // cache directory is reused from
+        // `crosvm_config.rootfs_cache_dir` for the same
+        // OS-agnostic reason as the socket dir above. Vz accepts
+        // a raw ext4 file as a `VZVirtioBlockDevice` — Day 5
+        // boot evidence confirms this.
+        let rootfs_base = capsule_dir.join("rootfs.ext4");
+        if rootfs_base.is_file() {
+            let overlay_dir = self.crosvm_config.rootfs_cache_dir.join("overlays");
+            tokio::fs::create_dir_all(&overlay_dir).await?;
+            let overlay_path = overlay_dir.join(format!("{}.ext4", handle));
+            let _ = tokio::fs::remove_file(&overlay_path).await;
+            tokio::fs::copy(&rootfs_base, &overlay_path).await?;
+            vm_config.rootfs_path = overlay_path;
+        }
+
+        Ok((vm_config, handle, cid, carrier_socket))
     }
 
     /// Launch a Carrier-plane service as a host process (for `permissions.carrier: true`).
@@ -2155,39 +2390,18 @@ mod tests {
         assert!(err.to_string().contains("kubo not found"));
     }
 
-    /// Phase 3 Day 1 contract: on macOS, the supervisor must
-    /// reach `VzProvider::load_with_vm_config` for a synthetic
-    /// MicroVM capsule. Pre-Day-1, the macOS arm of
-    /// `launch_capsule` bailed with `PHASE_1_STUB_MESSAGE`
-    /// **before** any provider call. The post-Day-1 seam
-    /// surfaces a typed error from `load_with_vm_config`
-    /// (Kernel/Rootfs not found, or the Day-2-pending
-    /// registration message) — never the old stub.
-    ///
-    /// This test exercises `start_capsule_vm_macos` directly to
-    /// keep the assertion scope small (it doesn't depend on a
-    /// real on-disk capsule, only on the seam contract).
+    /// Build a synthetic MicroVM `CapsuleManifest` suitable for
+    /// the Phase 3 macOS supervisor tests. Each call returns a
+    /// fresh value so tests don't share state.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn start_capsule_vm_macos_reaches_vz_provider_after_phase3_day1() {
+    fn synthetic_microvm_manifest(name: &str) -> elastos_common::CapsuleManifest {
         use elastos_common::{
             CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, ResourceLimits, SCHEMA_V1,
         };
-
-        let supervisor = make_test_supervisor();
-
-        // Synthetic microvm capsule. `capsule_dir` is a tempdir
-        // that intentionally does NOT contain a real rootfs;
-        // VzProvider::load_with_vm_config will fail at one of
-        // its input-validation gates (Kernel-not-found if no
-        // ~/.local/share/elastos/bin/vmlinux is installed, or
-        // Rootfs-not-found if a kernel is). Either failure is
-        // proof the seam was reached.
-        let capsule_dir = tempfile::tempdir().unwrap().keep();
-        let manifest = CapsuleManifest {
+        CapsuleManifest {
             schema: SCHEMA_V1.into(),
             version: "0.1.0".into(),
-            name: "phase3-day1-seam-test".into(),
+            name: name.into(),
             description: None,
             author: None,
             role: CapsuleRole::App,
@@ -2215,33 +2429,258 @@ mod tests {
             providers: None,
             viewer: None,
             signature: None,
-        };
+        }
+    }
+
+    /// Phase 3 Day 1 contract: on macOS, the supervisor must
+    /// reach `VzProvider::load_with_vm_config` for a synthetic
+    /// MicroVM capsule. Pre-Day-1, the macOS arm of
+    /// `launch_capsule` bailed with `PHASE_1_STUB_MESSAGE`
+    /// **before** any provider call. The post-Day-1 seam
+    /// surfaces a typed error from `load_with_vm_config`
+    /// (Kernel/Rootfs not found, or the Day-N-pending
+    /// registration message) — never the old stub.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_capsule_vm_macos_reaches_vz_provider_after_phase3_day1() {
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = synthetic_microvm_manifest("phase3-day1-seam-test");
 
         let err = supervisor
-            .start_capsule_vm_macos("phase3-day1-seam-test", manifest, capsule_dir.to_path_buf())
+            .start_capsule_vm_macos(
+                "phase3-day1-seam-test",
+                manifest,
+                capsule_dir.to_path_buf(),
+                serde_json::Value::Null,
+            )
             .await
             .unwrap_err();
         let msg = err.to_string();
 
-        // The new seam MUST NOT surface the old Phase 1 stub.
         assert!(
             !msg.contains(elastos_vz::PHASE_1_STUB_MESSAGE),
             "seam regression: error still contains the pre-Day-1 PHASE_1_STUB_MESSAGE: {msg}"
         );
 
-        // The error MUST be from VzProvider — one of the input
-        // validation gates inside load_with_vm_config, OR the
-        // Day-1 fail-closed registration message after a
-        // successful load+start.
         let is_kernel_missing = msg.contains("Kernel not found");
         let is_rootfs_missing = msg.contains("Rootfs not found");
-        let is_day2_pending =
-            msg.contains("supervisor RunningCapsule registration is pending Day 2");
+        let is_pending_registration =
+            msg.contains("supervisor RunningCapsule registration is pending");
         assert!(
-            is_kernel_missing || is_rootfs_missing || is_day2_pending,
-            "expected a typed error from VzProvider::load_with_vm_config \
-             (kernel-missing / rootfs-missing) or the Day-1 fail-closed \
-             registration message; got: {msg}"
+            is_kernel_missing || is_rootfs_missing || is_pending_registration,
+            "expected a typed error from VzProvider::load_with_vm_config or the \
+             Day-2 fail-closed registration message; got: {msg}"
+        );
+    }
+
+    /// Phase 3 Day 2 contract: `build_vm_config_for_mac` bakes
+    /// every substrate-agnostic boot arg the Linux flow does —
+    /// `elastos.data_dir`, session token (when applicable),
+    /// command payload (base64), capsule args (base64),
+    /// provider_port, carrier_path — into `vm_config.boot_args`
+    /// BEFORE the VM is handed to VzProvider. Also confirms
+    /// `/dev/hvc1` is the Mac carrier path (not `/dev/hvc0`).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_bakes_full_phase3_day2_prefix() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = synthetic_microvm_manifest("phase3-day2-bake-test");
+
+        let launch_config = serde_json::json!({
+            "command": "chat",
+            "_elastos_interactive": false,
+            "_elastos_capsule_args": ["--peer", "alice"],
+            "user_payload": {"hello": "world"}
+        });
+
+        let vz_config = VzConfig::default();
+        let (vm_config, handle, _cid, carrier_socket) = supervisor
+            .build_vm_config_for_mac(
+                "phase3-day2-bake-test",
+                &manifest,
+                &capsule_dir,
+                launch_config,
+                &vz_config,
+            )
+            .await
+            .expect("build_vm_config_for_mac succeeds with synthetic inputs");
+
+        // Carrier path is the Mac-specific /dev/hvc1 (kernel
+        // console is /dev/hvc0 on Vz). Diverges intentionally
+        // from the Linux flow which uses /dev/hvc0.
+        assert!(
+            vm_config
+                .boot_args
+                .contains("elastos.carrier_path=/dev/hvc1"),
+            "expected carrier_path=/dev/hvc1 on Mac, got boot_args: {}",
+            vm_config.boot_args
+        );
+        assert!(
+            !vm_config
+                .boot_args
+                .contains("elastos.carrier_path=/dev/hvc0"),
+            "must not use hvc0 on Mac (kernel console lives there): {}",
+            vm_config.boot_args
+        );
+
+        // Command payload was base64-encoded.
+        assert!(
+            vm_config.boot_args.contains("elastos.command="),
+            "expected base64-encoded command payload in boot args: {}",
+            vm_config.boot_args
+        );
+        // Capsule args were extracted, stripped from the launch
+        // config, and re-encoded as a base64 newline-joined
+        // payload.
+        assert!(
+            vm_config.boot_args.contains("elastos.capsule_args="),
+            "expected base64-encoded capsule_args in boot args: {}",
+            vm_config.boot_args
+        );
+        // data_dir always set.
+        assert!(
+            vm_config
+                .boot_args
+                .contains("elastos.data_dir=/opt/elastos"),
+            "expected data_dir boot arg: {}",
+            vm_config.boot_args
+        );
+        // Handle format is `vm-<name>-<cid>-<millis>` so the
+        // capsule name must appear in it; carrier socket path
+        // must embed the full handle.
+        assert!(
+            handle.contains("phase3-day2-bake-test"),
+            "handle should embed the capsule name, got: {handle}"
+        );
+        assert!(
+            handle.starts_with("vm-"),
+            "handle should follow the supervisor's vm-<name>-<cid>-<millis> convention, got: {handle}"
+        );
+        assert!(
+            carrier_socket.to_string_lossy().contains(&handle),
+            "carrier socket path should embed the handle: {}",
+            carrier_socket.display()
+        );
+        assert!(
+            carrier_socket.to_string_lossy().ends_with("-carrier.sock"),
+            "carrier socket should use the -carrier.sock suffix: {}",
+            carrier_socket.display()
+        );
+        assert_eq!(
+            vm_config.carrier_socket_path.as_deref(),
+            Some(carrier_socket.as_path())
+        );
+    }
+
+    /// Phase 3 Day 2 contract: a TAP-requesting capsule
+    /// (`permissions.guest_network: true`) fails closed on Mac
+    /// with a typed message naming the entitlement and the
+    /// Phase 3 Day 4+ milestone. NO silent downgrade to NAT.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_capsule_vm_macos_fails_closed_when_manifest_requests_tap_network() {
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let mut manifest = synthetic_microvm_manifest("phase3-day2-tap-test");
+        manifest.permissions.guest_network = true;
+
+        let err = supervisor
+            .start_capsule_vm_macos(
+                "phase3-day2-tap-test",
+                manifest,
+                capsule_dir.to_path_buf(),
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("com.apple.vm.networking"),
+            "expected the error to name the entitlement, got: {msg}"
+        );
+        assert!(
+            msg.contains("guest_network") || msg.contains("TAP"),
+            "expected the error to name the requested capability, got: {msg}"
+        );
+        assert!(
+            msg.contains("phase3-day2-tap-test"),
+            "expected the error to carry the capsule name, got: {msg}"
+        );
+    }
+
+    /// Phase 3 Day 2 contract: when the capsule directory holds
+    /// a `rootfs.ext4`, `build_vm_config_for_mac` creates a
+    /// writable overlay under `rootfs_cache_dir/overlays/` and
+    /// rewires `vm_config.rootfs_path` to point at it. The host
+    /// source rootfs stays untouched (Linux has the same
+    /// invariant).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_creates_rootfs_overlay_when_source_present() {
+        use elastos_vz::VzConfig;
+        use std::fs;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+
+        // Stand-in rootfs file. Production capsules ship a real
+        // ext4; the test only needs bytes that round-trip
+        // through `tokio::fs::copy`.
+        let rootfs_src = capsule_dir.join("rootfs.ext4");
+        fs::write(&rootfs_src, b"phase3-day2-fake-rootfs").unwrap();
+
+        let manifest = synthetic_microvm_manifest("phase3-day2-overlay-test");
+        let vz_config = VzConfig::default();
+        let (vm_config, handle, _cid, _carrier) = supervisor
+            .build_vm_config_for_mac(
+                "phase3-day2-overlay-test",
+                &manifest,
+                &capsule_dir,
+                serde_json::Value::Null,
+                &vz_config,
+            )
+            .await
+            .expect("build_vm_config_for_mac succeeds with rootfs source present");
+
+        // Source rootfs untouched.
+        assert_eq!(
+            fs::read(&rootfs_src).unwrap(),
+            b"phase3-day2-fake-rootfs",
+            "source rootfs.ext4 must not be mutated"
+        );
+
+        // Overlay path rewired to a per-handle file under
+        // rootfs_cache_dir/overlays/.
+        assert!(
+            vm_config.rootfs_path.is_file(),
+            "overlay file must exist on disk at {}",
+            vm_config.rootfs_path.display()
+        );
+        assert!(
+            vm_config.rootfs_path != rootfs_src,
+            "overlay must NOT be the same path as the source rootfs"
+        );
+        let overlay_str = vm_config.rootfs_path.to_string_lossy();
+        assert!(
+            overlay_str.contains("overlays"),
+            "overlay path should live under …/overlays/: {}",
+            overlay_str
+        );
+        assert!(
+            overlay_str.contains(&handle),
+            "overlay filename should embed the handle: {}",
+            overlay_str
+        );
+        // Bytes copied verbatim.
+        assert_eq!(
+            fs::read(&vm_config.rootfs_path).unwrap(),
+            b"phase3-day2-fake-rootfs",
+            "overlay must carry the source rootfs bytes verbatim"
         );
     }
 }
