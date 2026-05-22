@@ -41,18 +41,21 @@ use crate::vm::RunningVm;
 use crate::PHASE_1_STUB_MESSAGE;
 
 /// Apple Virtualization.framework compute provider.
+///
+/// **Phase 4 Day 1.** The GCD dispatch queue is no longer owned
+/// by the provider. Apple's threading rules apply per
+/// `VZVirtualMachine` instance, not per process, so every
+/// `VzMachineHandle::new` constructs a fresh serial queue
+/// labelled with the VM's `vm_id`. A single provider can now
+/// host N concurrent VMs without all of them serializing on the
+/// same GCD queue — important for multi-microVM launch graphs
+/// (`home` + `chat` + `localhost-provider` started concurrently).
+/// See [`docs/vz-backend/PHASE_4_DAY_1_NOTES.md`].
 pub struct VzProvider {
     config: VzConfig,
 
     /// Running VMs indexed by capsule ID.
     vms: Arc<RwLock<HashMap<CapsuleId, RunningVm>>>,
-
-    /// One serial dispatch queue per provider. Every
-    /// `VZVirtualMachine` constructed by this provider is bound
-    /// to this queue per Apple's threading requirement (Phase 0
-    /// §D pitfall #10).
-    #[cfg(target_os = "macos")]
-    queue: Arc<crate::ffi::dispatch::VzDispatchQueue>,
 }
 
 impl VzProvider {
@@ -61,10 +64,6 @@ impl VzProvider {
         Ok(Self {
             config,
             vms: Arc::new(RwLock::new(HashMap::new())),
-            #[cfg(target_os = "macos")]
-            queue: Arc::new(crate::ffi::dispatch::VzDispatchQueue::new(
-                "elastos-vz.provider",
-            )),
         })
     }
 
@@ -258,7 +257,6 @@ impl VzProvider {
                 let handle = crate::ffi::lifecycle::VzMachineHandle::new(
                     built_vz_config,
                     kernel_console_host_read,
-                    self.queue.clone(),
                     vm_config.vm_id.clone(),
                 )
                 .map_err(ElastosError::Compute)?;

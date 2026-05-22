@@ -196,9 +196,15 @@ impl VzMachineHandle {
     pub(crate) fn new(
         vz_config: Retained<VZVirtualMachineConfiguration>,
         kernel_console_host_read: std::fs::File,
-        queue: Arc<VzDispatchQueue>,
         vm_id: String,
     ) -> Result<Self, String> {
+        // Phase 4 Day 1: per-VM dispatch queue. Apple's
+        // threading rules apply per `VZVirtualMachine` — each VM
+        // gets its own serial queue so concurrent launches do
+        // not serialize through a single GCD queue. The label
+        // embeds `vm_id` so `Instruments.app` / `lldb` can
+        // attribute traces back to the right capsule.
+        let queue = Arc::new(VzDispatchQueue::new(&format!("elastos-vz.vm.{vm_id}")));
         // SAFETY: validateWithError runs entirely on the calling
         // thread; the documentation does not require a dispatch
         // queue for validation.

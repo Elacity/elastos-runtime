@@ -238,6 +238,24 @@ impl Supervisor {
         format!("vm-{}-{}-{}", name, cid, millis)
     }
 
+    /// Allocate the next vsock CID under the supervisor's
+    /// `next_cid` write lock and increment the counter.
+    ///
+    /// **Phase 4 Day 1.** Extracted from the inline blocks in
+    /// `start_capsule_vm_macos` / `build_vm_config_for_mac` /
+    /// the crosvm launch path so the allocator can be exercised
+    /// in isolation by the concurrent-launch tests. The
+    /// `RwLock::write` future grants mutually exclusive access
+    /// regardless of how many writers race for it, which makes
+    /// CID assignment race-free without any additional
+    /// synchronisation.
+    async fn allocate_next_cid(&self) -> u32 {
+        let mut next = self.next_cid.write().await;
+        let cid = *next;
+        *next += 1;
+        cid
+    }
+
     fn resolve_external_install_path(
         registry: &ComponentsManifest,
         data_dir: &Path,
@@ -1079,14 +1097,7 @@ impl Supervisor {
         self.verify_host_artifact("crosvm", &self.crosvm_config.crosvm_bin)?;
         self.verify_host_artifact("vmlinux", &self.crosvm_config.kernel_path)?;
 
-        // Assign vsock CID (unique per VM)
-        let cid = {
-            let mut next = self.next_cid.write().await;
-            let cid = *next;
-            *next += 1;
-            cid
-        };
-
+        let cid = self.allocate_next_cid().await;
         let handle = Self::unique_handle(name, cid);
 
         // Normalize supervisor-reserved launch config keys.
@@ -1618,13 +1629,10 @@ impl Supervisor {
 
         // CID alloc — advisory only on Mac (Apple does not let
         // us hand the CID to Vz, Phase 0 §D pitfall #5) but kept
-        // for log-line diffability with the Linux path.
-        let cid = {
-            let mut next = self.next_cid.write().await;
-            let cid = *next;
-            *next += 1;
-            cid
-        };
+        // for log-line diffability with the Linux path. The
+        // allocator is shared with the Linux flow via
+        // `allocate_next_cid` (Phase 4 Day 1).
+        let cid = self.allocate_next_cid().await;
         let handle = Self::unique_handle(name, cid);
 
         // Normalize supervisor-reserved launch config keys.
@@ -3284,6 +3292,224 @@ mod tests {
         assert!(
             err.to_string().contains("running map has been dropped"),
             "expected dropped-map error message, got: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4 Day 1 — N concurrent launches: CID allocator audit,
+    // multi-VM launch isolation, reaper concurrency.
+    // ---------------------------------------------------------------
+
+    /// The CID allocator is the only shared mutable state both
+    /// launch flows touch before they branch into substrate-
+    /// specific code. Under N concurrent callers it must hand
+    /// out N distinct values — the `RwLock::write` future is the
+    /// only thing standing between us and duplicate CIDs (which
+    /// would later collide in the runtime's vsock dispatch).
+    ///
+    /// 100 spawned tasks exceeds Tokio's default
+    /// `worker_threads = 1` test runtime by a wide margin so we
+    /// run on the multi-thread flavour with 4 workers; we also
+    /// verify the contract under the default single-thread
+    /// flavour (the second test below) since CI invocations may
+    /// pin `RUST_TEST_THREADS=1`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cid_allocator_hands_out_100_unique_values_under_concurrent_load() {
+        let supervisor = std::sync::Arc::new(make_test_supervisor());
+
+        const N: usize = 100;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..N {
+            let supervisor = supervisor.clone();
+            set.spawn(async move { supervisor.allocate_next_cid().await });
+        }
+
+        let mut cids = Vec::with_capacity(N);
+        while let Some(joined) = set.join_next().await {
+            cids.push(joined.expect("join must not panic"));
+        }
+        assert_eq!(cids.len(), N, "every spawned task must produce a CID");
+
+        let mut sorted = cids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            N,
+            "100 parallel allocate_next_cid calls must yield 100 distinct CIDs, got {} after dedup (cids: {:?})",
+            sorted.len(),
+            cids
+        );
+    }
+
+    /// Same contract as the multi-thread case above but exercised
+    /// under the single-threaded test runtime. Both `RUST_TEST_THREADS`
+    /// values are CI gates per Phase 4 Day 1, so the allocator
+    /// must remain race-free under either scheduler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cid_allocator_hands_out_100_unique_values_on_single_threaded_runtime() {
+        let supervisor = std::sync::Arc::new(make_test_supervisor());
+
+        const N: usize = 100;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..N {
+            let supervisor = supervisor.clone();
+            set.spawn(async move { supervisor.allocate_next_cid().await });
+        }
+
+        let mut cids = Vec::with_capacity(N);
+        while let Some(joined) = set.join_next().await {
+            cids.push(joined.expect("join must not panic"));
+        }
+
+        let mut sorted = cids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            N,
+            "single-threaded runtime must also yield 100 distinct CIDs"
+        );
+    }
+
+    /// Three parallel `build_vm_config_for_mac` calls must each
+    /// receive a distinct CID and a handle that embeds its OWN
+    /// capsule name. This is the supervisor-level analogue of the
+    /// `elastos-vz` concurrent_load_rejections test: it proves the
+    /// supervisor's `next_cid` write lock and `unique_handle`
+    /// composition stay race-free when the multi-microVM launch
+    /// graph (`home` + `chat` + `localhost-provider`) hits the
+    /// supervisor in parallel.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_vm_config_for_mac_isolates_concurrent_launches() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = std::sync::Arc::new(make_test_supervisor());
+        let vz_config = std::sync::Arc::new(VzConfig::default());
+
+        let names = ["alpha", "bravo", "charlie"];
+        let mut set = tokio::task::JoinSet::new();
+        for name in names.iter() {
+            let supervisor = supervisor.clone();
+            let vz_config = vz_config.clone();
+            let name = name.to_string();
+            let capsule_dir = tempfile::tempdir().unwrap().keep();
+            let manifest = synthetic_microvm_manifest(&name);
+
+            set.spawn(async move {
+                let (_vm_config, handle, cid, _carrier_socket) = supervisor
+                    .build_vm_config_for_mac(
+                        &name,
+                        &manifest,
+                        &capsule_dir,
+                        serde_json::Value::Null,
+                        &vz_config,
+                    )
+                    .await
+                    .expect("build_vm_config_for_mac succeeds with synthetic inputs");
+                (name, handle, cid)
+            });
+        }
+
+        let mut results = Vec::with_capacity(names.len());
+        while let Some(joined) = set.join_next().await {
+            results.push(joined.expect("join must not panic"));
+        }
+
+        // Every CID must be distinct.
+        let mut cids: Vec<u32> = results.iter().map(|(_, _, c)| *c).collect();
+        cids.sort_unstable();
+        cids.dedup();
+        assert_eq!(
+            cids.len(),
+            names.len(),
+            "concurrent build_vm_config_for_mac calls must allocate distinct CIDs"
+        );
+
+        // Each handle must carry its OWN capsule name — proves
+        // no name shadowing through the shared supervisor.
+        for (name, handle, _) in &results {
+            assert!(
+                handle.contains(name),
+                "handle '{handle}' must embed its own capsule name '{name}'"
+            );
+        }
+
+        // Handles must themselves be distinct (UUID-ish via cid
+        // disambiguator).
+        let mut handles: Vec<String> = results.iter().map(|(_, h, _)| h.clone()).collect();
+        handles.sort();
+        handles.dedup();
+        assert_eq!(
+            handles.len(),
+            names.len(),
+            "concurrent launches must produce distinct handles"
+        );
+    }
+
+    /// `reap_dead_capsules` must remove ONLY the capsules whose
+    /// backend reports `is_running() == false`. Inject three
+    /// synthetic `RunningCapsule`s — two with `status: Running`,
+    /// one with `status: Stopped` — and assert exactly the
+    /// stopped one is evicted. This is the supervisor's safety
+    /// contract against accidental mass-eviction on a single
+    /// VM's terminal transition.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn reap_dead_capsules_removes_only_stopped_vz_capsules() {
+        use elastos_common::CapsuleStatus;
+
+        let supervisor = make_test_supervisor();
+
+        // Reuse the Day-3 `synthetic_vzvm_running_capsule`
+        // helper and mutate the inner `RunningVm.status` so
+        // `is_running()` returns either `true` (Running) or
+        // `false` (Stopped) without needing a live Vz handle.
+        fn make_vz_capsule_with_status(
+            name: &str,
+            status: CapsuleStatus,
+        ) -> (String, RunningCapsule) {
+            let handle = format!("vm-{name}-1-1");
+            let mut rc = synthetic_vzvm_running_capsule(name, &handle);
+            if let CapsuleBackend::VzVm(ref mut vm) = rc.backend {
+                vm.status = status;
+            }
+            (handle, rc)
+        }
+
+        {
+            let mut running = supervisor.running.write().await;
+            let (h_alive, c_alive) = make_vz_capsule_with_status("alpha", CapsuleStatus::Running);
+            let (h_dead, c_dead) = make_vz_capsule_with_status("bravo", CapsuleStatus::Stopped);
+            let (h_alive2, c_alive2) =
+                make_vz_capsule_with_status("charlie", CapsuleStatus::Running);
+            running.insert(h_alive, c_alive);
+            running.insert(h_dead, c_dead);
+            running.insert(h_alive2, c_alive2);
+        }
+
+        supervisor.reap_dead_capsules().await;
+
+        let running = supervisor.running.read().await;
+        assert_eq!(
+            running.len(),
+            2,
+            "reaper must leave exactly the two live capsules; got {} keys: {:?}",
+            running.len(),
+            running.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            running.keys().any(|k| k.contains("alpha")),
+            "alpha must remain (Running)"
+        );
+        assert!(
+            running.keys().any(|k| k.contains("charlie")),
+            "charlie must remain (Running)"
+        );
+        assert!(
+            !running.keys().any(|k| k.contains("bravo")),
+            "bravo (Stopped) must be reaped"
         );
     }
 }
