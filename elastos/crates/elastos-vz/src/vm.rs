@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use elastos_common::{CapsuleManifest, CapsuleStatus, ElastosError, Result};
 
 use crate::config::VmConfig;
+use crate::error::{VzError, VzExitReason};
 
 /// State of a single capsule's VM as seen by the Vz provider.
 pub struct RunningVm {
@@ -63,6 +64,23 @@ pub struct RunningVm {
     /// Carrier channel, log and continue".
     #[cfg(target_os = "macos")]
     carrier_host_fd: Option<std::os::fd::OwnedFd>,
+
+    /// Typed Vz error from the most recent failed
+    /// [`Self::stop`] (macOS only). **Phase 4 Day 7.** Populated
+    /// before `stop` returns so the supervisor can read
+    /// `last_vz_error()` for structured telemetry without
+    /// re-parsing the [`ElastosError`] string surface.
+    #[cfg(target_os = "macos")]
+    last_vz_error: Option<VzError>,
+
+    /// Typed Vz exit reason from the most recent terminal
+    /// observation (macOS only). **Phase 4 Day 7.** Populated by
+    /// [`Self::stop`] on host-initiated stops and by
+    /// [`Self::wait_for_exit_code`] on delegate-observed exits;
+    /// the supervisor surfaces this via
+    /// `SupervisorResponse::last_exit_reason`.
+    #[cfg(target_os = "macos")]
+    last_exit_reason: Option<VzExitReason>,
 }
 
 impl RunningVm {
@@ -79,6 +97,10 @@ impl RunningVm {
             handle: None,
             #[cfg(target_os = "macos")]
             carrier_host_fd: None,
+            #[cfg(target_os = "macos")]
+            last_vz_error: None,
+            #[cfg(target_os = "macos")]
+            last_exit_reason: None,
         }
     }
 
@@ -99,7 +121,79 @@ impl RunningVm {
             status: CapsuleStatus::Stopped,
             handle: Some(handle),
             carrier_host_fd: Some(carrier_host_fd),
+            last_vz_error: None,
+            last_exit_reason: None,
         }
+    }
+
+    /// Typed Vz error from the most recent failed [`Self::stop`]
+    /// call (macOS only). Returns `None` on success, before any
+    /// stop attempt, or on platforms without Vz. **Phase 4 Day 7.**
+    ///
+    /// The supervisor reads this immediately after `stop`
+    /// returns `Err` so it can populate
+    /// `SupervisorResponse::last_exit_reason` with the typed
+    /// telemetry label (e.g. `"forced_after_timeout"`,
+    /// `"vz_internal"`) without re-parsing the [`ElastosError`]
+    /// string surface.
+    #[cfg(target_os = "macos")]
+    pub fn last_vz_error(&self) -> Option<&VzError> {
+        self.last_vz_error.as_ref()
+    }
+
+    /// Typed Vz exit reason from the most recent terminal
+    /// observation (macOS only). Returns `None` before any stop
+    /// or `wait_for_exit_code` call. **Phase 4 Day 7.**
+    ///
+    /// The supervisor reads this after `stop` returns `Ok` (or
+    /// after `wait_for_exit_code` resolves) so the
+    /// `SupervisorResponse::last_exit_reason` JSON field is
+    /// populated with the canonical telemetry label
+    /// (`"guest_clean_stop"`, `"host_initiated_stop"`,
+    /// `"forced_after_timeout"`, `"stopped_with_error"`).
+    pub fn last_exit_reason(&self) -> Option<VzExitReason> {
+        #[cfg(target_os = "macos")]
+        {
+            self.last_exit_reason
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Test-only injection point for [`Self::last_exit_reason`].
+    /// **Phase 4 Day 7.**
+    ///
+    /// Synthetic supervisor tests in `elastos-server` need to
+    /// drive `capsule_status` / `stop_capsule` through every
+    /// `VzExitReason` variant without having to spin up a real
+    /// Vz VM and provoke each terminal state (impossible in CI
+    /// without an Apple-runner anyway — see Day 7 scope). This
+    /// hook is `#[doc(hidden)]` so it does not appear in the
+    /// public API surface; it is not part of any contract and
+    /// production code MUST NOT call it.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn set_last_exit_reason_for_testing(&mut self, reason: VzExitReason) {
+        self.last_exit_reason = Some(reason);
+    }
+
+    /// Test-only setter for the cached lifecycle [`status`][CapsuleStatus]
+    /// field. **Phase 4 Day 7.**
+    ///
+    /// Synthetic Vz capsules constructed via [`Self::new`] have
+    /// no Vz handle attached so [`Self::is_running`] defers to
+    /// the cached `status`. Supervisor tests need to mark such
+    /// records as `Running` to keep
+    /// [`crate::Supervisor::reap_dead_capsules`][reap] from
+    /// pruning them mid-test. `#[doc(hidden)]` because this is
+    /// a test fixture, not a real API.
+    ///
+    /// [reap]: # "elastos-server/src/supervisor.rs::Supervisor::reap_dead_capsules"
+    #[doc(hidden)]
+    pub fn set_status_for_testing(&mut self, status: CapsuleStatus) {
+        self.status = status;
     }
 
     /// Take the host-side carrier console fd, leaving `None` in
@@ -132,7 +226,24 @@ impl RunningVm {
                     self.config.vm_id
                 ))
             })?;
-            handle.start().await.map_err(ElastosError::Compute)?;
+            // Phase 4 Day 7: typed `VzError` from the handle is
+            // converted to `ElastosError::Compute` at the trait
+            // boundary so the public surface stays
+            // backward-compatible. The kind_label prefix (e.g.
+            // `vz_internal: …`) survives via `VzError::Display`
+            // so log-grep telemetry still recognises the
+            // classification.
+            handle
+                .start()
+                .await
+                .map_err(|e| ElastosError::Compute(e.to_string()))?;
+            // Successful start clears any previously-cached
+            // failure metadata — operators looking at
+            // `last_vz_error()` after a restart see "no error
+            // since this start" not "the old error from before
+            // the restart".
+            self.last_vz_error = None;
+            self.last_exit_reason = None;
             self.status = CapsuleStatus::Running;
             Ok(())
         }
@@ -151,11 +262,54 @@ impl RunningVm {
     /// is attached (mirrors crosvm's `RunningVm::stop` semantics
     /// when already stopped). On macOS with an attached handle,
     /// dispatches `VZVirtualMachine.stopWithCompletionHandler`.
+    ///
+    /// **Phase 4 Day 7**: on both success and failure paths the
+    /// typed [`VzError`] / [`VzExitReason`] is captured on this
+    /// record for the supervisor to read via [`Self::last_vz_error`]
+    /// / [`Self::last_exit_reason`] when populating
+    /// `SupervisorResponse::last_exit_reason`. The public
+    /// signature stays `Result<()>` to keep the
+    /// [`ComputeProvider`] trait surface backward-compatible.
     pub async fn stop(&mut self) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             if let Some(handle) = self.handle.as_ref() {
-                handle.stop().await.map_err(ElastosError::Compute)?;
+                match handle.stop().await {
+                    Ok(()) => {
+                        self.last_vz_error = None;
+                        // `VzMachineHandle::stop` only resolves
+                        // `Ok` on the host-initiated path; the
+                        // guest-clean / stopped-with-error /
+                        // forced-after-timeout cases route via
+                        // `wait_for_exit_code` and `Err(...)`
+                        // respectively.
+                        self.last_exit_reason = Some(VzExitReason::HostInitiatedStop);
+                    }
+                    Err(err) => {
+                        let label = err.kind_label();
+                        // Map timeout into the typed exit
+                        // reason directly so the supervisor's
+                        // `last_exit_reason` JSON field reports
+                        // `"forced_after_timeout"` even though
+                        // `stop` is returning Err.
+                        self.last_exit_reason = if matches!(err, VzError::TimedOut { .. }) {
+                            Some(VzExitReason::ForcedAfterTimeout)
+                        } else {
+                            None
+                        };
+                        let formatted = err.to_string();
+                        self.last_vz_error = Some(err);
+                        // Pre-existing Day 6 contract: status
+                        // remains `Stopped` even on error, since
+                        // the supervisor performs best-effort
+                        // cleanup either way.
+                        self.status = CapsuleStatus::Stopped;
+                        return Err(ElastosError::Compute(format!(
+                            "{label}: {formatted}",
+                            formatted = formatted
+                        )));
+                    }
+                }
             }
         }
         self.status = CapsuleStatus::Stopped;
@@ -257,12 +411,17 @@ impl RunningVm {
                     self.config.vm_id
                 )));
             };
-            let exit_code = handle
-                .wait_for_exit()
+            // Phase 4 Day 7: use the typed `wait_for_exit_classified`
+            // so we can capture the `VzExitReason` for the
+            // supervisor's `last_exit_reason` telemetry while
+            // preserving the public `i32` exit-code surface.
+            let reason = handle
+                .wait_for_exit_classified()
                 .await
                 .map_err(ElastosError::Compute)?;
+            self.last_exit_reason = Some(reason);
             self.status = CapsuleStatus::Stopped;
-            Ok(exit_code)
+            Ok(reason.exit_code())
         }
 
         #[cfg(not(target_os = "macos"))]

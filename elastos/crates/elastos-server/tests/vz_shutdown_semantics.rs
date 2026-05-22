@@ -440,3 +440,79 @@ async fn bridge_on_terminate_notify_is_observable_when_subscribed_before_teardow
         .await
         .expect("on_terminate must fire within 1s of bridge loop exit (race-free)");
 }
+
+/// Phase 4 Day 7 — JSON wire-format contract for the typed
+/// `last_exit_reason` field on [`elastos_server::supervisor::SupervisorResponse`].
+///
+/// Operators piping `elastos stop` / `elastos status` JSON into
+/// Datadog / Grafana need a stable, structured signal to alert
+/// on "forced-after-timeout" rate without grepping log lines.
+/// Day 7 added a new optional field; this test guards the wire
+/// shape:
+///
+/// 1. When `last_exit_reason` is `Some(label)`, the JSON MUST
+///    include `"last_exit_reason":"<label>"`.
+/// 2. When `last_exit_reason` is `None`, the JSON MUST omit the
+///    field entirely (driven by `#[serde(skip_serializing_if = "Option::is_none")]`).
+/// 3. Every [`elastos_vz::VzExitReason`] variant's label MUST
+///    round-trip through the JSON surface (regression guard:
+///    adding a new variant without updating the canonical
+///    labels would change the wire format silently).
+///
+/// We deliberately do NOT spin up a full `Supervisor` here —
+/// the unit tests in `supervisor.rs::tests` (which can reach
+/// private helpers) already exercise `handle_request` end to
+/// end. This integration-level check focuses on the wire
+/// format, which is the contract external dashboards depend on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_response_json_wire_format_for_last_exit_reason() {
+    use elastos_server::supervisor::SupervisorResponse;
+    use elastos_vz::VzExitReason;
+
+    // Walk every canonical label so adding a new VzExitReason
+    // variant fails this test loudly if the supervisor's wire
+    // format isn't updated in lockstep.
+    let cases: &[(VzExitReason, &str)] = &[
+        (VzExitReason::GuestCleanStop, "guest_clean_stop"),
+        (VzExitReason::HostInitiatedStop, "host_initiated_stop"),
+        (VzExitReason::StoppedWithError, "stopped_with_error"),
+        (VzExitReason::ForcedAfterTimeout, "forced_after_timeout"),
+    ];
+    for (reason, expected_label) in cases {
+        let response = SupervisorResponse {
+            status: "ok".into(),
+            path: None,
+            handle: None,
+            vsock_cid: None,
+            uptime_secs: None,
+            exit_code: None,
+            error: None,
+            last_exit_reason: Some(reason.label().to_string()),
+        };
+        let json = serde_json::to_string(&response).expect("serialise SupervisorResponse");
+        assert!(
+            json.contains(&format!("\"last_exit_reason\":\"{expected_label}\"")),
+            "wire format must include canonical label for {reason:?}: {json}"
+        );
+    }
+
+    // Negative path: None must skip-serialise (no
+    // `last_exit_reason` key at all), so legacy dashboards that
+    // don't know about the field keep working unchanged. This
+    // is the backward-compatibility hinge for Day 7.
+    let bare = SupervisorResponse {
+        status: "ok".into(),
+        path: None,
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+    };
+    let bare_json = serde_json::to_string(&bare).expect("serialise bare");
+    assert!(
+        !bare_json.contains("last_exit_reason"),
+        "None last_exit_reason must skip-serialise to preserve backward compatibility: {bare_json}"
+    );
+}

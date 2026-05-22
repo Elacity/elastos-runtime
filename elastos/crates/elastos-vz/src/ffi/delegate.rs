@@ -36,8 +36,12 @@ use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineDelegate};
 use super::error::ns_error_to_string;
 
 /// Terminal-state classification surfaced by the delegate and
-/// by `VzMachineHandle::stop`. The supervisor's `wait_for_exit`
-/// maps each variant to an exit code via [`Self::exit_code`].
+/// by `VzMachineHandle::stop`.
+///
+/// **Phase 4 Day 7**: the public exit-code + telemetry-label
+/// mapping moved to [`crate::error::VzExitReason`]; this enum
+/// remains as the FFI-internal representation. [`VzMachineHandle::wait_for_exit_classified`]
+/// is the conversion point.
 #[derive(Clone, Debug)]
 pub(crate) enum DelegateExit {
     /// `guestDidStopVirtualMachine:` — the guest shut itself
@@ -50,8 +54,9 @@ pub(crate) enum DelegateExit {
     /// The inner message is logged via `Debug` in
     /// [`ElastosVzDelegate::signal_exit`] before the variant
     /// crosses the channel; downstream consumers map straight
-    /// to [`Self::exit_code`] so the string is not read again,
-    /// but we keep it for diagnostics.
+    /// to the typed [`crate::error::VzExitReason`] so the
+    /// string is not read again, but we keep it for
+    /// diagnostics.
     #[allow(dead_code)]
     StoppedWithError(String),
     /// `VzMachineHandle::stop` succeeded — the supervisor
@@ -61,26 +66,12 @@ pub(crate) enum DelegateExit {
     /// because Apple's `stopWithCompletionHandler:` block did
     /// not fire within `VzConfig::stop_timeout`. The supervisor
     /// has already orphaned the Vz handle (best-effort
-    /// cleanup); waiters on `wait_for_exit` resolve with exit
-    /// code 137 (matches the SIGKILL semantics Linux uses when
-    /// its 5 s SIGTERM grace elapses). **Phase 4 Day 6.**
+    /// cleanup); waiters on `wait_for_exit_classified` resolve
+    /// with `VzExitReason::ForcedAfterTimeout` whose
+    /// `exit_code()` is 137 (matches the SIGKILL semantics
+    /// Linux uses when its 5 s SIGTERM grace elapses). **Phase 4
+    /// Day 6.**
     ForcedAfterTimeout,
-}
-
-impl DelegateExit {
-    /// Map a terminal state to the integer exit code the
-    /// supervisor logs and surfaces via `elastos status`.
-    pub(crate) fn exit_code(&self) -> i32 {
-        match self {
-            DelegateExit::GuestCleanStop | DelegateExit::HostInitiatedStop => 0,
-            DelegateExit::StoppedWithError(_) => 1,
-            // Mirrors Linux's `128 + SIGKILL(9) = 137` convention
-            // for "process forcibly terminated after grace period
-            // elapsed". Operator-facing tooling already
-            // recognises 137 as a forced-stop marker.
-            DelegateExit::ForcedAfterTimeout => 137,
-        }
-    }
 }
 
 /// Shared exit-signal handle — held by both
@@ -192,20 +183,11 @@ unsafe impl Sync for SendableDelegate {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn delegate_exit_maps_to_expected_codes() {
-        assert_eq!(DelegateExit::GuestCleanStop.exit_code(), 0);
-        assert_eq!(DelegateExit::HostInitiatedStop.exit_code(), 0);
-        assert_eq!(
-            DelegateExit::StoppedWithError("kernel panic".into()).exit_code(),
-            1
-        );
-        // Phase 4 Day 6: 128 + SIGKILL(9) = 137 — same
-        // convention Linux uses for forcibly-killed processes
-        // so operator tooling can recognise the surface
-        // identically across substrates.
-        assert_eq!(DelegateExit::ForcedAfterTimeout.exit_code(), 137);
-    }
+    // Phase 4 Day 7: the integer exit-code mapping moved to
+    // `VzExitReason::exit_code()` (see `crate::error::tests`).
+    // This module's only contract is that the delegate observes
+    // every terminal state correctly; the
+    // `delegate_signal_exit_*` test below covers that.
 
     #[tokio::test]
     async fn delegate_signal_exit_sends_first_terminal_observation_only() {

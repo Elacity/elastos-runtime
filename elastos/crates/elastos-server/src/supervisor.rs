@@ -189,6 +189,34 @@ fn prune_stale_mac_artifacts(
     counts
 }
 
+/// Extract the typed Vz exit-reason telemetry label from a
+/// capsule backend, if one is set. **Phase 4 Day 7.**
+///
+/// Returns `Some(label)` only for macOS [`CapsuleBackend::VzVm`]
+/// records whose `RunningVm` has cached a `VzExitReason` (set by
+/// `RunningVm::stop` or `wait_for_exit_code`). Linux crosvm,
+/// Carrier and non-Vz Mac records intentionally surface `None` —
+/// their exit telemetry stays on the existing wire contract.
+///
+/// The label string is one of the canonical values from
+/// [`elastos_vz::VzExitReason::label`]:
+/// `guest_clean_stop`, `host_initiated_stop`,
+/// `stopped_with_error`, `forced_after_timeout`.
+fn vz_last_exit_reason(backend: &CapsuleBackend) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        match backend {
+            CapsuleBackend::VzVm(vm) => vm.last_exit_reason().map(|r| r.label().to_string()),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = backend;
+        None
+    }
+}
+
 fn vm_provider_bridge_enabled() -> bool {
     std::env::var("ELASTOS_VM_PROVIDER_BRIDGE")
         .map(|v| {
@@ -250,6 +278,16 @@ pub struct SupervisorResponse {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Typed Vz exit-reason telemetry (macOS only). **Phase 4
+    /// Day 7.** Populated by `stop_capsule` and `capsule_status`
+    /// for stopped Vz capsules with one of the canonical
+    /// labels: `"guest_clean_stop"`, `"host_initiated_stop"`,
+    /// `"forced_after_timeout"`, or `"stopped_with_error"`.
+    /// Operators piping `elastos status` JSON into Datadog /
+    /// Grafana can alert on `forced_after_timeout` without
+    /// grepping log lines. See `docs/vz-backend/PHASE_4_DAY_7_NOTES.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_reason: Option<String>,
 }
 
 impl SupervisorResponse {
@@ -262,6 +300,20 @@ impl SupervisorResponse {
             uptime_secs: None,
             exit_code: None,
             error: None,
+            last_exit_reason: None,
+        }
+    }
+
+    /// Builder for the success surface returned by `stop_capsule`
+    /// with a Phase-4-Day-7 `last_exit_reason` telemetry label
+    /// attached. Used both on the host-initiated-stop success
+    /// path and the forced-after-timeout path (where the
+    /// supervisor swallows the typed error but still publishes
+    /// the reason so dashboards know the VM was forced).
+    fn ok_with_exit_reason(reason: Option<String>) -> Self {
+        Self {
+            last_exit_reason: reason,
+            ..Self::ok()
         }
     }
 
@@ -296,6 +348,7 @@ impl SupervisorResponse {
             vsock_cid: None,
             uptime_secs: None,
             exit_code: None,
+            last_exit_reason: None,
         }
     }
 }
@@ -663,7 +716,12 @@ impl Supervisor {
                 }
             }
             SupervisorRequest::StopCapsule { handle } => match self.stop_capsule(&handle).await {
-                Ok(()) => SupervisorResponse::ok(),
+                // Phase 4 Day 7: surface the typed Vz exit
+                // reason in the response so operators piping
+                // `elastos stop` JSON into telemetry can record
+                // whether the VM was host-stopped cleanly or
+                // forced after the configured Day 6 timeout.
+                Ok(last_exit_reason) => SupervisorResponse::ok_with_exit_reason(last_exit_reason),
                 Err(e) => SupervisorResponse::err(format!("stop_capsule failed: {e}")),
             },
             SupervisorRequest::WaitCapsule { handle } => match self.wait_for_exit(&handle).await {
@@ -2151,7 +2209,14 @@ impl Supervisor {
     }
 
     /// Stop a running capsule.
-    async fn stop_capsule(&self, handle: &str) -> Result<()> {
+    /// Stop a running capsule.
+    ///
+    /// **Phase 4 Day 7**: returns the typed Vz exit-reason
+    /// telemetry label (one of `"host_initiated_stop"`,
+    /// `"forced_after_timeout"`) when stopping a macOS Vz
+    /// capsule. Non-Vz backends return `None` so the existing
+    /// Linux-side stop wire contract stays unchanged.
+    async fn stop_capsule(&self, handle: &str) -> Result<Option<String>> {
         let mut running = self.running.write().await;
         let capsule = running
             .remove(handle)
@@ -2161,7 +2226,7 @@ impl Supervisor {
             self.unregister_provider_route(route).await;
         }
 
-        match capsule.backend {
+        let last_exit_reason: Option<String> = match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
                 vm.stop()
                     .await
@@ -2174,11 +2239,13 @@ impl Supervisor {
                     .join("overlays")
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
+                None
             }
             CapsuleBackend::Carrier => {
                 // Carrier service child process is killed when CarrierServiceProvider
                 // is dropped (via CarrierServiceBridge::drop). Unregistering the
                 // provider route above drops the last Arc reference.
+                None
             }
             #[cfg(target_os = "macos")]
             CapsuleBackend::VzVm(mut vm) => {
@@ -2238,24 +2305,42 @@ impl Supervisor {
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
 
+                // Phase 4 Day 7: read the typed exit reason
+                // BEFORE returning so the response surface
+                // includes the canonical label (e.g.
+                // `"host_initiated_stop"` on success,
+                // `"forced_after_timeout"` if Day 6's stop
+                // timeout fired). `RunningVm::stop` caches the
+                // reason on both Ok and (in the
+                // forced-after-timeout case) Err paths.
+                let last_exit_reason = vm.last_exit_reason().map(|r| r.label().to_string());
+
                 if let Err(e) = stop_outcome {
                     // After best-effort cleanup ran, still
                     // surface the typed error to the caller —
                     // the supervisor's `stop_capsule` API
                     // contract is that a non-`Ok` return means
                     // operator attention is needed even if
-                    // local state is consistent.
+                    // local state is consistent. The typed
+                    // last_exit_reason is dropped here on the
+                    // Err path because the dispatcher's
+                    // `SupervisorResponse::err(...)` doesn't
+                    // carry a reason field; operators read the
+                    // structured kind_label from the error
+                    // message instead.
+                    let _ = last_exit_reason;
                     return Err(anyhow::anyhow!(
                         "Vz VM stop failed for '{}': {} (cleanup ran best-effort)",
                         capsule.name,
                         e
                     ));
                 }
+                last_exit_reason
             }
-        }
+        };
 
         eprintln!("[supervisor] Stopped capsule handle={}", handle);
-        Ok(())
+        Ok(last_exit_reason)
     }
 
     /// Wait for a running capsule's VM process to exit.
@@ -2366,6 +2451,16 @@ impl Supervisor {
                     }
                 };
 
+                // Phase 4 Day 7: typed `last_exit_reason`
+                // telemetry — only meaningful for stopped Vz
+                // capsules that are still held in the `running`
+                // map (e.g. a guest-clean delegate signal that
+                // the supervisor hasn't reaped yet). Non-Vz
+                // capsules (Linux crosvm, Carrier) intentionally
+                // surface `None`; their exit-reason wire format
+                // stays on the existing Linux contract.
+                let last_exit_reason = vz_last_exit_reason(&rc.backend);
+
                 Ok(SupervisorResponse {
                     status: status.into(),
                     handle: Some(rc.handle.clone()),
@@ -2374,6 +2469,7 @@ impl Supervisor {
                     exit_code: None,
                     path: None,
                     error: None,
+                    last_exit_reason,
                 })
             }
             None => Ok(SupervisorResponse {
@@ -2384,6 +2480,7 @@ impl Supervisor {
                 exit_code: None,
                 path: None,
                 error: None,
+                last_exit_reason: None,
             }),
         }
     }
@@ -3589,6 +3686,127 @@ mod tests {
         assert_eq!(response.vsock_cid, Some(1234));
     }
 
+    /// Phase 4 Day 7 — `capsule_status` reports the typed
+    /// `last_exit_reason` telemetry label for a stopped VzVm
+    /// capsule whose `RunningVm` cached a `ForcedAfterTimeout`
+    /// outcome.
+    ///
+    /// Synthetic: we inject the reason via the
+    /// `set_last_exit_reason_for_testing` hook because real
+    /// `ForcedAfterTimeout` requires a wedged Apple completion
+    /// handler — impossible to provoke in CI without an
+    /// Apple-runner. The supervisor's wiring (which is what
+    /// Day 7 changes) is what this test validates.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_status_includes_last_exit_reason_for_forced_after_timeout_vz_capsule() {
+        use elastos_vz::VzExitReason;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day7-status-forced-after-timeout";
+
+        let mut rc =
+            synthetic_vzvm_running_capsule("phase4-day7-status-forced-after-timeout", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_last_exit_reason_for_testing(VzExitReason::ForcedAfterTimeout);
+        } else {
+            panic!("synthetic_vzvm_running_capsule must yield a VzVm backend");
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .capsule_status(handle)
+            .await
+            .expect("capsule_status must dispatch through the VzVm arm");
+
+        assert_eq!(
+            response.last_exit_reason.as_deref(),
+            Some("forced_after_timeout"),
+            "capsule_status must surface the typed telemetry label for forced-after-timeout \
+             stops so Datadog / Grafana can alert without grepping log lines: {response:?}"
+        );
+    }
+
+    /// Phase 4 Day 7 — every supported `VzExitReason` round
+    /// trips through `capsule_status`'s `last_exit_reason`
+    /// field. Guards against a regression where a new
+    /// `VzExitReason` variant is added without updating the
+    /// supervisor classifier.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_status_round_trips_every_vz_exit_reason_label() {
+        use elastos_vz::VzExitReason;
+
+        let supervisor = make_test_supervisor();
+        let cases: &[(VzExitReason, &str)] = &[
+            (VzExitReason::GuestCleanStop, "guest_clean_stop"),
+            (VzExitReason::HostInitiatedStop, "host_initiated_stop"),
+            (VzExitReason::StoppedWithError, "stopped_with_error"),
+            (VzExitReason::ForcedAfterTimeout, "forced_after_timeout"),
+        ];
+        for (reason, expected_label) in cases {
+            let handle = format!("vm-phase4-day7-status-{expected_label}");
+            let mut rc = synthetic_vzvm_running_capsule(expected_label, &handle);
+            if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+                vm.set_last_exit_reason_for_testing(*reason);
+            }
+            supervisor.running.write().await.insert(handle.clone(), rc);
+
+            let response = supervisor
+                .capsule_status(&handle)
+                .await
+                .expect("capsule_status must dispatch through the VzVm arm");
+
+            assert_eq!(
+                response.last_exit_reason.as_deref(),
+                Some(*expected_label),
+                "{reason:?} must surface as '{expected_label}', got {:?}",
+                response.last_exit_reason
+            );
+        }
+    }
+
+    /// Phase 4 Day 7 — non-Vz backends (Linux crosvm, Carrier,
+    /// or a VzVm with no cached exit reason) MUST leave
+    /// `last_exit_reason` as `None`. This guards against any
+    /// accidental cross-backend leakage of the new field.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_status_omits_last_exit_reason_when_vz_capsule_has_no_cached_outcome() {
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day7-status-no-cached-outcome";
+        let rc = synthetic_vzvm_running_capsule("phase4-day7-status-no-cached-outcome", handle);
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .capsule_status(handle)
+            .await
+            .expect("capsule_status must dispatch through the VzVm arm");
+
+        assert!(
+            response.last_exit_reason.is_none(),
+            "capsule_status must omit last_exit_reason for Vz capsules with no cached outcome; \
+             got {:?}",
+            response.last_exit_reason
+        );
+    }
+
+    /// Phase 4 Day 7 — `not_found` responses MUST never carry a
+    /// `last_exit_reason` (we have no capsule to read from).
+    /// Trivial but catches a regression where a `Some(...)` is
+    /// leaked through `..Self::ok()` defaulting on a future
+    /// refactor.
+    #[tokio::test]
+    async fn capsule_status_not_found_response_has_no_last_exit_reason() {
+        let supervisor = make_test_supervisor();
+        let response = supervisor
+            .capsule_status("vm-phase4-day7-no-such-handle")
+            .await
+            .expect("capsule_status of unknown handle must return Ok(not_found)");
+        assert_eq!(response.status, "not_found");
+        assert!(response.last_exit_reason.is_none());
+    }
+
     /// Phase 3 Day 3 contract: `stop_capsule` removes a
     /// `CapsuleBackend::VzVm` entry from `self.running` and
     /// dispatches `RunningVm::stop` to the Vz substrate.
@@ -3602,15 +3820,73 @@ mod tests {
         let rc = synthetic_vzvm_running_capsule("phase3-day3-stop-test", handle);
         supervisor.running.write().await.insert(handle.into(), rc);
 
-        supervisor
+        let last_exit_reason = supervisor
             .stop_capsule(handle)
             .await
             .expect("stop_capsule must dispatch through the VzVm arm cleanly");
+
+        // Synthetic VzVm has no Vz handle attached, so
+        // `RunningVm::stop` is a no-op and `last_exit_reason`
+        // stays `None`. Day 7's contract is "non-None only
+        // when the Vz handle actually stopped"; the value here
+        // is precisely `None`.
+        assert!(
+            last_exit_reason.is_none(),
+            "synthetic Vz capsule (no Vz handle) must surface no last_exit_reason: {:?}",
+            last_exit_reason
+        );
 
         let running = supervisor.running.read().await;
         assert!(
             !running.contains_key(handle),
             "stop_capsule must remove the VzVm entry from `running`"
+        );
+    }
+
+    /// Phase 4 Day 7 — `handle_request(StopCapsule)` must
+    /// surface the typed `last_exit_reason` in the JSON
+    /// response when the underlying `RunningVm` cached one
+    /// (e.g. a forced-after-timeout stop). This is the
+    /// end-to-end wire-format check operators / dashboards
+    /// depend on.
+    ///
+    /// We mark the synthetic VM as `Running` via the
+    /// `set_status_for_testing` hook so `reap_dead_capsules`
+    /// (which `handle_request` calls first) doesn't prune the
+    /// record before `stop_capsule` runs.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn handle_request_stop_capsule_surfaces_typed_last_exit_reason_in_response() {
+        use elastos_common::CapsuleStatus;
+        use elastos_vz::VzExitReason;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day7-handle-request-forced";
+
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day7-handle-request-forced", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_status_for_testing(CapsuleStatus::Running);
+            vm.set_last_exit_reason_for_testing(VzExitReason::ForcedAfterTimeout);
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .handle_request(SupervisorRequest::StopCapsule {
+                handle: handle.to_string(),
+            })
+            .await;
+
+        assert_eq!(
+            response.status, "ok",
+            "stop_capsule must succeed: error={:?}",
+            response.error
+        );
+        assert_eq!(
+            response.last_exit_reason.as_deref(),
+            Some("forced_after_timeout"),
+            "stop_capsule response must surface the typed telemetry label so \
+             `elastos stop` JSON-mode consumers (Datadog / Grafana / scripts) can \
+             alert on forced-stop rate without grepping logs: {response:?}"
         );
     }
 

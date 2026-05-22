@@ -48,6 +48,7 @@ use super::console_forwarder::{spawn_console_forwarder, ConsoleForwarder};
 use super::delegate::{DelegateExit, ElastosVzDelegate, SendableDelegate, SharedExitSender};
 use super::dispatch::VzDispatchQueue;
 use super::error::ns_error_to_string;
+use crate::error::{VzError, VzExitReason};
 
 /// Operator-facing hint appended to the error returned by
 /// [`VzMachineHandle::new`] when Apple's `validateWithError`
@@ -281,7 +282,11 @@ impl VzMachineHandle {
 
     /// Start the VM. Resolves when Apple's
     /// `startWithCompletionHandler:` invokes its block.
-    pub(crate) async fn start(&self) -> Result<(), String> {
+    ///
+    /// **Phase 4 Day 7**: returns the typed [`VzError`] surface
+    /// instead of a flat string so the supervisor can pattern
+    /// match without re-parsing log lines.
+    pub(crate) async fn start(&self) -> Result<(), VzError> {
         run_completion_handler_on_queue(
             self.vm.clone(),
             self.queue.clone(),
@@ -306,7 +311,7 @@ impl VzMachineHandle {
     /// and the forwarder exits naturally. Until drop, the
     /// forwarder's `JoinHandle` sits idle in [`Self::forwarder`]
     /// (Tokio detaches it on drop, so no leak).
-    pub(crate) async fn stop(&self) -> Result<(), String> {
+    pub(crate) async fn stop(&self) -> Result<(), VzError> {
         // Phase 4 Day 6: wrap the completion-handler future
         // with a `tokio::time::timeout` so a wedged Apple
         // framework call cannot pin the supervisor's
@@ -314,6 +319,12 @@ impl VzMachineHandle {
         // RPC timeout existed before but had no internal
         // counter-pressure; this is the per-VM enforcement
         // point.
+        //
+        // Phase 4 Day 7: the inner future now resolves to a
+        // typed `VzError` (instead of a flat `String`) so the
+        // outer `drive_stop_with_timeout` can either pass
+        // through Apple's classified failure or wrap it into
+        // `VzError::TimedOut`.
         let op_label = format!("stop (vm_id='{}')", self.vm_id);
         let inner = run_completion_handler_on_queue(
             self.vm.clone(),
@@ -334,18 +345,14 @@ impl VzMachineHandle {
         // historical `HostInitiatedStop` (exit 0).
         let signal = match &outcome {
             Ok(()) => DelegateExit::HostInitiatedStop,
-            Err(StopError::Timeout(_)) => DelegateExit::ForcedAfterTimeout,
-            Err(StopError::Apple(_)) => DelegateExit::HostInitiatedStop,
+            Err(VzError::TimedOut { .. }) => DelegateExit::ForcedAfterTimeout,
+            Err(_) => DelegateExit::HostInitiatedStop,
         };
         if let Some(tx) = self.exit_state.lock().expect("exit_state mutex").take() {
             let _ = tx.send(signal);
         }
 
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(StopError::Apple(msg)) => Err(msg),
-            Err(StopError::Timeout(msg)) => Err(msg),
-        }
+        outcome
     }
 
     /// Dial the guest's vsock listener on `port` and return an
@@ -363,15 +370,22 @@ impl VzMachineHandle {
     }
 
     /// Wait for a terminal lifecycle observation and return the
-    /// classified exit code. Phase 3 Day 5 replaces the polling
-    /// loop with a oneshot signalled by either:
+    /// typed [`VzExitReason`] classification. Phase 3 Day 5
+    /// introduced the delegate-driven `oneshot`; Phase 4 Day 7
+    /// upgraded the return type from `i32` to the typed
+    /// `VzExitReason` so the supervisor can populate
+    /// `last_exit_reason` telemetry directly without re-parsing
+    /// the integer exit code.
+    ///
+    /// Signalled by either:
     /// - the [`ElastosVzDelegate`] delegate (guest clean stop,
     ///   crash with NSError), or
-    /// - [`Self::stop`] after a successful host-initiated stop.
+    /// - [`Self::stop`] after a successful host-initiated stop /
+    ///   forced-after-timeout.
     ///
     /// The receiver is consumed on first call; subsequent calls
     /// return a typed error rather than block indefinitely.
-    pub(crate) async fn wait_for_exit(&self) -> Result<i32, String> {
+    pub(crate) async fn wait_for_exit_classified(&self) -> Result<VzExitReason, String> {
         let rx = self.exit_rx.lock().expect("exit_rx mutex").take();
         let Some(rx) = rx else {
             return Err(format!(
@@ -380,7 +394,7 @@ impl VzMachineHandle {
             ));
         };
         match rx.await {
-            Ok(exit) => Ok(exit.exit_code()),
+            Ok(exit) => Ok(delegate_exit_to_reason(exit)),
             Err(_) => Err(format!(
                 "vz wait_for_exit (vm_id='{}'): delegate sender dropped before signalling",
                 self.vm_id
@@ -422,23 +436,25 @@ impl VzMachineHandle {
 /// we already hold the queue's thread). The closure itself only
 /// needs `Send` for the `tx_slot` + `vm` + `op` captures, all of
 /// which are Send by construction.
+///
+/// **Phase 4 Day 7**: returns a typed [`VzError`] instead of a
+/// flat string so callers can pattern-match on the underlying
+/// Apple `VZErrorCode`.
 async fn run_completion_handler_on_queue<F>(
     vm: Arc<SendableVm>,
     queue: Arc<VzDispatchQueue>,
     op_label: &str,
     issue: F,
-) -> Result<(), String>
+) -> Result<(), VzError>
 where
     F: FnOnce(&VZVirtualMachine, &block2::DynBlock<dyn Fn(*mut NSError)>) + Send + 'static,
 {
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), VzError>>();
     let tx_slot = Arc::new(Mutex::new(Some(tx)));
-    let op = op_label.to_string();
 
     let vm_for_dispatch = vm.clone();
     queue.as_raw().exec_sync(move || {
         let tx_for_block = tx_slot.clone();
-        let op_for_block = op.clone();
 
         // Vz retains the block when the issue closure passes it
         // into startWithCompletionHandler / stopWithCompletionHandler.
@@ -451,12 +467,9 @@ where
             } else {
                 // SAFETY: Vz hands us a non-null NSError it
                 // owns; we borrow it for the duration of this
-                // closure to extract the description.
+                // closure to extract the typed pieces.
                 let nserror: &NSError = unsafe { &*err };
-                Err(format!(
-                    "vz {op_for_block}: {}",
-                    ns_error_to_string(nserror)
-                ))
+                Err(ns_error_to_vz_error(nserror))
             };
             if let Some(sender) = tx_for_block.lock().expect("oneshot mutex").take() {
                 let _ = sender.send(result);
@@ -471,55 +484,55 @@ where
 
     match rx.await {
         Ok(result) => result,
-        Err(_) => Err(format!(
-            "vz {op_label}: completion handler oneshot dropped before signalling"
-        )),
+        Err(_) => Err(VzError::Internal {
+            description: format!(
+                "vz {op_label}: completion handler oneshot dropped before signalling"
+            ),
+        }),
     }
 }
 
-/// Classified outcome of [`VzMachineHandle::stop`]'s inner
-/// future. Lets the caller distinguish "Apple completion fired
-/// with an error" (Vz reported a problem; the VM may or may not
-/// still be running) from "we never heard back from Apple"
-/// (timeout — the supervisor must walk away and proceed with
-/// best-effort cleanup). **Phase 4 Day 6.**
-#[derive(Debug)]
-enum StopError {
-    /// `tokio::time::timeout` fired before
-    /// `run_completion_handler_on_queue` resolved. The inner
-    /// future is dropped; Apple's framework may still complete
-    /// its work asynchronously but we cannot observe it. The
-    /// string is operator-facing.
-    Timeout(String),
-    /// `run_completion_handler_on_queue` resolved with
-    /// `Err(_)` — Apple's completion fired with a non-nil
-    /// `NSError`. The string is `format_validate_error`-style
-    /// pre-formatted by the inner helper.
-    Apple(String),
+/// Pull the typed pieces out of an Apple `NSError` and classify
+/// it through [`VzError::from_ns_error_parts`]. Phase 4 Day 7.
+fn ns_error_to_vz_error(err: &NSError) -> VzError {
+    let domain = err.domain().to_string();
+    // NSInteger is `isize` on every Apple platform we support.
+    let code = err.code();
+    let description = ns_error_to_string(err);
+    VzError::from_ns_error_parts(&domain, code, &description)
 }
 
 /// Drive [`VzMachineHandle::stop`]'s inner future under a
 /// timeout. Extracted as a free `async fn` so unit tests can
 /// exercise the timeout path without needing a real Apple
 /// dispatch queue. **Phase 4 Day 6.**
-async fn drive_stop_with_timeout<F>(
-    inner: F,
-    timeout: Duration,
-    vm_id: &str,
-) -> Result<(), StopError>
+///
+/// **Phase 4 Day 7**: returns typed [`VzError`] — Apple's
+/// completion failures route as the typed Vz variant straight
+/// from [`run_completion_handler_on_queue`]; the timeout path
+/// constructs a [`VzError::TimedOut`].
+async fn drive_stop_with_timeout<F>(inner: F, timeout: Duration, vm_id: &str) -> Result<(), VzError>
 where
-    F: std::future::Future<Output = Result<(), String>>,
+    F: std::future::Future<Output = Result<(), VzError>>,
 {
     match tokio::time::timeout(timeout, inner).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(msg)) => Err(StopError::Apple(msg)),
-        Err(_elapsed) => Err(StopError::Timeout(format!(
-            "vz stop timed out after {:?} (vm_id='{vm_id}') — \
-             Apple's stopWithCompletionHandler: did not fire within the budget. \
-             The Vz handle is now best-effort orphaned; the supervisor will \
-             continue with overlay cleanup. See docs/vz-backend/PHASE_4_DAY_6_NOTES.md.",
-            timeout
-        ))),
+        Ok(result) => result,
+        Err(_elapsed) => Err(VzError::TimedOut {
+            vm_id: vm_id.to_string(),
+            budget: timeout,
+        }),
+    }
+}
+
+/// Map the FFI-internal [`DelegateExit`] (which we keep
+/// `pub(crate)` for hygiene) to the public [`VzExitReason`] the
+/// supervisor surfaces via `last_exit_reason`. Phase 4 Day 7.
+fn delegate_exit_to_reason(exit: DelegateExit) -> VzExitReason {
+    match exit {
+        DelegateExit::GuestCleanStop => VzExitReason::GuestCleanStop,
+        DelegateExit::HostInitiatedStop => VzExitReason::HostInitiatedStop,
+        DelegateExit::StoppedWithError(_) => VzExitReason::StoppedWithError,
+        DelegateExit::ForcedAfterTimeout => VzExitReason::ForcedAfterTimeout,
     }
 }
 
@@ -619,16 +632,21 @@ mod tests {
     }
 
     /// Phase 4 Day 6 — `drive_stop_with_timeout` must surface a
-    /// typed `StopError::Timeout` when the inner future never
+    /// typed [`VzError::TimedOut`] when the inner future never
     /// resolves. This proves the wrapper that
     /// [`VzMachineHandle::stop`] uses to guard against a wedged
     /// `stopWithCompletionHandler:` block actually fires, with
-    /// an operator-facing message that names the budget and the
-    /// vm_id (for log correlation) and points at the Day 6
+    /// an operator-facing description that names the budget and
+    /// the vm_id (for log correlation) and points at the Day 6
     /// notes for the on-call runbook.
+    ///
+    /// **Phase 4 Day 7**: the error is now the typed
+    /// [`VzError::TimedOut`] (not the old internal
+    /// `StopError::Timeout(String)`); the description string is
+    /// still grep-friendly via [`VzError::description`].
     #[tokio::test(start_paused = true)]
     async fn drive_stop_with_timeout_returns_typed_error_when_inner_future_never_resolves() {
-        let never_resolving = std::future::pending::<Result<(), String>>();
+        let never_resolving = std::future::pending::<Result<(), VzError>>();
         let budget = Duration::from_millis(100);
 
         let started = tokio::time::Instant::now();
@@ -636,21 +654,28 @@ mod tests {
         let elapsed = started.elapsed();
 
         match outcome {
-            Err(StopError::Timeout(msg)) => {
+            Err(VzError::TimedOut { vm_id, budget: b }) => {
+                assert_eq!(vm_id, "phase4-day6-vm");
+                assert_eq!(b, budget);
+                let desc = VzError::TimedOut {
+                    vm_id: vm_id.clone(),
+                    budget: b,
+                }
+                .description();
                 assert!(
-                    msg.contains("phase4-day6-vm"),
-                    "timeout error must include vm_id for log correlation: {msg}"
+                    desc.contains("phase4-day6-vm"),
+                    "timeout description must include vm_id for log correlation: {desc}"
                 );
                 assert!(
-                    msg.contains("100ms") || msg.contains("100 ms"),
-                    "timeout error must name the budget: {msg}"
+                    desc.contains("100ms") || desc.contains("100 ms"),
+                    "timeout description must name the budget: {desc}"
                 );
                 assert!(
-                    msg.contains("PHASE_4_DAY_6_NOTES.md"),
-                    "timeout error must point at the runbook: {msg}"
+                    desc.contains("PHASE_4_DAY_6_NOTES.md"),
+                    "timeout description must point at the runbook: {desc}"
                 );
             }
-            other => panic!("expected StopError::Timeout, got {other:?}"),
+            other => panic!("expected VzError::TimedOut, got {other:?}"),
         }
 
         // With `start_paused = true` the Tokio runtime advances
@@ -669,24 +694,56 @@ mod tests {
     /// nominal `stopWithCompletionHandler:` takes).
     #[tokio::test]
     async fn drive_stop_with_timeout_passes_through_ok_when_inner_future_resolves_first() {
-        let inner = async { Ok::<(), String>(()) };
+        let inner = async { Ok::<(), VzError>(()) };
         let outcome = drive_stop_with_timeout(inner, Duration::from_secs(30), "vm").await;
         assert!(outcome.is_ok(), "successful completion must pass through");
     }
 
-    /// Phase 4 Day 6 — when the inner future resolves with an
-    /// Apple `NSError`, the wrapper must classify that as
-    /// `StopError::Apple` (distinct from `Timeout` — the
-    /// supervisor uses the distinction to choose between
-    /// `HostInitiatedStop` and `ForcedAfterTimeout` exit
-    /// signalling).
+    /// Phase 4 Day 6 + Day 7 — when the inner future resolves
+    /// with a typed Apple error, the wrapper must pass it
+    /// through (distinct from `TimedOut` — the supervisor uses
+    /// the distinction to choose between `HostInitiatedStop` and
+    /// `ForcedAfterTimeout` telemetry).
     #[tokio::test]
     async fn drive_stop_with_timeout_classifies_apple_error_distinctly_from_timeout() {
-        let inner = async { Err::<(), String>("vz stop: NSError (3)".into()) };
+        let apple_err = VzError::from_ns_error_parts(
+            "VZErrorDomain",
+            3,
+            "Invalid virtual machine state for stop",
+        );
+        let inner = async move { Err::<(), VzError>(apple_err) };
         let outcome = drive_stop_with_timeout(inner, Duration::from_secs(30), "vm").await;
         match outcome {
-            Err(StopError::Apple(msg)) => assert!(msg.contains("vz stop")),
-            other => panic!("expected StopError::Apple, got {other:?}"),
+            Err(VzError::InvalidState { description }) => {
+                assert!(description.contains("Invalid virtual machine state"));
+            }
+            other => panic!("expected VzError::InvalidState, got {other:?}"),
         }
+    }
+
+    /// Phase 4 Day 7 — every `DelegateExit` variant the FFI
+    /// surfaces must map to a public `VzExitReason`, including
+    /// the `StoppedWithError` arm that carries a payload. This
+    /// catches a regression where adding a new delegate variant
+    /// without updating the classifier would silently route
+    /// through the wrong telemetry label.
+    #[test]
+    fn delegate_exit_to_reason_classifies_every_variant() {
+        assert_eq!(
+            delegate_exit_to_reason(DelegateExit::GuestCleanStop),
+            VzExitReason::GuestCleanStop
+        );
+        assert_eq!(
+            delegate_exit_to_reason(DelegateExit::HostInitiatedStop),
+            VzExitReason::HostInitiatedStop
+        );
+        assert_eq!(
+            delegate_exit_to_reason(DelegateExit::StoppedWithError("kernel panic".into())),
+            VzExitReason::StoppedWithError
+        );
+        assert_eq!(
+            delegate_exit_to_reason(DelegateExit::ForcedAfterTimeout),
+            VzExitReason::ForcedAfterTimeout
+        );
     }
 }

@@ -62,6 +62,7 @@
 //! ```
 
 mod config;
+mod error;
 #[cfg(target_os = "macos")]
 mod ffi;
 #[cfg(target_os = "macos")]
@@ -73,6 +74,7 @@ mod provider;
 mod vm;
 
 pub use config::{VmConfig, VzConfig, DEFAULT_VZ_STOP_TIMEOUT};
+pub use error::{VzError, VzExitReason};
 pub use network::NetworkConfig;
 pub use provider::VzProvider;
 pub use vm::RunningVm;
