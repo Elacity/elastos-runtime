@@ -70,6 +70,125 @@ fn host_phys_mem_mib_mac() -> u64 {
     bytes / (1024 * 1024)
 }
 
+/// Phase 4 Day 5 — counts of artifacts removed by
+/// [`Supervisor::prune_stale_mac_artifacts`]. Returned so callers
+/// can log / audit cleanup activity without coupling to
+/// filesystem semantics.
+///
+/// On Linux the helper is a no-op stub and these counts are
+/// always zero; the struct exists on all platforms so call
+/// sites can be platform-agnostic.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaleArtifactCounts {
+    pub overlays_removed: usize,
+    pub sockets_removed: usize,
+}
+
+/// Phase 4 Day 5 — remove orphaned per-VM artifacts left behind
+/// by a prior supervisor process that exited without calling
+/// `stop_capsule` (panic, SIGKILL, segfault).
+///
+/// On macOS, Apple's `VZVirtualMachine` instances die with the
+/// owning process — they cannot leak across process boundaries
+/// (no cross-process state in `Virtualization.framework`). What
+/// *can* leak is the filesystem state the supervisor creates on
+/// the host side:
+///
+/// - rootfs overlay copies under `<rootfs_cache_dir>/overlays/`.
+///   Their UUID-based filenames (`<handle>.ext4`) are derived
+///   from a per-launch handle, so no overlay file can be
+///   claimed by a fresh `Supervisor` (the handle space is
+///   process-local).
+/// - Carrier socket files under `<socket_dir>/*-carrier.sock`
+///   and `<socket_dir>/*.sock`. Unix domain socket inodes
+///   linger past the listener; reusing the path would `EADDRINUSE`.
+///
+/// The Linux path doesn't need this helper — `crosvm` child
+/// processes either survive the supervisor's death (in which
+/// case they're reaped by `reap_dead_capsules`) or exit with
+/// the supervisor (closing their socket fds). Either way the
+/// Mac-specific drop chain (Vz handle → NSFileHandle config →
+/// pipe write end → bridge EOF) doesn't apply on Linux, so the
+/// helper is gated behind `cfg(target_os = "macos")` to keep
+/// the Linux launch path byte-identical.
+///
+/// **Idempotent**: safe to call multiple times. **Best-effort**:
+/// failures to remove individual files are logged but do not
+/// abort the sweep; the caller decides how to react to the
+/// returned counts.
+///
+/// Not wired into `Supervisor::new` automatically — operators
+/// (or future `elastos serve` startup glue) opt in by calling
+/// `Supervisor::prune_stale_mac_artifacts()` explicitly. This
+/// avoids the edge case of two simultaneous supervisor
+/// processes nuking each other's in-flight overlays.
+#[cfg(target_os = "macos")]
+fn prune_stale_mac_artifacts(
+    socket_dir: &std::path::Path,
+    rootfs_cache_dir: &std::path::Path,
+) -> StaleArtifactCounts {
+    let mut counts = StaleArtifactCounts::default();
+
+    let overlays_dir = rootfs_cache_dir.join("overlays");
+    if let Ok(entries) = std::fs::read_dir(&overlays_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_overlay = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("ext4"))
+                .unwrap_or(false);
+            if !is_overlay {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => counts.overlays_removed += 1,
+                Err(e) => tracing::warn!(
+                    "prune_stale_mac_artifacts: could not remove overlay {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir(socket_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Unix domain socket inodes report `is_file() == false`
+            // and `is_dir() == false`. We accept any non-directory
+            // entry whose name matches the supervisor's socket
+            // naming convention; this catches both crosvm control
+            // sockets (`<handle>.sock`) and carrier IPC sockets
+            // (`<handle>-carrier.sock`).
+            if path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let is_carrier_socket = name.ends_with("-carrier.sock") || name.ends_with(".sock");
+            if !is_carrier_socket {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => counts.sockets_removed += 1,
+                Err(e) => tracing::warn!(
+                    "prune_stale_mac_artifacts: could not remove socket {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    }
+
+    counts
+}
+
 fn vm_provider_bridge_enabled() -> bool {
     std::env::var("ELASTOS_VM_PROVIDER_BRIDGE")
         .map(|v| {
@@ -418,6 +537,38 @@ impl Supervisor {
         }
 
         Ok(())
+    }
+
+    /// Phase 4 Day 5 — opt-in cleanup of orphaned per-VM
+    /// artifacts left behind by a prior supervisor process that
+    /// died without calling `stop_capsule`. Calls the free
+    /// [`prune_stale_mac_artifacts`] helper against this
+    /// supervisor's `socket_dir` and `rootfs_cache_dir`.
+    ///
+    /// On Linux this is a no-op stub (returns zero counts) so
+    /// callers can be platform-agnostic without `cfg!()` gates
+    /// at the call site. The Linux launch path's existing
+    /// `reap_dead_capsules` (already running on a timer) covers
+    /// the equivalent surface for crosvm child processes.
+    ///
+    /// Operators wire this into `elastos serve` startup if they
+    /// want the cleanup. `Supervisor::new` does NOT call it
+    /// automatically — see the helper's doc comment for the
+    /// multi-instance safety trade-off.
+    #[cfg(target_os = "macos")]
+    pub fn prune_stale_mac_artifacts(&self) -> StaleArtifactCounts {
+        prune_stale_mac_artifacts(
+            &self.crosvm_config.socket_dir,
+            &self.crosvm_config.rootfs_cache_dir,
+        )
+    }
+
+    /// Linux stub for [`Supervisor::prune_stale_mac_artifacts`].
+    /// Returns the zero-valued counts so call sites can be
+    /// uniform across platforms.
+    #[cfg(not(target_os = "macos"))]
+    pub fn prune_stale_mac_artifacts(&self) -> StaleArtifactCounts {
+        StaleArtifactCounts::default()
     }
 
     pub fn new(data_dir: PathBuf, registry: ComponentsManifest) -> Self {
@@ -3045,6 +3196,131 @@ mod tests {
         assert_eq!(
             vm_config.mem_size_mib, 128,
             "the manifest's memory_mb must be passed through unchanged when under the host limit"
+        );
+    }
+
+    /// Phase 4 Day 5 — orphaned per-VM artifacts from a prior
+    /// supervisor process must be detectable and removable on
+    /// restart. Simulates the post-crash filesystem state by
+    /// laying down stale overlay files and socket files, then
+    /// invoking `prune_stale_mac_artifacts` and verifying the
+    /// returned counts plus the on-disk state.
+    ///
+    /// The reverse contract is equally important: files whose
+    /// names do not match the supervisor's per-VM naming
+    /// convention (e.g. an unrelated config file the operator
+    /// dropped in `rootfs_cache_dir`) must be preserved. This
+    /// keeps the helper from doubling as a wildcard `rm -rf` on
+    /// the user's data dir.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prune_stale_mac_artifacts_removes_overlays_and_sockets_but_preserves_unrelated_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_dir = temp.path().join("crosvm");
+        let rootfs_cache_dir = temp.path().join("rootfs-cache");
+        let overlays_dir = rootfs_cache_dir.join("overlays");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::create_dir_all(&overlays_dir).unwrap();
+
+        let stale_overlay_a = overlays_dir.join("uuid-aaa.ext4");
+        let stale_overlay_b = overlays_dir.join("uuid-bbb.ext4");
+        std::fs::write(&stale_overlay_a, b"stale rootfs overlay A").unwrap();
+        std::fs::write(&stale_overlay_b, b"stale rootfs overlay B").unwrap();
+
+        let unrelated_overlays_file = overlays_dir.join("README.txt");
+        std::fs::write(&unrelated_overlays_file, b"left by the operator").unwrap();
+
+        let stale_carrier_sock = socket_dir.join("uuid-aaa-carrier.sock");
+        let stale_control_sock = socket_dir.join("uuid-aaa.sock");
+        std::fs::write(&stale_carrier_sock, b"placeholder").unwrap();
+        std::fs::write(&stale_control_sock, b"placeholder").unwrap();
+
+        let unrelated_socket_file = socket_dir.join("operator-notes.txt");
+        std::fs::write(&unrelated_socket_file, b"keep me").unwrap();
+
+        let counts = prune_stale_mac_artifacts(&socket_dir, &rootfs_cache_dir);
+        assert_eq!(
+            counts,
+            StaleArtifactCounts {
+                overlays_removed: 2,
+                sockets_removed: 2,
+            },
+            "prune must report exactly the artifacts removed; got {counts:?}"
+        );
+
+        assert!(!stale_overlay_a.exists(), "stale overlay A must be removed");
+        assert!(!stale_overlay_b.exists(), "stale overlay B must be removed");
+        assert!(
+            !stale_carrier_sock.exists(),
+            "stale carrier socket must be removed"
+        );
+        assert!(
+            !stale_control_sock.exists(),
+            "stale control socket must be removed"
+        );
+
+        assert!(
+            unrelated_overlays_file.exists(),
+            "non-overlay files in overlays/ must be preserved"
+        );
+        assert!(
+            unrelated_socket_file.exists(),
+            "non-socket files in socket_dir must be preserved"
+        );
+
+        // Idempotent: a second sweep over the same dirs yields
+        // zero counts and does not error.
+        let counts_again = prune_stale_mac_artifacts(&socket_dir, &rootfs_cache_dir);
+        assert_eq!(
+            counts_again,
+            StaleArtifactCounts::default(),
+            "second sweep must be a no-op; got {counts_again:?}"
+        );
+    }
+
+    /// Phase 4 Day 5 — a fresh `Supervisor` constructed against a
+    /// data dir containing pre-existing stale overlay + socket
+    /// files must NOT falsely report any of them as a running
+    /// capsule. `running` starts empty regardless of on-disk
+    /// state; the operator must opt in to cleanup via
+    /// `prune_stale_mac_artifacts`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn fresh_supervisor_does_not_falsely_report_stale_overlay_files_as_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let socket_dir = data_dir.join("crosvm");
+        let overlays_dir = data_dir.join("rootfs-cache").join("overlays");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::create_dir_all(&overlays_dir).unwrap();
+        std::fs::write(overlays_dir.join("ghost-handle.ext4"), b"orphan").unwrap();
+        std::fs::write(socket_dir.join("ghost-handle.sock"), b"orphan").unwrap();
+        std::fs::write(socket_dir.join("ghost-handle-carrier.sock"), b"orphan").unwrap();
+
+        let supervisor = Supervisor::new(
+            data_dir,
+            ComponentsManifest {
+                external: std::collections::HashMap::new(),
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+        let running = supervisor.running.read().await;
+        assert!(
+            running.is_empty(),
+            "fresh Supervisor must start with an empty running map regardless of stale on-disk artifacts"
+        );
+        drop(running);
+
+        // Confirm the opt-in cleanup actually removes them.
+        let counts = supervisor.prune_stale_mac_artifacts();
+        assert_eq!(
+            counts.overlays_removed, 1,
+            "the orphan overlay must be cleaned by the opt-in helper"
+        );
+        assert_eq!(
+            counts.sockets_removed, 2,
+            "both orphan socket files must be cleaned by the opt-in helper"
         );
     }
 
