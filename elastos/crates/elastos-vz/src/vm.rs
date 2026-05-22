@@ -1,25 +1,32 @@
-//! Running VM placeholder (Phase 1).
+//! Running VM record.
 //!
 //! Mirrors the shape of [`elastos_crosvm::RunningVm`] so the
-//! supervisor's existing state-tracking code can hold a `RunningVm`
-//! from either substrate behind the [`ComputeProvider`] abstraction.
-//! Phase 2 fills `start`/`stop` with real
-//! `VZVirtualMachine.start`/`.requestStop` lifecycle wiring; Phase 1
-//! is data-only.
+//! supervisor's existing state-tracking code can hold a
+//! `RunningVm` from either substrate behind the
+//! [`ComputeProvider`] abstraction.
+//!
+//! As of Phase 2 Day 3:
+//!
+//! - On macOS, [`RunningVm`] optionally carries a
+//!   [`crate::ffi::lifecycle::VzMachineHandle`] populated by
+//!   [`crate::VzProvider::load`]. `start` / `stop` /
+//!   `is_running` delegate to it.
+//! - On non-macOS platforms, the same struct compiles as a
+//!   fail-closed stub (the FFI handle is gated to macOS).
+//! - The legacy [`RunningVm::new`] three-argument constructor is
+//!   preserved so the Phase 1 tests and any caller that just
+//!   wants the data half of the record keep working; on macOS
+//!   it produces an "incomplete" record whose `start` fails
+//!   closed with [`crate::PHASE_1_STUB_MESSAGE`] — same contract
+//!   as before, just narrower in scope.
 
 use std::path::PathBuf;
 
 use elastos_common::{CapsuleManifest, CapsuleStatus, ElastosError, Result};
 
 use crate::config::VmConfig;
-use crate::PHASE_1_STUB_MESSAGE;
 
 /// State of a single capsule's VM as seen by the Vz provider.
-///
-/// In Phase 1 this struct exists only so callers can reference its
-/// type. No instance is ever constructed by the provider's
-/// fail-closed `load()`. Phase 2 will construct one per booted VM
-/// and route delegate state-change callbacks into [`Self::status`].
 pub struct RunningVm {
     /// VM configuration captured at load time.
     pub config: VmConfig,
@@ -27,50 +34,122 @@ pub struct RunningVm {
     /// Capsule manifest the VM was launched from.
     pub manifest: CapsuleManifest,
 
-    /// Unix-socket path crosvm uses for control; on Vz this is the
-    /// per-VM state dir base. Kept as a `PathBuf` so the supervisor's
-    /// existing socket-cleanup logic works unchanged.
+    /// Unix-socket path used for cleanup. On Vz this is the
+    /// per-VM state dir base — the supervisor's existing
+    /// socket-cleanup logic works unchanged.
     pub socket_path: PathBuf,
 
-    /// Last observed status (set by the Vz delegate in Phase 2).
+    /// Last observed status. Updated by [`Self::start`] /
+    /// [`Self::stop`].
     pub status: CapsuleStatus,
+
+    /// Live Vz handle (macOS only). Populated by
+    /// [`crate::VzProvider::load`]; absent for records
+    /// constructed via the legacy [`Self::new`] path (which
+    /// stays fail-closed for back-compat with Phase 1 tests).
+    #[cfg(target_os = "macos")]
+    handle: Option<crate::ffi::lifecycle::VzMachineHandle>,
 }
 
 impl RunningVm {
-    /// Construct a (not-yet-running) VM record. Mirrors
-    /// [`elastos_crosvm::RunningVm::new`] in shape.
+    /// Legacy data-only constructor. Phase 1 callers use this;
+    /// Phase 2's `VzProvider::load` builds a complete record via
+    /// [`Self::with_handle`] (macOS-only).
     pub fn new(config: VmConfig, manifest: CapsuleManifest, socket_path: PathBuf) -> Self {
         Self {
             config,
             manifest,
             socket_path,
             status: CapsuleStatus::Stopped,
+            #[cfg(target_os = "macos")]
+            handle: None,
         }
     }
 
-    /// Start the VM. Phase 1: fail closed. Phase 2 wires this to
-    /// `VZVirtualMachine.start(...)`.
-    pub async fn start(&mut self) -> Result<()> {
-        Err(ElastosError::Compute(format!(
-            "{} (RunningVm::start: vm_id='{}')",
-            PHASE_1_STUB_MESSAGE, self.config.vm_id
-        )))
+    /// Construct a `RunningVm` already bound to a Vz handle.
+    /// `VzProvider::load` is the only caller.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_handle(
+        config: VmConfig,
+        manifest: CapsuleManifest,
+        socket_path: PathBuf,
+        handle: crate::ffi::lifecycle::VzMachineHandle,
+    ) -> Self {
+        Self {
+            config,
+            manifest,
+            socket_path,
+            status: CapsuleStatus::Stopped,
+            handle: Some(handle),
+        }
     }
 
-    /// Stop the VM. Phase 1: idempotent no-op because no VM was
-    /// started (matches `RunningVm::stop` semantics on crosvm when
-    /// already stopped). Phase 2 wires this to
-    /// `VZVirtualMachine.requestStop` with a SIGKILL-equivalent
-    /// fallback per `docs/vz-backend/PHASE_0_SCOPE.md` §D pitfall #9.
+    /// Start the VM.
+    ///
+    /// - macOS + handle present: dispatch
+    ///   `VZVirtualMachine.startWithCompletionHandler` and wait.
+    /// - macOS + handle missing: fail-closed with the Phase 1
+    ///   stub message (legacy callers).
+    /// - non-macOS: fail-closed with the Phase 1 stub message.
+    pub async fn start(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let handle = self.handle.as_ref().ok_or_else(|| {
+                ElastosError::Compute(format!(
+                    "{} (RunningVm::start: vm_id='{}', handle missing — use VzProvider::load)",
+                    crate::PHASE_1_STUB_MESSAGE,
+                    self.config.vm_id
+                ))
+            })?;
+            handle.start().await.map_err(ElastosError::Compute)?;
+            self.status = CapsuleStatus::Running;
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(ElastosError::Compute(format!(
+                "{} (RunningVm::start: vm_id='{}')",
+                crate::PHASE_1_STUB_MESSAGE,
+                self.config.vm_id
+            )))
+        }
+    }
+
+    /// Stop the VM. Idempotent: returns `Ok(())` if no Vz handle
+    /// is attached (mirrors crosvm's `RunningVm::stop` semantics
+    /// when already stopped). On macOS with an attached handle,
+    /// dispatches `VZVirtualMachine.stopWithCompletionHandler`.
     pub async fn stop(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(handle) = self.handle.as_ref() {
+                handle.stop().await.map_err(ElastosError::Compute)?;
+            }
+        }
         self.status = CapsuleStatus::Stopped;
         Ok(())
     }
 
-    /// Is the VM currently running. Phase 1 always returns `false`;
-    /// Phase 2 reads the cached delegate state.
+    /// Is the VM currently running.
+    ///
+    /// macOS: queries Vz's `state` property through the
+    /// dispatch queue and compares against [`Running`][running].
+    /// Other platforms / no-handle: returns the cached `status`
+    /// field.
+    ///
+    /// [running]: crate::ffi::lifecycle
     pub fn is_running(&self) -> bool {
-        false
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(handle) = self.handle.as_ref() {
+                return matches!(
+                    handle.current_state(),
+                    crate::ffi::lifecycle::VmState::Running
+                );
+            }
+        }
+        matches!(self.status, CapsuleStatus::Running)
     }
 
     /// HTTP port forwarded for this VM, if any.
@@ -88,7 +167,7 @@ mod tests {
         CapsuleManifest {
             schema: SCHEMA_V1.into(),
             version: "0.1.0".into(),
-            name: "phase1-vm".into(),
+            name: "phase2-day3-vm".into(),
             description: None,
             author: None,
             role: CapsuleRole::App,
@@ -119,46 +198,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn running_vm_new_captures_config_and_starts_stopped() {
+    fn make_legacy_vm() -> RunningVm {
         let m = manifest();
         let config =
             VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
-        let vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
+        RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"))
+    }
+
+    #[test]
+    fn running_vm_new_captures_config_and_starts_stopped() {
+        let vm = make_legacy_vm();
         assert!(matches!(vm.status, CapsuleStatus::Stopped));
         assert!(!vm.is_running());
     }
 
     #[tokio::test]
-    async fn running_vm_start_fails_closed_with_phase_1_stub() {
-        let m = manifest();
-        let config =
-            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
-        let mut vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
-
+    async fn running_vm_start_without_handle_fails_closed_with_phase_1_stub() {
+        // The Phase 1 contract survives Day 3 for callers that
+        // construct a `RunningVm` via the legacy `new` path.
+        // `VzProvider::load` builds a fully-wired record via
+        // `with_handle` (macOS only); everyone else gets the
+        // documented fail-closed error.
+        let mut vm = make_legacy_vm();
         let err = vm.start().await.unwrap_err();
-        assert!(err.to_string().contains(PHASE_1_STUB_MESSAGE));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(crate::PHASE_1_STUB_MESSAGE),
+            "expected stub message, got: {msg}"
+        );
     }
 
     #[tokio::test]
-    async fn running_vm_stop_is_idempotent_in_phase_1() {
-        let m = manifest();
-        let config =
-            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
-        let mut vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
-
-        // Calling stop on a never-started VM must not error — same
-        // contract as crosvm's RunningVm::stop.
+    async fn running_vm_stop_is_idempotent_for_legacy_record() {
+        let mut vm = make_legacy_vm();
         vm.stop().await.unwrap();
         vm.stop().await.unwrap();
     }
 
     #[test]
     fn running_vm_http_port_passes_through_from_config() {
-        let m = manifest();
-        let config =
-            VmConfig::from_manifest(&m, std::path::Path::new("/c"), std::path::Path::new("/k"));
-        let vm = RunningVm::new(config, m, PathBuf::from("/tmp/vm.sock"));
+        let vm = make_legacy_vm();
         assert_eq!(vm.http_port(), Some(4100));
     }
 }

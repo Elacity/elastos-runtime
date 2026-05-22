@@ -39,25 +39,24 @@
 // in `lib.rs`, so this file is only compiled on macOS. We do
 // **not** repeat the cfg here — clippy flags the duplication.
 //
-// Day 2 ships the FFI wrappers + builder, but the lifecycle
-// integration (Day 3) is what actually calls them from
-// `provider.rs::load()` and `vm.rs::start()`. Until then every
-// submodule's public function is reachable only from its own
-// `#[cfg(test)]` tests and from `builder.rs`, so a strict `cargo
-// build` reports them as dead. Allow at the module root with a
-// single, auditable annotation so dropping it in Day 3 is one
-// line — and so we don't sprinkle `#[allow(dead_code)]` over
-// every wrapper, which would mask real future bit-rot.
-#![allow(dead_code)]
+// As of Day 3 the FFI surface is reachable through
+// `ffi::lifecycle::VzMachineHandle`, which is itself reached
+// from `provider.rs::load`. The blanket `#![allow(dead_code)]`
+// Day 2 used is therefore gone; specific items that won't be
+// wired until later phases (e.g. the Carrier multi-port
+// attachment Phase 3 will replace) carry their own
+// `#[allow(dead_code)]` with an inline justification.
 
 pub(crate) mod balloon;
 pub(crate) mod block;
 pub(crate) mod boot_loader;
 pub(crate) mod builder;
 pub(crate) mod console;
+pub(crate) mod console_forwarder;
 pub(crate) mod dispatch;
 pub(crate) mod entropy;
 pub(crate) mod error;
+pub(crate) mod lifecycle;
 pub(crate) mod network;
 pub(crate) mod platform;
 pub(crate) mod vsock;

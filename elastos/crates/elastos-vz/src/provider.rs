@@ -1,12 +1,20 @@
-//! Vz compute provider implementation (Phase 1: stubs).
+//! Vz compute provider implementation.
 //!
-//! Implements [`ComputeProvider`] with the same six methods
-//! [`elastos_crosvm::CrosvmProvider`] implements. Every entry point
-//! that would touch Apple `Virtualization.framework` returns a
-//! deliberate [`crate::PHASE_1_STUB_MESSAGE`] error so callers
-//! fail-closed with a single, searchable error string. No
-//! `objc2_virtualization` symbols are referenced anywhere in this
-//! file — Vz wiring is Phase 2.
+//! Phase 2 Day 3: `load` / `start` / `stop` / `status` / `info` /
+//! `http_port` are wired to Apple's `VZVirtualMachine` via
+//! [`crate::ffi::lifecycle::VzMachineHandle`]. The
+//! genuinely-unimplemented surfaces (`set_session_for_vm`,
+//! `append_boot_args_for_vm`) keep returning
+//! [`crate::PHASE_1_STUB_MESSAGE`] until a later day implements
+//! late-bound boot-arg mutation (`VZVirtualMachineConfiguration`
+//! is frozen after `VZVirtualMachine::initWithConfiguration:queue:`,
+//! so re-applying boot args needs a teardown + rebuild that we
+//! defer past first boot).
+//!
+//! Linux build path: every method that would touch Apple's
+//! framework fails closed with the existing Phase 1 stub
+//! message. The `network_stub` module + the cfg gates on
+//! `ffi::lifecycle` keep the Linux workspace build green.
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -25,37 +33,30 @@ use crate::vm::RunningVm;
 use crate::PHASE_1_STUB_MESSAGE;
 
 /// Apple Virtualization.framework compute provider.
-///
-/// Phase 1: holds configuration + a `RunningVm` map for future
-/// state but never actually boots a VM. Phase 2 wires the real
-/// `VZVirtualMachine` lifecycle.
 pub struct VzProvider {
-    /// Configuration.
     config: VzConfig,
 
-    /// Running VMs indexed by capsule ID. Phase 1: the map exists so
-    /// the public API can be exercised; entries are inserted by
-    /// `load()` only if Phase 2 is reached. Today `load()` fails
-    /// closed before any insertion, so the field is intentionally
-    /// unread until Phase 2.
-    #[allow(dead_code)]
+    /// Running VMs indexed by capsule ID.
     vms: Arc<RwLock<HashMap<CapsuleId, RunningVm>>>,
+
+    /// One serial dispatch queue per provider. Every
+    /// `VZVirtualMachine` constructed by this provider is bound
+    /// to this queue per Apple's threading requirement (Phase 0
+    /// §D pitfall #10).
+    #[cfg(target_os = "macos")]
+    queue: Arc<crate::ffi::dispatch::VzDispatchQueue>,
 }
 
 impl VzProvider {
     /// Create a new Vz provider.
     pub fn new(config: VzConfig) -> Result<Self> {
-        // Phase 1 deliberately does NOT call `config.validate()` —
-        // that would require the user to have a vmlinux on disk
-        // before the provider can be constructed, which is fine on
-        // Linux/crosvm but creates a usability cliff on Mac during
-        // Phase 1 development. Phase 2 will validate at `load()` time
-        // (before the first real Vz call) where the failure message
-        // can point at the install instructions for the Mac kernel
-        // artifact.
         Ok(Self {
             config,
             vms: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(target_os = "macos")]
+            queue: Arc::new(crate::ffi::dispatch::VzDispatchQueue::new(
+                "elastos-vz.provider",
+            )),
         })
     }
 
@@ -64,10 +65,7 @@ impl VzProvider {
         Self::new(VzConfig::default())
     }
 
-    /// Initialize the provider (create directories, etc.).
-    ///
-    /// Phase 1: ensures the state and rootfs-cache dirs exist so
-    /// Phase 2 can rely on them without re-checking. No Vz calls.
+    /// Initialise on-disk state directories.
     pub async fn init(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.config.state_dir)
             .await
@@ -96,44 +94,108 @@ impl ComputeProvider for VzProvider {
             )));
         }
 
-        // Phase 1 builds the VmConfig (data-only) so the from-manifest
-        // translation is exercised by tests, then fail-closed before
-        // touching Vz. Phase 2 replaces the `Err(...)` below with the
-        // real `VZVirtualMachine` construction + `vms.insert(...)`.
-        let _vm_config = VmConfig::from_manifest(&manifest, path, &self.config.kernel_path);
+        let rootfs_path = path.join(&manifest.entrypoint);
+        if !rootfs_path.exists() {
+            return Err(ElastosError::CapsuleNotFound(format!(
+                "Rootfs not found: {}",
+                rootfs_path.display()
+            )));
+        }
 
-        Err(ElastosError::Compute(format!(
-            "{} (load: capsule='{}')",
-            PHASE_1_STUB_MESSAGE, manifest.name
-        )))
+        let vm_config = VmConfig::from_manifest(&manifest, path, &self.config.kernel_path);
+
+        if !vm_config.kernel_path.exists() {
+            return Err(ElastosError::Compute(format!(
+                "Kernel not found: {}",
+                vm_config.kernel_path.display()
+            )));
+        }
+
+        // Mint a fresh capsule id matching the crosvm convention
+        // so log lines stay diff-able across substrates.
+        let id = CapsuleId::new(format!("microvm-{}", uuid::Uuid::new_v4()));
+        let socket_path = self.config.state_dir.join(&id.0);
+
+        #[cfg(target_os = "macos")]
+        {
+            let built = crate::ffi::builder::BuiltMachine::from_vm_config(&vm_config, &self.config)
+                .map_err(ElastosError::Compute)?;
+
+            let handle = crate::ffi::lifecycle::VzMachineHandle::new(
+                built,
+                self.queue.clone(),
+                vm_config.vm_id.clone(),
+            )
+            .map_err(ElastosError::Compute)?;
+
+            let vm = RunningVm::with_handle(vm_config, manifest.clone(), socket_path, handle);
+
+            self.vms.write().await.insert(id.clone(), vm);
+
+            tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
+
+            Ok(CapsuleHandle {
+                id,
+                manifest,
+                args: vec![],
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Non-macOS keeps the historical fail-closed
+            // contract: there is no Vz framework here. The
+            // workspace builds, but every load resolves to the
+            // stub message.
+            let _ = (vm_config, socket_path); // silence unused
+            Err(ElastosError::Compute(format!(
+                "{} (load: capsule='{}')",
+                PHASE_1_STUB_MESSAGE, manifest.name
+            )))
+        }
     }
 
     async fn start(&self, handle: &CapsuleHandle) -> Result<()> {
-        Err(ElastosError::Compute(format!(
-            "{} (start: handle='{}')",
-            PHASE_1_STUB_MESSAGE, handle.id
-        )))
+        let mut vms = self.vms.write().await;
+        let vm = vms
+            .get_mut(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))?;
+        vm.start().await
     }
 
     async fn stop(&self, handle: &CapsuleHandle) -> Result<()> {
-        Err(ElastosError::Compute(format!(
-            "{} (stop: handle='{}')",
-            PHASE_1_STUB_MESSAGE, handle.id
-        )))
+        let mut vms = self.vms.write().await;
+        if let Some(vm) = vms.get_mut(&handle.id) {
+            vm.stop().await?;
+        }
+        Ok(())
     }
 
     async fn status(&self, handle: &CapsuleHandle) -> Result<CapsuleStatus> {
-        Err(ElastosError::Compute(format!(
-            "{} (status: handle='{}')",
-            PHASE_1_STUB_MESSAGE, handle.id
-        )))
+        let vms = self.vms.read().await;
+        let vm = vms
+            .get(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))?;
+
+        if vm.is_running() {
+            Ok(CapsuleStatus::Running)
+        } else {
+            Ok(vm.status)
+        }
     }
 
     async fn info(&self, handle: &CapsuleHandle) -> Result<CapsuleInfo> {
-        Err(ElastosError::Compute(format!(
-            "{} (info: handle='{}')",
-            PHASE_1_STUB_MESSAGE, handle.id
-        )))
+        let vms = self.vms.read().await;
+        let vm = vms
+            .get(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))?;
+
+        Ok(CapsuleInfo {
+            id: handle.id.clone(),
+            name: vm.manifest.name.clone(),
+            status: vm.status,
+            memory_used_mb: vm.config.mem_size_mib,
+        })
     }
 
     fn supports(&self, capsule_type: &CapsuleType) -> bool {
@@ -142,11 +204,17 @@ impl ComputeProvider for VzProvider {
 }
 
 impl VzProvider {
-    /// Configure session credentials for a VM before starting it.
-    /// Mirrors [`elastos_crosvm::CrosvmProvider::set_session_for_vm`]
-    /// so the supervisor's call site can be platform-conditional
-    /// without diverging in shape. Fails closed in Phase 1 because
-    /// no VM exists yet.
+    /// Configure session credentials for a VM **before** load.
+    ///
+    /// Apple's `VZVirtualMachineConfiguration` is frozen the
+    /// moment `VZVirtualMachine::initWithConfiguration:queue:`
+    /// is invoked (Phase 0 audit §D pitfall #9 covers the
+    /// related "no late mutation" rule). Day 3 therefore keeps
+    /// the Phase 1 stub for this surface — the supervisor's
+    /// macOS path (still gated by Phase 1's bail) is the only
+    /// caller anyway. A later day will surface a different API
+    /// shape (set session **before** load) once we add the
+    /// supervisor-side route.
     pub async fn set_session_for_vm(
         &self,
         capsule_id: &CapsuleId,
@@ -154,13 +222,14 @@ impl VzProvider {
         _api_addr: &str,
     ) -> Result<()> {
         Err(ElastosError::Compute(format!(
-            "{} (set_session_for_vm: capsule='{}')",
+            "{} (set_session_for_vm: capsule='{}', see provider.rs comment)",
             PHASE_1_STUB_MESSAGE, capsule_id.0
         )))
     }
 
-    /// Attach explicit guest-network TAP equivalent. Phase 3 wires
-    /// this to a `VZNATNetworkDeviceAttachment`. Phase 1 fails closed.
+    /// Attach explicit guest-network TAP equivalent. Phase 3
+    /// wires this to `VZNATNetworkDeviceAttachment` with an
+    /// explicit subnet. Day 3: not implemented.
     pub async fn set_network_for_vm(
         &self,
         capsule_id: &CapsuleId,
@@ -172,13 +241,15 @@ impl VzProvider {
         )))
     }
 
-    /// Return None in Phase 1 — no VMs registered.
+    /// Return None — same shape as
+    /// `CrosvmProvider::get_network_for_vm` for an unattached VM.
     pub async fn get_network_for_vm(&self, _capsule_id: &CapsuleId) -> Option<NetworkConfig> {
         None
     }
 
-    /// Append boot arguments to a VM before start. Fails closed in
-    /// Phase 1.
+    /// Append boot arguments to a VM before start. See the
+    /// note on `set_session_for_vm` for why this remains
+    /// fail-closed until a later day.
     pub async fn append_boot_args_for_vm(&self, capsule_id: &CapsuleId, _args: &str) -> Result<()> {
         Err(ElastosError::Compute(format!(
             "{} (append_boot_args_for_vm: capsule='{}')",
@@ -186,19 +257,19 @@ impl VzProvider {
         )))
     }
 
-    /// Get the VM ID for a capsule. Returns None in Phase 1 because
-    /// no VMs are registered.
-    pub async fn get_vm_id(&self, _capsule_id: &CapsuleId) -> Option<String> {
-        None
+    /// Get the underlying VM ID for a capsule, if loaded.
+    pub async fn get_vm_id(&self, capsule_id: &CapsuleId) -> Option<String> {
+        let vms = self.vms.read().await;
+        vms.get(capsule_id).map(|vm| vm.config.vm_id.clone())
     }
 
-    /// Get the HTTP port for a VM. Phase 1: fails closed because no
-    /// VM exists.
+    /// Get the HTTP port for a loaded VM.
     pub async fn http_port(&self, handle: &CapsuleHandle) -> Result<Option<u16>> {
-        Err(ElastosError::Compute(format!(
-            "{} (http_port: handle='{}')",
-            PHASE_1_STUB_MESSAGE, handle.id
-        )))
+        let vms = self.vms.read().await;
+        let vm = vms
+            .get(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))?;
+        Ok(vm.http_port())
     }
 }
 
@@ -244,8 +315,6 @@ mod tests {
 
     #[tokio::test]
     async fn vz_provider_new_succeeds_without_a_kernel_on_disk() {
-        // Phase 1 deliberately defers validation to `load()` so a Mac
-        // dev can `cargo test` without a vmlinux installed.
         let provider = VzProvider::new(VzConfig::default());
         assert!(provider.is_ok());
     }
@@ -259,33 +328,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vz_provider_load_microvm_returns_phase_1_stub_error() {
-        let provider = VzProvider::new(VzConfig::default()).unwrap();
-        let manifest = capsule_manifest("smoke", CapsuleType::MicroVM);
-
-        let err = provider
-            .load(std::path::Path::new("/tmp/does-not-exist"), manifest)
-            .await
-            .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains(PHASE_1_STUB_MESSAGE),
-            "expected stub message in error, got: {msg}"
-        );
-        assert!(msg.contains("smoke"));
-    }
-
-    #[tokio::test]
-    async fn vz_provider_load_rejects_wasm_capsule_with_typed_error() {
+    async fn vz_provider_load_rejects_non_microvm_with_typed_error() {
         let provider = VzProvider::new(VzConfig::default()).unwrap();
         let manifest = capsule_manifest("not-a-vm", CapsuleType::Wasm);
-
         let err = provider
             .load(std::path::Path::new("/tmp"), manifest)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("only supports MicroVM"));
+    }
+
+    #[tokio::test]
+    async fn vz_provider_load_returns_capsule_not_found_when_rootfs_missing() {
+        // Phase 1 used to assert PHASE_1_STUB_MESSAGE here; Day 3
+        // now actually validates the inputs in the same order
+        // crosvm does, so the first error is CapsuleNotFound for
+        // a missing rootfs.
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let manifest = capsule_manifest("smoke", CapsuleType::MicroVM);
+        let err = provider
+            .load(std::path::Path::new("/tmp/does-not-exist"), manifest)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Rootfs not found"),
+            "expected 'Rootfs not found', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vz_provider_lifecycle_methods_fail_closed_for_unloaded_handle() {
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let handle = CapsuleHandle {
+            id: CapsuleId::new("never-loaded".to_string()),
+            manifest: capsule_manifest("never-loaded", CapsuleType::MicroVM),
+            args: vec![],
+        };
+
+        // start / status / info / http_port all surface
+        // CapsuleNotFound for an unloaded handle — same
+        // contract as the crosvm provider.
+        let start_err = provider.start(&handle).await.unwrap_err();
+        let status_err = provider.status(&handle).await.unwrap_err();
+        let info_err = provider.info(&handle).await.unwrap_err();
+        let http_err = provider.http_port(&handle).await.unwrap_err();
+
+        for (label, err) in [
+            ("start", start_err),
+            ("status", status_err),
+            ("info", info_err),
+            ("http_port", http_err),
+        ] {
+            assert!(
+                matches!(err, ElastosError::CapsuleNotFound(_)),
+                "{label}: expected CapsuleNotFound, got: {err}"
+            );
+        }
+
+        // stop is intentionally idempotent: missing VM ⇒ Ok(())
+        provider.stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vz_provider_session_and_boot_args_still_fail_closed_with_stub() {
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let capsule_id = CapsuleId::new("phase2-day3-session".to_string());
+
+        let session_err = provider
+            .set_session_for_vm(&capsule_id, "abc12345", "http://127.0.0.1:3000")
+            .await
+            .unwrap_err();
+        let bootargs_err = provider
+            .append_boot_args_for_vm(&capsule_id, "extra.token=value")
+            .await
+            .unwrap_err();
+        let network_err = provider
+            .set_network_for_vm(&capsule_id, NetworkConfig::new("phase2-day3-session"))
+            .await
+            .unwrap_err();
+
+        for (label, err) in [
+            ("set_session_for_vm", session_err),
+            ("append_boot_args_for_vm", bootargs_err),
+            ("set_network_for_vm", network_err),
+        ] {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(PHASE_1_STUB_MESSAGE),
+                "{label}: expected stub message, got: {msg}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -295,33 +428,15 @@ mod tests {
             .with_state_dir(tmp.path().join("vz"))
             .with_rootfs_cache_dir(tmp.path().join("rootfs-cache"));
         let provider = VzProvider::new(config).unwrap();
-
         provider.init().await.unwrap();
-
         assert!(tmp.path().join("vz").is_dir());
         assert!(tmp.path().join("rootfs-cache").is_dir());
     }
 
     #[tokio::test]
-    async fn vz_provider_lifecycle_methods_all_fail_closed_with_stub_message() {
+    async fn vz_provider_get_vm_id_returns_none_for_unloaded_capsule() {
         let provider = VzProvider::new(VzConfig::default()).unwrap();
-        let handle = CapsuleHandle {
-            id: CapsuleId::new("phase1-test".to_string()),
-            manifest: capsule_manifest("phase1-test", CapsuleType::MicroVM),
-            args: vec![],
-        };
-
-        for (label, err) in [
-            ("start", provider.start(&handle).await.unwrap_err()),
-            ("stop", provider.stop(&handle).await.unwrap_err()),
-            ("status", provider.status(&handle).await.unwrap_err()),
-            ("info", provider.info(&handle).await.unwrap_err()),
-            ("http_port", provider.http_port(&handle).await.unwrap_err()),
-        ] {
-            assert!(
-                err.to_string().contains(PHASE_1_STUB_MESSAGE),
-                "{label}: expected stub message, got: {err}"
-            );
-        }
+        let id = CapsuleId::new("not-here".to_string());
+        assert!(provider.get_vm_id(&id).await.is_none());
     }
 }
