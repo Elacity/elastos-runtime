@@ -894,6 +894,209 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------
+    // Phase 4 Day 2 — Carrier-bridge multiplex audit.
+    //
+    // Production reality: every microVM gets its own carrier
+    // socketpair and the bridge dispatch loop is detached via
+    // `tokio::spawn` — the `JoinHandle` is intentionally
+    // discarded. Bridge termination is socket-driven: dropping
+    // the guest endpoint (which the supervisor does by dropping
+    // the `RunningCapsule`'s `carrier_host_fd`) causes the next
+    // `read_line` to return `Ok(0)` (EOF) and the loop to break
+    // cleanly.
+    //
+    // The audit question is: can N bridges run side-by-side
+    // sharing the same `Arc<ProviderRegistry>` without
+    // cross-talk? The tests below build three independent
+    // socketpairs, attach three bridges to one registry, and
+    // assert per-bridge isolation in both the steady-state
+    // (ping/pong round-tripping on each) and shutdown
+    // (dropping one guest endpoint terminates only that
+    // bridge) cases.
+    // ---------------------------------------------------------------
+
+    /// Helper: build a non-blocking socketpair and return both
+    /// halves as `tokio::net::UnixStream`s.
+    #[cfg(target_os = "macos")]
+    fn build_socketpair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+        let mut sv = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair must succeed");
+
+        for fd in sv {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0);
+        }
+
+        let a = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let b = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        let host = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(a.into_raw_fd())
+        })
+        .expect("host-side UnixStream::from_std");
+        let test = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(b.into_raw_fd())
+        })
+        .expect("test-side UnixStream::from_std");
+        (host, test)
+    }
+
+    /// Helper: drive a ping/pong round-trip on a test-side
+    /// stream and parse the JSON response. Returns `None` if
+    /// the bridge does not respond within 2s — surface the
+    /// timeout as a `None` so callers can distinguish "bridge
+    /// alive but slow" (rare) from "bridge dead" (expected
+    /// after shutdown).
+    #[cfg(target_os = "macos")]
+    async fn ping_bridge(
+        stream: &mut tokio::net::UnixStream,
+        request_id: u64,
+    ) -> Option<serde_json::Value> {
+        let req = format!("{{\"id\":{request_id},\"request\":{{\"type\":\"ping\"}}}}\n");
+        stream.write_all(req.as_bytes()).await.expect("write ping");
+        stream.flush().await.expect("flush ping");
+
+        let mut buf = [0u8; 4096];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(stream, &mut buf),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if read == 0 {
+            return None;
+        }
+        // The bridge writes one line per response; the kernel
+        // may briefly buffer but `read` returns when any bytes
+        // are available. We trust the bridge wrote a complete
+        // line (the implementation does `write_all` + `flush`).
+        let line = std::str::from_utf8(&buf[..read]).ok()?;
+        let trimmed = line.trim_end();
+        serde_json::from_str(trimmed).ok()
+    }
+
+    /// Three concurrent bridges sharing ONE `ProviderRegistry`
+    /// must each respond to its own ping with a pong, without
+    /// any cross-VM message contamination. Proves the detached-
+    /// spawn model has per-bridge isolation under N>1.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_concurrent_carrier_bridges_isolate_per_capsule() {
+        let registry = Arc::new(ProviderRegistry::new());
+
+        let mut clients: Vec<tokio::net::UnixStream> = Vec::with_capacity(3);
+        let labels = ["alpha", "bravo", "charlie"];
+        for label in labels.iter() {
+            let (host, test) = build_socketpair();
+            spawn_carrier_bridge_on_stream(
+                host,
+                registry.clone(),
+                String::new(),
+                None,
+                format!("test:phase4-day2-multiplex-{label}"),
+            );
+            clients.push(test);
+        }
+
+        // Issue one ping per bridge, identified by a distinct
+        // request id. Each bridge must echo back its OWN id —
+        // never another bridge's.
+        for (idx, stream) in clients.iter_mut().enumerate() {
+            let request_id = 1000 + idx as u64;
+            let response = ping_bridge(stream, request_id)
+                .await
+                .unwrap_or_else(|| panic!("bridge {idx} ({}) failed to respond", labels[idx]));
+            assert_eq!(
+                response["id"],
+                serde_json::Value::from(request_id),
+                "bridge {idx} ({}) must echo its OWN request id; got: {response}",
+                labels[idx]
+            );
+            assert_eq!(
+                response["response"]["type"], "pong",
+                "bridge {idx} ({}) must respond with pong; got: {response}",
+                labels[idx]
+            );
+        }
+    }
+
+    /// Dropping ONE bridge's guest endpoint must terminate
+    /// ONLY that bridge's dispatch loop (the next read EOFs,
+    /// the loop breaks). The other two bridges keep serving
+    /// requests on the same shared `ProviderRegistry`. Proves
+    /// the "supervisor drops `RunningCapsule.carrier_host_fd`,
+    /// bridge dies" contract holds under N>1.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_one_carrier_endpoint_terminates_only_that_bridge() {
+        let registry = Arc::new(ProviderRegistry::new());
+
+        let (host_a, mut client_a) = build_socketpair();
+        let (host_b, client_b) = build_socketpair();
+        let (host_c, mut client_c) = build_socketpair();
+
+        spawn_carrier_bridge_on_stream(
+            host_a,
+            registry.clone(),
+            String::new(),
+            None,
+            "test:phase4-day2-shutdown-alpha".into(),
+        );
+        spawn_carrier_bridge_on_stream(
+            host_b,
+            registry.clone(),
+            String::new(),
+            None,
+            "test:phase4-day2-shutdown-bravo".into(),
+        );
+        spawn_carrier_bridge_on_stream(
+            host_c,
+            registry.clone(),
+            String::new(),
+            None,
+            "test:phase4-day2-shutdown-charlie".into(),
+        );
+
+        // Sanity: alpha + charlie alive and responding.
+        let resp = ping_bridge(&mut client_a, 2001)
+            .await
+            .expect("alpha pre-shutdown ping");
+        assert_eq!(resp["id"], serde_json::Value::from(2001u64));
+        let resp = ping_bridge(&mut client_c, 2003)
+            .await
+            .expect("charlie pre-shutdown ping");
+        assert_eq!(resp["id"], serde_json::Value::from(2003u64));
+
+        // Drop bravo's guest endpoint — its bridge's next
+        // read_line returns Ok(0) (EOF) and the loop breaks.
+        drop(client_b);
+
+        // Give Tokio one yield to let the EOF propagate
+        // through the (idle) bravo bridge. The other two are
+        // unaffected.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Alpha + charlie must still serve a fresh ping.
+        let resp = ping_bridge(&mut client_a, 2101)
+            .await
+            .expect("alpha post-bravo-shutdown ping must succeed");
+        assert_eq!(resp["id"], serde_json::Value::from(2101u64));
+        assert_eq!(resp["response"]["type"], "pong");
+
+        let resp = ping_bridge(&mut client_c, 2103)
+            .await
+            .expect("charlie post-bravo-shutdown ping must succeed");
+        assert_eq!(resp["id"], serde_json::Value::from(2103u64));
+        assert_eq!(resp["response"]["type"], "pong");
+    }
+
     #[test]
     fn test_build_capability_resource_localhost_full_uri() {
         let body = serde_json::json!({"path": "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"});

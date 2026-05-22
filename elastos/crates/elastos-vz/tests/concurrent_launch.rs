@@ -158,41 +158,97 @@ async fn concurrent_load_rejections_isolate_per_vm() {
     assert_eq!(completed, 3, "all three tasks must complete");
 }
 
-/// Real-kernel multi-VM boot. Opt-in via env vars; the test is
-/// `#[ignore]` so CI never executes it. Manual invocation is:
+/// Auto-discover the canonical kernel install path. The
+/// supervisor's `VzConfig::default()` resolves to
+/// `~/.local/share/elastos/bin/vmlinux` (see `VzConfig::new`).
+/// `ELASTOS_VZ_TEST_KERNEL` overrides the discovery for
+/// developer-driven runs against a kernel in a non-standard
+/// location.
+fn discover_kernel() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ELASTOS_VZ_TEST_KERNEL") {
+        let pb = PathBuf::from(p);
+        return pb.is_file().then_some(pb);
+    }
+    let home = std::env::var_os("HOME")?;
+    let candidate = PathBuf::from(home).join(".local/share/elastos/bin/vmlinux");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Auto-discover any installed capsule rootfs. The supervisor
+/// extracts capsules to `~/.local/share/elastos/capsules/<name>/`
+/// with the rootfs at `<name>/rootfs.ext4`. We pick the first
+/// match — every capsule's rootfs is bootable; the test only
+/// needs to prove parallel VMs load.
+/// `ELASTOS_VZ_TEST_ROOTFS` is the override.
+fn discover_rootfs() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ELASTOS_VZ_TEST_ROOTFS") {
+        let pb = PathBuf::from(p);
+        return pb.is_file().then_some(pb);
+    }
+    let home = std::env::var_os("HOME")?;
+    let capsules_dir = PathBuf::from(home).join(".local/share/elastos/capsules");
+    let entries = std::fs::read_dir(&capsules_dir).ok()?;
+    for entry in entries.flatten() {
+        let rootfs = entry.path().join("rootfs.ext4");
+        if rootfs.is_file() {
+            return Some(rootfs);
+        }
+    }
+    None
+}
+
+/// Real-kernel multi-VM boot. Auto-discovers the kernel and
+/// rootfs from the supervisor's canonical install path
+/// (`~/.local/share/elastos/bin/vmlinux` and
+/// `~/.local/share/elastos/capsules/<name>/rootfs.ext4`);
+/// `ELASTOS_VZ_TEST_KERNEL` / `ELASTOS_VZ_TEST_ROOTFS` env
+/// vars override the discovery. Visibly skips (via `eprintln!`,
+/// NOT `#[ignore]`) when the host is not an Apple Silicon Mac
+/// or when no kernel/rootfs is installed.
 ///
-/// ```bash
-/// ELASTOS_VZ_TEST_KERNEL=/path/to/vmlinux \
-///   ELASTOS_VZ_TEST_ROOTFS=/path/to/rootfs.ext4 \
-///   cargo test -p elastos-vz --test concurrent_launch \
-///   concurrent_load_with_real_kernel -- --ignored --nocapture
-/// ```
-///
-/// Three VMs differ only in `vm_id`. All must reach the post-load
-/// `RunningVm` state without panics, deadlocks, or cross-VM state
-/// contamination.
+/// Three VMs differ only in `vm_id`. All must reach a loaded
+/// `CapsuleHandle` without panics, deadlocks, or cross-VM state
+/// contamination — proves the per-VM dispatch queue refactor
+/// (Phase 4 Day 1) holds up under a real concurrent boot
+/// attempt, even when only `validateWithError` succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a real Linux kernel + rootfs; set ELASTOS_VZ_TEST_KERNEL and ELASTOS_VZ_TEST_ROOTFS"]
 async fn concurrent_load_with_real_kernel() {
     if !is_supported() {
-        eprintln!("is_supported() = false; skipping real-kernel concurrent load");
+        eprintln!(
+            "concurrent_load_with_real_kernel: skipping — is_supported() == false \
+             (off Apple Silicon macOS, Vz framework unreachable)"
+        );
         return;
     }
 
-    let kernel = match std::env::var("ELASTOS_VZ_TEST_KERNEL") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("ELASTOS_VZ_TEST_KERNEL unset; skipping");
+    let kernel = match discover_kernel() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "concurrent_load_with_real_kernel: skipping — no kernel found at \
+                 $ELASTOS_VZ_TEST_KERNEL or ~/.local/share/elastos/bin/vmlinux. \
+                 Run `elastos setup --with vmlinux` first."
+            );
             return;
         }
     };
-    let rootfs = match std::env::var("ELASTOS_VZ_TEST_ROOTFS") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => {
-            eprintln!("ELASTOS_VZ_TEST_ROOTFS unset; skipping");
+    let rootfs = match discover_rootfs() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "concurrent_load_with_real_kernel: skipping — no rootfs found at \
+                 $ELASTOS_VZ_TEST_ROOTFS or ~/.local/share/elastos/capsules/*/rootfs.ext4. \
+                 Run `elastos setup` and pull at least one MicroVM capsule first."
+            );
             return;
         }
     };
+
+    eprintln!(
+        "concurrent_load_with_real_kernel: using kernel={} rootfs={}",
+        kernel.display(),
+        rootfs.display()
+    );
 
     let tmp = tempfile::tempdir().unwrap();
     let provider = std::sync::Arc::new(

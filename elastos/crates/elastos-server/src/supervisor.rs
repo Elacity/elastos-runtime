@@ -3512,4 +3512,121 @@ mod tests {
             "bravo (Stopped) must be reaped"
         );
     }
+
+    /// Phase 4 Day 2 — `reap_dead_capsules` × concurrent reader
+    /// race. The reaper takes `running.write().await`; the
+    /// supervisor's `capsule_status` / `info` / introspection
+    /// handlers take `running.read().await`. Tokio's `RwLock` is
+    /// fair: a long-held read briefly delays a contending write
+    /// but never starves it, and vice versa.
+    ///
+    /// This test:
+    /// 1. Inserts three `VzVm` capsules (alpha Running,
+    ///    bravo Stopped, charlie Running).
+    /// 2. Spawns a "reader" task that holds `running.read().await`
+    ///    for ~200ms (simulates a supervisor introspection
+    ///    call mid-iteration).
+    /// 3. Calls `reap_dead_capsules` while the read is held.
+    /// 4. Asserts the reaper completes after the reader
+    ///    releases (proven by total elapsed >= 150ms), removes
+    ///    ONLY bravo, and the reader's view never observed a
+    ///    partial removal (proven by iterating it BEFORE the
+    ///    drop and after re-acquiring a read).
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reap_dead_capsules_does_not_starve_concurrent_readers() {
+        use elastos_common::CapsuleStatus;
+
+        let supervisor = std::sync::Arc::new(make_test_supervisor());
+
+        fn make_vz_capsule_with_status(
+            name: &str,
+            status: CapsuleStatus,
+        ) -> (String, RunningCapsule) {
+            let handle = format!("vm-{name}-1-1");
+            let mut rc = synthetic_vzvm_running_capsule(name, &handle);
+            if let CapsuleBackend::VzVm(ref mut vm) = rc.backend {
+                vm.status = status;
+            }
+            (handle, rc)
+        }
+
+        {
+            let mut running = supervisor.running.write().await;
+            let (h_alive, c_alive) = make_vz_capsule_with_status("alpha", CapsuleStatus::Running);
+            let (h_dead, c_dead) = make_vz_capsule_with_status("bravo", CapsuleStatus::Stopped);
+            let (h_alive2, c_alive2) =
+                make_vz_capsule_with_status("charlie", CapsuleStatus::Running);
+            running.insert(h_alive, c_alive);
+            running.insert(h_dead, c_dead);
+            running.insert(h_alive2, c_alive2);
+        }
+
+        // Spawn the reader: hold a read lock for 200ms while
+        // observing the map. The read MUST see all three
+        // entries — the reaper cannot mutate the map while
+        // the read is held.
+        let reader_supervisor = supervisor.clone();
+        let reader = tokio::spawn(async move {
+            let running = reader_supervisor.running.read().await;
+            let snapshot: Vec<String> = running.keys().cloned().collect();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // After the sleep, the map is STILL the same (the
+            // read lock guarantees this — Tokio's RwLock blocks
+            // writers behind active readers).
+            let after: Vec<String> = running.keys().cloned().collect();
+            assert_eq!(
+                snapshot, after,
+                "reader's snapshot must be stable under a held read lock"
+            );
+            snapshot
+        });
+
+        // Give the reader a head start so it definitely owns
+        // the read lock before the reaper attempts the write.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let reap_start = std::time::Instant::now();
+        supervisor.reap_dead_capsules().await;
+        let reap_elapsed = reap_start.elapsed();
+
+        // The reaper had to wait for the reader to release —
+        // the reader holds the lock for 200ms, we started the
+        // reaper ~50ms in, so the reap should take at least
+        // ~150ms before the lock becomes available. Bound it
+        // loosely (>= 120ms) to absorb scheduler jitter.
+        assert!(
+            reap_elapsed >= std::time::Duration::from_millis(120),
+            "reaper must have waited for the reader to release the read lock; elapsed={:?}",
+            reap_elapsed
+        );
+
+        // Confirm the reader saw the pre-reap state (all three
+        // handles) and the post-reap state has only two.
+        let reader_snapshot = reader.await.expect("reader task must not panic");
+        assert_eq!(
+            reader_snapshot.len(),
+            3,
+            "reader must have observed all three pre-reap capsules; saw: {reader_snapshot:?}"
+        );
+
+        let running = supervisor.running.read().await;
+        assert_eq!(
+            running.len(),
+            2,
+            "post-reap state must have exactly two live capsules"
+        );
+        assert!(
+            running.keys().any(|k| k.contains("alpha")),
+            "alpha (Running) must remain after reap"
+        );
+        assert!(
+            running.keys().any(|k| k.contains("charlie")),
+            "charlie (Running) must remain after reap"
+        );
+        assert!(
+            !running.keys().any(|k| k.contains("bravo")),
+            "bravo (Stopped) must have been reaped"
+        );
+    }
 }
