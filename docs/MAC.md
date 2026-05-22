@@ -140,16 +140,18 @@ trade-off.
   Linux host) and connect to it. This mirrors how Docker Desktop and
   the Kubernetes control plane handle the Mac case.
 
-## First boot on Apple Silicon (Phase 2 Day 4+)
+## First boot on Apple Silicon (Phase 2 Day 5)
 
-Once the Vz backend lands you'll be able to boot a Linux guest
-end-to-end against your own kernel + rootfs. The wiring is in
-place as of Phase 2 Day 4; the only remaining gap is "a real
-arm64 Linux kernel image that Apple's `VZLinuxBootLoader`
-accepts" — see [`vz-backend/PHASE_2_DAY_4_NOTES.md`](vz-backend/PHASE_2_DAY_4_NOTES.md)
-for the verified outcome of the Day 4 attempt.
+As of Phase 2 Day 5 you can boot a real Linux guest end-to-end.
+The control plane (codesign → load → validate → start → console
+forwarder → state polling) is fully wired; the missing piece
+from Day 4 — "a real arm64 kernel + initramfs that Vz accepts"
+— is now a one-shot `fetch-vz-kernel.sh` invocation against
+Ubuntu's archived cloud images. The Day 5 outcome log
+([`vz-backend/PHASE_2_DAY_5_NOTES.md`](vz-backend/PHASE_2_DAY_5_NOTES.md))
+records the verbatim guest console output.
 
-The operator recipe, once kernel artifacts are available:
+Operator recipe:
 
 ```bash
 # 1. Build the runtime binary.
@@ -157,40 +159,70 @@ cargo build -p elastos-server
 
 # 2. Sign it with com.apple.security.virtualization so Apple's
 #    VZVirtualMachineConfiguration.validateWithError accepts the
-#    config. The script is idempotent — re-run after every
-#    `cargo build`.
+#    config. Re-run after every `cargo build`.
 scripts/dev/sign-elastos-vz/sign.sh
 
-# 3. Boot the guest. The kernel must be a raw arm64 Linux Image
-#    (NOT a bzImage). The rootfs will be exposed as /dev/vda
-#    inside the guest. Guest kernel printk streams via the
-#    `vm_console` tracing target — visible by default.
-target/debug/elastos vm-debug boot \
-  --rootfs /path/to/rootfs.img \
-  --kernel /path/to/Image \
-  --memory-mb 256 \
-  --vcpus 1
+# 3. Fetch a Vz-compatible kernel + initramfs + rootfs.
+#    Downloads Ubuntu 22.04 arm64 cloud-image artifacts to
+#    ~/.local/share/elastos/vz-bin/, verifies their SHA-256
+#    against checksums baked into the script, gunzips the
+#    kernel to a raw Linux Image, and converts the qcow2
+#    disk to raw via `qemu-img` (install via `brew install qemu`
+#    if missing). Idempotent.
+scripts/dev/fetch-vz-kernel.sh
 
-# Press Ctrl-C to stop. The VM also stops itself if the guest
-# shuts down.
+# 4. Boot the guest. Guest kernel printk streams via the
+#    `vm_console` tracing target — visible by default at
+#    `info` level. Ubuntu's rootfs lives on /dev/vda1, not
+#    the whole disk, so we override the default --boot-args.
+target/debug/elastos vm-debug boot \
+  --rootfs    ~/.local/share/elastos/vz-bin/rootfs.img \
+  --kernel    ~/.local/share/elastos/vz-bin/Image \
+  --initramfs ~/.local/share/elastos/vz-bin/initramfs.img \
+  --memory-mb 1024 \
+  --boot-args 'console=hvc0 root=/dev/vda1 rw'
+
+# Press Ctrl-C to stop. The VM also stops itself if the
+# guest reaches an end state (panic, shutdown).
 ```
 
-If step 2 is skipped you'll see a single operator-friendly
-error string when `vm-debug boot` calls `provider.load`:
+You can swap in your own kernel + rootfs at any time — the
+fetch script is a known-working starting point, not a hard
+dependency. Anything that satisfies Vz's contract works
+(arm64 raw Linux Image, raw disk image, optional initramfs
+mmap-able by Vz).
+
+### Common error shapes
+
+If you skip the codesign step (#2 above) you'll see this
+error when `vm-debug boot` calls `provider.load`:
 
 > `vz validate (vm_id='…'): missing com.apple.security.virtualization entitlement — sign the binary with scripts/dev/sign-elastos-vz/ (Phase 2 Day 4) or see docs/MAC.md. Apple error: …`
 
-If the kernel artifact isn't a Vz-compatible arm64 Image, Apple
-returns `Internal Virtualization error. The virtual machine
-failed to start.` from `provider.start`. That's the signal you
-need a real kernel — Day 5 (and Phase 3 in `PLAN.md`) covers
-how to get one.
+If the kernel artifact isn't a Vz-compatible arm64 Image,
+Apple returns the same opaque message from `provider.start`:
+
+> `Internal Virtualization error. The virtual machine failed to start.`
+
+That's the signal that the kernel format is wrong — either
+it's a bzImage (x86), a compressed vmlinuz that wasn't
+decompressed, or a kernel built without arm64 Image format
+support. Re-run `fetch-vz-kernel.sh` to get a known-good
+artifact, or check that your own kernel's first 0x44 bytes
+contain the `ARMd…PE\0\0` magic at offset 0x38/0x40.
+
+If you pass `--initramfs <path>` but the file is missing,
+validation errors before any Vz call:
+
+> `boot loader: initramfs file does not exist at /path/to/initramfs`
 
 ## Cross-references
 
 - The plan: [`docs/vz-backend/PLAN.md`](vz-backend/PLAN.md)
 - Day 4 outcome log: [`docs/vz-backend/PHASE_2_DAY_4_NOTES.md`](vz-backend/PHASE_2_DAY_4_NOTES.md)
+- Day 5 outcome log: [`docs/vz-backend/PHASE_2_DAY_5_NOTES.md`](vz-backend/PHASE_2_DAY_5_NOTES.md)
 - Codesign helper: [`scripts/dev/sign-elastos-vz/README.md`](../scripts/dev/sign-elastos-vz/README.md)
+- Kernel fetcher: [`scripts/dev/fetch-vz-kernel.sh`](../scripts/dev/fetch-vz-kernel.sh)
 - The principles this plan obeys: [`PRINCIPLES.md`](../PRINCIPLES.md)
   (#10, #11, #12 in particular)
 - The runtime's support boundary: [`state.md`](../state.md)

@@ -102,7 +102,21 @@ impl ComputeProvider for VzProvider {
             )));
         }
 
-        let vm_config = VmConfig::from_manifest(&manifest, path, &self.config.kernel_path);
+        let mut vm_config = VmConfig::from_manifest(&manifest, path, &self.config.kernel_path);
+
+        // Apply the provider-wide initramfs default. The capsule
+        // manifest doesn't carry an initramfs path (Phase 2 design
+        // decision — `elastos-common` is Linux-untouched), so
+        // `vm-debug boot --initramfs …` propagates the path here
+        // via `VzConfig::with_initramfs_path`. A future per-VM
+        // override would land before this line and take
+        // precedence by only setting from the provider default
+        // when the per-VM field is still `None`.
+        if vm_config.initramfs_path.is_none() {
+            if let Some(default_initramfs) = self.config.initramfs_path.as_ref() {
+                vm_config.initramfs_path = Some(default_initramfs.clone());
+            }
+        }
 
         if !vm_config.kernel_path.exists() {
             return Err(ElastosError::Compute(format!(

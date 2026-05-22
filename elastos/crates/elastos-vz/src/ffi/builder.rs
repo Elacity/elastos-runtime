@@ -82,8 +82,12 @@ impl BuiltMachine {
         let platform = build_platform(&provider_config.state_dir, &vm.vm_id)
             .map_err(|e| format!("vz machine builder: {e}"))?;
 
-        let boot_loader = build_boot_loader(&vm.kernel_path, &vm.vz_boot_args())
-            .map_err(|e| format!("vz machine builder: {e}"))?;
+        let boot_loader = build_boot_loader(
+            &vm.kernel_path,
+            &vm.vz_boot_args(),
+            vm.initramfs_path.as_deref(),
+        )
+        .map_err(|e| format!("vz machine builder: {e}"))?;
 
         let rootfs = build_block_device(&vm.rootfs_path, vm.rootfs_readonly)
             .map_err(|e| format!("vz machine builder: {e}"))?;
@@ -216,6 +220,7 @@ mod tests {
             network: None,
             interactive_stdio: false,
             carrier_socket_path: None,
+            initramfs_path: None,
         }
     }
 
@@ -294,6 +299,52 @@ mod tests {
         assert!(
             err.contains("not found") || err.contains("does not exist"),
             "expected typed not-found error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_vm_config_with_initramfs_threads_through_to_boot_loader() {
+        // Day 5 contract: the `initramfs_path` field on `VmConfig`
+        // must reach `VZLinuxBootLoader.initialRamdiskURL`, not
+        // disappear into the builder. Without this gate, an
+        // operator passing `--initramfs` would get a silent
+        // `nil`-on-the-boot-loader and a guest kernel that panics
+        // with "no working init found".
+        let tmp = TempDir::new().unwrap();
+        let kernel = write_fake_kernel(tmp.path());
+        let rootfs = write_fake_disk(tmp.path(), "rootfs.img");
+        let initramfs = {
+            let p = tmp.path().join("initramfs.img");
+            std::fs::write(&p, b"# placeholder initramfs for tests\n").unwrap();
+            p
+        };
+
+        let mut vm = make_vm_config(&kernel, &rootfs);
+        vm.initramfs_path = Some(initramfs.clone());
+
+        let provider = make_vz_config(tmp.path().join("vz-state"), kernel.clone());
+        let built =
+            BuiltMachine::from_vm_config(&vm, &provider).expect("builder succeeds with initramfs");
+
+        let boot_loader = unsafe { built.vz_config.bootLoader() }
+            .expect("configuration has a boot loader after build");
+        // Downcast the VZBootLoader to VZLinuxBootLoader so we can
+        // read its initramfs URL. We pre-condition on the only
+        // boot-loader class the builder constructs (Linux). If
+        // Apple ever returns nil or a different subclass here, the
+        // test correctly fails.
+        let linux_bl: Retained<objc2_virtualization::VZLinuxBootLoader> = boot_loader
+            .downcast()
+            .expect("builder must produce a VZLinuxBootLoader");
+        let stored = unsafe { linux_bl.initialRamdiskURL() }
+            .expect("initialRamdiskURL must be set when VmConfig.initramfs_path is Some");
+        let stored_path = stored
+            .path()
+            .expect("file URL must round-trip back to a path")
+            .to_string();
+        assert!(
+            stored_path.ends_with("initramfs.img"),
+            "expected initramfs.img tail in stored URL, got: {stored_path}"
         );
     }
 

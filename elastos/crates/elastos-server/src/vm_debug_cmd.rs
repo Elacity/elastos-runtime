@@ -53,6 +53,17 @@ pub(crate) struct BootArgs {
     #[arg(long)]
     pub kernel: PathBuf,
 
+    /// Optional path to an initial ramdisk image.
+    ///
+    /// Every modern arm64 distro kernel (Ubuntu, Debian, Alpine
+    /// cloud images) expects an initramfs to bring up userspace.
+    /// Pass the same `initrd` / `initramfs` your kernel was
+    /// published with; Vz mmap's it into guest memory at boot
+    /// via `VZLinuxBootLoader.setInitialRamdiskURL:`. Omit only
+    /// for kernels with a baked-in initramfs.
+    #[arg(long)]
+    pub initramfs: Option<PathBuf>,
+
     /// Guest memory in MiB.
     #[arg(long, default_value_t = 256)]
     pub memory_mb: u32,
@@ -115,6 +126,14 @@ pub(crate) fn validate_boot_inputs(args: &BootArgs) -> Result<()> {
             "kernel not found: {} (pass --kernel /path/to/Image)",
             args.kernel.display()
         );
+    }
+    if let Some(initramfs) = args.initramfs.as_ref() {
+        if !initramfs.exists() {
+            bail!(
+                "initramfs not found: {} (omit --initramfs to boot without one)",
+                initramfs.display()
+            );
+        }
     }
     if args.memory_mb < 64 {
         bail!(
@@ -227,10 +246,23 @@ mod macos {
             .kernel
             .canonicalize()
             .context("vm-debug boot: cannot canonicalize --kernel path")?;
-        let vz_config = VzConfig::new()
+        let mut vz_config = VzConfig::new()
             .with_state_dir(tmp.path().join("vz-state"))
             .with_rootfs_cache_dir(tmp.path().join("rootfs-cache"))
             .with_kernel_path(kernel);
+
+        // Canonicalise the initramfs too. Vz reads the path
+        // verbatim, and a relative path would resolve against
+        // the wrong cwd inside the framework's worker process.
+        if let Some(initramfs) = args.initramfs.as_ref() {
+            let initramfs = initramfs.canonicalize().with_context(|| {
+                format!(
+                    "vm-debug boot: cannot canonicalize --initramfs path {}",
+                    initramfs.display()
+                )
+            })?;
+            vz_config = vz_config.with_initramfs_path(initramfs);
+        }
 
         let provider = VzProvider::new(vz_config)
             .map_err(|e| anyhow::anyhow!("vm-debug boot: cannot construct VzProvider: {e}"))?;
@@ -343,6 +375,7 @@ mod tests {
         BootArgs {
             rootfs,
             kernel,
+            initramfs: None,
             memory_mb: 256,
             vcpus: 1,
             boot_args: None,
@@ -391,6 +424,45 @@ mod tests {
 
         let err = validate_boot_inputs(&a).unwrap_err();
         assert!(err.to_string().contains("memory_mb must be >= 64"));
+    }
+
+    #[test]
+    fn validate_boot_inputs_rejects_specified_but_missing_initramfs() {
+        // --initramfs is optional, but if the operator passes a
+        // path it must exist — silently dropping a typo here
+        // would produce a confusing "no working init" guest
+        // panic 30 seconds into boot.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs.img");
+        let kernel = tmp.path().join("Image");
+        std::fs::write(&rootfs, b"r").unwrap();
+        std::fs::write(&kernel, b"k").unwrap();
+        let mut a = args(rootfs, kernel);
+        a.initramfs = Some(tmp.path().join("does-not-exist-initramfs.img"));
+
+        let err = validate_boot_inputs(&a).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("initramfs not found"),
+            "expected 'initramfs not found', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_boot_inputs_accepts_present_initramfs() {
+        // Sanity check: if the initramfs path is supplied AND
+        // exists, validation passes.
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs.img");
+        let kernel = tmp.path().join("Image");
+        let initramfs = tmp.path().join("initramfs.img");
+        std::fs::write(&rootfs, b"r").unwrap();
+        std::fs::write(&kernel, b"k").unwrap();
+        std::fs::write(&initramfs, b"i").unwrap();
+        let mut a = args(rootfs, kernel);
+        a.initramfs = Some(initramfs);
+
+        validate_boot_inputs(&a).expect("present initramfs must pass validation");
     }
 
     #[test]

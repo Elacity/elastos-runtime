@@ -34,6 +34,17 @@ pub struct VzConfig {
 
     /// Directory for rootfs overlays. Mirrors crosvm semantics.
     pub rootfs_cache_dir: PathBuf,
+
+    /// Optional default initial ramdisk path applied to every VM
+    /// the provider loads.
+    ///
+    /// The capsule manifest schema does not carry an initramfs
+    /// path (`elastos-common` is a Linux-untouched protected crate),
+    /// so for Phase 2 the only producer of this field is
+    /// `elastos vm-debug boot --initramfs …`. When set, every
+    /// `VmConfig` the provider builds inherits this path before
+    /// the FFI builder hands it to `VZLinuxBootLoader.setInitialRamdiskURL:`.
+    pub initramfs_path: Option<PathBuf>,
 }
 
 impl VzConfig {
@@ -46,6 +57,7 @@ impl VzConfig {
             kernel_path: data_dir.join("bin/vmlinux"),
             state_dir: data_dir.join("vz"),
             rootfs_cache_dir: data_dir.join("rootfs-cache"),
+            initramfs_path: None,
         }
     }
 
@@ -64,6 +76,15 @@ impl VzConfig {
     /// Set the rootfs cache directory.
     pub fn with_rootfs_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.rootfs_cache_dir = path.into();
+        self
+    }
+
+    /// Set the provider-wide default initramfs path. Every VM
+    /// loaded through this provider will inherit the path on its
+    /// `VmConfig` (and thus its `VZLinuxBootLoader`) unless a
+    /// future per-VM override is wired in.
+    pub fn with_initramfs_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.initramfs_path = Some(path.into());
         self
     }
 
@@ -230,6 +251,18 @@ pub struct VmConfig {
     /// kernel console occupies `/dev/hvc0`, so the Carrier port moves
     /// to the second virtio-console multi-port entry.
     pub carrier_socket_path: Option<PathBuf>,
+
+    /// Optional initial ramdisk image.
+    ///
+    /// Every modern distro kernel built for arm64 expects an
+    /// initramfs to bring up userspace (module loading, root pivot,
+    /// `/sbin/init` discovery). Vz exposes this via
+    /// `VZLinuxBootLoader.setInitialRamdiskURL:`; the FFI builder
+    /// only attaches it when this field is `Some`. Capsule manifests
+    /// don't currently surface this — `elastos-common::MicroVmConfig`
+    /// is a Linux-untouched protected crate — so the only Phase 2
+    /// path that sets it is `elastos vm-debug boot --initramfs …`.
+    pub initramfs_path: Option<PathBuf>,
 }
 
 impl VmConfig {
@@ -285,7 +318,19 @@ impl VmConfig {
             network: None,
             interactive_stdio: false,
             carrier_socket_path: None,
+            initramfs_path: None,
         }
+    }
+
+    /// Attach an initial ramdisk path. Used by `elastos vm-debug
+    /// boot --initramfs …` and any future flow that needs to boot a
+    /// kernel that depends on an initramfs (every Ubuntu / Debian /
+    /// Alpine cloud image kernel we know of). `None` is the default
+    /// and matches the Vz boot loader's `nil`-by-default
+    /// `initialRamdiskURL` property.
+    pub fn with_initramfs_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.initramfs_path = Some(path.into());
+        self
     }
 
     /// Return the boot args ready for [`VZLinuxBootLoader.commandLine`].
@@ -477,6 +522,35 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         fs::write(tmp.path(), b"... ext4 ... virtio_blk ... virtio_pci ...").unwrap();
         validate_guest_kernel(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn vm_config_initramfs_path_defaults_to_none_from_manifest() {
+        let manifest = microvm_manifest("");
+        let config = VmConfig::from_manifest(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+        );
+        assert!(
+            config.initramfs_path.is_none(),
+            "from_manifest must not invent an initramfs path"
+        );
+    }
+
+    #[test]
+    fn vm_config_with_initramfs_path_sets_the_field() {
+        let manifest = microvm_manifest("");
+        let config = VmConfig::from_manifest(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+        )
+        .with_initramfs_path("/tmp/initrd.img");
+        assert_eq!(
+            config.initramfs_path.as_deref(),
+            Some(std::path::Path::new("/tmp/initrd.img"))
+        );
     }
 
     #[test]

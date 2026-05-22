@@ -29,7 +29,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENTITLEMENTS="$SCRIPT_DIR/vz.entitlements.plist"
-DEFAULT_BINARY="target/debug/elastos"
+# Cargo workspace root lives at <repo>/elastos/, so the debug
+# build lands at <repo>/elastos/target/debug/elastos — NOT at
+# <repo>/target/debug/elastos. Day 4 documented this in MAC.md
+# but the default path here pointed at the repo-root build dir,
+# which only exists if someone runs cargo from the repo root.
+DEFAULT_BINARY="elastos/target/debug/elastos"
 
 require_macos() {
   if [[ "$(uname -s)" != "Darwin" ]]; then
