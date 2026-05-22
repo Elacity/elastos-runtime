@@ -31,7 +31,7 @@ to first-class support.
 |---|---|---|
 | `type: wasm` (e.g. `home`, `system`, `chat-room`) | wasmtime, capability tokens | Same as Linux |
 | `type: data` (e.g. `documents`, `library`, `inbox`, `gba-emulator`) | static assets, served by gateway | Same as Linux |
-| `type: microvm` (e.g. `chat`, `agent`, `localhost-provider`, `did-provider`, `shell`, `webspace-provider`, `ipfs-provider`, `tunnel-provider`, ...) | KVM + crosvm | **Not on macOS yet.** See "Path to first-class support" below. |
+| `type: microvm` (e.g. `chat`, `agent`, `localhost-provider`, `did-provider`, `shell`, `webspace-provider`, `ipfs-provider`, `tunnel-provider`, ...) | KVM + crosvm on Linux; Apple Vz on macOS *(in progress — see below)* | **Day-5 boot proved a real Linux guest boots under Vz.** Phase 3 Day 1 shipped the supervisor → `VzProvider` seam, so `elastos start <microvm>` no longer bails before reaching `VzProvider::load_with_vm_config`. The supervisor's `RunningCapsule` registration (so `elastos ps` / `elastos stop` see Mac VMs) is **pending Phase 3 Day 2**, hence the typed fail-closed message on `start`. See [`vz-backend/PHASE_3_DAY_1_PORT_PLAN.md`](vz-backend/PHASE_3_DAY_1_PORT_PLAN.md). |
 
 The browser-hosted Home surface
 (`http://127.0.0.1:8090/apps/home/`) and its child apps (System, Inbox,

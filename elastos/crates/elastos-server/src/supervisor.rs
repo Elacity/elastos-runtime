@@ -961,16 +961,12 @@ impl Supervisor {
 
         #[cfg(target_os = "macos")]
         {
-            if !elastos_vz::is_supported() {
-                bail!(
-                    "Apple Virtualization.framework not available — cannot launch capsule '{name}' on this host. Requires macOS 12+ on Apple Silicon."
-                );
-            }
-            bail!(
-                "{} (supervisor: launch capsule '{}' on macOS not yet routed through Vz)",
-                elastos_vz::PHASE_1_STUB_MESSAGE,
-                name
-            );
+            // Clone to keep the Linux arm of this function
+            // (compiled but unreachable on Mac) byte-identical:
+            // it still owns the original manifest and capsule_dir.
+            return self
+                .start_capsule_vm_macos(name, manifest.clone(), capsule_dir.clone())
+                .await;
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1210,6 +1206,110 @@ impl Supervisor {
         }
 
         Ok((handle, cid))
+    }
+
+    /// Phase 3 Day 1 — supervisor seam to `VzProvider`.
+    ///
+    /// Replaces the pre-Day-1 `bail!()` that short-circuited the
+    /// macOS arm of [`Self::launch_capsule`] before any
+    /// substrate-agnostic launch step ran. **Day 1 deliberately
+    /// keeps scope minimal** ([`docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md`](../../../docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)):
+    ///
+    /// 1. Validate `elastos_vz::is_supported()` (Apple Silicon, macOS 12+).
+    /// 2. Construct an `elastos_vz::VmConfig` from the manifest using
+    ///    the same shape as the Linux arm does for `elastos_crosvm::VmConfig`.
+    /// 3. Hand it to [`elastos_vz::VzProvider::load_with_vm_config`]
+    ///    + [`elastos_vz::VzProvider::start`].
+    /// 4. Return a typed, named error explaining the supervisor
+    ///    `RunningCapsule` registration is pending Day 2 — the VM
+    ///    boots (Day 5 evidence) but is **not** tracked by
+    ///    `elastos ps` / `elastos stop` yet.
+    ///
+    /// **Explicitly NOT ported by Day 1** (Day 2+ work, named in
+    /// the port plan): session token injection, command payload,
+    /// capsule args, Carrier bridge spawn, rootfs overlay, TAP
+    /// network, supervisor `running` map insertion.
+    ///
+    /// The Linux launch path ([`Self::launch_capsule`] body below
+    /// this method) is **byte-identical** to the pre-Day-1 commit.
+    /// The macOS arm now early-returns through this helper.
+    #[cfg(target_os = "macos")]
+    async fn start_capsule_vm_macos(
+        &self,
+        name: &str,
+        manifest: elastos_common::CapsuleManifest,
+        capsule_dir: std::path::PathBuf,
+    ) -> Result<(String, u32)> {
+        use elastos_compute::ComputeProvider;
+        use elastos_vz::{VmConfig as VzVmConfig, VzConfig, VzProvider};
+
+        if !elastos_vz::is_supported() {
+            bail!(
+                "Apple Virtualization.framework not available — cannot launch capsule '{name}' on this host. Requires macOS 12+ on Apple Silicon."
+            );
+        }
+
+        let vz_config = VzConfig::default();
+        let provider = VzProvider::new(vz_config.clone())
+            .map_err(|e| anyhow::anyhow!("failed to construct VzProvider: {e}"))?;
+        provider
+            .init()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to init VzProvider state dir: {e}"))?;
+
+        // Day 1 builds a MINIMAL VmConfig. Day 2 will bake in
+        // session tokens, command payload, capsule args, and
+        // Carrier path here. The port plan lists every chunk.
+        let vm_config = VzVmConfig::from_manifest(&manifest, &capsule_dir, &vz_config.kernel_path);
+
+        // CID assignment so log lines stay diff-able across
+        // substrates. Apple doesn't let us hand this to Vz
+        // (Phase 0 §D pitfall #5); it's advisory only.
+        let cid = {
+            let mut next = self.next_cid.write().await;
+            let cid = *next;
+            *next += 1;
+            cid
+        };
+        let handle = Self::unique_handle(name, cid);
+
+        tracing::info!(
+            target: "supervisor",
+            capsule = name,
+            handle = %handle,
+            cid = cid,
+            "phase 3 day 1: reaching VzProvider::load_with_vm_config"
+        );
+
+        let capsule_handle = provider
+            .load_with_vm_config(vm_config, manifest)
+            .await
+            .map_err(|e| anyhow::anyhow!("vz provider load failed for '{}': {}", name, e))?;
+        provider
+            .start(&capsule_handle)
+            .await
+            .map_err(|e| anyhow::anyhow!("vz provider start failed for '{}': {}", name, e))?;
+
+        // Day 1 honest fail point: the VM is booting (Day 5
+        // evidence), but the supervisor's `RunningCapsule` map
+        // can't hold a Vz handle yet — `CapsuleBackend::Vm`
+        // wraps `Box<elastos_crosvm::vm::RunningVm>` and adding
+        // a `Vz` variant is Day 2 work. The VM keeps running
+        // (its `VzMachineHandle` is owned by `provider.vms`
+        // inside the local `provider`); it will be dropped when
+        // this function returns. That's deliberate: an
+        // un-registered VM would be invisible to `elastos ps`
+        // and `elastos stop`, which is a worse outcome than a
+        // fail-closed message naming the next milestone.
+        drop(provider); // explicit: VM stops here.
+        bail!(
+            "vz: capsule '{}' reached VzProvider::start (Phase 3 Day 1 seam), \
+             but supervisor RunningCapsule registration is pending Day 2 \
+             (needs CapsuleBackend::VzVm enum variant). \
+             VM was stopped cleanly. \
+             See docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md.",
+            name
+        );
     }
 
     /// Launch a Carrier-plane service as a host process (for `permissions.carrier: true`).
@@ -2053,5 +2153,95 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    /// Phase 3 Day 1 contract: on macOS, the supervisor must
+    /// reach `VzProvider::load_with_vm_config` for a synthetic
+    /// MicroVM capsule. Pre-Day-1, the macOS arm of
+    /// `launch_capsule` bailed with `PHASE_1_STUB_MESSAGE`
+    /// **before** any provider call. The post-Day-1 seam
+    /// surfaces a typed error from `load_with_vm_config`
+    /// (Kernel/Rootfs not found, or the Day-2-pending
+    /// registration message) — never the old stub.
+    ///
+    /// This test exercises `start_capsule_vm_macos` directly to
+    /// keep the assertion scope small (it doesn't depend on a
+    /// real on-disk capsule, only on the seam contract).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_capsule_vm_macos_reaches_vz_provider_after_phase3_day1() {
+        use elastos_common::{
+            CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, ResourceLimits, SCHEMA_V1,
+        };
+
+        let supervisor = make_test_supervisor();
+
+        // Synthetic microvm capsule. `capsule_dir` is a tempdir
+        // that intentionally does NOT contain a real rootfs;
+        // VzProvider::load_with_vm_config will fail at one of
+        // its input-validation gates (Kernel-not-found if no
+        // ~/.local/share/elastos/bin/vmlinux is installed, or
+        // Rootfs-not-found if a kernel is). Either failure is
+        // proof the seam was reached.
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = CapsuleManifest {
+            schema: SCHEMA_V1.into(),
+            version: "0.1.0".into(),
+            name: "phase3-day1-seam-test".into(),
+            description: None,
+            author: None,
+            role: CapsuleRole::App,
+            capsule_type: CapsuleType::MicroVM,
+            entrypoint: "rootfs.ext4".into(),
+            requires: Vec::new(),
+            provides: None,
+            capabilities: Vec::new(),
+            resources: ResourceLimits {
+                memory_mb: 128,
+                cpu_shares: 100,
+                gpu: false,
+            },
+            permissions: Default::default(),
+            microvm: Some(MicroVmConfig {
+                kernel: None,
+                boot_args: "console=ttyS0".into(),
+                http_port: None,
+                vcpu_count: Some(1),
+                rootfs_cid: None,
+                kernel_cid: None,
+                rootfs_size: None,
+                persistent_storage_mb: None,
+            }),
+            providers: None,
+            viewer: None,
+            signature: None,
+        };
+
+        let err = supervisor
+            .start_capsule_vm_macos("phase3-day1-seam-test", manifest, capsule_dir.to_path_buf())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        // The new seam MUST NOT surface the old Phase 1 stub.
+        assert!(
+            !msg.contains(elastos_vz::PHASE_1_STUB_MESSAGE),
+            "seam regression: error still contains the pre-Day-1 PHASE_1_STUB_MESSAGE: {msg}"
+        );
+
+        // The error MUST be from VzProvider — one of the input
+        // validation gates inside load_with_vm_config, OR the
+        // Day-1 fail-closed registration message after a
+        // successful load+start.
+        let is_kernel_missing = msg.contains("Kernel not found");
+        let is_rootfs_missing = msg.contains("Rootfs not found");
+        let is_day2_pending =
+            msg.contains("supervisor RunningCapsule registration is pending Day 2");
+        assert!(
+            is_kernel_missing || is_rootfs_missing || is_day2_pending,
+            "expected a typed error from VzProvider::load_with_vm_config \
+             (kernel-missing / rootfs-missing) or the Day-1 fail-closed \
+             registration message; got: {msg}"
+        );
     }
 }

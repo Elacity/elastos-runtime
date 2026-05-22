@@ -252,6 +252,8 @@ Risk: kernel config mismatch. Fallback: ship a small Mac-specific arm64 kernel b
 
 ### Phase 3 — Virtio plumbing: vsock + console + net + blk (1–2 weeks)
 
+**Status as of `73cd293 + Day-1 commit`**: Phase 3 Day 1 in progress. Supervisor → `VzProvider` seam shipped (`elastos start <microvm>` on Mac now reaches `VzProvider::load_with_vm_config` instead of bailing before any work). The wrong-shape `append_boot_args_for_vm` retired in favour of `load_with_vm_config`. Full Day-1 audit in [`PHASE_3_DAY_1_PORT_PLAN.md`](PHASE_3_DAY_1_PORT_PLAN.md). Day 2+ closes the remaining substrate-agnostic prefix (session token, command payload, Carrier bridge spawn, rootfs overlay) and the `CapsuleBackend::VzVm` enum extension that lets the supervisor register Vz VMs in its running map.
+
 Goal: a guest VM under Vz can speak the same wire protocols a guest under Crosvm speaks. Default networking mode requires **no Apple entitlements** so a normal Mac dev build works out of the box.
 
 - **virtio-vsock**: implement the host side of `VZVirtioSocketDevice`. Validate that the Carrier-bridge protocol used in [`carrier_bridge.rs`](../../elastos/crates/elastos-server/src/carrier_bridge.rs) flows guest↔host without changes to the bridge code.

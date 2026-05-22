@@ -118,55 +118,13 @@ impl ComputeProvider for VzProvider {
             }
         }
 
-        if !vm_config.kernel_path.exists() {
-            return Err(ElastosError::Compute(format!(
-                "Kernel not found: {}",
-                vm_config.kernel_path.display()
-            )));
-        }
-
-        // Mint a fresh capsule id matching the crosvm convention
-        // so log lines stay diff-able across substrates.
-        let id = CapsuleId::new(format!("microvm-{}", uuid::Uuid::new_v4()));
-        let socket_path = self.config.state_dir.join(&id.0);
-
-        #[cfg(target_os = "macos")]
-        {
-            let built = crate::ffi::builder::BuiltMachine::from_vm_config(&vm_config, &self.config)
-                .map_err(ElastosError::Compute)?;
-
-            let handle = crate::ffi::lifecycle::VzMachineHandle::new(
-                built,
-                self.queue.clone(),
-                vm_config.vm_id.clone(),
-            )
-            .map_err(ElastosError::Compute)?;
-
-            let vm = RunningVm::with_handle(vm_config, manifest.clone(), socket_path, handle);
-
-            self.vms.write().await.insert(id.clone(), vm);
-
-            tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
-
-            Ok(CapsuleHandle {
-                id,
-                manifest,
-                args: vec![],
-            })
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Non-macOS keeps the historical fail-closed
-            // contract: there is no Vz framework here. The
-            // workspace builds, but every load resolves to the
-            // stub message.
-            let _ = (vm_config, socket_path); // silence unused
-            Err(ElastosError::Compute(format!(
-                "{} (load: capsule='{}')",
-                PHASE_1_STUB_MESSAGE, manifest.name
-            )))
-        }
+        // Trait entry point: the caller (e.g. a smoke test) wants
+        // VzProvider to do all the VmConfig defaulting itself.
+        // The supervisor takes the parallel `load_with_vm_config`
+        // path instead, because it already bakes session tokens,
+        // command payloads, carrier-path, etc. into the boot args
+        // before calling us (Phase 3 Day 1 port plan).
+        self.load_with_vm_config(vm_config, manifest).await
     }
 
     async fn start(&self, handle: &CapsuleHandle) -> Result<()> {
@@ -218,6 +176,93 @@ impl ComputeProvider for VzProvider {
 }
 
 impl VzProvider {
+    /// Load a microVM from a pre-built [`VmConfig`].
+    ///
+    /// **Phase 3 Day 1 seam.** This is the API shape the
+    /// supervisor needs — Apple's `VZVirtualMachineConfiguration`
+    /// is frozen the moment `VZVirtualMachine::initWithConfiguration:queue:`
+    /// is invoked, so every boot arg (session token, command
+    /// payload, capsule args, carrier path, …) MUST be baked
+    /// into the `VmConfig` **before** `load`. The supervisor
+    /// does exactly this composition on Linux today
+    /// ([`elastos-server/src/supervisor.rs`](../../../elastos/crates/elastos-server/src/supervisor.rs)
+    /// L1019–1133) and Phase 3 Day 1 mirrors the same flow on
+    /// macOS.
+    ///
+    /// The trait method [`Self::load`] is a thin wrapper that
+    /// builds a default `VmConfig` from the manifest and calls
+    /// this method — useful for smoke tests and callers that
+    /// don't need bespoke boot-arg composition.
+    pub async fn load_with_vm_config(
+        &self,
+        vm_config: VmConfig,
+        manifest: CapsuleManifest,
+    ) -> Result<CapsuleHandle> {
+        if manifest.capsule_type != CapsuleType::MicroVM {
+            return Err(ElastosError::Compute(format!(
+                "VzProvider only supports MicroVM capsules, got: {:?}",
+                manifest.capsule_type
+            )));
+        }
+
+        if !vm_config.kernel_path.exists() {
+            return Err(ElastosError::Compute(format!(
+                "Kernel not found: {}",
+                vm_config.kernel_path.display()
+            )));
+        }
+
+        if !vm_config.rootfs_path.exists() {
+            return Err(ElastosError::CapsuleNotFound(format!(
+                "Rootfs not found: {}",
+                vm_config.rootfs_path.display()
+            )));
+        }
+
+        // Mint a fresh capsule id matching the crosvm convention
+        // so log lines stay diff-able across substrates.
+        let id = CapsuleId::new(format!("microvm-{}", uuid::Uuid::new_v4()));
+        let socket_path = self.config.state_dir.join(&id.0);
+
+        #[cfg(target_os = "macos")]
+        {
+            let built = crate::ffi::builder::BuiltMachine::from_vm_config(&vm_config, &self.config)
+                .map_err(ElastosError::Compute)?;
+
+            let handle = crate::ffi::lifecycle::VzMachineHandle::new(
+                built,
+                self.queue.clone(),
+                vm_config.vm_id.clone(),
+            )
+            .map_err(ElastosError::Compute)?;
+
+            let vm = RunningVm::with_handle(vm_config, manifest.clone(), socket_path, handle);
+
+            self.vms.write().await.insert(id.clone(), vm);
+
+            tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
+
+            Ok(CapsuleHandle {
+                id,
+                manifest,
+                args: vec![],
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Non-macOS keeps the historical fail-closed
+            // contract: there is no Vz framework here. The
+            // workspace builds, but every load resolves to the
+            // stub message.
+            let _ = (vm_config, socket_path); // silence unused
+            Err(ElastosError::Compute(format!(
+                "{} (load_with_vm_config: capsule='{}')",
+                PHASE_1_STUB_MESSAGE, manifest.name
+            )))
+        }
+    }
+
     /// Configure session credentials for a VM **before** load.
     ///
     /// Apple's `VZVirtualMachineConfiguration` is frozen the
@@ -261,13 +306,24 @@ impl VzProvider {
         None
     }
 
-    /// Append boot arguments to a VM before start. See the
-    /// note on `set_session_for_vm` for why this remains
-    /// fail-closed until a later day.
+    /// **Deprecated by Phase 3 Day 1.** Apple's
+    /// `VZVirtualMachineConfiguration` is frozen post-init
+    /// (Phase 0 §D pitfall #9); no boot arg can be appended
+    /// after the VM has been loaded. The correct shape is to
+    /// bake every boot arg into [`VmConfig::boot_args`]
+    /// **before** calling [`Self::load_with_vm_config`].
+    ///
+    /// This method is intentionally kept to surface a clear,
+    /// typed migration message to any caller still on the
+    /// pre-Day-1 API. It always fails closed.
     pub async fn append_boot_args_for_vm(&self, capsule_id: &CapsuleId, _args: &str) -> Result<()> {
         Err(ElastosError::Compute(format!(
-            "{} (append_boot_args_for_vm: capsule='{}')",
-            PHASE_1_STUB_MESSAGE, capsule_id.0
+            "vz: append_boot_args_for_vm is unsupported — \
+             VZVirtualMachineConfiguration is frozen after load. \
+             Bake boot args into VmConfig.boot_args and call \
+             VzProvider::load_with_vm_config(vm_config, manifest) instead. \
+             (capsule='{}'; see docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md)",
+            capsule_id.0
         )))
     }
 
@@ -405,16 +461,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vz_provider_session_and_boot_args_still_fail_closed_with_stub() {
+    async fn vz_provider_session_and_network_still_fail_closed_with_stub() {
+        // Day 3 contract: set_session_for_vm and set_network_for_vm
+        // still surface PHASE_1_STUB_MESSAGE. Phase 3 Day 1
+        // explicitly leaves them — Day 2 removes them entirely
+        // in favour of supervisor-side baking into VmConfig.
         let provider = VzProvider::new(VzConfig::default()).unwrap();
         let capsule_id = CapsuleId::new("phase2-day3-session".to_string());
 
         let session_err = provider
             .set_session_for_vm(&capsule_id, "abc12345", "http://127.0.0.1:3000")
-            .await
-            .unwrap_err();
-        let bootargs_err = provider
-            .append_boot_args_for_vm(&capsule_id, "extra.token=value")
             .await
             .unwrap_err();
         let network_err = provider
@@ -424,7 +480,6 @@ mod tests {
 
         for (label, err) in [
             ("set_session_for_vm", session_err),
-            ("append_boot_args_for_vm", bootargs_err),
             ("set_network_for_vm", network_err),
         ] {
             let msg = err.to_string();
@@ -433,6 +488,46 @@ mod tests {
                 "{label}: expected stub message, got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn vz_provider_append_boot_args_returns_typed_migration_error_after_phase3_day1() {
+        // Phase 3 Day 1 contract: the old mid-life-cycle
+        // append_boot_args_for_vm shape is unsupported because
+        // VZVirtualMachineConfiguration is frozen after load.
+        // The method exists only to surface a typed migration
+        // message pointing callers at load_with_vm_config.
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let capsule_id = CapsuleId::new("phase3-day1-bootargs".to_string());
+
+        let err = provider
+            .append_boot_args_for_vm(&capsule_id, "elastos.token=ignored")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+
+        // Must NOT carry the old PHASE_1_STUB_MESSAGE — Day 1
+        // explicitly retires that text here so operators don't
+        // confuse this with the (still-stubbed) session/network
+        // surfaces.
+        assert!(
+            !msg.contains(PHASE_1_STUB_MESSAGE),
+            "append_boot_args_for_vm should no longer use the Phase 1 stub message; got: {msg}"
+        );
+
+        // Must point at the correct new API and the port plan.
+        assert!(
+            msg.contains("load_with_vm_config"),
+            "expected the error to name load_with_vm_config, got: {msg}"
+        );
+        assert!(
+            msg.contains("VZVirtualMachineConfiguration is frozen"),
+            "expected the error to name Apple's constraint, got: {msg}"
+        );
+        assert!(
+            msg.contains(&capsule_id.0),
+            "expected the error to carry the capsule id, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -452,5 +547,113 @@ mod tests {
         let provider = VzProvider::new(VzConfig::default()).unwrap();
         let id = CapsuleId::new("not-here".to_string());
         assert!(provider.get_vm_id(&id).await.is_none());
+    }
+
+    use std::path::PathBuf;
+
+    /// Synthesise a `VmConfig` shaped like one
+    /// `Supervisor::start_capsule_vm` would build for Vz —
+    /// minimal fields, no real Vz allocation required.
+    fn synthetic_vm_config(name: &str, kernel: PathBuf, rootfs: PathBuf) -> VmConfig {
+        VmConfig {
+            vm_id: format!("microvm-{name}"),
+            kernel_path: kernel,
+            boot_args: String::from("console=hvc0"),
+            rootfs_path: rootfs,
+            rootfs_readonly: false,
+            mem_size_mib: 128,
+            vcpu_count: 1,
+            http_port: None,
+            data_disk_path: None,
+            vsock_cid: 3,
+            network: None,
+            interactive_stdio: false,
+            carrier_socket_path: None,
+            initramfs_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn vz_provider_load_with_vm_config_rejects_non_microvm_capsule_type() {
+        // Phase 3 Day 1 contract: load_with_vm_config enforces
+        // the same MicroVM-only constraint as load(), so wrong
+        // capsule types fail fast before any Vz allocation
+        // happens.
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let manifest = capsule_manifest("wasm-capsule", CapsuleType::Wasm);
+        let vm_config = synthetic_vm_config(
+            "phase3-day1-wrongtype",
+            PathBuf::from("/nonexistent/kernel"),
+            PathBuf::from("/nonexistent/rootfs"),
+        );
+
+        let err = provider
+            .load_with_vm_config(vm_config, manifest)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("only supports MicroVM"),
+            "expected MicroVM-only error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vz_provider_load_with_vm_config_returns_kernel_not_found_when_kernel_missing() {
+        // Phase 3 Day 1 contract: load_with_vm_config validates
+        // its inputs in the same order Day 3's load() did —
+        // capsule type, then kernel, then rootfs. The supervisor
+        // can rely on this order when surfacing typed errors
+        // upstream.
+        let provider = VzProvider::new(VzConfig::default()).unwrap();
+        let manifest = capsule_manifest("phase3-day1-no-kernel", CapsuleType::MicroVM);
+        let vm_config = synthetic_vm_config(
+            "phase3-day1-no-kernel",
+            PathBuf::from("/nonexistent/kernel-for-phase3-day1"),
+            PathBuf::from("/nonexistent/rootfs-for-phase3-day1"),
+        );
+
+        let err = provider
+            .load_with_vm_config(vm_config, manifest)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Kernel not found"),
+            "expected 'Kernel not found' (first validation gate), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vz_provider_load_with_vm_config_preserves_baked_boot_args() {
+        // Phase 3 Day 1 contract: any boot args the supervisor
+        // bakes into VmConfig.boot_args (session token, command
+        // payload, capsule args, carrier path, …) must reach
+        // load_with_vm_config unchanged. We assert the VmConfig
+        // round-trips because the production validation path
+        // exits early on kernel-missing, before any FFI build.
+        // The boot-args plumbing into VZLinuxBootLoader is
+        // already covered by
+        // ffi::builder::tests::from_vm_config_*.
+        let mut vm_config = synthetic_vm_config(
+            "phase3-day1-bootargs",
+            PathBuf::from("/nonexistent/kernel-phase3-day1-bootargs"),
+            PathBuf::from("/nonexistent/rootfs-phase3-day1-bootargs"),
+        );
+        let baked = "console=hvc0 elastos.token=abc elastos.carrier_path=/dev/hvc1";
+        vm_config.boot_args = baked.to_string();
+
+        assert_eq!(
+            vm_config.boot_args, baked,
+            "VmConfig.boot_args is a plain mutable field; the seam relies on the supervisor's pre-load mutation"
+        );
+        assert!(
+            vm_config.boot_args.contains("elastos.token="),
+            "session token survived the seam"
+        );
+        assert!(
+            vm_config
+                .boot_args
+                .contains("elastos.carrier_path=/dev/hvc1"),
+            "carrier path survived the seam (Mac uses /dev/hvc1, not /dev/hvc0)"
+        );
     }
 }
