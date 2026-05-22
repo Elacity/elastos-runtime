@@ -1956,6 +1956,14 @@ mod tests {
 
     #[test]
     fn verify_component_binary_with_data_dir_verifies_installed_agent_binary() {
+        // Sibling to setup::tests::test_verify_installed_component_binary_*:
+        // the fixture's platforms-map key must match the host the
+        // test actually runs on, otherwise the production code's
+        // platform lookup returns "no platform entry for <host>"
+        // before it ever validates the checksum. Using
+        // `setup::detect_platform()` keeps the test exercising the
+        // SAME property on every host (Linux CI + local Mac).
+        let platform = elastos_server::setup::detect_platform();
         let data_dir = tempfile::tempdir().unwrap();
         let bin_dir = data_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -1975,8 +1983,8 @@ mod tests {
     "agent": {{
       "install_path": "bin/agent",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/agent"
         }}
       }}
@@ -1984,7 +1992,6 @@ mod tests {
   }},
   "profiles": {{}}
 }}"#,
-                checksum
             )
         })
         .unwrap();

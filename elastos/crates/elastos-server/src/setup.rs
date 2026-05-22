@@ -2133,6 +2133,14 @@ mod tests {
 
     #[test]
     fn test_verify_installed_component_binary_requires_checksum() {
+        // Fixture must carry an entry for the platform the test
+        // actually runs on; otherwise `verify_installed_component_binary`
+        // surfaces "no platform entry for <host>" before it gets a
+        // chance to notice the missing checksum — and the assertion
+        // on "missing checksum" never fires. Using `detect_platform()`
+        // keeps the test exercising the SAME property on every host
+        // (Linux CI + local Mac).
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2141,21 +2149,23 @@ mod tests {
         fs::write(&install_path, b"shell-binary").unwrap();
         fs::write(
             data_dir.join("components.json"),
-            r#"{
-  "external": {
-    "shell": {
+            format!(
+                r#"{{
+  "external": {{
+    "shell": {{
       "install_path": "bin/shell",
-      "platforms": {
-        "linux-amd64": {
+      "platforms": {{
+        "{platform}": {{
           "checksum": "",
           "url": "https://example.invalid/shell"
-        }
-      }
-    }
-  },
-  "capsules": {},
-  "profiles": {}
-}"#,
+        }}
+      }}
+    }}
+  }},
+  "capsules": {{}},
+  "profiles": {{}}
+}}"#,
+            ),
         )
         .unwrap();
 
@@ -2167,6 +2177,10 @@ mod tests {
 
     #[test]
     fn test_verify_installed_component_binary_verifies_checksum() {
+        // See the comment on the sibling `requires_checksum` test
+        // for why the fixture key is the current host platform
+        // instead of a hard-coded "linux-amd64".
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2183,8 +2197,8 @@ mod tests {
     "shell": {{
       "install_path": "bin/shell",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/shell"
         }}
       }}
@@ -2193,7 +2207,6 @@ mod tests {
   "capsules": {{}},
   "profiles": {{}}
 }}"#,
-                checksum
             ),
         )
         .unwrap();
@@ -2204,6 +2217,13 @@ mod tests {
 
     #[test]
     fn test_write_installed_manifest_stamps_local_copy_checksum() {
+        // Two coupled platform strings here: the JSON fixture key
+        // AND the `write_installed_manifest(.., platform)` argument
+        // MUST agree so the function finds a matching entry to stamp.
+        // Hard-coding either to "linux-amd64" makes the test
+        // host-specific; using `detect_platform()` keeps it
+        // exercising the same property on every host.
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2219,7 +2239,7 @@ mod tests {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
                     "platforms": {
-                        "linux-amd64": {
+                        platform.as_str(): {
                             "strategy": "local-copy",
                             "source": source_path.to_string_lossy(),
                             "install_path": "bin/vmlinux"
@@ -2232,7 +2252,7 @@ mod tests {
         }))
         .unwrap();
 
-        let stamped = write_installed_manifest(data_dir, &manifest, "linux-amd64").unwrap();
+        let stamped = write_installed_manifest(data_dir, &manifest, &platform).unwrap();
         assert_eq!(stamped, vec!["vmlinux".to_string()]);
 
         let result = verify_installed_component_binary(data_dir, "vmlinux", &install_path).unwrap();
