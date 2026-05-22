@@ -3,10 +3,27 @@
 //! This adapter implements the runtime `Provider` trait and forwards raw JSON
 //! requests over the Carrier-managed guest control network. Capsules are
 //! expected to expose line-delimited JSON on the configured port.
+//!
+//! Two host→guest transports are supported:
+//!
+//! 1. **Linux flow (default).** Crosvm's TAP networking gives the host a
+//!    routable IP for the guest, and the bridge dials it via TCP (or
+//!    `AF_VSOCK` when `guest_host` parses as a numeric CID). Byte-identical
+//!    to the pre-Phase-3 behaviour.
+//! 2. **macOS flow (Phase 3 Day 6).** Apple's `Virtualization.framework`
+//!    forbids `socket(AF_VSOCK, …)`; the only supported host→guest channel
+//!    is `VZVirtioSocketDevice.connectToPort:`. The supervisor registers a
+//!    [`MacVsockDial`] closure when launching a Vz VM, and the bridge
+//!    uses it instead of opening an `AF_VSOCK` socket. The closure looks
+//!    up the live [`crate::supervisor::RunningCapsule`] for the handle,
+//!    downcasts to the `VzVm` backend, and calls `RunningVm::connect_vsock`
+//!    (Phase 3 Day 5 primitive).
 
+use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +31,17 @@ use elastos_runtime::provider::{
     EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
     ResourceResponse,
 };
+
+/// Boxed-future closure that dials the guest's vsock listener on a given
+/// port and returns an owned host-side fd. **Phase 3 Day 6.**
+///
+/// The supervisor builds one of these per Mac microVM provider route at
+/// launch time. The closure captures a `Weak` reference to the running
+/// map plus the capsule handle, so the lookup is lazy and a torn-down
+/// VM cleanly surfaces `io::ErrorKind::NotConnected`.
+pub type MacVsockDial = Arc<
+    dyn Fn(u32) -> Pin<Box<dyn Future<Output = std::io::Result<OwnedFd>> + Send>> + Send + Sync,
+>;
 
 struct VmIo {
     reader: BufReader<Box<dyn Read + Send>>,
@@ -32,6 +60,10 @@ struct VmRawBridge {
     guest_port: u16,
     init_config: serde_json::Value,
     io: Mutex<Option<VmIo>>,
+    /// Phase 3 Day 6: when present, the bridge bypasses `socket(AF_VSOCK,…)`
+    /// and instead calls this closure to obtain the host-side fd. Required
+    /// for macOS, where `AF_VSOCK` is not exposed to userspace.
+    mac_vsock_dialer: Option<MacVsockDial>,
 }
 
 impl VmRawBridge {
@@ -41,6 +73,28 @@ impl VmRawBridge {
             guest_port,
             init_config,
             io: Mutex::new(None),
+            mac_vsock_dialer: None,
+        }
+    }
+
+    /// Phase 3 Day 6 — Mac construction.
+    ///
+    /// `guest_host` is still passed for log parity with the Linux flow
+    /// (it shows up in error messages and traces), but the actual dial
+    /// goes through the supplied closure rather than an `AF_VSOCK`
+    /// socket. The Linux side keeps using [`VmRawBridge::new`].
+    fn new_with_vsock_dialer(
+        guest_host: String,
+        guest_port: u16,
+        init_config: serde_json::Value,
+        dialer: MacVsockDial,
+    ) -> Self {
+        Self {
+            guest_host,
+            guest_port,
+            init_config,
+            io: Mutex::new(None),
+            mac_vsock_dialer: Some(dialer),
         }
     }
 
@@ -79,6 +133,14 @@ impl VmRawBridge {
     }
 
     fn try_connect_once(&self) -> Result<VmIo, ProviderError> {
+        // Phase 3 Day 6: prefer the Mac vsock dialer when set. We
+        // route by closure presence rather than `cfg!(target_os)` so
+        // tests on either platform can inject a fake dialer to
+        // exercise the bridge end-to-end without touching the kernel.
+        if let Some(dialer) = self.mac_vsock_dialer.clone() {
+            return self.try_mac_vsock_dial(dialer, self.guest_port as u32);
+        }
+
         // Connect via vsock (guest_host is the vsock CID as a string)
         if let Ok(cid) = self.guest_host.parse::<u32>() {
             return self.try_vsock_connect(cid, self.guest_port as u32);
@@ -219,6 +281,57 @@ impl VmRawBridge {
                 raw_fd,
             })
         }
+    }
+
+    /// Phase 3 Day 6 — Mac transport.
+    ///
+    /// Drive the supervisor-provided dialer (which ultimately calls
+    /// `VZVirtioSocketDevice.connectToPort:`) and wrap the resulting
+    /// fd in the same blocking `VmIo` shape used by the Linux
+    /// `AF_VSOCK` and TCP paths.
+    ///
+    /// We are called from inside `tokio::task::spawn_blocking`
+    /// (`Provider::send_raw` → `block_in_place` semantics) so it is
+    /// safe to drive a `Future` to completion with
+    /// `Handle::block_on`. Doing so on a runtime worker thread would
+    /// panic; doing it on a blocking-pool thread is the standard
+    /// idiom for "sync API that needs async I/O".
+    fn try_mac_vsock_dial(&self, dialer: MacVsockDial, port: u32) -> Result<VmIo, ProviderError> {
+        use std::os::unix::io::FromRawFd;
+
+        let owned_fd = tokio::runtime::Handle::current()
+            .block_on(dialer(port))
+            .map_err(|e| {
+                ProviderError::Provider(format!(
+                    "mac vsock dial to '{}' port {} failed: {}",
+                    self.guest_host, port, e
+                ))
+            })?;
+
+        // Mirror the AF_VSOCK arm: re-wrap the fd into a `File`,
+        // clone it for the writer half, and stash the raw fd for
+        // later `poll()` use in `wait_for_response`.
+        let raw_fd = owned_fd.as_raw_fd();
+        // SAFETY: `owned_fd` is the sole owner of this fd, returned
+        // from `RunningVm::connect_vsock` (which itself `dup`s the
+        // Vz-managed connection fd). Converting to `File` transfers
+        // ownership; we immediately `try_clone` for the writer, and
+        // the original `OwnedFd` is forgotten via `into_raw_fd`.
+        let stream = unsafe {
+            use std::os::fd::IntoRawFd;
+            std::fs::File::from_raw_fd(owned_fd.into_raw_fd())
+        };
+        let writer = stream
+            .try_clone()
+            .map_err(|e| ProviderError::Provider(format!("mac vsock clone failed: {e}")))?;
+        let reader: BufReader<Box<dyn Read + Send>> = BufReader::new(Box::new(stream));
+        let writer: Box<dyn Write + Send> = Box::new(writer);
+
+        Ok(VmIo {
+            reader,
+            writer,
+            raw_fd,
+        })
     }
 
     fn send_raw_blocking(
@@ -447,6 +560,32 @@ impl VmCapsuleProvider {
         Self {
             scheme,
             bridge: Arc::new(VmRawBridge::new(guest_host, guest_port, init_config)),
+        }
+    }
+
+    /// Phase 3 Day 6 — macOS constructor.
+    ///
+    /// Identical to [`Self::new`] except the underlying bridge will
+    /// dial through `dialer` rather than `socket(AF_VSOCK,…)`. Used
+    /// only by the supervisor's `start_capsule_vm_macos` path; the
+    /// Linux launch path continues to use [`Self::new`].
+    pub fn new_with_vsock_dialer(
+        scheme: impl Into<String>,
+        guest_host: String,
+        guest_port: u16,
+        init_config: serde_json::Value,
+        dialer: MacVsockDial,
+    ) -> Self {
+        let scheme = scheme.into().to_ascii_lowercase();
+        let scheme: &'static str = Box::leak(scheme.into_boxed_str());
+        Self {
+            scheme,
+            bridge: Arc::new(VmRawBridge::new_with_vsock_dialer(
+                guest_host,
+                guest_port,
+                init_config,
+                dialer,
+            )),
         }
     }
 
@@ -748,5 +887,208 @@ mod tests {
                 "{host}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 Day 6: MacVsockDial integration tests.
+    // -----------------------------------------------------------------
+    //
+    // These tests exercise `VmRawBridge::try_mac_vsock_dial` without
+    // touching the kernel's `AF_VSOCK` path. We inject a mock dialer
+    // that hands over one end of a socketpair, and a "fake guest"
+    // thread services the other end with a stock line-delimited JSON
+    // protocol. The bridge cannot tell the difference between this
+    // and a real `VZVirtioSocketDevice.connectToPort:` connection —
+    // both surface as a single `OwnedFd`.
+
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::sync::Mutex as StdMutex;
+
+    /// Build a socketpair and return the two halves as owned fds.
+    fn socketpair_owned_fds() -> (OwnedFd, OwnedFd) {
+        let (a, b) = StdUnixStream::pair().expect("socketpair");
+        a.set_nonblocking(false).unwrap();
+        b.set_nonblocking(false).unwrap();
+        (a.into(), b.into())
+    }
+
+    /// Build a `MacVsockDial` that hands out the fd held in `slot`
+    /// on its first call and fails with `NotConnected` afterwards
+    /// (mirrors a torn-down VM). We use a `Mutex<Option<OwnedFd>>`
+    /// because the dialer's `Fn` signature does not allow direct
+    /// moves out of captured state.
+    fn one_shot_dialer(slot: Arc<StdMutex<Option<OwnedFd>>>) -> MacVsockDial {
+        Arc::new(move |_port: u32| {
+            let slot = slot.clone();
+            Box::pin(async move {
+                let mut guard = slot.lock().unwrap();
+                guard.take().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "dialer slot drained — vm gone",
+                    )
+                })
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vm_capsule_provider_uses_mac_dialer_when_present() {
+        // Host end is what the dialer hands to the bridge; guest end
+        // is what the fake guest thread reads/writes.
+        let (host_fd, guest_fd) = socketpair_owned_fds();
+        let slot = Arc::new(StdMutex::new(Some(host_fd)));
+        let dialer = one_shot_dialer(slot);
+
+        // Fake guest: handle the bridge's init handshake first
+        // (`{"op":"init", "config": {…}}`), then service the actual
+        // request. Mirrors what a real provider capsule does inside
+        // its vsock listener loop on the guest side.
+        //
+        // After the response we block on a final read so the
+        // socket stays open until the bridge has actually parsed
+        // the response. Without this the bridge's `poll()` races
+        // the guest's drop and observes `POLLIN | POLLHUP` (0x11),
+        // which it treats as unhealthy and fails the request.
+        let guest_handle = std::thread::spawn(move || {
+            use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+            let stream: StdUnixStream = guest_fd.into();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let mut init_line = String::new();
+            reader.read_line(&mut init_line).expect("guest read init");
+            let init_parsed: serde_json::Value =
+                serde_json::from_str(&init_line).expect("guest parse init");
+            assert_eq!(
+                init_parsed.get("op").and_then(|v| v.as_str()),
+                Some("init"),
+                "first frame must be init"
+            );
+            writer
+                .write_all(b"{\"status\":\"ok\"}\n")
+                .expect("guest init ack");
+
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).expect("guest read req");
+            let req_parsed: serde_json::Value =
+                serde_json::from_str(&req_line).expect("guest parse req");
+            assert_eq!(req_parsed.get("op").and_then(|v| v.as_str()), Some("read"));
+            writer
+                .write_all(b"{\"status\":\"ok\",\"data\":{\"content\":[104,105]}}\n")
+                .expect("guest write");
+
+            // Stay alive until the bridge closes its half; this
+            // prevents the bridge's poll() from observing POLLHUP
+            // mid-response.
+            let mut sink = [0u8; 64];
+            let _ = reader.get_mut().read(&mut sink);
+        });
+
+        // Build the provider with the dialer; run send_raw on a
+        // blocking thread (the bridge expects to be invoked from
+        // `spawn_blocking`-equivalent context, exactly like the
+        // Linux production path).
+        let provider = VmCapsuleProvider::new_with_vsock_dialer(
+            "localhost",
+            "handle-test".into(),
+            7000,
+            serde_json::json!({}),
+            dialer,
+        );
+        let bridge = provider.bridge.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            bridge.send_raw_blocking(&serde_json::json!({
+                "op": "read",
+                "path": "anything",
+                "token": ""
+            }))
+        })
+        .await
+        .expect("blocking task")
+        .expect("bridge call");
+
+        assert_eq!(response.get("status").and_then(|v| v.as_str()), Some("ok"));
+        let content = response
+            .get("data")
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        assert_eq!(content.len(), 2);
+
+        // Drop the provider so the bridge's writer half closes,
+        // letting the guest's parking read return cleanly.
+        drop(provider);
+        guest_handle.join().expect("guest thread");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vm_capsule_provider_propagates_dialer_errors() {
+        // Empty slot — dialer's first call returns NotConnected.
+        // This is the shape `start_capsule_vm_macos`'s dialer
+        // produces when the running map no longer contains the
+        // capsule handle (torn-down VM, supervisor reaped).
+        let slot = Arc::new(StdMutex::new(None::<OwnedFd>));
+        let dialer = one_shot_dialer(slot);
+
+        let bridge = Arc::new(VmRawBridge::new_with_vsock_dialer(
+            "handle-missing".into(),
+            7000,
+            serde_json::json!({}),
+            dialer,
+        ));
+        let bridge_call = bridge.clone();
+        let err = tokio::task::spawn_blocking(move || {
+            bridge_call.send_raw_blocking(&serde_json::json!({"op":"ping"}))
+        })
+        .await
+        .expect("blocking task")
+        .expect_err("expected dialer error");
+
+        // The connect() retry loop wraps the dialer's error in its
+        // own message; we only require that the original payload
+        // ("vm gone") shows up somewhere in the chain.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vm gone") || msg.contains("dialer"),
+            "expected dialer error to surface, got: {msg}"
+        );
+
+        // Bridge state must remain clean after a failed dial — the
+        // io guard must not be set so a subsequent send retries the
+        // dialer rather than reusing a half-built `VmIo`.
+        assert!(bridge.io.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mac_vsock_dialer_takes_priority_over_af_vsock_path() {
+        // Defensive: the dialer-bearing bridge must NOT fall through
+        // to the AF_VSOCK socket path. We verify this by pointing
+        // `guest_host` at a value that would otherwise parse as a
+        // numeric CID (`42`) — the dialer must short-circuit and
+        // produce its own error, NOT one mentioning
+        // `vsock connect to CID 42:…`.
+        let slot = Arc::new(StdMutex::new(None::<OwnedFd>));
+        let dialer = one_shot_dialer(slot);
+
+        let bridge =
+            VmRawBridge::new_with_vsock_dialer("42".into(), 7000, serde_json::json!({}), dialer);
+        let result = tokio::task::spawn_blocking(move || bridge.try_connect_once())
+            .await
+            .unwrap();
+        let err = match result {
+            Ok(_) => panic!("dialer returned no fd; expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("vsock connect to CID"),
+            "AF_VSOCK fallback fired despite Mac dialer being set: {msg}"
+        );
+        assert!(
+            msg.contains("mac vsock dial"),
+            "expected the mac dialer's error wrapper, got: {msg}"
+        );
     }
 }

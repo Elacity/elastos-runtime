@@ -563,6 +563,86 @@ impl Supervisor {
         }
     }
 
+    /// Phase 3 Day 6 — Mac sibling of [`Supervisor::register_provider_route`].
+    ///
+    /// Diff vs the Linux helper: `VmCapsuleProvider` is constructed
+    /// with [`crate::vm_provider::VmCapsuleProvider::new_with_vsock_dialer`]
+    /// so the bridge dials the guest via Apple's
+    /// `VZVirtioSocketDevice.connectToPort:` (the Day 5 primitive)
+    /// instead of `socket(AF_VSOCK,…)`. `guest_host` is the
+    /// capsule's supervisor handle string — purely for log parity;
+    /// the dialer drives the connection.
+    ///
+    /// Linux registration paths are byte-identical because they
+    /// keep calling [`Self::register_provider_route`]; this helper
+    /// is only invoked from the macOS launch arm.
+    #[cfg(target_os = "macos")]
+    async fn register_provider_route_with_vsock_dialer(
+        &self,
+        capsule_name: &str,
+        provides: Option<&str>,
+        guest_host: String,
+        init_config: serde_json::Value,
+        dialer: crate::vm_provider::MacVsockDial,
+    ) -> Option<ProviderRoute> {
+        if !vm_provider_bridge_enabled() {
+            return None;
+        }
+        let registry = self.provider_registry.as_ref()?;
+        let provides = provides?;
+        let route = Self::parse_provider_route_from_provides(provides)?;
+        let provider_scheme = match &route {
+            ProviderRoute::SubProvider(sub) => sub.clone(),
+            ProviderRoute::Scheme(scheme) => scheme.clone(),
+        };
+
+        let provider: Arc<dyn elastos_runtime::provider::Provider> =
+            Arc::new(VmCapsuleProvider::new_with_vsock_dialer(
+                provider_scheme,
+                guest_host.clone(),
+                VM_PROVIDER_PORT,
+                init_config,
+                dialer,
+            ));
+
+        match route.clone() {
+            ProviderRoute::SubProvider(sub) => {
+                match registry.register_sub_provider(&sub, provider).await {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Registered Vz VM sub-provider route elastos://{}/... -> capsule '{}' (handle={}, port={})",
+                            sub,
+                            capsule_name,
+                            guest_host,
+                            VM_PROVIDER_PORT
+                        );
+                        Some(ProviderRoute::SubProvider(sub))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to register Vz VM provider route for '{}' ({}): {}",
+                            capsule_name,
+                            provides,
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            ProviderRoute::Scheme(scheme) => {
+                registry.register(provider).await;
+                tracing::info!(
+                    "Registered Vz VM provider route {}://... -> capsule '{}' (handle={}, port={})",
+                    scheme,
+                    capsule_name,
+                    guest_host,
+                    VM_PROVIDER_PORT
+                );
+                Some(ProviderRoute::Scheme(scheme))
+            }
+        }
+    }
+
     async fn register_carrier_service_route(
         &self,
         capsule_name: &str,
@@ -1320,6 +1400,12 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("failed to init VzProvider state dir: {e}"))?;
 
+        // Phase 3 Day 6: keep a copy of `launch_config` for the
+        // provider-route registration below; `build_vm_config_for_mac`
+        // consumes its input to assemble boot args (matching the
+        // Linux flow at L1013–L1203 where `launch_config` is moved
+        // into `register_provider_route`).
+        let launch_config_for_route = config.clone();
         let (vm_config, handle, cid, _carrier_socket_path) = self
             .build_vm_config_for_mac(name, &manifest, &capsule_dir, config, &vz_config)
             .await?;
@@ -1420,14 +1506,81 @@ impl Supervisor {
             }
         }
 
-        let route = None; // NAT-only on Mac (Phase 3 Day 4+ for bridged).
+        // Phase 3 Day 6: Mac provider-route registration.
+        //
+        // The Linux arm calls `register_provider_route` with the
+        // guest's TAP IP; on Mac we have no IP (NAT-only, no
+        // entitlements) so we register through a vsock dialer
+        // instead. The dialer captures a `Weak` of the supervisor's
+        // running map plus this capsule's handle, and resolves the
+        // live `RunningVm` on every dial — so a torn-down VM
+        // surfaces `io::ErrorKind::NotConnected` cleanly rather
+        // than panicking or holding a dangling Arc.
+        //
+        // We must register BEFORE inserting into `self.running`
+        // because the dialer only needs `Weak<RwLock<…>>` to
+        // function — the actual `RunningCapsule` will be present
+        // by the time any other capsule issues a request that
+        // routes through this provider.
+        let provider_route = if manifest.provides.is_some() {
+            let running_weak = Arc::downgrade(&self.running);
+            let handle_for_dialer = handle.clone();
+            let dialer: crate::vm_provider::MacVsockDial = Arc::new(move |port: u32| {
+                let running_weak = running_weak.clone();
+                let handle = handle_for_dialer.clone();
+                Box::pin(async move {
+                    let Some(running) = running_weak.upgrade() else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "supervisor running map has been dropped",
+                        ));
+                    };
+                    let map = running.read().await;
+                    let Some(rc) = map.get(&handle) else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            format!("capsule handle '{handle}' is no longer running"),
+                        ));
+                    };
+                    match &rc.backend {
+                        CapsuleBackend::VzVm(vm) => vm
+                            .connect_vsock(port)
+                            .await
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    e.to_string(),
+                                )
+                            }),
+                        _ => Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            format!(
+                                "capsule '{handle}' is not a Vz VM (defensive — supervisor invariant)"
+                            ),
+                        )),
+                    }
+                })
+            });
+
+            self.register_provider_route_with_vsock_dialer(
+                name,
+                manifest.provides.as_deref(),
+                handle.clone(),
+                launch_config_for_route,
+                dialer,
+            )
+            .await
+        } else {
+            None
+        };
+
         let started_at = std::time::Instant::now();
         let running_capsule = RunningCapsule {
             name: name.to_string(),
             handle: handle.clone(),
             vsock_cid: cid,
             started_at,
-            provider_route: route,
+            provider_route,
             backend: CapsuleBackend::VzVm(Box::new(vz_vm)),
         };
         self.running
@@ -2922,6 +3075,119 @@ mod tests {
             fs::read(&vm_config.rootfs_path).unwrap(),
             b"phase3-day2-fake-rootfs",
             "overlay must carry the source rootfs bytes verbatim"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 3 Day 6 — provider-bridge registration on the Mac arm.
+    // ---------------------------------------------------------------
+
+    /// The Mac sibling of `register_provider_route` must actually
+    /// land a `Provider` in the supervisor's registry for the
+    /// `localhost://` scheme when the manifest declares
+    /// `provides: localhost://…`. The dialer doesn't fire during
+    /// registration (only at first request), so we can validate
+    /// the registration path without a live VM.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn register_provider_route_with_vsock_dialer_attaches_provider_to_registry() {
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let mut supervisor = make_test_supervisor();
+        supervisor.set_provider_registry(Arc::clone(&registry));
+
+        let dialer: crate::vm_provider::MacVsockDial = Arc::new(|_port| {
+            Box::pin(async move {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "test dialer never fires",
+                ))
+            })
+        });
+
+        let route = supervisor
+            .register_provider_route_with_vsock_dialer(
+                "localhost-provider-mac",
+                Some("localhost://"),
+                "vm-localhost-provider-mac-1".into(),
+                serde_json::json!({"hello": "world"}),
+                dialer,
+            )
+            .await;
+
+        match route {
+            Some(ProviderRoute::Scheme(s)) => assert_eq!(s, "localhost"),
+            other => panic!("expected Scheme('localhost'), got {other:?}"),
+        }
+
+        // The registry must now resolve the scheme — confirming a
+        // real `VmCapsuleProvider` (with the dialer) was inserted.
+        assert!(
+            registry.has_provider("localhost").await,
+            "expected provider to be resolvable for 'localhost' scheme"
+        );
+    }
+
+    /// The dialer closure baked into `start_capsule_vm_macos` looks
+    /// up the live `RunningCapsule` via `Weak<…>` so a torn-down VM
+    /// surfaces a clean `io::ErrorKind::NotConnected` rather than
+    /// panicking. We can't easily boot a real Vz VM in test, but we
+    /// CAN reproduce the closure shape against an empty running
+    /// map — which is exactly the state the supervisor's reaper
+    /// leaves behind for a dead VM.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_vsock_dialer_closure_returns_not_connected_when_handle_is_missing() {
+        // Build the same `Weak<RwLock<HashMap<…>>>` topology that
+        // `start_capsule_vm_macos` would use, but never populate
+        // the map. This exercises both fall-throughs in the
+        // closure: `weak.upgrade()` ok, then `map.get(handle)` miss.
+        let running: Arc<RwLock<HashMap<String, RunningCapsule>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let running_weak = Arc::downgrade(&running);
+        let handle_for_dialer: String = "vm-phantom-1-1".into();
+
+        let dialer: crate::vm_provider::MacVsockDial = Arc::new(move |port: u32| {
+            let running_weak = running_weak.clone();
+            let handle = handle_for_dialer.clone();
+            Box::pin(async move {
+                let Some(running) = running_weak.upgrade() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "supervisor running map has been dropped",
+                    ));
+                };
+                let map = running.read().await;
+                let Some(rc) = map.get(&handle) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        format!("capsule handle '{handle}' is no longer running"),
+                    ));
+                };
+                match &rc.backend {
+                    CapsuleBackend::VzVm(vm) => vm
+                        .connect_vsock(port)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string())),
+                    _ => Err(std::io::Error::other("not a Vz VM")),
+                }
+            })
+        });
+
+        let err = dialer(7000).await.expect_err("expected NotConnected");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+        assert!(
+            err.to_string().contains("no longer running"),
+            "expected handle-missing error message, got: {err}"
+        );
+
+        // Now drop the running map entirely and assert the other
+        // path (weak.upgrade() fails) also produces NotConnected.
+        drop(running);
+        let err = dialer(7000).await.expect_err("expected NotConnected");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+        assert!(
+            err.to_string().contains("running map has been dropped"),
+            "expected dropped-map error message, got: {err}"
         );
     }
 }
