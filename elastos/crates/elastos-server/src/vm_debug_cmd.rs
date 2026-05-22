@@ -81,11 +81,20 @@ async fn run_boot(args: BootArgs) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn run_boot(_args: BootArgs) -> Result<()> {
+async fn run_boot(args: BootArgs) -> Result<()> {
+    // Validate inputs first so misconfigured invocations get a
+    // useful "rootfs not found" / "kernel not found" message
+    // even on platforms that can never actually boot — better
+    // dev UX than failing on the platform check first when
+    // the real problem is a bad path.
+    validate_boot_inputs(&args)?;
+
     Err(anyhow!(
         "`elastos vm-debug boot` requires macOS on Apple Silicon \
          with Apple Virtualization.framework support. This host is \
-         not macOS — see docs/MAC.md for the support boundary."
+         not macOS — see docs/MAC.md for the support boundary. \
+         (The macOS path would have used boot args: '{}'.)",
+        VM_DEBUG_DEFAULT_BOOT_ARGS
     ))
 }
 
@@ -124,6 +133,14 @@ pub(crate) fn validate_boot_inputs(args: &BootArgs) -> Result<()> {
 /// at `<capsule_dir>/<manifest.entrypoint>`. Pure path-only
 /// helper — does not require Vz linkage, so the same logic is
 /// covered by tests on Linux.
+///
+/// `cfg_attr(allow(dead_code))` on Linux because nothing on the
+/// non-macOS path currently calls it (the Linux `run_boot`
+/// shortcuts to the "macOS only" error after input validation).
+/// The test in this module still exercises the function on
+/// every platform, but tests don't influence the non-test
+/// build's dead-code lint.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn build_staging_layout(
     staging_root: &std::path::Path,
     rootfs: &std::path::Path,
@@ -159,6 +176,8 @@ pub(crate) fn build_staging_layout(
 }
 
 /// Resolved staging-dir layout produced by [`build_staging_layout`].
+/// Same reason as the fn for the non-macOS `allow(dead_code)`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct StagedCapsule {
     pub(crate) capsule_dir: PathBuf,
