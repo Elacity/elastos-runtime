@@ -1,13 +1,23 @@
-//! Public-API smoke tests for the Phase 1 elastos-vz scaffold.
+//! Public-API smoke tests for the elastos-vz crate.
 //!
 //! These tests live in `tests/` (integration tests) so they exercise
 //! only the crate's public surface — exactly what downstream callers
-//! (elastos-server's `main.rs` registration block and the supervisor's
-//! Mac arm in Phase 1) can see. If a smoke fails here, callers break
-//! too.
+//! (elastos-server's `main.rs` registration block and the supervisor)
+//! can see. If a smoke fails here, callers break too.
+//!
+//! Updated for Phase 2 Day 3: `load`, `start`, `stop`, `status`,
+//! `info`, `http_port` now return real typed errors (not the
+//! Phase 1 stub) when the input is invalid or the handle was
+//! never loaded. The Phase 1 stub message is reserved for the
+//! still-unimplemented surfaces (`set_session_for_vm`,
+//! `append_boot_args_for_vm`, `set_network_for_vm`) and for the
+//! non-macOS fall-through path in `load` once all input
+//! validations have passed (i.e. "you gave me a valid capsule on
+//! Linux; Vz won't run here").
 
 use elastos_common::{
-    CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, ResourceLimits, SCHEMA_V1,
+    CapsuleManifest, CapsuleRole, CapsuleType, ElastosError, MicroVmConfig, ResourceLimits,
+    SCHEMA_V1,
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 
@@ -97,7 +107,12 @@ async fn vz_provider_init_creates_state_dirs_idempotently() {
 }
 
 #[tokio::test]
-async fn vz_provider_load_for_microvm_fails_closed_with_phase_marker() {
+async fn vz_provider_load_returns_rootfs_not_found_for_missing_capsule() {
+    // Day 3: input validation moved ahead of the Vz / stub
+    // branches. A missing rootfs is now surfaced as a typed
+    // CapsuleNotFound error regardless of platform — the
+    // Phase 1 stub message is reserved for the non-macOS
+    // fall-through (covered by the test below).
     let provider = VzProvider::with_defaults().unwrap();
     let manifest = microvm_manifest("smoke-load");
 
@@ -106,12 +121,45 @@ async fn vz_provider_load_for_microvm_fails_closed_with_phase_marker() {
         .await
         .unwrap_err();
 
-    let msg = err.to_string();
     assert!(
-        msg.contains("Phase 2"),
-        "expected Phase-2 marker, got: {msg}"
+        matches!(err, ElastosError::CapsuleNotFound(_)),
+        "expected CapsuleNotFound for missing rootfs, got: {err}"
     );
-    assert!(msg.contains("docs/vz-backend/PLAN.md"));
+    assert!(err.to_string().contains("Rootfs not found"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn vz_provider_load_falls_closed_with_phase_marker_on_non_macos() {
+    // On Linux a perfectly-formed capsule still cannot boot
+    // because Apple's Vz framework is unreachable. After
+    // input-validation, load() must surface the Phase 2 stub
+    // message + a pointer to the plan doc so the operator
+    // knows where to look.
+    let tmp = tempfile::tempdir().unwrap();
+    let capsule_dir = tmp.path().join("capsule");
+    std::fs::create_dir_all(&capsule_dir).unwrap();
+    let rootfs = capsule_dir.join("rootfs.ext4");
+    std::fs::write(&rootfs, b"fake-rootfs").unwrap();
+    let kernel = tmp.path().join("vmlinux");
+    std::fs::write(&kernel, b"fake-kernel").unwrap();
+
+    let config = VzConfig::new()
+        .with_state_dir(tmp.path().join("vz-state"))
+        .with_rootfs_cache_dir(tmp.path().join("rootfs-cache"))
+        .with_kernel_path(kernel);
+    let provider = VzProvider::new(config).unwrap();
+
+    let err = provider
+        .load(&capsule_dir, microvm_manifest("smoke-stub-non-macos"))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Phase 2"), "expected Phase-2 marker: {msg}");
+    assert!(
+        msg.contains("docs/vz-backend/PLAN.md"),
+        "expected plan-doc anchor: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -128,39 +176,33 @@ async fn vz_provider_load_rejects_wasm_type_with_clear_message() {
 }
 
 #[tokio::test]
-async fn vz_provider_lifecycle_methods_fail_closed_with_phase_marker() {
+async fn vz_provider_lifecycle_methods_fail_closed_for_unloaded_handle() {
+    // Day 3 contract: start / status / info / http_port on an
+    // unknown handle return CapsuleNotFound; stop is
+    // idempotent (Ok). Mirrors crosvm's contract so the
+    // supervisor can treat both substrates uniformly.
     let provider = VzProvider::with_defaults().unwrap();
     let handle = CapsuleHandle {
-        id: elastos_common::CapsuleId::new("phase1-smoke".to_string()),
-        manifest: microvm_manifest("phase1-smoke"),
+        id: elastos_common::CapsuleId::new("unloaded-smoke".to_string()),
+        manifest: microvm_manifest("unloaded-smoke"),
         args: vec![],
     };
 
-    let cases: Vec<(&str, String)> = vec![
-        (
-            "start",
-            provider.start(&handle).await.unwrap_err().to_string(),
-        ),
-        (
-            "stop",
-            provider.stop(&handle).await.unwrap_err().to_string(),
-        ),
-        (
-            "status",
-            provider.status(&handle).await.unwrap_err().to_string(),
-        ),
-        (
-            "info",
-            provider.info(&handle).await.unwrap_err().to_string(),
-        ),
-    ];
-
-    for (label, msg) in cases {
+    for (label, err) in [
+        ("start", provider.start(&handle).await.unwrap_err()),
+        ("status", provider.status(&handle).await.unwrap_err()),
+        ("info", provider.info(&handle).await.unwrap_err()),
+        ("http_port", provider.http_port(&handle).await.unwrap_err()),
+    ] {
         assert!(
-            msg.contains("Phase 2"),
-            "{label}: expected Phase-2 marker, got: {msg}"
+            matches!(err, ElastosError::CapsuleNotFound(_)),
+            "{label}: expected CapsuleNotFound, got: {err}"
         );
     }
+
+    // stop on an unknown handle is intentionally Ok(()) —
+    // same as crosvm.
+    provider.stop(&handle).await.unwrap();
 }
 
 #[test]
