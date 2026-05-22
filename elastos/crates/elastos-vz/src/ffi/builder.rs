@@ -20,6 +20,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use objc2::rc::Retained;
@@ -53,13 +54,21 @@ pub(crate) struct BuiltMachine {
     pub(crate) kernel_console_host_read: std::fs::File,
 
     /// Carrier multi-port console kept alive separately so
-    /// Phase 3 can swap its placeholder attachment for a real
-    /// socketpair without re-walking the whole configuration.
+    /// the bridge can be re-attached without re-walking the
+    /// whole configuration.
     /// (`VZVirtualMachineConfiguration` already retains it via
-    /// `setConsoleDevices`, but holding our own `Retained` makes
-    /// the Phase 3 patch point explicit.)
+    /// `setConsoleDevices`, but holding our own `Retained`
+    /// keeps the lifecycle explicit.)
     #[allow(dead_code)]
     pub(crate) carrier_console: Retained<VZVirtioConsoleDeviceConfiguration>,
+
+    /// Host-side endpoint of the Carrier console
+    /// `socketpair(AF_UNIX, SOCK_STREAM)`. **Phase 3 Day 4.**
+    /// Already configured non-blocking — the supervisor wraps
+    /// it in `tokio::net::UnixStream::from_std` and feeds it to
+    /// the Carrier bridge dispatch loop. The Vz-side fd lives
+    /// inside the `carrier_console` attachment above.
+    pub(crate) carrier_host_fd: OwnedFd,
 
     /// On-disk identifier path used for this VM, for log/UX use.
     #[allow(dead_code)]
@@ -103,8 +112,10 @@ impl BuiltMachine {
         let kernel_console =
             build_kernel_console().map_err(|e| format!("vz machine builder: {e}"))?;
 
-        let carrier_console = build_carrier_console_slot("elastos-carrier")
+        let carrier = build_carrier_console_slot("elastos-carrier")
             .map_err(|e| format!("vz machine builder: {e}"))?;
+        let carrier_console = carrier.device;
+        let carrier_host_fd = carrier.host_fd;
 
         let vsock = build_vsock_device();
         let network = build_nat_network();
@@ -168,6 +179,7 @@ impl BuiltMachine {
             vz_config: cfg,
             kernel_console_host_read: kernel_console.host_read,
             carrier_console,
+            carrier_host_fd,
             identifier_path: platform.identifier_path,
         })
     }

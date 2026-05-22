@@ -49,6 +49,20 @@ pub struct RunningVm {
     /// stays fail-closed for back-compat with Phase 1 tests).
     #[cfg(target_os = "macos")]
     handle: Option<crate::ffi::lifecycle::VzMachineHandle>,
+
+    /// Host-side endpoint of the Carrier console socketpair
+    /// (macOS only). **Phase 3 Day 4.** Populated by
+    /// [`crate::VzProvider::load_with_vm_config`]; the
+    /// supervisor takes it via [`Self::take_carrier_host_fd`]
+    /// and feeds it to the Carrier bridge so bytes flow
+    /// guest↔host on `/dev/hvc1`.
+    ///
+    /// Absent for records constructed via the legacy
+    /// [`Self::new`] path (no Vz wiring) — the supervisor's
+    /// dispatch arms handle the `None` case as "no real
+    /// Carrier channel, log and continue".
+    #[cfg(target_os = "macos")]
+    carrier_host_fd: Option<std::os::fd::OwnedFd>,
 }
 
 impl RunningVm {
@@ -63,6 +77,8 @@ impl RunningVm {
             status: CapsuleStatus::Stopped,
             #[cfg(target_os = "macos")]
             handle: None,
+            #[cfg(target_os = "macos")]
+            carrier_host_fd: None,
         }
     }
 
@@ -74,6 +90,7 @@ impl RunningVm {
         manifest: CapsuleManifest,
         socket_path: PathBuf,
         handle: crate::ffi::lifecycle::VzMachineHandle,
+        carrier_host_fd: std::os::fd::OwnedFd,
     ) -> Self {
         Self {
             config,
@@ -81,7 +98,21 @@ impl RunningVm {
             socket_path,
             status: CapsuleStatus::Stopped,
             handle: Some(handle),
+            carrier_host_fd: Some(carrier_host_fd),
         }
+    }
+
+    /// Take the host-side carrier console fd, leaving `None` in
+    /// its place. **Phase 3 Day 4.** The supervisor calls this
+    /// exactly once per VM, immediately after
+    /// `VzProvider::take_running_vm`, to feed the Carrier
+    /// bridge dispatch loop.
+    ///
+    /// Subsequent calls return `None` — the fd has already been
+    /// handed off and the bridge owns it.
+    #[cfg(target_os = "macos")]
+    pub fn take_carrier_host_fd(&mut self) -> Option<std::os::fd::OwnedFd> {
+        self.carrier_host_fd.take()
     }
 
     /// Start the VM.

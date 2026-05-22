@@ -39,9 +39,10 @@ use std::sync::{Arc, Mutex};
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::NSError;
-use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineState};
+use objc2_virtualization::{
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
+};
 
-use super::builder::BuiltMachine;
 use super::console_forwarder::{spawn_console_forwarder, ConsoleForwarder};
 use super::dispatch::VzDispatchQueue;
 use super::error::ns_error_to_string;
@@ -168,18 +169,20 @@ impl VzMachineHandle {
     /// Validate the assembled machine, instantiate the
     /// `VZVirtualMachine` on the provided queue and spawn the
     /// kernel-console forwarder.
+    ///
+    /// Takes a destructured `BuiltMachine` so the caller (the
+    /// `VzProvider`) can split off the `carrier_host_fd` and
+    /// keep ownership of it for the supervisor's Carrier
+    /// bridge — Phase 3 Day 4 wiring. The `carrier_console`
+    /// `Retained` is held by the `VZVirtualMachineConfiguration`
+    /// already (via `setConsoleDevices`), so it does not need
+    /// to be kept here.
     pub(crate) fn new(
-        built: BuiltMachine,
+        vz_config: Retained<VZVirtualMachineConfiguration>,
+        kernel_console_host_read: std::fs::File,
         queue: Arc<VzDispatchQueue>,
         vm_id: String,
     ) -> Result<Self, String> {
-        let BuiltMachine {
-            vz_config,
-            kernel_console_host_read,
-            carrier_console: _carrier_console,
-            identifier_path: _,
-        } = built;
-
         // SAFETY: validateWithError runs entirely on the calling
         // thread; the documentation does not require a dispatch
         // queue for validation.

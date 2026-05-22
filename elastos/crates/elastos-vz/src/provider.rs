@@ -234,17 +234,44 @@ impl VzProvider {
 
         #[cfg(target_os = "macos")]
         {
-            let built = crate::ffi::builder::BuiltMachine::from_vm_config(&vm_config, &self.config)
+            // Build, then immediately consume `BuiltMachine`
+            // into `VzMachineHandle` and the host-side carrier
+            // fd. We do this in a tight non-async block so the
+            // non-`Send` `Retained<...>` fields inside
+            // `BuiltMachine` never cross an `await` point —
+            // that would poison `load_with_vm_config`'s future
+            // (`VZVirtualMachineConfiguration` holds raw
+            // Objective-C pointers and is not `Send`). The
+            // `VzMachineHandle` returned IS `Send` via its
+            // internal `Arc<SendableVm>` wrapper.
+            let (handle, carrier_host_fd) = {
+                let built =
+                    crate::ffi::builder::BuiltMachine::from_vm_config(&vm_config, &self.config)
+                        .map_err(ElastosError::Compute)?;
+                let crate::ffi::builder::BuiltMachine {
+                    vz_config: built_vz_config,
+                    kernel_console_host_read,
+                    carrier_console: _,
+                    carrier_host_fd,
+                    identifier_path: _,
+                } = built;
+                let handle = crate::ffi::lifecycle::VzMachineHandle::new(
+                    built_vz_config,
+                    kernel_console_host_read,
+                    self.queue.clone(),
+                    vm_config.vm_id.clone(),
+                )
                 .map_err(ElastosError::Compute)?;
+                (handle, carrier_host_fd)
+            };
 
-            let handle = crate::ffi::lifecycle::VzMachineHandle::new(
-                built,
-                self.queue.clone(),
-                vm_config.vm_id.clone(),
-            )
-            .map_err(ElastosError::Compute)?;
-
-            let vm = RunningVm::with_handle(vm_config, manifest.clone(), socket_path, handle);
+            let vm = RunningVm::with_handle(
+                vm_config,
+                manifest.clone(),
+                socket_path,
+                handle,
+                carrier_host_fd,
+            );
 
             self.vms.write().await.insert(id.clone(), vm);
 

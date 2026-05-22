@@ -38,12 +38,19 @@ pub struct BridgeContext {
     pub capsule_id: String,
 }
 
-/// Spawn a Carrier bridge handler for a microVM capsule.
+/// Spawn a Carrier bridge handler for a microVM capsule on a
+/// **path** (Linux / crosvm flow).
 ///
-/// Listens on a Unix socket that crosvm serial port 2 connects to.
-/// Must be called BEFORE starting the VM so the socket exists when crosvm launches.
-/// Reads `RequestEnvelope` JSON lines, dispatches to providers,
-/// writes `ResponseEnvelope` JSON lines back.
+/// Binds a Unix listener that crosvm's `--serial type=unix-stream`
+/// connects to at VM start, then hands the accepted stream into
+/// the shared bridge loop. Must be called BEFORE starting the
+/// VM so the socket exists when crosvm launches.
+///
+/// macOS / Vz capsules use [`spawn_carrier_bridge_on_stream`]
+/// instead, because the host endpoint comes directly from a
+/// `socketpair(AF_UNIX, SOCK_STREAM)` carrier-console attachment
+/// — there is no listener to bind. The shared bridge loop is
+/// the same.
 pub async fn spawn_carrier_bridge(
     socket_path: &Path,
     _provider_registry: Arc<ProviderRegistry>,
@@ -57,7 +64,6 @@ pub async fn spawn_carrier_bridge(
         .context("Failed to bind microVM Carrier bridge socket")?;
 
     let socket_display = socket_path.display().to_string();
-    let ctx = bridge_ctx;
 
     // Accept one bidirectional connection in background — crosvm connects when
     // the VM boots. The supported contract is a single `unix-stream` socket
@@ -74,66 +80,111 @@ pub async fn spawn_carrier_bridge(
             "Carrier microVM bridge: bidirectional connection accepted for {}",
             socket_display
         );
-        let (reader, mut writer) = stream.into_split();
-        const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
-        let mut reader = BufReader::new(reader);
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF — guest shut down
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Carrier bridge read error: {}", e);
-                    break;
-                }
-            }
-
-            if line.len() > MAX_LINE_BYTES {
-                tracing::warn!(
-                    "Carrier bridge: oversized line ({} bytes), dropping",
-                    line.len()
-                );
-                let error = serde_json::json!({
-                    "id": 0,
-                    "type": "error",
-                    "error": "request_too_large"
-                });
-                let _ = writer.write_all(error.to_string().as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
-                let _ = writer.flush().await;
-                continue;
-            }
-
-            tracing::debug!("[serial-bridge] → {}", line.trim());
-            let response = match handle_request(&line, &ctx).await {
-                Ok(resp) => {
-                    tracing::debug!("[serial-bridge] ← {}", resp);
-                    resp
-                }
-                Err(e) => {
-                    tracing::warn!("[serial-bridge] error: {}", e);
-                    serde_json::json!({
-                        "id": 0,
-                        "response": {"type": "error", "code": "bridge_error", "message": e.to_string()}
-                    })
-                }
-            };
-
-            let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
-            bytes.push(b'\n');
-            if writer.write_all(&bytes).await.is_err() {
-                break;
-            }
-            if writer.flush().await.is_err() {
-                break;
-            }
-        }
-        tracing::info!("Carrier bridge closed for {}", socket_display);
+        run_carrier_bridge_loop(stream, bridge_ctx, socket_display).await;
     });
 
     Ok(())
+}
+
+/// Spawn a Carrier bridge handler on an **already-connected**
+/// `tokio::net::UnixStream` — **Phase 3 Day 4** entry point for
+/// the macOS / Vz flow.
+///
+/// On Mac, the host endpoint of the Carrier console is the
+/// host-side fd of a `socketpair(AF_UNIX, SOCK_STREAM)` set up
+/// by `elastos-vz::ffi::console::build_carrier_console_slot`.
+/// The supervisor takes that fd via `RunningVm::take_carrier_host_fd`,
+/// converts it to a `tokio::net::UnixStream`, and hands it to
+/// this function — no listener / bind / accept needed.
+///
+/// The bridge dispatch loop is byte-identical to
+/// [`spawn_carrier_bridge`]; only the connection-acquisition
+/// half differs.
+pub fn spawn_carrier_bridge_on_stream(
+    stream: tokio::net::UnixStream,
+    _provider_registry: Arc<ProviderRegistry>,
+    _session_token: String,
+    bridge_ctx: Option<BridgeContext>,
+    label: String,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            "Carrier microVM bridge: pre-connected stream attached for {}",
+            label
+        );
+        run_carrier_bridge_loop(stream, bridge_ctx, label).await;
+    });
+}
+
+/// Shared per-connection bridge dispatch loop. Reads newline
+/// delimited JSON `RequestEnvelope`s off the supplied stream,
+/// dispatches them through `bridge_ctx` providers, and writes
+/// `ResponseEnvelope`s back on the same stream.
+///
+/// `label` is a human-readable identifier used in trace log
+/// lines (socket path on Linux, capsule handle on Mac).
+async fn run_carrier_bridge_loop(
+    stream: tokio::net::UnixStream,
+    ctx: Option<BridgeContext>,
+    label: String,
+) {
+    let (reader, mut writer) = stream.into_split();
+    const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
+    let mut reader = BufReader::new(reader);
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break, // EOF — guest shut down
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("Carrier bridge read error: {}", e);
+                break;
+            }
+        }
+
+        if line.len() > MAX_LINE_BYTES {
+            tracing::warn!(
+                "Carrier bridge: oversized line ({} bytes), dropping",
+                line.len()
+            );
+            let error = serde_json::json!({
+                "id": 0,
+                "type": "error",
+                "error": "request_too_large"
+            });
+            let _ = writer.write_all(error.to_string().as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+            continue;
+        }
+
+        tracing::debug!("[serial-bridge] → {}", line.trim());
+        let response = match handle_request(&line, &ctx).await {
+            Ok(resp) => {
+                tracing::debug!("[serial-bridge] ← {}", resp);
+                resp
+            }
+            Err(e) => {
+                tracing::warn!("[serial-bridge] error: {}", e);
+                serde_json::json!({
+                    "id": 0,
+                    "response": {"type": "error", "code": "bridge_error", "message": e.to_string()}
+                })
+            }
+        };
+
+        let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
+        bytes.push(b'\n');
+        if writer.write_all(&bytes).await.is_err() {
+            break;
+        }
+        if writer.flush().await.is_err() {
+            break;
+        }
+    }
+    tracing::info!("Carrier bridge closed for {}", label);
 }
 
 /// Spawn a Carrier bridge for a WASM capsule.
@@ -747,6 +798,101 @@ mod tests {
         capability::token::{Action, CapabilityToken, ResourceId, TokenConstraints},
         primitives::time::SecureTimestamp,
     };
+
+    /// Phase 3 Day 4: prove the bridge dispatch loop can be
+    /// driven by a pre-connected `tokio::net::UnixStream` (the
+    /// Mac flow), not just an `accept()`-derived one (the Linux
+    /// flow). Sends a `ping` request through one half of a
+    /// socketpair, expects a `pong` response on the other.
+    ///
+    /// `ctx = None` is the worst-case bridge state (no provider
+    /// registry, no capability manager) — only the built-in
+    /// handlers (ping / get_runtime_info) work in that mode,
+    /// which is exactly what this test exercises. A pong proves
+    /// the per-stream dispatch loop is wired correctly.
+    #[tokio::test]
+    async fn spawn_carrier_bridge_on_stream_handles_ping_pong_over_socketpair() {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        // Build a connected pair of fds — same shape as the Vz
+        // carrier console socketpair.
+        let mut sv = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair must succeed for the test fixture");
+
+        // Set both ends non-blocking so tokio is happy.
+        for fd in sv {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0);
+        }
+
+        let host_fd = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let test_fd = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        // Convert each end to a `tokio::net::UnixStream`.
+        let host_stream = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(host_fd.into_raw_fd())
+        })
+        .expect("host-side tokio UnixStream from_std");
+        let mut test_stream = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(test_fd.into_raw_fd())
+        })
+        .expect("test-side tokio UnixStream from_std");
+
+        // We need a non-empty `ProviderRegistry` clone for the
+        // signature, but `ctx: None` means the dispatch loop
+        // never touches it. Use `Arc::new(ProviderRegistry::new())`.
+        let registry = Arc::new(ProviderRegistry::new());
+
+        spawn_carrier_bridge_on_stream(
+            host_stream,
+            registry,
+            String::new(),
+            None,
+            "test:phase3-day4-pingpong".to_string(),
+        );
+
+        // Send a ping line on the test side.
+        let ping = b"{\"id\":42,\"request\":{\"type\":\"ping\"}}\n";
+        test_stream
+            .write_all(ping)
+            .await
+            .expect("write ping to socketpair");
+        test_stream.flush().await.expect("flush ping to socketpair");
+
+        // Read the pong response back.
+        let (reader, _writer) = test_stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut response_line = String::new();
+        // Allow a generous timeout — the bridge dispatch loop
+        // runs in a separate task and the kernel may briefly
+        // buffer.
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut response_line),
+        )
+        .await;
+        assert!(
+            read_result.is_ok(),
+            "bridge must respond within 2s; got timeout"
+        );
+        assert!(
+            read_result.unwrap().is_ok(),
+            "read_line must succeed; got error"
+        );
+
+        // The bridge wraps the inner response in `{"id":42,"response":{...}}`.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_line).expect("response is JSON");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(
+            parsed["response"]["type"], "pong",
+            "expected a pong response from the ping request, got: {response_line}"
+        );
+    }
 
     #[test]
     fn test_build_capability_resource_localhost_full_uri() {

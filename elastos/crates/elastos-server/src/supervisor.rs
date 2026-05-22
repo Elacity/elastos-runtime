@@ -1320,38 +1320,17 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("failed to init VzProvider state dir: {e}"))?;
 
-        let (vm_config, handle, cid, carrier_socket) = self
+        let (vm_config, handle, cid, _carrier_socket_path) = self
             .build_vm_config_for_mac(name, &manifest, &capsule_dir, config, &vz_config)
             .await?;
 
-        // Spawn the microVM Carrier bridge BEFORE starting the VM.
-        // Linux spawns this at supervisor.rs L1148-1174; Mac does
-        // the exact same call. The bridge listens on the Unix
-        // socket; the guest will only connect once the Vz console
-        // attachment is a real socketpair (Day 4+) — until then
-        // the listener exists but no bytes flow.
-        if let Some(ref registry) = self.provider_registry {
-            let session_token = self.shell_token.clone().unwrap_or_default();
-            let bridge_ctx = match (&self.capability_manager, &self.pending_store) {
-                (Some(cap_mgr), Some(pending)) => Some(crate::carrier_bridge::BridgeContext {
-                    provider_registry: registry.clone(),
-                    capability_manager: cap_mgr.clone(),
-                    pending_store: pending.clone(),
-                    capsule_id: format!("vm-{}", name),
-                }),
-                _ => None,
-            };
-            if let Err(e) = crate::carrier_bridge::spawn_carrier_bridge(
-                &carrier_socket,
-                registry.clone(),
-                session_token,
-                bridge_ctx,
-            )
-            .await
-            {
-                tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
-            }
-        }
+        // Phase 3 Day 4: the Carrier bridge on Mac does not bind
+        // a Unix listener — the host endpoint comes directly from
+        // the Vz console socketpair set up in
+        // `elastos-vz::ffi::console::build_carrier_console_slot`.
+        // The fd is taken off `RunningVm::take_carrier_host_fd`
+        // AFTER `take_running_vm` below (see Phase-3 Day-4 wiring
+        // further down this function).
 
         tracing::info!(
             target: "supervisor",
@@ -1382,13 +1361,64 @@ impl Supervisor {
         // the sole owner. The VzMachineHandle inside RunningVm
         // carries its own Arc to the dispatch queue, so the
         // provider can drop without affecting the live VM.
-        let vz_vm = provider
+        let mut vz_vm = provider
             .take_running_vm(&capsule_handle)
             .await
             .map_err(|e| {
                 anyhow::anyhow!("vz provider take_running_vm failed for '{}': {}", name, e)
             })?;
         drop(provider); // explicit: queue Arc lives on inside vz_vm.
+
+        // Phase 3 Day 4: take the Carrier host-side socket fd
+        // and hand it to `spawn_carrier_bridge_on_stream`. From
+        // here forward the guest's `/dev/hvc1` reads and writes
+        // round-trip through the bridge dispatch loop and the
+        // supervisor's `ProviderRegistry` — exactly the same
+        // request/response semantics the Linux flow has via
+        // crosvm's `unix-stream` carrier socket.
+        if let Some(carrier_fd) = vz_vm.take_carrier_host_fd() {
+            if let Some(ref registry) = self.provider_registry {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                use std::os::unix::net::UnixStream as StdUnixStream;
+
+                let session_token = self.shell_token.clone().unwrap_or_default();
+                let bridge_ctx = match (&self.capability_manager, &self.pending_store) {
+                    (Some(cap_mgr), Some(pending)) => Some(crate::carrier_bridge::BridgeContext {
+                        provider_registry: registry.clone(),
+                        capability_manager: cap_mgr.clone(),
+                        pending_store: pending.clone(),
+                        capsule_id: format!("vm-{}", name),
+                    }),
+                    _ => None,
+                };
+
+                // SAFETY: `carrier_fd` is an `OwnedFd` returned from
+                // `build_carrier_console_slot`, already set
+                // non-blocking, with no other Rust owner. We
+                // move it into `StdUnixStream` (which takes
+                // ownership of the raw fd) and then into
+                // `tokio::net::UnixStream` via `from_std`.
+                let std_stream = unsafe { StdUnixStream::from_raw_fd(carrier_fd.into_raw_fd()) };
+                match tokio::net::UnixStream::from_std(std_stream) {
+                    Ok(tokio_stream) => {
+                        crate::carrier_bridge::spawn_carrier_bridge_on_stream(
+                            tokio_stream,
+                            registry.clone(),
+                            session_token,
+                            bridge_ctx,
+                            format!("vz:{}", handle),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Carrier bridge failed to take Vz console fd for '{}': {}",
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
 
         let route = None; // NAT-only on Mac (Phase 3 Day 4+ for bridged).
         let started_at = std::time::Instant::now();
