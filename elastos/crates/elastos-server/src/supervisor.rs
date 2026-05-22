@@ -31,6 +31,45 @@ const CACHED_CID_FILE: &str = ".elastos-cid";
 const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 const CHAT_RETURN_HOME_EXIT_CODE: i32 = 73;
 
+/// Phase 4 Day 4 — RAM reserved for the host kernel + Carrier + Rust
+/// runtime when sizing a Vz microVM. The supervisor's pre-flight
+/// memory guard rejects manifest requests larger than `(host_phys_mem
+/// - this)` so an over-spec'd capsule fails with a clear message
+/// instead of Apple's opaque `VZErrorInvalidVirtualMachineConfiguration`.
+///
+/// 1 GiB matches the headroom the Vz documentation suggests for a
+/// host that's also running its normal desktop workload.
+#[cfg(target_os = "macos")]
+const MAC_HOST_HEADROOM_MIB: u64 = 1024;
+
+/// Phase 4 Day 4 — query the host's total physical RAM in MiB via
+/// `sysctlbyname("hw.memsize", …)`. The mach-port memory APIs are
+/// the source of truth on Darwin; `sysconf(_SC_PHYS_PAGES)` exists
+/// but returns 0 on macOS. Falls back to a conservative 4096 MiB if
+/// the sysctl call ever fails (it shouldn't on any supported host),
+/// keeping the pre-flight guard *active* rather than silently
+/// permissive.
+#[cfg(target_os = "macos")]
+fn host_phys_mem_mib_mac() -> u64 {
+    const FALLBACK_MIB: u64 = 4096;
+    let name = std::ffi::CString::new("hw.memsize").expect("static C string");
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut bytes as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || bytes == 0 {
+        return FALLBACK_MIB;
+    }
+    bytes / (1024 * 1024)
+}
+
 fn vm_provider_bridge_enabled() -> bool {
     std::env::var("ELASTOS_VM_PROVIDER_BRIDGE")
         .map(|v| {
@@ -1665,6 +1704,31 @@ impl Supervisor {
         vm_config.boot_args = format!("{} elastos.data_dir=/opt/elastos", vm_config.boot_args);
         vm_config.interactive_stdio = interactive_stdio;
 
+        // Phase 4 Day 4: pre-flight memory guard. Apple Vz throws an
+        // opaque runtime error if `setMemorySize:` exceeds the host's
+        // available physical RAM. The Linux supervisor path does not
+        // pre-check (KVM lazily commits guest pages so an oversize
+        // request only manifests when the guest faults), but on Mac
+        // the failure is surfaced at boot with no actionable message.
+        // We reject manifest values larger than `host_phys_mem_mib -
+        // MAC_HOST_HEADROOM_MIB` so the operator sees a clear
+        // "manifest requests X MiB, host has Y MiB free for VMs"
+        // error pointing at `docs/MAC.md`. Anchored in
+        // `docs/vz-backend/PHASE_4_DAY_4_NOTES.md`.
+        let host_phys_mem_mib = host_phys_mem_mib_mac();
+        let max_capsule_mem_mib = host_phys_mem_mib.saturating_sub(MAC_HOST_HEADROOM_MIB);
+        if vm_config.mem_size_mib as u64 > max_capsule_mem_mib {
+            bail!(
+                "capsule '{}' requests {} MiB of memory but this host only has {} MiB physical RAM \
+                 ({} MiB reserved for the host). Edit the capsule manifest's `resources.memory_mb` \
+                 or run on a host with more RAM. See docs/MAC.md for sizing guidance.",
+                name,
+                vm_config.mem_size_mib,
+                host_phys_mem_mib,
+                MAC_HOST_HEADROOM_MIB,
+            );
+        }
+
         // Phase 3 Day 7: bridged-networking opt-in.
         //
         // When the manifest sets `permissions.guest_network: true`,
@@ -2897,6 +2961,93 @@ mod tests {
     /// behaviour. The test asserts only that
     /// `start_capsule_vm_macos` rejects the launch — silent
     /// success on an unentitled host would be a bug.
+    /// Phase 4 Day 4 contract: a manifest requesting more memory
+    /// than the host can satisfy must be rejected by the
+    /// supervisor's pre-flight guard with a clear, actionable
+    /// error. Without this guard the request would propagate into
+    /// `VZVirtualMachineConfiguration.setMemorySize:` and surface
+    /// as an opaque `VZErrorInvalidVirtualMachineConfiguration`
+    /// long after the supervisor has already minted handles,
+    /// allocated CIDs, and copied the rootfs overlay — leaking
+    /// resources on every failed launch attempt.
+    ///
+    /// The test asks for 100 PiB (10^20 bytes-ish in MiB units) so
+    /// the assertion is robust against any plausible Apple-Silicon
+    /// hardware. The error must mention `memory_mb` so an operator
+    /// can map the message to the manifest field.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_fails_closed_when_memory_exceeds_host_ram() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let mut manifest = synthetic_microvm_manifest("phase4-day4-oversized-memory");
+        // u32::MAX MiB ≈ 4 PiB — well above any plausible
+        // Apple-Silicon RAM. Apple's bound is implicit; ours is
+        // explicit and refuses with an actionable message.
+        manifest.resources.memory_mb = u32::MAX;
+
+        let vz_config = VzConfig::default();
+        let result = supervisor
+            .build_vm_config_for_mac(
+                "phase4-day4-oversized-memory",
+                &manifest,
+                &capsule_dir,
+                serde_json::Value::Null,
+                &vz_config,
+            )
+            .await;
+
+        let err = result.expect_err(
+            "manifest requesting more RAM than the host has must fail closed in the pre-flight guard",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MiB") && msg.contains("memory"),
+            "fail-closed message must mention memory sizing so operators \
+             can find the manifest field; got: {msg}"
+        );
+        assert!(
+            msg.contains("phase4-day4-oversized-memory"),
+            "fail-closed message must name the offending capsule for log triage; got: {msg}"
+        );
+    }
+
+    /// Phase 4 Day 4 mirror: a manifest with a sensible memory
+    /// request must NOT be rejected by the pre-flight guard. This
+    /// guards against accidentally inverting the comparison or
+    /// regressing the host-RAM sysctl call (e.g. returning 0 and
+    /// then refusing every launch).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_accepts_modest_memory_under_pre_flight_guard() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let manifest = synthetic_microvm_manifest("phase4-day4-modest-memory");
+        // Default synthetic manifest asks for 128 MiB — any
+        // CI/dev host with > ~1.5 GiB RAM should pass.
+
+        let vz_config = VzConfig::default();
+        let (vm_config, _handle, _cid, _carrier_socket) = supervisor
+            .build_vm_config_for_mac(
+                "phase4-day4-modest-memory",
+                &manifest,
+                &capsule_dir,
+                serde_json::Value::Null,
+                &vz_config,
+            )
+            .await
+            .expect("modest memory request must pass the pre-flight guard");
+
+        assert_eq!(
+            vm_config.mem_size_mib, 128,
+            "the manifest's memory_mb must be passed through unchanged when under the host limit"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn start_capsule_vm_macos_fails_closed_when_guest_network_lacks_entitlement() {
