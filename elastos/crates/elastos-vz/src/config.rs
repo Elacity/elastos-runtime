@@ -11,10 +11,23 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use elastos_common::CapsuleManifest;
 
 use crate::network::NetworkConfig;
+
+/// Default upper bound on how long
+/// [`crate::ffi::lifecycle::VzMachineHandle::stop`] will wait for
+/// Apple's `stopWithCompletionHandler:` block to fire. 30 s is
+/// long enough to cover any documented Vz stop delay (guest
+/// kernel shutdown sequencing, paravirt device drain) but short
+/// enough that a wedged framework call doesn't pin the
+/// supervisor's `stop_capsule` indefinitely. Operators on slow
+/// or instrumented hardware can extend it via
+/// [`VzConfig::with_stop_timeout`]; CI uses short values to
+/// exercise the timeout path. **Phase 4 Day 6.**
+pub const DEFAULT_VZ_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for the Vz provider.
 ///
@@ -45,6 +58,23 @@ pub struct VzConfig {
     /// `VmConfig` the provider builds inherits this path before
     /// the FFI builder hands it to `VZLinuxBootLoader.setInitialRamdiskURL:`.
     pub initramfs_path: Option<PathBuf>,
+
+    /// Upper bound on how long
+    /// [`crate::ffi::lifecycle::VzMachineHandle::stop`] will wait
+    /// for Apple's `stopWithCompletionHandler:` block to fire
+    /// before returning a typed timeout error. Defaults to
+    /// [`DEFAULT_VZ_STOP_TIMEOUT`]. **Phase 4 Day 6** — closes
+    /// the audit finding from Day 5 that Mac has no equivalent
+    /// of `kill -9` on a Vz VM, so a wedged completion handler
+    /// would block the supervisor's `stop_capsule` indefinitely
+    /// without this timeout.
+    ///
+    /// Linux's [`elastos_crosvm::CrosvmConfig`] has no analogue
+    /// (Linux uses SIGTERM + 5 s SIGKILL escalation in
+    /// `RunningVm::stop`); this field is therefore Mac-only at
+    /// the *use-site* level (`elastos-server`'s Linux launch
+    /// path never reads it).
+    pub stop_timeout: Duration,
 }
 
 impl VzConfig {
@@ -58,6 +88,7 @@ impl VzConfig {
             state_dir: data_dir.join("vz"),
             rootfs_cache_dir: data_dir.join("rootfs-cache"),
             initramfs_path: None,
+            stop_timeout: DEFAULT_VZ_STOP_TIMEOUT,
         }
     }
 
@@ -85,6 +116,12 @@ impl VzConfig {
     /// future per-VM override is wired in.
     pub fn with_initramfs_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.initramfs_path = Some(path.into());
+        self
+    }
+
+    /// Override the stop-timeout budget. **Phase 4 Day 6.**
+    pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
+        self.stop_timeout = timeout;
         self
     }
 

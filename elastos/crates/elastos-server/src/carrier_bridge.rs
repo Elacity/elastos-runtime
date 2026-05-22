@@ -36,6 +36,20 @@ pub struct BridgeContext {
     pub pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     /// Capsule identity for token minting (session ID or capsule name)
     pub capsule_id: String,
+    /// Optional bridge-termination observer. **Phase 4 Day 6.**
+    ///
+    /// When set, [`run_carrier_bridge_loop`] calls
+    /// `notify.notify_waiters()` on EVERY exit path (EOF, read
+    /// error, write error, oversized-line teardown) before
+    /// returning. Lets the supervisor's `stop_capsule` await
+    /// the bridge's natural termination after `vm.stop()`
+    /// resolves, rather than relying on send-and-pray
+    /// observability.
+    ///
+    /// `None` for legacy callers (Linux crosvm bridges,
+    /// WASM-stdio bridges) where lifecycle observation is not
+    /// wired today.
+    pub on_terminate: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Spawn a Carrier bridge handler for a microVM capsule on a
@@ -128,6 +142,11 @@ async fn run_carrier_bridge_loop(
     ctx: Option<BridgeContext>,
     label: String,
 ) {
+    // Phase 4 Day 6: stash the termination observer up front
+    // so every exit path can fire it without re-matching on
+    // `ctx`.
+    let on_terminate = ctx.as_ref().and_then(|c| c.on_terminate.clone());
+
     let (reader, mut writer) = stream.into_split();
     const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
     let mut reader = BufReader::new(reader);
@@ -185,6 +204,17 @@ async fn run_carrier_bridge_loop(
         }
     }
     tracing::info!("Carrier bridge closed for {}", label);
+
+    // Phase 4 Day 6: fire the termination observer (if wired)
+    // on EVERY loop exit so the supervisor's `stop_capsule`
+    // can await natural bridge teardown deterministically.
+    // `notify_waiters()` is fire-and-forget — if no one is
+    // listening, the signal is dropped (the post-stop poll
+    // uses a bounded `tokio::time::timeout` either way, so a
+    // missed signal degrades to a best-effort warn).
+    if let Some(notify) = on_terminate {
+        notify.notify_waiters();
+    }
 }
 
 /// Spawn a Carrier bridge for a WASM capsule.

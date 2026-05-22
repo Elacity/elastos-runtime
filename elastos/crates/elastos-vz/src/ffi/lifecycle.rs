@@ -35,6 +35,7 @@
 //!   created once per provider in `ffi::dispatch`.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::AnyThread;
@@ -179,6 +180,15 @@ pub(crate) struct VzMachineHandle {
     /// hang forever — the supervisor enforces this with a
     /// single waiter per capsule.
     exit_rx: Mutex<Option<tokio::sync::oneshot::Receiver<DelegateExit>>>,
+
+    /// Upper bound on `stopWithCompletionHandler:` wait. **Phase
+    /// 4 Day 6** — closes the audit finding from Day 5 that Mac
+    /// has no `kill -9` equivalent on a Vz VM. If Apple's
+    /// completion block doesn't fire within this budget,
+    /// [`Self::stop`] returns a typed error and signals
+    /// [`DelegateExit::ForcedAfterTimeout`] so any concurrent
+    /// `wait_for_exit` resolves rather than hanging forever.
+    stop_timeout: Duration,
 }
 
 impl VzMachineHandle {
@@ -197,6 +207,7 @@ impl VzMachineHandle {
         vz_config: Retained<VZVirtualMachineConfiguration>,
         kernel_console_host_read: std::fs::File,
         vm_id: String,
+        stop_timeout: Duration,
     ) -> Result<Self, String> {
         // Phase 4 Day 1: per-VM dispatch queue. Apple's
         // threading rules apply per `VZVirtualMachine` — each VM
@@ -264,6 +275,7 @@ impl VzMachineHandle {
             delegate: SendableDelegate(delegate),
             exit_state,
             exit_rx: Mutex::new(Some(exit_rx)),
+            stop_timeout,
         })
     }
 
@@ -295,21 +307,45 @@ impl VzMachineHandle {
     /// forwarder's `JoinHandle` sits idle in [`Self::forwarder`]
     /// (Tokio detaches it on drop, so no leak).
     pub(crate) async fn stop(&self) -> Result<(), String> {
-        let result = run_completion_handler_on_queue(
+        // Phase 4 Day 6: wrap the completion-handler future
+        // with a `tokio::time::timeout` so a wedged Apple
+        // framework call cannot pin the supervisor's
+        // `stop_capsule` indefinitely. The supervisor's outer
+        // RPC timeout existed before but had no internal
+        // counter-pressure; this is the per-VM enforcement
+        // point.
+        let op_label = format!("stop (vm_id='{}')", self.vm_id);
+        let inner = run_completion_handler_on_queue(
             self.vm.clone(),
             self.queue.clone(),
-            &format!("stop (vm_id='{}')", self.vm_id),
+            &op_label,
             |vm, handler| unsafe { vm.stopWithCompletionHandler(handler) },
-        )
-        .await;
-        // Phase 3 Day 5: signal the delegate's shared exit
-        // channel so any waiter blocked in `wait_for_exit`
-        // resolves on host-initiated stops too. The delegate
-        // only fires for guest-initiated stops or errors.
+        );
+        let outcome = drive_stop_with_timeout(inner, self.stop_timeout, &self.vm_id).await;
+
+        // Always signal the shared exit channel, regardless of
+        // whether the completion fired or we timed out. The
+        // delegate only fires for guest-initiated stops or
+        // errors, so without this any concurrent
+        // `wait_for_exit` would hang on a host-initiated stop.
+        // Phase 4 Day 6: on timeout we send
+        // `ForcedAfterTimeout` (exit 137) so operators see the
+        // forced-stop marker; on success we send the
+        // historical `HostInitiatedStop` (exit 0).
+        let signal = match &outcome {
+            Ok(()) => DelegateExit::HostInitiatedStop,
+            Err(StopError::Timeout(_)) => DelegateExit::ForcedAfterTimeout,
+            Err(StopError::Apple(_)) => DelegateExit::HostInitiatedStop,
+        };
         if let Some(tx) = self.exit_state.lock().expect("exit_state mutex").take() {
-            let _ = tx.send(DelegateExit::HostInitiatedStop);
+            let _ = tx.send(signal);
         }
-        result
+
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(StopError::Apple(msg)) => Err(msg),
+            Err(StopError::Timeout(msg)) => Err(msg),
+        }
     }
 
     /// Dial the guest's vsock listener on `port` and return an
@@ -441,6 +477,52 @@ where
     }
 }
 
+/// Classified outcome of [`VzMachineHandle::stop`]'s inner
+/// future. Lets the caller distinguish "Apple completion fired
+/// with an error" (Vz reported a problem; the VM may or may not
+/// still be running) from "we never heard back from Apple"
+/// (timeout — the supervisor must walk away and proceed with
+/// best-effort cleanup). **Phase 4 Day 6.**
+#[derive(Debug)]
+enum StopError {
+    /// `tokio::time::timeout` fired before
+    /// `run_completion_handler_on_queue` resolved. The inner
+    /// future is dropped; Apple's framework may still complete
+    /// its work asynchronously but we cannot observe it. The
+    /// string is operator-facing.
+    Timeout(String),
+    /// `run_completion_handler_on_queue` resolved with
+    /// `Err(_)` — Apple's completion fired with a non-nil
+    /// `NSError`. The string is `format_validate_error`-style
+    /// pre-formatted by the inner helper.
+    Apple(String),
+}
+
+/// Drive [`VzMachineHandle::stop`]'s inner future under a
+/// timeout. Extracted as a free `async fn` so unit tests can
+/// exercise the timeout path without needing a real Apple
+/// dispatch queue. **Phase 4 Day 6.**
+async fn drive_stop_with_timeout<F>(
+    inner: F,
+    timeout: Duration,
+    vm_id: &str,
+) -> Result<(), StopError>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(timeout, inner).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(StopError::Apple(msg)),
+        Err(_elapsed) => Err(StopError::Timeout(format!(
+            "vz stop timed out after {:?} (vm_id='{vm_id}') — \
+             Apple's stopWithCompletionHandler: did not fire within the budget. \
+             The Vz handle is now best-effort orphaned; the supervisor will \
+             continue with overlay cleanup. See docs/vz-backend/PHASE_4_DAY_6_NOTES.md.",
+            timeout
+        ))),
+    }
+}
+
 fn validate_error_message(err: &NSError, vm_id: &str) -> String {
     format_validate_error(&ns_error_to_string(err), vm_id)
 }
@@ -534,5 +616,77 @@ mod tests {
         );
         assert!(wrapped.contains(apple_msg));
         assert!(wrapped.contains("phase2-day3-test"));
+    }
+
+    /// Phase 4 Day 6 — `drive_stop_with_timeout` must surface a
+    /// typed `StopError::Timeout` when the inner future never
+    /// resolves. This proves the wrapper that
+    /// [`VzMachineHandle::stop`] uses to guard against a wedged
+    /// `stopWithCompletionHandler:` block actually fires, with
+    /// an operator-facing message that names the budget and the
+    /// vm_id (for log correlation) and points at the Day 6
+    /// notes for the on-call runbook.
+    #[tokio::test(start_paused = true)]
+    async fn drive_stop_with_timeout_returns_typed_error_when_inner_future_never_resolves() {
+        let never_resolving = std::future::pending::<Result<(), String>>();
+        let budget = Duration::from_millis(100);
+
+        let started = tokio::time::Instant::now();
+        let outcome = drive_stop_with_timeout(never_resolving, budget, "phase4-day6-vm").await;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Err(StopError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("phase4-day6-vm"),
+                    "timeout error must include vm_id for log correlation: {msg}"
+                );
+                assert!(
+                    msg.contains("100ms") || msg.contains("100 ms"),
+                    "timeout error must name the budget: {msg}"
+                );
+                assert!(
+                    msg.contains("PHASE_4_DAY_6_NOTES.md"),
+                    "timeout error must point at the runbook: {msg}"
+                );
+            }
+            other => panic!("expected StopError::Timeout, got {other:?}"),
+        }
+
+        // With `start_paused = true` the Tokio runtime advances
+        // virtual time on its own; elapsed wall-clock should be
+        // negligible (well under 2 × budget). The test cares
+        // about the contract (typed timeout), not the precise
+        // tick count.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "drive_stop_with_timeout must not block beyond ~2×budget; took {elapsed:?}"
+        );
+    }
+
+    /// Phase 4 Day 6 — when the inner future completes cleanly
+    /// the wrapper must surface `Ok(())` (the path Apple's
+    /// nominal `stopWithCompletionHandler:` takes).
+    #[tokio::test]
+    async fn drive_stop_with_timeout_passes_through_ok_when_inner_future_resolves_first() {
+        let inner = async { Ok::<(), String>(()) };
+        let outcome = drive_stop_with_timeout(inner, Duration::from_secs(30), "vm").await;
+        assert!(outcome.is_ok(), "successful completion must pass through");
+    }
+
+    /// Phase 4 Day 6 — when the inner future resolves with an
+    /// Apple `NSError`, the wrapper must classify that as
+    /// `StopError::Apple` (distinct from `Timeout` — the
+    /// supervisor uses the distinction to choose between
+    /// `HostInitiatedStop` and `ForcedAfterTimeout` exit
+    /// signalling).
+    #[tokio::test]
+    async fn drive_stop_with_timeout_classifies_apple_error_distinctly_from_timeout() {
+        let inner = async { Err::<(), String>("vz stop: NSError (3)".into()) };
+        let outcome = drive_stop_with_timeout(inner, Duration::from_secs(30), "vm").await;
+        match outcome {
+            Err(StopError::Apple(msg)) => assert!(msg.contains("vz stop")),
+            other => panic!("expected StopError::Apple, got {other:?}"),
+        }
     }
 }

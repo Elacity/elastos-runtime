@@ -258,6 +258,7 @@ impl VzProvider {
                     built_vz_config,
                     kernel_console_host_read,
                     vm_config.vm_id.clone(),
+                    self.config.stop_timeout,
                 )
                 .map_err(ElastosError::Compute)?;
                 (handle, carrier_host_fd)

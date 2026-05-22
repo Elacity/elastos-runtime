@@ -96,6 +96,11 @@ impl Runtime {
                     provider_registry: reg.clone(),
                     capability_manager: cap_mgr.clone(),
                     pending_store: pending.clone(),
+                    // WASM stdio bridges run inside the host
+                    // process; the Day 6 lifecycle observer is
+                    // a Mac/Vz-specific facility and not used
+                    // here.
+                    on_terminate: None,
                     capsule_id: format!(
                         "wasm-{}",
                         std::time::SystemTime::now()

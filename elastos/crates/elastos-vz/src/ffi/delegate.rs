@@ -57,6 +57,14 @@ pub(crate) enum DelegateExit {
     /// `VzMachineHandle::stop` succeeded — the supervisor
     /// asked for the VM to stop and Apple confirmed. Exit 0.
     HostInitiatedStop,
+    /// `VzMachineHandle::stop` returned with a typed timeout
+    /// because Apple's `stopWithCompletionHandler:` block did
+    /// not fire within `VzConfig::stop_timeout`. The supervisor
+    /// has already orphaned the Vz handle (best-effort
+    /// cleanup); waiters on `wait_for_exit` resolve with exit
+    /// code 137 (matches the SIGKILL semantics Linux uses when
+    /// its 5 s SIGTERM grace elapses). **Phase 4 Day 6.**
+    ForcedAfterTimeout,
 }
 
 impl DelegateExit {
@@ -66,6 +74,11 @@ impl DelegateExit {
         match self {
             DelegateExit::GuestCleanStop | DelegateExit::HostInitiatedStop => 0,
             DelegateExit::StoppedWithError(_) => 1,
+            // Mirrors Linux's `128 + SIGKILL(9) = 137` convention
+            // for "process forcibly terminated after grace period
+            // elapsed". Operator-facing tooling already
+            // recognises 137 as a forced-stop marker.
+            DelegateExit::ForcedAfterTimeout => 137,
         }
     }
 }
@@ -187,6 +200,11 @@ mod tests {
             DelegateExit::StoppedWithError("kernel panic".into()).exit_code(),
             1
         );
+        // Phase 4 Day 6: 128 + SIGKILL(9) = 137 — same
+        // convention Linux uses for forcibly-killed processes
+        // so operator tooling can recognise the surface
+        // identically across substrates.
+        assert_eq!(DelegateExit::ForcedAfterTimeout.exit_code(), 137);
     }
 
     #[tokio::test]

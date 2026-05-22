@@ -334,6 +334,18 @@ struct RunningCapsule {
     started_at: std::time::Instant,
     provider_route: Option<ProviderRoute>,
     backend: CapsuleBackend,
+    /// Phase 4 Day 6 — per-bridge termination observer
+    /// (Mac path). `Some` when the supervisor wired
+    /// `BridgeContext::on_terminate` for this capsule;
+    /// `stop_capsule` awaits this notify with a bounded
+    /// timeout after `vm.stop()` resolves so it can log
+    /// "bridge terminated cleanly" vs. "bridge orphaned —
+    /// continuing with cleanup". `None` for Linux capsules
+    /// (no Mac-side lifecycle to observe) and for Mac
+    /// capsules without a `capability_manager` /
+    /// `pending_store` (no bridge_ctx → no notify).
+    #[cfg(target_os = "macos")]
+    bridge_terminated: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 struct RunningGateway {
@@ -1452,6 +1464,13 @@ impl Supervisor {
                     capability_manager: cap_mgr.clone(),
                     pending_store: pending.clone(),
                     capsule_id: format!("vm-{}", name),
+                    // Linux launch path keeps the Phase 4 Day
+                    // 6 lifecycle observability off — crosvm
+                    // bridges already terminate
+                    // deterministically with the child
+                    // process. Mac-only feature; see
+                    // `start_capsule_vm_macos`.
+                    on_terminate: None,
                 }),
                 _ => None,
             };
@@ -1499,6 +1518,11 @@ impl Supervisor {
                     started_at: std::time::Instant::now(),
                     provider_route,
                     backend: CapsuleBackend::Vm(Box::new(vm)),
+                    // Linux crosvm path — bridge lifecycle
+                    // ties to the child process (Day 6 feature
+                    // is Mac-only).
+                    #[cfg(target_os = "macos")]
+                    bridge_terminated: None,
                 },
             );
         }
@@ -1651,6 +1675,13 @@ impl Supervisor {
             })?;
         drop(provider); // explicit: queue Arc lives on inside vz_vm.
 
+        // Phase 4 Day 6: per-bridge termination observer
+        // declared at function scope so it can be stored on
+        // the `RunningCapsule` below. Populated only when a
+        // bridge is actually wired (carrier_fd + provider
+        // registry + capability infrastructure all present).
+        let mut bridge_terminated: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+
         // Phase 3 Day 4: take the Carrier host-side socket fd
         // and hand it to `spawn_carrier_bridge_on_stream`. From
         // here forward the guest's `/dev/hvc1` reads and writes
@@ -1670,9 +1701,19 @@ impl Supervisor {
                         capability_manager: cap_mgr.clone(),
                         pending_store: pending.clone(),
                         capsule_id: format!("vm-{}", name),
+                        // Phase 4 Day 6: mint a per-bridge
+                        // termination observer so the supervisor's
+                        // `stop_capsule` can deterministically
+                        // await natural bridge teardown after
+                        // `vm.stop()` resolves. The supervisor
+                        // extracts this Arc from the context
+                        // below and stores it on the
+                        // `RunningCapsule`.
+                        on_terminate: Some(std::sync::Arc::new(tokio::sync::Notify::new())),
                     }),
                     _ => None,
                 };
+                bridge_terminated = bridge_ctx.as_ref().and_then(|c| c.on_terminate.clone());
 
                 // SAFETY: `carrier_fd` is an `OwnedFd` returned from
                 // `build_carrier_console_slot`, already set
@@ -1778,6 +1819,7 @@ impl Supervisor {
             started_at,
             provider_route,
             backend: CapsuleBackend::VzVm(Box::new(vz_vm)),
+            bridge_terminated,
         };
         self.running
             .write()
@@ -2078,6 +2120,10 @@ impl Supervisor {
                     started_at: std::time::Instant::now(),
                     provider_route,
                     backend: CapsuleBackend::Carrier,
+                    // Carrier services are host-side processes —
+                    // no Vz bridge, no Day 6 notify wiring.
+                    #[cfg(target_os = "macos")]
+                    bridge_terminated: None,
                 },
             );
         }
@@ -2136,20 +2182,75 @@ impl Supervisor {
             }
             #[cfg(target_os = "macos")]
             CapsuleBackend::VzVm(mut vm) => {
-                // Same shape as the crosvm arm: stop the VM
-                // (Vz dispatches stopWithCompletionHandler on
-                // the per-machine queue), then remove the
-                // rootfs overlay the supervisor created in
-                // Phase 3 Day 2's build_vm_config_for_mac.
-                vm.stop().await.map_err(|e| {
-                    anyhow::anyhow!("Vz VM stop failed for '{}': {}", capsule.name, e)
-                })?;
+                // Phase 4 Day 5/6: best-effort stop semantics.
+                // The Vz path has no `kill -9` equivalent, so a
+                // wedged `stopWithCompletionHandler:` would
+                // block `stop_capsule` indefinitely. Day 6
+                // bounded that with `VzConfig::stop_timeout`
+                // inside `VzMachineHandle::stop`; on timeout the
+                // call returns a typed error, the Vz handle is
+                // orphaned, and the supervisor MUST proceed
+                // with overlay + bridge cleanup so future
+                // launches of the same capsule are not blocked
+                // by stale on-disk state.
+                let stop_outcome = vm.stop().await;
+                if let Err(e) = &stop_outcome {
+                    tracing::warn!(
+                        "Vz VM stop failed for '{}' (handle={}): {} — \
+                         continuing with best-effort cleanup (Phase 4 Day 6).",
+                        capsule.name,
+                        handle,
+                        e
+                    );
+                }
+
+                // Phase 4 Day 6: deterministic bridge teardown
+                // observation. The Carrier-bridge dispatch loop
+                // signals `bridge_terminated` on every exit
+                // path; we wait up to 10 s for it to fire. If
+                // it doesn't, we log and proceed — same
+                // best-effort posture as the stop-timeout
+                // case. 10 s comfortably covers the
+                // NSFileHandle release lag (sub-second on real
+                // hardware per the Day 5 audit).
+                if let Some(notify) = capsule.bridge_terminated.as_ref() {
+                    let bridge_budget = std::time::Duration::from_secs(10);
+                    match tokio::time::timeout(bridge_budget, notify.notified()).await {
+                        Ok(()) => tracing::debug!(
+                            "Vz bridge for '{}' (handle={}) terminated cleanly",
+                            capsule.name,
+                            handle
+                        ),
+                        Err(_) => tracing::warn!(
+                            "Vz bridge for '{}' (handle={}) did not terminate within {:?} — \
+                             continuing with best-effort cleanup (Phase 4 Day 6).",
+                            capsule.name,
+                            handle,
+                            bridge_budget
+                        ),
+                    }
+                }
+
                 let overlay_path = self
                     .crosvm_config
                     .rootfs_cache_dir
                     .join("overlays")
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
+
+                if let Err(e) = stop_outcome {
+                    // After best-effort cleanup ran, still
+                    // surface the typed error to the caller —
+                    // the supervisor's `stop_capsule` API
+                    // contract is that a non-`Ok` return means
+                    // operator attention is needed even if
+                    // local state is consistent.
+                    return Err(anyhow::anyhow!(
+                        "Vz VM stop failed for '{}': {} (cleanup ran best-effort)",
+                        capsule.name,
+                        e
+                    ));
+                }
             }
         }
 
@@ -3456,6 +3557,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             provider_route: None,
             backend: CapsuleBackend::VzVm(Box::new(vm)),
+            bridge_terminated: None,
         }
     }
 
@@ -3509,6 +3611,97 @@ mod tests {
         assert!(
             !running.contains_key(handle),
             "stop_capsule must remove the VzVm entry from `running`"
+        );
+    }
+
+    /// Phase 4 Day 6 — `stop_capsule` awaits
+    /// `RunningCapsule::bridge_terminated` after `vm.stop`
+    /// resolves and continues without delay once the notify
+    /// fires. Proves the deterministic teardown observation
+    /// the supervisor now relies on.
+    ///
+    /// Fixture:
+    /// 1. Build a synthetic VzVm capsule whose `RunningVm::stop`
+    ///    is an idempotent no-op (no handle attached).
+    /// 2. Attach a fresh `bridge_terminated` Arc<Notify>.
+    /// 3. Spawn `stop_capsule(handle)` in the background.
+    /// 4. After a tiny delay (let stop_capsule reach its
+    ///    `notify.notified()` await), fire `notify_waiters()`.
+    /// 5. Assert the spawn returns Ok within 1 s.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_capsule_proceeds_immediately_when_bridge_termination_notify_fires() {
+        let supervisor = std::sync::Arc::new(make_test_supervisor());
+        let handle = "vm-phase4-day6-bridge-notify-fires";
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day6-bridge-notify-fires", handle);
+        rc.bridge_terminated = Some(std::sync::Arc::clone(&notify));
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let supervisor_for_stop = std::sync::Arc::clone(&supervisor);
+        let handle_for_stop = handle.to_string();
+        let stop_task =
+            tokio::spawn(async move { supervisor_for_stop.stop_capsule(&handle_for_stop).await });
+
+        // Give stop_capsule time to reach `notify.notified()`.
+        // The synthetic RunningVm::stop is synchronous-no-op,
+        // so the supervisor task is parked in the notify wait
+        // after ~one tick.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        notify.notify_waiters();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stop_task)
+            .await
+            .expect("stop_capsule must return inside 1s once bridge notify fires")
+            .expect("stop_capsule task must not panic")
+            .expect("stop_capsule must succeed on the happy path");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "stop_capsule must observe the notify and proceed quickly; took {:?}",
+            elapsed
+        );
+
+        let running = supervisor.running.read().await;
+        assert!(
+            !running.contains_key(handle),
+            "stop_capsule must remove the VzVm entry from `running` regardless of bridge state"
+        );
+    }
+
+    /// Phase 4 Day 6 — when the bridge notify is `None` (no
+    /// BridgeContext was wired, e.g. legacy infrastructure
+    /// capsules), `stop_capsule` MUST NOT block waiting for a
+    /// non-existent signal. The synthetic capsule defaults to
+    /// `bridge_terminated = None`, so this also doubles as a
+    /// regression guard against accidental "always wait
+    /// 10 s" behaviour.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stop_capsule_does_not_block_when_bridge_terminated_is_none() {
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day6-no-bridge-notify";
+        let rc = synthetic_vzvm_running_capsule("phase4-day6-no-bridge-notify", handle);
+        assert!(
+            rc.bridge_terminated.is_none(),
+            "synthetic capsule starts with no bridge notify (legacy / no-cap-infra path)"
+        );
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let started = std::time::Instant::now();
+        supervisor
+            .stop_capsule(handle)
+            .await
+            .expect("stop_capsule must succeed without a bridge notify");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "stop_capsule must NOT block when there is no bridge to await; took {:?}",
+            elapsed
         );
     }
 
