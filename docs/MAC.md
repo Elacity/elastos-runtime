@@ -31,7 +31,20 @@ to first-class support.
 |---|---|---|
 | `type: wasm` (e.g. `home`, `system`, `chat-room`) | wasmtime, capability tokens | Same as Linux |
 | `type: data` (e.g. `documents`, `library`, `inbox`, `gba-emulator`) | static assets, served by gateway | Same as Linux |
-| `type: microvm` (e.g. `chat`, `agent`, `localhost-provider`, `did-provider`, `shell`, `webspace-provider`, `ipfs-provider`, `tunnel-provider`, ...) | KVM + crosvm on Linux; Apple Vz on macOS *(in progress — see below)* | **Phase 3 Day 6 closes the inter-capsule provider RPC loop on Mac.** Earlier Phase-3 days landed the supervisor → `VzProvider` seam (Day 1), the launch prefix (Day 2), `CapsuleBackend::VzVm` (Day 3), the Carrier console socketpair (Day 4), and delegate-driven exit codes + the host→guest vsock primitive (Day 5). **Day 6 wires that primitive into `vm_provider.rs`:** when a Mac microVM declares `provides:`, the supervisor registers a `VmCapsuleProvider` backed by a `MacVsockDial` closure that calls `RunningVm::connect_vsock` (Apple's `VZVirtioSocketDevice.connectToPort:`). Sibling capsules can now route `localhost://`/`elastos://…` requests at provider-VM capsules on Mac — capsule code on Mac can both call out to host providers (Day 4) AND be reached by other capsules' provider calls (Day 6). TAP networking remains rejected with a typed entitlement-required message; bridged-mode is Phase 3 Day 7+. See [`vz-backend/PHASE_3_DAY_6_NOTES.md`](vz-backend/PHASE_3_DAY_6_NOTES.md). |
+| `type: microvm` (e.g. `chat`, `agent`, `localhost-provider`, `did-provider`, `shell`, `webspace-provider`, `ipfs-provider`, `tunnel-provider`, ...) | KVM + crosvm on Linux; Apple Vz on macOS *(in progress — see below)* | **Phase 3 Day 7 turns `guest_network` into a runtime-conditional capability on Mac.** Earlier Phase-3 days landed the supervisor → `VzProvider` seam (Day 1), the launch prefix (Day 2), `CapsuleBackend::VzVm` (Day 3), the Carrier console socketpair (Day 4), delegate-driven exit codes + the host→guest vsock primitive (Day 5), and `MacVsockDial` provider-bridge integration (Day 6). **Day 7 adds a `Security.framework`-based runtime entitlement check** (`SecTaskCopyValueForEntitlement` on `com.apple.vm.networking`) and threads it through the Vz FFI builder: capsules that declare `permissions.guest_network: true` now reach the builder rather than hitting an unconditional bail, and the builder either (a) attaches a `VZBridgedNetworkDeviceAttachment` (when the binary is signed with the entitlement) or (b) surfaces a typed `ElastosError::Compute` naming `com.apple.vm.networking` and `guest_network` and pointing operators at this document. NAT-only capsules (`guest_network: false`) keep going through the Day-2 NAT attachment byte-identically. See [`vz-backend/PHASE_3_DAY_7_NOTES.md`](vz-backend/PHASE_3_DAY_7_NOTES.md). |
+
+### `guest_network: true` on macOS — binary signing requirements
+
+The runtime check uses `SecTaskCopyValueForEntitlement` against the
+current process's embedded entitlements plist. The two reachable
+states are:
+
+| Binary | Outcome for a `guest_network: true` capsule |
+|---|---|
+| **Signed with `com.apple.vm.networking` entitlement** (release build provisioned via the Apple Developer ID + entitlement request) | `VZBridgedNetworkDeviceAttachment` attached to the VM, deterministic MAC from `NetworkConfig.guest_mac`, capsule sees a routable interface bridged to the host's primary network. |
+| **Unsigned dev binary** (every `cargo build` artifact, every CI runner) | Builder returns `ElastosError::Compute` naming `com.apple.vm.networking` and `guest_network`. Operator is told to either drop the manifest flag (capsule runs NAT-only) or install the signed dev build. NO silent NAT downgrade — the capsule explicitly asked for routable networking and must either get it or be told why it can't. |
+
+NAT-only capsules (the vast majority — every `home`, `chat`, `agent`, etc.) are not affected by this gate and run identically on signed and unsigned binaries.
 
 The browser-hosted Home surface
 (`http://127.0.0.1:8090/apps/home/`) and its child apps (System, Inbox,

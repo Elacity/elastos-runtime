@@ -33,8 +33,9 @@ use super::balloon::build_balloon_device;
 use super::block::build_block_device;
 use super::boot_loader::build_boot_loader;
 use super::console::{build_carrier_console_slot, build_kernel_console};
+use super::entitlement::has_vm_networking_entitlement;
 use super::entropy::build_entropy_device;
-use super::network::build_nat_network;
+use super::network::{build_bridged_network, build_nat_network};
 use super::platform::build_platform;
 use super::vsock::build_vsock_device;
 
@@ -118,7 +119,33 @@ impl BuiltMachine {
         let carrier_host_fd = carrier.host_fd;
 
         let vsock = build_vsock_device();
-        let network = build_nat_network();
+        // Phase 3 Day 7: network device selection.
+        //
+        // - `vm.network = None` → NAT (no entitlement needed,
+        //   Day-2 default behaviour byte-identical).
+        // - `vm.network = Some(_)` + entitlement granted →
+        //   bridged attachment, deterministic MAC from
+        //   `NetworkConfig.guest_mac`.
+        // - `vm.network = Some(_)` + entitlement missing →
+        //   typed fail-closed. NO silent NAT downgrade — the
+        //   capsule explicitly asked for routable networking
+        //   and must either get it or be told why it can't.
+        let network = match vm.network.as_ref() {
+            None => build_nat_network(),
+            Some(net_cfg) => {
+                if !has_vm_networking_entitlement() {
+                    return Err(format!(
+                        "vz machine builder: capsule '{}' requested guest_network (bridged \
+                         attachment) but this binary lacks the `com.apple.vm.networking` Apple \
+                         entitlement. Drop `permissions.guest_network` from the manifest, OR \
+                         install the signed dev build that carries the entitlement. See \
+                         docs/MAC.md and docs/vz-backend/PHASE_3_DAY_7_NOTES.md.",
+                        vm.vm_id
+                    ));
+                }
+                build_bridged_network(net_cfg).map_err(|e| format!("vz machine builder: {e}"))?
+            }
+        };
         let entropy = build_entropy_device();
         let balloon = build_balloon_device();
 
@@ -378,5 +405,129 @@ mod tests {
         assert_eq!(unsafe { cfg.networkDevices() }.count(), 1);
         assert_eq!(unsafe { cfg.entropyDevices() }.count(), 1);
         assert_eq!(unsafe { cfg.memoryBalloonDevices() }.count(), 1);
+    }
+
+    // --------------------------------------------------------------
+    // Phase 3 Day 7 — guest_network entitlement gating
+    // --------------------------------------------------------------
+
+    /// When the capsule asks for bridged networking but the
+    /// binary lacks `com.apple.vm.networking`, the builder
+    /// must fail closed with a typed message naming both the
+    /// entitlement and the manifest field. NO silent NAT
+    /// downgrade — capsule asked for routable networking and
+    /// must be told why it can't have it.
+    #[test]
+    fn builder_surfaces_typed_error_when_entitlement_absent_and_network_requested() {
+        use crate::ffi::entitlement::override_for_testing;
+        use crate::network::NetworkConfig;
+
+        let _guard = override_for_testing(false);
+
+        let tmp = TempDir::new().unwrap();
+        let kernel = write_fake_kernel(tmp.path());
+        let rootfs = write_fake_disk(tmp.path(), "rootfs.img");
+
+        let mut vm = make_vm_config(&kernel, &rootfs);
+        vm.network = Some(NetworkConfig::new(&vm.vm_id));
+
+        let provider = make_vz_config(tmp.path().join("vz-state"), kernel.clone());
+        let err = BuiltMachine::from_vm_config(&vm, &provider)
+            .expect_err("builder must reject vm.network = Some(_) when entitlement is absent");
+
+        assert!(
+            err.contains("com.apple.vm.networking"),
+            "expected entitlement name in error, got: {err}"
+        );
+        assert!(
+            err.contains("guest_network"),
+            "expected manifest field name in error, got: {err}"
+        );
+        // The capsule's vm_id (or the manifest entry that
+        // produced it) must surface so operators can trace
+        // which capsule was rejected.
+        assert!(
+            err.contains(&vm.vm_id),
+            "expected vm_id in error, got: {err}"
+        );
+    }
+
+    /// When the entitlement IS granted (override-true), the
+    /// builder must produce a configuration with exactly one
+    /// network device — same shape as the NAT path. The
+    /// underlying attachment is `VZBridgedNetworkDeviceAttachment`
+    /// instead of `VZNATNetworkDeviceAttachment`; we don't
+    /// downcast in this test because Apple's class hierarchy
+    /// doesn't expose a public discriminant on
+    /// `VZNetworkDeviceConfiguration` and the device-count
+    /// invariant is the contract that matters for the
+    /// `VZVirtualMachineConfiguration::validate` path.
+    ///
+    /// Note: on a host with no bridge-capable interfaces (rare),
+    /// this test surfaces the `no host interface available`
+    /// error from `pick_first_bridged_interface` — also a
+    /// correct fail-closed. We accept either Ok or that
+    /// specific error.
+    #[test]
+    fn builder_attaches_bridged_attachment_when_entitlement_present() {
+        use crate::ffi::entitlement::override_for_testing;
+        use crate::network::NetworkConfig;
+
+        let _guard = override_for_testing(true);
+
+        let tmp = TempDir::new().unwrap();
+        let kernel = write_fake_kernel(tmp.path());
+        let rootfs = write_fake_disk(tmp.path(), "rootfs.img");
+
+        let mut vm = make_vm_config(&kernel, &rootfs);
+        vm.network = Some(NetworkConfig::new(&vm.vm_id));
+
+        let provider = make_vz_config(tmp.path().join("vz-state"), kernel.clone());
+        match BuiltMachine::from_vm_config(&vm, &provider) {
+            Ok(built) => {
+                let net_devices = unsafe { built.vz_config.networkDevices() };
+                assert_eq!(
+                    net_devices.count(),
+                    1,
+                    "expected exactly one network device on the bridged path"
+                );
+            }
+            Err(e) => {
+                // The only acceptable error here is the
+                // "no host interface" surface; the entitlement
+                // gate already passed via override.
+                assert!(
+                    e.contains("no host interface"),
+                    "unexpected builder error on entitlement-present path: {e}"
+                );
+            }
+        }
+    }
+
+    /// Defensive: when the capsule does NOT request
+    /// `guest_network`, the entitlement state must be
+    /// irrelevant. Whether the override says yes or no, the
+    /// builder produces the NAT-attached configuration and
+    /// never consults the bridged path. Guards against an
+    /// accidental "entitlement controls all networking"
+    /// regression.
+    #[test]
+    fn builder_ignores_entitlement_when_capsule_uses_nat_only() {
+        use crate::ffi::entitlement::override_for_testing;
+
+        for override_value in [false, true] {
+            let _guard = override_for_testing(override_value);
+
+            let tmp = TempDir::new().unwrap();
+            let kernel = write_fake_kernel(tmp.path());
+            let rootfs = write_fake_disk(tmp.path(), "rootfs.img");
+
+            let vm = make_vm_config(&kernel, &rootfs); // .network = None
+            let provider = make_vz_config(tmp.path().join("vz-state"), kernel.clone());
+
+            let built = BuiltMachine::from_vm_config(&vm, &provider)
+                .expect("NAT-only capsule must succeed regardless of entitlement state");
+            assert_eq!(unsafe { built.vz_config.networkDevices() }.count(), 1);
+        }
     }
 }

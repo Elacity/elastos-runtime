@@ -1376,21 +1376,16 @@ impl Supervisor {
             );
         }
 
-        // Phase 3 Day 4+ (Vz bridged networking) territory.
-        // NAT-only Vz networking is the Day 2 default — no
-        // Apple entitlement required, and it's what the Phase 0
-        // audit signed off on for unmodified dev installs.
-        if manifest.permissions.guest_network {
-            bail!(
-                "vz: capsule '{}' requests guest_network (TAP), but Vz bridged \
-                 networking requires the `com.apple.vm.networking` Apple entitlement \
-                 — deferred to Phase 3 Day 4+. NAT-only capsules launch normally on \
-                 macOS; this capsule needs to drop `permissions.guest_network` or \
-                 wait for the bridged-mode milestone. \
-                 See docs/vz-backend/PHASE_3_DAY_1_PORT_PLAN.md.",
-                name
-            );
-        }
+        // Phase 3 Day 7: `permissions.guest_network` is no longer
+        // an unconditional bail. The supervisor populates
+        // `vm_config.network` inside `build_vm_config_for_mac`;
+        // the Vz builder then decides at build time whether the
+        // process is entitled to attach a
+        // `VZBridgedNetworkDeviceAttachment` (entitlement
+        // present → bridged device; absent → typed Compute
+        // error pointing at `docs/MAC.md`). NAT-only capsules
+        // (`guest_network: false`) keep going through the
+        // Day-2 NAT attachment with zero diff.
 
         let vz_config = VzConfig::default();
         let provider = VzProvider::new(vz_config.clone())
@@ -1661,6 +1656,23 @@ impl Supervisor {
         vm_config.vsock_cid = cid;
         vm_config.boot_args = format!("{} elastos.data_dir=/opt/elastos", vm_config.boot_args);
         vm_config.interactive_stdio = interactive_stdio;
+
+        // Phase 3 Day 7: bridged-networking opt-in.
+        //
+        // When the manifest sets `permissions.guest_network: true`,
+        // populate `vm_config.network` with a deterministic
+        // per-VM `NetworkConfig` (matching the Linux
+        // `with_network(NetworkConfig::new(&vm_id))` shape at
+        // supervisor.rs L1123-1126). The Vz FFI builder
+        // (`elastos-vz::ffi::builder`) then attaches a
+        // `VZBridgedNetworkDeviceAttachment` if the process holds
+        // the `com.apple.vm.networking` entitlement, OR returns
+        // a typed `ElastosError::Compute` if the binary is
+        // unsigned. There is NO silent NAT downgrade — the
+        // capsule explicitly asked for routable networking.
+        if manifest.permissions.guest_network {
+            vm_config.network = Some(elastos_vz::NetworkConfig::new(&vm_config.vm_id));
+        }
         // Apply the provider-wide initramfs default if set.
         // VzConfig carries this for `vm-debug boot --initramfs`;
         // real capsules typically don't need it but the seam
@@ -2858,40 +2870,124 @@ mod tests {
         );
     }
 
-    /// Phase 3 Day 2 contract: a TAP-requesting capsule
-    /// (`permissions.guest_network: true`) fails closed on Mac
-    /// with a typed message naming the entitlement and the
-    /// Phase 3 Day 4+ milestone. NO silent downgrade to NAT.
+    /// Phase 3 Day 7 contract: a `guest_network: true` capsule
+    /// no longer hits an unconditional bail in
+    /// `start_capsule_vm_macos`. Instead `build_vm_config_for_mac`
+    /// populates `vm_config.network` and the Vz FFI builder
+    /// decides at build time whether to attach a
+    /// `VZBridgedNetworkDeviceAttachment` (entitlement present)
+    /// or surface a typed error (entitlement absent — every
+    /// dev/CI binary).
+    ///
+    /// On a test host without the entitlement we expect the
+    /// supervisor to fail somewhere in its launch pipeline. The
+    /// exact failure depends on what else is missing: in a
+    /// stock CI environment with no kernel/rootfs installed
+    /// the kernel-not-found error fires first (also a valid
+    /// fail-closed); when those are present the builder's
+    /// entitlement error fires. Either is correct fail-closed
+    /// behaviour. The test asserts only that
+    /// `start_capsule_vm_macos` rejects the launch — silent
+    /// success on an unentitled host would be a bug.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn start_capsule_vm_macos_fails_closed_when_manifest_requests_tap_network() {
+    async fn start_capsule_vm_macos_fails_closed_when_guest_network_lacks_entitlement() {
         let supervisor = make_test_supervisor();
         let capsule_dir = tempfile::tempdir().unwrap().keep();
-        let mut manifest = synthetic_microvm_manifest("phase3-day2-tap-test");
+        let mut manifest = synthetic_microvm_manifest("phase3-day7-guest-network-test");
         manifest.permissions.guest_network = true;
 
-        let err = supervisor
+        let result = supervisor
             .start_capsule_vm_macos(
-                "phase3-day2-tap-test",
+                "phase3-day7-guest-network-test",
                 manifest,
                 capsule_dir.to_path_buf(),
                 serde_json::Value::Null,
             )
+            .await;
+        assert!(
+            result.is_err(),
+            "guest_network: true must fail closed on an unentitled CI host"
+        );
+    }
+
+    /// Phase 3 Day 7 routing contract: when the manifest sets
+    /// `permissions.guest_network: true`, `build_vm_config_for_mac`
+    /// must populate `vm_config.network = Some(NetworkConfig)`
+    /// so the Vz FFI builder can decide bridged-vs-fail-closed
+    /// at construction time. Without this routing, every Mac
+    /// capsule would silently get NAT — exactly the kind of
+    /// "fail open" the Phase 0 audit ruled out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_routes_guest_network_capsule_into_vm_config_network() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let mut manifest = synthetic_microvm_manifest("phase3-day7-network-routing");
+        manifest.permissions.guest_network = true;
+
+        let vz_config = VzConfig::default();
+        let (vm_config, _handle, _cid, _carrier_socket) = supervisor
+            .build_vm_config_for_mac(
+                "phase3-day7-network-routing",
+                &manifest,
+                &capsule_dir,
+                serde_json::Value::Null,
+                &vz_config,
+            )
             .await
-            .unwrap_err();
-        let msg = err.to_string();
+            .expect("build_vm_config_for_mac succeeds (entitlement check is the builder's job)");
+
+        let network = vm_config.network.as_ref().expect(
+            "guest_network: true must populate vm_config.network — \
+             without it the Vz builder cannot decide bridged-vs-fail-closed",
+        );
+        // The deterministic per-VM derivation lives in
+        // `elastos_vz::NetworkConfig::new`; assert the
+        // observable invariants (the supervisor doesn't need
+        // to know the exact IP allocator).
+        assert!(
+            network.host_ip.starts_with("172.16."),
+            "expected the Vz NetworkConfig host_ip to be in the 172.16/12 RFC1918 range, got {}",
+            network.host_ip
+        );
+        assert!(network.guest_mac.starts_with("AA:FC:"));
+        assert_eq!(network.prefix_len, 30);
+    }
+
+    /// Phase 3 Day 7 routing contract (mirror): a capsule that
+    /// does NOT declare `guest_network` must leave
+    /// `vm_config.network` as `None` — the Vz builder then takes
+    /// the NAT path with zero diff vs Day 2. Guards against an
+    /// accidental "always-on bridged" regression.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn build_vm_config_for_mac_leaves_network_none_when_guest_network_not_requested() {
+        use elastos_vz::VzConfig;
+
+        let supervisor = make_test_supervisor();
+        let capsule_dir = tempfile::tempdir().unwrap().keep();
+        let mut manifest = synthetic_microvm_manifest("phase3-day7-nat-default");
+        manifest.permissions.guest_network = false;
+
+        let vz_config = VzConfig::default();
+        let (vm_config, _handle, _cid, _carrier_socket) = supervisor
+            .build_vm_config_for_mac(
+                "phase3-day7-nat-default",
+                &manifest,
+                &capsule_dir,
+                serde_json::Value::Null,
+                &vz_config,
+            )
+            .await
+            .expect("build_vm_config_for_mac succeeds for NAT-only capsule");
 
         assert!(
-            msg.contains("com.apple.vm.networking"),
-            "expected the error to name the entitlement, got: {msg}"
-        );
-        assert!(
-            msg.contains("guest_network") || msg.contains("TAP"),
-            "expected the error to name the requested capability, got: {msg}"
-        );
-        assert!(
-            msg.contains("phase3-day2-tap-test"),
-            "expected the error to carry the capsule name, got: {msg}"
+            vm_config.network.is_none(),
+            "NAT-only capsule must leave vm_config.network = None; got Some({:?})",
+            vm_config.network
         );
     }
 

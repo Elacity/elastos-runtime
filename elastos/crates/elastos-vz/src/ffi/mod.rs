@@ -55,6 +55,7 @@ pub(crate) mod console;
 pub(crate) mod console_forwarder;
 pub(crate) mod delegate;
 pub(crate) mod dispatch;
+pub(crate) mod entitlement;
 pub(crate) mod entropy;
 pub(crate) mod error;
 pub(crate) mod lifecycle;
