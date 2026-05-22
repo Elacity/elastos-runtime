@@ -140,9 +140,57 @@ trade-off.
   Linux host) and connect to it. This mirrors how Docker Desktop and
   the Kubernetes control plane handle the Mac case.
 
+## First boot on Apple Silicon (Phase 2 Day 4+)
+
+Once the Vz backend lands you'll be able to boot a Linux guest
+end-to-end against your own kernel + rootfs. The wiring is in
+place as of Phase 2 Day 4; the only remaining gap is "a real
+arm64 Linux kernel image that Apple's `VZLinuxBootLoader`
+accepts" — see [`vz-backend/PHASE_2_DAY_4_NOTES.md`](vz-backend/PHASE_2_DAY_4_NOTES.md)
+for the verified outcome of the Day 4 attempt.
+
+The operator recipe, once kernel artifacts are available:
+
+```bash
+# 1. Build the runtime binary.
+cargo build -p elastos-server
+
+# 2. Sign it with com.apple.security.virtualization so Apple's
+#    VZVirtualMachineConfiguration.validateWithError accepts the
+#    config. The script is idempotent — re-run after every
+#    `cargo build`.
+scripts/dev/sign-elastos-vz/sign.sh
+
+# 3. Boot the guest. The kernel must be a raw arm64 Linux Image
+#    (NOT a bzImage). The rootfs will be exposed as /dev/vda
+#    inside the guest. Guest kernel printk streams via the
+#    `vm_console` tracing target — visible by default.
+target/debug/elastos vm-debug boot \
+  --rootfs /path/to/rootfs.img \
+  --kernel /path/to/Image \
+  --memory-mb 256 \
+  --vcpus 1
+
+# Press Ctrl-C to stop. The VM also stops itself if the guest
+# shuts down.
+```
+
+If step 2 is skipped you'll see a single operator-friendly
+error string when `vm-debug boot` calls `provider.load`:
+
+> `vz validate (vm_id='…'): missing com.apple.security.virtualization entitlement — sign the binary with scripts/dev/sign-elastos-vz/ (Phase 2 Day 4) or see docs/MAC.md. Apple error: …`
+
+If the kernel artifact isn't a Vz-compatible arm64 Image, Apple
+returns `Internal Virtualization error. The virtual machine
+failed to start.` from `provider.start`. That's the signal you
+need a real kernel — Day 5 (and Phase 3 in `PLAN.md`) covers
+how to get one.
+
 ## Cross-references
 
 - The plan: [`docs/vz-backend/PLAN.md`](vz-backend/PLAN.md)
+- Day 4 outcome log: [`docs/vz-backend/PHASE_2_DAY_4_NOTES.md`](vz-backend/PHASE_2_DAY_4_NOTES.md)
+- Codesign helper: [`scripts/dev/sign-elastos-vz/README.md`](../scripts/dev/sign-elastos-vz/README.md)
 - The principles this plan obeys: [`PRINCIPLES.md`](../PRINCIPLES.md)
   (#10, #11, #12 in particular)
 - The runtime's support boundary: [`state.md`](../state.md)

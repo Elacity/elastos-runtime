@@ -21,6 +21,7 @@ mod share_cmd;
 mod shares_cmd;
 mod site_cmd;
 mod trust_cmd;
+mod vm_debug_cmd;
 mod webspace_cmd;
 
 use clap::{Parser, Subcommand};
@@ -491,6 +492,12 @@ enum Commands {
         #[arg(long)]
         rollback_to: Option<String>,
     },
+
+    /// Developer entry point: drive the Apple Silicon Vz backend
+    /// directly. macOS only — see `docs/MAC.md` and
+    /// `docs/vz-backend/PLAN.md` (Phase 2 Day 4).
+    #[command(name = "vm-debug", subcommand)]
+    VmDebug(vm_debug_cmd::VmDebugCommand),
 }
 
 #[derive(Subcommand)]
@@ -1025,11 +1032,19 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize logging — uses ConditionalStderr so interactive VMs can suppress output.
+    //
+    // The extra `vm_console=info` directive opts the guest-kernel
+    // console target into the default filter so both the Linux
+    // (crosvm) and macOS (Vz) backends' `tracing::info!(target =
+    // "vm_console", …)` events are visible without forcing
+    // operators to set `RUST_LOG` by hand. `EnvFilter::from_default_env`
+    // still wins, so a user-provided `RUST_LOG` can override.
     tracing_subscriber::fmt()
         .with_writer(ConditionalStderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("elastos=info".parse().expect("valid tracing directive")),
+                .add_directive("elastos=info".parse().expect("valid tracing directive"))
+                .add_directive("vm_console=info".parse().expect("valid tracing directive")),
         )
         .init();
 
@@ -1076,6 +1091,14 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Publish { path } => {
             return capsule_publish_cmd::run_publish(path).await;
+        }
+
+        Commands::VmDebug(vm_debug) => {
+            // Phase 2 Day 4 (docs/vz-backend/PLAN.md). The
+            // subcommand itself decides whether the host is
+            // capable; here we just hand off so the typed error
+            // surface lives in one place.
+            return vm_debug_cmd::run(vm_debug).await;
         }
 
         Commands::Share {
