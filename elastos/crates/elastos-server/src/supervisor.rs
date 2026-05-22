@@ -911,6 +911,19 @@ impl Supervisor {
     /// `config` is an opaque JSON payload from the CLI command. For the shell
     /// capsule, this contains the forwarded command (e.g. `{"command":"chat",...}`).
     /// It is base64-encoded and passed via the `elastos.command` kernel boot arg.
+    ///
+    /// **Linux:** the crosvm path below is the only substrate; behavior is
+    /// byte-identical to the pre-Vz-backend commit. **macOS:** the launch
+    /// path short-circuits at the substrate-check site below with a Phase 1
+    /// `vz backend not yet implemented` bail. Phase 2/3 (see
+    /// `docs/vz-backend/PLAN.md`) replace that bail with a real
+    /// `VzProvider.load(...)` route, at which point the rest of this
+    /// function body remains the Linux/crosvm-only code path.
+    ///
+    /// The `cfg_attr` below silences the expected `unreachable_code` warning
+    /// on macOS, where the Phase 1 bail makes the rest of the function dead
+    /// code. The warning is informational on Mac and a true error on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(unreachable_code, unused_variables))]
     async fn launch_capsule(&self, name: &str, config: serde_json::Value) -> Result<(String, u32)> {
         let (capsule_dir, manifest) = self.load_capsule_manifest(name).await?;
 
@@ -927,10 +940,42 @@ impl Supervisor {
                 .await;
         }
 
-        // VM path — hard require KVM
+        // VM path — hard require a microVM substrate.
+        //
+        // Linux: behavior is byte-identical to the pre-Vz-backend commit;
+        // crosvm is the only substrate, and `/dev/kvm` must be present.
+        //
+        // macOS: the Vz substrate is registered in main.rs but the
+        // per-VM launch path is not yet routed through it. Phase 1
+        // delivers scaffold only; Phase 2 wires `VzProvider.load(...)`
+        // and Phase 3 routes the supervisor through this site. Until
+        // then, fail closed with the same single-source-of-truth
+        // message used by VzProvider's stubs. See
+        // `docs/vz-backend/PLAN.md`.
+        //
+        // Other OS: no microVM substrate is available at all.
+        #[cfg(target_os = "linux")]
         if !elastos_crosvm::is_supported() {
             bail!("/dev/kvm not available — crosvm requires KVM. Cannot launch capsule '{name}'.");
         }
+
+        #[cfg(target_os = "macos")]
+        {
+            if !elastos_vz::is_supported() {
+                bail!(
+                    "Apple Virtualization.framework not available — cannot launch capsule '{name}' on this host. Requires macOS 12+ on Apple Silicon."
+                );
+            }
+            bail!(
+                "{} (supervisor: launch capsule '{}' on macOS not yet routed through Vz)",
+                elastos_vz::PHASE_1_STUB_MESSAGE,
+                name
+            );
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        bail!("no microVM substrate available on this OS — cannot launch capsule '{name}'");
+
         self.crosvm_config.validate().map_err(|e| {
             anyhow::anyhow!(
                 "VM prerequisites missing: {}. Run `elastos setup --with crosvm --with vmlinux` \

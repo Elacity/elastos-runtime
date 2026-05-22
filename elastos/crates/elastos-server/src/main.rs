@@ -1875,6 +1875,34 @@ pub(crate) async fn create_runtime(
         }
     }
 
+    // Add Apple Virtualization.framework provider on macOS. This is a
+    // SIBLING block to the crosvm registration above — it never
+    // executes on Linux (compiled out by `cfg(target_os = "macos")`)
+    // and the crosvm block above is byte-identical to the
+    // pre-Vz-backend commit. Per `docs/vz-backend/PLAN.md` Phase 1
+    // ("Linux-untouched gate"). Phase 1 wires the provider as a stub
+    // — every `load`/`start` call fails closed with the message in
+    // `elastos_vz::PHASE_1_STUB_MESSAGE`.
+    #[cfg(target_os = "macos")]
+    if elastos_vz::is_supported() {
+        match elastos_vz::VzProvider::new(elastos_vz::VzConfig::default()) {
+            Ok(provider) => {
+                if let Err(e) = provider.init().await {
+                    tracing::warn!("Failed to initialize vz provider: {}", e);
+                } else {
+                    tracing::info!(
+                        "vz provider enabled (Apple Virtualization.framework available; \
+                         Phase 1 stub — microVM launch fails closed)"
+                    );
+                    compute_providers.push(Arc::new(provider));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("vz provider not available: {}", e);
+            }
+        }
+    }
+
     Ok(Runtime::with_providers(
         storage,
         compute_providers,

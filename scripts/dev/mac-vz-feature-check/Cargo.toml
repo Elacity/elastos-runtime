@@ -1,0 +1,21 @@
+[package]
+name = "mac-vz-feature-check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone macOS probe that reports which Apple Virtualization.framework features are available on the running host. Phase 1: stub scaffold; Phase 1 Day 2 fills in the actual VZVirtualMachineConfiguration probes per docs/vz-backend/PHASE_0_SCOPE.md appendix A."
+
+[[bin]]
+name = "mac-vz-feature-check"
+path = "src/main.rs"
+
+# Intentionally NOT a workspace member — this is a developer-side
+# diagnostic tool, not part of the runtime build. It is invoked
+# manually before Phase 2 begins.
+[workspace]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Phase 1 stub: dependencies are declared empty. Phase 1 Day 2 adds:
+#   objc2 = "0.6"
+#   objc2-virtualization = "0.3"
+#   objc2-foundation = "0.3"
