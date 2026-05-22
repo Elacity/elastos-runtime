@@ -332,6 +332,28 @@ impl VzProvider {
             .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))
     }
 
+    /// Dial the guest's vsock listener on `port` from the host.
+    /// **Phase 3 Day 5.**
+    ///
+    /// Only valid while the VM is still owned by the provider
+    /// (i.e. before [`Self::take_running_vm`] has been called).
+    /// After the supervisor takes ownership it must dial via
+    /// the `RunningCapsule`'s `VzVm` backend directly — calling
+    /// this method on a moved-out handle returns
+    /// `ElastosError::CapsuleNotFound` so the supervisor can
+    /// distinguish "not found" from "lifecycle mismatch".
+    pub async fn vsock_connect(
+        &self,
+        handle: &CapsuleHandle,
+        port: u32,
+    ) -> Result<std::os::fd::OwnedFd> {
+        let vms = self.vms.read().await;
+        let vm = vms
+            .get(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))?;
+        vm.connect_vsock(port).await
+    }
+
     /// **Deprecated by Phase 3 Day 2.** Apple's
     /// `VZVirtualMachineConfiguration` is frozen post-init
     /// (Phase 0 §D pitfall #9); no session credentials can be

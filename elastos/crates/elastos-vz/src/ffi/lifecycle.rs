@@ -44,6 +44,7 @@ use objc2_virtualization::{
 };
 
 use super::console_forwarder::{spawn_console_forwarder, ConsoleForwarder};
+use super::delegate::{DelegateExit, ElastosVzDelegate, SendableDelegate, SharedExitSender};
 use super::dispatch::VzDispatchQueue;
 use super::error::ns_error_to_string;
 
@@ -113,7 +114,7 @@ impl From<VZVirtualMachineState> for VmState {
 /// - Never call a `VZVirtualMachine` method without first
 ///   re-entering the associated dispatch queue.
 /// - Never deref the inner `Retained` from arbitrary threads.
-struct SendableVm(Retained<VZVirtualMachine>);
+pub(crate) struct SendableVm(pub(crate) Retained<VZVirtualMachine>);
 
 // SAFETY: see the type-level docstring. Every external use of
 // `SendableVm.0` goes through `VzDispatchQueue::exec_sync` or
@@ -153,16 +154,31 @@ pub(crate) struct VzMachineHandle {
     /// join would block until drop anyway.
     #[allow(dead_code)]
     forwarder: ConsoleForwarder,
-    //
-    // NOTE on the missing `carrier_console` field: Day 2's
-    // `BuiltMachine` carries a `Retained<VZVirtioConsoleDeviceConfiguration>`
-    // so Phase 3's Carrier bridge can patch the slot in-place.
-    // For Day 3 we don't need that handle (the assembled
-    // `VZVirtualMachineConfiguration` already retains it via
-    // `setConsoleDevices`), and `Retained<NSObject>` is not
-    // unconditionally `Send`. Reintroducing it would require a
-    // `SendableConsole` newtype mirroring `SendableVm`. Phase 3
-    // adds both together.
+
+    /// Held to keep the delegate alive — Apple's
+    /// `setDelegate:` uses a weak reference, so the
+    /// `VZVirtualMachine` does not retain it. Dropping this
+    /// field after the VM is gone is a no-op; dropping it
+    /// while the VM is still alive would invalidate Apple's
+    /// weak pointer. Phase 3 Day 5.
+    #[allow(dead_code)]
+    delegate: SendableDelegate,
+
+    /// Shared sender to the exit oneshot — also held inside
+    /// the delegate's ivars. First-to-take-it-wins:
+    /// - The delegate takes it on
+    ///   `guestDidStopVirtualMachine:` or
+    ///   `virtualMachine:didStopWithError:`.
+    /// - [`Self::stop`] takes it after a successful host
+    ///   `stopWithCompletionHandler:` so `wait_for_exit`
+    ///   resolves on intentional shutdowns too.
+    exit_state: SharedExitSender,
+
+    /// Receiver consumed by [`Self::wait_for_exit`] exactly
+    /// once. Subsequent calls return a typed error rather than
+    /// hang forever — the supervisor enforces this with a
+    /// single waiter per capsule.
+    exit_rx: Mutex<Option<tokio::sync::oneshot::Receiver<DelegateExit>>>,
 }
 
 impl VzMachineHandle {
@@ -196,6 +212,14 @@ impl VzMachineHandle {
         // its first byte.
         let forwarder = spawn_console_forwarder(kernel_console_host_read, vm_id.clone());
 
+        // Phase 3 Day 5: prepare the delegate + exit channel
+        // BEFORE the VM is constructed, so `setDelegate:` can
+        // run immediately after init on the same dispatch
+        // queue.
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<DelegateExit>();
+        let exit_state: SharedExitSender = Arc::new(Mutex::new(Some(exit_tx)));
+        let delegate = ElastosVzDelegate::new(vm_id.clone(), exit_state.clone());
+
         // SAFETY: `initWithConfiguration_queue` documents that
         // the queue is retained for the lifetime of the VM and
         // that all subsequent VM calls must happen on the same
@@ -208,12 +232,32 @@ impl VzMachineHandle {
                 queue.as_raw(),
             )
         };
+        let vm = Arc::new(SendableVm(vm));
+
+        // Set the delegate on the dispatch queue — Apple
+        // requires every VM property mutation to happen on
+        // the associated queue.
+        let vm_for_setup = vm.clone();
+        let delegate_for_setup = SendableDelegate(delegate.clone());
+        queue.as_raw().exec_sync(move || {
+            // SAFETY: we are on the VM's associated queue
+            // inside this closure, satisfying Apple's
+            // setDelegate: threading contract.
+            unsafe {
+                vm_for_setup
+                    .0
+                    .setDelegate(Some(delegate_for_setup.0.as_protocol()));
+            }
+        });
 
         Ok(Self {
-            vm: Arc::new(SendableVm(vm)),
+            vm,
             queue,
             vm_id,
             forwarder,
+            delegate: SendableDelegate(delegate),
+            exit_state,
+            exit_rx: Mutex::new(Some(exit_rx)),
         })
     }
 
@@ -245,13 +289,61 @@ impl VzMachineHandle {
     /// forwarder's `JoinHandle` sits idle in [`Self::forwarder`]
     /// (Tokio detaches it on drop, so no leak).
     pub(crate) async fn stop(&self) -> Result<(), String> {
-        run_completion_handler_on_queue(
+        let result = run_completion_handler_on_queue(
             self.vm.clone(),
             self.queue.clone(),
             &format!("stop (vm_id='{}')", self.vm_id),
             |vm, handler| unsafe { vm.stopWithCompletionHandler(handler) },
         )
-        .await
+        .await;
+        // Phase 3 Day 5: signal the delegate's shared exit
+        // channel so any waiter blocked in `wait_for_exit`
+        // resolves on host-initiated stops too. The delegate
+        // only fires for guest-initiated stops or errors.
+        if let Some(tx) = self.exit_state.lock().expect("exit_state mutex").take() {
+            let _ = tx.send(DelegateExit::HostInitiatedStop);
+        }
+        result
+    }
+
+    /// Dial the guest's vsock listener on `port` and return an
+    /// owned host-side fd connected to it. **Phase 3 Day 5.**
+    ///
+    /// Delegates to [`super::vsock::connect_vsock`] which
+    /// dispatches `VZVirtioSocketDevice.connectToPort:` on the
+    /// VM's associated queue and marshals the completion
+    /// handler into a Tokio oneshot. The returned fd is a
+    /// `dup` of Apple's connection fd, so the caller owns it
+    /// independently of Apple's `VZVirtioSocketConnection`
+    /// lifecycle.
+    pub(crate) async fn connect_vsock(&self, port: u32) -> Result<std::os::fd::OwnedFd, String> {
+        super::vsock::connect_vsock(self.vm.clone(), self.queue.clone(), &self.vm_id, port).await
+    }
+
+    /// Wait for a terminal lifecycle observation and return the
+    /// classified exit code. Phase 3 Day 5 replaces the polling
+    /// loop with a oneshot signalled by either:
+    /// - the [`ElastosVzDelegate`] delegate (guest clean stop,
+    ///   crash with NSError), or
+    /// - [`Self::stop`] after a successful host-initiated stop.
+    ///
+    /// The receiver is consumed on first call; subsequent calls
+    /// return a typed error rather than block indefinitely.
+    pub(crate) async fn wait_for_exit(&self) -> Result<i32, String> {
+        let rx = self.exit_rx.lock().expect("exit_rx mutex").take();
+        let Some(rx) = rx else {
+            return Err(format!(
+                "vz wait_for_exit (vm_id='{}'): receiver already consumed",
+                self.vm_id
+            ));
+        };
+        match rx.await {
+            Ok(exit) => Ok(exit.exit_code()),
+            Err(_) => Err(format!(
+                "vz wait_for_exit (vm_id='{}'): delegate sender dropped before signalling",
+                self.vm_id
+            )),
+        }
     }
 
     /// Read the current VM state. Runs on the dispatch queue

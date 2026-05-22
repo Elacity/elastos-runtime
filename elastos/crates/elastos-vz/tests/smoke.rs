@@ -205,6 +205,27 @@ async fn vz_provider_lifecycle_methods_fail_closed_for_unloaded_handle() {
     provider.stop(&handle).await.unwrap();
 }
 
+#[tokio::test]
+async fn vz_provider_vsock_connect_fails_closed_for_unknown_handle() {
+    // Phase 3 Day 5 contract: dialing a vsock connection on a
+    // capsule that the provider does not own returns the same
+    // CapsuleNotFound shape every other provider method
+    // surfaces, so the supervisor can dispatch on a single
+    // error variant.
+    let provider = VzProvider::with_defaults().unwrap();
+    let handle = CapsuleHandle {
+        id: elastos_common::CapsuleId::new("unloaded-vsock".to_string()),
+        manifest: microvm_manifest("unloaded-vsock"),
+        args: vec![],
+    };
+
+    let err = provider.vsock_connect(&handle, 4100).await.unwrap_err();
+    assert!(
+        matches!(err, ElastosError::CapsuleNotFound(_)),
+        "vsock_connect on unknown handle must return CapsuleNotFound, got: {err}"
+    );
+}
+
 #[test]
 fn vm_config_from_manifest_translates_to_vz_console_naming() {
     let manifest = microvm_manifest("vm-args");
