@@ -1061,6 +1061,207 @@ mod tests {
         assert!(bridge.io.lock().unwrap().is_none());
     }
 
+    // ---------------------------------------------------------------
+    // Phase 4 Day 3 — cross-VM RPC dispatch under N consumers × M
+    // providers.
+    //
+    // Audit finding (documented in PHASE_4_DAY_3_NOTES.md): the host
+    // bridge has NO request-id allocator. Pairing is by strict order
+    // over a `Mutex<Option<VmIo>>`-protected single connection — N
+    // concurrent callers against ONE `VmCapsuleProvider` serialize at
+    // the Mutex, but N concurrent callers against M providers proceed
+    // in parallel (M independent Mutexes / connections). This test
+    // proves both halves: per-provider serialization is race-free
+    // (no cross-talk, no lost responses, no spurious responses) and
+    // cross-provider dispatch is fully concurrent.
+    // ---------------------------------------------------------------
+
+    /// Spawn a synthetic provider-VM thread on the guest end of a
+    /// socketpair. It handles the bridge's `init` handshake, then
+    /// echoes back each request with a per-provider marker and the
+    /// original `nonce` so the consumer can prove its OWN request
+    /// is what came back.
+    fn spawn_synthetic_provider_vm(
+        guest_fd: OwnedFd,
+        provider_marker: &'static str,
+        served_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+            let stream: StdUnixStream = guest_fd.into();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            // Init handshake — bridge sends `{"op":"init","config":…}` first.
+            let mut init_line = String::new();
+            if reader.read_line(&mut init_line).is_err() {
+                return;
+            }
+            let _: serde_json::Value = match serde_json::from_str(&init_line) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            if writer.write_all(b"{\"status\":\"ok\"}\n").is_err() {
+                return;
+            }
+
+            // Service loop — read JSON line, echo back with marker.
+            loop {
+                let mut req_line = String::new();
+                match reader.read_line(&mut req_line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let parsed: serde_json::Value = match serde_json::from_str(&req_line) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let nonce = parsed.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
+                let response = format!(
+                    "{{\"status\":\"ok\",\"data\":{{\"provider\":\"{}\",\"nonce\":{}}}}}\n",
+                    provider_marker, nonce
+                );
+                if writer.write_all(response.as_bytes()).is_err() {
+                    break;
+                }
+                served_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Drain anything else the bridge writes after we exit
+            // so the bridge's `flush` does not error.
+            let mut sink = [0u8; 64];
+            let _ = reader.get_mut().read(&mut sink);
+        })
+    }
+
+    /// Two synthetic provider VMs + three concurrent consumer
+    /// tasks each issuing 20 RPCs (10 per provider). Total: 60
+    /// RPCs against the shared `Arc<VmCapsuleProvider>` pair.
+    /// Each consumer's per-RPC response MUST carry its OWN nonce
+    /// (strict-order pairing through the per-provider Mutex)
+    /// and the provider's OWN marker (no cross-provider mixup).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_vm_rpc_dispatch_isolates_per_provider_under_n_consumers() {
+        let (host_a, guest_a) = socketpair_owned_fds();
+        let (host_b, guest_b) = socketpair_owned_fds();
+
+        let served_a = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let guest_thread_a = spawn_synthetic_provider_vm(guest_a, "alpha", served_a.clone());
+        let guest_thread_b = spawn_synthetic_provider_vm(guest_b, "bravo", served_b.clone());
+
+        // One-shot dialers — each bridge will dial its provider
+        // exactly once at first request, the slot drains after.
+        let slot_a = Arc::new(StdMutex::new(Some(host_a)));
+        let slot_b = Arc::new(StdMutex::new(Some(host_b)));
+        let dialer_a = one_shot_dialer(slot_a);
+        let dialer_b = one_shot_dialer(slot_b);
+
+        let provider_a = Arc::new(VmCapsuleProvider::new_with_vsock_dialer(
+            "alpha-provider",
+            "vm-stress-a".into(),
+            7000,
+            serde_json::json!({}),
+            dialer_a,
+        ));
+        let provider_b = Arc::new(VmCapsuleProvider::new_with_vsock_dialer(
+            "bravo-provider",
+            "vm-stress-b".into(),
+            7000,
+            serde_json::json!({}),
+            dialer_b,
+        ));
+
+        // Three consumer tasks, each issues 10 RPCs to alpha then
+        // 10 to bravo, interleaved (alpha, bravo, alpha, bravo …)
+        // so the per-provider Mutex sees genuinely interleaved
+        // contention.
+        const CONSUMERS: usize = 3;
+        const PER_PROVIDER_PER_CONSUMER: usize = 10;
+        let mut set = tokio::task::JoinSet::new();
+        for consumer_idx in 0..CONSUMERS {
+            let provider_a = Arc::clone(&provider_a);
+            let provider_b = Arc::clone(&provider_b);
+            set.spawn(async move {
+                let mut results = Vec::with_capacity(2 * PER_PROVIDER_PER_CONSUMER);
+                for iteration in 0..PER_PROVIDER_PER_CONSUMER {
+                    let nonce_a = (consumer_idx as u64) * 1_000_000 + iteration as u64;
+                    let nonce_b = nonce_a + 500_000;
+
+                    let req_a = serde_json::json!({
+                        "op": "ping",
+                        "nonce": nonce_a,
+                    });
+                    let req_b = serde_json::json!({
+                        "op": "ping",
+                        "nonce": nonce_b,
+                    });
+
+                    let resp_a = provider_a
+                        .send_raw(&req_a)
+                        .await
+                        .unwrap_or_else(|e| panic!("alpha send_raw {nonce_a}: {e}"));
+                    let resp_b = provider_b
+                        .send_raw(&req_b)
+                        .await
+                        .unwrap_or_else(|e| panic!("bravo send_raw {nonce_b}: {e}"));
+
+                    results.push(("alpha", nonce_a, resp_a));
+                    results.push(("bravo", nonce_b, resp_b));
+                }
+                results
+            });
+        }
+
+        let mut all = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            all.extend(joined.expect("consumer task must not panic"));
+        }
+
+        assert_eq!(
+            all.len(),
+            CONSUMERS * 2 * PER_PROVIDER_PER_CONSUMER,
+            "expected 60 round-trips total"
+        );
+
+        for (expected_provider, expected_nonce, response) in &all {
+            let data = response
+                .get("data")
+                .unwrap_or_else(|| panic!("response missing data: {response}"));
+            assert_eq!(
+                data.get("provider").and_then(|v| v.as_str()),
+                Some(*expected_provider),
+                "response routed through the wrong provider: nonce={expected_nonce} resp={response}"
+            );
+            assert_eq!(
+                data.get("nonce").and_then(|v| v.as_u64()),
+                Some(*expected_nonce),
+                "nonce mismatch — pairing broke. expected provider={expected_provider} nonce={expected_nonce} resp={response}"
+            );
+        }
+
+        // Each provider must have served exactly half the calls.
+        assert_eq!(
+            served_a.load(std::sync::atomic::Ordering::Relaxed),
+            CONSUMERS * PER_PROVIDER_PER_CONSUMER,
+            "provider alpha must have served 30 requests"
+        );
+        assert_eq!(
+            served_b.load(std::sync::atomic::Ordering::Relaxed),
+            CONSUMERS * PER_PROVIDER_PER_CONSUMER,
+            "provider bravo must have served 30 requests"
+        );
+
+        // Drop providers so the bridges close their writer halves
+        // and the guest threads exit cleanly.
+        drop(provider_a);
+        drop(provider_b);
+        guest_thread_a.join().expect("alpha guest thread");
+        guest_thread_b.join().expect("bravo guest thread");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mac_vsock_dialer_takes_priority_over_af_vsock_path() {
         // Defensive: the dialer-bearing bridge must NOT fall through
