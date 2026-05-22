@@ -217,6 +217,44 @@ fn vz_last_exit_reason(backend: &CapsuleBackend) -> Option<String> {
     }
 }
 
+/// Project the cached typed Vz error (if any) into the
+/// supervisor-facing [`elastos_vz::VzErrorReport`]. **Phase 4
+/// Day 8.**
+///
+/// Returns `None` for non-Vz backends (Linux crosvm, Carrier),
+/// for Mac Vz capsules with no cached error, and on every
+/// platform that isn't macOS. Mac Vz capsules with a cached
+/// [`elastos_vz::VzError`] surface the typed report.
+fn vz_last_error_report(backend: &CapsuleBackend) -> Option<elastos_vz::VzErrorReport> {
+    #[cfg(target_os = "macos")]
+    {
+        match backend {
+            CapsuleBackend::VzVm(vm) => vm.last_vz_error().map(|e| e.to_report()),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = backend;
+        None
+    }
+}
+
+/// Result of [`Supervisor::capsule_vz_error`]. **Phase 4 Day 8.**
+///
+/// Three-state outcome the dispatcher maps to the response
+/// shape:
+/// - `Found(None)` → `status: "ok"`, no `vz_error` field
+///   (capsule exists but has no cached error / is non-Vz).
+/// - `Found(Some(report))` → `status: "ok"`,
+///   `vz_error: Some(report)`.
+/// - `NotFound` → `status: "not_found"`.
+#[derive(Debug)]
+enum CapsuleVzErrorOutcome {
+    Found(Option<elastos_vz::VzErrorReport>),
+    NotFound,
+}
+
 fn vm_provider_bridge_enabled() -> bool {
     std::env::var("ELASTOS_VM_PROVIDER_BRIDGE")
         .map(|v| {
@@ -250,6 +288,17 @@ pub enum SupervisorRequest {
 
     #[serde(rename = "capsule_status")]
     CapsuleStatus { handle: String },
+
+    /// Read the cached typed Vz error for a Mac Vz capsule.
+    /// **Phase 4 Day 8.**
+    ///
+    /// Returns the structured [`elastos_vz::VzErrorReport`] for
+    /// the most recent failed `RunningVm::stop` / wait, or
+    /// `None` if no error was cached (success path, pre-stop,
+    /// or non-Vz backend). Unknown handles return
+    /// `status: "not_found"` (consistent with `capsule_status`).
+    #[serde(rename = "capsule_vz_error")]
+    CapsuleVzError { handle: String },
 
     #[serde(rename = "download_external")]
     DownloadExternal { name: String, platform: String },
@@ -288,6 +337,20 @@ pub struct SupervisorResponse {
     /// grepping log lines. See `docs/vz-backend/PHASE_4_DAY_7_NOTES.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_reason: Option<String>,
+
+    /// Structured Vz error readback (macOS only). **Phase 4
+    /// Day 8.** Populated by the new `capsule_vz_error` RPC
+    /// (always when present) and by `capsule_status` for
+    /// stopped Vz capsules that have a cached error. Carries
+    /// the typed [`elastos_vz::VzErrorReport`] — `kind_label` is
+    /// always set (`"vz_internal"`, `"vz_timed_out"`,
+    /// `"vz_unknown"`, …); `domain` / `code` are populated only
+    /// for `Unknown` variants Apple may have added in a future
+    /// macOS; `vm_id` / `budget_secs` are populated only for
+    /// stop-timeout cases. See
+    /// `docs/vz-backend/PHASE_4_DAY_8_NOTES.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vz_error: Option<elastos_vz::VzErrorReport>,
 }
 
 impl SupervisorResponse {
@@ -301,6 +364,7 @@ impl SupervisorResponse {
             exit_code: None,
             error: None,
             last_exit_reason: None,
+            vz_error: None,
         }
     }
 
@@ -313,6 +377,29 @@ impl SupervisorResponse {
     fn ok_with_exit_reason(reason: Option<String>) -> Self {
         Self {
             last_exit_reason: reason,
+            ..Self::ok()
+        }
+    }
+
+    /// Builder for the success surface returned by
+    /// `capsule_vz_error`. **Phase 4 Day 8.** Carries an
+    /// optional [`elastos_vz::VzErrorReport`] — `None` means
+    /// "no cached error" (success path, pre-stop, or non-Vz
+    /// backend).
+    fn ok_with_vz_error(report: Option<elastos_vz::VzErrorReport>) -> Self {
+        Self {
+            vz_error: report,
+            ..Self::ok()
+        }
+    }
+
+    /// Builder for the standard `not_found` shape both
+    /// `capsule_status` and (Phase 4 Day 8) `capsule_vz_error`
+    /// return for unknown handles. Centralised so future
+    /// fields don't drift between the two query paths.
+    fn not_found() -> Self {
+        Self {
+            status: "not_found".into(),
             ..Self::ok()
         }
     }
@@ -349,6 +436,7 @@ impl SupervisorResponse {
             uptime_secs: None,
             exit_code: None,
             last_exit_reason: None,
+            vz_error: None,
         }
     }
 }
@@ -732,6 +820,22 @@ impl Supervisor {
                 match self.capsule_status(&handle).await {
                     Ok(resp) => resp,
                     Err(e) => SupervisorResponse::err(format!("capsule_status failed: {e}")),
+                }
+            }
+            SupervisorRequest::CapsuleVzError { handle } => {
+                // Phase 4 Day 8 — typed Vz error readback. The
+                // RPC is Mac-relevant only, but the dispatcher
+                // is platform-agnostic: on Linux, every Vz
+                // capsule lookup is `NotFound` (no Vz backends
+                // can exist) and non-Vz backends on macOS
+                // surface `Found(None)`. The cross-platform
+                // shape lets shell clients ask the question
+                // unconditionally and key off the response.
+                match self.capsule_vz_error(&handle).await {
+                    CapsuleVzErrorOutcome::Found(report) => {
+                        SupervisorResponse::ok_with_vz_error(report)
+                    }
+                    CapsuleVzErrorOutcome::NotFound => SupervisorResponse::not_found(),
                 }
             }
             SupervisorRequest::DownloadExternal { name, platform } => {
@@ -2461,6 +2565,16 @@ impl Supervisor {
                 // stays on the existing Linux contract.
                 let last_exit_reason = vz_last_exit_reason(&rc.backend);
 
+                // Phase 4 Day 8: structured Vz error readback
+                // alongside the exit-reason label. Together
+                // they give operators one-query observability
+                // for stopped Vz capsules — `last_exit_reason`
+                // is the alertable signal, `vz_error` is the
+                // structured detail (Apple's domain + code for
+                // unmodelled variants, stop-budget for
+                // timeouts).
+                let vz_error = vz_last_error_report(&rc.backend);
+
                 Ok(SupervisorResponse {
                     status: status.into(),
                     handle: Some(rc.handle.clone()),
@@ -2470,18 +2584,28 @@ impl Supervisor {
                     path: None,
                     error: None,
                     last_exit_reason,
+                    vz_error,
                 })
             }
-            None => Ok(SupervisorResponse {
-                status: "not_found".into(),
-                handle: None,
-                vsock_cid: None,
-                uptime_secs: None,
-                exit_code: None,
-                path: None,
-                error: None,
-                last_exit_reason: None,
-            }),
+            None => Ok(SupervisorResponse::not_found()),
+        }
+    }
+
+    /// Read the cached typed Vz error for a Mac Vz capsule.
+    /// **Phase 4 Day 8.**
+    ///
+    /// The three-state outcome distinguishes "unknown handle"
+    /// (dispatch as `not_found`) from "known handle, no cached
+    /// error" (dispatch as `ok` with `vz_error: None`) from
+    /// "known handle, cached error" (dispatch as `ok` with
+    /// `vz_error: Some(report)`). Non-Vz backends always
+    /// surface `Found(None)` — their failure modes stay on the
+    /// existing `error` string contract.
+    async fn capsule_vz_error(&self, handle: &str) -> CapsuleVzErrorOutcome {
+        let running = self.running.read().await;
+        match running.get(handle) {
+            Some(rc) => CapsuleVzErrorOutcome::Found(vz_last_error_report(&rc.backend)),
+            None => CapsuleVzErrorOutcome::NotFound,
         }
     }
 
@@ -3888,6 +4012,351 @@ mod tests {
              `elastos stop` JSON-mode consumers (Datadog / Grafana / scripts) can \
              alert on forced-stop rate without grepping logs: {response:?}"
         );
+    }
+
+    // ── Phase 4 Day 8: structured `vz_error` readback ──────────
+
+    /// Phase 4 Day 8 — `capsule_vz_error` returns
+    /// `NotFound` for an unknown handle so the dispatcher can
+    /// emit the standard `not_found` response shape and stay
+    /// consistent with `capsule_status`.
+    #[tokio::test]
+    async fn capsule_vz_error_unknown_handle_returns_not_found() {
+        let supervisor = make_test_supervisor();
+        let outcome = supervisor
+            .capsule_vz_error("vm-phase4-day8-no-such-handle")
+            .await;
+        assert!(
+            matches!(outcome, CapsuleVzErrorOutcome::NotFound),
+            "unknown handle must yield NotFound: {outcome:?}"
+        );
+    }
+
+    /// Phase 4 Day 8 — a Vz capsule with **no cached error**
+    /// (success path, pre-stop) MUST return `Found(None)` so
+    /// the dispatcher emits `status: "ok"` with `vz_error`
+    /// skip-serialised. Guards against `is_none()` confusion
+    /// across the `Found(None)` / `NotFound` boundary.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_vz_error_known_handle_without_cached_error_returns_found_none() {
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-known-no-error";
+        let rc = synthetic_vzvm_running_capsule("phase4-day8-known-no-error", handle);
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let outcome = supervisor.capsule_vz_error(handle).await;
+        match outcome {
+            CapsuleVzErrorOutcome::Found(report) => assert!(
+                report.is_none(),
+                "no cached error must surface as Found(None), got {report:?}"
+            ),
+            CapsuleVzErrorOutcome::NotFound => panic!("known handle must not return NotFound"),
+        }
+    }
+
+    /// Phase 4 Day 8 — every documented [`elastos_vz::VzError`]
+    /// variant round-trips through `capsule_vz_error` into the
+    /// typed [`elastos_vz::VzErrorReport`]. This is the
+    /// observability contract Datadog / Grafana dashboards key
+    /// off: filtering on
+    /// `vz_error.kind_label == "vz_internal"` must match every
+    /// capsule whose underlying Vz error was
+    /// `VzError::Internal`, etc.
+    ///
+    /// Synthetic: we inject the cached error via the
+    /// `set_last_vz_error_for_testing` hook because real
+    /// `VZErrorCode`s require an Apple-runner (impossible in
+    /// CI). The wiring is what we're validating, not Apple's
+    /// classifier.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_vz_error_round_trips_every_documented_vzerror_variant() {
+        use elastos_vz::VzError;
+
+        let supervisor = make_test_supervisor();
+        let cases: Vec<(VzError, &'static str)> = vec![
+            (
+                VzError::Internal {
+                    description: "kernel panic in vsock driver".into(),
+                },
+                "vz_internal",
+            ),
+            (
+                VzError::InvalidConfiguration {
+                    description: "boot config malformed".into(),
+                },
+                "vz_invalid_configuration",
+            ),
+            (
+                VzError::InvalidState {
+                    description: "stop while resuming".into(),
+                },
+                "vz_invalid_state",
+            ),
+            (
+                VzError::InvalidStateTransition {
+                    description: "double-start".into(),
+                },
+                "vz_invalid_state_transition",
+            ),
+            (
+                VzError::NetworkError {
+                    description: "NAT interface down".into(),
+                },
+                "vz_network_error",
+            ),
+            (
+                VzError::OperationCancelled {
+                    description: "supervisor cancelled mid-stop".into(),
+                },
+                "vz_operation_cancelled",
+            ),
+            (
+                VzError::NotSupported {
+                    description: "AMD CPU".into(),
+                },
+                "vz_not_supported",
+            ),
+        ];
+
+        for (err, expected_label) in cases {
+            let handle = format!("vm-phase4-day8-vz-error-{expected_label}");
+            let mut rc = synthetic_vzvm_running_capsule(expected_label, &handle);
+            if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+                vm.set_last_vz_error_for_testing(err.clone());
+            } else {
+                panic!("synthetic_vzvm_running_capsule must yield a VzVm backend");
+            }
+            supervisor.running.write().await.insert(handle.clone(), rc);
+
+            let outcome = supervisor.capsule_vz_error(&handle).await;
+            let report = match outcome {
+                CapsuleVzErrorOutcome::Found(Some(report)) => report,
+                other => panic!("{err:?} must surface as Found(Some(report)), got {other:?}"),
+            };
+            assert_eq!(
+                report.kind_label, expected_label,
+                "{err:?} must surface kind_label '{expected_label}', got '{}'",
+                report.kind_label
+            );
+            assert!(
+                report.domain.is_none(),
+                "documented variant must leave domain implicit: {report:?}"
+            );
+            assert!(
+                report.code.is_none(),
+                "documented variant must leave code implicit: {report:?}"
+            );
+        }
+    }
+
+    /// Phase 4 Day 8 — `VzError::Unknown` round-trips with its
+    /// `domain` + `code` preserved, so operators can grep
+    /// future / unmodelled Apple variants without needing a
+    /// binding update.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_vz_error_unknown_variant_preserves_domain_and_code() {
+        use elastos_vz::VzError;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-vz-error-unknown";
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day8-vz-error-unknown", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_last_vz_error_for_testing(VzError::Unknown {
+                domain: "VZErrorDomain".into(),
+                code: 30001,
+                description: "future variant".into(),
+            });
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let outcome = supervisor.capsule_vz_error(handle).await;
+        let report = match outcome {
+            CapsuleVzErrorOutcome::Found(Some(report)) => report,
+            other => panic!("Unknown must surface as Found(Some(report)), got {other:?}"),
+        };
+        assert_eq!(report.kind_label, "vz_unknown");
+        assert_eq!(report.domain.as_deref(), Some("VZErrorDomain"));
+        assert_eq!(report.code, Some(30001));
+    }
+
+    /// Phase 4 Day 8 — `VzError::TimedOut` round-trips with its
+    /// `vm_id` + `budget_secs` preserved. Operators sizing the
+    /// fleet-wide `VzConfig::stop_timeout` query `budget_secs`
+    /// directly.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_vz_error_timed_out_preserves_vm_id_and_budget() {
+        use elastos_vz::VzError;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-vz-error-timed-out";
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day8-vz-error-timed-out", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_last_vz_error_for_testing(VzError::TimedOut {
+                vm_id: "phase4-day8-vz-error-timed-out".into(),
+                budget: std::time::Duration::from_millis(2_500),
+            });
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let outcome = supervisor.capsule_vz_error(handle).await;
+        let report = match outcome {
+            CapsuleVzErrorOutcome::Found(Some(report)) => report,
+            other => panic!("TimedOut must surface as Found(Some(report)), got {other:?}"),
+        };
+        assert_eq!(report.kind_label, "vz_timed_out");
+        assert_eq!(
+            report.vm_id.as_deref(),
+            Some("phase4-day8-vz-error-timed-out")
+        );
+        assert_eq!(report.budget_secs, Some(2.5));
+    }
+
+    /// Phase 4 Day 8 — end-to-end through the dispatcher:
+    /// `handle_request(CapsuleVzError)` for a Vz capsule with a
+    /// cached `Internal` error returns
+    /// `status: "ok"` + the typed `vz_error.kind_label`.
+    ///
+    /// We mark the synthetic VM as `Running` via the
+    /// `set_status_for_testing` hook so `reap_dead_capsules`
+    /// (which `handle_request` calls first) doesn't prune the
+    /// record before the dispatcher reaches the
+    /// `CapsuleVzError` arm. Same trick as the Day-7
+    /// `handle_request_stop_capsule_*` test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn handle_request_capsule_vz_error_surfaces_typed_report_for_internal_variant() {
+        use elastos_common::CapsuleStatus;
+        use elastos_vz::VzError;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-handle-request-internal";
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day8-handle-request-internal", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_status_for_testing(CapsuleStatus::Running);
+            vm.set_last_vz_error_for_testing(VzError::Internal {
+                description: "kernel panic in vsock driver".into(),
+            });
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .handle_request(SupervisorRequest::CapsuleVzError {
+                handle: handle.to_string(),
+            })
+            .await;
+
+        assert_eq!(response.status, "ok", "error={:?}", response.error);
+        let report = response
+            .vz_error
+            .expect("Internal variant must surface vz_error in the response");
+        assert_eq!(report.kind_label, "vz_internal");
+        assert!(
+            report.description.contains("kernel panic"),
+            "description must round-trip Apple's localised string: {report:?}"
+        );
+    }
+
+    /// Phase 4 Day 8 — `handle_request(CapsuleVzError)` for a
+    /// Vz capsule with a cached `TimedOut` error returns the
+    /// `vm_id` + `budget_secs` operators sizing the fleet-wide
+    /// `VzConfig::stop_timeout` rely on.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn handle_request_capsule_vz_error_surfaces_typed_report_for_timed_out_variant() {
+        use elastos_common::CapsuleStatus;
+        use elastos_vz::VzError;
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-handle-request-timed-out";
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day8-handle-request-timed-out", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_status_for_testing(CapsuleStatus::Running);
+            vm.set_last_vz_error_for_testing(VzError::TimedOut {
+                vm_id: handle.into(),
+                budget: std::time::Duration::from_secs(3),
+            });
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .handle_request(SupervisorRequest::CapsuleVzError {
+                handle: handle.to_string(),
+            })
+            .await;
+
+        assert_eq!(response.status, "ok", "error={:?}", response.error);
+        let report = response
+            .vz_error
+            .expect("TimedOut variant must surface vz_error in the response");
+        assert_eq!(report.kind_label, "vz_timed_out");
+        assert_eq!(report.vm_id.as_deref(), Some(handle));
+        assert_eq!(report.budget_secs, Some(3.0));
+    }
+
+    /// Phase 4 Day 8 — `handle_request(CapsuleVzError)` for an
+    /// unknown handle MUST return `status: "not_found"` with
+    /// no `vz_error` field. The dispatcher reuses the same
+    /// `not_found` shape as `capsule_status` so shell consumers
+    /// can handle both paths uniformly.
+    #[tokio::test]
+    async fn handle_request_capsule_vz_error_unknown_handle_returns_not_found() {
+        let supervisor = make_test_supervisor();
+        let response = supervisor
+            .handle_request(SupervisorRequest::CapsuleVzError {
+                handle: "vm-phase4-day8-handle-request-no-such-handle".into(),
+            })
+            .await;
+
+        assert_eq!(response.status, "not_found");
+        assert!(
+            response.vz_error.is_none(),
+            "not_found response must omit vz_error: {response:?}"
+        );
+    }
+
+    /// Phase 4 Day 8 — `capsule_status` enriches a stopped Vz
+    /// capsule's response with BOTH the Day-7
+    /// `last_exit_reason` label AND the Day-8 structured
+    /// `vz_error`. Single-query observability: operators get
+    /// the telemetry label for alerting AND the structured
+    /// detail for triage in one round-trip.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capsule_status_enrichment_carries_both_last_exit_reason_and_vz_error() {
+        use elastos_vz::{VzError, VzExitReason};
+
+        let supervisor = make_test_supervisor();
+        let handle = "vm-phase4-day8-status-enrichment";
+        let mut rc = synthetic_vzvm_running_capsule("phase4-day8-status-enrichment", handle);
+        if let CapsuleBackend::VzVm(vm) = &mut rc.backend {
+            vm.set_last_exit_reason_for_testing(VzExitReason::ForcedAfterTimeout);
+            vm.set_last_vz_error_for_testing(VzError::TimedOut {
+                vm_id: handle.into(),
+                budget: std::time::Duration::from_secs(5),
+            });
+        }
+        supervisor.running.write().await.insert(handle.into(), rc);
+
+        let response = supervisor
+            .capsule_status(handle)
+            .await
+            .expect("capsule_status must dispatch through the VzVm arm");
+
+        assert_eq!(
+            response.last_exit_reason.as_deref(),
+            Some("forced_after_timeout"),
+            "telemetry label must be present alongside vz_error: {response:?}"
+        );
+        let report = response
+            .vz_error
+            .expect("capsule_status must enrich with structured vz_error: {response:?}");
+        assert_eq!(report.kind_label, "vz_timed_out");
+        assert_eq!(report.vm_id.as_deref(), Some(handle));
+        assert_eq!(report.budget_secs, Some(5.0));
     }
 
     /// Phase 4 Day 6 — `stop_capsule` awaits

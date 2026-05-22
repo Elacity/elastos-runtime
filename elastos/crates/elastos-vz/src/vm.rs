@@ -179,6 +179,21 @@ impl RunningVm {
         self.last_exit_reason = Some(reason);
     }
 
+    /// Test-only injection point for [`Self::last_vz_error`].
+    /// **Phase 4 Day 8.**
+    ///
+    /// Supervisor tests need to drive the new `CapsuleVzError`
+    /// RPC through every [`VzError`] variant without provoking
+    /// real Apple NSErrors (impossible to provoke in CI without
+    /// an Apple-runner). Like the other Day-7 / Day-8 test
+    /// hooks, `#[doc(hidden)]` so production code MUST NOT
+    /// call it.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn set_last_vz_error_for_testing(&mut self, err: VzError) {
+        self.last_vz_error = Some(err);
+    }
+
     /// Test-only setter for the cached lifecycle [`status`][CapsuleStatus]
     /// field. **Phase 4 Day 7.**
     ///

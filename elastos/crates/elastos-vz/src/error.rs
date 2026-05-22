@@ -31,6 +31,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// Typed classification of a Vz failure. Mirrors the variants of
 /// Apple's `VZErrorCode` for the codes Day 5's failure-mode
 /// matrix called out, plus a synthetic [`Self::TimedOut`] for
@@ -190,6 +192,114 @@ impl std::fmt::Display for VzError {
 }
 
 impl std::error::Error for VzError {}
+
+impl VzError {
+    /// Project this typed error into the operator-facing
+    /// [`VzErrorReport`] surface — the JSON shape the supervisor
+    /// returns from the Phase 4 Day 8 `CapsuleVzError` RPC.
+    ///
+    /// Fields are populated only when meaningful for the
+    /// variant:
+    ///
+    /// - **`kind_label` / `description`** are always present
+    ///   (mirror [`Self::kind_label`] / [`Self::description`]).
+    /// - **`domain` / `code`** are populated only for
+    ///   [`Self::Unknown`] — that's the only variant where the
+    ///   raw Apple identifiers carry information the typed
+    ///   variants haven't already absorbed. Operators can grep
+    ///   on `code=N` to filter Apple variants the binding
+    ///   doesn't yet model.
+    /// - **`vm_id` / `budget_secs`** are populated only for
+    ///   [`Self::TimedOut`] — operator alerting on "stop budget
+    ///   too tight per-fleet" needs the budget value, not the
+    ///   description text.
+    pub fn to_report(&self) -> VzErrorReport {
+        let mut report = VzErrorReport {
+            kind_label: self.kind_label().to_string(),
+            description: self.description(),
+            domain: None,
+            code: None,
+            vm_id: None,
+            budget_secs: None,
+        };
+        match self {
+            VzError::Unknown {
+                domain,
+                code,
+                description: _,
+            } => {
+                report.domain = Some(domain.clone());
+                report.code = Some(*code);
+            }
+            VzError::TimedOut { vm_id, budget } => {
+                report.vm_id = Some(vm_id.clone());
+                report.budget_secs = Some(budget.as_secs_f64());
+            }
+            // Documented Apple variants leave domain/code/vm_id
+            // implicit — the kind_label IS the structured signal.
+            VzError::Internal { .. }
+            | VzError::InvalidConfiguration { .. }
+            | VzError::InvalidState { .. }
+            | VzError::InvalidStateTransition { .. }
+            | VzError::NetworkError { .. }
+            | VzError::OperationCancelled { .. }
+            | VzError::NotSupported { .. } => {}
+        }
+        report
+    }
+}
+
+/// Operator-facing JSON projection of a [`VzError`]. **Phase 4
+/// Day 8.**
+///
+/// Carried via the new
+/// `SupervisorResponse::vz_error: Option<VzErrorReport>` field
+/// on both the [`capsule_vz_error`][rpc] RPC and the
+/// `capsule_status` enrichment for stopped Vz capsules.
+///
+/// Every field except `kind_label` + `description` is
+/// optional and `#[serde(skip_serializing_if = "Option::is_none")]`
+/// so the JSON shape stays minimal for the common case and
+/// dashboards can rely on field presence as a typed signal
+/// (e.g. presence of `code` means the supervisor saw a future /
+/// unmodelled Apple variant).
+///
+/// [rpc]: # "elastos-server/src/supervisor.rs::Supervisor::capsule_vz_error"
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VzErrorReport {
+    /// Stable telemetry label — one of [`VzError::kind_label`]'s
+    /// outputs (e.g. `"vz_internal"`, `"vz_timed_out"`,
+    /// `"vz_unknown"`). Dashboards / alerts MUST filter on this
+    /// rather than on `description`.
+    pub kind_label: String,
+    /// Localised description from Apple's
+    /// `NSError.localizedDescription`, or — for
+    /// [`VzError::TimedOut`] — the synthesised operator runbook
+    /// string. Free-form text; do NOT use for alerting.
+    pub description: String,
+    /// Raw `NSError.domain` for [`VzError::Unknown`]; `None` for
+    /// every documented variant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Raw `NSError.code` for [`VzError::Unknown`]; `None` for
+    /// every documented variant. Operators can filter on
+    /// specific Apple codes the typed enum doesn't yet model
+    /// (e.g. a future `VZErrorVirtualMachineGuestPaniced`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<isize>,
+    /// VM identifier for [`VzError::TimedOut`] — matches the
+    /// supervisor's `handle` log lines so operators can pivot
+    /// from the alert to the surrounding logs without parsing
+    /// the description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_id: Option<String>,
+    /// Configured stop-timeout budget (seconds, as `f64` so
+    /// sub-second budgets survive the JSON wire) for
+    /// [`VzError::TimedOut`]. Operators sizing the fleet-wide
+    /// `VzConfig::stop_timeout` use this directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_secs: Option<f64>,
+}
 
 /// Typed classification of a Vz VM's terminal state. Mirrors
 /// [`super::ffi::delegate::DelegateExit`] (which is `pub(crate)`
@@ -372,6 +482,165 @@ mod tests {
         assert_eq!(VzExitReason::HostInitiatedStop.exit_code(), 0);
         assert_eq!(VzExitReason::StoppedWithError.exit_code(), 1);
         assert_eq!(VzExitReason::ForcedAfterTimeout.exit_code(), 137);
+    }
+
+    /// Phase 4 Day 8 — every documented Apple variant must
+    /// produce a report with `domain` / `code` / `vm_id` /
+    /// `budget_secs` left `None`. The `kind_label` IS the
+    /// structured signal for these — populating the raw Apple
+    /// code on a typed variant would be redundant and risk
+    /// dashboards filtering on `code=1` instead of
+    /// `kind_label="vz_internal"`, breaking when Apple
+    /// renumbers (unlikely but possible).
+    #[test]
+    fn to_report_for_documented_variants_omits_unknown_specific_fields() {
+        let cases: &[(isize, &str)] = &[
+            (1, "vz_internal"),
+            (2, "vz_invalid_configuration"),
+            (3, "vz_invalid_state"),
+            (4, "vz_invalid_state_transition"),
+            (7, "vz_network_error"),
+            (9, "vz_operation_cancelled"),
+            (10, "vz_not_supported"),
+        ];
+        for (code, expected_label) in cases {
+            let err = VzError::from_ns_error_parts("VZErrorDomain", *code, "Apple's text");
+            let report = err.to_report();
+            assert_eq!(report.kind_label, *expected_label);
+            assert_eq!(report.description, "Apple's text");
+            assert!(
+                report.domain.is_none(),
+                "documented variant {expected_label} must leave domain implicit: {report:?}"
+            );
+            assert!(
+                report.code.is_none(),
+                "documented variant {expected_label} must leave code implicit: {report:?}"
+            );
+            assert!(
+                report.vm_id.is_none(),
+                "documented variant {expected_label} must leave vm_id implicit: {report:?}"
+            );
+            assert!(
+                report.budget_secs.is_none(),
+                "documented variant {expected_label} must leave budget_secs implicit: {report:?}"
+            );
+        }
+    }
+
+    /// Phase 4 Day 8 — `Unknown` populates `domain` + `code` so
+    /// operators can grep specific Apple variants the typed
+    /// enum doesn't yet model (e.g. a future
+    /// `VZErrorVirtualMachineGuestPaniced`). `vm_id` /
+    /// `budget_secs` stay `None`.
+    #[test]
+    fn to_report_for_unknown_variant_populates_raw_apple_identifiers() {
+        let err = VzError::from_ns_error_parts("VZErrorDomain", 30001, "USB controller not found");
+        let report = err.to_report();
+        assert_eq!(report.kind_label, "vz_unknown");
+        assert_eq!(report.description, "USB controller not found");
+        assert_eq!(report.domain.as_deref(), Some("VZErrorDomain"));
+        assert_eq!(report.code, Some(30001));
+        assert!(report.vm_id.is_none());
+        assert!(report.budget_secs.is_none());
+
+        // Non-Vz domain (e.g. NSPOSIXErrorDomain) must surface
+        // the original domain — operators tracing lower-level
+        // OS errors need the domain to make sense of the code.
+        let posix = VzError::from_ns_error_parts("NSPOSIXErrorDomain", 13, "Permission denied");
+        let posix_report = posix.to_report();
+        assert_eq!(posix_report.kind_label, "vz_unknown");
+        assert_eq!(posix_report.domain.as_deref(), Some("NSPOSIXErrorDomain"));
+        assert_eq!(posix_report.code, Some(13));
+    }
+
+    /// Phase 4 Day 8 — `TimedOut` populates `vm_id` +
+    /// `budget_secs` from the structured fields, NOT by parsing
+    /// the description. Operators sizing fleet-wide
+    /// `VzConfig::stop_timeout` query `budget_secs` directly;
+    /// alerts pivoting from "forced_after_timeout spike" to
+    /// "which capsule" use `vm_id`. `domain` / `code` stay
+    /// `None` (no Apple identifiers for the synthetic case).
+    #[test]
+    fn to_report_for_timed_out_populates_vm_id_and_budget_seconds() {
+        let err = VzError::TimedOut {
+            vm_id: "phase4-day8-test".into(),
+            budget: Duration::from_millis(1_500),
+        };
+        let report = err.to_report();
+        assert_eq!(report.kind_label, "vz_timed_out");
+        assert_eq!(report.vm_id.as_deref(), Some("phase4-day8-test"));
+        assert_eq!(report.budget_secs, Some(1.5));
+        assert!(report.domain.is_none());
+        assert!(report.code.is_none());
+        assert!(
+            report.description.contains("phase4-day8-test"),
+            "description still embeds the runbook pointer + vm_id for human readers: {}",
+            report.description
+        );
+    }
+
+    /// Phase 4 Day 8 — the JSON wire format. The new
+    /// `VzErrorReport` MUST round-trip through `serde_json`
+    /// without losing fields, and optional fields MUST
+    /// skip-serialise so dashboards can use field presence as a
+    /// typed signal.
+    #[test]
+    fn to_report_serde_round_trip_preserves_typed_fields_and_skips_none() {
+        // Documented variant: only kind_label + description
+        // appear in JSON.
+        let report =
+            VzError::from_ns_error_parts("VZErrorDomain", 1, "internal failure").to_report();
+        let json = serde_json::to_string(&report).expect("serialise");
+        assert!(
+            json.contains("\"kind_label\":\"vz_internal\""),
+            "kind_label must appear: {json}"
+        );
+        assert!(
+            !json.contains("\"domain\""),
+            "documented variant must skip-serialise `domain`: {json}"
+        );
+        assert!(
+            !json.contains("\"code\""),
+            "documented variant must skip-serialise `code`: {json}"
+        );
+        assert!(
+            !json.contains("\"vm_id\""),
+            "documented variant must skip-serialise `vm_id`: {json}"
+        );
+        assert!(
+            !json.contains("\"budget_secs\""),
+            "documented variant must skip-serialise `budget_secs`: {json}"
+        );
+
+        let parsed: VzErrorReport = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(parsed, report);
+
+        // Unknown variant: domain + code appear; vm_id +
+        // budget_secs stay skipped.
+        let unknown = VzError::Unknown {
+            domain: "VZErrorDomain".into(),
+            code: 12345,
+            description: "future".into(),
+        }
+        .to_report();
+        let unknown_json = serde_json::to_string(&unknown).expect("serialise unknown");
+        assert!(unknown_json.contains("\"domain\":\"VZErrorDomain\""));
+        assert!(unknown_json.contains("\"code\":12345"));
+        assert!(!unknown_json.contains("\"vm_id\""));
+        assert!(!unknown_json.contains("\"budget_secs\""));
+
+        // TimedOut variant: vm_id + budget_secs appear; domain
+        // + code stay skipped.
+        let timed_out = VzError::TimedOut {
+            vm_id: "vm-x".into(),
+            budget: Duration::from_secs(2),
+        }
+        .to_report();
+        let timed_out_json = serde_json::to_string(&timed_out).expect("serialise timed_out");
+        assert!(timed_out_json.contains("\"vm_id\":\"vm-x\""));
+        assert!(timed_out_json.contains("\"budget_secs\":2.0"));
+        assert!(!timed_out_json.contains("\"domain\""));
+        assert!(!timed_out_json.contains("\"code\""));
     }
 
     #[test]

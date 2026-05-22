@@ -74,7 +74,7 @@ mod provider;
 mod vm;
 
 pub use config::{VmConfig, VzConfig, DEFAULT_VZ_STOP_TIMEOUT};
-pub use error::{VzError, VzExitReason};
+pub use error::{VzError, VzErrorReport, VzExitReason};
 pub use network::NetworkConfig;
 pub use provider::VzProvider;
 pub use vm::RunningVm;

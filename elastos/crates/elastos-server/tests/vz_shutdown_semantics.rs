@@ -488,6 +488,7 @@ async fn supervisor_response_json_wire_format_for_last_exit_reason() {
             exit_code: None,
             error: None,
             last_exit_reason: Some(reason.label().to_string()),
+            vz_error: None,
         };
         let json = serde_json::to_string(&response).expect("serialise SupervisorResponse");
         assert!(
@@ -509,10 +510,169 @@ async fn supervisor_response_json_wire_format_for_last_exit_reason() {
         exit_code: None,
         error: None,
         last_exit_reason: None,
+        vz_error: None,
     };
     let bare_json = serde_json::to_string(&bare).expect("serialise bare");
     assert!(
         !bare_json.contains("last_exit_reason"),
         "None last_exit_reason must skip-serialise to preserve backward compatibility: {bare_json}"
+    );
+}
+
+/// Phase 4 Day 8 — JSON wire-format contract for the typed
+/// `vz_error` field on
+/// [`elastos_server::supervisor::SupervisorResponse`].
+///
+/// Operators piping `elastos status` / `elastos vz-error` JSON
+/// into Datadog / Grafana need a stable, structured shape for
+/// the Vz error readback so they can filter on
+/// `vz_error.kind_label`, pivot from a forced-after-timeout
+/// alert to the offending capsule's `vm_id`, and grep
+/// unmodelled Apple variants by `vz_error.domain` + `code`.
+///
+/// This test pins the wire format for every variant produced
+/// by [`elastos_vz::VzError::to_report`]:
+///
+/// 1. Documented variants surface `kind_label` + `description`
+///    only — `domain` / `code` / `vm_id` / `budget_secs` MUST
+///    skip-serialise so dashboards can use field presence as a
+///    typed signal.
+/// 2. `Unknown` surfaces `kind_label` + `description` + `domain`
+///    + `code` — `vm_id` / `budget_secs` skip-serialise.
+/// 3. `TimedOut` surfaces `kind_label` + `description` +
+///    `vm_id` + `budget_secs` — `domain` / `code`
+///    skip-serialise.
+/// 4. The outer `vz_error: None` MUST skip-serialise entirely
+///    (backward compatibility for legacy dashboards).
+///
+/// We deliberately go through `serde_json::Value` so the
+/// assertions stay robust against key-order changes — the
+/// supervisor unit tests already cover the round-trip end to
+/// end against `Supervisor::handle_request`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_response_json_wire_format_for_vz_error() {
+    use elastos_server::supervisor::SupervisorResponse;
+    use elastos_vz::VzError;
+    use std::time::Duration;
+
+    // Documented Apple variant → kind_label + description only.
+    let internal = VzError::Internal {
+        description: "kernel panic in vsock driver".into(),
+    };
+    let response = SupervisorResponse {
+        status: "ok".into(),
+        path: None,
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: Some(internal.to_report()),
+    };
+    let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
+    let vz = value
+        .get("vz_error")
+        .expect("documented variant must surface vz_error");
+    assert_eq!(vz["kind_label"], "vz_internal");
+    assert_eq!(vz["description"], "kernel panic in vsock driver");
+    assert!(
+        vz.get("domain").is_none(),
+        "documented variant must skip-serialise `domain`: {vz}"
+    );
+    assert!(
+        vz.get("code").is_none(),
+        "documented variant must skip-serialise `code`: {vz}"
+    );
+    assert!(
+        vz.get("vm_id").is_none(),
+        "documented variant must skip-serialise `vm_id`: {vz}"
+    );
+    assert!(
+        vz.get("budget_secs").is_none(),
+        "documented variant must skip-serialise `budget_secs`: {vz}"
+    );
+
+    // Unknown variant → domain + code populated.
+    let unknown = VzError::Unknown {
+        domain: "VZErrorDomain".into(),
+        code: 30001,
+        description: "future Apple variant".into(),
+    };
+    let response = SupervisorResponse {
+        status: "ok".into(),
+        path: None,
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: Some(unknown.to_report()),
+    };
+    let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
+    let vz = value
+        .get("vz_error")
+        .expect("unknown must surface vz_error");
+    assert_eq!(vz["kind_label"], "vz_unknown");
+    assert_eq!(vz["domain"], "VZErrorDomain");
+    assert_eq!(vz["code"], 30001);
+    assert!(
+        vz.get("vm_id").is_none(),
+        "Unknown variant must skip-serialise `vm_id`: {vz}"
+    );
+    assert!(
+        vz.get("budget_secs").is_none(),
+        "Unknown variant must skip-serialise `budget_secs`: {vz}"
+    );
+
+    // TimedOut variant → vm_id + budget_secs populated.
+    let timed_out = VzError::TimedOut {
+        vm_id: "vm-phase4-day8-wire-format".into(),
+        budget: Duration::from_millis(2_500),
+    };
+    let response = SupervisorResponse {
+        status: "ok".into(),
+        path: None,
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: Some(timed_out.to_report()),
+    };
+    let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
+    let vz = value
+        .get("vz_error")
+        .expect("TimedOut must surface vz_error");
+    assert_eq!(vz["kind_label"], "vz_timed_out");
+    assert_eq!(vz["vm_id"], "vm-phase4-day8-wire-format");
+    assert_eq!(vz["budget_secs"], 2.5);
+    assert!(
+        vz.get("domain").is_none(),
+        "TimedOut must skip-serialise `domain`: {vz}"
+    );
+    assert!(
+        vz.get("code").is_none(),
+        "TimedOut must skip-serialise `code`: {vz}"
+    );
+
+    // Outer `vz_error: None` → field skip-serialises.
+    let bare = SupervisorResponse {
+        status: "not_found".into(),
+        path: None,
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: None,
+    };
+    let bare_json = serde_json::to_string(&bare).expect("serialise bare");
+    assert!(
+        !bare_json.contains("vz_error"),
+        "None vz_error must skip-serialise to preserve backward compatibility: {bare_json}"
     );
 }
