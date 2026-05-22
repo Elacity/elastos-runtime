@@ -156,6 +156,63 @@ impl RunningVm {
     pub fn http_port(&self) -> Option<u16> {
         self.config.http_port
     }
+
+    /// Wait for the VM to exit the `Running` state and return an
+    /// exit code.
+    ///
+    /// Vz does not expose a host-process exit status the way
+    /// crosvm does (no child process to `wait()` on). Day 3
+    /// approximates the supervisor's wait semantics by polling
+    /// the Vz state property through the dispatch queue at a
+    /// short interval until the VM transitions out of
+    /// [`VmState::Running`][running]. Returns `0` for any
+    /// non-running terminal state — the supervisor's existing
+    /// non-zero-exit handling is the same as the crosvm path,
+    /// so a more granular code is Day 4+ work once
+    /// `VZVirtualMachineDelegate` notifications are wired and
+    /// we can distinguish clean shutdown from crash.
+    ///
+    /// On non-macOS this method fails closed — the substrate
+    /// has no VM to wait on.
+    ///
+    /// [running]: crate::ffi::lifecycle
+    pub async fn wait_for_exit_code(&mut self) -> Result<i32> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(handle) = self.handle.as_ref() else {
+                return Err(ElastosError::Compute(format!(
+                    "{} (wait_for_exit_code: vm_id='{}', handle missing — use VzProvider::load_with_vm_config)",
+                    crate::PHASE_1_STUB_MESSAGE,
+                    self.config.vm_id
+                )));
+            };
+            // Poll interval chosen to match crosvm's
+            // `wait_for_exit` snappiness without busy-waiting:
+            // microVMs exit in O(100ms) on graceful shutdown,
+            // and Vz state queries through the dispatch queue
+            // are cheap.
+            const POLL_INTERVAL_MS: u64 = 100;
+            loop {
+                if !matches!(
+                    handle.current_state(),
+                    crate::ffi::lifecycle::VmState::Running
+                ) {
+                    self.status = CapsuleStatus::Stopped;
+                    return Ok(0);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(ElastosError::Compute(format!(
+                "{} (wait_for_exit_code: vm_id='{}')",
+                crate::PHASE_1_STUB_MESSAGE,
+                self.config.vm_id
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

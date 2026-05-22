@@ -1,10 +1,14 @@
 ## Phase 3 Day 1 — supervisor → VzProvider port plan
 
-> **Day 2 status:** every AG row in the audit table below is now
-> ported (commit on the head of `sash/local-test`). The Day-2
-> notes live in [`PHASE_3_DAY_2_NOTES.md`](PHASE_3_DAY_2_NOTES.md);
-> this document is preserved as the original audit + Day-1 plan
-> so future days can re-verify against the same line numbers.
+> **Day 3 status:** the audit table below is fully closed. Every
+> AG, GAP, LX/VZ row has either landed in the Mac arm or been
+> deferred with a named milestone (Day 4 for the Carrier console
+> socketpair, Day 5 for vsock, Phase 3 Day 4+ for TAP). Day-3
+> outcome log lives in
+> [`PHASE_3_DAY_3_NOTES.md`](PHASE_3_DAY_3_NOTES.md); Day-2 in
+> [`PHASE_3_DAY_2_NOTES.md`](PHASE_3_DAY_2_NOTES.md). This
+> document is preserved as the original audit + Day-1 plan so
+> future days can re-verify against the same line numbers.
 >
 > Audit-only document. Status as of `73cd293` on `sash/local-test`
 > (Phase 2 Day 5 complete + the host-portable fixture fix).
@@ -68,7 +72,7 @@ in that range is classified into exactly one of four buckets:
 | 1177-1180 | `RunningVm::new(vm_config, manifest, socket_path)` + `vm.start(&self.crosvm_config.crosvm_bin)` | LX/VZ | **Different types**: Linux's `RunningVm` = `elastos_crosvm::vm::RunningVm`; Mac's `RunningVm` = `elastos_vz::vm::RunningVm`. The latter is already wired (Day 3) — boots a real Vz machine via `VzMachineHandle`. Day 1 calls `VzProvider::load_with_vm_config + start` instead of constructing `RunningVm` directly. Linux path stays byte-identical. |
 | 1182-1185 | Log line "Launched VM '%s' …" | AG | No change. |
 | 1187-1194 | `register_provider_route` (requires guest IP from TAP) | GAP | On Mac with NAT-only networking, `vm.config.network` is `None` so the route is `None` — same shape as a Linux capsule without `guest_network: true`. Day 1: no change. |
-| 1197-1210 | `running.write().insert(handle, RunningCapsule { backend: CapsuleBackend::Vm(Box<RunningVm>), ... })` | GAP | `CapsuleBackend::Vm` is hard-wired to **crosvm**'s `RunningVm`. On Mac we'd need a `CapsuleBackend::VzVm(Box<elastos_vz::vm::RunningVm>)` variant, OR an enum erasure via a trait. **Day 1 explicitly defers**: the Mac path successfully starts the VM via `VzProvider::start` (proved by Day 5 boot), but does NOT register it in `running`. Surfaces a typed error: `"vz: VM started but supervisor RunningCapsule registration pending (Phase 3 Day 2 — needs CapsuleBackend::VzVm enum variant)"`. This is honest: the VM is observable in `tracing` and `vm_console` output but is invisible to `elastos ps`, `elastos stop`, etc. Day 2 closes this. |
+| 1197-1210 | `running.write().insert(handle, RunningCapsule { backend: CapsuleBackend::Vm(Box<RunningVm>), ... })` | GAP | **CLOSED (Phase 3 Day 3).** `CapsuleBackend::VzVm(Box<elastos_vz::RunningVm>)` added (Mac-gated). The supervisor calls `VzProvider::take_running_vm` after a successful `load_with_vm_config + start` and inserts the `RunningCapsule` into `self.running` using the same `handle` key the Linux arm uses. Every match-on-backend site (reap_dead_capsules, stop_capsule, wait_for_exit, capsule_status) gained a Mac-gated `VzVm` arm. `elastos ps` / `elastos status` / `elastos stop` work on Mac. See [`PHASE_3_DAY_3_NOTES.md`](PHASE_3_DAY_3_NOTES.md). |
 
 ### Stub re-classification
 

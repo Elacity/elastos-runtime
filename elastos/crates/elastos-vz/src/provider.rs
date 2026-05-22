@@ -271,6 +271,40 @@ impl VzProvider {
         }
     }
 
+    /// Remove a loaded [`RunningVm`] from the provider's internal
+    /// map and return ownership to the caller.
+    ///
+    /// **Phase 3 Day 3.** The supervisor's launch flow on Mac is:
+    ///
+    /// 1. `provider.load_with_vm_config(vm_config, manifest)` →
+    ///    `CapsuleHandle` (provider's `vms` map gets a fresh
+    ///    `RunningVm`).
+    /// 2. `provider.start(&handle)` (the VM starts).
+    /// 3. `provider.take_running_vm(&handle)` → the supervisor
+    ///    takes ownership and inserts the `RunningVm` into its
+    ///    own `running` map as a `CapsuleBackend::VzVm` variant.
+    ///
+    /// After step 3, the provider's `vms` map no longer holds the
+    /// VM and its trait methods (`stop` / `status` / `info`) will
+    /// return `CapsuleNotFound` for the same handle — which is
+    /// correct: the supervisor owns the lifecycle now. This
+    /// mirrors how the Linux flow gives the supervisor exclusive
+    /// ownership of `elastos_crosvm::vm::RunningVm` after start.
+    ///
+    /// The VM keeps running because the `RunningVm` carries the
+    /// `VzMachineHandle` (with its own `Arc` to the dispatch
+    /// queue) — dropping the provider does NOT stop the VM. Only
+    /// dropping the returned `RunningVm` (or calling `stop()` on
+    /// it) ends the Vz lifecycle.
+    ///
+    /// Fails closed with `CapsuleNotFound` if the handle has
+    /// already been taken or was never loaded.
+    pub async fn take_running_vm(&self, handle: &CapsuleHandle) -> Result<crate::vm::RunningVm> {
+        let mut vms = self.vms.write().await;
+        vms.remove(&handle.id)
+            .ok_or_else(|| ElastosError::CapsuleNotFound(handle.id.0.clone()))
+    }
+
     /// **Deprecated by Phase 3 Day 2.** Apple's
     /// `VZVirtualMachineConfiguration` is frozen post-init
     /// (Phase 0 §D pitfall #9); no session credentials can be
