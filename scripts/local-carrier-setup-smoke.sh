@@ -131,65 +131,42 @@ if [[ "${ELASTOS_VZ_SMOKE_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
-echo "[local-carrier-setup] building current binary and first-party Home core assets"
-
 # Phase 5 Day 1 — Mac pre-flight: detect whether components.json
 # has the darwin-arm64 release metadata required for the
-# Carrier install half of this smoke. Pre-Work removed the
-# dishonest darwin entries; Phase 6 restores truthful ones
-# (per `docs/vz-backend/PLAN.md` L321). Between those, on Mac,
-# this smoke cannot exercise the native-binary install path
-# end-to-end.
+# Carrier install half of this smoke.
 #
-# Rather than blow up with a cryptic Python KeyError, we
-# detect the gap up front and exit cleanly with a clear
-# operator-facing message + skip telemetry. The smoke's
-# bash-portability + helper-sourcing + dry-run lanes (the
-# Phase 5 Day 1 deliverable) have already been validated by
-# the time we reach this check. The substrate probe at the
-# tail is unaffected — it visibly-skips for the same reason.
+# Phase 5 Day 2 — the inline Python check was hoisted into
+# `cross_platform_assert_native_binary_release_metadata`
+# (`scripts/lib/cross-platform.sh`) so Day 1 / Day 2 / Day 3
+# / future Phase-6 install smokes share one source of truth
+# for the platform-key + names check.
+#
+# Pre-Work removed the dishonest darwin entries; Phase 6
+# restores truthful ones (per `docs/vz-backend/PLAN.md` L321).
+# Between those, on Mac, this smoke cannot exercise the
+# native-binary install path end-to-end. We exit 0 with a
+# clear operator-facing message + skip telemetry. The
+# substrate probe at the tail is unaffected — it visibly-skips
+# for the same reason.
+#
+# We run this BEFORE the "building current binary…" echo so the
+# operator-facing skip output isn't preceded by a misleading
+# "we're building things" header.
 if [[ "${OS_TOKEN}" == "darwin" ]] \
         && [[ "${ELASTOS_VZ_SMOKE_FORCE_PROCEED:-0}" != "1" ]]; then
-    if ! COMPONENTS_PATH="${REPO_ROOT}/components.json" \
-            python3 - <<'PY' 2>/dev/null; then
-import json
-import os
-
-manifest = json.loads(open(os.environ["COMPONENTS_PATH"]).read())
-required = ["shell", "localhost-provider", "did-provider", "webspace-provider"]
-missing = []
-for name in required:
-    plats = (manifest.get("external", {}).get(name, {}).get("platforms")) or {}
-    if "darwin-arm64" not in plats and "*" not in plats:
-        missing.append(name)
-if missing:
-    raise SystemExit(f"missing darwin-arm64 release metadata for: {', '.join(missing)}")
-PY
-        cat >&2 <<'MSG'
-[local-carrier-setup] Mac pre-flight: components.json has no darwin-arm64 release metadata for one or more native binaries.
-
-  Required:   shell, localhost-provider, did-provider, webspace-provider
-  Phase:      Phase 6 deliverable (see docs/vz-backend/PLAN.md L321).
-  Status:     Pre-Work removed the dishonest darwin entries; Phase 6
-              restores truthful ones once Mac substrate + signing land.
-
-  This smoke validates the Carrier-backed install pipeline for the
-  native-binary path, which cannot complete on Mac until the metadata
-  is restored. The Phase-5-Day-1 deliverables (script ports, bash 3.2
-  portability, helper library, Vz substrate probe) are unaffected and
-  have already been validated by reaching this point.
-
-  To skip this guard and exercise the WASM/data half regardless,
-  rerun with: ELASTOS_VZ_SMOKE_FORCE_PROCEED=1 ...
-
-  To dry-run only (CI fast lane), set: ELASTOS_VZ_SMOKE_DRY_RUN=1 ...
-MSG
+    if ! cross_platform_assert_native_binary_release_metadata \
+            "${REPO_ROOT}/components.json" \
+            shell localhost-provider did-provider webspace-provider 2>/dev/null
+    then
+        cross_platform_print_phase6_skip_message
         echo "[local-carrier-setup] Mac pre-flight: SKIP (Phase 6 prerequisite not met)"
         # Exit 0 — this is a clean skip, not a smoke failure. CI dashboards
         # alert on the skip telemetry separately.
         exit 0
     fi
 fi
+
+echo "[local-carrier-setup] building current binary and first-party Home core assets"
 
 (cd "${ELASTOS_ROOT}" && cargo build -p elastos-server)
 (cd "${REPO_ROOT}/elastos/capsules/shell" && cargo build --release)

@@ -167,6 +167,153 @@ else
     ok "wasm-only capsule correctly skipped"
 fi
 
+# ─── kill_pid_then_group ────────────────────────────────────
+
+TEST_NAME="kill_pid_then_group"
+echo "${TEST_NAME}:"
+
+# Empty / missing PIDs must be no-op returns (callers reading
+# from coords files often pass through missing values; tripping
+# `set -u` here would mask real bugs further up the stack).
+assert_true "empty PID is no-op return 0" kill_pid_then_group ""
+
+# Non-numeric PIDs are rejected silently.
+assert_true "non-numeric PID is no-op return 0" kill_pid_then_group "not-a-pid"
+
+# Already-dead PIDs no-op (the live-pid kill path is exercised
+# below in a real spawn + kill test).
+assert_true "dead PID is no-op return 0" kill_pid_then_group 99999
+
+# Live PID gets terminated within the grace window. Use a
+# 30 s sleep with a 1 s grace; we expect SIGTERM to land first
+# and the process to be gone well before the grace expires.
+# Suppress bash's "Terminated: 15" job-control noise on
+# macOS — it's expected and not a failure.
+sleep 30 &
+sleep_pid=$!
+disown "$sleep_pid" 2>/dev/null || true
+sleep 0.2
+assert_true "spawned sleep child is alive" pid_is_running "$sleep_pid"
+kill_pid_then_group "$sleep_pid" 1
+assert_false "kill_pid_then_group terminates live PID within grace" \
+    pid_is_running "$sleep_pid"
+
+# ─── free_port_via_python3 ──────────────────────────────────
+
+TEST_NAME="free_port_via_python3"
+echo "${TEST_NAME}:"
+
+port="$(free_port_via_python3)"
+if [[ -n "$port" ]] && [[ "$port" =~ ^[0-9]+$ ]] \
+        && [[ "$port" -ge 1024 ]] && [[ "$port" -le 65535 ]]; then
+    ok "returns port in 1024–65535 (got $port)"
+else
+    fail "expected an ephemeral port, got '$port'"
+fi
+
+# ─── cross_platform_assert_native_binary_release_metadata ───
+
+TEST_NAME="cross_platform_assert_native_binary_release_metadata"
+echo "${TEST_NAME}:"
+
+# Fixture: components.json under the scratch dir. The helper
+# reads via $MANIFEST_PATH so we don't pollute the real
+# repo file.
+ASSERT_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/elastos-cp-assert-XXXXXX")"
+# Track for cleanup. Original SCRATCH dir was already trapped
+# via `trap 'rm -rf "${SCRATCH}"' EXIT`; extend it.
+trap 'rm -rf "${SCRATCH}" "${ASSERT_SCRATCH}"' EXIT
+
+# Synthesise a manifest with no darwin-arm64 entry.
+cat >"${ASSERT_SCRATCH}/no-darwin.json" <<'EOF'
+{
+    "external": {
+        "shell": {
+            "platforms": {
+                "linux-amd64": { "release_path": "shell/linux-amd64/shell" }
+            }
+        }
+    }
+}
+EOF
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # On Mac the helper checks for darwin-arm64; the fixture
+    # lacks it → expect failure.
+    if cross_platform_assert_native_binary_release_metadata \
+            "${ASSERT_SCRATCH}/no-darwin.json" shell 2>/dev/null; then
+        fail "no-darwin manifest must fail on Darwin"
+    else
+        ok "no-darwin manifest correctly fails on Darwin"
+    fi
+else
+    # On Linux the helper checks for linux-amd64 / linux-arm64;
+    # the fixture HAS linux-amd64 so the test reverses meaning.
+    # Skip the meaningful assertion on non-Darwin hosts and
+    # log it as ok for Linux byte-identical behaviour.
+    if cross_platform_assert_native_binary_release_metadata \
+            "${ASSERT_SCRATCH}/no-darwin.json" shell 2>/dev/null; then
+        ok "Linux host: manifest with linux-amd64 entry passes (byte-identical Day-1 behaviour)"
+    else
+        fail "Linux host: linux-amd64 entry must pass"
+    fi
+fi
+
+# Synthesise a manifest with explicit darwin-arm64 entry.
+cat >"${ASSERT_SCRATCH}/with-darwin.json" <<'EOF'
+{
+    "external": {
+        "shell": {
+            "platforms": {
+                "darwin-arm64": { "release_path": "shell/darwin-arm64/shell" },
+                "linux-amd64":  { "release_path": "shell/linux-amd64/shell" }
+            }
+        }
+    }
+}
+EOF
+if cross_platform_assert_native_binary_release_metadata \
+        "${ASSERT_SCRATCH}/with-darwin.json" shell; then
+    ok "manifest with darwin-arm64 entry passes"
+else
+    fail "manifest with darwin-arm64 entry must pass"
+fi
+
+# Synthesise a manifest with wildcard `"*"` entry (e.g. WASM
+# capsules). Helper must accept it regardless of host OS.
+cat >"${ASSERT_SCRATCH}/wildcard.json" <<'EOF'
+{
+    "external": {
+        "home-cli": {
+            "platforms": {
+                "*": { "release_path": "home-cli/home-cli.tar.gz" }
+            }
+        }
+    }
+}
+EOF
+if cross_platform_assert_native_binary_release_metadata \
+        "${ASSERT_SCRATCH}/wildcard.json" home-cli; then
+    ok "manifest with wildcard '*' entry passes on all hosts"
+else
+    fail "manifest with wildcard '*' entry must pass"
+fi
+
+# Missing manifest path → helper returns 1, no crash.
+if cross_platform_assert_native_binary_release_metadata \
+        "${ASSERT_SCRATCH}/does-not-exist.json" shell 2>/dev/null; then
+    fail "missing manifest must fail"
+else
+    ok "missing manifest correctly fails"
+fi
+
+# No names supplied → helper returns 1 (defensive).
+if cross_platform_assert_native_binary_release_metadata \
+        "${ASSERT_SCRATCH}/with-darwin.json" 2>/dev/null; then
+    fail "no names supplied must fail"
+else
+    ok "no names supplied correctly fails"
+fi
+
 # ─── summary ────────────────────────────────────────────────
 
 echo
