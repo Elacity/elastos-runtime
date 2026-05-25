@@ -902,9 +902,27 @@ impl Supervisor {
         // Linux is untouched: the cfg-gate keeps the existing arm
         // byte-identical, and `vz_config.kernel_path` on Linux is dead
         // code (the launch path goes through `crosvm_config`).
+        // Phase 7 Day 5 — directory fields complete the Day-3 data-dir
+        // migration. `VzConfig::new()` points `state_dir` and
+        // `rootfs_cache_dir` at the same Unix-style
+        // `~/.local/share/elastos/{vz,rootfs-cache}` tree as
+        // `kernel_path`, so Day-3 left those two fields resolving through
+        // the elastos-vz default even though the kernel/initrd paths were
+        // correctly migrated to `~/Library/Application Support/elastos/`.
+        // `elastos doctor` surfaced the split layout on its first run
+        // (see PHASE_7_DAY_4_NOTES.md § 5). Same `#[cfg(target_os =
+        // "macos")]` gate as Day 3 → Linux byte-identical.
+        //
+        // Names mirror the crosvm convention used by `crosvm_config`
+        // above (`data_dir.join("rootfs-cache")`) and the elastos-vz
+        // defaults (`data_dir.join("vz")` for state) so a single
+        // `elastos doctor` walks a consistent layout on both substrates.
         #[cfg(target_os = "macos")]
         let vz_config = {
-            let vz_config = vz_config.with_kernel_path(kernel_path);
+            let vz_config = vz_config
+                .with_kernel_path(kernel_path)
+                .with_state_dir(data_dir.join("vz"))
+                .with_rootfs_cache_dir(data_dir.join("rootfs-cache"));
             let installed_initrd =
                 Self::resolve_external_install_path(&registry, &data_dir, "initrd", "bin/initrd");
             if installed_initrd.is_file() {
@@ -4152,6 +4170,52 @@ mod tests {
             "Phase 7 Day 3: Mac supervisor must leave initramfs_path = None when \
              bin/initrd does not exist as a regular file (is_file() must reject \
              the stray-directory case for fail-closed behaviour)."
+        );
+    }
+
+    /// Phase 7 Day 5 — the Mac supervisor must also override the
+    /// `VzConfig::new()` defaults for `state_dir` and
+    /// `rootfs_cache_dir`. Day 3 fixed `kernel_path` + `initramfs_path`
+    /// but left these two directory fields pointing at
+    /// `~/.local/share/elastos/{vz,rootfs-cache}` — the elastos-vz
+    /// Unix default. `elastos doctor` surfaced the split layout on
+    /// its first run (PHASE_7_DAY_4_NOTES.md § 5). On Mac all four
+    /// Vz substrate paths must now live under the same data_dir so
+    /// operators get one consistent runtime tree.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_supervisor_wires_state_dir_and_rootfs_cache_dir_from_data_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+
+        // Empty manifest: nothing to install. The directory wire-up
+        // happens unconditionally in `new_with_vz_config`, independent
+        // of any registry entries, so an empty manifest is the
+        // narrowest test surface.
+        let supervisor = Supervisor::new(
+            data_dir.clone(),
+            ComponentsManifest {
+                external: std::collections::HashMap::new(),
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            supervisor.vz_config().state_dir,
+            data_dir.join("vz"),
+            "Phase 7 Day 5: Mac supervisor must override VzConfig::new's \
+             default state_dir (~/.local/share/elastos/vz) with \
+             <data_dir>/vz so the Vz runtime state lives under the same \
+             tree as the kernel + initrd (Day 3 fix)."
+        );
+        assert_eq!(
+            supervisor.vz_config().rootfs_cache_dir,
+            data_dir.join("rootfs-cache"),
+            "Phase 7 Day 5: Mac supervisor must override VzConfig::new's \
+             default rootfs_cache_dir (~/.local/share/elastos/rootfs-cache) \
+             with <data_dir>/rootfs-cache, mirroring the crosvm_config \
+             convention used on Linux."
         );
     }
 

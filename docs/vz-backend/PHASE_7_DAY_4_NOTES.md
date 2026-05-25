@@ -226,6 +226,15 @@ unless there is an approved task authorizing that change."
 
 ### 5.1 Day-5 proposal (~10 LOC, follows Day-3 pattern exactly)
 
+> **Resolved in [`PHASE_7_DAY_5_NOTES.md`](./PHASE_7_DAY_5_NOTES.md) §§ 3–4.** The
+> Day-5 commit extends the same `#[cfg(target_os = "macos")]` block in
+> `new_with_vz_config` with `.with_state_dir(data_dir.join("vz"))` +
+> `.with_rootfs_cache_dir(data_dir.join("rootfs-cache"))`, plus one
+> dedicated unit test. 385/385 lib tests green; manual `elastos doctor`
+> on this Mac confirms all four substrate paths now resolve under
+> `~/Library/Application Support/elastos/`.
+
+
 In `supervisor.rs` `new_with_vz_config` the Day-3 `#[cfg(target_os =
 "macos")]` block extends to:
 
