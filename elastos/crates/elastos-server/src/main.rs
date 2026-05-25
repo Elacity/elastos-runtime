@@ -432,6 +432,19 @@ enum Commands {
         list: bool,
     },
 
+    /// Inspect the substrate paths the runtime would launch with
+    ///
+    /// Read-only triage command. Reports the resolved kernel, initrd,
+    /// state_dir, and rootfs_cache_dir against the current data_dir +
+    /// components.json, flagging absent artifacts with the exact
+    /// remediation command to install them.
+    Doctor {
+        /// Include manifest metadata (URL, checksum, compression, size)
+        /// for each substrate artifact row.
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Manage trusted release sources
     #[command(subcommand)]
     Source(sources::SourceCommand),
@@ -1254,6 +1267,11 @@ async fn main() -> anyhow::Result<()> {
             list,
         } => {
             setup::run(profile, with, without, list).await?;
+        }
+
+        Commands::Doctor { verbose } => {
+            elastos_server::doctor_cmd::run(elastos_server::doctor_cmd::DoctorArgs { verbose })
+                .await?;
         }
 
         Commands::Source(cmd) => {

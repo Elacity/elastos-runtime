@@ -325,7 +325,7 @@ pub async fn run(
 
 // ── Manifest loading ────────────────────────────────────────────────
 
-fn load_manifest() -> anyhow::Result<ComponentsManifest> {
+pub(crate) fn load_manifest() -> anyhow::Result<ComponentsManifest> {
     let exe_path = std::env::current_exe().ok();
     let installed_paths = [
         // Installed layout (honors $ELASTOS_DATA_DIR override)
