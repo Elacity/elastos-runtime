@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Day 1 complete (audit landed); Day 2 unblocked.** Closes the
+> **Status:** **In progress. Days 1–2 complete (audit + Class-A/D/E + capsules-projection edits landed); Day 3 unblocked.** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -138,7 +138,37 @@ hunt-and-peck.
 
 ---
 
-### Day 2 — First microVM capsule darwin-arm64 entry (6–8 h)
+### Day 2 — `components.json` schema edits, host-binary lane (6–8 h)
+
+> **Outcome (2026-05-25):** ✅ **Class-A/D/E + capsules-projection
+> edits landed; Day-3 unblocked.**
+> Notes:
+> [`PHASE_6_DAY_2_NOTES.md`](PHASE_6_DAY_2_NOTES.md).
+> **2 of 3 smoke pre-flights flip SKIP → PASS** on Mac
+> (`local-carrier-setup`, `home-frontdoor`); the third
+> (`chat-wasm-native-interop`) is awaiting the Class-B
+> `chat` capsule entry due Day 3, per the audit's
+> per-Class schedule. New durable verifier
+> [`scripts/lib/components-json-verify.sh`](../../scripts/lib/components-json-verify.sh)
+> gates Day-3+ drift. The 3 upstream darwin-arm64 checksums
+> (kubo / cloudflared / llama-server) are recorded
+> verbatim in the notes for audit trail. Linux behaviour
+> preserved: helper still returns 0 for both linux-amd64
+> and linux-arm64 keys against the same binary lists; diff
+> is purely additive (no linux-amd64 or linux-arm64 row
+> deleted).
+>
+> **Scope deviation from original plan.** The original Day-2
+> framing (below) picked one microVM capsule and walked it
+> end-to-end. The Day-1 audit re-sequenced this: Class A
+> (7 host binaries) + Class D + Class E + capsules
+> projection are all metadata-only and ship together on
+> Day 2; the microVM capsule (`chat`, Class B) walks
+> end-to-end on Day 3 because it depends on a Decision-D.2
+> sub-pick (duplicate vs `share_release` field). This
+> re-sequencing trades the original Day-2's "one-capsule
+> proof" for "everything that doesn't need a substrate
+> change ships at once" — a strictly larger Day-2 deliverable.
 
 **Problem.** Day 1 produces a decision matrix; Day 2
 proves the *workflow* — pick one capsule, walk it
