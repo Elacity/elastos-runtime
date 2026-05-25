@@ -38,24 +38,54 @@ use objc2_virtualization::{
 
 /// Result of building the kernel console.
 ///
-/// The Rust side keeps ownership of [`host_read`] so the
-/// lifecycle module can read guest kernel output as raw bytes
-/// and forward them to a `tracing` target. The Vz side keeps
-/// ownership of the write end of the pipe (via the attachment
-/// inside [`serial_port_cfg`]) and writes guest output there.
+/// Two construction modes, switched by the `interactive` flag to
+/// `build_kernel_console`:
+///
+/// * **Pipe-backed** (Days 1-6): the Rust side keeps ownership of
+///   [`host_read`] so the lifecycle module can read guest kernel
+///   output as raw bytes and forward them to a `tracing` target.
+///   The Vz side keeps the write end of the pipe inside an
+///   `NSFileHandle` (via [`serial_port_cfg`]) and writes guest
+///   output there. Guest reads from `/dev/hvc0` always return EOF
+///   (the attachment passes `None` for the reading file handle).
+///
+/// * **Interactive-stdio** (Day 7+): Vz is wired directly to the
+///   operator's terminal — guest output prints on stdout and Vz
+///   reads guest input from stdin. No in-process pipe, so
+///   [`host_read`] is `None` and the lifecycle module skips the
+///   console forwarder. The `enable_host_raw_mode_pub()` guard
+///   on the caller side keeps the terminal in raw mode so
+///   keystrokes flow through unmolested.
 pub(crate) struct KernelConsole {
-    /// Host-owned read end. Reads from this `File` yield bytes
-    /// the guest emitted on its kernel console.
-    pub(crate) host_read: std::fs::File,
+    /// Host-owned read end of the pipe-backed variant. `None`
+    /// for the interactive-stdio variant — see struct docs.
+    pub(crate) host_read: Option<std::fs::File>,
 
     /// Vz-side configuration ready to hand to
-    /// `VZVirtualMachineConfiguration::setSerialPorts`. Holds the
-    /// write end of the pipe inside an `NSFileHandle`.
+    /// `VZVirtualMachineConfiguration::setSerialPorts`. For
+    /// pipe-backed: holds the write end of the pipe. For
+    /// interactive: holds dup'd stdin/stdout handles.
     pub(crate) serial_port_cfg: Retained<VZVirtioConsoleDeviceSerialPortConfiguration>,
 }
 
-/// Build the kernel-console serial port + its host-side read end.
-pub(crate) fn build_kernel_console() -> Result<KernelConsole, String> {
+/// Build the kernel-console serial port.
+///
+/// `interactive`:
+/// - `false`: pipe-backed, write-only (Days 1-6). Output flows
+///   into the returned `host_read` for the in-process tracing
+///   forwarder.
+/// - `true`:  bidirectional stdio-backed (Day 7+). Output prints
+///   on the operator's stdout; input reads from operator stdin.
+///   Returned `host_read` is `None`.
+pub(crate) fn build_kernel_console(interactive: bool) -> Result<KernelConsole, String> {
+    if interactive {
+        build_interactive_kernel_console()
+    } else {
+        build_pipe_kernel_console()
+    }
+}
+
+fn build_pipe_kernel_console() -> Result<KernelConsole, String> {
     let (host_read_fd, vz_write_fd) = create_pipe()?;
 
     // SAFETY: We just opened these fds and have not handed them to
@@ -82,7 +112,73 @@ pub(crate) fn build_kernel_console() -> Result<KernelConsole, String> {
     unsafe { serial_port_cfg.setAttachment(Some(&attachment)) };
 
     Ok(KernelConsole {
-        host_read,
+        host_read: Some(host_read),
+        serial_port_cfg,
+    })
+}
+
+/// Phase 8 Day 7 — build the kernel-console attachment wired to
+/// host stdin / stdout so the operator can interact with the
+/// guest shell directly.
+///
+/// `dup`'s the process's stdin and stdout before handing them to
+/// `VZFileHandleSerialPortAttachment` — the attachment is
+/// `closeOnDealloc=true`, which would otherwise tear down the
+/// parent process's stdin/stdout when the VM stops. The dups are
+/// independent FDs, so closing them on VM teardown is safe.
+///
+/// The caller is responsible for putting stdin into raw mode
+/// (`crate::runtime_control::enable_host_raw_mode_pub` in the
+/// elastos-server crate). Without that, the terminal driver
+/// line-buffers + echoes operator keystrokes before they reach
+/// Vz, making the guest unresponsive to anything except full
+/// lines of input.
+fn build_interactive_kernel_console() -> Result<KernelConsole, String> {
+    use std::io::Error;
+
+    // SAFETY: `dup` is async-signal-safe and may be called on any
+    // valid fd. STDIN_FILENO / STDOUT_FILENO are guaranteed by
+    // POSIX to be open in any process that wasn't exec'd with
+    // detached IO; if either is closed, dup returns -1 and we
+    // surface a typed error.
+    let stdin_dup = unsafe { libc::dup(libc::STDIN_FILENO) };
+    if stdin_dup < 0 {
+        return Err(format!(
+            "interactive console: dup(STDIN_FILENO): {}",
+            Error::last_os_error()
+        ));
+    }
+    let stdout_dup = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if stdout_dup < 0 {
+        // Clean up the previous dup before returning. Forgetting
+        // this would leak an fd on every failed launch.
+        unsafe { libc::close(stdin_dup) };
+        return Err(format!(
+            "interactive console: dup(STDOUT_FILENO): {}",
+            Error::last_os_error()
+        ));
+    }
+
+    let read_handle = into_ns_file_handle(stdin_dup);
+    let write_handle = into_ns_file_handle(stdout_dup);
+
+    // SAFETY: `VZFileHandleSerialPortAttachment` retains both
+    // handles via `closeOnDealloc=true`; once the attachment is
+    // released the OS closes stdin_dup and stdout_dup. The
+    // process's real STDIN/STDOUT are untouched (we dup'd above).
+    let attachment = unsafe {
+        VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+            VZFileHandleSerialPortAttachment::alloc(),
+            Some(&read_handle),
+            Some(&write_handle),
+        )
+    };
+
+    let serial_port_cfg = unsafe { VZVirtioConsoleDeviceSerialPortConfiguration::new() };
+    unsafe { serial_port_cfg.setAttachment(Some(&attachment)) };
+
+    Ok(KernelConsole {
+        host_read: None,
         serial_port_cfg,
     })
 }
@@ -283,15 +379,34 @@ mod tests {
 
     #[test]
     fn kernel_console_produces_an_owned_host_read_fd() {
-        let console = build_kernel_console().expect("kernel console builds");
-        let raw_fd = console.host_read.as_raw_fd();
+        let console = build_kernel_console(false).expect("kernel console builds");
+        let host_read = console
+            .host_read
+            .as_ref()
+            .expect("pipe-backed console must yield a host_read fd");
+        let raw_fd = host_read.as_raw_fd();
         assert!(raw_fd >= 0, "host_read fd must be valid (got {raw_fd})");
         // Confirm the file handle is the read end by trying to
         // read 0 bytes — should not error even with no writer
         // attached (POSIX read returns 0 / EAGAIN / blocks).
         // We use `try_clone` to avoid consuming the file in the
         // test before Phase 2 main wires the forwarder.
-        let _clone = console.host_read.try_clone().expect("clone host_read");
+        let _clone = host_read.try_clone().expect("clone host_read");
+    }
+
+    /// Phase 8 Day 7 — the interactive variant must NOT produce
+    /// an in-process pipe; Vz is wired directly to stdin/stdout
+    /// so the lifecycle module skips spawning a console
+    /// forwarder. Asserting `host_read.is_none()` here pins the
+    /// branch the lifecycle code keys off of.
+    #[test]
+    fn interactive_kernel_console_does_not_produce_a_host_read_fd() {
+        let console =
+            build_kernel_console(true).expect("interactive kernel console builds on macOS");
+        assert!(
+            console.host_read.is_none(),
+            "interactive console must not leak an in-process pipe handle"
+        );
     }
 
     #[test]

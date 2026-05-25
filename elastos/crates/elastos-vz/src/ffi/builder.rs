@@ -52,7 +52,11 @@ pub(crate) struct BuiltMachine {
     /// Day 3 attaches a `tracing` forwarder; Phase 2 Day 2 just
     /// guarantees the handle is reachable and owned.
     #[allow(dead_code)]
-    pub(crate) kernel_console_host_read: std::fs::File,
+    /// Host-owned read end of the pipe-backed kernel console, or
+    /// `None` when the VM was built with `interactive_stdio=true`
+    /// (Day 7+ standalone lane wires Vz directly to host stdio
+    /// and there's no in-process pipe to forward).
+    pub(crate) kernel_console_host_read: Option<std::fs::File>,
 
     /// Carrier multi-port console kept alive separately so
     /// the bridge can be re-attached without re-walking the
@@ -110,8 +114,8 @@ impl BuiltMachine {
             None => None,
         };
 
-        let kernel_console =
-            build_kernel_console().map_err(|e| format!("vz machine builder: {e}"))?;
+        let kernel_console = build_kernel_console(vm.interactive_stdio)
+            .map_err(|e| format!("vz machine builder: {e}"))?;
 
         let carrier = build_carrier_console_slot("elastos-carrier")
             .map_err(|e| format!("vz machine builder: {e}"))?;
@@ -282,9 +286,14 @@ mod tests {
         let built =
             BuiltMachine::from_vm_config(&vm, &provider).expect("builder succeeds with fixtures");
 
-        // The host-side fd must remain valid and owned by us.
+        // The host-side fd must remain valid and owned by us in
+        // the non-interactive (pipe-backed) build path.
+        let host_read = built
+            .kernel_console_host_read
+            .as_ref()
+            .expect("pipe-backed build path must yield a kernel_console_host_read");
         assert!(
-            built.kernel_console_host_read.as_raw_fd() >= 0,
+            host_read.as_raw_fd() >= 0,
             "kernel-console host fd must be live after build"
         );
         // Identifier must have been persisted under the state dir.

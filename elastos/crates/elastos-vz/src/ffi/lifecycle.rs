@@ -154,8 +154,12 @@ pub(crate) struct VzMachineHandle {
     /// cleanly. We never `await`/`abort` it directly because
     /// Apple keeps the write fd open across `stop`, so a forced
     /// join would block until drop anyway.
+    ///
+    /// `None` for the Day-7 interactive-stdio variant: in that
+    /// build path Vz is wired directly to the operator's
+    /// stdin/stdout so there is no in-process pipe to forward.
     #[allow(dead_code)]
-    forwarder: ConsoleForwarder,
+    forwarder: Option<ConsoleForwarder>,
 
     /// Held to keep the delegate alive — Apple's
     /// `setDelegate:` uses a weak reference, so the
@@ -206,7 +210,7 @@ impl VzMachineHandle {
     /// to be kept here.
     pub(crate) fn new(
         vz_config: Retained<VZVirtualMachineConfiguration>,
-        kernel_console_host_read: std::fs::File,
+        kernel_console_host_read: Option<std::fs::File>,
         vm_id: String,
         stop_timeout: Duration,
     ) -> Result<Self, String> {
@@ -228,7 +232,14 @@ impl VzMachineHandle {
         // any stray bytes the kernel emits during early boot are
         // captured. The forwarder is idle until the guest writes
         // its first byte.
-        let forwarder = spawn_console_forwarder(kernel_console_host_read, vm_id.clone());
+        //
+        // Phase 8 Day 7: when `interactive_stdio` was set on the
+        // VmConfig, the builder wires Vz directly to host
+        // stdin/stdout and there's no host_read pipe to forward.
+        // The lifecycle skips the spawn in that branch; the
+        // operator's terminal becomes the forwarder.
+        let forwarder = kernel_console_host_read
+            .map(|host_read| spawn_console_forwarder(host_read, vm_id.clone()));
 
         // Phase 3 Day 5: prepare the delegate + exit channel
         // BEFORE the VM is constructed, so `setDelegate:` can

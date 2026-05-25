@@ -170,6 +170,40 @@ mount -t overlay overlay \
     -o lowerdir=/lower,upperdir=/upper/upper,workdir=/upper/work \
     /newroot
 
+# Phase 8 Day 7 -- drop the operator directly into a root shell
+# on hvc0 by installing a serial-getty drop-in plus a tiny
+# `elastos-login` wrapper script. Both live in the overlay
+# upperdir so the squashfs base is untouched and state is
+# per-boot ephemeral.
+#
+# Why a wrapper instead of `--login-program /bin/bash`: agetty
+# always passes `-p -h <host> -f <user>` to whatever program
+# `--login-program` names, which bash misinterprets (`-h` is a
+# builtin flag, the trailing username becomes a script path).
+# Why not the default `/bin/login`: Ubuntu's PAM stack pulls in
+# `pam_securetty` + `pam_unix`; even with agetty's `-f` flag,
+# login re-prompts for a password on hvc0 (not in securetty)
+# and locked root accounts are rejected. Bypassing `/bin/login`
+# is correct for the v0.1 operator-only lane -- agetty already
+# vouched for the autologin user out of band, and there is no
+# multi-tenant trust boundary inside the guest.
+mkdir -p /newroot/usr/local/sbin
+cat > /newroot/usr/local/sbin/elastos-login <<'WRAP_EOF'
+#!/bin/bash
+# Discard agetty's `-p -h <host> -f <user>` args and exec an
+# interactive login shell as the current uid (already set to
+# the autologin user by agetty).
+exec -l /bin/bash
+WRAP_EOF
+chmod +x /newroot/usr/local/sbin/elastos-login
+
+mkdir -p /newroot/etc/systemd/system/serial-getty@hvc0.service.d
+cat > /newroot/etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf <<'AUTOLOGIN_EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --login-program /usr/local/sbin/elastos-login --keep-baud 115200,38400,9600 %I $TERM
+AUTOLOGIN_EOF
+
 # Move pseudo-fs into the new root so systemd-on-/newroot sees
 # them at the expected paths.
 mount --move /proc /newroot/proc
@@ -319,6 +353,38 @@ mod tests {
         assert!(
             contains(&bytes, b"exec switch_root"),
             "cpio body must contain the switch_root handoff"
+        );
+    }
+
+    /// Phase 8 Day 7 — pin the autologin drop-in. If a future
+    /// refactor removes it without replacing it with another
+    /// no-credential UX path, `elastos run ubuntu-base` would
+    /// silently regress to the Day-6 behaviour of stopping at a
+    /// `login:` prompt the operator can never get past without
+    /// the root password (which Canonical's cloud image doesn't
+    /// expose).
+    #[test]
+    fn cpio_contains_serial_getty_autologin_dropin() {
+        let bytes = build_overlay_init_cpio();
+        assert!(
+            contains(&bytes, b"serial-getty@hvc0.service.d"),
+            "cpio body must drop in a serial-getty@hvc0 override"
+        );
+        assert!(
+            contains(&bytes, b"--autologin root"),
+            "cpio body must wire the override to --autologin root"
+        );
+        assert!(
+            contains(&bytes, b"--login-program /usr/local/sbin/elastos-login"),
+            "cpio body must point agetty at the elastos-login wrapper"
+        );
+        assert!(
+            contains(&bytes, b"elastos-login"),
+            "cpio body must drop in the elastos-login wrapper script"
+        );
+        assert!(
+            contains(&bytes, b"exec -l /bin/bash"),
+            "elastos-login wrapper must exec an interactive login shell"
         );
     }
 

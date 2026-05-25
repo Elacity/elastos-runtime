@@ -372,6 +372,17 @@ async fn run_microvm_standalone(
         .await
         .map_err(|e| anyhow::anyhow!("standalone boot: provider.init: {e}"))?;
 
+    // Phase 8 Day 7 — interactive console attach. When stdin is a
+    // TTY we wire Vz directly to host stdin/stdout so the operator
+    // can type at the guest's `ubuntu login:` prompt and reach a
+    // shell. When stdin isn't a TTY (CI, piped input, headless),
+    // raw mode is impossible and we fall back to the Day-6
+    // pipe-backed lane so kernel output still streams to tracing.
+    // The TermiosGuard restores the terminal on drop, even if the
+    // VM exits via Ctrl-C or panics.
+    let raw_mode_guard = crate::runtime_control::enable_host_raw_mode_pub();
+    let interactive = raw_mode_guard.is_some();
+
     let vm_config = VmConfig {
         vm_id: format!("{}-standalone", manifest.name),
         kernel_path: data_dir.join("bin/vmlinux"),
@@ -384,7 +395,7 @@ async fn run_microvm_standalone(
         data_disk_path: None,
         vsock_cid: 3,
         network: None,
-        interactive_stdio: false,
+        interactive_stdio: interactive,
         carrier_socket_path: None,
         initramfs_path: initramfs_path_opt,
     };
@@ -403,10 +414,18 @@ async fn run_microvm_standalone(
         .start(&handle)
         .await
         .map_err(|e| anyhow::anyhow!("standalone boot: provider.start: {e}"))?;
-    eprintln!(
-        "[run] guest started. Press Ctrl-C to stop. \
-         Guest kernel console streams via tracing target `vm_console`."
-    );
+    if interactive {
+        eprintln!(
+            "[run] guest started in interactive mode. Press Ctrl-C in the host \
+             terminal to stop the VM (the host raw-mode guard keeps ISIG enabled). \
+             Inside the guest, run `poweroff` for a clean shutdown."
+        );
+    } else {
+        eprintln!(
+            "[run] guest started in headless mode (stdin is not a TTY). \
+             Guest kernel console streams via tracing target `vm_console`."
+        );
+    }
 
     loop {
         tokio::select! {
@@ -436,6 +455,13 @@ async fn run_microvm_standalone(
         eprintln!("[run] provider.stop returned: {e}");
     }
     eprintln!("[run] done.");
+    // The TermiosGuard restores the host terminal on drop —
+    // explicit drop here documents the lifecycle ordering: the
+    // guard must outlive the VM (so guest output keeps reaching
+    // a sensibly-configured terminal) but must drop before this
+    // function returns (so the next command the operator types
+    // sees a normal shell).
+    drop(raw_mode_guard);
     Ok(())
 }
 
