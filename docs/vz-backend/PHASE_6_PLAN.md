@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Days 1–5a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux + signing recipes shipped; 3/3 Mac smoke pre-flights PASS; self-hosted-runner setup recipe live-tested + spec/runbook updated); Day 6 unblocked modulo Day-5b operator handoff (~20 min). Day-4b + Day-5b operator handoffs queued.** Closes the
+> **Status:** **In progress. Days 1–6a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux build recipe + kconfig fragment shipped; signing recipes shipped; 3/3 Mac smoke pre-flights PASS; self-hosted-runner setup recipe + local-lane orchestrator live-tested); Day 7 unblocked modulo Day-6b operator handoff (~45 min single-sitting). Day-4b folded into Day-6b queue; Day-5b deferred as Phase-7 self-hosted-CI work.** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -507,7 +507,48 @@ is dormant; CI is dry-run-only.
 
 ---
 
-### Day 6 — First end-to-end FORCE_FULL smoke green on self-hosted (6–8 h)
+### Day 6 — First end-to-end FORCE_FULL smoke green (6a local-lane scaffolding) (3–4 h agent + ~45 min operator handoff)
+
+> **Outcome (2026-05-25):** ✅ **Day 6a complete (agent-shipped
+> scaffolding); Day 7 unblocked modulo Day-6b operator handoff.**
+> Notes: [`PHASE_6_DAY_6_NOTES.md`](PHASE_6_DAY_6_NOTES.md).
+>
+> **What landed (6a):** `scripts/release/vmlinux-arm64.config` (the
+> missing kconfig fragment that gated Day-4b — Vz-required CONFIG_*
+> overrides + capsule-isolation primitives + rootfs prereqs), modified
+> `scripts/build-vmlinux-arm64.sh` to use the canonical kernel-build
+> pattern (`make defconfig` → `merge_config.sh -m` →
+> `make olddefconfig`), and `scripts/ci/local-day6-smoke.sh`
+> (one-command orchestrator: preflight delegate, cargo build, vmlinux
+> probe, per-smoke FORCE_FULL run with env-var matrix, structured
+> triage summary). Live-tested stages 1–3 on dev Mac with clean
+> typed exit-3 on missing vmlinux.
+>
+> **What's queued (6b — operator-side):** `brew install
+> aarch64-elf-gcc make elfutils openssl@3 bc jq`, then `bash
+> scripts/build-vmlinux-arm64.sh` (~30–40 min), stage Image at
+> `~/.local/share/elastos/bin/vmlinux`, then `bash
+> scripts/ci/local-day6-smoke.sh` for the first 3/3 green. ~45–55 min
+> single-sitting modulo per-iter cycles if real-Vz substrate bugs
+> surface.
+>
+> **Scope deviation from original plan — lane reframing.** Original
+> Day-6 framing assumed `mac-vz.yml::mac-vz-full-boot` would have
+> produced a terminal first-run by now (gated on Day-5b's self-hosted
+> runner registration). Phase-6 audit revealed the runner is not the
+> cheapest substrate for *first-green* — the dev Mac in hand has the
+> same Vz API surface. Day-6 reframed as a **local-lane substrate
+> validation** with the self-hosted CI lane deferred to Phase 7 as
+> gating-CI work. Same Vz API contract; same kernel Image; same
+> elastos-server binary; just no separate runner machine needed for
+> the headline-gate "first FORCE_FULL smoke green" outcome.
+>
+> **Day-4b absorbed into Day-6b.** Day-4a's operator queue
+> (`vmlinux-arm64.config` derivation + `build-vmlinux-arm64.sh` run)
+> is now a single `bash scripts/build-vmlinux-arm64.sh` invocation —
+> Day-6a shipped the previously-missing fragment + recipe modification.
+> Day-4b's signing/notarization sub-task (Gate 4b-6) remains queued
+> as Phase-7 work — the local lane doesn't require signed binaries.
 
 **Problem.** Day 5 activates the runner; Day 5's first
 `mac-vz-full-boot` job invocation likely surfaces 1+ real

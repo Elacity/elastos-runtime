@@ -43,8 +43,11 @@
 #                                  If absent, downloads via
 #                                  ELASTOS_VMLINUX_SRC_URL.
 #   - ELASTOS_VMLINUX_SRC_URL      tarball URL (default: kernel.org).
-#   - ELASTOS_VMLINUX_CONFIG       path to a Kconfig template
-#                                  (default: scripts/release/vmlinux-arm64.config).
+#   - ELASTOS_VMLINUX_CONFIG       path to a Kconfig **fragment** (small
+#                                  override set; merged onto `make defconfig`
+#                                  via kernel's merge_config.sh).
+#                                  Default: scripts/release/vmlinux-arm64.config
+#                                  (Phase-6 Day-6a deliverable).
 #   - ELASTOS_VMLINUX_OUT          output directory
 #                                  (default: ${PWD}/elastos/target/vmlinux-darwin-arm64).
 #   - CROSS_COMPILE                toolchain prefix (auto-detected; e.g.
@@ -121,19 +124,46 @@ fi
 log "source tree: ${VMLINUX_SRC}"
 
 # ── Apply config ───────────────────────────────────────────────────────────
+# Day-6a updated this stage: instead of treating ELASTOS_VMLINUX_CONFIG as a
+# full .config file (which would hardcode a kernel-version-specific defconfig
+# into the repo), we use the canonical kernel-build pattern:
+#   1. `make ARCH=arm64 defconfig` produces a baseline self-consistent config
+#      from the kernel's shipped arch/arm64/configs/defconfig.
+#   2. `scripts/kconfig/merge_config.sh -m` merges our small fragment of Vz-
+#      required CONFIG_* overrides on top.
+#   3. `make olddefconfig` resolves any dependency cascades.
+# The fragment lives at scripts/release/vmlinux-arm64.config and tracks only
+# what we need to OVERRIDE — typically ~30 lines vs ~5000 for a full .config.
+
 mkdir -p "${VMLINUX_OUT}"
 
 if [[ ! -f "${VMLINUX_CONFIG}" ]]; then
-    die "config template absent at ${VMLINUX_CONFIG}. Run scripts/release/seed-vmlinux-config.sh first, or supply ELASTOS_VMLINUX_CONFIG=<path>."
+    die "config fragment absent at ${VMLINUX_CONFIG}. The Phase-6 default lives at scripts/release/vmlinux-arm64.config; supply ELASTOS_VMLINUX_CONFIG=<path> to override."
 fi
 
-cp "${VMLINUX_CONFIG}" "${VMLINUX_SRC}/.config"
-log "applied config template from ${VMLINUX_CONFIG}"
-log "running olddefconfig to materialise the full .config from the template seeds"
+log "stage 1/3: 'make defconfig' (baseline arm64 config)"
+(
+    cd "${VMLINUX_SRC}"
+    "${GMAKE}" -j1 ARCH=arm64 CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+) >"${VMLINUX_OUT}/build.log" 2>&1 || {
+    tail -40 "${VMLINUX_OUT}/build.log" >&2
+    die "make defconfig failed; see ${VMLINUX_OUT}/build.log" 2
+}
+
+log "stage 2/3: 'merge_config.sh -m' (apply Vz-required overrides from ${VMLINUX_CONFIG})"
+(
+    cd "${VMLINUX_SRC}"
+    ARCH=arm64 ./scripts/kconfig/merge_config.sh -m .config "${VMLINUX_CONFIG}"
+) >>"${VMLINUX_OUT}/build.log" 2>&1 || {
+    tail -40 "${VMLINUX_OUT}/build.log" >&2
+    die "merge_config.sh failed; see ${VMLINUX_OUT}/build.log" 2
+}
+
+log "stage 3/3: 'make olddefconfig' (resolve dependency cascade)"
 (
     cd "${VMLINUX_SRC}"
     "${GMAKE}" -j1 ARCH=arm64 CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
-) >"${VMLINUX_OUT}/build.log" 2>&1 || {
+) >>"${VMLINUX_OUT}/build.log" 2>&1 || {
     tail -40 "${VMLINUX_OUT}/build.log" >&2
     die "olddefconfig failed; see ${VMLINUX_OUT}/build.log" 2
 }
