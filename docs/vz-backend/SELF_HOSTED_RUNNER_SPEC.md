@@ -1,12 +1,17 @@
-# Self-Hosted Mac Runner Specification (Phase 5 Day 6)
+# Self-Hosted Mac Runner Specification (Phase 5 Day 6 → Phase 6 Day 5a)
 
 > Authoritative spec for a self-hosted **macOS Apple-Silicon** GitHub Actions
 > runner that can execute the `mac-vz-full-boot` job in
 > [`.github/workflows/mac-vz.yml`](../../.github/workflows/mac-vz.yml).
 >
-> **Status:** Phase 5 Day 6 deliverable. The runner is **not yet provisioned**;
-> this document is the contract a future operator follows once an Apple-Silicon
-> Mac is available.
+> **Status:** Spec authored in Phase 5 Day 6. Phase 6 Day 5a turned the spec's
+> § 4 provisioning checklist into the executable recipe
+> [`scripts/ci/setup-mac-runner.sh`](../../scripts/ci/setup-mac-runner.sh);
+> the smokes' Mac pre-flight no longer visible-skips (Phase 6 Days 2–3 landed
+> the `darwin-arm64` `components.json` metadata; Day 4a landed the kernel
+> build recipe). The runner is **not yet physically provisioned**; this
+> document remains the contract a future operator follows. See § 4.5 for the
+> one-command preflight the operator runs first.
 
 ---
 
@@ -84,21 +89,27 @@ ordered so a partial completion still leaves the machine in a usable state.
 ### 4.2 Provision the elastos data directory
 
 The full smokes expect `~/.local/share/elastos` to exist with a warmed
-kernel/rootfs cache. Phase 6's signing + release pipeline will publish
-real darwin-arm64 artefacts; until then the operator must hand-bootstrap:
+kernel/rootfs cache. **Phase 6 Day 5a turned this into a recipe:**
 
 ```sh
-mkdir -p "$HOME/.local/share/elastos"
-# Drop in the kernel image, rootfs.ext4 squashfs, and components.json
-# entries for any capsules the runner will smoke. Phase 6 will turn
-# this into a `just provision-mac-runner` recipe.
+bash scripts/ci/setup-mac-runner.sh
 ```
 
-> **Today's reality:** until Phase 6 lands the darwin-arm64 release
-> metadata, the smokes will visible-skip with the Mac pre-flight banner
-> ("`components.json has no darwin-arm64 release metadata`"). The
-> Day-6 runner is **wired but dormant**, intentionally — flipping the
-> repo-var on early would just produce a fleet of skip-runs.
+The recipe verifies HW/OS prereqs, installs toolchains where absent,
+delegates to [`scripts/lib/components-json-verify.sh`](../../scripts/lib/components-json-verify.sh)
+to confirm manifest invariants, probes for the operator-built vmlinux
+Image (Day-4b artefact), reports the Class-E helper cache state, and
+prints the exact `gh variable set` + runner-registration commands for
+the next steps. See § 4.5 below for full details.
+
+> **Today's reality (post Phase 6 Day 4a):** the `darwin-arm64` release
+> metadata is **structurally present** in `components.json` for all
+> Class-A/B/C/E entries. The Mac pre-flight no longer skips the smokes;
+> they now run their real Vz boot path. **Day 4b operator handoff is
+> still pending** for the `vmlinux` checksum + signed `elastos-server`;
+> when this completes the smokes have a real kernel to boot. Until
+> then the smokes detect the missing artefact at runtime and exit with
+> a typed error (NOT a pre-flight skip), which is a real test signal.
 
 ### 4.3 Install the GitHub Actions runner agent
 
@@ -128,6 +139,31 @@ Once the runner shows **Idle** in the GitHub UI:
 
 The next `mac-vz.yml` run will pick up the new gate state and schedule
 `mac-vz-full-boot` on the runner.
+
+### 4.5 One-command preflight (Phase 6 Day 5a addition)
+
+The recipe at [`scripts/ci/setup-mac-runner.sh`](../../scripts/ci/setup-mac-runner.sh)
+collapses § 4.1 + § 4.2 + the pre-flight checks into a single
+re-runnable bash script. It's idempotent: re-running it on a partially
+provisioned machine completes the gaps and reports what was already
+done.
+
+The recipe enforces the floors in § 2 (arm64, macOS ≥ 13, RAM ≥ 16 GiB,
+free disk ≥ 100 GiB) and uses typed exit codes:
+
+| Exit | Meaning                                                                                                                      |
+|----:|------------------------------------------------------------------------------------------------------------------------------|
+| 0   | All checks green; provisioning ready for § 4.3 (runner agent install) + § 4.4 (variable flip).                              |
+| 1   | HW/OS prerequisite failed (Intel Mac, macOS < 13, RAM/disk floor). Diagnostic on stderr names the failing check.            |
+| 2   | Toolchain install failed (xcode-select / rustup error). Stderr captures the underlying tool failure.                        |
+| 3   | `Virtualization.framework` absent (impossible on a supported macOS — fail hard so the operator notices a corrupted system). |
+| 4   | `components.json` verifier failed (manifest drift). Re-run Phase 6 Day 1–4 verifier to localise the regression.             |
+
+The recipe deliberately does **not** register the runner agent or set
+the repository variable: the registration token is single-use and
+short-lived, and the variable flip needs repo-admin credentials. The
+recipe prints the exact commands for both steps in its terminal
+hand-off block at the end.
 
 ---
 
@@ -177,14 +213,22 @@ A successfully-provisioned runner satisfies the following:
 
 ## 7. What this spec does NOT cover (yet)
 
-The following are intentionally **Phase 6+** deliverables:
+The following are intentionally **Phase 6+** deliverables, with current
+status as of Phase 6 Day 5a:
 
-- **darwin-arm64 release metadata** in `components.json` — Phase 6 (PLAN
-  L321).
+- **darwin-arm64 release metadata** in `components.json` — Phase 6 Days
+  2–4a **completed structurally**; Class-A/B/D/E green, Class-C
+  awaiting Day-4b operator handoff for the `vmlinux` `{checksum,size}`
+  populate.
 - **Code signing + notarisation** of the elastos binaries shipped to the
-  runner. Today the smokes accept un-notarised binaries because the
-  Day-6 runner is a controlled environment; Phase 6 will tighten this
-  for the public release.
+  runner. **Phase 6 Day 4a shipped** the recipe + entitlements
+  ([`scripts/release-mac.sh`](../../scripts/release-mac.sh) +
+  [`scripts/release/elastos-server.entitlements.plist`](../../scripts/release/elastos-server.entitlements.plist));
+  Day 4b operator handoff runs them against an Apple Developer Program
+  cert. The Day-6 self-hosted runner accepts an un-notarised dev
+  binary today because the runner is a controlled environment; the
+  public release flips this on per
+  [`PHASE_6_DAY_4_NOTES.md`](./PHASE_6_DAY_4_NOTES.md) § 4 Gate 4b-6.
 - **Performance benchmarks.** The full-boot lane currently has no
   perf-regression detection. A Phase 6 follow-up will land a
   capture-and-compare baseline.
@@ -200,6 +244,11 @@ The following are intentionally **Phase 6+** deliverables:
 
 - [`.github/workflows/mac-vz.yml`](../../.github/workflows/mac-vz.yml) — the Day-5/Day-6 workflow.
 - [`.github/workflows/_self-hosted-probe.yml`](../../.github/workflows/_self-hosted-probe.yml) — heartbeat probe.
+- [`scripts/ci/setup-mac-runner.sh`](../../scripts/ci/setup-mac-runner.sh) — **Phase 6 Day 5a** one-command preflight (§ 4.5).
+- [`scripts/build-vmlinux-arm64.sh`](../../scripts/build-vmlinux-arm64.sh) — Day-4b operator recipe for the `vmlinux` Image.
+- [`scripts/release-mac.sh`](../../scripts/release-mac.sh) — Day-4b operator recipe for codesign + notarize + staple.
 - [`docs/vz-backend/CI_RUNBOOK.md`](./CI_RUNBOOK.md) — operator runbook for CI.
 - [`docs/vz-backend/PHASE_5_DAY_6_NOTES.md`](./PHASE_5_DAY_6_NOTES.md) — Day-6 completion notes.
 - [`docs/vz-backend/PHASE_5_PLAN.md`](./PHASE_5_PLAN.md) § Day 6 — the upstream prompt.
+- [`docs/vz-backend/PHASE_6_DAY_4_NOTES.md`](./PHASE_6_DAY_4_NOTES.md) — Day-4a/4b split + Day-4b operator queue.
+- [`docs/vz-backend/PHASE_6_DAY_5_NOTES.md`](./PHASE_6_DAY_5_NOTES.md) — Day-5a/5b split (this commit).

@@ -101,6 +101,8 @@ Two switches must BOTH be on:
 1. **Repository variable.** Settings → Secrets and variables → Actions → Variables → set `MAC_VZ_FULL_BOOT_ENABLED=true`. Default-off keeps the lane silent for public forks.
 2. **Self-hosted runner.** A runner registered with the exact label set `[self-hosted, macOS, ARM64, vz-capable]` must be **Idle** in the Runners page. See [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md) for provisioning.
 
+Phase 6 Day 5a shipped the one-command preflight that turns spec § 4 into a re-runnable bash script: `bash scripts/ci/setup-mac-runner.sh`. Run it on the Apple-Silicon Mac before § 4.3 (runner-agent install). The recipe verifies HW/OS prereqs, installs Rust toolchain if absent, delegates to `scripts/lib/components-json-verify.sh`, and prints the exact `gh variable set` + label set the operator types next. Exit codes are typed (0..4) per [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md) § 4.5.
+
 When both switches are on, the next `mac-vz.yml` push/PR will schedule `mac-vz-full-boot` on the runner. The three smoke steps print `FORCE_FULL=1 — forcing full smoke run` and run the real Vz boot.
 
 ### 3a.3 The heartbeat probe
@@ -147,7 +149,7 @@ The `just` recipes are the local source of truth — the workflow's job steps ar
 | Real Vz microVM boot on the **self-hosted** lane | **Wired but dormant** (Phase 5 Day 6). Becomes active when an operator provisions a runner per [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md) and sets `MAC_VZ_FULL_BOOT_ENABLED=true`. | [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md). |
 | Linux smoke runs (`local-carrier-setup-smoke.sh` etc.) full end-to-end on Linux | Not covered. CI runs only the dry-run lane; the full runs need a provisioned `~/.local/share/elastos` which CI doesn't have. | Phase 5 Day 8 follow-up — likely never automated; the local `just verify` recipe is the source of truth. |
 | Performance / regression benchmarks | Not covered. | Phase 5 Day 7 deliverable. |
-| Real `darwin-arm64` `components.json` release metadata + Carrier-backed install | Not covered. | Phase 6 — the smokes correctly visible-skip on this today via `cross_platform_assert_native_binary_release_metadata`. |
+| Real `darwin-arm64` `components.json` release metadata + Carrier-backed install | **Structurally landed Phase 6 Days 2–4a.** Class-A/B/D/E green; Class-C vmlinux awaits Day-4b operator handoff to populate checksum + size. The smokes now run their full Vz boot path instead of pre-flight-skipping; bin-fetch fails with a typed error if Day-4b hasn't shipped a kernel yet. | [`PHASE_6_DAY_4_NOTES.md`](./PHASE_6_DAY_4_NOTES.md) § 4 Gate 4b-3 + Gate 4b-6 (Day-4b operator queue). |
 
 ---
 
@@ -170,8 +172,10 @@ Public-repo macOS minutes on GitHub Actions are free for open-source projects (1
 - [`PHASE_5_PLAN.md`](PHASE_5_PLAN.md) § Day 5, § Day 6 — the original plans.
 - [`PHASE_5_DAY_5_NOTES.md`](PHASE_5_DAY_5_NOTES.md) — Day-5 shipped surface + carry-forward findings.
 - [`PHASE_5_DAY_6_NOTES.md`](PHASE_5_DAY_6_NOTES.md) — Day-6 shipped surface + carry-forward findings.
-- [`SELF_HOSTED_RUNNER_SPEC.md`](SELF_HOSTED_RUNNER_SPEC.md) — provisioning contract for the Day-6 lane.
+- [`PHASE_6_DAY_5_NOTES.md`](PHASE_6_DAY_5_NOTES.md) — Phase 6 Day 5a/5b split + operator handoff.
+- [`SELF_HOSTED_RUNNER_SPEC.md`](SELF_HOSTED_RUNNER_SPEC.md) — provisioning contract for the Day-6 lane (Day 5a added § 4.5).
 - [`PLAN.md`](PLAN.md) — overarching Vz-backend roadmap.
 - `.github/workflows/mac-vz.yml` — the main workflow.
 - `.github/workflows/_self-hosted-probe.yml` — the heartbeat probe.
+- `scripts/ci/setup-mac-runner.sh` — **Phase 6 Day 5a** one-command preflight for the self-hosted runner.
 - `justfile` § "Phase 5 Day 5 — CI-mirror recipes" — the local-mirror recipes.

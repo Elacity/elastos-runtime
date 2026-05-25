@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Days 1–4a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux + signing recipes shipped; 3/3 Mac smoke pre-flights PASS); Day 5 unblocked. Day-4b operator handoff queued.** Closes the
+> **Status:** **In progress. Days 1–5a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux + signing recipes shipped; 3/3 Mac smoke pre-flights PASS; self-hosted-runner setup recipe live-tested + spec/runbook updated); Day 6 unblocked modulo Day-5b operator handoff (~20 min). Day-4b + Day-5b operator handoffs queued.** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -418,9 +418,45 @@ that `PLAN.md` L335 calls out as a Phase-6 mandatory.
 
 ---
 
-### Day 5 — Self-hosted Mac runner activation (4–6 h)
+### Day 5 — Self-hosted Mac runner activation (5a) (3–4 h agent + ~20 min operator handoff)
 
-**Problem.** Day 4 closes Unblocker 1; Day 5 lights up
+> **Outcome (2026-05-25):** ✅ **Day 5a complete (agent-shipped
+> scaffolding); Day 6 unblocked modulo ~20 min operator wall-clock.
+> Day-5b operator handoff queued.**
+> Notes: [`PHASE_6_DAY_5_NOTES.md`](PHASE_6_DAY_5_NOTES.md).
+>
+> **What landed (5a):** `scripts/ci/setup-mac-runner.sh` (one-command
+> preflight: HW/OS floors, toolchain install, Vz framework check,
+> components.json verifier delegate, Day-4b artefact probe, operator
+> handoff block). Spec [`SELF_HOSTED_RUNNER_SPEC.md`](SELF_HOSTED_RUNNER_SPEC.md)
+> promoted from "wired but dormant" to "recipe available; pre-flight
+> no longer skips" — new § 4.5 documents the recipe + typed exit
+> codes (0..4). Runbook [`CI_RUNBOOK.md`](CI_RUNBOOK.md) § 3a.2 +
+> § 5 status table refreshed. Recipe live-tested on dev Mac with
+> clean `exit=0`.
+>
+> **What's queued (5b — operator-side):** procure Apple-Silicon Mac
+> matching spec § 2 floors; run `bash scripts/ci/setup-mac-runner.sh`;
+> register runner with `self-hosted,macOS,ARM64,vz-capable` labels;
+> `gh variable set MAC_VZ_FULL_BOOT_ENABLED --body true`; trigger
+> `_self-hosted-probe.yml` for the first probe-attempt green. ~20 min
+> active operator time excluding HW procurement.
+>
+> **Scope deviation from original plan.** The original Day-5 prompt's
+> 8 gates required physical HW + GitHub registration token + repo-admin
+> credentials — none agent-attainable. Day 5a/5b split mirrors Day 4a/4b
+> precedent: agent ships reproducible recipe, operator runs it. The
+> original 8 gates are still covered (4 in 5a as agent-side; 4 in 5b
+> as operator-side). Spec/runbook/notes/banner updates land in 5a; the
+> first runner activation lands in 5b.
+>
+> **Day-4b + Day-5b ordering note.** Either order works. Day 5b first
+> means `mac-vz-full-boot` exits with typed "vmlinux not found" until
+> Day 4b lands; Day 4b first means the runner has its kernel ready
+> the moment Day-5b activates it. The recipe handles either order via
+> its informational-only Day-4b artefact probe.
+
+**Problem.** Day 4 closes Unblocker 1 structurally; Day 5 lights up
 Unblocker 2 per
 [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md)
 § Unblocker 2. Without a self-hosted runner activated,
