@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Planned. Day 1 ready to start.** Closes the
+> **Status:** **In progress. Day 1 complete (audit landed); Day 2 unblocked.** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -45,6 +45,23 @@ metadata (Days 1–4)**, **CI activation (Days 5–6)**,
 ---
 
 ### Day 1 — `components.json` audit + per-binary decision matrix (4–6 h)
+
+> **Outcome (2026-05-25):** ✅ **Audit complete; Day-2 unblocked.**
+> Audit lives at
+> [`PHASE_6_COMPONENTS_AUDIT.md`](PHASE_6_COMPONENTS_AUDIT.md).
+> All four architecture decisions are closed:
+> **(A)** `vmlinux` darwin-arm64 = build same 6.1.59 source for arm64;
+> **(B)** `crosvm` darwin = omit entry (install-loop skip is graceful);
+> **(C)** `kubo` / `cloudflared` / `llama-server` darwin-arm64 = ingest
+> upstream macOS-arm64 builds;
+> **(D)** `install.sh` upstream bash-3.2 fix deferred to Phase 7; Mac
+> smokes use `ELASTOS_BIN_OVERRIDE` for Phase 6.
+> Smoke surface map: `local-carrier-setup` + `home-frontdoor` +
+> `chat-wasm-native-interop` collectively assert on **5 binaries**
+> (`shell`, `localhost-provider`, `did-provider`, `webspace-provider`,
+> `chat`) — these are Day-2's minimum-required population set.
+> Day-1 diff is docs-only (this banner + the audit doc); no
+> substrate touched.
 
 **Problem.** `PLAN.md` L338 mandates *"restore the darwin
 entries in `components.json` — this time truthfully,
