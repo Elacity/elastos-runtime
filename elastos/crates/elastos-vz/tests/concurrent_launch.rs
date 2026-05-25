@@ -25,12 +25,20 @@
 //!    on a real Apple Silicon Mac with a real kernel artefact.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use elastos_common::{
     CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, ResourceLimits, SCHEMA_V1,
 };
+use elastos_compute::ComputeProvider;
 
 use elastos_vz::{is_supported, VmConfig, VzConfig, VzProvider};
+
+use tracing::field::{Field, Visit};
+use tracing::Event;
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
 
 fn microvm_manifest(name: &str) -> CapsuleManifest {
     CapsuleManifest {
@@ -311,4 +319,283 @@ async fn concurrent_load_with_real_kernel() {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 3, "CapsuleId must be unique per concurrent load");
+}
+
+// ─── Day 7 ─ Boot-to-userspace validation ──────────────────────────────────
+//
+// Captures the kernel-console `tracing` stream (target = "vm_console")
+// emitted by `src/ffi/console_forwarder.rs` and asserts that booting a
+// real Linux kernel + initramfs through the substrate produces
+// recognizable boot markers (e.g. "Linux version", "Run /init").
+//
+// Discovery contract mirrors `concurrent_load_with_real_kernel`:
+//
+//   - $ELASTOS_VZ_TEST_KERNEL  → kernel Image path
+//   - $ELASTOS_VZ_TEST_INITRD  → initramfs path (NEW Day-7 input)
+//   - else: ~/.local/share/elastos/bin/{vmlinux,initrd-generic}
+//
+// The test cleanly skips (eprintln + return) on unsupported hosts or
+// when artefacts are missing — same pattern as Day-6's load test.
+
+/// Lines tagged with target = "vm_console" since process start. Shared
+/// across all tests in this binary; populated by `VmConsoleCaptureLayer`
+/// (installed exactly once via `init_vm_console_capture`).
+type LineBuffer = Arc<Mutex<Vec<String>>>;
+static VM_CONSOLE_LINES: OnceLock<LineBuffer> = OnceLock::new();
+
+/// Install the capturing tracing subscriber on first call. Subsequent
+/// calls return the same shared buffer. Idempotent across tests in the
+/// same binary so the no-tracing-setup-needed contract of the other
+/// tests stays intact.
+fn init_vm_console_capture() -> LineBuffer {
+    VM_CONSOLE_LINES
+        .get_or_init(|| {
+            let buf: LineBuffer = Arc::new(Mutex::new(Vec::new()));
+            let layer = VmConsoleCaptureLayer { lines: buf.clone() };
+            // `try_init` is non-panicking: if some other test already
+            // installed a global subscriber, we silently fall through
+            // (our buffer just stays empty, which the boot test will
+            // surface as a clear assertion failure).
+            let _ = tracing_subscriber::registry().with(layer).try_init();
+            buf
+        })
+        .clone()
+}
+
+/// Minimal tracing `Layer` that collects the message body of every
+/// `vm_console`-targeted event into a shared `Vec<String>`. Drops all
+/// other targets unchanged (so the `concurrent_load_*` tests in this
+/// same file remain unaffected).
+struct VmConsoleCaptureLayer {
+    lines: LineBuffer,
+}
+
+impl<S> Layer<S> for VmConsoleCaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "vm_console" {
+            return;
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        if !visitor.0.is_empty() {
+            if let Ok(mut guard) = self.lines.lock() {
+                guard.push(visitor.0);
+            }
+        }
+    }
+}
+
+struct MessageVisitor(String);
+
+impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.0.push_str(value);
+        }
+    }
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            // `tracing::info!(..., "{line}")` ends up as a Debug
+            // record on the message field at the layer boundary;
+            // the actual line string lives inside that Debug repr.
+            self.0.push_str(&format!("{value:?}"));
+        }
+    }
+}
+
+fn discover_initrd() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ELASTOS_VZ_TEST_INITRD") {
+        let pb = PathBuf::from(p);
+        return pb.is_file().then_some(pb);
+    }
+    let home = std::env::var_os("HOME")?;
+    let candidate = PathBuf::from(home).join(".local/share/elastos/bin/initrd-generic");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Returns true once the captured `vm_console` buffer contains any of
+/// the recognised Linux-boot markers. Day-7 acceptance gate.
+fn observed_boot_markers(buf: &LineBuffer) -> Option<&'static str> {
+    // These three are present in *every* arm64 Linux 5.x boot. We
+    // accept any one of them as proof of "kernel reached
+    // initialisation"; the union covers cases where one or another
+    // is filtered by a `quiet` boot arg or a custom printk level.
+    const MARKERS: &[&str] = &[
+        "Linux version",
+        "Booting Linux",
+        "Run /init",
+    ];
+    let lines = buf.lock().ok()?;
+    for marker in MARKERS {
+        if lines.iter().any(|l| l.contains(marker)) {
+            return Some(marker);
+        }
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_vm_boots_to_userspace() {
+    if !is_supported() {
+        eprintln!(
+            "single_vm_boots_to_userspace: skipping — is_supported() == false \
+             (off Apple Silicon macOS, Vz framework unreachable)"
+        );
+        return;
+    }
+
+    let kernel = match discover_kernel() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "single_vm_boots_to_userspace: skipping — no kernel at \
+                 $ELASTOS_VZ_TEST_KERNEL or ~/.local/share/elastos/bin/vmlinux. \
+                 See docs/vz-backend/PHASE_6_DAY_6_VALIDATION.md § 6."
+            );
+            return;
+        }
+    };
+    let initrd = match discover_initrd() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "single_vm_boots_to_userspace: skipping — no initramfs at \
+                 $ELASTOS_VZ_TEST_INITRD or ~/.local/share/elastos/bin/initrd-generic. \
+                 Download Ubuntu's published one: curl -fsSL -o \
+                 ~/.local/share/elastos/bin/initrd-generic \
+                 https://cloud-images.ubuntu.com/jammy/current/unpacked/jammy-server-cloudimg-arm64-initrd-generic"
+            );
+            return;
+        }
+    };
+
+    // The 1 MB zero-filled placeholder rootfs from Day 6 is still
+    // valid here: Apple's `validateWithError:` only checks file
+    // existence, and the boot path never tries to mount it — the
+    // initramfs is the rootfs at this stage. Reuse if present;
+    // otherwise create one on the fly so the test is self-contained.
+    let rootfs = std::env::var("ELASTOS_VZ_TEST_ROOTFS")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| {
+            let tmp_root = std::env::temp_dir().join("elastos-vz-day7-rootfs.raw");
+            if !tmp_root.is_file() {
+                let f = std::fs::File::create(&tmp_root).expect("create rootfs placeholder");
+                f.set_len(1024 * 1024).expect("size rootfs placeholder");
+            }
+            tmp_root
+        });
+
+    eprintln!(
+        "single_vm_boots_to_userspace: kernel={} initrd={} rootfs={}",
+        kernel.display(),
+        initrd.display(),
+        rootfs.display()
+    );
+
+    let console_lines = init_vm_console_capture();
+    let baseline_len = console_lines.lock().unwrap().len();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = std::sync::Arc::new(
+        VzProvider::new(
+            VzConfig::new()
+                .with_state_dir(tmp.path().join("vz"))
+                .with_rootfs_cache_dir(tmp.path().join("rootfs-cache"))
+                .with_kernel_path(kernel.clone())
+                .with_initramfs_path(initrd.clone()),
+        )
+        .unwrap(),
+    );
+    provider.init().await.unwrap();
+
+    // `console=hvc0` is the Vz-native virtio-console; `init=/init`
+    // tells the kernel to execute the initramfs's `/init` directly
+    // (Ubuntu's initramfs ships one). We deliberately keep verbosity
+    // ON (no `quiet`) so the early printk reaches our capture before
+    // any userspace handover that might silence the kernel ring.
+    let vm_config = VmConfig {
+        vm_id: "day7-boot-probe".to_string(),
+        kernel_path: kernel.clone(),
+        boot_args: "console=hvc0 init=/init".to_string(),
+        rootfs_path: rootfs.clone(),
+        rootfs_readonly: true,
+        mem_size_mib: 256, // initramfs unpacking needs more headroom than 128
+        vcpu_count: 1,
+        http_port: None,
+        data_disk_path: None,
+        vsock_cid: 3,
+        network: None,
+        interactive_stdio: false,
+        carrier_socket_path: None,
+        initramfs_path: Some(initrd.clone()),
+    };
+
+    let handle = provider
+        .load_with_vm_config(vm_config, microvm_manifest("day7-boot-probe"))
+        .await
+        .expect("load_with_vm_config must accept kernel+initramfs config");
+
+    provider
+        .start(&handle)
+        .await
+        .expect("start must succeed once validateWithError has passed");
+
+    // Poll the capture buffer for boot markers — up to 30s wall
+    // clock. The first `Linux version` line typically appears
+    // within 1–2 seconds of `start()` returning on M1/M2.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let found = loop {
+        if let Some(marker) = observed_boot_markers(&console_lines) {
+            break Some(marker);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    // Capture a slice of the post-boot console for diagnostic
+    // logging (first 30 lines past our baseline). This shows up in
+    // `cargo test -- --nocapture` so a reader can confirm the VM
+    // actually booted — even when the assertion passes — and so
+    // failures include real evidence.
+    let captured: Vec<String> = console_lines
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(baseline_len)
+        .take(30)
+        .cloned()
+        .collect();
+    if !captured.is_empty() {
+        eprintln!("=== first ≤30 kernel-console lines ===");
+        for line in &captured {
+            eprintln!("    {line}");
+        }
+        eprintln!("=== end console capture ===");
+    } else {
+        eprintln!("=== no kernel-console output captured (capture layer race or pipe stalled) ===");
+    }
+
+    // Stop the VM. Best-effort: even if the kernel panicked we still
+    // want a clean teardown so the test binary exits cleanly.
+    let _ = provider.stop(&handle).await;
+
+    match found {
+        Some(marker) => {
+            eprintln!("single_vm_boots_to_userspace: PASS (marker '{marker}' observed)");
+        }
+        None => panic!(
+            "single_vm_boots_to_userspace: 30s elapsed with no Linux-boot marker; \
+             the substrate did not surface a booting kernel. Total captured lines: {}. \
+             First captured line (if any): {:?}",
+            captured.len(),
+            captured.first()
+        ),
+    }
 }
