@@ -18,6 +18,11 @@ on:
     branches: ["sash/**", "vz/**"]
   pull_request:
     branches: [main]
+  # Phase 5 Day 5 — allow manual one-shot triggers from the
+  # Actions UI so operators can re-run the gate after rebasing
+  # without pushing a new commit. Matches the trigger surface
+  # of the new mac-vz.yml workflow.
+  workflow_dispatch: {}
 
 jobs:
   linux-untouched:

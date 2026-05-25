@@ -114,6 +114,19 @@ trap cleanup EXIT
 
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
 
+# Phase 5 Day 5 — auto-dry-run in CI. GitHub Actions runners
+# don't have a provisioned `~/.local/share/elastos`, so the
+# full smoke would visible-skip on every PR. Explicit operator
+# override via `ELASTOS_VZ_SMOKE_DRY_RUN=0` keeps the full
+# semantics available for self-hosted CI runners that DO have a
+# data dir provisioned (Phase 5 Day 6+ deliverable). The
+# explicit `=1` setting always wins below; this branch only
+# fires when the env is otherwise silent.
+if [[ -z "${ELASTOS_VZ_SMOKE_DRY_RUN:-}" ]] && cross_platform_in_ci; then
+    echo "[local-carrier-setup] CI detected (GITHUB_ACTIONS or CI env set); auto-enabling ELASTOS_VZ_SMOKE_DRY_RUN=1"
+    export ELASTOS_VZ_SMOKE_DRY_RUN=1
+fi
+
 # Phase 5 Day 1 — dry-run mode for CI. Exits successfully after
 # the bash-portability checks + helper sourcing, BEFORE paying
 # the cargo-build cost. Lets a Mac CI runner prove the script

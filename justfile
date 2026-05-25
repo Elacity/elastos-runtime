@@ -128,6 +128,41 @@ publish-quick version key:
 publish-local version key:
     ./scripts/publish-release.sh --version {{version}} --key {{key}} --skip-build --skip-rootfs --no-public-url
 
+# ─── Phase 5 Day 5 — CI-mirror recipes ──────────────────────
+# These recipes are the LOCAL source of truth for what the
+# .github/workflows/mac-vz.yml workflow runs in CI. Keep them
+# in sync: if you change the workflow, update the matching
+# recipe (and vice versa). The workflow's job names match the
+# recipe names verbatim for grep-ability.
+
+# Run the full mac-vz CI sequence locally (fmt + clippy + tests + shell helpers + smokes dry-run)
+ci-mac:
+    just ci-rust
+    just ci-shell
+    just ci-smokes-dry
+
+# Mirror the mac-rust-tests CI job: fmt + clippy + tests (threads=1 then =4)
+ci-rust:
+    cd elastos && cargo fmt --all -- --check
+    cd elastos && cargo clippy --workspace --all-targets -- -D warnings
+    cd elastos && cargo test -p elastos-server -p elastos-vz --tests -- --test-threads=1
+    cd elastos && cargo test -p elastos-server -p elastos-vz --tests -- --test-threads=4
+
+# Mirror the mac-shell-helpers CI job: bash 3.2 helper-library unit tests
+ci-shell:
+    bash scripts/lib/cross-platform-test.sh
+    bash scripts/lib/runtime-cleanup-test.sh
+
+# Mirror the mac-smokes-dry-run CI job: three shell smokes in their dry-run lane
+ci-smokes-dry:
+    ELASTOS_VZ_SMOKE_DRY_RUN=1 bash scripts/local-carrier-setup-smoke.sh
+    ELASTOS_VZ_SMOKE_DRY_RUN=1 bash scripts/home-frontdoor-smoke.sh
+    ELASTOS_VZ_SMOKE_DRY_RUN=1 bash scripts/chat-wasm-native-interop-smoke.sh
+
+# Run the linux-untouched gate locally against the Phase 0 baseline
+ci-linux-untouched:
+    scripts/check-linux-untouched.sh a65dad3
+
 # Run P2P chat demo
 chat *args:
     ./scripts/chat.sh {{args}}

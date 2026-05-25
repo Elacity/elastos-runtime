@@ -449,6 +449,59 @@ else
     fail "prose mentioning vz_timed_out without colon must NOT trip alert"
 fi
 
+# ─── cross_platform_in_ci (Phase 5 Day 5) ──────────────────
+
+TEST_NAME="cross_platform_in_ci"
+
+# Run each assertion in an isolated sub-shell so env mutations
+# don't leak into surrounding tests (the test file itself may
+# legitimately run in a CI environment where these vars are
+# already set).
+
+# 1. Both env vars unset → not in CI.
+if (
+    unset GITHUB_ACTIONS CI
+    cross_platform_in_ci
+); then
+    fail "no env vars set must report 'not in CI'"
+else
+    ok "no env vars set returns 1 (not in CI)"
+fi
+
+# 2. GITHUB_ACTIONS=true → in CI.
+if (
+    unset CI
+    GITHUB_ACTIONS=true
+    cross_platform_in_ci
+); then
+    ok "GITHUB_ACTIONS=true returns 0 (in CI)"
+else
+    fail "GITHUB_ACTIONS=true must report 'in CI'"
+fi
+
+# 3. CI=true (no GITHUB_ACTIONS) → in CI.
+if (
+    unset GITHUB_ACTIONS
+    CI=true
+    cross_platform_in_ci
+); then
+    ok "CI=true returns 0 (in CI)"
+else
+    fail "CI=true must report 'in CI'"
+fi
+
+# 4. Both env vars set (the actual GitHub Actions runtime
+#    case) → in CI. Locks in the dual-recognition contract.
+if (
+    GITHUB_ACTIONS=true
+    CI=true
+    cross_platform_in_ci
+); then
+    ok "GITHUB_ACTIONS=true AND CI=true returns 0 (in CI)"
+else
+    fail "both GITHUB_ACTIONS=true AND CI=true must report 'in CI'"
+fi
+
 # ─── summary ────────────────────────────────────────────────
 
 echo

@@ -417,6 +417,40 @@ cross_platform_print_phase6_skip_message() {
 MSG
 }
 
+# Predicate: are we running inside a CI environment?
+# **Phase 5 Day 5.** Returns 0 (true) when EITHER
+# `$GITHUB_ACTIONS` is set to any non-empty value (the
+# canonical GitHub Actions signal) OR `$CI` is set to any
+# truthy-looking value (the de-facto industry standard
+# CircleCI, Travis, GitLab, Buildkite, Jenkins, …). Returns
+# non-zero (false) otherwise.
+#
+# Used by the three Mac smokes to silently auto-enable
+# `ELASTOS_VZ_SMOKE_DRY_RUN=1` when no kernel/rootfs is
+# available — CI runners don't have a provisioned
+# `~/.local/share/elastos`, so without the auto-dry-run the
+# smokes would loudly visible-skip on every PR, which is
+# correct behaviour but adds noise to the check list.
+# Operators retain full control via the explicit
+# `ELASTOS_VZ_SMOKE_DRY_RUN=1` / `=0` env override; this
+# predicate only fires when the env is otherwise silent.
+#
+# Truthy `$CI` values recognised: `true`, `1`, `yes`, `on`.
+# Anything else (including empty or unset) → not in CI.
+# GitHub Actions sets `GITHUB_ACTIONS=true` AND `CI=true`,
+# so both branches catch it; the dual recognition matters
+# for projects that mirror this workflow into other CI
+# providers.
+cross_platform_in_ci() {
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        return 0
+    fi
+    case "${CI:-}" in
+        true|TRUE|True|1|yes|YES|Yes|on|ON|On) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Locate an installed Vz-launchable capsule on the host.
 # **Phase 5 Day 1.** Returns 0 and prints the capsule name on
 # stdout if a `<data_dir>/capsules/<name>/rootfs.ext4` plus a
