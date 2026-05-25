@@ -1,6 +1,50 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Phase 9 OPEN. Day 2 (2026-05-26) extended the
+> **Status:** **Phase 9 OPEN. Day 3 (2026-05-26) closed the
+> last structurally-red row on the Mac Home dashboard — the
+> `Full-screen Apps` service whose `SystemServiceSpec.backing`
+> hard-coded `["crosvm", "vmlinux"]`. crosvm is Linux-only by
+> design (the Phase-6 components audit explicitly omits it from
+> the macOS install plan; Mac runs Apple's Virtualization.framework
+> embedded in the elastos binary), so the row was guaranteed
+> red on Mac no matter how many providers we shipped. Day 3
+> introduces two cfg-gated static constants in
+> `elastos-server::home_cmd` —
+> `FULL_SCREEN_APPS_BACKING = &["vmlinux"]` on
+> `#[cfg(target_os = "macos")]` and the original
+> `&["crosvm", "vmlinux"]` elsewhere — and the
+> `SystemServiceSpec` references whichever was selected at
+> compile time. Three guard tests live in `home_cmd::tests` (two
+> assert the per-platform constant shape, one walks
+> `gather_system_services` end-to-end with a `["vmlinux"]`-only
+> snapshot on macOS and a `["vmlinux"]`-without-`crosvm`
+> snapshot on non-macOS to confirm the gate flips the way the
+> per-platform user expects). A shared
+> `full_screen_apps_service(services)` helper panics if the row
+> is ever dropped from `SYSTEM_SERVICES` so a regression that
+> removes the row breaks the build instead of silently no-op'ing
+> the assertions. Net substrate diff: one spec field switched to
+> a constant + two cfg-gated constants + five test entries; the
+> body of `gather_system_services` is unchanged. After Day 3
+> the Mac dashboard reports **6 / 8 services ready** (up from
+> 5 / 8), and the two remaining red rows (`Content Exchange`,
+> `Public Edge`) are now honestly third-party-dependency gaps
+> that flip green with `brew install kubo cloudflared` — no
+> further substrate work needed for them. Re-signing the
+> dev binary after the cargo rebuild took the usual one-liner
+> (`scripts/dev/sign-elastos-vz/sign.sh elastos/target/debug/elastos`),
+> and the Phase-8-Day-8 WASM-standalone smoke re-verified
+> (`elastos run capsules/home` → `home capsule launched … →
+> [run] WASM capsule 'home' exited`) and the VZ provider init
+> log line (`vz provider enabled …`) both green. **517 tests
+> pass across the elastos-server lib + bin + integration suites
+> (lib 404, bin 86 incl. the +2 Day-3 entries on macOS host,
+> +28 across the integration binaries) — zero regressions.**
+> See [`PHASE_9_DAY_3_NOTES.md`](PHASE_9_DAY_3_NOTES.md) for the
+> alternative shapes considered, the cfg-gated test pattern, the
+> Day-4 candidate list (bootstrap auto-re-sign, WASM↔HTTP
+> carrier_bridge wiring for the five Home-surface capsules,
+> notarized release distribution). Day 2 (2026-05-26) extended the
 > Day-1 bootstrap from three providers to the full first-party
 > Home surface a Mac source checkout can build on its own:
 > seven host provider binaries (`shell`, `localhost-provider`,

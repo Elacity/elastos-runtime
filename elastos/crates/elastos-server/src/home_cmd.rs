@@ -121,9 +121,23 @@ const SYSTEM_SERVICES: &[SystemServiceSpec] = &[
     SystemServiceSpec {
         name: "Full-screen Apps",
         role: "Supports immersive full-screen app capsules such as packaged chat in microVM and WASM form.",
-        backing: &["crosvm", "vmlinux"],
+        backing: FULL_SCREEN_APPS_BACKING,
     },
 ];
+
+// Full-screen capsule launch needs a VM monitor + a guest kernel. The VMM
+// is platform-conditional: Linux hosts run `crosvm` (a host binary), macOS
+// hosts run Apple's Virtualization.framework via the in-process
+// `elastos-vz` crate — there's no `crosvm` binary on macOS, and the Vz
+// substrate isn't represented as a discoverable component in `bin/`. So on
+// macOS we drop `crosvm` from the backing list and rely on `vmlinux` (and,
+// implicitly, the fact that the elastos binary itself ships Vz support)
+// to gate this row. Phase 9 Day 3 wiring.
+#[cfg(target_os = "macos")]
+const FULL_SCREEN_APPS_BACKING: &[&str] = &["vmlinux"];
+
+#[cfg(not(target_os = "macos"))]
+const FULL_SCREEN_APPS_BACKING: &[&str] = &["crosvm", "vmlinux"];
 
 /// Core actions are built into the runtime binary. They are always visible.
 const CORE_ACTIONS: &[ActionSpec] = &[
@@ -3273,5 +3287,72 @@ mod tests {
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"shell"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"did-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"home"));
+    }
+
+    fn full_screen_apps_service<'a>(
+        services: &'a [SystemServiceStatus],
+    ) -> &'a SystemServiceStatus {
+        services
+            .iter()
+            .find(|service| service.name == "Full-screen Apps")
+            .expect("Full-screen Apps service must always be enumerated")
+    }
+
+    // Phase 9 Day 3 — the Full-screen Apps row's backing must be platform-
+    // conditional. On macOS the VMM is Apple's Virtualization.framework
+    // embedded in the runtime binary itself (no discoverable `crosvm` lives
+    // on `bin/`), so only `vmlinux` should gate the row. On every other
+    // host we still require both `crosvm` and `vmlinux`.
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_screen_apps_backing_is_vmlinux_only_on_macos() {
+        assert_eq!(FULL_SCREEN_APPS_BACKING, &["vmlinux"]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn full_screen_apps_backing_keeps_crosvm_off_macos() {
+        assert_eq!(FULL_SCREEN_APPS_BACKING, &["crosvm", "vmlinux"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_screen_apps_ready_on_macos_with_just_vmlinux() {
+        let snapshot = sample_snapshot_with_components(&["vmlinux"]);
+        let services = gather_system_services(&snapshot.components);
+        let full_screen = full_screen_apps_service(&services);
+        assert!(
+            full_screen.ready,
+            "macOS Full-screen Apps should be ready with vmlinux alone, got {:?}",
+            full_screen
+        );
+        assert_eq!(full_screen.backing, "vmlinux");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn full_screen_apps_not_ready_off_macos_without_crosvm() {
+        let snapshot = sample_snapshot_with_components(&["vmlinux"]);
+        let services = gather_system_services(&snapshot.components);
+        let full_screen = full_screen_apps_service(&services);
+        assert!(
+            !full_screen.ready,
+            "non-macOS Full-screen Apps must require crosvm; got {:?}",
+            full_screen
+        );
+        assert_eq!(full_screen.backing, "crosvm + vmlinux");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn full_screen_apps_ready_off_macos_with_crosvm_and_vmlinux() {
+        let snapshot = sample_snapshot_with_components(&["crosvm", "vmlinux"]);
+        let services = gather_system_services(&snapshot.components);
+        let full_screen = full_screen_apps_service(&services);
+        assert!(
+            full_screen.ready,
+            "non-macOS Full-screen Apps must be ready when crosvm + vmlinux both present"
+        );
     }
 }
