@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Days 1–6a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux build recipe + kconfig fragment shipped; signing recipes shipped; 3/3 Mac smoke pre-flights PASS; self-hosted-runner setup recipe + local-lane orchestrator live-tested); Day 7 unblocked modulo Day-6b operator handoff (~45 min single-sitting). Day-4b folded into Day-6b queue; Day-5b deferred as Phase-7 self-hosted-CI work.** Closes the
+> **Status:** **Day 6 substrate-validation milestone GREEN. Days 1–6 complete: audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux build recipe + kconfig fragment shipped (with honest macOS-native-build limitation banner — see [`PHASE_6_DAY_6_VALIDATION.md`](PHASE_6_DAY_6_VALIDATION.md) § 2 audit miss); signing recipes shipped; `elastos-vz::concurrent_load_with_real_kernel` PASSES on real Apple Silicon Mac against Ubuntu jammy arm64 kernel (13/13 elastos-vz tests green); local validation recipe published as 3-command reproduction (`PHASE_6_DAY_6_VALIDATION.md` § 6). Day 7 unblocked — focus is closing the last "VM boots to userspace" claim. Day-5b deferred as Phase-7 self-hosted-CI work; Mac-vmlinux artifact publication deferred as Phase-7 CI (Linux runner builds the kernel where it "just works").** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):

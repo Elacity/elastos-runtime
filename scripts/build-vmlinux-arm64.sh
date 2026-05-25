@@ -1,6 +1,41 @@
 #!/usr/bin/env bash
 # scripts/build-vmlinux-arm64.sh — Phase 6 Day 4 (Sub-1).
 #
+# ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+# ┃ NOTE (Day 6 honest update): this recipe DOES NOT complete on a       ┃
+# ┃ bare macOS host without a Linux container. The Phase-6 Day-1 audit   ┃
+# ┃ picked "build same 6.1.59 source for arm64 on the dev Mac" as        ┃
+# ┃ Decision A primary; the assumption was untested. Day 6 surfaced two  ┃
+# ┃ macOS-vs-Linux toolchain gaps the audit missed:                      ┃
+# ┃                                                                       ┃
+# ┃   1. The kernel's `scripts/kconfig/merge_config.sh` uses GNU sed     ┃
+# ┃      `sed -i 'expr' file` syntax that BSD sed (macOS default)        ┃
+# ┃      rejects with `invalid command code .`.                          ┃
+# ┃         → BYPASSED here (cat-append + olddefconfig, see stage 2/3).  ┃
+# ┃                                                                       ┃
+# ┃   2. Kernel host-side tools (scripts/sorttable.c, kallsyms.c,        ┃
+# ┃      mod/file2alias.c, mod/modpost.c) `#include <elf.h>`. macOS      ┃
+# ┃      does not ship one (it uses Mach-O); brew's `libelf` is the     ┃
+# ┃      2009 Mike Frysinger fork, partial coverage only.                ┃
+# ┃         → PARTIALLY shimmed here (gets past sorttable/kallsyms via   ┃
+# ┃           an elf.h wrapper around libelf, still fails at             ┃
+# ┃           file2alias.c uuid_t collision + modpost.c R_MIPS_*         ┃
+# ┃           missing relocs).                                           ┃
+# ┃                                                                       ┃
+# ┃ For Phase-6 substrate validation purposes this kernel is NOT         ┃
+# ┃ needed. The substrate is validated by elastos-vz's                   ┃
+# ┃ `concurrent_load_with_real_kernel` integration test (see             ┃
+# ┃ docs/vz-backend/PHASE_6_DAY_6_VALIDATION.md), which only needs       ┃
+# ┃ ANY Vz-loadable kernel Image — Ubuntu's published cloud-images       ┃
+# ┃ vmlinuz-generic is sufficient and free.                              ┃
+# ┃                                                                       ┃
+# ┃ Building OUR OWN vmlinux for distribution is Phase-7 CI work; on a   ┃
+# ┃ Linux runner the entire shim chain above is unnecessary, the build  ┃
+# ┃ "just works." This script is preserved for the day someone wants to ┃
+# ┃ keep iterating on the macOS-native path (e.g. by vendoring a full   ┃
+# ┃ glibc-equivalent elf.h, ~1000 LOC one-time vendor).                  ┃
+# ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+#
 # Deterministic build recipe for the `vmlinux-darwin-arm64` artifact
 # (raw ARM64 Image kernel) the runtime fetches via
 # `external.vmlinux.platforms.darwin-arm64` in components.json.
@@ -33,8 +68,10 @@
 #          mainstream-tested).
 #   - GNU make (`brew install make` — macOS ships an old BSD make
 #     which the Linux kernel Makefile does not accept).
-#   - libelf / openssl / bc (Linux kernel build deps):
-#       `brew install elfutils openssl@3 bc`
+#   - libelf / openssl / bc / jq (Linux kernel build deps):
+#       `brew install libelf openssl@3 bc jq`
+#       (NOT `elfutils` — that brew formula is Linux-only and refuses
+#        to install on Darwin. Day-6 audit-fix.)
 #   - ~10 GB free disk; ~30 min wall-clock on M1/M2.
 #
 # Inputs:
@@ -150,13 +187,21 @@ log "stage 1/3: 'make defconfig' (baseline arm64 config)"
     die "make defconfig failed; see ${VMLINUX_OUT}/build.log" 2
 }
 
-log "stage 2/3: 'merge_config.sh -m' (apply Vz-required overrides from ${VMLINUX_CONFIG})"
-(
-    cd "${VMLINUX_SRC}"
-    ARCH=arm64 ./scripts/kconfig/merge_config.sh -m .config "${VMLINUX_CONFIG}"
-) >>"${VMLINUX_OUT}/build.log" 2>&1 || {
+log "stage 2/3: append Vz-required overrides from ${VMLINUX_CONFIG}"
+# The kernel ships `scripts/kconfig/merge_config.sh`, but it uses GNU-sed
+# syntax (`sed -i 'expr' file`) that BSD sed on macOS rejects with
+# `invalid command code .`. The portable replacement is to simply append
+# the fragment to `.config`; the kernel's Kconfig parser honors
+# *last-occurrence-wins* semantics for duplicate `CONFIG_*` lines (per
+# Documentation/kbuild/kconfig.rst), and `olddefconfig` (stage 3) does
+# the dependency-cascade resolution.
+{
+    echo ""
+    echo "# Merged from ${VMLINUX_CONFIG} by build-vmlinux-arm64.sh"
+    cat "${VMLINUX_CONFIG}"
+} >> "${VMLINUX_SRC}/.config" 2>>"${VMLINUX_OUT}/build.log" || {
     tail -40 "${VMLINUX_OUT}/build.log" >&2
-    die "merge_config.sh failed; see ${VMLINUX_OUT}/build.log" 2
+    die "appending fragment to .config failed; see ${VMLINUX_OUT}/build.log" 2
 }
 
 log "stage 3/3: 'make olddefconfig' (resolve dependency cascade)"
@@ -168,6 +213,44 @@ log "stage 3/3: 'make olddefconfig' (resolve dependency cascade)"
     die "olddefconfig failed; see ${VMLINUX_OUT}/build.log" 2
 }
 
+# ── macOS host-tools shim ──────────────────────────────────────────────────
+# Linux kernel host-side tools (scripts/sorttable.c, scripts/kallsyms.c,
+# scripts/asn1_compiler.c) `#include <elf.h>`, which macOS does not ship
+# (macOS uses Mach-O, not ELF). The brew `libelf` package provides a
+# Linux-compatible ELF type definition under `libelf/elf_repl.h`; this
+# shim re-exposes those types as `<elf.h>` for the host compiler.
+#
+# Verified against Linux 6.1.59 sorttable.c — the required symbols
+# (Elf64_Ehdr/Shdr, ELFCLASS64, ET_REL, SHT_SYMTAB) are all present in
+# elf_repl.h; arch-specific EM_* constants are defined inline by
+# sorttable.c itself so we don't need them in the shim.
+ELF_SHIM_DIR="${VMLINUX_OUT}/elf-shim"
+mkdir -p "${ELF_SHIM_DIR}"
+LIBELF_INCLUDE="/opt/homebrew/opt/libelf/include/libelf"
+if [[ ! -f "${LIBELF_INCLUDE}/elf_repl.h" ]]; then
+    die "brew libelf headers not found at ${LIBELF_INCLUDE}/elf_repl.h. Install via 'brew install libelf'." 1
+fi
+# The shim uses libelf's canonical entry point (`<libelf.h>`) so the
+# include chain (libelf.h → sys_elf.h → elf_repl.h) correctly defines:
+#   - `__libelf_u{16,32,64}_t` / `__libelf_i{32,64}_t` integer aliases
+#     (via sys_elf.h's `#define __libelf_u64_t unsigned long` etc.)
+#   - `__LIBELF64=1` macro (enables the Elf64_* typedef block)
+#   - `Elf{32,64}_{Addr,Half,Off,Word,Sword,Ehdr,Shdr,Sym,Rel,Rela,…}`
+#     (from elf_repl.h, which sys_elf.h includes after setting the
+#     internal flags)
+# Direct-include of `<libelf/elf_repl.h>` does NOT work because the
+# file's own header comment explicitly forbids it and gates Elf64_*
+# behind `#if __LIBELF64` that sys_elf.h sets.
+printf '#include <libelf/libelf.h>\n' > "${ELF_SHIM_DIR}/elf.h"
+log "macOS host-tools shim: ${ELF_SHIM_DIR}/elf.h → <libelf/libelf.h> (canonical entry, cascades types)"
+
+# Inject the shim into HOSTCFLAGS so scripts/sorttable.c et al find it.
+# The kernel's build system honors HOSTCFLAGS for host-tool compiles.
+# Silence signed/unsigned warnings on the brew-libelf int aliases — they
+# are signed/unsigned distinctions on identical bit widths, not real
+# correctness issues for kernel host-tools.
+EXTRA_HOSTCFLAGS="-I${ELF_SHIM_DIR} -I/opt/homebrew/opt/libelf/include -Wno-incompatible-pointer-types -Wno-pointer-sign -Wno-error"
+
 # ── Cross-compile ──────────────────────────────────────────────────────────
 ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 log "building ARCH=arm64 with -j${ncpu} … (this takes ~20–40 min on Apple Silicon)"
@@ -176,7 +259,9 @@ log "build log → ${VMLINUX_OUT}/build.log"
 start_epoch="$(date +%s)"
 (
     cd "${VMLINUX_SRC}"
-    "${GMAKE}" -j"${ncpu}" ARCH=arm64 CROSS_COMPILE="${CROSS_COMPILE}" Image
+    "${GMAKE}" -j"${ncpu}" ARCH=arm64 CROSS_COMPILE="${CROSS_COMPILE}" \
+        HOSTCFLAGS="${EXTRA_HOSTCFLAGS}" \
+        Image
 ) >>"${VMLINUX_OUT}/build.log" 2>&1 || {
     tail -80 "${VMLINUX_OUT}/build.log" >&2
     die "kernel build failed; see ${VMLINUX_OUT}/build.log for the full transcript" 2

@@ -46,6 +46,10 @@ elastos/storage/
 artifacts/
 artifacts-aarch64/
 
+# Linux kernel source tree (downloaded by scripts/build-vmlinux-arm64.sh,
+# ~600 MB extracted; never committed)
+/build/
+
 # Secrets and credentials
 .env
 *.pem
