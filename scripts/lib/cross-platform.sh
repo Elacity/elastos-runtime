@@ -253,6 +253,144 @@ sys.exit(0)
 PY
 }
 
+# Probe a URL via `curl --head` and emit a structured skip on
+# non-2xx / timeout. **Phase 5 Day 3.** Hoist of the
+# publisher-gateway dependency check the Day-3 chat-wasm
+# interop smoke needs before paying for an `install.sh` curl
+# pipe to bash.
+#
+# Returns 0 (reachable) if `curl -fsS --head --max-time 5
+# "$url"` succeeds. Returns 1 (unreachable) otherwise, after
+# printing the operator-facing skip message AND the
+# Day-3-standardised escape-hatch reminder (the
+# `ELASTOS_CHAT_INTEROP_OFFLINE=1` flag).
+#
+# This helper does NOT exit — the caller decides whether
+# unreachability is a hard fail or a soft skip. Smokes that
+# can fall back to a local build call `_OFFLINE=1` and exit 0;
+# CI gates that REQUIRE the gateway call this and exit 1.
+#
+# Usage:
+#   if ! cross_platform_curl_or_skip "${PUBLISHER_GATEWAY%/}/install.sh" "[interop]"; then
+#       if [[ "${ELASTOS_CHAT_INTEROP_OFFLINE:-0}" == "1" ]]; then
+#           echo "[interop] offline mode: skipping curl install"
+#       else
+#           exit 0
+#       fi
+#   fi
+cross_platform_curl_or_skip() {
+    local url="$1"
+    local prefix="${2:-[cross-platform]}"
+    if [[ -z "$url" ]]; then
+        echo "${prefix} cross_platform_curl_or_skip: empty URL supplied" >&2
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "${prefix} cross_platform_curl_or_skip: curl not installed" >&2
+        return 1
+    fi
+    # `--head` for a cheap HEAD; `-fsS` for failure-on-non-2xx,
+    # silent body, but surfaced errors; `--max-time 5` bounds
+    # the probe so a hung gateway doesn't pin the smoke for
+    # minutes.
+    if curl -fsS --head --max-time 5 "$url" >/dev/null 2>&1; then
+        return 0
+    fi
+    cat >&2 <<MSG
+${prefix} publisher gateway probe failed: ${url}
+
+  Cause:      curl --head returned non-2xx or timed out within 5 s.
+  Effect:     this smoke's published-install assertion cannot complete.
+  Mitigation: set ELASTOS_CHAT_INTEROP_OFFLINE=1 to skip the gateway
+              install step and fall back to the local-build path
+              (requires ELASTOS_BIN_OVERRIDE to point at a built
+              \`elastos\` binary).
+MSG
+    return 1
+}
+
+# Grep one or more log files for `VzError::Display` tokens.
+# **Phase 5 Day 3.** The Day-3 alerting hook that turns the
+# Phase-4-Day-7 `Display` contract into an active smoke-level
+# tripwire.
+#
+# `VzError::Display` (anchored in `elastos-vz/src/error.rs`'s
+# `vz_error_display_includes_kind_label_for_log_grep` test)
+# guarantees every rendered `VzError` starts with one of the
+# nine stable `kind_label:` tokens:
+#   - vz_internal:
+#   - vz_invalid_configuration:
+#   - vz_invalid_state:
+#   - vz_invalid_state_transition:
+#   - vz_network_error:
+#   - vz_operation_cancelled:
+#   - vz_not_supported:
+#   - vz_timed_out:
+#   - vz_unknown:
+# Operators alerting on Vz failures grep for those tokens. The
+# Day-3 smoke runs this helper at its tail across every log it
+# collected; if any token is found, the smoke fails LOUDLY
+# with the matched lines and a runbook pointer.
+#
+# Returns 0 if NO tokens found (the happy path); returns 1 if
+# any token found, having printed the matched lines + a
+# runbook pointer to stderr.
+#
+# Usage:
+#   if ! cross_platform_alert_on_vz_error_in_logs \
+#           "${install_log}" "${setup_log}" "${session_log}"; then
+#       exit 1
+#   fi
+cross_platform_alert_on_vz_error_in_logs() {
+    if [[ $# -eq 0 ]]; then
+        echo "[cross-platform] cross_platform_alert_on_vz_error_in_logs: no log paths supplied" >&2
+        return 1
+    fi
+    # Build the existing-files list. Missing files are
+    # silently ignored — log files are best-effort outputs
+    # and the smoke may legitimately have skipped a phase.
+    local files=()
+    local f
+    for f in "$@"; do
+        [[ -n "$f" && -f "$f" ]] && files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        # No files to inspect: treat as no-alerts. The smoke's
+        # primary assertions already covered the happy path.
+        return 0
+    fi
+    # Token regex — the nine stable kind_label prefixes from
+    # `VzError::Display`. Use grep -E (POSIX ERE) so the
+    # pattern is portable across GNU grep (Linux) and BSD grep
+    # (macOS). `-l` would list filenames only; we want the
+    # actual lines so operators can see the kind_label +
+    # description in one go.
+    local pattern='vz_(internal|invalid_configuration|invalid_state|invalid_state_transition|network_error|operation_cancelled|not_supported|timed_out|unknown):'
+    local matches
+    matches="$(grep -E -H -n "$pattern" "${files[@]}" 2>/dev/null || true)"
+    if [[ -z "$matches" ]]; then
+        return 0
+    fi
+    cat >&2 <<MSG
+[cross-platform] ALERT: VzError kind_label tokens found in collected logs.
+
+  Phase:     Phase 5 Day 3 alerting hook on the Phase 4 Day 7
+             VzError::Display contract.
+  Tokens:    vz_internal: / vz_invalid_configuration: / vz_invalid_state: /
+             vz_invalid_state_transition: / vz_network_error: /
+             vz_operation_cancelled: / vz_not_supported: / vz_timed_out: /
+             vz_unknown:
+
+  Runbook:   See docs/vz-backend/PHASE_4_DAY_7_NOTES.md and
+             docs/vz-backend/PHASE_4_DAY_8_NOTES.md for the typed-error
+             surface; the kind_label is the stable telemetry label.
+
+  Matched lines (file:line:content):
+MSG
+    printf '%s\n' "$matches" >&2
+    return 1
+}
+
 # Print the actionable Phase-6 operator message and exit 0.
 # **Phase 5 Day 2.** Hoisted from Day 1's inline `cat >&2`
 # block so Day-2's home-frontdoor smoke + future smokes share

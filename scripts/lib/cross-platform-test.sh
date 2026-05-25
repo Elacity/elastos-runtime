@@ -314,6 +314,141 @@ else
     ok "no names supplied correctly fails"
 fi
 
+# ─── cross_platform_curl_or_skip ────────────────────────────
+
+TEST_NAME="cross_platform_curl_or_skip"
+echo "${TEST_NAME}:"
+
+# Reachable URL — example.com is a well-known stable target
+# (RFC 2606 reserved IANA test domain). If this assertion
+# trips, it almost certainly means the host has no network.
+# We tolerate that case by treating it as a soft-skip rather
+# than a hard test failure: the helper's contract is "returns
+# 0 iff curl --head succeeds", and we can't verify that
+# without network. Print a clear skip line so CI logs
+# distinguish "test missing" from "test failed".
+if curl -fsS --head --max-time 5 https://example.com >/dev/null 2>&1; then
+    if cross_platform_curl_or_skip "https://example.com" "[test]" 2>/dev/null; then
+        ok "reachable URL returns 0"
+    else
+        fail "reachable URL must return 0"
+    fi
+else
+    PASS=$((PASS + 1))
+    printf '  SKIP %s\n' "reachable URL test (host has no network — curl --head https://example.com failed in pre-check)"
+fi
+
+# Unreachable URL — TLD `.invalid` is reserved (RFC 2606) so
+# DNS resolution MUST fail, deterministically, on every host
+# regardless of network state. This is the assertion the
+# Day-3 alert hook depends on for its skip path.
+if cross_platform_curl_or_skip \
+        "https://this-domain-definitely-does-not-exist-elastos.invalid/missing" \
+        "[test]" 2>/dev/null; then
+    fail "unreachable .invalid URL must return 1"
+else
+    ok "unreachable .invalid URL returns 1"
+fi
+
+# Empty URL — defensive return-1, no `set -u` trip.
+if cross_platform_curl_or_skip "" "[test]" 2>/dev/null; then
+    fail "empty URL must return 1"
+else
+    ok "empty URL returns 1"
+fi
+
+# ─── cross_platform_alert_on_vz_error_in_logs ───────────────
+
+TEST_NAME="cross_platform_alert_on_vz_error_in_logs"
+echo "${TEST_NAME}:"
+
+# No args → defensive return 1.
+if cross_platform_alert_on_vz_error_in_logs 2>/dev/null; then
+    fail "no args must return 1"
+else
+    ok "no args returns 1"
+fi
+
+# Reuse the assertion scratch dir from earlier in this file.
+ALERT_SCRATCH="${ASSERT_SCRATCH}"
+
+# Missing file → silent no-op return 0 (best-effort: log
+# files are optional outputs, missing is not an error).
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/does-not-exist.log"; then
+    ok "missing log file returns 0"
+else
+    fail "missing log file must return 0"
+fi
+
+# Clean log → return 0.
+cat >"${ALERT_SCRATCH}/clean.log" <<'EOF'
+[runtime] startup complete
+[runtime] capsule chat ready
+[runtime] capsule chat-wasm ready
+[runtime] shutdown clean
+EOF
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/clean.log"; then
+    ok "clean log returns 0"
+else
+    fail "clean log must return 0"
+fi
+
+# Log with `vz_timed_out:` → return 1.
+cat >"${ALERT_SCRATCH}/timeout.log" <<'EOF'
+[runtime] startup complete
+[supervisor] error stopping capsule chat: vz_timed_out: stop timed out for vm chat-vm after 30s budget (runbook: docs/vz-backend/PHASE_4_DAY_6_NOTES.md)
+[runtime] shutdown after timeout
+EOF
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/timeout.log" 2>/dev/null; then
+    fail "log with vz_timed_out: must return 1"
+else
+    ok "log with vz_timed_out: returns 1"
+fi
+
+# Log with `vz_internal:` → return 1 (covers a second kind_label).
+cat >"${ALERT_SCRATCH}/internal.log" <<'EOF'
+[runtime] startup complete
+[supervisor] error starting capsule did-provider: vz_internal: kernel panic in vsock driver
+EOF
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/internal.log" 2>/dev/null; then
+    fail "log with vz_internal: must return 1"
+else
+    ok "log with vz_internal: returns 1"
+fi
+
+# Log with `vz_unknown:` → return 1 (covers the future-proof
+# kind_label for unmodelled Apple variants).
+cat >"${ALERT_SCRATCH}/unknown.log" <<'EOF'
+[supervisor] error: vz_unknown: future Apple variant USB controller not found domain=VZErrorDomain code=30001
+EOF
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/unknown.log" 2>/dev/null; then
+    fail "log with vz_unknown: must return 1"
+else
+    ok "log with vz_unknown: returns 1"
+fi
+
+# Multiple logs, only one dirty → return 1.
+if cross_platform_alert_on_vz_error_in_logs \
+        "${ALERT_SCRATCH}/clean.log" "${ALERT_SCRATCH}/timeout.log" 2>/dev/null; then
+    fail "mix of clean + dirty logs must return 1"
+else
+    ok "mix of clean + dirty logs returns 1"
+fi
+
+# False-positive guard: the bare token `vz_timed_out` without
+# the trailing colon must NOT trip the alert (rules out
+# documentation prose that mentions the token in passing).
+cat >"${ALERT_SCRATCH}/prose.log" <<'EOF'
+This log file is supposed to discuss vz_timed_out behaviour without
+matching the alert pattern. The colon-suffixed grep target should NOT
+fire on this content. See docs/vz-backend/PHASE_4_DAY_7_NOTES.md.
+EOF
+if cross_platform_alert_on_vz_error_in_logs "${ALERT_SCRATCH}/prose.log" 2>/dev/null; then
+    ok "prose mentioning vz_timed_out without colon does NOT trip alert"
+else
+    fail "prose mentioning vz_timed_out without colon must NOT trip alert"
+fi
+
 # ─── summary ────────────────────────────────────────────────
 
 echo
