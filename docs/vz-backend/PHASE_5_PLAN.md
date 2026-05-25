@@ -1,6 +1,8 @@
 # Phase 5 — Hardening + Linux smoke parity on Mac
 
-> **Status:** Days 1–6 complete (see `PHASE_5_DAY_{1,2,3,4,5,6}_NOTES.md`); Days 7–8 remain. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+> **Status:** Days 1–7 complete (see `PHASE_5_DAY_{1,2,3,4,5,6,7}_NOTES.md`); Day 8 remains. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+>
+> **Day 7 outcome:** Performance measurement substrate + honest baseline document landed. New `elastos-server/tests/vz_perf_harness.rs` (11 tests, 6 measurements + 5 schema/utility guards) measures 6 synthetic Phase-4/5 Rust paths and emits a `schema_version: 1` JSONL stream into `ELASTOS_VZ_PERF_REPORT`. New `scripts/measure-vz-baseline.sh` (cross-OS, Day-5/Day-6 precedence aware) and `scripts/measure-crosvm-baseline.sh` (Linux-only, clean-exit on Mac) aggregate 5 runs each and write canonical `target/{vz,crosvm}-baseline.json`. New `docs/vz-backend/PERFORMANCE_BASELINE.md` documents methodology + initial Mac (M-series) numbers + a pre-baked comparison table with `_TBD_` cells for Linux + real-boot rows. All 6 measured paths run sub-millisecond at p99 on M-series Mac; real Vz boot timings remain Phase-6-gated (darwin-arm64 release metadata). No production Rust code changes; pure measurement substrate + docs.
 >
 > **Day 6 outcome:** Self-hosted full-boot lane wired but dormant. New `mac-vz-full-boot` job in `mac-vz.yml`, doubly-gated on `vars.MAC_VZ_FULL_BOOT_ENABLED == 'true'` + `runs-on: [self-hosted, macOS, ARM64, vz-capable]`. New `ELASTOS_VZ_SMOKE_FORCE_FULL=1` smoke env-var sits at the top of a documented 5-layer precedence table (FORCE_FULL → explicit DRY_RUN → CI auto-detect → default). 3 new shell-helper assertions covering FORCE_FULL precedence (41 → 44) + new canonical `cross_platform_smoke_should_dry_run` helper. New `_self-hosted-probe.yml` heartbeat probe runs every 6 h. New `SELF_HOSTED_RUNNER_SPEC.md` documents hardware + label set + provisioning + security posture + kill switches. `CI_RUNBOOK.md` § 3a covers the self-hosted lane end-to-end.
 >
@@ -129,7 +131,9 @@ This is **the** smoke that exercises the full Phase-4 Day-3 dispatch graph end t
 
 ### Day 7 — Apple-Silicon GitHub Actions CI runner (6–8 h)
 
-**Problem.** Every Day-1-through-6 deliverable is locally green on the developer's Mac but unproven in CI. PLAN.md L307 asks: "each runs end-to-end on Mac with the Vz backend; each is `green` in CI on an Apple-Silicon GitHub Actions runner."
+> **Day-7 actual scope deviation:** Day 7 shipped the **performance measurement substrate + honest baseline document** (the original Day-6 scope, deferred by one day because Day 6 needed the self-hosted lane spec first). The original Day-7 CI-runner scope was already fulfilled by Day 5 (GitHub-hosted lane) and Day 6 (self-hosted lane). See `PHASE_5_DAY_7_NOTES.md` for the actual delivery.
+
+**Problem (original).** Every Day-1-through-6 deliverable is locally green on the developer's Mac but unproven in CI. PLAN.md L307 asks: "each runs end-to-end on Mac with the Vz backend; each is `green` in CI on an Apple-Silicon GitHub Actions runner."
 
 **Concrete deliverables:**
 1. **`.github/workflows/ci.yml`** gains three new jobs:
