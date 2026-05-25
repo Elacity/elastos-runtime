@@ -78,10 +78,76 @@ fn host_phys_mem_mib_mac() -> u64 {
 /// On Linux the helper is a no-op stub and these counts are
 /// always zero; the struct exists on all platforms so call
 /// sites can be platform-agnostic.
+///
+/// **Phase 5 Day 4**: split socket counts into the two
+/// real categories the prune sweeps separately so the
+/// telemetry projected via [`OrphanCounts`] gives operators
+/// a fleet-wide signal on which orphan class is the long
+/// tail. `sockets_removed` continues to count generic
+/// `*.sock` files (crosvm-style control sockets);
+/// `bridge_sockets_removed` counts the
+/// `*-carrier.sock` Carrier-bridge IPC files specifically.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StaleArtifactCounts {
     pub overlays_removed: usize,
     pub sockets_removed: usize,
+    /// Carrier-bridge IPC socket files (`*-carrier.sock`).
+    /// Counted separately from generic `*.sock` files because
+    /// the bridge half of the orphan-cleanup carries different
+    /// operator semantics (Phase 4 Day 6 documented the bridge
+    /// teardown surface independently).
+    pub bridge_sockets_removed: usize,
+}
+
+/// Phase 5 Day 4 — operator-facing JSON projection of
+/// [`StaleArtifactCounts`] surfaced via
+/// [`SupervisorResponse::orphans_pruned`] on the first
+/// [`SupervisorRequest::EnsureCapsule`] response after
+/// [`Supervisor::new`]. **One-shot per supervisor lifetime**:
+/// subsequent `EnsureCapsule` calls skip-serialise the field
+/// so dashboards distinguish "supervisor just started + cleaned
+/// orphans" from "supervisor steady-state."
+///
+/// Field shape mirrors [`StaleArtifactCounts`] one-to-one but
+/// adds `serde` derives so the response is wire-format-stable.
+/// Operators alerting on a sustained non-zero orphan rate
+/// have a single field per category to pivot on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct OrphanCounts {
+    /// Overlay files (`<rootfs_cache>/overlays/*.ext4`) left
+    /// behind by a prior supervisor that died mid-launch.
+    pub overlays_removed: usize,
+    /// Generic Unix-domain socket files (`<socket_dir>/*.sock`)
+    /// not matching the carrier-bridge suffix.
+    pub sockets_removed: usize,
+    /// Carrier-bridge IPC socket files
+    /// (`<socket_dir>/*-carrier.sock`). Split out from
+    /// `sockets_removed` so operators can pivot on the
+    /// bridge-orphan rate independently of the crosvm-style
+    /// control-socket rate.
+    pub bridge_sockets_removed: usize,
+}
+
+impl From<StaleArtifactCounts> for OrphanCounts {
+    fn from(s: StaleArtifactCounts) -> Self {
+        Self {
+            overlays_removed: s.overlays_removed,
+            sockets_removed: s.sockets_removed,
+            bridge_sockets_removed: s.bridge_sockets_removed,
+        }
+    }
+}
+
+impl OrphanCounts {
+    /// True when every category is zero — i.e. nothing was
+    /// pruned. Used by the supervisor's caching logic to
+    /// decide whether to surface the report at all on the
+    /// first `EnsureCapsule` response (a zero-counts report
+    /// is also surfaced so dashboards can use field presence
+    /// as the "supervisor just started" signal).
+    pub fn is_zero(&self) -> bool {
+        self.overlays_removed == 0 && self.sockets_removed == 0 && self.bridge_sockets_removed == 0
+    }
 }
 
 /// Phase 4 Day 5 — remove orphaned per-VM artifacts left behind
@@ -171,12 +237,24 @@ fn prune_stale_mac_artifacts(
                 Some(n) => n,
                 None => continue,
             };
-            let is_carrier_socket = name.ends_with("-carrier.sock") || name.ends_with(".sock");
-            if !is_carrier_socket {
+            // Phase 5 Day 4: split bridge sockets from generic
+            // sockets so the OrphanCounts projection gives
+            // operators category-level pivots. The `*-carrier.sock`
+            // check is intentionally first because every
+            // `-carrier.sock` also ends with `.sock`.
+            let is_bridge_socket = name.ends_with("-carrier.sock");
+            let is_socket = is_bridge_socket || name.ends_with(".sock");
+            if !is_socket {
                 continue;
             }
             match std::fs::remove_file(&path) {
-                Ok(()) => counts.sockets_removed += 1,
+                Ok(()) => {
+                    if is_bridge_socket {
+                        counts.bridge_sockets_removed += 1;
+                    } else {
+                        counts.sockets_removed += 1;
+                    }
+                }
                 Err(e) => tracing::warn!(
                     "prune_stale_mac_artifacts: could not remove socket {}: {}",
                     path.display(),
@@ -351,6 +429,20 @@ pub struct SupervisorResponse {
     /// `docs/vz-backend/PHASE_4_DAY_8_NOTES.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vz_error: Option<elastos_vz::VzErrorReport>,
+
+    /// One-shot orphan-prune report (macOS only). **Phase 5
+    /// Day 4.** Populated by the FIRST
+    /// [`SupervisorRequest::EnsureCapsule`] response after
+    /// [`Supervisor::new`] ran the Mac startup orphan-prune;
+    /// every subsequent response leaves the field absent so
+    /// dashboards can use field presence as the "supervisor
+    /// just started + cleaned" signal. Always absent on Linux
+    /// (the prune is a no-op stub) and absent when the
+    /// operator opts out via
+    /// [`elastos_vz::VzConfig::prune_orphans_on_startup`]`= false`.
+    /// See `docs/vz-backend/PHASE_5_DAY_4_NOTES.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphans_pruned: Option<OrphanCounts>,
 }
 
 impl SupervisorResponse {
@@ -365,7 +457,19 @@ impl SupervisorResponse {
             error: None,
             last_exit_reason: None,
             vz_error: None,
+            orphans_pruned: None,
         }
+    }
+
+    /// Phase 5 Day 4 — attach the cached one-shot
+    /// orphan-prune report (if any) to an existing success
+    /// response. Used by the `EnsureCapsule` handler so the
+    /// first `ensure_capsule` response after `Supervisor::new`
+    /// carries the startup-prune telemetry alongside its
+    /// normal `path` payload.
+    fn with_orphans_pruned(mut self, report: Option<OrphanCounts>) -> Self {
+        self.orphans_pruned = report;
+        self
     }
 
     /// Builder for the success surface returned by `stop_capsule`
@@ -437,6 +541,7 @@ impl SupervisorResponse {
             exit_code: None,
             last_exit_reason: None,
             vz_error: None,
+            orphans_pruned: None,
         }
     }
 }
@@ -530,6 +635,22 @@ pub struct Supervisor {
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
     /// Optional running gateway server task.
     gateway: Arc<RwLock<Option<RunningGateway>>>,
+    /// Phase 5 Day 4 — Vz-backend configuration consulted by
+    /// the Mac-only startup orphan-prune in `Supervisor::new`.
+    /// Defaults to [`elastos_vz::VzConfig::new`] (which sets
+    /// `prune_orphans_on_startup: true`). Held independently
+    /// from `crosvm_config` because the Linux launch path
+    /// must remain byte-identical (it never reads this field).
+    vz_config: elastos_vz::VzConfig,
+    /// Phase 5 Day 4 — cached one-shot orphan-prune report
+    /// surfaced via [`SupervisorResponse::orphans_pruned`] on
+    /// the FIRST [`SupervisorRequest::EnsureCapsule`] response
+    /// after construction. `Mutex` over `Arc<RwLock<_>>` because
+    /// the slot is single-writer (filled in `Supervisor::new`)
+    /// and single-reader-on-take (consumed by the first
+    /// `ensure_capsule` handler); the heavier RwLock buys
+    /// nothing here. Always `None` on Linux.
+    pending_orphan_report: std::sync::Mutex<Option<OrphanCounts>>,
 }
 
 impl Supervisor {
@@ -725,6 +846,27 @@ impl Supervisor {
     }
 
     pub fn new(data_dir: PathBuf, registry: ComponentsManifest) -> Self {
+        Self::new_with_vz_config(data_dir, registry, elastos_vz::VzConfig::new())
+    }
+
+    /// Phase 5 Day 4 — construct a `Supervisor` with an
+    /// explicit [`elastos_vz::VzConfig`]. Used by tests and
+    /// future operator-driven harnesses that need to opt out
+    /// of the Mac startup orphan-prune (or override Vz
+    /// timeouts) without touching the simpler [`Supervisor::new`]
+    /// signature.
+    ///
+    /// On Linux, every field of `vz_config` except the
+    /// behaviour-bearing ones is ignored — the Linux launch
+    /// path stays byte-identical. The `prune_orphans_on_startup`
+    /// flag is still read (it's stored on the supervisor) but
+    /// its consumer, [`prune_stale_mac_artifacts`], is a
+    /// no-op stub on Linux, so the net effect is zero.
+    pub fn new_with_vz_config(
+        data_dir: PathBuf,
+        registry: ComponentsManifest,
+        vz_config: elastos_vz::VzConfig,
+    ) -> Self {
         let capsules_dir = data_dir.join("capsules");
         let crosvm_bin =
             Self::resolve_external_install_path(&registry, &data_dir, "crosvm", "bin/crosvm");
@@ -736,6 +878,38 @@ impl Supervisor {
             .with_kernel_path(kernel_path)
             .with_socket_dir(data_dir.join("crosvm"))
             .with_rootfs_cache_dir(data_dir.join("rootfs-cache"));
+
+        // Phase 5 Day 4: Mac-only startup orphan prune. Computed
+        // BEFORE `Self { ... }` so the supervisor's filesystem
+        // baseline is clean before any RPC handler can see it,
+        // and so the unit tests can observe the on-disk state
+        // post-construction. Result cached for one-shot delivery
+        // via `pending_orphan_report`.
+        #[cfg(target_os = "macos")]
+        let pending_orphan_report: Option<OrphanCounts> = if vz_config.prune_orphans_on_startup {
+            let counts = prune_stale_mac_artifacts(
+                &crosvm_config.socket_dir,
+                &crosvm_config.rootfs_cache_dir,
+            );
+            tracing::info!(
+                overlays_removed = counts.overlays_removed,
+                sockets_removed = counts.sockets_removed,
+                bridge_sockets_removed = counts.bridge_sockets_removed,
+                "vz: startup orphan-prune complete"
+            );
+            Some(OrphanCounts::from(counts))
+        } else {
+            tracing::debug!(
+                "vz: startup orphan-prune skipped (VzConfig::prune_orphans_on_startup = false)"
+            );
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let pending_orphan_report: Option<OrphanCounts> = {
+            let _ = &crosvm_config;
+            let _ = vz_config.prune_orphans_on_startup;
+            None
+        };
 
         Self {
             capsules_dir,
@@ -751,7 +925,30 @@ impl Supervisor {
             capability_manager: None,
             pending_store: None,
             gateway: Arc::new(RwLock::new(None)),
+            vz_config,
+            pending_orphan_report: std::sync::Mutex::new(pending_orphan_report),
         }
+    }
+
+    /// Phase 5 Day 4 — read-only accessor on the Vz config the
+    /// supervisor was constructed with. Used by tests to assert
+    /// the `prune_orphans_on_startup` flag was honoured.
+    pub fn vz_config(&self) -> &elastos_vz::VzConfig {
+        &self.vz_config
+    }
+
+    /// Phase 5 Day 4 — consume the one-shot orphan-prune
+    /// report cached by [`Supervisor::new`]. Returns `Some` on
+    /// the first call after construction (if startup pruning
+    /// ran), `None` on every subsequent call. Used by the
+    /// `EnsureCapsule` RPC handler so dashboards can pivot on
+    /// `orphans_pruned` field presence as the "supervisor
+    /// just started + cleaned" signal.
+    fn take_pending_orphan_report(&self) -> Option<OrphanCounts> {
+        self.pending_orphan_report
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
     }
 
     /// Set shell session credentials and session registry for minting capsule tokens.
@@ -794,7 +991,8 @@ impl Supervisor {
         self.reap_dead_capsules().await;
         match req {
             SupervisorRequest::EnsureCapsule { name } => match self.ensure_capsule(&name).await {
-                Ok(path) => SupervisorResponse::ok_with_path(path.display().to_string()),
+                Ok(path) => SupervisorResponse::ok_with_path(path.display().to_string())
+                    .with_orphans_pruned(self.take_pending_orphan_report()),
                 Err(e) => SupervisorResponse::err(format!("ensure_capsule failed: {e}")),
             },
             SupervisorRequest::LaunchCapsule { name, config } => {
@@ -2585,6 +2783,7 @@ impl Supervisor {
                     error: None,
                     last_exit_reason,
                     vz_error,
+                    orphans_pruned: None,
                 })
             }
             None => Ok(SupervisorResponse::not_found()),
@@ -3565,9 +3764,10 @@ mod tests {
             counts,
             StaleArtifactCounts {
                 overlays_removed: 2,
-                sockets_removed: 2,
+                sockets_removed: 1,
+                bridge_sockets_removed: 1,
             },
-            "prune must report exactly the artifacts removed; got {counts:?}"
+            "prune must split socket counts: 1 bridge socket (`*-carrier.sock`) + 1 control socket (`*.sock`); got {counts:?}"
         );
 
         assert!(!stale_overlay_a.exists(), "stale overlay A must be removed");
@@ -3600,24 +3800,35 @@ mod tests {
         );
     }
 
-    /// Phase 4 Day 5 — a fresh `Supervisor` constructed against a
-    /// data dir containing pre-existing stale overlay + socket
-    /// files must NOT falsely report any of them as a running
-    /// capsule. `running` starts empty regardless of on-disk
-    /// state; the operator must opt in to cleanup via
-    /// `prune_stale_mac_artifacts`.
+    /// Phase 5 Day 4 — a fresh `Supervisor` constructed against
+    /// a data dir containing pre-existing stale overlay + socket
+    /// files must (a) NOT falsely report any of them as a
+    /// running capsule, and (b) AUTOMATICALLY clean them via
+    /// the default `VzConfig::prune_orphans_on_startup = true`
+    /// path. The supervisor's `running` map starts empty
+    /// regardless; the on-disk orphans get swept during
+    /// `Supervisor::new` so the subsequent supervisor lifetime
+    /// sees a clean baseline.
+    ///
+    /// Pre-Day-4 behaviour (operator must opt in via
+    /// `supervisor.prune_stale_mac_artifacts()` after
+    /// construction) is preserved as the OPT-OUT path; see
+    /// `supervisor_new_with_prune_orphans_on_startup_false_preserves_artifacts`.
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn fresh_supervisor_does_not_falsely_report_stale_overlay_files_as_running() {
+    async fn fresh_supervisor_auto_prunes_orphans_on_startup_by_default() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().to_path_buf();
         let socket_dir = data_dir.join("crosvm");
         let overlays_dir = data_dir.join("rootfs-cache").join("overlays");
         std::fs::create_dir_all(&socket_dir).unwrap();
         std::fs::create_dir_all(&overlays_dir).unwrap();
-        std::fs::write(overlays_dir.join("ghost-handle.ext4"), b"orphan").unwrap();
-        std::fs::write(socket_dir.join("ghost-handle.sock"), b"orphan").unwrap();
-        std::fs::write(socket_dir.join("ghost-handle-carrier.sock"), b"orphan").unwrap();
+        let stale_overlay = overlays_dir.join("ghost-handle.ext4");
+        let stale_control = socket_dir.join("ghost-handle.sock");
+        let stale_bridge = socket_dir.join("ghost-handle-carrier.sock");
+        std::fs::write(&stale_overlay, b"orphan").unwrap();
+        std::fs::write(&stale_control, b"orphan").unwrap();
+        std::fs::write(&stale_bridge, b"orphan").unwrap();
 
         let supervisor = Supervisor::new(
             data_dir,
@@ -3627,6 +3838,7 @@ mod tests {
                 profiles: std::collections::HashMap::new(),
             },
         );
+
         let running = supervisor.running.read().await;
         assert!(
             running.is_empty(),
@@ -3634,16 +3846,166 @@ mod tests {
         );
         drop(running);
 
-        // Confirm the opt-in cleanup actually removes them.
-        let counts = supervisor.prune_stale_mac_artifacts();
-        assert_eq!(
-            counts.overlays_removed, 1,
-            "the orphan overlay must be cleaned by the opt-in helper"
+        // Phase 5 Day 4 contract: the default Vz config opts INTO
+        // startup pruning, so the orphan files must already be
+        // gone by the time `Supervisor::new` returns.
+        assert!(
+            !stale_overlay.exists(),
+            "Phase 5 Day 4: default Supervisor::new must auto-prune the orphan overlay"
         );
-        assert_eq!(
-            counts.sockets_removed, 2,
-            "both orphan socket files must be cleaned by the opt-in helper"
+        assert!(
+            !stale_control.exists(),
+            "Phase 5 Day 4: default Supervisor::new must auto-prune the orphan control socket"
         );
+        assert!(
+            !stale_bridge.exists(),
+            "Phase 5 Day 4: default Supervisor::new must auto-prune the orphan carrier-bridge socket"
+        );
+
+        // The cached one-shot report must surface the exact
+        // category split for downstream `EnsureCapsule` delivery.
+        let report = supervisor
+            .take_pending_orphan_report()
+            .expect("Phase 5 Day 4: cached orphan report must be present after auto-prune");
+        assert_eq!(
+            report,
+            OrphanCounts {
+                overlays_removed: 1,
+                sockets_removed: 1,
+                bridge_sockets_removed: 1,
+            },
+            "cached report must split 1 control socket vs. 1 carrier-bridge socket; got {report:?}"
+        );
+
+        // One-shot semantics: a second take returns None.
+        assert!(
+            supervisor.take_pending_orphan_report().is_none(),
+            "cached orphan report must be consumed by the first take(); subsequent takes return None"
+        );
+
+        // Idempotent: explicit prune after auto-prune yields zero counts.
+        let counts_again = supervisor.prune_stale_mac_artifacts();
+        assert_eq!(
+            counts_again,
+            StaleArtifactCounts::default(),
+            "explicit prune after auto-prune must be a no-op; got {counts_again:?}"
+        );
+    }
+
+    /// Phase 5 Day 4 — operator opt-out: when the supervisor is
+    /// constructed with `VzConfig::prune_orphans_on_startup =
+    /// false`, on-disk orphan artifacts MUST be preserved
+    /// across `Supervisor::new`, and the cached one-shot report
+    /// MUST be `None` (so the first `EnsureCapsule` response
+    /// elides the `orphans_pruned` field entirely).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn supervisor_new_with_prune_orphans_on_startup_false_preserves_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let socket_dir = data_dir.join("crosvm");
+        let overlays_dir = data_dir.join("rootfs-cache").join("overlays");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::create_dir_all(&overlays_dir).unwrap();
+        let stale_overlay = overlays_dir.join("opt-out.ext4");
+        let stale_carrier = socket_dir.join("opt-out-carrier.sock");
+        std::fs::write(&stale_overlay, b"keep").unwrap();
+        std::fs::write(&stale_carrier, b"keep").unwrap();
+
+        let supervisor = Supervisor::new_with_vz_config(
+            data_dir,
+            ComponentsManifest {
+                external: std::collections::HashMap::new(),
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+            elastos_vz::VzConfig::new().with_prune_orphans_on_startup(false),
+        );
+
+        assert!(
+            !supervisor.vz_config().prune_orphans_on_startup,
+            "VzConfig opt-out must round-trip through Supervisor::new_with_vz_config"
+        );
+        assert!(
+            stale_overlay.exists(),
+            "Phase 5 Day 4 opt-out: stale overlay must NOT be pruned when prune_orphans_on_startup is false"
+        );
+        assert!(
+            stale_carrier.exists(),
+            "Phase 5 Day 4 opt-out: stale carrier-bridge socket must NOT be pruned when prune_orphans_on_startup is false"
+        );
+        assert!(
+            supervisor.take_pending_orphan_report().is_none(),
+            "Phase 5 Day 4 opt-out: pending orphan report must be None so EnsureCapsule responses elide the orphans_pruned field"
+        );
+    }
+
+    /// Phase 5 Day 4 — Linux contract: the orphan-prune helper
+    /// is a no-op stub on Linux, so `Supervisor::new` must
+    /// NEVER touch on-disk artifacts on Linux regardless of the
+    /// Vz config flag. This pins the Linux launch path's
+    /// byte-identical guarantee against the Day-4 change set.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn supervisor_new_is_noop_on_linux_even_with_prune_flag_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let socket_dir = data_dir.join("crosvm");
+        let overlays_dir = data_dir.join("rootfs-cache").join("overlays");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::create_dir_all(&overlays_dir).unwrap();
+        let linux_orphan_overlay = overlays_dir.join("linux-untouched.ext4");
+        let linux_orphan_socket = socket_dir.join("linux-untouched.sock");
+        std::fs::write(&linux_orphan_overlay, b"linux untouched").unwrap();
+        std::fs::write(&linux_orphan_socket, b"linux untouched").unwrap();
+
+        // Even with the (Mac-only-behaviourally-meaningful) flag
+        // explicitly set to true, Linux's stub `prune_stale_mac_artifacts`
+        // must not touch any file.
+        let supervisor = Supervisor::new_with_vz_config(
+            data_dir,
+            ComponentsManifest {
+                external: std::collections::HashMap::new(),
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+            elastos_vz::VzConfig::new().with_prune_orphans_on_startup(true),
+        );
+
+        assert!(
+            linux_orphan_overlay.exists(),
+            "Linux launch path must be byte-identical: orphan overlay file must NOT be touched"
+        );
+        assert!(
+            linux_orphan_socket.exists(),
+            "Linux launch path must be byte-identical: orphan socket file must NOT be touched"
+        );
+        assert!(
+            supervisor.take_pending_orphan_report().is_none(),
+            "Linux: cached orphan report must always be None"
+        );
+    }
+
+    /// Phase 5 Day 4 — `OrphanCounts` projection semantics.
+    /// Pins `From<StaleArtifactCounts>` field-by-field plus the
+    /// `is_zero()` convenience used by future operator-side
+    /// alerting.
+    #[test]
+    fn orphan_counts_projection_round_trip_from_stale_artifact_counts() {
+        let stale = StaleArtifactCounts {
+            overlays_removed: 7,
+            sockets_removed: 3,
+            bridge_sockets_removed: 5,
+        };
+        let projected = OrphanCounts::from(stale);
+        assert_eq!(projected.overlays_removed, 7);
+        assert_eq!(projected.sockets_removed, 3);
+        assert_eq!(projected.bridge_sockets_removed, 5);
+        assert!(!projected.is_zero());
+
+        let zero = OrphanCounts::default();
+        assert!(zero.is_zero());
+        assert_eq!(zero, OrphanCounts::from(StaleArtifactCounts::default()));
     }
 
     #[cfg(target_os = "macos")]

@@ -75,6 +75,31 @@ pub struct VzConfig {
     /// the *use-site* level (`elastos-server`'s Linux launch
     /// path never reads it).
     pub stop_timeout: Duration,
+
+    /// Phase 5 Day 4 — opt-in to running the Mac-only
+    /// stale-artifact prune (overlays + sockets +
+    /// carrier-bridge sockets) automatically inside
+    /// `Supervisor::new`. Defaults to `true` so a freshly
+    /// started `elastos serve` always converges its on-disk
+    /// state to a clean baseline after a crash of the prior
+    /// supervisor process.
+    ///
+    /// Operators running multiple supervisor processes
+    /// against the same `data_dir` (rare; the Mac launch path
+    /// expects per-instance data dirs) can set this to
+    /// `false` to avoid the edge case where two supervisors
+    /// nuke each other's in-flight overlays. The standalone
+    /// [`elastos_server::supervisor::Supervisor::prune_stale_mac_artifacts`]
+    /// method remains available for explicit operator-driven
+    /// cleanup.
+    ///
+    /// Linux's launch path ignores this field entirely (the
+    /// stub `prune_stale_mac_artifacts` is a no-op on Linux);
+    /// it lives on `VzConfig` because the prune *behaviour*
+    /// is Mac-specific even though the *toggle* must be
+    /// reachable from the supervisor's construction site on
+    /// every platform.
+    pub prune_orphans_on_startup: bool,
 }
 
 impl VzConfig {
@@ -89,6 +114,7 @@ impl VzConfig {
             rootfs_cache_dir: data_dir.join("rootfs-cache"),
             initramfs_path: None,
             stop_timeout: DEFAULT_VZ_STOP_TIMEOUT,
+            prune_orphans_on_startup: true,
         }
     }
 
@@ -122,6 +148,16 @@ impl VzConfig {
     /// Override the stop-timeout budget. **Phase 4 Day 6.**
     pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
         self.stop_timeout = timeout;
+        self
+    }
+
+    /// Override the Phase 5 Day 4 "prune orphans on startup"
+    /// flag. The default (`true`) covers the common case of a
+    /// single `elastos serve` per data dir; pass `false` from
+    /// CI / multi-supervisor harnesses that need to preserve
+    /// on-disk artifacts across construction.
+    pub fn with_prune_orphans_on_startup(mut self, enabled: bool) -> Self {
+        self.prune_orphans_on_startup = enabled;
         self
     }
 
@@ -587,6 +623,29 @@ mod tests {
         assert_eq!(
             config.initramfs_path.as_deref(),
             Some(std::path::Path::new("/tmp/initrd.img"))
+        );
+    }
+
+    #[test]
+    fn vz_config_default_prune_orphans_on_startup_is_true() {
+        let config = VzConfig::new();
+        assert!(
+            config.prune_orphans_on_startup,
+            "Phase 5 Day 4 contract: default-constructed VzConfig must opt INTO the Mac startup orphan prune so `elastos serve` self-heals after a supervisor crash"
+        );
+    }
+
+    #[test]
+    fn vz_config_with_prune_orphans_on_startup_round_trip() {
+        let opted_out = VzConfig::new().with_prune_orphans_on_startup(false);
+        assert!(
+            !opted_out.prune_orphans_on_startup,
+            "with_prune_orphans_on_startup(false) must set the flag to false"
+        );
+        let opted_in_again = opted_out.with_prune_orphans_on_startup(true);
+        assert!(
+            opted_in_again.prune_orphans_on_startup,
+            "with_prune_orphans_on_startup(true) must restore the flag"
         );
     }
 

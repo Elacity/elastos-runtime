@@ -1,6 +1,8 @@
 # Phase 5 — Hardening + Linux smoke parity on Mac
 
-> **Status:** Planning artifact. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+> **Status:** Days 1–4 complete (see `PHASE_5_DAY_{1,2,3,4}_NOTES.md`); Days 5–8 remain. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+>
+> **Day 4 outcome:** `Supervisor::new` now auto-prunes Mac orphan overlays + control sockets + carrier-bridge sockets (split telemetry). Opt-out via `VzConfig::prune_orphans_on_startup = false`. New `SupervisorResponse::orphans_pruned` one-shot field surfaces on the first `EnsureCapsule` response after construction. 3 supervisor unit tests + 2 RPC-contract integration tests + 1 JSON wire-format test, all green. Linux launch path remains byte-identical (stub helper, byte-identical-test passes under `#[cfg(not(target_os = "macos"))]`).
 >
 > **Anchor:** Phase 4 closed all internal observability surfaces ([`PHASE_4_DAY_8_NOTES.md`](PHASE_4_DAY_8_NOTES.md)). Phase 5 takes that substrate and validates it against the real workloads — the three Linux smoke scripts — and ships the operator-facing polish (startup-time orphan cleanup, perf baseline, CI runner).
 

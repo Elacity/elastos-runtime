@@ -489,6 +489,7 @@ async fn supervisor_response_json_wire_format_for_last_exit_reason() {
             error: None,
             last_exit_reason: Some(reason.label().to_string()),
             vz_error: None,
+            orphans_pruned: None,
         };
         let json = serde_json::to_string(&response).expect("serialise SupervisorResponse");
         assert!(
@@ -511,6 +512,7 @@ async fn supervisor_response_json_wire_format_for_last_exit_reason() {
         error: None,
         last_exit_reason: None,
         vz_error: None,
+        orphans_pruned: None,
     };
     let bare_json = serde_json::to_string(&bare).expect("serialise bare");
     assert!(
@@ -569,6 +571,7 @@ async fn supervisor_response_json_wire_format_for_vz_error() {
         error: None,
         last_exit_reason: None,
         vz_error: Some(internal.to_report()),
+        orphans_pruned: None,
     };
     let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
     let vz = value
@@ -609,6 +612,7 @@ async fn supervisor_response_json_wire_format_for_vz_error() {
         error: None,
         last_exit_reason: None,
         vz_error: Some(unknown.to_report()),
+        orphans_pruned: None,
     };
     let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
     let vz = value
@@ -641,6 +645,7 @@ async fn supervisor_response_json_wire_format_for_vz_error() {
         error: None,
         last_exit_reason: None,
         vz_error: Some(timed_out.to_report()),
+        orphans_pruned: None,
     };
     let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
     let vz = value
@@ -669,10 +674,124 @@ async fn supervisor_response_json_wire_format_for_vz_error() {
         error: None,
         last_exit_reason: None,
         vz_error: None,
+        orphans_pruned: None,
     };
     let bare_json = serde_json::to_string(&bare).expect("serialise bare");
     assert!(
         !bare_json.contains("vz_error"),
         "None vz_error must skip-serialise to preserve backward compatibility: {bare_json}"
+    );
+}
+
+/// Phase 5 Day 4 — JSON wire-format contract for the
+/// `orphans_pruned` field on
+/// [`elastos_server::supervisor::SupervisorResponse`].
+///
+/// Operators piping `elastos ensure` JSON into Datadog /
+/// Grafana need a stable, structured shape for the
+/// one-shot startup-prune report so they can:
+///
+/// 1. Alert on `orphans_pruned` field PRESENCE as the
+///    "supervisor just restarted + cleaned" signal.
+/// 2. Pivot on `orphans_pruned.overlays_removed`,
+///    `.sockets_removed`, and `.bridge_sockets_removed`
+///    independently — a sustained non-zero bridge-socket
+///    rate has a different root cause (bridge teardown
+///    bug) from a sustained non-zero overlay rate
+///    (supervisor SIGKILL during launch).
+/// 3. Trust field ABSENCE as "steady-state, no orphans to
+///    report" — this is the backward-compatibility hinge
+///    so legacy dashboards that don't know about the
+///    field keep working unchanged.
+///
+/// We deliberately go through `serde_json::Value` so the
+/// assertions stay robust against key-order changes — the
+/// supervisor integration test
+/// (`vz_supervisor_startup_orphan_cleanup.rs`) covers the
+/// `Supervisor::new` → `handle_request` round-trip end to
+/// end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_response_json_wire_format_for_orphans_pruned() {
+    use elastos_server::supervisor::{OrphanCounts, SupervisorResponse};
+
+    // Populated report: every category must surface as an
+    // integer key on the nested object.
+    let response = SupervisorResponse {
+        status: "ok".into(),
+        path: Some("/data/capsules/synthetic".into()),
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: None,
+        orphans_pruned: Some(OrphanCounts {
+            overlays_removed: 4,
+            sockets_removed: 2,
+            bridge_sockets_removed: 7,
+        }),
+    };
+    let value: serde_json::Value = serde_json::to_value(&response).expect("to_value");
+    let orphans = value
+        .get("orphans_pruned")
+        .expect("populated orphans_pruned MUST surface on the wire");
+    assert_eq!(
+        orphans["overlays_removed"], 4,
+        "overlays_removed must serialise as integer 4"
+    );
+    assert_eq!(
+        orphans["sockets_removed"], 2,
+        "sockets_removed must serialise as integer 2"
+    );
+    assert_eq!(
+        orphans["bridge_sockets_removed"], 7,
+        "bridge_sockets_removed must serialise as integer 7 — split from sockets_removed per Phase 5 Day 4 contract"
+    );
+
+    // Zero-counts report: dashboards use field PRESENCE as
+    // the "supervisor just restarted" signal, so a zero
+    // report still surfaces (a freshly started supervisor
+    // on a clean data dir would emit this).
+    let zero_response = SupervisorResponse {
+        status: "ok".into(),
+        path: Some("/data/capsules/clean".into()),
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: None,
+        orphans_pruned: Some(OrphanCounts::default()),
+    };
+    let zero_value: serde_json::Value =
+        serde_json::to_value(&zero_response).expect("to_value zero");
+    let zero_orphans = zero_value.get("orphans_pruned").expect(
+        "zero-counts orphans_pruned MUST still surface — field presence is the restart signal",
+    );
+    assert_eq!(zero_orphans["overlays_removed"], 0);
+    assert_eq!(zero_orphans["sockets_removed"], 0);
+    assert_eq!(zero_orphans["bridge_sockets_removed"], 0);
+
+    // None: field skip-serialises (backward compatibility
+    // for legacy dashboards that don't know the field
+    // exists).
+    let bare = SupervisorResponse {
+        status: "ok".into(),
+        path: Some("/data/capsules/steady-state".into()),
+        handle: None,
+        vsock_cid: None,
+        uptime_secs: None,
+        exit_code: None,
+        error: None,
+        last_exit_reason: None,
+        vz_error: None,
+        orphans_pruned: None,
+    };
+    let bare_json = serde_json::to_string(&bare).expect("serialise bare");
+    assert!(
+        !bare_json.contains("orphans_pruned"),
+        "None orphans_pruned MUST skip-serialise to preserve backward compatibility: {bare_json}"
     );
 }
