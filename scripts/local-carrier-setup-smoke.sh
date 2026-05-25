@@ -114,39 +114,26 @@ trap cleanup EXIT
 
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
 
-# Phase 5 Day 6 — FORCE_FULL override (highest precedence).
-# Used by the self-hosted Mac runner spec (see
-# docs/vz-backend/SELF_HOSTED_RUNNER_SPEC.md) to opt back into
-# the full smoke lane after Day-5's CI auto-detect would have
-# downgraded the run to dry-run. Layered precedence (top wins):
-#   1. ELASTOS_VZ_SMOKE_FORCE_FULL=1   → full run, even in CI.
-#   2. ELASTOS_VZ_SMOKE_DRY_RUN=0/1   → explicit operator setting.
-#   3. CI auto-detect + DRY_RUN unset → DRY_RUN=1 (Day 5).
-#   4. Default                        → full run.
+# Phase 5 Day 8 — Day-5 + Day-6 inline precedence blocks
+# consolidated into `scripts/lib/cross-platform.sh`'s
+# `cross_platform_smoke_should_dry_run` predicate + the
+# companion `cross_platform_smoke_log_dry_run_reason` echo
+# helper. The wire format of the operator-visible echo lines
+# is preserved byte-for-byte from the Day-5/Day-6 inline
+# blocks; CI log parsers + dashboards keep working unchanged.
+#
+# Precedence (top wins, encoded by the helper):
+#   1. ELASTOS_VZ_SMOKE_FORCE_FULL=1   → full run.
+#   2. ELASTOS_VZ_SMOKE_DRY_RUN=0      → full run.
+#   3. ELASTOS_VZ_SMOKE_DRY_RUN=1      → dry run.
+#   4. CI auto-detect (GITHUB_ACTIONS / CI env set) → dry run.
+#   5. Default                          → full run.
 if [[ "${ELASTOS_VZ_SMOKE_FORCE_FULL:-0}" == "1" ]]; then
     echo "[local-carrier-setup] FORCE_FULL=1 — forcing full smoke run (overrides CI auto-detect)"
-    export ELASTOS_VZ_SMOKE_DRY_RUN=0
 fi
 
-# Phase 5 Day 5 — auto-dry-run in CI. GitHub Actions runners
-# don't have a provisioned `~/.local/share/elastos`, so the
-# full smoke would visible-skip on every PR. Explicit operator
-# override via `ELASTOS_VZ_SMOKE_DRY_RUN=0` keeps the full
-# semantics available for self-hosted CI runners that DO have a
-# data dir provisioned (Phase 5 Day 6+ deliverable). The
-# explicit `=1` setting always wins below; this branch only
-# fires when the env is otherwise silent.
-if [[ -z "${ELASTOS_VZ_SMOKE_DRY_RUN:-}" ]] && cross_platform_in_ci; then
-    echo "[local-carrier-setup] CI detected (GITHUB_ACTIONS or CI env set); auto-enabling ELASTOS_VZ_SMOKE_DRY_RUN=1"
-    export ELASTOS_VZ_SMOKE_DRY_RUN=1
-fi
-
-# Phase 5 Day 1 — dry-run mode for CI. Exits successfully after
-# the bash-portability checks + helper sourcing, BEFORE paying
-# the cargo-build cost. Lets a Mac CI runner prove the script
-# at least parses + sources its helpers without committing to a
-# full ~10-minute end-to-end run on every push.
-if [[ "${ELASTOS_VZ_SMOKE_DRY_RUN:-0}" == "1" ]]; then
+if cross_platform_smoke_should_dry_run; then
+    cross_platform_smoke_log_dry_run_reason "[local-carrier-setup]"
     echo "[local-carrier-setup] dry-run mode: parse OK, helper sourced OK; exiting before cargo build"
     if [[ "${OS_TOKEN}" == "darwin" ]]; then
         if vz_host_is_capable; then

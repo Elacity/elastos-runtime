@@ -27,7 +27,8 @@
 - **Latency unit:** microseconds throughout. All values are wall-clock from inside the test harness.
 - **No warm-up suppression** for `supervisor_new_cold` — cold-start IS the metric.
 - **Host capture:** OS + arch + logical CPU count + Rust toolchain version + Phase tag, embedded in every JSONL line and the aggregated baseline.
-- **Schema versioning:** the on-disk JSON carries `schema_version: 1`. Future schema bumps must update every consumer (`scripts/measure-*-baseline.sh`, the future Phase-6 regression detector).
+- **Schema versioning:** the on-disk JSON carries `schema_version: 2` (Day 8). Future schema bumps must update every consumer (`scripts/measure-*-baseline.sh`, the future Phase-6 regression detector).
+- **Commit attribution (Day 8):** every JSONL record and the aggregated baseline carry `git_sha` — captured by the wrapper script from `git rev-parse --short=12 HEAD` (with `-dirty` suffix when uncommitted changes are present), or `"unknown"` when git is unavailable. Lets a Phase-6 regression-detector attribute deltas to specific commits without re-running git.
 
 ## 3. What we measure today
 
@@ -92,7 +93,7 @@
 
 ### Rules of engagement for Phase-6 measurements
 
-1. **Same Rust commit.** The Mac + Linux numbers MUST come from the same `git rev-parse HEAD` to be apples-to-apples. The captured JSON has `host` info but not commit SHA today — Phase 6 should add it.
+1. **Same Rust commit.** The Mac + Linux numbers MUST come from the same `git rev-parse HEAD` to be apples-to-apples. The captured JSON's `git_sha` field (schema v2, Day 8) makes this trivially verifiable — refuse to compare baselines whose `git_sha` differs.
 2. **Same toolchain.** Both hosts on stable Rust at the same minor version. Document any deviation.
 3. **No `--release` for the Day-7 numbers.** The harness runs under `cargo test` (debug profile) so these numbers are NOT release-profile-optimised. A delta > 2× between the two hosts is meaningful; a Mac-vs-Linux comparison at debug profile is honest **for tracking the substrate cost**, not for "this is what production latency looks like." Phase 6 should add a `--release`-profile lane.
 4. **No comparison without a `host_load = idle` confirmation.** Both hosts should be measured with no other CPU-heavy workloads running. The harness does not enforce this; the operator does.
@@ -103,8 +104,9 @@ The on-disk `target/{vz,crosvm}-baseline.json` is the canonical artefact. Schema
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "captured_at_unix_ms": 1779693369330,
+  "git_sha": "fe40122dffab-dirty",
   "host": {
     "os": "macos",
     "arch": "aarch64",
@@ -132,9 +134,14 @@ The on-disk `target/{vz,crosvm}-baseline.json` is the canonical artefact. Schema
 }
 ```
 
-The intermediate JSONL stream (`target/{vz,crosvm}-baseline.jsonl`) contains one line per metric per run, with the per-run percentiles. The aggregated JSON's `median_p*_us` fields are the median of the per-run percentiles across all runs.
+The intermediate JSONL stream (`target/{vz,crosvm}-baseline.jsonl`) contains one line per metric per run, with the per-run percentiles AND the per-record `git_sha`. The aggregated JSON's `median_p*_us` fields are the median of the per-run percentiles across all runs.
 
-**Schema-version contract:** `schema_version: 1` is frozen at Phase 5 Day 7. Any future change MUST bump the version AND update every consumer (the shell scripts that aggregate, the Phase-6 regression detector when wired). Field additions inside `metrics`/`host`/`notes` that are skip-serialisable do NOT need a bump.
+**Schema-version contract.**
+
+- **v1 (Phase 5 Day 7):** the original shape. Frozen.
+- **v2 (Phase 5 Day 8):** adds a top-level `git_sha` field (also threaded into every per-record JSONL line). The wrapper scripts (`scripts/measure-{vz,crosvm}-baseline.sh`) capture it from `git rev-parse --short=12 HEAD` (with `-dirty` suffix if uncommitted changes are present); the harness's in-process default is `"unknown"` (read from `ELASTOS_VZ_PERF_GIT_SHA` env var). v2 is purely additive — a v1-only consumer ignoring `git_sha` still parses every v2 file.
+
+Any future change MUST bump the version AND update every consumer (the shell scripts that aggregate, the Phase-6 regression detector when wired). Field additions inside `metrics`/`host`/`notes` that are skip-serialisable do NOT need a bump.
 
 ## 8. How to regenerate
 

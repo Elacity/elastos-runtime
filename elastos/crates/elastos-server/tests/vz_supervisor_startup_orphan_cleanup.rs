@@ -41,89 +41,14 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::HashMap;
-
-use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType, ResourceLimits, SCHEMA_V1};
-use elastos_server::setup::{CapsuleEntry, ComponentsManifest};
 use elastos_server::supervisor::{Supervisor, SupervisorRequest, SupervisorResponse};
+
+mod common;
+use common::{seed_cached_synthetic_capsule, synthetic_components_manifest};
 
 const SYNTHETIC_CAPSULE_NAME: &str = "phase5-day4-orphan-cleanup-capsule";
 const SYNTHETIC_CAPSULE_CID: &str = "bafy-phase5-day4-orphan-test";
-
-/// Pre-populate a capsule on disk so `ensure_capsule` short-circuits
-/// the IPFS download path. The contract `ensure_capsule` actually
-/// checks is:
-///   1. `<capsules_dir>/<name>/capsule.json` exists,
-///   2. `.elastos-cid` matches `entry.cid`,
-///   3. `entry.sha256` is empty OR `.elastos-artifact-sha256`
-///      matches it.
-///
-/// Mirrors the cached layout produced by a previous successful
-/// `ensure_capsule` run — exactly the steady-state on-disk
-/// shape Phase 5 Day 4 needs to drive the response builder.
-fn seed_cached_synthetic_capsule(data_dir: &std::path::Path, name: &str, cid: &str) {
-    let capsule_dir = data_dir.join("capsules").join(name);
-    std::fs::create_dir_all(&capsule_dir).expect("create synthetic capsule dir");
-
-    let manifest = CapsuleManifest {
-        schema: SCHEMA_V1.into(),
-        version: "0.1.0".into(),
-        name: name.into(),
-        description: Some("Phase 5 Day 4 orphan-cleanup integration test capsule".into()),
-        author: None,
-        role: CapsuleRole::App,
-        capsule_type: CapsuleType::Wasm,
-        entrypoint: "noop".into(),
-        requires: Vec::new(),
-        provides: None,
-        capabilities: Vec::new(),
-        resources: ResourceLimits {
-            memory_mb: 64,
-            cpu_shares: 100,
-            gpu: false,
-        },
-        permissions: Default::default(),
-        microvm: None,
-        providers: None,
-        viewer: None,
-        signature: None,
-    };
-    let manifest_json = serde_json::to_string_pretty(&manifest).expect("serialise manifest");
-    std::fs::write(capsule_dir.join("capsule.json"), manifest_json).expect("write capsule.json");
-    std::fs::write(capsule_dir.join("noop"), b"").expect("write noop entrypoint");
-    // Cache-metadata files that ensure_capsule consults to short-circuit
-    // the IPFS download path. `.elastos-cid` must equal entry.cid;
-    // `.elastos-artifact-sha256` can be anything since our entry leaves
-    // sha256 empty.
-    std::fs::write(capsule_dir.join(".elastos-cid"), format!("{}\n", cid))
-        .expect("write .elastos-cid");
-    std::fs::write(
-        capsule_dir.join(".elastos-artifact-sha256"),
-        "synthetic-test-sha\n",
-    )
-    .expect("write .elastos-artifact-sha256");
-}
-
-/// Build a `ComponentsManifest` whose `capsules` map contains
-/// the synthetic entry. Empty `sha256` so the cache-metadata
-/// check bypasses the on-disk SHA comparison.
-fn synthetic_components_manifest(name: &str, cid: &str) -> ComponentsManifest {
-    let mut capsules: HashMap<String, CapsuleEntry> = HashMap::new();
-    capsules.insert(
-        name.into(),
-        CapsuleEntry {
-            cid: cid.into(),
-            sha256: String::new(),
-            size: 0,
-            platforms: Vec::new(),
-        },
-    );
-    ComponentsManifest {
-        external: HashMap::new(),
-        capsules,
-        profiles: HashMap::new(),
-    }
-}
+const SYNTHETIC_CAPSULE_DESCRIPTION: &str = "Phase 5 Day 4 orphan-cleanup integration test capsule";
 
 /// Phase 5 Day 4 — the production RPC contract for the
 /// supervisor's startup orphan cleanup.
@@ -152,7 +77,12 @@ async fn supervisor_ensure_capsule_response_surfaces_one_shot_orphan_cleanup_rep
     std::fs::write(&orphan_bridge, b"orphan bridge").expect("write orphan bridge");
 
     // Seed the synthetic capsule so `ensure_capsule` resolves Ok.
-    seed_cached_synthetic_capsule(&data_dir, SYNTHETIC_CAPSULE_NAME, SYNTHETIC_CAPSULE_CID);
+    seed_cached_synthetic_capsule(
+        &data_dir,
+        SYNTHETIC_CAPSULE_NAME,
+        SYNTHETIC_CAPSULE_CID,
+        SYNTHETIC_CAPSULE_DESCRIPTION,
+    );
     let registry = synthetic_components_manifest(SYNTHETIC_CAPSULE_NAME, SYNTHETIC_CAPSULE_CID);
 
     // Construct the supervisor. The default `VzConfig` opts INTO
@@ -254,7 +184,12 @@ async fn supervisor_ensure_capsule_response_elides_orphan_report_when_opted_out(
     std::fs::write(&orphan_overlay, b"keep").expect("write keep overlay");
     std::fs::write(&orphan_bridge, b"keep").expect("write keep bridge");
 
-    seed_cached_synthetic_capsule(&data_dir, SYNTHETIC_CAPSULE_NAME, SYNTHETIC_CAPSULE_CID);
+    seed_cached_synthetic_capsule(
+        &data_dir,
+        SYNTHETIC_CAPSULE_NAME,
+        SYNTHETIC_CAPSULE_CID,
+        SYNTHETIC_CAPSULE_DESCRIPTION,
+    );
     let registry = synthetic_components_manifest(SYNTHETIC_CAPSULE_NAME, SYNTHETIC_CAPSULE_CID);
 
     let supervisor = Supervisor::new_with_vz_config(

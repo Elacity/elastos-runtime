@@ -72,6 +72,19 @@ mkdir -p "${REPORT_DIR}"
 JSONL_PATH="${REPORT_DIR}/crosvm-baseline.jsonl"
 BASELINE_PATH="${REPORT_DIR}/crosvm-baseline.json"
 
+# Phase 5 Day 8 — capture workspace git SHA (same contract as
+# the Vz lane). Fall back to "unknown" when git is absent so
+# the wrapper never errors out on a tarball / vendored copy.
+if PERF_GIT_SHA="$(cd "${REPO_ROOT}" && git rev-parse --short=12 HEAD 2>/dev/null)"; then
+    if [[ -n "$(cd "${REPO_ROOT}" && git status --porcelain 2>/dev/null)" ]]; then
+        PERF_GIT_SHA="${PERF_GIT_SHA}-dirty"
+    fi
+else
+    PERF_GIT_SHA="unknown"
+fi
+export ELASTOS_VZ_PERF_GIT_SHA="${PERF_GIT_SHA}"
+echo "[measure-crosvm-baseline] git_sha=${PERF_GIT_SHA}"
+
 RUNS="${ELASTOS_VZ_PERF_RUNS:-5}"
 echo "[measure-crosvm-baseline] starting ${RUNS} runs (backend=${BACKEND_LABEL})"
 echo "[measure-crosvm-baseline] JSONL → ${JSONL_PATH}"
@@ -94,18 +107,19 @@ while [[ "${run_idx}" -le "${RUNS}" ]]; do
     run_idx=$((run_idx + 1))
 done
 
-python3 - "${JSONL_PATH}" "${BASELINE_PATH}" "${BACKEND_LABEL}" <<'PY'
+python3 - "${JSONL_PATH}" "${BASELINE_PATH}" "${BACKEND_LABEL}" "${PERF_GIT_SHA}" <<'PY'
 import json
 import statistics
 import sys
 import time
 
-jsonl_path, baseline_path, backend_label = sys.argv[1], sys.argv[2], sys.argv[3]
+jsonl_path, baseline_path, backend_label, git_sha = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 per_metric = {}
 host = None
 notes = None
 schema_version = None
+emitted_git_shas = set()
 with open(jsonl_path) as f:
     for line in f:
         line = line.strip()
@@ -116,6 +130,8 @@ with open(jsonl_path) as f:
         host = record["host"]
         notes = record["notes"]
         schema_version = record["schema_version"]
+        if "git_sha" in record:
+            emitted_git_shas.add(record["git_sha"])
 
 def median_of(samples_for_key, key):
     values = [s[key] for s in samples_for_key]
@@ -146,13 +162,20 @@ crosvm_notes = {
 }
 
 baseline = {
-    "schema_version": schema_version or 1,
+    "schema_version": schema_version or 2,
     "captured_at_unix_ms": int(time.time() * 1000),
+    "git_sha": git_sha,
     "host": host or {},
     "backend": backend_label,
     "notes": crosvm_notes,
     "metrics": metrics,
 }
+
+if emitted_git_shas and emitted_git_shas != {git_sha}:
+    print(
+        f"  WARN: emitted records carry git_sha set {emitted_git_shas} "
+        f"but wrapper captured {git_sha}; using wrapper value."
+    )
 
 with open(baseline_path, "w") as f:
     json.dump(baseline, f, indent=2, sort_keys=True)
@@ -160,8 +183,9 @@ with open(baseline_path, "w") as f:
 
 print()
 print(f"=== crosvm baseline ({backend_label}) ===")
-print(f"  host:   {host.get('os','?')}/{host.get('arch','?')}  cpu_count_logical={host.get('cpu_count_logical','?')}")
-print(f"  phase:  {host.get('phase','?')}  runs={len(next(iter(per_metric.values()), []))}")
+print(f"  host:    {host.get('os','?')}/{host.get('arch','?')}  cpu_count_logical={host.get('cpu_count_logical','?')}")
+print(f"  phase:   {host.get('phase','?')}  runs={len(next(iter(per_metric.values()), []))}")
+print(f"  git_sha: {git_sha}")
 print()
 print(f"  {'metric':<45} {'samples':>8} {'p50':>10} {'p95':>10} {'p99':>10} {'max':>10}")
 print(f"  {'-' * 45} {'-' * 8} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}")

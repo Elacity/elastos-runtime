@@ -1,6 +1,8 @@
 # Phase 5 — Hardening + Linux smoke parity on Mac
 
-> **Status:** Days 1–7 complete (see `PHASE_5_DAY_{1,2,3,4,5,6,7}_NOTES.md`); Day 8 remains. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+> **Status:** **All 8 days complete.** See `PHASE_5_DAY_{1..8}_NOTES.md` for day-by-day details, `PHASE_5_RETROSPECTIVE.md` for the closeout, and `PHASE_6_ENTRY_CHECKLIST.md` for the Phase 6 gates. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day landed one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+>
+> **Day 8 outcome:** Phase-5 closeout + DRY hoist. Refactored the three Mac smokes to use the new `cross_platform_smoke_log_dry_run_reason` helper alongside the Day-6 `cross_platform_smoke_should_dry_run` predicate — operator-visible echo lines preserved byte-for-byte in the production CI auto-detect path. Bash helper assertions: 44 → 47 (3 new for `log_dry_run_reason`). Extracted `seed_cached_synthetic_capsule` + `synthetic_components_manifest` from `vz_perf_harness.rs` (Day 7) and `vz_supervisor_startup_orphan_cleanup.rs` (Day 4) into shared `tests/common/mod.rs`. Bumped perf-report `schema_version` 1→2 with a new `git_sha` field (populated by the `measure-{vz,crosvm}-baseline.sh` wrappers from `git rev-parse --short=12 HEAD` + `-dirty` suffix, "unknown" sentinel for bare-`cargo test` runs). New `PHASE_5_RETROSPECTIVE.md` documents what shipped + 8 carry-forward items. New `PHASE_6_ENTRY_CHECKLIST.md` enumerates Phase-5 closeout gates + 3 Phase-6 unblockers. 598 tests + 47 helper assertions all green; Linux side untouched.
 >
 > **Day 7 outcome:** Performance measurement substrate + honest baseline document landed. New `elastos-server/tests/vz_perf_harness.rs` (11 tests, 6 measurements + 5 schema/utility guards) measures 6 synthetic Phase-4/5 Rust paths and emits a `schema_version: 1` JSONL stream into `ELASTOS_VZ_PERF_REPORT`. New `scripts/measure-vz-baseline.sh` (cross-OS, Day-5/Day-6 precedence aware) and `scripts/measure-crosvm-baseline.sh` (Linux-only, clean-exit on Mac) aggregate 5 runs each and write canonical `target/{vz,crosvm}-baseline.json`. New `docs/vz-backend/PERFORMANCE_BASELINE.md` documents methodology + initial Mac (M-series) numbers + a pre-baked comparison table with `_TBD_` cells for Linux + real-boot rows. All 6 measured paths run sub-millisecond at p99 on M-series Mac; real Vz boot timings remain Phase-6-gated (darwin-arm64 release metadata). No production Rust code changes; pure measurement substrate + docs.
 >
@@ -150,17 +152,21 @@ This is **the** smoke that exercises the full Phase-4 Day-3 dispatch graph end t
 
 ---
 
-### Day 8 — `just verify` Mac parity + Phase 5 closing summary (4–6 h)
+### Day 8 — DRY hoist + Phase 5 closeout (6–8 h, actual)
 
-**Problem.** PLAN.md success criterion #1: *`just verify` green on `aarch64-apple-darwin`.* PLAN.md L383. Currently `just verify` is Linux-shaped.
+> **Day-8 actual scope deviation:** Day 8 shipped a **DRY hoist + perf-schema v2 bump + Phase-5 closeout** instead of the original `just verify` Mac parity scope. Rationale: the original `Justfile` Mac-verify scope re-implements what `mac-vz.yml` already does (Day 5 + Day 6 ship the canonical CI lanes); chasing it would have duplicated CI substrate in a developer-facing recipe runner with no operator-facing benefit. The DRY hoist + schema v2 bump locks in the Phase-5 substrate's stability before Phase 6 expands it. `just verify` Mac parity moves to Phase 6 backlog (`PHASE_6_ENTRY_CHECKLIST.md` § Carry-forward). See `PHASE_5_DAY_8_NOTES.md` for actual delivery.
 
-**Concrete deliverables:**
-1. **`Justfile`** (or top-level recipe runner) gets a Mac-aware `verify` target that invokes the right per-platform smoke set + the Apple-specific quality gates (the Phase-4 Day-7 + Day-8 typed-error tests, the Phase-5 Day-5 concurrent stress).
-2. **`state.md` Support boundary** section updated to add macOS (`aarch64-apple-darwin`) — this is the Phase-6 deliverable per the existing PLAN.md L322, but Day 8 prepares the diff so Phase 6 is a strict subset of Phase-5-Day-8.
-3. **Phase 5 closing summary** in `docs/vz-backend/PLAN.md` — same as Phase 4 Day 8's capstone summary. Marks Phase 5 complete.
-4. **`docs/MAC.md`** capability matrix final pass: every row now refers to Phase-5-or-later. Phase-4 rows get pinned with a "✅ Phase 4 complete" prefix.
-5. **Optional: short demo capture.** Phase 4's original deliverable was *"short demo capture showing an unmodified ElastOS MicroVM capsule running in real Vz isolation on a Mac, talking via Carrier to a Linux peer."* Day 8 records a 30-second screen capture if a Linux peer is available; if not, documents that the smoke suite *is* the proof.
-6. **Docs:** `PHASE_5_DAY_8_NOTES.md` + Phase-5 capstone in PLAN.md.
+**Problem (actual).** Phase 5 shipped 7 days of substrate work in 7 different files; the dry-run precedence inline blocks (Days 5-6) and the perf-harness fixture helpers (Days 4, 7) were copies waiting to be DRY'd. Plus the perf-report schema (Day 7) had no commit attribution — a Phase-6 regression-detector consuming the JSON would have to re-run git to attribute deltas. Phase-5 closeout was also pending (retrospective + Phase-6 entry checklist).
+
+**Concrete deliverables (shipped):**
+1. **`cross_platform_smoke_log_dry_run_reason`** helper in `scripts/lib/cross-platform.sh` — emits the operator-visible "why dry-run" echo line, byte-for-byte matches the Day-5/Day-6 inline blocks for the production CI auto-detect path. Companion to `cross_platform_smoke_should_dry_run` (Day 6).
+2. **3 Mac smokes refactored** to use the helper pair (`should_dry_run` + `log_dry_run_reason`). Inline blocks deleted; precedence centralised.
+3. **3 new helper assertions** for `log_dry_run_reason` (44 → 47), covering: explicit-DRY_RUN=1 echo, CI auto-detect echo (byte-exact to Day-5), CI side-effect (env-var export).
+4. **`tests/common/mod.rs`** in `elastos-server` — extracts `seed_cached_synthetic_capsule` + `synthetic_components_manifest` from `vz_perf_harness.rs` (Day 7) and `vz_supervisor_startup_orphan_cleanup.rs` (Day 4). Single source of truth for the perf + orphan-cleanup fixtures.
+5. **Perf-report schema v1 → v2.** New top-level `git_sha` field, populated by the `measure-{vz,crosvm}-baseline.sh` wrappers from `git rev-parse --short=12 HEAD` (with `-dirty` suffix when uncommitted changes are present). Harness defaults to `"unknown"` when env var unset. v2 is purely additive — v1 consumers ignoring `git_sha` still parse v2 files.
+6. **`PHASE_5_RETROSPECTIVE.md`** — what shipped, scope deviations, what went well, what didn't, 8 carry-forward items.
+7. **`PHASE_6_ENTRY_CHECKLIST.md`** — Phase-5 closeout gates, 3 Phase-6 unblockers (`components.json` darwin-arm64 metadata, self-hosted runner activation, first end-to-end full-boot smoke), Phase-6 backlog.
+8. **Docs:** `PHASE_5_DAY_8_NOTES.md` + `PERFORMANCE_BASELINE.md` § JSON wire format updated for schema v2 + `PLAN.md` Phase-5-closed marker + this section updated.
 
 ---
 

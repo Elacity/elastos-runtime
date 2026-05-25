@@ -552,6 +552,65 @@ else
     ok "FORCE_FULL=1 beats CI auto-detect (full run)"
 fi
 
+# ─── cross_platform_smoke_log_dry_run_reason (Phase 5 Day 8) ─
+TEST_NAME="cross_platform_smoke_log_dry_run_reason"
+
+# Pin the operator-visible echo lines for each precedence
+# branch. The three Phase-5 smokes (Day 8 refactor) lean on
+# this helper to produce the same wire-format echo lines
+# Day-5/Day-6 emitted from inline blocks; the smokes' CI log
+# parsers + dashboards keep working unchanged. These
+# assertions are the contract guard.
+
+# 1. Explicit DRY_RUN=1 → "explicitly set" echo line.
+explicit_output=$(
+    unset GITHUB_ACTIONS CI
+    ELASTOS_VZ_SMOKE_DRY_RUN=1
+    cross_platform_smoke_log_dry_run_reason "[test]"
+)
+case "${explicit_output}" in
+    *"ELASTOS_VZ_SMOKE_DRY_RUN=1 explicitly set"*)
+        ok "log_dry_run_reason emits 'explicitly set' for DRY_RUN=1"
+        ;;
+    *)
+        fail "log_dry_run_reason on DRY_RUN=1 must mention 'explicitly set'; got: ${explicit_output}"
+        ;;
+esac
+
+# 2. CI auto-detect → "CI detected" echo line (matches
+#    Day-5 inline block byte-for-byte).
+ci_output=$(
+    unset ELASTOS_VZ_SMOKE_DRY_RUN
+    GITHUB_ACTIONS=true
+    cross_platform_smoke_log_dry_run_reason "[test]"
+)
+case "${ci_output}" in
+    *"CI detected (GITHUB_ACTIONS or CI env set); auto-enabling ELASTOS_VZ_SMOKE_DRY_RUN=1"*)
+        ok "log_dry_run_reason emits Day-5 byte-exact CI echo"
+        ;;
+    *)
+        fail "log_dry_run_reason on CI must emit the Day-5 byte-exact echo; got: ${ci_output}"
+        ;;
+esac
+
+# 3. CI auto-detect → side-effect: exports DRY_RUN=1 so
+#    later code inspecting the env var still works
+#    (preserves the Day-5 inline behaviour for any smoke
+#    that hasn't been refactored to the predicate). The
+#    function's wire format is the echo line; this assertion
+#    pins the env-var side-effect that other code may rely on.
+side_effect_value=$(
+    unset ELASTOS_VZ_SMOKE_DRY_RUN
+    GITHUB_ACTIONS=true
+    cross_platform_smoke_log_dry_run_reason "[test]" >/dev/null
+    echo "${ELASTOS_VZ_SMOKE_DRY_RUN:-unset}"
+)
+if [[ "${side_effect_value}" == "1" ]]; then
+    ok "log_dry_run_reason on CI exports DRY_RUN=1 side effect"
+else
+    fail "log_dry_run_reason on CI must export DRY_RUN=1; got ${side_effect_value}"
+fi
+
 # ─── summary ────────────────────────────────────────────────
 
 echo

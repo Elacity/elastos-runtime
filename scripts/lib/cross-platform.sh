@@ -483,6 +483,47 @@ cross_platform_smoke_should_dry_run() {
     return 1
 }
 
+# Companion to `cross_platform_smoke_should_dry_run`. Emits
+# the operator-visible reason that triggered dry-run mode,
+# prefixed with the caller's label (e.g. "[interop]").
+#
+# **Phase 5 Day 8.** Centralises the per-reason echo line so
+# the three Mac smokes share one source-of-truth message
+# rather than each inlining it. The wire format of the
+# message is preserved byte-for-byte from the Day-5 + Day-6
+# inline blocks: existing CI log parsers / dashboards keep
+# working unchanged.
+#
+# Only call this when `cross_platform_smoke_should_dry_run`
+# has just returned 0 — the function inspects the same env
+# vars and picks the matching reason. The two functions are
+# tested together in `cross-platform-test.sh`.
+cross_platform_smoke_log_dry_run_reason() {
+    local prefix="${1:-[smoke]}"
+    # Precedence mirrors the predicate above. FORCE_FULL=1 never
+    # reaches this function (it returns 1); we therefore know
+    # the dry-run is from one of the three remaining branches.
+    case "${ELASTOS_VZ_SMOKE_DRY_RUN:-}" in
+        1)
+            echo "${prefix} ELASTOS_VZ_SMOKE_DRY_RUN=1 explicitly set; entering dry-run lane"
+            return 0
+            ;;
+    esac
+    if cross_platform_in_ci; then
+        echo "${prefix} CI detected (GITHUB_ACTIONS or CI env set); auto-enabling ELASTOS_VZ_SMOKE_DRY_RUN=1"
+        # Set the env var for the smoke's subsequent `${ELASTOS_VZ_SMOKE_DRY_RUN:-0}`
+        # checks (a couple of smokes still inspect the var
+        # directly for non-mode-related dry-run side branches —
+        # e.g. skipping the `cargo build` step). Sets to the
+        # same value the Day-5 inline block sets.
+        export ELASTOS_VZ_SMOKE_DRY_RUN=1
+        return 0
+    fi
+    # Defensive fallback — shouldn't be reached since the
+    # caller guarded with `cross_platform_smoke_should_dry_run`.
+    echo "${prefix} dry-run mode active (precedence: default-fallthrough)"
+}
+
 # Locate an installed Vz-launchable capsule on the host.
 # **Phase 5 Day 1.** Returns 0 and prints the capsule name on
 # stdout if a `<data_dir>/capsules/<name>/rootfs.ext4` plus a

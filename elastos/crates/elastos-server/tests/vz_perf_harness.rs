@@ -57,7 +57,6 @@
 
 #![allow(clippy::missing_docs_in_private_items)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,7 +65,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType, ResourceLimits, SCHEMA_V1};
 use elastos_runtime::capability::pending::{GrantDuration, PendingRequestStore};
 use elastos_runtime::capability::{Action, CapabilityManager, ResourceId, TokenConstraints};
 use elastos_runtime::primitives::audit::AuditLog;
@@ -74,8 +72,10 @@ use elastos_runtime::primitives::metrics::MetricsManager;
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
 };
-use elastos_server::setup::{CapsuleEntry, ComponentsManifest};
 use elastos_server::supervisor::{Supervisor, SupervisorRequest};
+
+mod common;
+use common::{seed_cached_synthetic_capsule, synthetic_components_manifest};
 
 // ───────────────────────────────────────────────────────────
 // Sample counts (kept low so the harness stays under a few
@@ -91,7 +91,17 @@ const CONCURRENT_SENDERS: usize = 4;
 const CONCURRENT_MESSAGES_PER_SENDER: usize = 25;
 
 const PERF_REPORT_ENV: &str = "ELASTOS_VZ_PERF_REPORT";
-const SCHEMA_VERSION: u32 = 1;
+
+// Phase 5 Day 8 bump: schema_version=2 adds the `git_sha`
+// field to every report so a Phase-6 regression-detector
+// (and the operator running multiple baselines back-to-back)
+// can attribute deltas to specific commits. The field is
+// populated from the `ELASTOS_VZ_PERF_GIT_SHA` env var that
+// `scripts/measure-{vz,crosvm}-baseline.sh` set before
+// invoking `cargo test`. Defaults to "unknown" so dev-host
+// runs without the script wrapper still produce valid JSON.
+const SCHEMA_VERSION: u32 = 2;
+const PERF_GIT_SHA_ENV: &str = "ELASTOS_VZ_PERF_GIT_SHA";
 
 // ───────────────────────────────────────────────────────────
 // JSON-serialisable report shape.
@@ -183,11 +193,31 @@ impl ReportNotes {
 struct PerfReport {
     schema_version: u32,
     captured_at_unix_ms: u128,
+    /// **Schema v2 (Day 8).** Git SHA of the workspace at the
+    /// moment the harness ran. Populated from
+    /// `ELASTOS_VZ_PERF_GIT_SHA` (the measure-baseline scripts
+    /// set this before invoking `cargo test`); "unknown" when
+    /// the env var is unset (dev-host bare `cargo test` runs).
+    git_sha: String,
     host: HostInfo,
     backend: String,
     metric_name: String,
     stats: MetricStats,
     notes: ReportNotes,
+}
+
+/// Capture the workspace's git SHA at the moment a sample
+/// is emitted, falling back to a sentinel when not set. The
+/// `current_git_sha` helper plus the `git_sha` field on
+/// [`PerfReport`] together form schema-v2's commit-attribution
+/// contract: a Phase-6 regression-detector consuming the
+/// JSON file can group samples by SHA without re-running git.
+///
+/// "unknown" is the documented skip-marker the
+/// regression-detector treats as "ignore for delta-attribution"
+/// — keeping bare `cargo test` runs honest (no fake SHA).
+fn current_git_sha() -> String {
+    std::env::var(PERF_GIT_SHA_ENV).unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn current_backend() -> &'static str {
@@ -218,6 +248,7 @@ fn maybe_emit(metric_name: &str, stats: &MetricStats) {
     let report = PerfReport {
         schema_version: SCHEMA_VERSION,
         captured_at_unix_ms: captured_at_unix_ms(),
+        git_sha: current_git_sha(),
         host: HostInfo::capture(),
         backend: current_backend().to_string(),
         metric_name: metric_name.into(),
@@ -249,71 +280,15 @@ fn maybe_emit(metric_name: &str, stats: &MetricStats) {
 }
 
 // ───────────────────────────────────────────────────────────
-// Synthetic capsule + manifest helpers — mirror the shape
-// `vz_supervisor_startup_orphan_cleanup.rs` uses so the
-// perf harness measures the same code path the orphan-cleanup
-// integration test pins.
+// Synthetic capsule identifiers — re-use the
+// `tests/common/mod.rs` fixtures so the perf harness measures
+// the same on-disk shape the Day-4 orphan-cleanup integration
+// test pins (Phase 5 Day 8 DRY hoist).
 // ───────────────────────────────────────────────────────────
 
 const PERF_SYNTHETIC_CAPSULE_NAME: &str = "phase5-day7-perf-capsule";
 const PERF_SYNTHETIC_CAPSULE_CID: &str = "bafy-phase5-day7-perf-test";
-
-fn seed_cached_synthetic_capsule(data_dir: &std::path::Path, name: &str, cid: &str) {
-    let capsule_dir = data_dir.join("capsules").join(name);
-    std::fs::create_dir_all(&capsule_dir).expect("create synthetic capsule dir");
-
-    let manifest = CapsuleManifest {
-        schema: SCHEMA_V1.into(),
-        version: "0.1.0".into(),
-        name: name.into(),
-        description: Some("Phase 5 Day 7 perf-harness capsule".into()),
-        author: None,
-        role: CapsuleRole::App,
-        capsule_type: CapsuleType::Wasm,
-        entrypoint: "noop".into(),
-        requires: Vec::new(),
-        provides: None,
-        capabilities: Vec::new(),
-        resources: ResourceLimits {
-            memory_mb: 64,
-            cpu_shares: 100,
-            gpu: false,
-        },
-        permissions: Default::default(),
-        microvm: None,
-        providers: None,
-        viewer: None,
-        signature: None,
-    };
-    let manifest_json = serde_json::to_string_pretty(&manifest).expect("serialise manifest");
-    std::fs::write(capsule_dir.join("capsule.json"), manifest_json).expect("write capsule.json");
-    std::fs::write(capsule_dir.join("noop"), b"").expect("write noop entrypoint");
-    std::fs::write(capsule_dir.join(".elastos-cid"), format!("{cid}\n"))
-        .expect("write .elastos-cid");
-    std::fs::write(
-        capsule_dir.join(".elastos-artifact-sha256"),
-        "synthetic-perf-sha\n",
-    )
-    .expect("write .elastos-artifact-sha256");
-}
-
-fn synthetic_components_manifest(name: &str, cid: &str) -> ComponentsManifest {
-    let mut capsules: HashMap<String, CapsuleEntry> = HashMap::new();
-    capsules.insert(
-        name.into(),
-        CapsuleEntry {
-            cid: cid.into(),
-            sha256: String::new(),
-            size: 0,
-            platforms: Vec::new(),
-        },
-    );
-    ComponentsManifest {
-        external: HashMap::new(),
-        capsules,
-        profiles: HashMap::new(),
-    }
-}
+const PERF_SYNTHETIC_CAPSULE_DESCRIPTION: &str = "Phase 5 Day 7 perf-harness capsule";
 
 // ───────────────────────────────────────────────────────────
 // Tiny synthetic provider for `send_raw` measurements. Same
@@ -429,6 +404,7 @@ async fn perf_synthetic_capsule_launch() {
         &data_dir,
         PERF_SYNTHETIC_CAPSULE_NAME,
         PERF_SYNTHETIC_CAPSULE_CID,
+        PERF_SYNTHETIC_CAPSULE_DESCRIPTION,
     );
     let registry =
         synthetic_components_manifest(PERF_SYNTHETIC_CAPSULE_NAME, PERF_SYNTHETIC_CAPSULE_CID);
@@ -622,10 +598,10 @@ fn metric_stats_from_single_sample_is_degenerate_but_stable() {
 #[test]
 fn perf_report_json_schema_is_stable_for_consumers() {
     // Pin the on-disk JSON shape — schema_version, metric_name,
-    // stats keys, notes keys — so the shell aggregator and
-    // future Phase-6 regression detector can parse without
-    // ambiguity. Day-7 freezes schema_version=1; future bumps
-    // must update consumers.
+    // stats keys, notes keys, git_sha (Day-8) — so the shell
+    // aggregator and future Phase-6 regression detector can
+    // parse without ambiguity. Day-8 bumps to schema_version=2;
+    // future bumps must update consumers.
     let stats = MetricStats {
         samples_count: 5,
         min_us: 1,
@@ -637,6 +613,7 @@ fn perf_report_json_schema_is_stable_for_consumers() {
     let report = PerfReport {
         schema_version: SCHEMA_VERSION,
         captured_at_unix_ms: 1_000,
+        git_sha: "abc1234".to_string(),
         host: HostInfo {
             os: "darwin".to_string(),
             arch: "arm64".to_string(),
@@ -650,7 +627,8 @@ fn perf_report_json_schema_is_stable_for_consumers() {
         notes: ReportNotes::day_seven_default(),
     };
     let json = serde_json::to_value(&report).expect("perf report must serialise");
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["git_sha"], "abc1234");
     assert_eq!(json["backend"], "vz");
     assert_eq!(json["metric_name"], "supervisor_new_cold");
     assert!(json["host"].is_object());
@@ -665,7 +643,23 @@ fn perf_report_json_schema_is_stable_for_consumers() {
     // file MUST be able to deserialise what we emit.
     let round_trip: PerfReport = serde_json::from_value(json).expect("round-trip must succeed");
     assert_eq!(round_trip.schema_version, SCHEMA_VERSION);
+    assert_eq!(round_trip.git_sha, "abc1234");
     assert_eq!(round_trip.stats.p50_us, 2);
+
+    // Day-8 fallback contract: `current_git_sha()` returns
+    // "unknown" when `ELASTOS_VZ_PERF_GIT_SHA` is unset
+    // (bare `cargo test` lane). The shell wrappers always
+    // set it before invoking us; this branch keeps dev-host
+    // runs honest with a sentinel rather than an empty
+    // string. The Phase-6 regression-detector treats
+    // "unknown" as a skip-marker.
+    if std::env::var(PERF_GIT_SHA_ENV).is_err() {
+        assert_eq!(
+            current_git_sha(),
+            "unknown",
+            "git_sha must default to 'unknown' when the env var is unset"
+        );
+    }
 }
 
 // Sanity guard for the `EchoProvider` shape (in case a
