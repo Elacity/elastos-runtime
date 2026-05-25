@@ -527,6 +527,19 @@
         }
       }
     },
+    "rootfs": {
+      "install_path": "capsules/ubuntu-base/rootfs.ext4",
+      "description": "Base Linux rootfs for the Mac (Vz) microVM path — v0.1 demo bar (Phase 8). Canonical's pinned arm64 squashfs from the same release-20260515 tree as the kernel + initrd, mounted directly by the kernel via `root=/dev/vda rootfstype=squashfs` (no format conversion needed — squashfs is a Linux-native filesystem). Read-only by design; per-VM writability comes from overlays (Phase 8 Day 4 will pick tmpfs vs ext4-overlay). Not installed on Linux: the crosvm path uses its own published capsule bundles (chat-linux-arm64.tar.gz etc.).",
+      "platforms": {
+        "darwin-arm64": {
+          "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260515/ubuntu-22.04-server-cloudimg-arm64.squashfs",
+          "checksum": "sha256:d2c9bcc0815a02f09293d56c91b0a8f5b16878977bb38a3b2c1b28efd7d1c1fb",
+          "size": 430985216,
+          "install_path": "capsules/ubuntu-base/rootfs.ext4",
+          "note": "Pinned Ubuntu 22.04 LTS arm64 squashfs (immutable release-20260515 path; checksum from Canonical's signed SHA256SUMS). Filename `rootfs.ext4` matches the supervisor's capsule-discovery glob in `elastos-vz/tests/concurrent_launch.rs:200`; the actual on-disk format is squashfs (the `.ext4` extension is a stable identifier, not a format claim). See docs/vz-backend/PHASE_8_DAY_1_NOTES.md § 1 for the A-vs-qcow2-vs-tar.xz decision and PHASE_8_DAY_2_NOTES.md for the install-path wiring."
+        }
+      }
+    },
     "kubo": {
       "platforms": {
         "linux-amd64": {
@@ -629,7 +642,8 @@
       "components": [
         "crosvm",
         "vmlinux",
-        "initrd"
+        "initrd",
+        "rootfs"
       ]
     },
     "home": {
@@ -681,7 +695,8 @@
         "chat",
         "crosvm",
         "vmlinux",
-        "initrd"
+        "initrd",
+        "rootfs"
       ]
     },
     "operator": {
@@ -755,6 +770,7 @@
         "crosvm",
         "vmlinux",
         "initrd",
+        "rootfs",
         "kubo",
         "cloudflared",
         "llama-server",
