@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Days 1–2 complete (audit + Class-A/D/E + capsules-projection edits landed); Day 3 unblocked.** Closes the
+> **Status:** **In progress. Days 1–3 complete (audit + Class-A/B/D/E + capsules projection landed; 3/3 Mac smoke pre-flights PASS); Day 4 unblocked (vmlinux + signing/notarization).** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -231,7 +231,37 @@ of the microVM capsules with high confidence.
 
 ---
 
-### Day 3 — Remaining 7 microVM capsule darwin-arm64 entries (6–8 h)
+### Day 3 — Class-B `chat` capsule darwin-arm64 (share-linux-arm64-bundle) (4–6 h)
+
+> **Outcome (2026-05-25):** ✅ **Class-B `chat` darwin-arm64
+> landed via D.2.a share-bundle metadata; all 3 Phase-5 smoke
+> pre-flights PASS on Mac; Day 4 unblocked.**
+> Notes:
+> [`PHASE_6_DAY_3_NOTES.md`](PHASE_6_DAY_3_NOTES.md).
+> **Decision D.2 closed at D.2.a** (duplicate
+> `linux-arm64.{cid,checksum,size,release_path,extract_path}`
+> into `darwin-arm64`; zero substrate change). **D.2.b
+> (`share_release` schema indirection) parked as a Phase-7
+> schema-elegance carry-forward.** The verifier now enforces
+> the D.2.a share-bundle invariant (5 fields must be
+> byte-identical between linux-arm64 and darwin-arm64);
+> negative-test confirmed the invariant catches drift.
+> Class B promoted from forward-compat to required; only
+> Class C remains forward-compat (Day 4 — `vmlinux`).
+> Linux preserved; diff is additive only.
+>
+> **Scope deviation from original plan.** The original Day-3
+> framing (below) was *"batch the remaining 7 microVM capsules
+> at once"*. The Day-1 audit re-shaped this — most of the
+> "microVM capsules" the original plan listed are actually
+> **host Rust binaries** (Class A), which Day 2 already
+> shipped. The only true Class-B microVM bundle is `chat`,
+> which is what Day 3 actually ships. The other 6 entries
+> the original plan listed (`ipfs-provider`, `tunnel-provider`,
+> `site-provider`, etc.) are Class-A host binaries already
+> covered by Day-2. Day 3 is therefore narrower and faster
+> than the 6–8h budget — the deliverable is one capsule
+> entry, one verifier promotion, one notes file.
 
 **Problem.** Day 2 proves the workflow; Day 3 batches the
 remaining 7 microVM capsules (`chat`, `ipfs-provider`,

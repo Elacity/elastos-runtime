@@ -8,9 +8,13 @@
 # What this checks (read the audit doc § 4 for the why):
 #   1. components.json parses as JSON.
 #   2. Class-A host Rust binaries (7): linux-amd64 + linux-arm64 + darwin-arm64 all present.
-#   3. Class-B microVM bundle (chat): linux-amd64 + linux-arm64 present today;
-#      darwin-arm64 added in Day 3 (this script is forward-compatible — it
-#      logs the chat gap as "Day 3 expected" rather than failing).
+#   3. Class-B microVM bundle (chat): linux-amd64 + linux-arm64 + darwin-arm64
+#      all present. **Day 3 (this commit) promoted chat from forward-compat
+#      to required.** Additionally, the share-linux-arm64-bundle invariant
+#      (Decision D.2.a) is enforced: `chat.darwin-arm64.{cid,checksum,size,
+#      release_path,extract_path}` must equal the corresponding linux-arm64
+#      values exactly. Catches accidental copy-paste drift in either
+#      direction once the release pipeline starts populating cids.
 #   4. Class-C kernel (vmlinux): linux-amd64 + linux-arm64 present today;
 #      darwin-arm64 added in Day 4 (forward-compatible — logged as "Day 4 expected").
 #   5. Class-D linux-only substrate (crosvm): platforms == EXACTLY
@@ -63,14 +67,23 @@ CLASS_A_HOST_BINARIES = [
     "tunnel-provider",
     "site-provider",
 ]
-# Day-3 deliverable; Day-2 forward-compat note only.
+# Promoted from forward-compat to required in Day 3.
 CLASS_B_MICROVM_BUNDLES = ["chat"]
-# Day-4 deliverable; Day-2 forward-compat note only.
+# Day-4 deliverable; Day-3 keeps as forward-compat note.
 CLASS_C_KERNEL = ["vmlinux"]
 CLASS_D_LINUX_ONLY = ["crosvm"]
 CLASS_E_HELPERS = ["kubo", "cloudflared", "llama-server"]
 
 REQUIRED_KEYS_ALL = ["linux-amd64", "linux-arm64", "darwin-arm64"]
+# Decision D.2.a invariant: these fields must be identical between
+# darwin-arm64 and linux-arm64 for every Class-B share-bundle entry.
+SHARE_BUNDLE_INVARIANT_FIELDS = [
+    "cid",
+    "checksum",
+    "size",
+    "release_path",
+    "extract_path",
+]
 
 external = manifest.get("external", {})
 capsules = manifest.get("capsules", {})
@@ -82,14 +95,24 @@ for name in CLASS_A_HOST_BINARIES:
     if missing:
         errors.append(f"[Class A] external.{name}.platforms missing keys: {missing}")
 
-# --- Class B (forward-compat: Day-3 work) ---
+# --- Class B (Day-3 promoted to required; enforce share-bundle invariant) ---
 for name in CLASS_B_MICROVM_BUNDLES:
     plats = external.get(name, {}).get("platforms", {})
-    base_missing = [k for k in ("linux-amd64", "linux-arm64") if k not in plats]
-    if base_missing:
-        errors.append(f"[Class B] external.{name}.platforms missing baseline keys: {base_missing}")
-    if "darwin-arm64" not in plats:
-        notes.append(f"[Class B] external.{name}.platforms.darwin-arm64 — Day 3 expected (carry-forward)")
+    missing = [k for k in REQUIRED_KEYS_ALL if k not in plats]
+    if missing:
+        errors.append(f"[Class B] external.{name}.platforms missing keys: {missing}")
+        continue
+    darwin = plats["darwin-arm64"]
+    linux_arm64 = plats["linux-arm64"]
+    for field in SHARE_BUNDLE_INVARIANT_FIELDS:
+        if darwin.get(field) != linux_arm64.get(field):
+            errors.append(
+                f"[Class B] D.2.a share-bundle invariant violated: "
+                f"external.{name}.platforms.darwin-arm64.{field} "
+                f"= {darwin.get(field)!r}, "
+                f"linux-arm64.{field} = {linux_arm64.get(field)!r}; "
+                "these must be byte-identical for share-linux-arm64-bundle"
+            )
 
 # --- Class C (forward-compat: Day-4 work) ---
 for name in CLASS_C_KERNEL:
@@ -148,7 +171,7 @@ if errors:
 
 print("[components-json-verify] OK")
 print(f"  Class A (host binaries):    {len(CLASS_A_HOST_BINARIES)}/{len(CLASS_A_HOST_BINARIES)} green")
-print(f"  Class B (microVM bundles):  baseline green ({len(CLASS_B_MICROVM_BUNDLES)} entries, darwin Day 3)")
+print(f"  Class B (microVM bundles):  {len(CLASS_B_MICROVM_BUNDLES)}/{len(CLASS_B_MICROVM_BUNDLES)} green (D.2.a share-bundle invariant enforced)")
 print(f"  Class C (kernel):           baseline green ({len(CLASS_C_KERNEL)} entry, darwin Day 4)")
 print(f"  Class D (linux-only):       {len(CLASS_D_LINUX_ONLY)}/{len(CLASS_D_LINUX_ONLY)} green (darwin absent as required)")
 print(f"  Class E (3rd-party):        {len(CLASS_E_HELPERS)}/{len(CLASS_E_HELPERS)} green (real url + checksum)")

@@ -264,7 +264,7 @@
     },
     "chat": {
       "install_path": "capsules/chat",
-      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path",
+      "description": "Packaged microVM chat bundle for the full-screen Carrier chat path. On darwin-arm64 the bundle is the same linux-arm64 rootfs (Vz boots Linux guests; the rootfs bytes are identical) \u2014 see docs/vz-backend/PHASE_6_COMPONENTS_AUDIT.md \u00a7 4.2 (Decision D.2.a, share-linux-arm64-bundle).",
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -275,6 +275,14 @@
           "install_path": "capsules/chat"
         },
         "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chat-linux-arm64.tar.gz",
+          "extract_path": "chat",
+          "install_path": "capsules/chat"
+        },
+        "darwin-arm64": {
           "cid": "",
           "checksum": "",
           "size": 0,
