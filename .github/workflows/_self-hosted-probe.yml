@@ -1,0 +1,95 @@
+name: Self-hosted Mac runner probe
+
+# Phase 5 Day 6 — heartbeat probe for the self-hosted Vz lane.
+#
+# Purpose: surface "is a runner matching the labels we need for
+# `mac-vz-full-boot` actually online?" without anyone having to
+# fight the Settings → Actions → Runners UI. The probe is
+# DELIBERATELY tiny — it just claims the same label set, prints
+# `sw_vers + uname -a + framework presence`, and exits 0.
+#
+# Two job pairs:
+#   - probe-attempt   — gated on the `vars.MAC_VZ_FULL_BOOT_ENABLED`
+#                       repo-var so we don't pay for queue-then-timeout
+#                       on every schedule when no runner is online.
+#                       When enabled and a matching runner IS online,
+#                       this completes in seconds.
+#   - probe-fallback  — always runs on `ubuntu-latest`, just records
+#                       the variable's current value so operators can
+#                       see the gate's state in the run history.
+#
+# Triggers:
+#   - schedule        — every 6 hours; cheap heartbeat.
+#   - workflow_dispatch — operator-on-demand probe before flipping
+#                       a fragile change.
+#   - (push/PR not in the trigger list — we don't want every PR
+#     paying the 6h-budgeted minutes).
+#
+# Anchors:
+#   - docs/vz-backend/SELF_HOSTED_RUNNER_SPEC.md
+#   - docs/vz-backend/CI_RUNBOOK.md § Self-hosted lane
+
+on:
+  schedule:
+    # 00:00, 06:00, 12:00, 18:00 UTC — four times per day. The
+    # cron is intentionally NOT every-hour to keep the public
+    # runner-minutes budget visible (24 min/day vs. 144 min/day).
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch: {}
+
+# Cancel previous probe runs on the same trigger ref so a
+# manual dispatch during a scheduled run doesn't double-pay.
+concurrency:
+  group: self-hosted-probe
+  cancel-in-progress: true
+
+jobs:
+  probe-attempt:
+    name: Probe matching runner (self-hosted)
+    if: ${{ vars.MAC_VZ_FULL_BOOT_ENABLED == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64, vz-capable]
+    # Short timeout: if no runner picks the job up within
+    # 5 minutes, treat it as "no runner online" and surface
+    # via job status (cancelled / queued past timeout). The
+    # main `mac-vz-full-boot` job keeps the 30-min budget
+    # for actual work.
+    timeout-minutes: 5
+    steps:
+      - name: macOS + Vz framework presence
+        run: |
+          set -euo pipefail
+          echo "=== sw_vers ==="
+          sw_vers
+          echo
+          echo "=== uname -a ==="
+          uname -a
+          echo
+          echo "=== Virtualization.framework ==="
+          if [ -d /System/Library/Frameworks/Virtualization.framework ]; then
+            echo "PRESENT"
+          else
+            echo "::error::Virtualization.framework not found"
+            exit 1
+          fi
+          echo
+          echo "=== runner labels (from \$RUNNER_NAME) ==="
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          echo "RUNNER_OS=${RUNNER_OS:-<unset>}"
+          echo "RUNNER_ARCH=${RUNNER_ARCH:-<unset>}"
+
+  probe-fallback:
+    name: Probe gate state (always runs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Report repository variable state
+        run: |
+          set -euo pipefail
+          echo "MAC_VZ_FULL_BOOT_ENABLED=${{ vars.MAC_VZ_FULL_BOOT_ENABLED }}"
+          if [ "${{ vars.MAC_VZ_FULL_BOOT_ENABLED }}" = "true" ]; then
+            echo "Day-6 full-boot lane is ENABLED."
+            echo "Check the 'probe-attempt' job above for runner availability."
+          else
+            echo "Day-6 full-boot lane is DISABLED (var unset or != 'true')."
+            echo "Set repository variable MAC_VZ_FULL_BOOT_ENABLED=true to enable."
+          fi

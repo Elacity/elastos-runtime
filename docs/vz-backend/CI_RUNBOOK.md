@@ -1,6 +1,6 @@
 # Vz-backend CI runbook
 
-> **Phase 5 Day 5.** Operator runbook for the GitHub Actions workflows that gate Vz-backend changes. Covers how to interpret failures, how to drive a manual one-shot run, and how to reproduce a CI failure locally.
+> **Phase 5 Day 5 + Day 6.** Operator runbook for the GitHub Actions workflows that gate Vz-backend changes. Covers how to interpret failures, how to drive a manual one-shot run, how to reproduce a CI failure locally, and how to operate the Day-6 self-hosted full-boot lane.
 
 ---
 
@@ -10,9 +10,10 @@
 |---|---|---|---|
 | `.github/workflows/ci.yml` | Linux baseline — fmt, clippy, tests, release build. Source of truth for full-workspace coverage. | `ubuntu-latest` | push to `main` / `sash/**` / `vz/**`; PR to `main`. |
 | `.github/workflows/linux-untouched.yml` | Enforces the Linux-untouched guarantee from `docs/vz-backend/PLAN.md`. Runs `scripts/check-linux-untouched.sh` against the Phase 0 baseline commit (`a65dad3`). | `ubuntu-latest` | push to `sash/**` / `vz/**`; PR to `main`; `workflow_dispatch`. |
-| `.github/workflows/mac-vz.yml` | Mac Apple-Silicon CI substrate. Three jobs: `mac-rust-tests`, `mac-shell-helpers`, `mac-smokes-dry-run`. **Phase 5 Day 5.** | `macos-latest` | push to `main` / `sash/**` / `vz/**`; PR to `main`; `workflow_dispatch`. |
+| `.github/workflows/mac-vz.yml` | Mac Apple-Silicon CI substrate. **Phase 5 Day 5** added three GitHub-hosted jobs (`mac-rust-tests`, `mac-shell-helpers`, `mac-smokes-dry-run`). **Phase 5 Day 6** added a fourth opt-in self-hosted job (`mac-vz-full-boot`). | `macos-latest` for jobs 1-3; `[self-hosted, macOS, ARM64, vz-capable]` for job 4. | push to `main` / `sash/**` / `vz/**`; PR to `main`; `workflow_dispatch`. |
+| `.github/workflows/_self-hosted-probe.yml` | Heartbeat probe for the self-hosted runner. Two jobs: `probe-attempt` (gated, self-hosted) and `probe-fallback` (always, `ubuntu-latest`). **Phase 5 Day 6.** | `[self-hosted, macOS, ARM64, vz-capable]` + `ubuntu-latest` | `schedule: 0 0,6,12,18 * * *`; `workflow_dispatch`. |
 
-All three workflows share a `concurrency:` group (`mac-vz-${{ github.ref }}` etc.) so a rapid-fire push sequence auto-cancels the older run rather than queuing duplicate minutes.
+All workflows share a `concurrency:` group so a rapid-fire push sequence auto-cancels the older run rather than queuing duplicate minutes.
 
 ---
 
@@ -36,7 +37,7 @@ Two steps:
 
 | Step | Asserts | Failure message |
 |---|---:|---|
-| `cross-platform.sh unit tests` | 41 | `FAIL <test_name>: <reason>` then `cross-platform.sh: N passed, M failed`. The action exits non-zero. |
+| `cross-platform.sh unit tests` | 44 | `FAIL <test_name>: <reason>` then `cross-platform.sh: N passed, M failed`. The action exits non-zero. |
 | `runtime-cleanup.sh unit tests` | 5 | Same format, different prefix. |
 
 A failure here means a bash-3.2 / BSD-utils incompatibility crept in. Reproduce locally with `just ci-shell`. The test file names are the same as the helper file names + `-test.sh`; the file:line in the failure points at the exact assertion that broke.
@@ -77,6 +78,53 @@ Use this when:
 
 ---
 
+## 3a. Self-hosted full-boot lane (Phase 5 Day 6)
+
+### 3a.1 Smoke precedence
+
+The three Mac smokes resolve their dry-run vs. full-run mode via a layered precedence table. Top of the table wins:
+
+| Order | Setting | Outcome | Owner |
+|---:|---|---|---|
+| 1 | `ELASTOS_VZ_SMOKE_FORCE_FULL=1` | **Full run.** Overrides every layer below. | Self-hosted runner job (Day 6). |
+| 2 | `ELASTOS_VZ_SMOKE_DRY_RUN=0` | **Full run.** Explicit operator opt-back-in. | Operator escape hatch. |
+| 3 | `ELASTOS_VZ_SMOKE_DRY_RUN=1` | **Dry run.** Explicit operator opt-in. | Operator local debug. |
+| 4 | CI auto-detect (`GITHUB_ACTIONS` or `CI` set) + `DRY_RUN` unset | **Dry run.** Day-5 default for the GitHub-hosted lane. | Day-5 default. |
+| 5 | None of the above (local Mac dev) | **Full run.** | Default. |
+
+The canonical implementation lives in `scripts/lib/cross-platform.sh::cross_platform_smoke_should_dry_run` and is pinned by three new assertions in `cross-platform-test.sh` (assertion count 41 → 44). The smokes today still carry inline FORCE_FULL + CI-auto-detect blocks for operator-visible echo lines; the helper documents the contract.
+
+### 3a.2 Enabling the lane
+
+Two switches must BOTH be on:
+
+1. **Repository variable.** Settings → Secrets and variables → Actions → Variables → set `MAC_VZ_FULL_BOOT_ENABLED=true`. Default-off keeps the lane silent for public forks.
+2. **Self-hosted runner.** A runner registered with the exact label set `[self-hosted, macOS, ARM64, vz-capable]` must be **Idle** in the Runners page. See [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md) for provisioning.
+
+When both switches are on, the next `mac-vz.yml` push/PR will schedule `mac-vz-full-boot` on the runner. The three smoke steps print `FORCE_FULL=1 — forcing full smoke run` and run the real Vz boot.
+
+### 3a.3 The heartbeat probe
+
+`_self-hosted-probe.yml` runs every 6 hours and on `workflow_dispatch`. It claims the same label set as `mac-vz-full-boot` plus emits a fallback job on `ubuntu-latest` that records the variable's current value. Use this to verify:
+
+- A runner is online — `probe-attempt` completes in < 1 min with `PRESENT` printed.
+- The lane is enabled — `probe-fallback` prints `MAC_VZ_FULL_BOOT_ENABLED=true`.
+
+If `probe-attempt` queues past its 5-minute timeout, no matching runner is online. Either re-register the runner or disable the lane (unset the variable) until the runner is back.
+
+### 3a.4 Kill switch
+
+Two independent kill switches, both effective immediately:
+
+| Action | Effect |
+|---|---|
+| Unset / set `MAC_VZ_FULL_BOOT_ENABLED` to anything other than `true`. | `if:` gate evaluates false; jobs do not schedule. |
+| Remove the `vz-capable` label from the runner (or take the runner offline). | Job's `runs-on` no longer matches; jobs queue until timeout, then cancel. |
+
+For routine maintenance prefer the variable; for emergency operator control prefer the runner label/offline.
+
+---
+
 ## 4. Reproducing CI locally
 
 | Goal | Recipe |
@@ -95,7 +143,8 @@ The `just` recipes are the local source of truth — the workflow's job steps ar
 
 | Surface | Status | Tracked in |
 |---|---|---|
-| Real Vz microVM boot in CI | Not covered. GitHub-hosted macOS runners don't reliably expose `Virtualization.framework` to nested processes. | Phase 5 Day 6+ self-hosted-runner spec (out of scope for Day 5). |
+| Real Vz microVM boot in CI on the **public** lane | Not covered. GitHub-hosted macOS runners don't reliably expose `Virtualization.framework` to nested processes. | Always — won't change. The Day-6 self-hosted lane is the substrate for real boots. |
+| Real Vz microVM boot on the **self-hosted** lane | **Wired but dormant** (Phase 5 Day 6). Becomes active when an operator provisions a runner per [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md) and sets `MAC_VZ_FULL_BOOT_ENABLED=true`. | [`SELF_HOSTED_RUNNER_SPEC.md`](./SELF_HOSTED_RUNNER_SPEC.md). |
 | Linux smoke runs (`local-carrier-setup-smoke.sh` etc.) full end-to-end on Linux | Not covered. CI runs only the dry-run lane; the full runs need a provisioned `~/.local/share/elastos` which CI doesn't have. | Phase 5 Day 8 follow-up — likely never automated; the local `just verify` recipe is the source of truth. |
 | Performance / regression benchmarks | Not covered. | Phase 5 Day 7 deliverable. |
 | Real `darwin-arm64` `components.json` release metadata + Carrier-backed install | Not covered. | Phase 6 — the smokes correctly visible-skip on this today via `cross_platform_assert_native_binary_release_metadata`. |
@@ -118,8 +167,11 @@ Public-repo macOS minutes on GitHub Actions are free for open-source projects (1
 
 ## 7. Anchors
 
-- [`PHASE_5_PLAN.md`](PHASE_5_PLAN.md) § Day 5 — the original plan.
-- [`PHASE_5_DAY_5_NOTES.md`](PHASE_5_DAY_5_NOTES.md) — what shipped + the carry-forward findings.
+- [`PHASE_5_PLAN.md`](PHASE_5_PLAN.md) § Day 5, § Day 6 — the original plans.
+- [`PHASE_5_DAY_5_NOTES.md`](PHASE_5_DAY_5_NOTES.md) — Day-5 shipped surface + carry-forward findings.
+- [`PHASE_5_DAY_6_NOTES.md`](PHASE_5_DAY_6_NOTES.md) — Day-6 shipped surface + carry-forward findings.
+- [`SELF_HOSTED_RUNNER_SPEC.md`](SELF_HOSTED_RUNNER_SPEC.md) — provisioning contract for the Day-6 lane.
 - [`PLAN.md`](PLAN.md) — overarching Vz-backend roadmap.
-- `.github/workflows/mac-vz.yml` — the workflow itself.
+- `.github/workflows/mac-vz.yml` — the main workflow.
+- `.github/workflows/_self-hosted-probe.yml` — the heartbeat probe.
 - `justfile` § "Phase 5 Day 5 — CI-mirror recipes" — the local-mirror recipes.

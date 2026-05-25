@@ -145,6 +145,14 @@ host_platform() {
     esac
 }
 
+# Phase 5 Day 6 — FORCE_FULL override (highest precedence).
+# See the matching block in `local-carrier-setup-smoke.sh` for
+# the precedence table.
+if [[ "${ELASTOS_VZ_SMOKE_FORCE_FULL:-0}" == "1" ]]; then
+    echo "[home-frontdoor] FORCE_FULL=1 — forcing full smoke run (overrides CI auto-detect)"
+    export ELASTOS_VZ_SMOKE_DRY_RUN=0
+fi
+
 # Phase 5 Day 5 — auto-dry-run in CI. See the matching block in
 # `local-carrier-setup-smoke.sh` for the rationale. Explicit
 # `ELASTOS_VZ_SMOKE_DRY_RUN` settings (either `=0` or `=1`)

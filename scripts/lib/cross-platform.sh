@@ -451,6 +451,38 @@ cross_platform_in_ci() {
     esac
 }
 
+# Predicate: should the Mac smokes run in dry-run mode?
+# **Phase 5 Day 6.** Returns 0 (dry-run) when the layered
+# precedence resolves to dry-run, non-zero (full smoke)
+# otherwise. The precedence table (top wins) is:
+#
+#   1. ELASTOS_VZ_SMOKE_FORCE_FULL=1 → full run, even in CI.
+#   2. ELASTOS_VZ_SMOKE_DRY_RUN=0    → full run.
+#   3. ELASTOS_VZ_SMOKE_DRY_RUN=1    → dry-run.
+#   4. CI auto-detect (Day 5)        → dry-run.
+#   5. Default                       → full run.
+#
+# Centralises the precedence so the three Mac smokes can be
+# refactored to share it (Phase 5 Day 8 follow-up) and so the
+# unit tests pin the contract independently of any individual
+# smoke's inline implementation. The smokes today still carry
+# the operator-visible echo lines for the FORCE_FULL and
+# CI-auto-detect cases; this helper is the canonical
+# precedence reference.
+cross_platform_smoke_should_dry_run() {
+    if [[ "${ELASTOS_VZ_SMOKE_FORCE_FULL:-0}" == "1" ]]; then
+        return 1
+    fi
+    case "${ELASTOS_VZ_SMOKE_DRY_RUN:-}" in
+        0) return 1 ;;
+        1) return 0 ;;
+    esac
+    if cross_platform_in_ci; then
+        return 0
+    fi
+    return 1
+}
+
 # Locate an installed Vz-launchable capsule on the host.
 # **Phase 5 Day 1.** Returns 0 and prints the capsule name on
 # stdout if a `<data_dir>/capsules/<name>/rootfs.ext4` plus a

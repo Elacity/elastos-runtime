@@ -1,6 +1,8 @@
 # Phase 5 — Hardening + Linux smoke parity on Mac
 
-> **Status:** Days 1–5 complete (see `PHASE_5_DAY_{1,2,3,4,5}_NOTES.md`); Days 6–8 remain. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+> **Status:** Days 1–6 complete (see `PHASE_5_DAY_{1,2,3,4,5,6}_NOTES.md`); Days 7–8 remain. Day-by-day breakdown of the Phase-5 deliverable from [`PLAN.md`](PLAN.md) ("the Mac substrate is as reliable as the Linux substrate for the same workloads"). Each day lands one commit + one `PHASE_5_DAY_N_NOTES.md` outcome log, following the Phase-4 cadence.
+>
+> **Day 6 outcome:** Self-hosted full-boot lane wired but dormant. New `mac-vz-full-boot` job in `mac-vz.yml`, doubly-gated on `vars.MAC_VZ_FULL_BOOT_ENABLED == 'true'` + `runs-on: [self-hosted, macOS, ARM64, vz-capable]`. New `ELASTOS_VZ_SMOKE_FORCE_FULL=1` smoke env-var sits at the top of a documented 5-layer precedence table (FORCE_FULL → explicit DRY_RUN → CI auto-detect → default). 3 new shell-helper assertions covering FORCE_FULL precedence (41 → 44) + new canonical `cross_platform_smoke_should_dry_run` helper. New `_self-hosted-probe.yml` heartbeat probe runs every 6 h. New `SELF_HOSTED_RUNNER_SPEC.md` documents hardware + label set + provisioning + security posture + kill switches. `CI_RUNBOOK.md` § 3a covers the self-hosted lane end-to-end.
 >
 > **Day 5 outcome:** New `.github/workflows/mac-vz.yml` workflow gates every Vz commit on Apple Silicon CI with three jobs (`mac-rust-tests`, `mac-shell-helpers`, `mac-smokes-dry-run`) under per-job timeout caps + concurrency-cancel + Mac-specific cargo-cache prefix. New `cross_platform_in_ci` predicate auto-enables `ELASTOS_VZ_SMOKE_DRY_RUN=1` when CI is detected (explicit `=0` operator override always wins). 4 new shell-helper assertions (37 → 41). Five new `just ci-*` recipes mirror the workflow exactly so local Mac dev stays feedback-aligned with CI. New `docs/vz-backend/CI_RUNBOOK.md` operator runbook covers failure-reading, manual-run triggers, local-reproduction, and the explicit list of what CI does NOT cover. `workflow_dispatch:` added to `linux-untouched.yml` so operators can re-run after a rebase without pushing.
 >
@@ -110,7 +112,9 @@ This is **the** smoke that exercises the full Phase-4 Day-3 dispatch graph end t
 
 ### Day 6 — Performance baseline document (4–6 h)
 
-**Problem.** PLAN.md L308 asks for "boot latency, throughput vs Linux; declare honest deltas in `docs/MAC.md`." Phase 5 Day 6 measures the deltas honestly, no apologetics.
+> **Day-6 actual scope deviation:** Day 6 shipped the **self-hosted full-boot CI lane** + FORCE_FULL precedence layer + `SELF_HOSTED_RUNNER_SPEC.md` instead of the original perf-baseline scope. Rationale: Day 5 landed the GitHub-hosted dry-run lane but explicitly deferred the real-Vz-boot lane to "Day 6+ self-hosted-runner spec" (see PHASE_5_DAY_5_NOTES.md). Without a Day-6 self-hosted lane, the perf-baseline numbers from a developer Mac wouldn't be reproducible in CI, so the perf baseline depends on the self-hosted runner being specified first. Perf baseline shifts to Day 7 (along with the original Day-7 CI runner scope, which Day 5 fulfilled). See `PHASE_5_DAY_6_NOTES.md` for the actual delivery.
+
+**Problem (original).** PLAN.md L308 asks for "boot latency, throughput vs Linux; declare honest deltas in `docs/MAC.md`." Phase 5 Day 6 measures the deltas honestly, no apologetics.
 
 **Concrete deliverables:**
 1. **`scripts/measure-vz-baseline.sh`** (new, Mac-only) — runs the Phase-5-Day-5 stress test 5 times, collects per-launch boot latency (handle minted → `capsule_status: running`), per-launch stop latency (`stop_capsule` issued → `last_exit_reason` returned), and per-RPC round-trip latency. Emits JSON to `target/vz-baseline.json`.

@@ -114,6 +114,20 @@ trap cleanup EXIT
 
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
 
+# Phase 5 Day 6 — FORCE_FULL override (highest precedence).
+# Used by the self-hosted Mac runner spec (see
+# docs/vz-backend/SELF_HOSTED_RUNNER_SPEC.md) to opt back into
+# the full smoke lane after Day-5's CI auto-detect would have
+# downgraded the run to dry-run. Layered precedence (top wins):
+#   1. ELASTOS_VZ_SMOKE_FORCE_FULL=1   → full run, even in CI.
+#   2. ELASTOS_VZ_SMOKE_DRY_RUN=0/1   → explicit operator setting.
+#   3. CI auto-detect + DRY_RUN unset → DRY_RUN=1 (Day 5).
+#   4. Default                        → full run.
+if [[ "${ELASTOS_VZ_SMOKE_FORCE_FULL:-0}" == "1" ]]; then
+    echo "[local-carrier-setup] FORCE_FULL=1 — forcing full smoke run (overrides CI auto-detect)"
+    export ELASTOS_VZ_SMOKE_DRY_RUN=0
+fi
+
 # Phase 5 Day 5 — auto-dry-run in CI. GitHub Actions runners
 # don't have a provisioned `~/.local/share/elastos`, so the
 # full smoke would visible-skip on every PR. Explicit operator

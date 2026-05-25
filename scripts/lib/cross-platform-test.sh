@@ -502,6 +502,56 @@ else
     fail "both GITHUB_ACTIONS=true AND CI=true must report 'in CI'"
 fi
 
+# ─── cross_platform_smoke_should_dry_run (Phase 5 Day 6) ────
+TEST_NAME="cross_platform_smoke_should_dry_run"
+
+# Precedence table (top wins):
+#   1. FORCE_FULL=1            → full run.
+#   2. DRY_RUN=0 / DRY_RUN=1   → explicit operator setting.
+#   3. CI auto-detect          → dry-run.
+#   4. Default                 → full run.
+#
+# These three assertions cover the FORCE_FULL precedence
+# specifically — the existing `cross_platform_in_ci` block
+# already pins the Day-5 CI auto-detect layer.
+
+# 1. FORCE_FULL=1 alone → no dry-run.
+if (
+    unset ELASTOS_VZ_SMOKE_DRY_RUN GITHUB_ACTIONS CI
+    ELASTOS_VZ_SMOKE_FORCE_FULL=1
+    cross_platform_smoke_should_dry_run
+); then
+    fail "FORCE_FULL=1 alone must NOT dry-run"
+else
+    ok "FORCE_FULL=1 alone returns 1 (full run)"
+fi
+
+# 2. FORCE_FULL=1 + DRY_RUN=1 → FORCE_FULL wins → no dry-run.
+if (
+    unset GITHUB_ACTIONS CI
+    ELASTOS_VZ_SMOKE_FORCE_FULL=1
+    ELASTOS_VZ_SMOKE_DRY_RUN=1
+    cross_platform_smoke_should_dry_run
+); then
+    fail "FORCE_FULL=1 must override explicit DRY_RUN=1"
+else
+    ok "FORCE_FULL=1 beats DRY_RUN=1 (full run)"
+fi
+
+# 3. FORCE_FULL=1 + CI=true → FORCE_FULL wins over CI
+#    auto-detect → no dry-run. Locks in the self-hosted
+#    runner's opt-back-in path (Day 6 deliverable).
+if (
+    unset ELASTOS_VZ_SMOKE_DRY_RUN GITHUB_ACTIONS
+    ELASTOS_VZ_SMOKE_FORCE_FULL=1
+    CI=true
+    cross_platform_smoke_should_dry_run
+); then
+    fail "FORCE_FULL=1 must override CI auto-detect"
+else
+    ok "FORCE_FULL=1 beats CI auto-detect (full run)"
+fi
+
 # ─── summary ────────────────────────────────────────────────
 
 echo
