@@ -875,9 +875,46 @@ impl Supervisor {
 
         let crosvm_config = CrosvmConfig::new()
             .with_crosvm_bin(crosvm_bin)
-            .with_kernel_path(kernel_path)
+            .with_kernel_path(kernel_path.clone())
             .with_socket_dir(data_dir.join("crosvm"))
             .with_rootfs_cache_dir(data_dir.join("rootfs-cache"));
+
+        // Phase 7 Day 3 — Mac substrate paths come from the registry.
+        //
+        // `VzConfig::new()` defaults `kernel_path` to
+        // `$HOME/.local/share/elastos/bin/vmlinux` (matching the crosvm
+        // convention so a single Linux data-dir hosts both substrates).
+        // On macOS that's the wrong directory: the elastos-server
+        // installer writes to `dirs::data_dir().join("elastos")` =
+        // `$HOME/Library/Application Support/elastos/`. Without the wire-
+        // up here, every Mac `launch_capsule` would hit `KernelNotFound`
+        // (caught by `VzConfig::validate`) even though `elastos setup`
+        // successfully staged the artifact.
+        //
+        // Initramfs is conditional: populate only when `bin/initrd`
+        // exists on disk. The Day-2 fetcher always installs it when
+        // `--profile minimal/chat/full` is selected, but a Linux-style
+        // boot (kernel-only) still has to work on Mac for the day
+        // someone ships a self-built kernel with virtio drivers built
+        // into the image. `is_file()` rather than `exists()` so we fail
+        // closed against a stray directory at that path.
+        //
+        // Linux is untouched: the cfg-gate keeps the existing arm
+        // byte-identical, and `vz_config.kernel_path` on Linux is dead
+        // code (the launch path goes through `crosvm_config`).
+        #[cfg(target_os = "macos")]
+        let vz_config = {
+            let vz_config = vz_config.with_kernel_path(kernel_path);
+            let installed_initrd =
+                Self::resolve_external_install_path(&registry, &data_dir, "initrd", "bin/initrd");
+            if installed_initrd.is_file() {
+                vz_config.with_initramfs_path(installed_initrd)
+            } else {
+                vz_config
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let _ = kernel_path;
 
         // Phase 5 Day 4: Mac-only startup orphan prune. Computed
         // BEFORE `Self { ... }` so the supervisor's filesystem
@@ -3940,6 +3977,181 @@ mod tests {
         assert!(
             supervisor.take_pending_orphan_report().is_none(),
             "Phase 5 Day 4 opt-out: pending orphan report must be None so EnsureCapsule responses elide the orphans_pruned field"
+        );
+    }
+
+    /// Phase 7 Day 3 — Mac supervisor must populate
+    /// `vz_config.kernel_path` from the registry-resolved
+    /// `bin/vmlinux` path, even when constructed via the
+    /// argument-free `Supervisor::new` (i.e. the production
+    /// call path from `serve_cmd.rs` + `gateway_cmd.rs`). The
+    /// default `VzConfig::new()` points at
+    /// `~/.local/share/elastos/bin/vmlinux` (crosvm convention),
+    /// which is the wrong location on macOS — the installer
+    /// writes to `dirs::data_dir().join("elastos")`. Without
+    /// this wire-up the first real-capsule launch on Mac would
+    /// hit `VzConfig::KernelNotFound` even though `elastos
+    /// setup` had successfully staged the kernel.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_supervisor_wires_kernel_path_from_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(data_dir.join("bin")).unwrap();
+
+        let mut external = std::collections::HashMap::new();
+        external.insert(
+            "vmlinux".to_string(),
+            make_external_component(
+                PlatformInfo {
+                    url: Some("https://example/vmlinuz".to_string()),
+                    cid: None,
+                    release_path: None,
+                    checksum: Some("sha256:placeholder".to_string()),
+                    extract_path: None,
+                    install_path: Some("bin/vmlinux".to_string()),
+                    strategy: None,
+                    source: None,
+                    note: None,
+                    size: Some(1),
+                    compression: Some("gzip".to_string()),
+                },
+                "bin/vmlinux",
+            ),
+        );
+
+        let supervisor = Supervisor::new(
+            data_dir.clone(),
+            ComponentsManifest {
+                external,
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            supervisor.vz_config().kernel_path,
+            data_dir.join("bin/vmlinux"),
+            "Phase 7 Day 3: Mac supervisor must override the VzConfig::new default \
+             (~/.local/share/elastos/bin/vmlinux) with the registry-resolved path \
+             under the supervisor's actual data_dir; otherwise VzConfig::validate \
+             will fail KernelNotFound at first launch."
+        );
+    }
+
+    /// Phase 7 Day 3 — when the registry-resolved `bin/initrd`
+    /// exists on disk, the Mac supervisor must populate
+    /// `vz_config.initramfs_path` so every per-capsule
+    /// `VmConfig` inherits it (see provider.rs:122-125 fallback
+    /// already in the elastos-vz substrate). The Day-2 fetcher
+    /// always writes `bin/initrd` for the minimal/chat/full
+    /// profiles, so this is the production-normal case on Mac.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_supervisor_picks_up_installed_initrd_as_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let installed_initrd = bin_dir.join("initrd");
+        std::fs::write(&installed_initrd, b"placeholder-initrd-bytes").unwrap();
+
+        let mut external = std::collections::HashMap::new();
+        external.insert(
+            "initrd".to_string(),
+            make_external_component(
+                PlatformInfo {
+                    url: Some(
+                        "https://example/ubuntu-22.04-server-cloudimg-arm64-initrd-generic"
+                            .to_string(),
+                    ),
+                    cid: None,
+                    release_path: None,
+                    checksum: Some("sha256:placeholder".to_string()),
+                    extract_path: None,
+                    install_path: Some("bin/initrd".to_string()),
+                    strategy: None,
+                    source: None,
+                    note: None,
+                    size: Some(1),
+                    compression: None,
+                },
+                "bin/initrd",
+            ),
+        );
+
+        let supervisor = Supervisor::new(
+            data_dir.clone(),
+            ComponentsManifest {
+                external,
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            supervisor.vz_config().initramfs_path.as_deref(),
+            Some(installed_initrd.as_path()),
+            "Phase 7 Day 3: Mac supervisor must default vz_config.initramfs_path \
+             to the registry-resolved bin/initrd when that file exists; otherwise \
+             every capsule on Mac will fail to mount its rootfs (Ubuntu's generic \
+             kernel ships virtio_blk as a module loaded by initramfs)."
+        );
+    }
+
+    /// Phase 7 Day 3 — symmetric to
+    /// `mac_supervisor_picks_up_installed_initrd_as_default`:
+    /// when `bin/initrd` is NOT on disk (e.g. someone shipped a
+    /// self-built kernel with built-in virtio_blk), the
+    /// supervisor must leave `vz_config.initramfs_path = None`
+    /// so the kernel boots directly into the rootfs. Fail-closed
+    /// against a stray directory at that path: the helper uses
+    /// `is_file()` not `exists()`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_supervisor_omits_initramfs_when_not_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(data_dir.join("bin")).unwrap();
+        // Drop a *directory* at bin/initrd to also exercise the
+        // is_file() fail-closed branch.
+        std::fs::create_dir_all(data_dir.join("bin/initrd")).unwrap();
+
+        let mut external = std::collections::HashMap::new();
+        external.insert(
+            "initrd".to_string(),
+            make_external_component(
+                PlatformInfo {
+                    url: Some("https://example/initrd".to_string()),
+                    cid: None,
+                    release_path: None,
+                    checksum: None,
+                    extract_path: None,
+                    install_path: Some("bin/initrd".to_string()),
+                    strategy: None,
+                    source: None,
+                    note: None,
+                    size: None,
+                    compression: None,
+                },
+                "bin/initrd",
+            ),
+        );
+
+        let supervisor = Supervisor::new(
+            data_dir,
+            ComponentsManifest {
+                external,
+                capsules: std::collections::HashMap::new(),
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+
+        assert!(
+            supervisor.vz_config().initramfs_path.is_none(),
+            "Phase 7 Day 3: Mac supervisor must leave initramfs_path = None when \
+             bin/initrd does not exist as a regular file (is_file() must reject \
+             the stray-directory case for fail-closed behaviour)."
         );
     }
 
