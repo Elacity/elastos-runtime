@@ -136,10 +136,61 @@ pub(crate) fn print_report(
         }
     }
 
+    // Phase 8 Day 3 — surface the base rootfs the supervisor's capsule
+    // launch path will consume. Unlike kernel/initrd (resolved via
+    // `VzConfig` because the substrate owns the absolute paths), the
+    // rootfs lives at a per-capsule path that the supervisor computes
+    // on demand from `capsules_dir`. Doctor reads the install path
+    // straight from the registry so the row is meaningful even before
+    // any capsule has been instantiated.
+    match resolve_rootfs_install_path(manifest, platform) {
+        Some(install_path) => {
+            let rootfs_path = data_dir.join(install_path);
+            print_artifact_row(
+                out,
+                ArtifactRow {
+                    label: "rootfs",
+                    path: &rootfs_path,
+                    validate_as_kernel: false,
+                    remediation: "elastos setup --profile minimal",
+                    manifest_component: "rootfs",
+                },
+                manifest,
+                verbose,
+            )?;
+        }
+        None => {
+            writeln!(out, "  rootfs:     not configured")?;
+            writeln!(
+                out,
+                "              no `external.rootfs` entry for {platform} in components.json"
+            )?;
+            writeln!(out)?;
+        }
+    }
+
     print_dir_row(out, "state_dir", &vz_config.state_dir)?;
     print_dir_row(out, "rootfs_cache_dir", &vz_config.rootfs_cache_dir)?;
 
     Ok(())
+}
+
+/// Resolve the on-disk install path for the base rootfs, honouring the
+/// same platform-override-then-component-default fallback the install
+/// loop uses in [`crate::setup`]. Returns `None` when the manifest has
+/// no `external.rootfs` entry, or when neither the platform row nor the
+/// component itself declares an `install_path` — both of which are
+/// "rootfs not configured for this platform" cases doctor reports
+/// explicitly so the operator knows to update `components.json`.
+fn resolve_rootfs_install_path<'a>(
+    manifest: &'a ComponentsManifest,
+    platform: &str,
+) -> Option<&'a str> {
+    let component = manifest.external.get("rootfs")?;
+    let platform_info = component.platforms.get(platform);
+    platform_info
+        .and_then(|p| p.install_path.as_deref())
+        .or(component.install_path.as_deref())
 }
 
 /// Parameters for a single substrate-artifact row. Bundled in a struct
@@ -272,9 +323,12 @@ mod tests {
     fn fixture_manifest() -> ComponentsManifest {
         // Build a minimal manifest that matches what `Supervisor::new`
         // expects: an `external.vmlinux` entry with a platform row for
-        // the test runner's platform that resolves to `bin/vmlinux`.
-        let mut platforms = HashMap::new();
-        platforms.insert(
+        // the test runner's platform that resolves to `bin/vmlinux`,
+        // plus an `external.rootfs` entry resolving to the canonical
+        // capsule path so the Phase-8-Day-3 rootfs row is exercised
+        // alongside the kernel row.
+        let mut vmlinux_platforms = HashMap::new();
+        vmlinux_platforms.insert(
             detect_platform(),
             PlatformInfo {
                 url: Some("https://example.test/vmlinux".to_string()),
@@ -290,6 +344,23 @@ mod tests {
                 compression: Some("gzip".to_string()),
             },
         );
+        let mut rootfs_platforms = HashMap::new();
+        rootfs_platforms.insert(
+            detect_platform(),
+            PlatformInfo {
+                url: Some("https://example.test/rootfs.squashfs".to_string()),
+                cid: None,
+                release_path: None,
+                checksum: Some("sha256:fedcba9876543210".to_string()),
+                extract_path: None,
+                install_path: Some("capsules/ubuntu-base/rootfs.ext4".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: Some(430985216),
+                compression: None,
+            },
+        );
         let mut external = HashMap::new();
         external.insert(
             "vmlinux".to_string(),
@@ -298,7 +369,17 @@ mod tests {
                 install_path: Some("bin/vmlinux".to_string()),
                 size_mb: None,
                 description: None,
-                platforms,
+                platforms: vmlinux_platforms,
+            },
+        );
+        external.insert(
+            "rootfs".to_string(),
+            Component {
+                version: None,
+                install_path: Some("capsules/ubuntu-base/rootfs.ext4".to_string()),
+                size_mb: None,
+                description: None,
+                platforms: rootfs_platforms,
             },
         );
 
@@ -420,6 +501,104 @@ mod tests {
             "Phase 7 Day 6: WARN-and-above events must still pass through \
              — otherwise doctor would silently hide real problems. \
              Captured:\n{captured}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_rootfs_with_remediation_when_absent() {
+        // Phase 8 Day 3 — the rootfs row is doctor's "are you ready
+        // to boot a Linux userspace inside Vz?" surface. When no
+        // capsule has been staged, doctor must say so clearly and
+        // point at `elastos setup --profile minimal` (same remediation
+        // string vmlinux/initrd use, since they all install under one
+        // command). This is the empty-data-dir state a fresh checkout
+        // would see.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest = fixture_manifest();
+
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("rootfs:"),
+            "expected a rootfs row, got:\n{out}"
+        );
+        // Path should be data_dir-relative (resolved through the
+        // manifest, not hard-coded), so the tmpdir prefix must be in
+        // the row to prove we're not falling back to a global path.
+        assert!(
+            out.contains("capsules/ubuntu-base/rootfs.ext4"),
+            "expected canonical rootfs install path, got:\n{out}"
+        );
+        // The first [absent] tag belongs to the vmlinux row; we want
+        // to make sure the rootfs row ALSO reports absent, not that
+        // any single absent marker exists. Easiest check: count two
+        // distinct absent markers across the report.
+        assert!(
+            out.matches("[absent]").count() >= 2,
+            "expected at least two [absent] rows (vmlinux + rootfs), got:\n{out}"
+        );
+        // Remediation hint must mention `elastos setup` so the
+        // operator has a single, actionable next step.
+        assert!(
+            out.contains("elastos setup --profile minimal"),
+            "expected remediation hint, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_rootfs_present_with_size() {
+        // Phase 8 Day 3 — when the install loop has landed the
+        // squashfs at the canonical path, doctor reports it as
+        // present and shows the on-disk size. We don't run the
+        // kernel validator on rootfs (it's not a kernel), so
+        // `validate_as_kernel: false` means the row terminates
+        // after the size line — no validate stanza.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        std::fs::create_dir_all(data_dir.join("capsules/ubuntu-base")).unwrap();
+        // 2 KiB sentinel — large enough to test the human-bytes path
+        // ("2.0 KB") but small enough to keep the test fast.
+        std::fs::write(
+            data_dir.join("capsules/ubuntu-base/rootfs.ext4"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+
+        let manifest = fixture_manifest();
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("rootfs:"),
+            "expected a rootfs row, got:\n{out}"
+        );
+        // The rootfs-row's `[present]` marker must follow the
+        // `rootfs:` label. Locate the rootfs section explicitly
+        // because the report contains a `[present]` from vmlinux
+        // too on present runs.
+        let rootfs_section = out
+            .split_once("rootfs:")
+            .map(|(_, rest)| rest)
+            .expect("report should contain a rootfs section");
+        let next_section = rootfs_section
+            .find("state_dir:")
+            .expect("state_dir row should follow rootfs row");
+        let rootfs_section = &rootfs_section[..next_section];
+        assert!(
+            rootfs_section.contains("[present]"),
+            "expected [present] in rootfs section, got rootfs section:\n{rootfs_section}"
+        );
+        assert!(
+            rootfs_section.contains("2.0 KB"),
+            "expected human-bytes size in rootfs section, got rootfs section:\n{rootfs_section}"
+        );
+        // Rootfs row must NOT run the kernel validator — it's not a
+        // kernel. The validator output would be either
+        // `[validate] passes …` or `[validate FAIL] …`. Absence of
+        // the substring is the assertion.
+        assert!(
+            !rootfs_section.contains("[validate"),
+            "rootfs row must not invoke the kernel validator, got rootfs section:\n{rootfs_section}"
         );
     }
 
