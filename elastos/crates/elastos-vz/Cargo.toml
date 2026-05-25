@@ -39,3 +39,12 @@ tempfile = "3.10"
 # don't need the formatting / filter / env machinery — just `Layer`
 # trait + `Registry` — so `tracing-subscriber` is minimal here.
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+# Phase 8 Day 4: platform-aware data-dir resolution for the
+# discover_kernel/initrd/rootfs helpers in tests/concurrent_launch.rs.
+# Linux: $XDG_DATA_HOME (default ~/.local/share) — byte-identical to
+# the old hard-coded Linux path, so existing Linux test workflows
+# stay green. macOS: ~/Library/Application Support — matches the
+# install paths `elastos setup` writes to on this platform (see
+# elastos-server/src/sources.rs::default_data_dir). Pinned to 5.0
+# to match elastos-server / elastos-storage / elastos-compute.
+dirs = "5.0"

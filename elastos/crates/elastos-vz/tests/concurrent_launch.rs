@@ -166,35 +166,56 @@ async fn concurrent_load_rejections_isolate_per_vm() {
     assert_eq!(completed, 3, "all three tasks must complete");
 }
 
-/// Auto-discover the canonical kernel install path. The
-/// supervisor's `VzConfig::default()` resolves to
-/// `~/.local/share/elastos/bin/vmlinux` (see `VzConfig::new`).
-/// `ELASTOS_VZ_TEST_KERNEL` overrides the discovery for
-/// developer-driven runs against a kernel in a non-standard
-/// location.
+/// Platform-aware base data directory the integration tests read
+/// from. Mirrors `elastos-server::sources::default_data_dir`:
+///
+/// - Linux: `$XDG_DATA_HOME/elastos` (default `~/.local/share/elastos`)
+/// - macOS: `~/Library/Application Support/elastos`
+///
+/// Phase 8 Day 4 — replaces three previously hard-coded
+/// `~/.local/share/elastos/` paths in the discover helpers
+/// (kernel/initrd/rootfs). Existing Linux test workflows are
+/// byte-identical because `dirs::data_dir()` on Linux returns the
+/// same `~/.local/share` path. macOS now finds artefacts that
+/// `elastos setup` actually installs, instead of looking under a
+/// directory that doesn't exist on this platform.
+///
+/// We keep this `pub(super)`-style (free function in the test
+/// crate) intentionally: the test crate is an integration boundary
+/// and shouldn't take a runtime dep on `elastos-server` just to
+/// reach `default_data_dir`. The 3-line lookup is cheap to
+/// replicate; correctness is enforced by the matching pinned
+/// `dirs = "5.0"` in this crate's dev-deps and in elastos-server's
+/// runtime deps.
+fn test_data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("elastos"))
+}
+
+/// Auto-discover the canonical kernel install path. Reads from
+/// `<data_dir>/bin/vmlinux` where `<data_dir>` resolves through
+/// [`test_data_dir`]. `ELASTOS_VZ_TEST_KERNEL` overrides the
+/// discovery for developer-driven runs against a kernel in a
+/// non-standard location.
 fn discover_kernel() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ELASTOS_VZ_TEST_KERNEL") {
         let pb = PathBuf::from(p);
         return pb.is_file().then_some(pb);
     }
-    let home = std::env::var_os("HOME")?;
-    let candidate = PathBuf::from(home).join(".local/share/elastos/bin/vmlinux");
+    let candidate = test_data_dir()?.join("bin/vmlinux");
     candidate.is_file().then_some(candidate)
 }
 
 /// Auto-discover any installed capsule rootfs. The supervisor
-/// extracts capsules to `~/.local/share/elastos/capsules/<name>/`
-/// with the rootfs at `<name>/rootfs.ext4`. We pick the first
-/// match — every capsule's rootfs is bootable; the test only
-/// needs to prove parallel VMs load.
-/// `ELASTOS_VZ_TEST_ROOTFS` is the override.
+/// extracts capsules to `<data_dir>/capsules/<name>/` with the
+/// rootfs at `<name>/rootfs.ext4`. We pick the first match — every
+/// capsule's rootfs is bootable; the test only needs to prove
+/// parallel VMs load. `ELASTOS_VZ_TEST_ROOTFS` is the override.
 fn discover_rootfs() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ELASTOS_VZ_TEST_ROOTFS") {
         let pb = PathBuf::from(p);
         return pb.is_file().then_some(pb);
     }
-    let home = std::env::var_os("HOME")?;
-    let capsules_dir = PathBuf::from(home).join(".local/share/elastos/capsules");
+    let capsules_dir = test_data_dir()?.join("capsules");
     let entries = std::fs::read_dir(&capsules_dir).ok()?;
     for entry in entries.flatten() {
         let rootfs = entry.path().join("rootfs.ext4");
@@ -234,8 +255,8 @@ async fn concurrent_load_with_real_kernel() {
         None => {
             eprintln!(
                 "concurrent_load_with_real_kernel: skipping — no kernel found at \
-                 $ELASTOS_VZ_TEST_KERNEL or ~/.local/share/elastos/bin/vmlinux. \
-                 Run `elastos setup --with vmlinux` first."
+                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux. \
+                 Run `elastos setup --profile minimal` first."
             );
             return;
         }
@@ -245,8 +266,8 @@ async fn concurrent_load_with_real_kernel() {
         None => {
             eprintln!(
                 "concurrent_load_with_real_kernel: skipping — no rootfs found at \
-                 $ELASTOS_VZ_TEST_ROOTFS or ~/.local/share/elastos/capsules/*/rootfs.ext4. \
-                 Run `elastos setup` and pull at least one MicroVM capsule first."
+                 $ELASTOS_VZ_TEST_ROOTFS or <data_dir>/capsules/*/rootfs.ext4. \
+                 Run `elastos setup --profile minimal` first."
             );
             return;
         }
@@ -411,9 +432,21 @@ fn discover_initrd() -> Option<PathBuf> {
         let pb = PathBuf::from(p);
         return pb.is_file().then_some(pb);
     }
-    let home = std::env::var_os("HOME")?;
-    let candidate = PathBuf::from(home).join(".local/share/elastos/bin/initrd-generic");
-    candidate.is_file().then_some(candidate)
+    let data_dir = test_data_dir()?;
+    // Phase 8 Day 4 — Phase 7 Day 2 standardised the canonical
+    // install path to `bin/initrd` (no suffix); the older
+    // `bin/initrd-generic` name predates that decision and stays as
+    // a fallback so a manual operator who fetched the artefact by
+    // its upstream filename still has a working test discovery.
+    // The canonical name wins on lookup precedence — that's the
+    // name `elastos setup` writes today.
+    for name in ["bin/initrd", "bin/initrd-generic"] {
+        let candidate = data_dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Returns true once the captured `vm_console` buffer contains any of
@@ -452,8 +485,8 @@ async fn single_vm_boots_to_userspace() {
         None => {
             eprintln!(
                 "single_vm_boots_to_userspace: skipping — no kernel at \
-                 $ELASTOS_VZ_TEST_KERNEL or ~/.local/share/elastos/bin/vmlinux. \
-                 See docs/vz-backend/PHASE_6_DAY_6_VALIDATION.md § 6."
+                 $ELASTOS_VZ_TEST_KERNEL or <data_dir>/bin/vmlinux. \
+                 Run `elastos setup --profile minimal` first."
             );
             return;
         }
@@ -463,10 +496,8 @@ async fn single_vm_boots_to_userspace() {
         None => {
             eprintln!(
                 "single_vm_boots_to_userspace: skipping — no initramfs at \
-                 $ELASTOS_VZ_TEST_INITRD or ~/.local/share/elastos/bin/initrd-generic. \
-                 Download Ubuntu's published one: curl -fsSL -o \
-                 ~/.local/share/elastos/bin/initrd-generic \
-                 https://cloud-images.ubuntu.com/jammy/current/unpacked/jammy-server-cloudimg-arm64-initrd-generic"
+                 $ELASTOS_VZ_TEST_INITRD or <data_dir>/bin/initrd (or the legacy \
+                 bin/initrd-generic fallback). Run `elastos setup --profile minimal` first."
             );
             return;
         }
