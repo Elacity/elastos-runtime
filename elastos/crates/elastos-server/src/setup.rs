@@ -308,6 +308,19 @@ pub async fn run(
 
     let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
 
+    // Phase 8 Day 5 — auto-init capsule metadata for known
+    // standalone microVM capsules (e.g. `ubuntu-base`) so that
+    // `elastos run <name>` finds a valid `capsule.json` adjacent
+    // to the rootfs.ext4 the install loop just wrote. Idempotent:
+    // skips when the file is already present, never overwrites
+    // operator edits. See `ensure_standalone_capsule_metadata`.
+    if let Err(e) = ensure_standalone_capsule_metadata(&data_dir) {
+        // Non-fatal: the rootfs is installed and the user can
+        // still hand-write a capsule.json. We just lose the
+        // one-command-demo path for this run.
+        eprintln!("[warn] capsule metadata init failed: {e}");
+    }
+
     println!();
     if !stamped.is_empty() {
         println!(
@@ -320,6 +333,63 @@ pub async fn run(
         installed_count, skipped_count
     );
 
+    Ok(())
+}
+
+/// Write a default `capsule.json` for any known standalone microVM
+/// capsule (today: `ubuntu-base`) when the rootfs is installed but
+/// the operator has not yet written their own manifest. Idempotent:
+/// if `capsule.json` already exists at the target path we leave it
+/// untouched, so operator customisations survive `elastos setup`
+/// re-runs.
+///
+/// The auto-init list is intentionally hard-coded for Phase 8 Day 5.
+/// A future general mechanism (`PlatformInfo.capsule_manifest` or a
+/// new `external.<name>.capsule_template` field) is the obvious
+/// next step, but premature generalisation would lock the schema
+/// before we have a second standalone capsule to drive it.
+pub(crate) fn ensure_standalone_capsule_metadata(data_dir: &Path) -> anyhow::Result<()> {
+    const UBUNTU_BASE_CAPSULE_JSON: &str = r#"{
+  "schema": "elastos.capsule/v1",
+  "version": "0.1.0",
+  "name": "ubuntu-base",
+  "description": "Ubuntu 22.04 LTS arm64 base rootfs — first real Linux guest on Mac (Phase 8 v0.1 demo). Boot path: kernel → initramfs → pivot to /dev/vda (the rootfs.ext4 squashfs from Canonical's cloud images). The squashfs is read-only; v0.1 boots through to userspace handover and exposes the demo behaviour. A writable overlay (tmpfs or copy-on-write file) is a Day-6+ task once we measure what userspace actually wants to write to.",
+  "role": "app",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "resources": {
+    "memory_mb": 256,
+    "cpu_shares": 100
+  },
+  "microvm": {
+    "boot_args": "console=hvc0 reboot=k panic=1 root=/dev/vda rootfstype=squashfs ro init=/sbin/init",
+    "vcpu_count": 1
+  }
+}
+"#;
+
+    let ubuntu_base_dir = data_dir.join("capsules/ubuntu-base");
+    let capsule_json_path = ubuntu_base_dir.join("capsule.json");
+    let rootfs_path = ubuntu_base_dir.join("rootfs.ext4");
+
+    // Only write metadata when the rootfs is actually present —
+    // otherwise we'd advertise a runnable capsule that fails at
+    // boot time with "rootfs not found", which is worse UX than
+    // the missing-rootfs error the rootfs check itself returns.
+    if !rootfs_path.is_file() {
+        return Ok(());
+    }
+
+    if capsule_json_path.is_file() {
+        return Ok(());
+    }
+
+    fs::write(&capsule_json_path, UBUNTU_BASE_CAPSULE_JSON)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", capsule_json_path.display()))?;
+    println!(
+        "[init] wrote default capsule metadata: {}",
+        capsule_json_path.display()
+    );
     Ok(())
 }
 
@@ -1803,6 +1873,80 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
+
+    /// Phase 8 Day 5 — the post-install hook writes a default
+    /// `capsule.json` next to the installed rootfs so
+    /// `elastos run ubuntu-base` finds a valid manifest. We
+    /// assert (a) it's a no-op when the rootfs isn't there
+    /// (no advertising a broken capsule), (b) it's a no-op when
+    /// the file already exists (operator edits survive setup
+    /// re-runs), and (c) when it does write, the result parses
+    /// as a valid `CapsuleManifest` so the install path doesn't
+    /// emit JSON we can't read back.
+    #[test]
+    fn ensure_capsule_metadata_skips_when_rootfs_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        // No rootfs was installed → the hook should leave the
+        // capsules dir alone (no spurious capsule.json that
+        // would advertise a runnable capsule with no payload).
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        assert!(
+            !data_dir.join("capsules/ubuntu-base/capsule.json").exists(),
+            "metadata hook must not write a manifest when the rootfs is missing"
+        );
+    }
+
+    #[test]
+    fn ensure_capsule_metadata_writes_when_rootfs_present_and_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let capsule_dir = data_dir.join("capsules/ubuntu-base");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(capsule_dir.join("rootfs.ext4"), b"sentinel").unwrap();
+
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        let manifest_path = capsule_dir.join("capsule.json");
+        assert!(
+            manifest_path.is_file(),
+            "metadata hook should write capsule.json when rootfs is present"
+        );
+
+        // Round-trip through the same parser `elastos run` uses
+        // — guards against future edits to the hard-coded JSON
+        // breaking the schema (typo in field name, missing
+        // schema version, etc.).
+        let body = fs::read_to_string(&manifest_path).unwrap();
+        let parsed: elastos_common::CapsuleManifest = serde_json::from_str(&body)
+            .expect("auto-init capsule.json must parse as CapsuleManifest");
+        parsed.validate().expect("auto-init capsule.json must validate");
+        assert_eq!(parsed.name, "ubuntu-base");
+        assert_eq!(parsed.entrypoint, "rootfs.ext4");
+        assert_eq!(parsed.capsule_type, elastos_common::CapsuleType::MicroVM);
+    }
+
+    #[test]
+    fn ensure_capsule_metadata_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let capsule_dir = data_dir.join("capsules/ubuntu-base");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(capsule_dir.join("rootfs.ext4"), b"sentinel").unwrap();
+
+        // Operator-edited content the hook must NOT overwrite —
+        // even though it doesn't parse as a real manifest, we
+        // promise not to clobber whatever's already there.
+        let manifest_path = capsule_dir.join("capsule.json");
+        let user_content = b"operator edited this -- do not overwrite";
+        fs::write(&manifest_path, user_content).unwrap();
+
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        let after = fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            after, user_content,
+            "metadata hook must not overwrite an existing capsule.json"
+        );
+    }
 
     #[test]
     fn test_detect_platform() {
