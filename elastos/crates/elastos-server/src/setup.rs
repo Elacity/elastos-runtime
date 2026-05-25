@@ -76,6 +76,13 @@ pub struct PlatformInfo {
     pub note: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    /// Optional whole-file compression applied to the downloaded bytes.
+    /// When set, the fetcher verifies the checksum against the *compressed*
+    /// bytes (matching what the publisher signed) and then decompresses to
+    /// `install_path`. Currently supports: "gzip". Does not apply to
+    /// tarball artifacts — those still use `extract_path` for unpacking.
+    #[serde(default)]
+    pub compression: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -476,6 +483,16 @@ pub fn verify_installed_component_binary(
             platform
         )
     })?;
+    // Compression-bearing artifacts cannot be checksum-verified post-install:
+    // the on-disk file is the decompressed form, whose hash by design differs
+    // from `platform_info.checksum` (which captures the as-downloaded,
+    // publisher-signed bytes). The download-time verifier already validated
+    // those compressed bytes when this file was first written, so we treat
+    // the artifact as verified here, consistent with how tarballs already skip
+    // per-file checksums.
+    if platform_info.compression.is_some() {
+        return Ok(String::new());
+    }
     let checksum = platform_info
         .checksum
         .as_deref()
@@ -732,33 +749,46 @@ fn component_install_state(
                 }
             }
 
-            if let Some(expected_size) = platform_info.size.filter(|size| *size > 0) {
-                match fs::metadata(&candidate) {
-                    Ok(meta) if meta.len() == expected_size => {}
-                    Ok(meta) => {
-                        return InstallState::Stale(format!(
-                            "size mismatch (have {} bytes, expected {})",
-                            meta.len(),
-                            expected_size
-                        ));
-                    }
-                    Err(err) => {
-                        return InstallState::Stale(format!("metadata read failed: {}", err));
+            // For compression-bearing artifacts, the on-disk file is the
+            // *decompressed* form — its size and hash do NOT match the
+            // `size`/`checksum` fields in components.json (those describe
+            // the as-downloaded, publisher-signed bytes). Skip the on-disk
+            // byte-level checks here, consistent with how tarball-extracted
+            // bundles skip per-file checksums (see lines above). Download-time
+            // `verify_checksum` has already validated the compressed bytes.
+            let skip_on_disk_byte_check = platform_info.compression.is_some();
+
+            if !skip_on_disk_byte_check {
+                if let Some(expected_size) = platform_info.size.filter(|size| *size > 0) {
+                    match fs::metadata(&candidate) {
+                        Ok(meta) if meta.len() == expected_size => {}
+                        Ok(meta) => {
+                            return InstallState::Stale(format!(
+                                "size mismatch (have {} bytes, expected {})",
+                                meta.len(),
+                                expected_size
+                            ));
+                        }
+                        Err(err) => {
+                            return InstallState::Stale(format!("metadata read failed: {}", err));
+                        }
                     }
                 }
-            }
 
-            if let Some(expected) = platform_info
-                .checksum
-                .as_deref()
-                .filter(|checksum| !checksum.is_empty())
-            {
-                match file_matches_checksum(&candidate, expected) {
-                    Ok(true) => InstallState::Installed,
-                    Ok(false) => InstallState::Stale("checksum mismatch".to_string()),
-                    Err(err) => {
-                        InstallState::Stale(format!("checksum verification failed: {}", err))
+                if let Some(expected) = platform_info
+                    .checksum
+                    .as_deref()
+                    .filter(|checksum| !checksum.is_empty())
+                {
+                    match file_matches_checksum(&candidate, expected) {
+                        Ok(true) => InstallState::Installed,
+                        Ok(false) => InstallState::Stale("checksum mismatch".to_string()),
+                        Err(err) => {
+                            InstallState::Stale(format!("checksum verification failed: {}", err))
+                        }
                     }
+                } else {
+                    InstallState::Installed
                 }
             } else {
                 InstallState::Installed
@@ -1312,7 +1342,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
     if is_tarball {
         extract_from_tarball(&bytes, dest, platform_info)?;
     } else {
-        atomic_write_file(dest, &bytes)?;
+        write_decompressed_or_verbatim(name, &bytes, dest, platform_info)?;
     }
 
     #[cfg(unix)]
@@ -1435,7 +1465,7 @@ async fn download_component(
         if is_tarball {
             extract_from_tarball(&bytes, dest, platform_info)?;
         } else {
-            atomic_write_file(dest, &bytes)?;
+            write_decompressed_or_verbatim(name, &bytes, dest, platform_info)?;
         }
     }
 
@@ -1586,6 +1616,49 @@ fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> any
     }
 
     Ok(())
+}
+
+/// Write the verified download bytes to `dest`, applying whole-file
+/// decompression first if `platform_info.compression` is set.
+///
+/// This is the single-file analogue of `extract_from_tarball`. The
+/// checksum has already been verified against the *as-downloaded*
+/// bytes upstream — that ordering is intentional, so the field in
+/// `components.json` matches what the publisher signs (e.g. Canonical's
+/// `SHA256SUMS` for `cloud-images.ubuntu.com` lists the compressed
+/// `vmlinuz-*-generic` bytes, not the decompressed Image).
+fn write_decompressed_or_verbatim(
+    name: &str,
+    data: &[u8],
+    dest: &Path,
+    platform_info: &PlatformInfo,
+) -> anyhow::Result<()> {
+    let Some(scheme) = platform_info
+        .compression
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return atomic_write_file(dest, data);
+    };
+
+    match scheme {
+        "gzip" => {
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+            let mut decoder = GzDecoder::new(data);
+            let mut decoded = Vec::with_capacity(data.len() * 2);
+            decoder.read_to_end(&mut decoded).map_err(|e| {
+                anyhow::anyhow!("gzip decompression of {} failed: {}", name, e)
+            })?;
+            atomic_write_file(dest, &decoded)
+        }
+        other => anyhow::bail!(
+            "unsupported compression scheme '{}' for component '{}' (supported: gzip)",
+            other,
+            name,
+        ),
+    }
 }
 
 fn extract_from_tarball(
@@ -1939,6 +2012,7 @@ mod tests {
                 source: None,
                 note: None,
                 size: Some(10),
+                compression: None,
             },
         );
         let comp = Component {
@@ -1984,6 +2058,7 @@ mod tests {
                 source: None,
                 note: None,
                 size: Some(1234),
+                compression: None,
             },
         );
         let component = Component {
@@ -2304,6 +2379,7 @@ mod tests {
                 source: Some(source_path.to_string_lossy().to_string()),
                 note: None,
                 size: Some(b"same-size-data".len() as u64),
+                compression: None,
             },
         );
         let comp = Component {
@@ -2333,6 +2409,7 @@ mod tests {
             source: None,
             note: None,
             size: None,
+            compression: None,
         };
 
         assert_eq!(

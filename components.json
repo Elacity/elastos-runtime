@@ -505,13 +505,25 @@
           "install_path": "bin/vmlinux"
         },
         "darwin-arm64": {
-          "cid": "",
-          "checksum": "",
-          "size": 0,
-          "release_path": "vmlinux-darwin-arm64",
+          "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260515/unpacked/ubuntu-22.04-server-cloudimg-arm64-vmlinuz-generic",
+          "checksum": "sha256:b712ef9919cad88f85e25e4b924c3dacde74e866363867b7b447b7841909462a",
+          "size": 15392425,
+          "compression": "gzip",
           "install_path": "bin/vmlinux",
-          "build_recipe": "scripts/build-vmlinux-arm64.sh",
-          "note": "Day-4b operator handoff: run scripts/build-vmlinux-arm64.sh on a dev Mac to produce the Image; populate checksum + size from the build output. cid is computed by the release pipeline (ipfs-provider add) at publish time."
+          "note": "Pinned Ubuntu 22.04 LTS arm64 kernel (5.15.0-179-generic, immutable release-20260515 path). The URL serves the gzip-compressed + EFI-signed vmlinuz Canonical publishes; `checksum`/`size` describe those AS-DOWNLOADED bytes (matches Canonical's SHA256SUMS). The fetcher gunzips the verified bytes into install_path as a raw ARM64 Image that VZLinuxBootLoader accepts. See docs/vz-backend/PHASE_7_DAY_1_NOTES.md for the A-vs-B decision and PHASE_7_DAY_2_NOTES.md for the wiring."
+        }
+      }
+    },
+    "initrd": {
+      "install_path": "bin/initrd",
+      "description": "Initial ramdisk that brings up userspace on the Mac (Vz) microVM path. Loads virtio_blk/virtio_net/virtio_vsock as modules before mounting the rootfs — required because Ubuntu's generic kernel ships those drivers as modules, not built-in. Not installed on Linux: crosvm boots vmlinux + rootfs directly without a separate initrd.",
+      "platforms": {
+        "darwin-arm64": {
+          "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260515/unpacked/ubuntu-22.04-server-cloudimg-arm64-initrd-generic",
+          "checksum": "sha256:8cb79fdcbf90313d7a5a315a2dc90bca7435976c3603a28929bce5feefab2b1c",
+          "size": 33053012,
+          "install_path": "bin/initrd",
+          "note": "Pinned Ubuntu 22.04 LTS arm64 initrd (immutable release-20260515 path). The initrd is zstd-compressed inside Canonical's wrapper; Linux 5.15+ self-decompresses zstd initramfs at boot time, so Vz passes the bytes through verbatim. See docs/vz-backend/PHASE_7_DAY_2_NOTES.md."
         }
       }
     },
@@ -616,7 +628,8 @@
       "description": "Runtime VM prerequisites only",
       "components": [
         "crosvm",
-        "vmlinux"
+        "vmlinux",
+        "initrd"
       ]
     },
     "home": {
@@ -667,7 +680,8 @@
         "did-provider",
         "chat",
         "crosvm",
-        "vmlinux"
+        "vmlinux",
+        "initrd"
       ]
     },
     "operator": {
@@ -740,6 +754,7 @@
         "inbox",
         "crosvm",
         "vmlinux",
+        "initrd",
         "kubo",
         "cloudflared",
         "llama-server",
