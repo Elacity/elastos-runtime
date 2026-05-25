@@ -1,26 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  scripts/dev/sign-elastos-vz/vz.entitlements.plist
-  Phase 2 Day 4 (docs/vz-backend/PLAN.md) — minimal entitlements
-  for local Apple Silicon development builds.
-
-  Granting `com.apple.security.virtualization` is the smallest
-  thing that makes Apple's `VZVirtualMachineConfiguration.validate`
-  return success. NOTHING else is requested — this file is
-  deliberately the empty-superset that turns a fresh `cargo build`
-  binary into one that can drive the Vz framework on the local
-  machine.
-
-  Phase 6 (production code-signing + notarization) WILL NOT
-  reuse this plist. It exists solely so a contributor on a Mac
-  can run `elastos vm-debug boot` against their own build
-  without checking in any signed binary or developer
-  certificate.
--->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>com.apple.security.virtualization</key>
-  <true/>
+	<key>com.apple.security.virtualization</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
 </dict>
 </plist>

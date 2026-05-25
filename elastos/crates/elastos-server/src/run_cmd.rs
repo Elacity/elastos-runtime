@@ -28,7 +28,22 @@ pub async fn run_capsule(
                 return run_microvm_standalone(&capsule_dir, manifest).await;
             }
             elastos_common::CapsuleType::Wasm => {
-                return run_wasm_via_operator_runtime(&capsule_dir, capsule_args).await;
+                // Phase 8 Day 8 — same pattern as the MicroVM lane:
+                // pick the cheapest path that works on this host.
+                // The operator-runtime lane sets a bridge spawner so
+                // capsule SDK calls round-trip to the daemon; for a
+                // freshly installed standalone capsule that's an
+                // unnecessary prerequisite, and on macOS without a
+                // daemon it hard-fails on the coords-file read.
+                // Standalone falls back to bridge-less wasmtime
+                // execution — sufficient for the v0.1 demo bar
+                // (`elastos run home` prints its launch line and
+                // exits) and a clean foundation for the future
+                // standalone-bridge work.
+                if operator_runtime_available().await {
+                    return run_wasm_via_operator_runtime(&capsule_dir, capsule_args).await;
+                }
+                return run_wasm_standalone(&capsule_dir, capsule_args).await;
             }
             elastos_common::CapsuleType::Data => {
                 let runtime = crate::create_runtime("/tmp/elastos/storage").await?;
@@ -220,6 +235,53 @@ async fn run_wasm_via_operator_runtime(
     }));
 
     let _saved_termios = crate::runtime_control::enable_host_raw_mode_pub();
+    let _term_env = ScopedTerminalEnv::capture();
+    let handle = runtime
+        .run_local(capsule_dir, capsule_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
+    eprintln!("[run] WASM capsule '{}' exited", handle.manifest.name);
+    Ok(())
+}
+
+/// Phase 8 Day 8 — in-process WASM execution lane.
+///
+/// Mirrors `run_microvm_standalone` from Day 5: when no
+/// `elastos serve` daemon is running, fall back to a bridge-less
+/// wasmtime execution rather than hard-failing on the
+/// `operator_runtime_coords()` check. Suitable for any WASM capsule
+/// whose `main()` doesn't depend on host-runtime SDK calls
+/// (provider registry, signed identity, IPFS bridge). The
+/// shipped ElastOS WASM capsules (`home`, `system`, `chat-room`,
+/// etc.) all fit that shape today — their `main()` prints a
+/// launch banner via `elastos_guest::CapsuleInfo::from_env()` and
+/// returns; the richer browser surface is rendered by the
+/// runtime daemon, not the WASM stub.
+///
+/// Storage lands under `<data_dir>/storage` so any state the
+/// capsule writes lines up with the same data dir Phase 7's
+/// `elastos doctor` inspects, the same dir the setup loop
+/// installs to, and the same dir the standalone microvm lane
+/// uses. Bridging is intentionally not configured: the WASM
+/// provider's default (no spawner -> `use_bridge = false`,
+/// inherited stdio) is correct for standalone.
+async fn run_wasm_standalone(
+    capsule_dir: &Path,
+    capsule_args: Vec<String>,
+) -> anyhow::Result<()> {
+    let storage_dir = crate::default_data_dir().join("storage");
+    let runtime = crate::create_runtime(&storage_dir).await?;
+
+    eprintln!(
+        "[run] WASM capsule launching standalone (in-process; no `elastos serve` daemon detected)"
+    );
+
+    // Capture terminal dimensions for capsules that look them up
+    // via the `ELASTOS_TERM_COLS` / `ELASTOS_TERM_ROWS` env vars.
+    // No raw mode here — the v0.1 standalone capsules are
+    // one-shot prints, not interactive readers. If/when a real
+    // interactive WASM capsule lands, this is the place to add
+    // a `_saved_termios` guard mirroring the operator lane.
     let _term_env = ScopedTerminalEnv::capture();
     let handle = runtime
         .run_local(capsule_dir, capsule_args)
