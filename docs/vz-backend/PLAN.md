@@ -330,6 +330,8 @@ Deliverable: `just verify` ([`state.md` L31](../../state.md)) and the public-ins
 
 ### Phase 6 — Ship (1 week)
 
+**Status:** **In progress (planned; Day 1 pending operator kickoff).** Day-by-day plan in [`PHASE_6_PLAN.md`](PHASE_6_PLAN.md). Entry gates in [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md). The 8-day plan sequences: Days 1–4 attack Unblocker 1 (truthful `components.json` darwin-arm64 entries — audit, first capsule, batch capsules, native helpers + signed binary); Day 5 lights up Unblocker 2 (self-hosted Mac CI runner activation); Day 6 closes Unblocker 3 (first end-to-end FORCE_FULL smoke green on self-hosted); Day 7 expands `vz_perf_harness.rs` with the real-microVM-boot path (flips `notes.real_vz_boot_measured` to `true`, schema v2 → v3); Day 8 ships the Phase-6 retrospective + Phase-7 entry checklist + tagged release.
+
 Goal: restore the manifests honestly, code-sign + notarize the macOS binary, update docs, ship the release.
 
 - **Code-sign and notarize the macOS binary.** Apple requires Developer ID code signing + notarization for any binary that uses `Virtualization.framework` in production (the runtime entitlement chain depends on it). Add a `just release-mac` recipe that signs with the project's Developer ID Application certificate, includes the hardened runtime, the `com.apple.security.virtualization` entitlement, and submits for notarization via `notarytool`. This is a release-pipeline change only, not a runtime code change.
