@@ -321,6 +321,18 @@ pub async fn run(
         eprintln!("[warn] capsule metadata init failed: {e}");
     }
 
+    // Phase 8 Day 6 — build the overlay-aware second-stage
+    // initramfs so Ubuntu userspace gets a writable root via
+    // tmpfs overlay on top of the read-only squashfs. Skipped
+    // when `bin/initrd` isn't present (kernel-only boot paths)
+    // or when the combined output is already up-to-date.
+    // Non-fatal on error: consumers fall back to plain
+    // `bin/initrd`, which still boots — userspace just keeps
+    // crashing on EROFS the way Day 5 captured.
+    if let Err(e) = ensure_overlay_initrd(&data_dir) {
+        eprintln!("[warn] overlay-initrd build failed: {e}");
+    }
+
     println!();
     if !stamped.is_empty() {
         println!(
@@ -390,6 +402,35 @@ pub(crate) fn ensure_standalone_capsule_metadata(data_dir: &Path) -> anyhow::Res
         "[init] wrote default capsule metadata: {}",
         capsule_json_path.display()
     );
+    Ok(())
+}
+
+/// Phase 8 Day 6 — build `bin/initrd-overlay` by appending our
+/// overlay-init CPIO to Ubuntu's pristine `bin/initrd`. The combined
+/// file is what consumers (supervisor, `elastos run` standalone lane,
+/// integration test discovery) prefer when present, so userspace gets
+/// a writable tmpfs overlay on top of the read-only squashfs without
+/// any per-consumer plumbing.
+///
+/// Idempotent: skips the write when the destination already contains
+/// exactly the bytes we'd produce (see `write_combined_initrd` for the
+/// byte-compare semantics). Safe to call on every `elastos setup`
+/// invocation. No-ops when `bin/initrd` isn't present — kernel-only
+/// boots and pre-Day-2 installs stay untouched.
+pub(crate) fn ensure_overlay_initrd(data_dir: &Path) -> anyhow::Result<()> {
+    let source = data_dir.join("bin/initrd");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let dest = data_dir.join("bin/initrd-overlay");
+    let wrote = crate::overlay_initrd::write_combined_initrd(&source, &dest)?;
+    if wrote {
+        println!(
+            "[init] built overlay initrd: {} ({} bytes)",
+            dest.display(),
+            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0)
+        );
+    }
     Ok(())
 }
 

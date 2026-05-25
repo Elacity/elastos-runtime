@@ -12,6 +12,7 @@ pub mod carrier_bridge;
 pub mod carrier_service;
 pub mod crypto;
 pub mod doctor_cmd;
+pub mod overlay_initrd;
 pub mod documents;
 pub mod fetcher;
 pub mod gateway_cmd;

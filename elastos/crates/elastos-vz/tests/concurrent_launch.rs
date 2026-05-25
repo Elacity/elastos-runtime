@@ -433,14 +433,17 @@ fn discover_initrd() -> Option<PathBuf> {
         return pb.is_file().then_some(pb);
     }
     let data_dir = test_data_dir()?;
-    // Phase 8 Day 4 — Phase 7 Day 2 standardised the canonical
-    // install path to `bin/initrd` (no suffix); the older
-    // `bin/initrd-generic` name predates that decision and stays as
-    // a fallback so a manual operator who fetched the artefact by
-    // its upstream filename still has a working test discovery.
-    // The canonical name wins on lookup precedence — that's the
-    // name `elastos setup` writes today.
-    for name in ["bin/initrd", "bin/initrd-generic"] {
+    // Phase 8 Day 6 — prefer the second-stage `bin/initrd-overlay`
+    // (writable-rootfs tmpfs overlay variant `elastos setup` now
+    // builds) over the pristine `bin/initrd` (Phase 7 Day 2's
+    // Canonical-published variant). `bin/initrd-generic` is the
+    // pre-standardisation upstream filename, kept as a final
+    // fallback so an operator who fetched the artefact directly
+    // (without `elastos setup`) still has a working discovery
+    // path. The overlay variant intentionally wins: the
+    // integration test should exercise the same boot lane
+    // `elastos run ubuntu-base` does in production.
+    for name in ["bin/initrd-overlay", "bin/initrd", "bin/initrd-generic"] {
         let candidate = data_dir.join(name);
         if candidate.is_file() {
             return Some(candidate);

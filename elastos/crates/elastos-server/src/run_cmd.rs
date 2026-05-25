@@ -325,8 +325,13 @@ async fn run_microvm_standalone(
             kernel_path.display()
         );
     }
-    let initramfs_path = data_dir.join("bin/initrd");
-    let initramfs_path_opt = initramfs_path.is_file().then_some(initramfs_path.clone());
+    // Phase 8 Day 6 — go through the shared resolver so we pick
+    // the writable-rootfs overlay variant when `elastos setup`
+    // has built it, falling back to the pristine initrd
+    // otherwise. Keeps the standalone lane symmetrical with the
+    // supervisor managed lane.
+    let initramfs_path_opt =
+        elastos_server::overlay_initrd::resolve_initrd_path(&data_dir.join("bin"));
 
     let rootfs_path = capsule_dir.join(&manifest.entrypoint);
     if !rootfs_path.is_file() {

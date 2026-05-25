@@ -923,10 +923,28 @@ impl Supervisor {
                 .with_kernel_path(kernel_path)
                 .with_state_dir(data_dir.join("vz"))
                 .with_rootfs_cache_dir(data_dir.join("rootfs-cache"));
-            let installed_initrd =
-                Self::resolve_external_install_path(&registry, &data_dir, "initrd", "bin/initrd");
-            if installed_initrd.is_file() {
-                vz_config.with_initramfs_path(installed_initrd)
+            // Phase 8 Day 6 — prefer the second-stage overlay
+            // initrd (`bin/initrd-overlay`) when `elastos setup`
+            // has built it. That variant carries our `/init`
+            // override which mounts a tmpfs overlay on top of the
+            // read-only squashfs rootfs, so Ubuntu userspace can
+            // write to /var, /tmp, etc. without crashing. When the
+            // overlay variant isn't staged we fall back to the
+            // pristine `bin/initrd` Canonical published —
+            // identical behaviour to Days 2-5.
+            let bin_dir = data_dir.join("bin");
+            let installed_initrd = crate::overlay_initrd::resolve_initrd_path(&bin_dir)
+                .or_else(|| {
+                    let registry_path = Self::resolve_external_install_path(
+                        &registry,
+                        &data_dir,
+                        "initrd",
+                        "bin/initrd",
+                    );
+                    registry_path.is_file().then_some(registry_path)
+                });
+            if let Some(initrd) = installed_initrd {
+                vz_config.with_initramfs_path(initrd)
             } else {
                 vz_config
             }
