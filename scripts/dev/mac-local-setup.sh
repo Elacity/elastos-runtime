@@ -295,9 +295,34 @@ if (( ${#THIRD_PARTY_HINTS[@]} > 0 )); then
   echo
 fi
 
-# ── 6. Self-verify ───────────────────────────────────────────────────
+# ── 6. Auto re-sign after a cargo rebuild ────────────────────────────
+#
+# `cargo build -p elastos-server` invalidates the codesign signature
+# (the linker rewrites the binary), so any rebuild silently strips the
+# four entitlements the dev-sign plist bakes in. Without them:
+#   - `com.apple.security.virtualization` missing → Vz refuses to boot.
+#   - `com.apple.security.cs.allow-jit` missing  → macOS SIGKILLs
+#     wasmtime the first time it `mprotect(PROT_EXEC)`s a JIT page
+#     (no stderr, exit 137).
+# Both failures look like silent misbehaviour to a fresh operator.
+#
+# Detect the missing entitlement and invoke the existing dev-sign
+# script. Idempotent: the check is a substring search on the
+# codesign XML output, so a correctly-signed binary is a no-op.
 
 DEBUG_ELASTOS="$REPO_ROOT/elastos/target/debug/elastos"
+SIGN_SCRIPT="$REPO_ROOT/scripts/dev/sign-elastos-vz/sign.sh"
+
+if [[ -x "$DEBUG_ELASTOS" ]]; then
+  if ! codesign -d --entitlements - --xml "$DEBUG_ELASTOS" 2>&1 \
+        | grep -q "com.apple.security.virtualization"; then
+    echo "[mac-local-setup] debug binary missing Vz/JIT entitlements — re-signing"
+    "$SIGN_SCRIPT" "$DEBUG_ELASTOS" 2>&1 | sed 's/^/  /'
+  fi
+fi
+
+# ── 7. Self-verify ───────────────────────────────────────────────────
+
 if [[ -x "$DEBUG_ELASTOS" ]]; then
   echo "[mac-local-setup] verifying via: elastos home --status --json"
   "$DEBUG_ELASTOS" home --status --json \

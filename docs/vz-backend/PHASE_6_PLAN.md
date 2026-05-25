@@ -1,6 +1,39 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Phase 9 OPEN. Day 3 (2026-05-26) closed the
+> **Status:** **Phase 9 OPEN. Day 4 (2026-05-26) closed the
+> silent-corruption footgun that Day 3 surfaced as an
+> operational note: every `cargo build -p elastos-server`
+> invalidates codesign and drops the four Vz + JIT entitlements
+> baked into the dev-sign plist, leaving the operator with a
+> runtime that **looks** healthy (`elastos home --status` still
+> works — that command doesn't need Vz or JIT) but fails closed
+> on the two end-to-end smokes that matter (`elastos run
+> capsules/home` exits 137 with no stderr because Hardened
+> Runtime SIGKILLs wasmtime the first time it `mprotect(PROT_EXEC)`s
+> a JIT page; `elastos run ubuntu-base` refuses to boot because
+> Vz's `validateWithError:` rejects the configuration without
+> `com.apple.security.virtualization`). Day 4 adds a ~20-LOC
+> block to `scripts/dev/mac-local-setup.sh` between the manifest
+> write and the live `--status --json` verifier that grep's the
+> codesign XML for `com.apple.security.virtualization` and, if
+> absent, invokes the existing `scripts/dev/sign-elastos-vz/sign.sh`
+> against the debug binary. Idempotent: a correctly-signed
+> binary triggers exactly zero work (the second-run grep finds
+> the sentinel entitlement and short-circuits). Smoke-tested
+> the strip-then-bootstrap recovery path on this Mac
+> (2026-05-26): `codesign --remove-signature elastos/target/debug/elastos`
+> → `scripts/dev/mac-local-setup.sh` → log shows `debug binary
+> missing Vz/JIT entitlements — re-signing`, `Done. elastos can
+> now drive Apple's Virtualization.framework`, `services ready:
+> 6 / 8` → entitlements XML restored byte-for-byte. Phase-8-Day-8
+> WASM-standalone smoke (`elastos run capsules/home`) and
+> `elastos home` (full dashboard) both green against the
+> re-signed binary. Zero substrate touched; zero new tests
+> (the smoke script is the test). See
+> [`PHASE_9_DAY_4_NOTES.md`](PHASE_9_DAY_4_NOTES.md) for the
+> alternative-location matrix (build.rs vs cargo wrapper vs
+> bootstrap script), the operational rationale, and the Day-5+
+> Cargo-wrapper candidate. Day 3 (2026-05-26) closed the
 > last structurally-red row on the Mac Home dashboard — the
 > `Full-screen Apps` service whose `SystemServiceSpec.backing`
 > hard-coded `["crosvm", "vmlinux"]`. crosvm is Linux-only by
