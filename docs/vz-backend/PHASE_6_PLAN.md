@@ -1,6 +1,46 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Phase 9 OPEN. Day 1 (2026-05-26) closed the
+> **Status:** **Phase 9 OPEN. Day 2 (2026-05-26) extended the
+> Day-1 bootstrap from three providers to the full first-party
+> Home surface a Mac source checkout can build on its own:
+> seven host provider binaries (`shell`, `localhost-provider`,
+> `did-provider`, `webspace-provider`, `site-provider`,
+> `ipfs-provider`, `tunnel-provider`) plus five shipped Home-surface
+> capsules (`home` + `system` as WASM, `documents` + `library`
+> + `inbox` as data-only HTML). New helpers in
+> `scripts/dev/mac-local-setup.sh` factor the build+stage+stamp
+> pattern (`build_and_stage_provider`), the wasm build+stage
+> pattern (`build_and_stage_wasm_capsule`), and the
+> manifest-free `cp`+exclude pattern (`stage_data_capsule`), all
+> backed by a single TSV stamp stream so the Python manifest
+> writer has one source of truth. Third-party binaries
+> (`kubo`, `cloudflared`) are detected on `PATH` (auto-discovered
+> via the existing `find_installed_provider_binary` PATH branch
+> when present) and a `brew install …` hint prints when absent —
+> we deliberately do not auto-brew. After running:
+> **`elastos home` reports 5 / 8 services ready** (up from 3 /
+> 8): `Home Session`, `Local World`, `Identity`, `WebSpaces`,
+> `Site Edge` all `[ok] installed`; `Content Exchange` + `Public
+> Edge` honestly waiting for kubo/cloudflared on PATH; the only
+> structurally-red row is `Full-screen Apps` whose
+> `SystemServiceSpec` hard-codes `["crosvm", "vmlinux"]` —
+> crosvm is Linux-only by design (Mac uses Vz), so this is the
+> first call-out for the substrate work Day 3+ should pick up
+> (one-line spec edit + 2 unit tests). The Home dashboard's
+> capsule registry now reports **6 capsules installed** (up from
+> 1); the five new Home-surface capsules correctly stay out of
+> the user-launchable Apps list because
+> `PROVIDER_CAPSULE_NAMES` + role filters exclude shells/
+> providers/data viewers, but they're registered and ready to be
+> wired to their respective WASM↔HTTP carrier_bridge surfaces in
+> Day 4+. **404/404** elastos-server lib tests pass — script
+> still writes only into `<data_dir>/`, no substrate change.
+> Idempotent re-runs complete in ~1 s wall-clock. See
+> [`PHASE_9_DAY_2_NOTES.md`](PHASE_9_DAY_2_NOTES.md) for the
+> three-helper architecture, the empty-CID install-state
+> invariant (capsule install gate satisfied without forging
+> trust-anchor metadata), the `[no]`-row root-cause analysis,
+> and Day-3 candidates. Day 1 (2026-05-26) closed the
 > Mac source-checkout bootstrap gap that blocked `elastos home`
 > on a fresh Mac. `elastos setup` requires a trusted Carrier
 > source already known to the host; on a freshly cloned repo

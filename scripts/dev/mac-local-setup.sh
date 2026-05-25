@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/dev/mac-local-setup.sh
 #
-# Phase 9 Day 1 — Mac source-checkout bootstrap for `elastos home`.
+# Phase 9 Day 1+2 — Mac source-checkout bootstrap for `elastos home`.
 #
 # On a fresh Mac there is no canonical install at
 # `~/Library/Application Support/elastos/`, so `elastos setup` fails
@@ -11,27 +11,44 @@
 # uses `getent`, GNU `sha256sum`/`stat -c`, and `scripts/install.sh`'s
 # stamped-installer path, none of which work on Mac.
 #
-# This script is the Mac equivalent: build the three host providers
-# (`shell`, `localhost-provider`, `did-provider`) from the workspace,
-# stage them under `<data_dir>/bin/`, and write a `components.json`
-# whose `darwin-arm64` entries carry the actual `sha256:` checksums
-# of the staged binaries — which is what
-# `verify_installed_component_binary` checks before letting the
-# runtime spawn them.
+# This script is the Mac equivalent. It builds and stages every
+# first-party Home component the runtime can look up on disk:
+#
+#   - Seven host providers (Rust binaries → `<data_dir>/bin/<name>`):
+#       shell, localhost-provider, did-provider,
+#       webspace-provider, site-provider,
+#       ipfs-provider, tunnel-provider
+#
+#   - Two WASM capsules (wasm32-wasip1 → `<data_dir>/capsules/<name>/`):
+#       home, system
+#
+#   - Three data capsules (HTML only → `<data_dir>/capsules/<name>/`):
+#       documents, library, inbox
+#
+# The manifest at `<data_dir>/components.json` is rewritten with the
+# live `sha256:<hex>` + `size` for every staged provider so
+# `verify_installed_component_binary` accepts them. Capsule entries
+# keep their empty CIDs (matching the empty CIDs in our manifest, so
+# the capsule install-state check is satisfied without writing
+# `.elastos-cid` files).
+#
+# Third-party binaries (`kubo`, `cloudflared`) are not built here.
+# If they're on PATH (`brew install kubo cloudflared`) the runtime
+# auto-discovers them via `find_installed_provider_binary`. The
+# script prints the install hint when either is missing.
 #
 # Usage:
 #   scripts/dev/mac-local-setup.sh
 #
-# After it finishes:
-#   elastos/target/debug/elastos home --status     # prereqs ready
-#
-# This script is idempotent (re-stamps with current binaries each run)
-# and Mac-only — it bails out on any other OS.
+# This script is idempotent (re-runs stage identical bytes when
+# sources are unchanged) and Mac-only.
 #
 # Anchors:
-#   - docs/vz-backend/PHASE_9_DAY_1_NOTES.md
+#   - docs/vz-backend/PHASE_9_DAY_1_NOTES.md (Day-1 baseline: 3/8 ready)
+#   - docs/vz-backend/PHASE_9_DAY_2_NOTES.md (this script's full surface)
 #   - elastos-server::binaries::find_installed_provider_binary
 #   - elastos-server::setup::verify_installed_component_binary
+#   - elastos-server::setup::component_install_state
 
 set -euo pipefail
 
@@ -43,91 +60,197 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DATA_DIR="${ELASTOS_DATA_DIR:-$HOME/Library/Application Support/elastos}"
-
-# Platform key as detect_platform() emits on darwin-arm64.
 PLATFORM="darwin-arm64"
-
-# Map each provider to the workspace it belongs to. `shell` and
-# `localhost-provider` are members of the elastos workspace; the
-# `did-provider` crate has its own Cargo.toml (capsules/did-provider).
-COMPONENT_NAMES=(shell localhost-provider did-provider)
-COMPONENT_MANIFESTS=(
-  "elastos/Cargo.toml"
-  "elastos/Cargo.toml"
-  "capsules/did-provider/Cargo.toml"
-)
-COMPONENT_TARGET_DIRS=(
-  "elastos/target/release"
-  "elastos/target/release"
-  "capsules/did-provider/target/release"
-)
 
 echo "[mac-local-setup] repo:      $REPO_ROOT"
 echo "[mac-local-setup] data-dir:  $DATA_DIR"
 echo "[mac-local-setup] platform:  $PLATFORM"
 echo
 
-# 1. Build the three providers in release mode.
-for idx in "${!COMPONENT_NAMES[@]}"; do
-  name="${COMPONENT_NAMES[$idx]}"
-  manifest="$REPO_ROOT/${COMPONENT_MANIFESTS[$idx]}"
-  echo "[mac-local-setup] building $name (manifest=$manifest)"
+mkdir -p "$DATA_DIR/bin" "$DATA_DIR/capsules"
+
+# Hold staged provider metadata in a single TSV stream so the inline
+# python stamper has one source of truth. Format per line:
+#   name<TAB>sha256<TAB>size
+PROVIDER_STAMPS_FILE="$(mktemp -t mac-local-setup-stamps.XXXXXX)"
+trap 'rm -f "$PROVIDER_STAMPS_FILE"' EXIT
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+# build_and_stage_provider <name> <manifest_path> <target_dir>
+#
+# Builds the named Rust crate in release mode, stages the resulting
+# binary under <data_dir>/bin/<name>, prints checksum + size, and
+# appends a TSV stamp row that the manifest writer consumes later.
+build_and_stage_provider() {
+  local name="$1"
+  local manifest="$REPO_ROOT/$2"
+  local target_dir="$REPO_ROOT/$3"
+
+  echo "[mac-local-setup] building provider: $name"
   (
     cd "$REPO_ROOT"
-    cargo build --release --manifest-path "$manifest" -p "$name"
+    cargo build --release --manifest-path "$manifest" -p "$name" 2>&1 \
+      | sed 's/^/  /'
   )
-done
-echo
 
-# 2. Stage the binaries into <data_dir>/bin and compute sha256 + size
-#    in a Mac-portable way (BSD `shasum -a 256`, BSD `stat -f`).
-mkdir -p "$DATA_DIR/bin"
-declare -a STAGED_SHAS=()
-declare -a STAGED_SIZES=()
-for idx in "${!COMPONENT_NAMES[@]}"; do
-  name="${COMPONENT_NAMES[$idx]}"
-  target_dir="$REPO_ROOT/${COMPONENT_TARGET_DIRS[$idx]}"
-  src="$target_dir/$name"
-  dest="$DATA_DIR/bin/$name"
-
+  local src="$target_dir/$name"
   if [[ ! -x "$src" ]]; then
     echo "error: built binary missing: $src" >&2
     exit 1
   fi
 
-  # `install -m` always re-copies, but the bytes only change when the
-  # build changed — which is what makes the operation effectively
-  # idempotent for the manifest writer below.
+  local dest="$DATA_DIR/bin/$name"
   install -m 0755 "$src" "$dest"
 
-  STAGED_SHAS[$idx]="$(shasum -a 256 "$dest" | awk '{print $1}')"
-  STAGED_SIZES[$idx]="$(stat -f '%z' "$dest")"
-  echo "[mac-local-setup] staged $dest"
-  echo "  sha256: ${STAGED_SHAS[$idx]}"
-  echo "  size:   ${STAGED_SIZES[$idx]}"
-done
+  local sha size
+  sha="$(shasum -a 256 "$dest" | awk '{print $1}')"
+  size="$(stat -f '%z' "$dest")"
+  printf '%s\t%s\t%s\n' "$name" "$sha" "$size" >> "$PROVIDER_STAMPS_FILE"
+
+  echo "  staged $dest"
+  echo "    sha256: $sha"
+  echo "    size:   $size"
+}
+
+# build_and_stage_wasm_capsule <name> <manifest_path> <target_dir>
+#
+# Builds the named crate to wasm32-wasip1 release and stages
+# <name>.wasm + capsule.json at <data_dir>/capsules/<name>/.
+build_and_stage_wasm_capsule() {
+  local name="$1"
+  local manifest="$REPO_ROOT/$2"
+  local target_dir="$REPO_ROOT/$3"
+
+  echo "[mac-local-setup] building wasm capsule: $name"
+  (
+    cd "$REPO_ROOT"
+    cargo build --release --target wasm32-wasip1 \
+      --manifest-path "$manifest" -p "$name" 2>&1 \
+      | sed 's/^/  /'
+  )
+
+  local src_wasm="$target_dir/${name}.wasm"
+  if [[ ! -f "$src_wasm" ]]; then
+    echo "error: built wasm missing: $src_wasm" >&2
+    exit 1
+  fi
+
+  local src_manifest="$REPO_ROOT/capsules/$name/capsule.json"
+  if [[ ! -f "$src_manifest" ]]; then
+    echo "error: capsule.json missing: $src_manifest" >&2
+    exit 1
+  fi
+
+  local dest_dir="$DATA_DIR/capsules/$name"
+  mkdir -p "$dest_dir"
+  install -m 0644 "$src_wasm" "$dest_dir/${name}.wasm"
+  install -m 0644 "$src_manifest" "$dest_dir/capsule.json"
+
+  echo "  staged $dest_dir/{${name}.wasm, capsule.json}"
+}
+
+# stage_data_capsule <name>
+#
+# Copies the HTML-only data capsule's manifest + entrypoint asset(s)
+# from capsules/<name>/ into <data_dir>/capsules/<name>/. Skips any
+# build artefacts (target/, *.lock).
+stage_data_capsule() {
+  local name="$1"
+  local src_dir="$REPO_ROOT/capsules/$name"
+  local dest_dir="$DATA_DIR/capsules/$name"
+
+  if [[ ! -f "$src_dir/capsule.json" ]]; then
+    echo "error: data capsule missing capsule.json: $src_dir" >&2
+    exit 1
+  fi
+
+  echo "[mac-local-setup] staging data capsule: $name"
+  mkdir -p "$dest_dir"
+
+  # `rsync` is portable on macOS and skips build/cache directories
+  # without needing GNU `cp -ru`. The exclusions match what the runtime
+  # ignores when discovering capsule directories.
+  rsync -a --delete \
+    --exclude 'target/' \
+    --exclude '*.lock' \
+    --exclude '.elastos-cid' \
+    --exclude '.elastos-artifact-sha256' \
+    --exclude 'browser/' \
+    "$src_dir/" "$dest_dir/"
+
+  echo "  staged $dest_dir/"
+}
+
+# ── 1. Native providers ──────────────────────────────────────────────
+
+build_and_stage_provider shell \
+  "elastos/Cargo.toml" \
+  "elastos/target/release"
+
+build_and_stage_provider localhost-provider \
+  "elastos/Cargo.toml" \
+  "elastos/target/release"
+
+build_and_stage_provider did-provider \
+  "capsules/did-provider/Cargo.toml" \
+  "capsules/did-provider/target/release"
+
+build_and_stage_provider webspace-provider \
+  "capsules/webspace-provider/Cargo.toml" \
+  "capsules/webspace-provider/target/release"
+
+build_and_stage_provider site-provider \
+  "capsules/site-provider/Cargo.toml" \
+  "capsules/site-provider/target/release"
+
+build_and_stage_provider ipfs-provider \
+  "capsules/ipfs-provider/Cargo.toml" \
+  "capsules/ipfs-provider/target/release"
+
+build_and_stage_provider tunnel-provider \
+  "capsules/tunnel-provider/Cargo.toml" \
+  "capsules/tunnel-provider/target/release"
+
 echo
 
-# 3. Read the source-checkout components.json, stamp the darwin-arm64
-#    entries for the three providers with the staged checksum/size, and
-#    write it to <data_dir>/components.json. `load_manifest` resolves
-#    this path first, so the runtime sees our local manifest.
-python3 - \
-    "$REPO_ROOT/components.json" \
-    "$DATA_DIR/components.json" \
-    "$PLATFORM" \
-    "${COMPONENT_NAMES[0]}" "${STAGED_SHAS[0]}" "${STAGED_SIZES[0]}" \
-    "${COMPONENT_NAMES[1]}" "${STAGED_SHAS[1]}" "${STAGED_SIZES[1]}" \
-    "${COMPONENT_NAMES[2]}" "${STAGED_SHAS[2]}" "${STAGED_SIZES[2]}" <<'PY'
+# ── 2. WASM capsules ─────────────────────────────────────────────────
+
+build_and_stage_wasm_capsule home \
+  "capsules/home/Cargo.toml" \
+  "capsules/home/target/wasm32-wasip1/release"
+
+build_and_stage_wasm_capsule system \
+  "capsules/system/Cargo.toml" \
+  "capsules/system/target/wasm32-wasip1/release"
+
+echo
+
+# ── 3. Data capsules ─────────────────────────────────────────────────
+
+stage_data_capsule documents
+stage_data_capsule library
+stage_data_capsule inbox
+
+echo
+
+# ── 4. Stamp the manifest ────────────────────────────────────────────
+
+python3 - "$REPO_ROOT/components.json" "$DATA_DIR/components.json" "$PLATFORM" \
+    "$PROVIDER_STAMPS_FILE" <<'PY'
 import json
 import sys
 
-src_path, dst_path, platform = sys.argv[1:4]
-stamps = []
-i = 4
-while i < len(sys.argv):
-    stamps.append((sys.argv[i], sys.argv[i + 1], int(sys.argv[i + 2])))
-    i += 3
+src_path, dst_path, platform, stamps_path = sys.argv[1:5]
+
+with open(stamps_path, "r", encoding="utf-8") as f:
+    stamps = []
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        name, sha, size = line.split("\t")
+        stamps.append((name, sha, int(size)))
 
 with open(src_path, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -153,8 +276,27 @@ PY
 echo "[mac-local-setup] wrote $DATA_DIR/components.json"
 echo
 
-# 4. Quick sanity check using the local debug binary if present, so the
-#    operator immediately sees whether the prereq check is satisfied.
+# ── 5. Third-party dependency hints ──────────────────────────────────
+
+THIRD_PARTY_HINTS=()
+for dep in kubo cloudflared; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    THIRD_PARTY_HINTS+=("$dep")
+  fi
+done
+
+if (( ${#THIRD_PARTY_HINTS[@]} > 0 )); then
+  echo "[mac-local-setup] third-party dependencies not on PATH:"
+  for dep in "${THIRD_PARTY_HINTS[@]}"; do
+    echo "  - $dep   (install with: brew install $dep)"
+  done
+  echo "  Content Exchange and/or Public Edge services will remain"
+  echo "  in 'missing prerequisites' state until they are installed."
+  echo
+fi
+
+# ── 6. Self-verify ───────────────────────────────────────────────────
+
 DEBUG_ELASTOS="$REPO_ROOT/elastos/target/debug/elastos"
 if [[ -x "$DEBUG_ELASTOS" ]]; then
   echo "[mac-local-setup] verifying via: elastos home --status --json"
@@ -163,16 +305,19 @@ if [[ -x "$DEBUG_ELASTOS" ]]; then
 import json, sys
 snap = json.load(sys.stdin)
 services = snap.get("system_services", [])
-host_backings = {"shell", "localhost-provider", "did-provider"}
-problems = [s for s in services if not s.get("ready") and s.get("backing") in host_backings]
-if problems:
-    for s in problems:
-        name = s.get("name")
-        backing = s.get("backing")
-        state = s.get("state")
-        print(f"  NOT READY: {name} (backing={backing}, state={state})")
+ready_count = sum(1 for s in services if s.get("ready"))
+total = len(services)
+print(f"  services ready: {ready_count} / {total}")
+for s in services:
+    state = "ok " if s.get("ready") else "no "
+    name = s.get("name")
+    backing = s.get("backing")
+    print(f"    [{state}] {name}  ({backing})")
+
+# Day-2 floor: at least 5 services ready (3 host providers + WebSpaces + Site Edge).
+if ready_count < 5:
+    print("  FAILED: fewer than 5 services ready.")
     sys.exit(1)
-print("[mac-local-setup] all three host providers report ready.")
 '
 else
   echo "[mac-local-setup] note: $DEBUG_ELASTOS not built — skipping live check."
@@ -181,4 +326,4 @@ fi
 
 echo
 echo "[mac-local-setup] OK"
-echo "  Try: $DEBUG_ELASTOS home --status"
+echo "  Try: $DEBUG_ELASTOS home"
