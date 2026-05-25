@@ -36,18 +36,44 @@ pub struct DoctorArgs {
 
 /// Top-level entry point. Resolves the live `data_dir` + manifest from disk
 /// and writes the report to stdout.
+///
+/// Phase 7 Day 6 — the body runs inside `tracing::subscriber::with_default`
+/// with a WARN-and-above subscriber, so the supervisor's INFO logs
+/// (e.g. `vz: startup orphan-prune complete`) do not bleed into the
+/// inspector output. `doctor` is a one-shot triage CLI; the global
+/// `elastos=info` subscriber installed in `main` is appropriate for
+/// long-running `serve`/`setup` paths but distracting here. The
+/// `with_default` swap is thread-local and ends when this function
+/// returns — other subcommands keep the operator's `RUST_LOG`
+/// configuration intact. Safe because the body of `run` is purely
+/// synchronous (no `.await`), so no task migration can leak the
+/// override across worker threads.
 pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
-    let data_dir = crate::sources::default_data_dir();
-    let manifest = load_manifest()?;
-    let platform = detect_platform();
+    tracing::subscriber::with_default(build_quiet_subscriber(), || -> anyhow::Result<()> {
+        let data_dir = crate::sources::default_data_dir();
+        let manifest = load_manifest()?;
+        let platform = detect_platform();
 
-    print_report(
-        &mut std::io::stdout(),
-        &data_dir,
-        &manifest,
-        &platform,
-        args.verbose,
-    )
+        print_report(
+            &mut std::io::stdout(),
+            &data_dir,
+            &manifest,
+            &platform,
+            args.verbose,
+        )
+    })
+}
+
+/// Build the WARN-and-above fmt subscriber installed by [`run`].
+/// Extracted as a free function so the unit test can install the
+/// same subscriber against a capture-buffer `MakeWriter` and assert
+/// the suppression behaviour directly.
+fn build_quiet_subscriber() -> impl tracing::Subscriber + Send + Sync {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .finish()
 }
 
 /// Write the substrate report to `out`. Extracted from [`run`] so unit
@@ -318,6 +344,82 @@ mod tests {
         assert!(
             out.contains("rootfs_cache_dir:"),
             "expected rootfs_cache_dir row, got:\n{out}"
+        );
+    }
+
+    /// Phase 7 Day 6 — verify the quiet-subscriber pattern actually
+    /// suppresses INFO-level tracing events while letting WARN/ERROR
+    /// through. We re-build the same subscriber [`run`] installs, but
+    /// point its writer at an `Arc<Mutex<Vec<u8>>>` capture buffer so
+    /// the assertion is over what an operator would have seen on
+    /// stderr — not over implementation details like `max_level_hint`.
+    #[test]
+    fn doctor_quiet_subscriber_suppresses_info_logs_but_passes_warn() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        /// Minimal `MakeWriter` adapter over a shared byte buffer so
+        /// the test can assert on the formatted log lines the
+        /// subscriber would have emitted.
+        #[derive(Clone)]
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+        struct CaptureHandle(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CaptureHandle {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureHandle;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureHandle(self.0.clone())
+            }
+        }
+
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = CaptureWriter(buffer.clone());
+
+        // Mirror exactly what `build_quiet_subscriber` does, but with
+        // the capture writer instead of stderr. Any divergence in the
+        // shape of this subscriber from `build_quiet_subscriber` would
+        // be a test-only false negative, so this construction stays
+        // intentionally tight.
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(capture)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Mimic the supervisor's startup INFO line that bleeds
+            // into pre-Day-6 doctor output.
+            tracing::info!("vz: startup orphan-prune complete");
+            // A real warning that operators should still see.
+            tracing::warn!("doctor: substrate kernel checksum mismatch");
+        });
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone())
+            .expect("capture buffer should be valid utf-8");
+
+        assert!(
+            !captured.contains("startup orphan-prune"),
+            "Phase 7 Day 6: WARN subscriber should suppress INFO events, \
+             but the captured output contained the supervisor's startup \
+             INFO marker. Captured:\n{captured}"
+        );
+        assert!(
+            captured.contains("substrate kernel checksum mismatch"),
+            "Phase 7 Day 6: WARN-and-above events must still pass through \
+             — otherwise doctor would silently hide real problems. \
+             Captured:\n{captured}"
         );
     }
 
