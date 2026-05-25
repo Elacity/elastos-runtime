@@ -1,6 +1,6 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **In progress. Days 1–3 complete (audit + Class-A/B/D/E + capsules projection landed; 3/3 Mac smoke pre-flights PASS); Day 4 unblocked (vmlinux + signing/notarization).** Closes the
+> **Status:** **In progress. Days 1–4a complete (audit + Class-A/B/C-structural/D/E + capsules projection landed; vmlinux + signing recipes shipped; 3/3 Mac smoke pre-flights PASS); Day 5 unblocked. Day-4b operator handoff queued.** Closes the
 > [`PLAN.md` § Phase 6](PLAN.md) deliverable (L331–344) and
 > resolves the 3 entry-gate unblockers from
 > [`PHASE_6_ENTRY_CHECKLIST.md`](PHASE_6_ENTRY_CHECKLIST.md):
@@ -317,7 +317,47 @@ decision matrix.
 
 ---
 
-### Day 4 — Native helpers + vmlinux + `just release-mac` recipe (6–8 h)
+### Day 4 — vmlinux build recipe + Mac signing/notarization scaffolding (4a) (4–6 h agent + ~5 h operator handoff)
+
+> **Outcome (2026-05-25):** ✅ **Day 4a complete (agent-shipped
+> scaffolding); Day 5 unblocked. Day-4b operator handoff queued.**
+> Notes: [`PHASE_6_DAY_4_NOTES.md`](PHASE_6_DAY_4_NOTES.md).
+>
+> **What landed (4a):** `scripts/build-vmlinux-arm64.sh`
+> (deterministic ARM64 kernel cross-compile recipe), `scripts/release-mac.sh`
+> (Developer-ID codesign + notarytool submit + staple recipe),
+> `scripts/release/elastos-server.entitlements.plist` (six Vz-aware
+> entitlements). `external.vmlinux.platforms.darwin-arm64` added
+> with the empty-cid/checksum stub pattern that Class-A host
+> binaries already use. Class-C verifier promoted from
+> forward-compat to required-keys-present; only operator-handoff
+> note remains. Both recipes preflight-tested live on dev Mac with
+> typed exit codes + clean diagnostics.
+>
+> **What's queued (4b — operator-side):** running the build
+> recipe (requires `brew install aarch64-elf-gcc`, ~30 min wall-clock),
+> populating components.json's vmlinux checksum+size from build
+> output, running the signing recipe (requires Apple Developer
+> Program enrollment + Developer ID cert + notarytool keychain
+> profile). ~5h total operator wall-clock. Not on Day-5/6/7
+> critical path.
+>
+> **Scope deviation from original plan.** The original Day-4 framing
+> bundled three Sub-deliverables (vmlinux build, components.json
+> edit, signing recipe) as one 6–8h day. Honest audit revealed:
+> Sub-1 (build) and Sub-3 (signing) both have hard operator
+> prerequisites (cross-compile toolchain installation, Apple
+> Developer Program enrollment) that can't close in an agent
+> session. The plan split into Day 4a (agent-shipped scaffolding)
+> and Day 4b (operator-shipped execution). 4a still landed every
+> piece of code the original prompt named; 4b is the documented
+> operator-handoff queue.
+>
+> **Mirrors Phase 3 Day 7 precedent.** That phase explicitly
+> scoped *"Mac-side release-engineering: Developer ID signing
+> pipeline, entitlement plist, notarization"* out of agent scope.
+> Phase 6 Day 4a finally addresses the scaffolding; Day 4b is the
+> operator execution.
 
 **Problem.** Phase 5 + Days 2–3 of Phase 6 prove the
 microVM-capsule install path. Day 4 closes the remaining

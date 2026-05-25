@@ -491,7 +491,7 @@
     },
     "vmlinux": {
       "install_path": "bin/vmlinux",
-      "description": "ElastOS guest kernel (6.1.59, CONFIG_VIRTIO_CONSOLE=y) for crosvm capsule boot",
+      "description": "ElastOS guest kernel (6.1.59, CONFIG_VIRTIO_CONSOLE=y) for crosvm/Vz capsule boot. On darwin-arm64 the artifact is a same-source recompile for ARM64 (PHASE_0_SCOPE.md \u00a7 C.3 Decision A); build recipe at scripts/build-vmlinux-arm64.sh.",
       "platforms": {
         "linux-amd64": {
           "cid": "Qmeb1qaqfMiri7G123FWmMz6qt74xhPjAgAJEy8ZSrFKh7",
@@ -503,6 +503,15 @@
           "source": "/boot/Image",
           "note": "Upstream crosvm aarch64 test kernel is broken on GICv3-only hosts (Jetson). Uses host kernel instead.",
           "install_path": "bin/vmlinux"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "vmlinux-darwin-arm64",
+          "install_path": "bin/vmlinux",
+          "build_recipe": "scripts/build-vmlinux-arm64.sh",
+          "note": "Day-4b operator handoff: run scripts/build-vmlinux-arm64.sh on a dev Mac to produce the Image; populate checksum + size from the build output. cid is computed by the release pipeline (ipfs-provider add) at publish time."
         }
       }
     },

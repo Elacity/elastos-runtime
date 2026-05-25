@@ -15,8 +15,12 @@
 #      release_path,extract_path}` must equal the corresponding linux-arm64
 #      values exactly. Catches accidental copy-paste drift in either
 #      direction once the release pipeline starts populating cids.
-#   4. Class-C kernel (vmlinux): linux-amd64 + linux-arm64 present today;
-#      darwin-arm64 added in Day 4 (forward-compatible — logged as "Day 4 expected").
+#   4. Class-C kernel (vmlinux): linux-amd64 + linux-arm64 + darwin-arm64
+#      all present. **Day 4 promoted Class C from forward-compat to
+#      required** (matches the Class A pattern: structural keys must
+#      exist; release-pipeline populates values). Day-4b operator
+#      handoff populates `darwin-arm64.{checksum, size}` from the
+#      output of `scripts/build-vmlinux-arm64.sh`.
 #   5. Class-D linux-only substrate (crosvm): platforms == EXACTLY
 #      [linux-amd64, linux-arm64]. The Mac install-loop skip relies on this.
 #   6. Class-E 3rd-party helpers (3): linux-amd64 + linux-arm64 + darwin-arm64
@@ -69,7 +73,9 @@ CLASS_A_HOST_BINARIES = [
 ]
 # Promoted from forward-compat to required in Day 3.
 CLASS_B_MICROVM_BUNDLES = ["chat"]
-# Day-4 deliverable; Day-3 keeps as forward-compat note.
+# Promoted from forward-compat to required in Day 4 (matches Class A
+# stub pattern; release pipeline + Day-4b operator handoff populate
+# checksum/size values).
 CLASS_C_KERNEL = ["vmlinux"]
 CLASS_D_LINUX_ONLY = ["crosvm"]
 CLASS_E_HELPERS = ["kubo", "cloudflared", "llama-server"]
@@ -114,14 +120,30 @@ for name in CLASS_B_MICROVM_BUNDLES:
                 "these must be byte-identical for share-linux-arm64-bundle"
             )
 
-# --- Class C (forward-compat: Day-4 work) ---
+# --- Class C (Day-4 promoted to required structural; values populated
+#     by Day-4b operator handoff via scripts/build-vmlinux-arm64.sh) ---
 for name in CLASS_C_KERNEL:
     plats = external.get(name, {}).get("platforms", {})
-    base_missing = [k for k in ("linux-amd64", "linux-arm64") if k not in plats]
-    if base_missing:
-        errors.append(f"[Class C] external.{name}.platforms missing baseline keys: {base_missing}")
-    if "darwin-arm64" not in plats:
-        notes.append(f"[Class C] external.{name}.platforms.darwin-arm64 — Day 4 expected (carry-forward)")
+    missing = [k for k in REQUIRED_KEYS_ALL if k not in plats]
+    if missing:
+        errors.append(f"[Class C] external.{name}.platforms missing keys: {missing}")
+        continue
+    darwin = plats["darwin-arm64"]
+    # Structural: release_path must reference the build-recipe output.
+    if not darwin.get("release_path"):
+        errors.append(
+            f"[Class C] external.{name}.platforms.darwin-arm64.release_path "
+            "missing — should be 'vmlinux-darwin-arm64' (output of "
+            "scripts/build-vmlinux-arm64.sh)"
+        )
+    # Soft signal: if checksum is still empty, log a Day-4b operator
+    # handoff note (non-fatal — matches Class A stub pattern).
+    if not darwin.get("checksum"):
+        notes.append(
+            f"[Class C] external.{name}.platforms.darwin-arm64.checksum "
+            "empty — Day-4b operator handoff pending "
+            "(run scripts/build-vmlinux-arm64.sh)"
+        )
 
 # --- Class D (Linux-only; darwin must NOT be present) ---
 for name in CLASS_D_LINUX_ONLY:
@@ -172,7 +194,7 @@ if errors:
 print("[components-json-verify] OK")
 print(f"  Class A (host binaries):    {len(CLASS_A_HOST_BINARIES)}/{len(CLASS_A_HOST_BINARIES)} green")
 print(f"  Class B (microVM bundles):  {len(CLASS_B_MICROVM_BUNDLES)}/{len(CLASS_B_MICROVM_BUNDLES)} green (D.2.a share-bundle invariant enforced)")
-print(f"  Class C (kernel):           baseline green ({len(CLASS_C_KERNEL)} entry, darwin Day 4)")
+print(f"  Class C (kernel):           {len(CLASS_C_KERNEL)}/{len(CLASS_C_KERNEL)} green (structural; checksum populated by Day-4b operator handoff)")
 print(f"  Class D (linux-only):       {len(CLASS_D_LINUX_ONLY)}/{len(CLASS_D_LINUX_ONLY)} green (darwin absent as required)")
 print(f"  Class E (3rd-party):        {len(CLASS_E_HELPERS)}/{len(CLASS_E_HELPERS)} green (real url + checksum)")
 print(f"  Capsules projection:        {len([c for c in capsules if c != 'chat-wasm'])} entries include 'aarch64-darwin'")
