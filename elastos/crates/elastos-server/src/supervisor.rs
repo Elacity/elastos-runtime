@@ -2290,8 +2290,6 @@ impl Supervisor {
         mut launch_config: serde_json::Value,
         vz_config: &elastos_vz::VzConfig,
     ) -> Result<(elastos_vz::VmConfig, String, u32, std::path::PathBuf)> {
-        use elastos_vz::VmConfig as VzVmConfig;
-
         // CID alloc — advisory only on Mac (Apple does not let
         // us hand the CID to Vz, Phase 0 §D pitfall #5) but kept
         // for log-line diffability with the Linux path. The
@@ -2321,11 +2319,29 @@ impl Supervisor {
         }
 
         // Build VmConfig. Mirrors supervisor.rs L1015-1024 but on
-        // the Vz type. `from_manifest` reuses the manifest's
-        // `microvm.kernel` if set, else falls back to
+        // the Vz type. `from_manifest_with_limits` reuses the
+        // manifest's `microvm.kernel` if set, else falls back to
         // `vz_config.kernel_path` (~/.local/share/elastos/bin/vmlinux).
-        let mut vm_config =
-            VzVmConfig::from_manifest(manifest, capsule_dir, &vz_config.kernel_path);
+        //
+        // Phase 10.5 M4: reject manifest-driven over-allocation
+        // (memory > 64 GiB or vCPUs > 32) BEFORE Apple's
+        // `validateWithError` is asked to briefly commit memory
+        // or allocate vCPU state — that brief stall on the
+        // supervisor thread was the M4 manifest-driven DoS the
+        // pre-review packet flagged.
+        let mut vm_config = elastos_vz::VmConfig::from_manifest_with_limits(
+            manifest,
+            capsule_dir,
+            &vz_config.kernel_path,
+            &elastos_vz::VmConfigLimits::default(),
+        )
+        .map_err(|e| {
+            elastos_common::ElastosError::InvalidManifest(format!(
+                "capsule '{name}': manifest requests memory_mb / vcpu_count above the \
+                 per-deployment cap (defaults: 65536 MiB / 32 vCPUs). Underlying \
+                 validation error: {e}"
+            ))
+        })?;
         vm_config.vsock_cid = cid;
         vm_config.boot_args = format!("{} elastos.data_dir=/opt/elastos", vm_config.boot_args);
         vm_config.interactive_stdio = interactive_stdio;

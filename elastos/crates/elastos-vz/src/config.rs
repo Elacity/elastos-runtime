@@ -29,6 +29,73 @@ use crate::network::NetworkConfig;
 /// exercise the timeout path. **Phase 4 Day 6.**
 pub const DEFAULT_VZ_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// **Phase 10.5 M4 — default per-capsule memory cap.**
+///
+/// 64 GiB. Two orders of magnitude above any plausible per-capsule
+/// workload but well below Apple's `validateWithError` blast
+/// radius — the OS validator briefly tries to commit memory when
+/// checking a `setMemorySize:` request, so a 4 TiB
+/// (`u32::MAX` MiB) manifest can stall the supervisor for seconds
+/// before being rejected. Sanity-rejecting at `from_manifest`
+/// time avoids that stall entirely.
+pub const DEFAULT_MAX_MEMORY_MIB: u32 = 65_536;
+
+/// **Phase 10.5 M4 — default per-capsule vCPU cap.**
+///
+/// 32 vCPUs. Apple Silicon hosts ship with at most 24 performance
+/// cores today (M3 Ultra); 32 is a comfortable ceiling for any
+/// foreseeable hardware and well below `u8::MAX = 255` (the type
+/// limit on the manifest field).
+pub const DEFAULT_MAX_VCPU_COUNT: u8 = 32;
+
+/// **Phase 10.5 M4 — per-deployment resource caps.**
+///
+/// Upper bounds on memory and vCPU requests accepted from
+/// capsule manifests. Defaults are conservative (see
+/// [`DEFAULT_MAX_MEMORY_MIB`] and [`DEFAULT_MAX_VCPU_COUNT`]) but
+/// can be overridden by operators that need tighter or looser
+/// bounds via [`VmConfig::from_manifest_with_limits`].
+///
+/// **Threat closed:** without this cap, a capsule manifest can
+/// request `u32::MAX` MiB (= 4 TiB) of RAM or `u8::MAX` (= 255)
+/// vCPUs — values that Apple's `validateWithError` will reject,
+/// but only *after* briefly trying to commit memory or allocate
+/// vCPU state. That brief stall on the supervisor thread is the
+/// manifest-driven DoS the pre-review packet's M4 flagged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmConfigLimits {
+    /// Maximum `mem_size_mib` accepted from a manifest's
+    /// `resources.memory_mb` field. Defaults to
+    /// [`DEFAULT_MAX_MEMORY_MIB`] (64 GiB).
+    pub max_memory_mib: u32,
+    /// Maximum `vcpu_count` accepted from a manifest's
+    /// `microvm.vcpu_count` field. Defaults to
+    /// [`DEFAULT_MAX_VCPU_COUNT`] (32 vCPUs).
+    pub max_vcpu_count: u8,
+}
+
+impl Default for VmConfigLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_mib: DEFAULT_MAX_MEMORY_MIB,
+            max_vcpu_count: DEFAULT_MAX_VCPU_COUNT,
+        }
+    }
+}
+
+impl VmConfigLimits {
+    /// Construct with explicit caps. Used by tests and any
+    /// future operator-driven flow that needs to override the
+    /// defaults (a multi-tenant deployment might want
+    /// per-tenant ceilings, for example).
+    pub const fn new(max_memory_mib: u32, max_vcpu_count: u8) -> Self {
+        Self {
+            max_memory_mib,
+            max_vcpu_count,
+        }
+    }
+}
+
 /// Configuration for the Vz provider.
 ///
 /// Field shape mirrors [`elastos_crosvm::CrosvmConfig`] minus the
@@ -395,6 +462,38 @@ impl VmConfig {
         }
     }
 
+    /// **Phase 10.5 M4 — fallible counterpart of [`from_manifest`].**
+    ///
+    /// Validates `manifest.resources.memory_mb` and the
+    /// effective `vcpu_count` against the supplied [`VmConfigLimits`]
+    /// BEFORE constructing the `VmConfig`. Returns
+    /// [`ConfigError::ResourceLimitExceeded`] for either cap on
+    /// violation; on success, delegates to [`from_manifest`] for
+    /// the construction body (zero behavioural drift between
+    /// the two paths).
+    ///
+    /// **Use this method from production launch paths** so
+    /// manifest-driven over-allocations are rejected before
+    /// Apple's `validateWithError` is asked to briefly commit
+    /// the memory / vCPU state (which can stall the supervisor
+    /// for seconds on a `u32::MAX` MiB ask).
+    ///
+    /// [`from_manifest`] remains available for tests and any
+    /// trusted-input call site that does not need
+    /// validation — it is the equivalent of calling this method
+    /// with effectively-unbounded limits and is intentionally
+    /// distinct so a future audit grep for the validated path
+    /// can find it.
+    pub fn from_manifest_with_limits(
+        manifest: &CapsuleManifest,
+        capsule_path: &std::path::Path,
+        default_kernel: &std::path::Path,
+        limits: &VmConfigLimits,
+    ) -> Result<Self, ConfigError> {
+        enforce_resource_limits(manifest, limits)?;
+        Ok(Self::from_manifest(manifest, capsule_path, default_kernel))
+    }
+
     /// Attach an initial ramdisk path. Used by `elastos vm-debug
     /// boot --initramfs …` and any future flow that needs to boot a
     /// kernel that depends on an initramfs (every Ubuntu / Debian /
@@ -424,6 +523,43 @@ impl VmConfig {
         );
         self
     }
+}
+
+/// **Phase 10.5 M4** — validate that a capsule manifest's
+/// resource requests fit within the supplied limits. Returns the
+/// first violation as a typed [`ConfigError::ResourceLimitExceeded`].
+///
+/// Order of checks: memory first (the more expensive runtime
+/// allocation to validate via Apple), then vCPU count.
+fn enforce_resource_limits(
+    manifest: &CapsuleManifest,
+    limits: &VmConfigLimits,
+) -> Result<(), ConfigError> {
+    let requested_memory = manifest.resources.memory_mb;
+    if requested_memory > limits.max_memory_mib {
+        return Err(ConfigError::ResourceLimitExceeded {
+            field: "resources.memory_mb",
+            requested: requested_memory as u64,
+            max: limits.max_memory_mib as u64,
+        });
+    }
+    // `vcpu_count` defaults to 1 when the manifest omits the
+    // field (mirrors the construction default in `from_manifest`),
+    // so a manifest with no `microvm.vcpu_count` is always within
+    // any sane cap.
+    let requested_vcpus = manifest
+        .microvm
+        .as_ref()
+        .and_then(|m| m.vcpu_count)
+        .unwrap_or(1);
+    if requested_vcpus > limits.max_vcpu_count {
+        return Err(ConfigError::ResourceLimitExceeded {
+            field: "microvm.vcpu_count",
+            requested: requested_vcpus as u64,
+            max: limits.max_vcpu_count as u64,
+        });
+    }
+    Ok(())
 }
 
 /// Public for tests and call sites that need to migrate a
@@ -462,6 +598,21 @@ pub enum ConfigError {
 
     #[error("kernel image at {0} is incompatible with the Vz boot contract; missing markers: {1}. Install a guest kernel with ext4 + virtio_blk + virtio_pci built in (Apple Silicon: raw ARM64 Image format).")]
     KernelIncompatible(PathBuf, String),
+
+    /// **Phase 10.5 M4** — manifest requested a resource value
+    /// above the configured upper bound. Carries the field name,
+    /// the requested value, and the cap so an operator looking
+    /// at the error can decide whether to lower the manifest's
+    /// ask or raise the deployment-wide cap.
+    #[error(
+        "manifest field `{field}` requested {requested}, but the configured maximum is {max} \
+         (raise the cap via VmConfigLimits, or lower the manifest's request)"
+    )]
+    ResourceLimitExceeded {
+        field: &'static str,
+        requested: u64,
+        max: u64,
+    },
 }
 
 #[cfg(test)]
@@ -647,6 +798,161 @@ mod tests {
             opted_in_again.prune_orphans_on_startup,
             "with_prune_orphans_on_startup(true) must restore the flag"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M4 — manifest resource cap regression tests.
+    //
+    // Pre-Phase-10.5 `from_manifest` accepted any `u32` value for
+    // `resources.memory_mb` (= 4 TiB max) and any `u8` value for
+    // `microvm.vcpu_count` (= 255 max) without bound. A manifest
+    // requesting absurd values would only be rejected later, by
+    // Apple's `validateWithError`, which briefly tries to commit
+    // memory / vCPU state and can stall the supervisor for seconds.
+    //
+    // `from_manifest_with_limits` is the fallible counterpart that
+    // production launch paths should use. These tests cover the
+    // four corner cases:
+    //   - happy path: typical manifest within defaults.
+    //   - reject: memory above default cap.
+    //   - reject: vCPU above default cap.
+    //   - override: custom limits accept values the default rejects.
+    // ---------------------------------------------------------------
+
+    fn microvm_manifest_with_resources(memory_mb: u32, vcpu_count: u8) -> CapsuleManifest {
+        let mut manifest = microvm_manifest("console=ttyS0");
+        manifest.resources.memory_mb = memory_mb;
+        if let Some(microvm) = manifest.microvm.as_mut() {
+            microvm.vcpu_count = Some(vcpu_count);
+        }
+        manifest
+    }
+
+    #[test]
+    fn from_manifest_with_limits_accepts_typical_request() {
+        let manifest = microvm_manifest_with_resources(512, 2);
+        let result = VmConfig::from_manifest_with_limits(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+            &VmConfigLimits::default(),
+        );
+        let config = result.expect("typical 512 MiB / 2 vCPU manifest must pass default caps");
+        assert_eq!(config.mem_size_mib, 512);
+        assert_eq!(config.vcpu_count, 2);
+    }
+
+    #[test]
+    fn from_manifest_with_limits_rejects_excessive_memory() {
+        // 1 MiB above the default cap.
+        let manifest = microvm_manifest_with_resources(DEFAULT_MAX_MEMORY_MIB + 1, 1);
+        let err = VmConfig::from_manifest_with_limits(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+            &VmConfigLimits::default(),
+        )
+        .expect_err("memory request above default cap must be rejected");
+        match err {
+            ConfigError::ResourceLimitExceeded {
+                field,
+                requested,
+                max,
+            } => {
+                assert_eq!(field, "resources.memory_mb");
+                assert_eq!(requested, (DEFAULT_MAX_MEMORY_MIB as u64) + 1);
+                assert_eq!(max, DEFAULT_MAX_MEMORY_MIB as u64);
+            }
+            other => panic!("expected ResourceLimitExceeded for memory, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_manifest_with_limits_rejects_excessive_vcpus() {
+        // 1 vCPU above the default cap.
+        let manifest = microvm_manifest_with_resources(128, DEFAULT_MAX_VCPU_COUNT + 1);
+        let err = VmConfig::from_manifest_with_limits(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+            &VmConfigLimits::default(),
+        )
+        .expect_err("vCPU request above default cap must be rejected");
+        match err {
+            ConfigError::ResourceLimitExceeded {
+                field,
+                requested,
+                max,
+            } => {
+                assert_eq!(field, "microvm.vcpu_count");
+                assert_eq!(requested, (DEFAULT_MAX_VCPU_COUNT as u64) + 1);
+                assert_eq!(max, DEFAULT_MAX_VCPU_COUNT as u64);
+            }
+            other => panic!("expected ResourceLimitExceeded for vcpu, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_manifest_with_limits_rejects_u32_max_memory() {
+        // The exact pre-Phase-10.5 attack: a manifest requesting
+        // 4 TiB of RAM. Pre-fix this would propagate all the way
+        // to Apple's `validateWithError`; post-fix it is rejected
+        // at config-build time without touching the framework.
+        let manifest = microvm_manifest_with_resources(u32::MAX, 1);
+        let err = VmConfig::from_manifest_with_limits(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+            &VmConfigLimits::default(),
+        )
+        .expect_err("u32::MAX MiB ask must be rejected");
+        assert!(
+            matches!(err, ConfigError::ResourceLimitExceeded { field: "resources.memory_mb", .. }),
+            "expected memory-field rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_manifest_with_custom_limits_overrides_default() {
+        // An operator running on a 256 GiB host can raise the cap
+        // to permit larger capsules. With limits raised, a 128 GiB
+        // ask that would be rejected under defaults now passes.
+        let above_default = DEFAULT_MAX_MEMORY_MIB + 65_536;
+        let manifest = microvm_manifest_with_resources(above_default, 16);
+        let custom = VmConfigLimits::new(above_default + 1024, 64);
+        let config = VmConfig::from_manifest_with_limits(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+            &custom,
+        )
+        .expect("custom-limits build must accept ask within the operator-raised cap");
+        assert_eq!(config.mem_size_mib, above_default);
+        assert_eq!(config.vcpu_count, 16);
+    }
+
+    #[test]
+    fn vm_config_limits_default_matches_documented_constants() {
+        let limits = VmConfigLimits::default();
+        assert_eq!(limits.max_memory_mib, DEFAULT_MAX_MEMORY_MIB);
+        assert_eq!(limits.max_vcpu_count, DEFAULT_MAX_VCPU_COUNT);
+    }
+
+    #[test]
+    fn from_manifest_remains_infallible_for_legacy_callers() {
+        // `from_manifest` (no `_with_limits`) is the unvalidated
+        // path retained for tests and trusted-input call sites.
+        // It must continue to accept absurd values without panic
+        // so production code that has not migrated to
+        // `from_manifest_with_limits` keeps compiling and running.
+        let manifest = microvm_manifest_with_resources(u32::MAX, u8::MAX);
+        let config = VmConfig::from_manifest(
+            &manifest,
+            std::path::Path::new("/c"),
+            std::path::Path::new("/k"),
+        );
+        assert_eq!(config.mem_size_mib, u32::MAX);
+        assert_eq!(config.vcpu_count, u8::MAX);
     }
 
     #[test]

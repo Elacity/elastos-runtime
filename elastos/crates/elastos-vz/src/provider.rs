@@ -27,7 +27,7 @@ use elastos_common::{
 };
 use elastos_compute::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 
-use crate::config::{VmConfig, VzConfig};
+use crate::config::{VmConfig, VmConfigLimits, VzConfig};
 use crate::network::NetworkConfig;
 use crate::vm::RunningVm;
 // PHASE_1_STUB_MESSAGE is referenced from the non-macOS branch
@@ -109,7 +109,21 @@ impl ComputeProvider for VzProvider {
             )));
         }
 
-        let mut vm_config = VmConfig::from_manifest(&manifest, path, &self.config.kernel_path);
+        // Phase 10.5 M4: production launch paths reject
+        // manifest-driven resource over-allocation BEFORE
+        // touching the Vz framework. Default caps are 64 GiB /
+        // 32 vCPUs — see `VmConfigLimits::default()`. Operators
+        // that need different bounds wire a custom limits
+        // builder here in a future enhancement; today the
+        // default is the only path because no caller has
+        // requested otherwise.
+        let mut vm_config = VmConfig::from_manifest_with_limits(
+            &manifest,
+            path,
+            &self.config.kernel_path,
+            &VmConfigLimits::default(),
+        )
+        .map_err(|e| ElastosError::InvalidManifest(e.to_string()))?;
 
         // Apply the provider-wide initramfs default. The capsule
         // manifest doesn't carry an initramfs path (Phase 2 design
