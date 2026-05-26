@@ -85,6 +85,7 @@ impl Runtime {
         registry: Arc<ProviderRegistry>,
         capability_manager: Arc<elastos_runtime::capability::CapabilityManager>,
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
+        data_dir: std::path::PathBuf,
     ) {
         // Configure WASM bridge if we have a concrete WasmProvider reference
         if let Some(ref wasm) = self.wasm_provider {
@@ -96,13 +97,9 @@ impl Runtime {
                     provider_registry: reg.clone(),
                     capability_manager: cap_mgr.clone(),
                     pending_store: pending.clone(),
-                    capsule_id: format!(
-                        "wasm-{}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
-                            .unwrap_or(0)
-                    ),
+                    capsule_id: pipes.capsule_id.clone(),
+                    principal_id: pipes.principal_id.clone(),
+                    data_dir: Some(data_dir.clone()),
                 };
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));
@@ -138,6 +135,17 @@ impl Runtime {
 
     /// Load and run a capsule from a local directory
     pub async fn run_local(&self, path: &Path, args: Vec<String>) -> Result<CapsuleHandle> {
+        self.run_local_with_principal(path, args, None).await
+    }
+
+    /// Load and run a capsule from a local directory with an optional runtime
+    /// principal for current-user storage alias resolution.
+    pub async fn run_local_with_principal(
+        &self,
+        path: &Path,
+        args: Vec<String>,
+        principal_id: Option<String>,
+    ) -> Result<CapsuleHandle> {
         // Read manifest
         let manifest_path = path.join("capsule.json");
         let manifest_data = tokio::fs::read_to_string(&manifest_path)
@@ -189,12 +197,23 @@ impl Runtime {
 
         // Load capsule
         let mut handle = provider.load(path, manifest).await?;
+        if handle.manifest.capsule_type == CapsuleType::Wasm {
+            if let Some(ref wasm) = self.wasm_provider {
+                wasm.set_bridge_principal(&handle.id, principal_id).await;
+            }
+        }
 
         // Set args on handle before starting
         handle.args = args;
 
         // Start capsule
-        provider.start(&handle).await?;
+        let start = provider.start(&handle).await;
+        if handle.manifest.capsule_type == CapsuleType::Wasm {
+            if let Some(ref wasm) = self.wasm_provider {
+                wasm.clear_bridge_principal(&handle.id).await;
+            }
+        }
+        start?;
 
         Ok(handle)
     }

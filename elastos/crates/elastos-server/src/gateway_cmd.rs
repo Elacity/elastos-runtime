@@ -160,6 +160,7 @@ where
             supervisor::SupervisorRequest::LaunchCapsule {
                 name: cap.clone(),
                 config: serde_json::json!({}),
+                principal_id: None,
             },
         )
         .await?;

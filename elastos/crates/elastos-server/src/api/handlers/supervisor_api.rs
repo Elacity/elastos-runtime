@@ -161,6 +161,7 @@ pub async fn launch_capsule(
     let req = SupervisorRequest::LaunchCapsule {
         name: input.name,
         config: input.config,
+        principal_id: None,
     };
     let resp = state.supervisor.handle_request(req).await;
     if resp.status != "ok" {

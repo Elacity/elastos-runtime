@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::localhost::is_supported_resource_scheme;
+use crate::localhost::{
+    is_runtime_system_service_resource, is_supported_resource_scheme,
+    is_system_only_backend_resource,
+};
 
 /// The main capsule manifest structure (capsule.json)
 ///
@@ -37,6 +40,10 @@ pub struct CapsuleManifest {
     /// Protocol URI this capsule provides (e.g. "elastos://ipfs/*")
     #[serde(default)]
     pub provides: Option<String>,
+
+    /// Provider-only authority declaration for reviewable service exceptions.
+    #[serde(default)]
+    pub authority: Option<ProviderAuthority>,
 
     /// Capabilities this capsule needs from other capsules (URI list)
     #[serde(default)]
@@ -119,6 +126,88 @@ impl CapsuleManifest {
         if self.role == CapsuleRole::Content && self.capsule_type != CapsuleType::Data {
             return Err("content capsules must use type=data".to_string());
         }
+        if self.role.is_app_viewer_or_content() {
+            if self.permissions.guest_network {
+                return Err(format!(
+                    "{} capsules cannot request guest_network; use a provider capsule for raw network backends",
+                    self.role.as_str()
+                ));
+            }
+            if self.permissions.carrier {
+                return Err(format!(
+                    "{} capsules cannot request carrier host execution; use a provider capsule for host services",
+                    self.role.as_str()
+                ));
+            }
+            if self.provides.is_some() {
+                return Err(format!(
+                    "{} capsules cannot provide protocol namespaces",
+                    self.role.as_str()
+                ));
+            }
+            if self
+                .requires
+                .iter()
+                .any(|req| req.kind == RequirementKind::External)
+            {
+                return Err(format!(
+                    "{} capsules cannot require external host dependencies; put protocol/tool adapters behind provider capsules",
+                    self.role.as_str()
+                ));
+            }
+            if self
+                .providers
+                .as_ref()
+                .is_some_and(|providers| !providers.is_empty())
+            {
+                return Err(format!(
+                    "{} capsules cannot choose provider implementations; the runtime/provider layer owns local vs network routing",
+                    self.role.as_str()
+                ));
+            }
+            if self
+                .microvm
+                .as_ref()
+                .and_then(|microvm| microvm.http_port)
+                .is_some()
+            {
+                return Err(format!(
+                    "{} capsules cannot expose microVM HTTP ports; use a host adapter or a provider capsule",
+                    self.role.as_str()
+                ));
+            }
+        }
+        if self.permissions.carrier
+            && (self.role != CapsuleRole::Provider || self.provides.is_none())
+        {
+            return Err(
+                "carrier host execution requires a provider capsule with an explicit provides namespace"
+                    .to_string(),
+            );
+        }
+        if self.permissions.guest_network
+            && (self.role != CapsuleRole::Provider || self.provides.is_none())
+        {
+            return Err(
+                "guest_network requires a provider capsule with an explicit provides namespace"
+                    .to_string(),
+            );
+        }
+        if self.provides.is_some() && self.role != CapsuleRole::Provider {
+            return Err("only provider capsules can provide protocol namespaces".to_string());
+        }
+        if self.role == CapsuleRole::Provider && self.provides.is_none() {
+            return Err("provider capsules must declare a provides namespace".to_string());
+        }
+        if self.role == CapsuleRole::Provider {
+            let authority = self
+                .authority
+                .as_ref()
+                .ok_or_else(|| "provider capsules must declare authority metadata".to_string())?;
+            authority.validate()?;
+        } else if self.authority.is_some() {
+            return Err("authority metadata is only valid on provider capsules".to_string());
+        }
 
         // Reject path traversal in viewer field (same rules as entrypoint)
         if let Some(viewer) = &self.viewer {
@@ -161,6 +250,45 @@ impl CapsuleManifest {
                     cap
                 ));
             }
+            if self.role.is_app_viewer_or_content() {
+                if is_system_only_backend_resource(cap) {
+                    return Err(format!(
+                        "{} capsules cannot request system-only backend capability \"{}\"; use the product/provider contract instead",
+                        self.role.as_str(),
+                        cap
+                    ));
+                }
+                if is_runtime_system_service_resource(cap) {
+                    return Err(format!(
+                        "{} capsules cannot request runtime system-service storage \"{}\"",
+                        self.role.as_str(),
+                        cap
+                    ));
+                }
+            }
+        }
+
+        for storage in &self.permissions.storage {
+            if !is_allowed_uri_scheme(storage) {
+                return Err(format!(
+                    "unsupported URI scheme in storage permission \"{}\"; allowed: elastos://, localhost://",
+                    storage
+                ));
+            }
+            if self.role.is_app_viewer_or_content() && is_runtime_system_service_resource(storage) {
+                return Err(format!(
+                    "{} capsules cannot request runtime system-service storage \"{}\"",
+                    self.role.as_str(),
+                    storage
+                ));
+            }
+            if self.role.is_app_viewer_or_content() && is_system_only_backend_resource(storage) {
+                return Err(format!(
+                    "{} capsules cannot request system-only backend storage \"{}\"; use the product/provider contract instead",
+                    self.role.as_str(),
+                    storage
+                ));
+            }
         }
 
         Ok(())
@@ -174,6 +302,83 @@ impl CapsuleManifest {
 
 fn is_allowed_uri_scheme(uri: &str) -> bool {
     is_supported_resource_scheme(uri)
+}
+
+/// Provider-only authority metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAuthority {
+    pub reason: String,
+    pub capabilities: Vec<ProviderCapabilitySchema>,
+    pub audit_events: Vec<String>,
+}
+
+impl ProviderAuthority {
+    fn validate(&self) -> Result<(), String> {
+        if self.reason.trim().is_empty() {
+            return Err("provider authority reason must not be empty".to_string());
+        }
+        if self.capabilities.is_empty() {
+            return Err(
+                "provider authority must declare at least one capability schema".to_string(),
+            );
+        }
+        if self.audit_events.is_empty() {
+            return Err("provider authority must declare expected audit events".to_string());
+        }
+        for capability in &self.capabilities {
+            capability.validate()?;
+        }
+        for event in &self.audit_events {
+            if event.trim().is_empty() {
+                return Err("provider authority audit event must not be empty".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A reviewable provider capability surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCapabilitySchema {
+    pub resource: String,
+    pub actions: Vec<String>,
+    pub operations: Vec<String>,
+}
+
+impl ProviderCapabilitySchema {
+    fn validate(&self) -> Result<(), String> {
+        if !is_allowed_uri_scheme(&self.resource) {
+            return Err(format!(
+                "unsupported URI scheme in provider authority resource \"{}\"; allowed: elastos://, localhost://",
+                self.resource
+            ));
+        }
+        if self.actions.is_empty() {
+            return Err("provider authority capability must declare actions".to_string());
+        }
+        if self.operations.is_empty() {
+            return Err("provider authority capability must declare operations".to_string());
+        }
+        for action in &self.actions {
+            if !matches!(
+                action.as_str(),
+                "read" | "write" | "execute" | "delete" | "message" | "admin"
+            ) {
+                return Err(format!(
+                    "unsupported provider authority action \"{}\"",
+                    action
+                ));
+            }
+        }
+        for operation in &self.operations {
+            if operation.trim().is_empty() {
+                return Err("provider authority operation must not be empty".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Supported capsule types
@@ -207,6 +412,20 @@ impl CapsuleRole {
 
     pub fn is_content(&self) -> bool {
         matches!(self, Self::Content)
+    }
+
+    pub fn is_app_viewer_or_content(&self) -> bool {
+        matches!(self, Self::App | Self::Viewer | Self::Content)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::App => "app",
+            Self::Viewer => "viewer",
+            Self::Provider => "provider",
+            Self::Content => "content",
+        }
     }
 }
 
@@ -689,6 +908,15 @@ mod tests {
             "entrypoint": "ipfs-provider",
             "requires": [{"name":"kubo","kind":"external"}],
             "provides": "elastos://ipfs/*",
+            "authority": {
+                "reason": "Low-level content availability backend owned by the runtime.",
+                "capabilities": [{
+                    "resource": "elastos://ipfs/*",
+                    "actions": ["read", "write", "delete", "admin"],
+                    "operations": ["add_bytes", "cat", "download_directory", "unpin", "status"]
+                }],
+                "audit_events": ["ipfs.publish", "ipfs.fetch", "ipfs.unpin"]
+            },
             "capabilities": ["localhost://ElastOS/SystemServices/IPFS/*"],
             "resources": { "memory_mb": 128, "gpu": false }
         }"#;
@@ -756,7 +984,16 @@ mod tests {
             "role": "provider",
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
-            "provides": "https://example.com/*"
+            "provides": "https://example.com/*",
+            "authority": {
+                "reason": "Bad provider authority.",
+                "capabilities": [{
+                    "resource": "elastos://bad/*",
+                    "actions": ["execute"],
+                    "operations": ["status"]
+                }],
+                "audit_events": ["bad.status"]
+            }
         }"#;
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         let err = manifest.validate().unwrap_err();
@@ -779,6 +1016,91 @@ mod tests {
         let err = manifest.validate().unwrap_err();
         assert!(err.contains("unsupported URI scheme"));
         assert!(err.contains("capability"));
+    }
+
+    #[test]
+    fn test_app_capsule_rejects_system_backend_capability() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "bad-backend-capability",
+            "version": "0.1.0",
+            "role": "app",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "capabilities": ["elastos://ipfs/add"]
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("system-only backend capability"));
+    }
+
+    #[test]
+    fn test_viewer_capsule_allows_content_contract_capability() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "content-aware-viewer",
+            "version": "0.1.0",
+            "role": "viewer",
+            "type": "data",
+            "entrypoint": "index.html",
+            "capabilities": ["elastos://content/fetch"]
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_content_capsule_rejects_runtime_system_service_storage() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "bad-system-service-capability",
+            "version": "0.1.0",
+            "role": "content",
+            "type": "data",
+            "entrypoint": "asset.bin",
+            "permissions": {
+                "storage": ["localhost://ElastOS/SystemServices/IPFS/*"]
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("runtime system-service storage"));
+    }
+
+    #[test]
+    fn test_app_capsule_rejects_system_backend_storage() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "bad-system-backend-storage",
+            "version": "0.1.0",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "permissions": {
+                "storage": ["elastos://ipfs-provider/add"]
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("system-only backend storage"));
+    }
+
+    #[test]
+    fn test_v1_reject_disallowed_storage_permission_scheme() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "name": "bad-storage-permission",
+            "version": "0.1.0",
+            "role": "app",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "permissions": {
+                "storage": ["../host"]
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("unsupported URI scheme in storage permission"));
     }
 
     #[test]
@@ -839,12 +1161,22 @@ mod tests {
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "provides": "elastos://my/*",
+            "authority": {
+                "reason": "Test provider authority.",
+                "capabilities": [{
+                    "resource": "elastos://my/*",
+                    "actions": ["execute"],
+                    "operations": ["status"]
+                }],
+                "audit_events": ["my.status"]
+            },
             "permissions": {
                 "guest_network": true
             }
         }"#;
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         assert!(manifest.permissions.guest_network);
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]
@@ -887,6 +1219,185 @@ mod tests {
             !manifest.permissions.carrier,
             "app capsules don't run on the host"
         );
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_app_capsule_guest_network_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-app",
+            "role": "app",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "permissions": {
+                "guest_network": true
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("app capsules cannot request guest_network"));
+    }
+
+    #[test]
+    fn test_app_capsule_external_requirement_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-app",
+            "role": "app",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "requires": [{"name": "kubo", "kind": "external"}]
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("app capsules cannot require external host dependencies"));
+    }
+
+    #[test]
+    fn test_viewer_capsule_provider_source_override_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-viewer",
+            "role": "viewer",
+            "type": "data",
+            "entrypoint": "index.html",
+            "providers": {
+                "content": "elastos://QmProviderCID"
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("viewer capsules cannot choose provider implementations"));
+    }
+
+    #[test]
+    fn test_app_capsule_microvm_http_port_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-app",
+            "role": "app",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "microvm": {
+                "http_port": 4100
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("app capsules cannot expose microVM HTTP ports"));
+    }
+
+    #[test]
+    fn test_viewer_capsule_carrier_permission_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-viewer",
+            "role": "viewer",
+            "type": "wasm",
+            "entrypoint": "viewer.wasm",
+            "permissions": {
+                "carrier": true
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("viewer capsules cannot request carrier host execution"));
+    }
+
+    #[test]
+    fn test_content_capsule_provides_rejected() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-content",
+            "role": "content",
+            "type": "data",
+            "entrypoint": "asset.bin",
+            "provides": "elastos://bad/*"
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("content capsules cannot provide protocol namespaces"));
+    }
+
+    #[test]
+    fn test_carrier_permission_requires_provider_with_namespace() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-provider",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "permissions": {
+                "carrier": true
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("carrier host execution requires a provider capsule"));
+    }
+
+    #[test]
+    fn test_provider_requires_provides_namespace() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "webspace-provider",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "capabilities": ["localhost://WebSpaces/*"]
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("provider capsules must declare a provides namespace"));
+    }
+
+    #[test]
+    fn test_provider_requires_authority_metadata() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "thin-provider",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "provides": "elastos://thin/*"
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("provider capsules must declare authority metadata"));
+    }
+
+    #[test]
+    fn test_authority_metadata_rejected_for_app_capsules() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-app-authority",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "authority": {
+                "reason": "not allowed",
+                "capabilities": [{
+                    "resource": "elastos://peer/*",
+                    "actions": ["execute"],
+                    "operations": ["connect"]
+                }],
+                "audit_events": ["peer.connect"]
+            }
+        }"#;
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("authority metadata is only valid on provider capsules"));
     }
 
     #[test]
@@ -900,6 +1411,15 @@ mod tests {
             "type": "microvm",
             "entrypoint": "rootfs.ext4",
             "provides": "localhost://Users/*",
+            "authority": {
+                "reason": "Test localhost provider authority.",
+                "capabilities": [{
+                    "resource": "localhost://Users/*",
+                    "actions": ["read", "write", "delete"],
+                    "operations": ["read", "write", "delete"]
+                }],
+                "audit_events": ["localhost.read", "localhost.write"]
+            },
             "permissions": {
                 "guest_network": true,
                 "storage": ["localhost://Users/"]
@@ -911,5 +1431,6 @@ mod tests {
             "provider capsule explicitly requests TAP"
         );
         assert!(manifest.provides.is_some());
+        assert!(manifest.validate().is_ok());
     }
 }

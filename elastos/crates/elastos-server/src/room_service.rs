@@ -1456,6 +1456,33 @@ pub fn start_local_runtime_session(
     display_name: &str,
     device_label: &str,
 ) -> anyhow::Result<LocalRuntimeSessionOutput> {
+    start_local_runtime_session_for_actor(data_dir, member_did, None, display_name, device_label)
+}
+
+pub fn start_local_principal_runtime_session(
+    data_dir: &Path,
+    member_did: &str,
+    principal_id: &str,
+    display_name: &str,
+    device_label: &str,
+) -> anyhow::Result<LocalRuntimeSessionOutput> {
+    let actor_id = local_principal_room_actor_id(principal_id)?;
+    start_local_runtime_session_for_actor(
+        data_dir,
+        member_did,
+        Some(actor_id),
+        display_name,
+        device_label,
+    )
+}
+
+fn start_local_runtime_session_for_actor(
+    data_dir: &Path,
+    member_did: &str,
+    actor_id: Option<String>,
+    display_name: &str,
+    device_label: &str,
+) -> anyhow::Result<LocalRuntimeSessionOutput> {
     let member_did = normalize_member_did(member_did)?;
     let display_name = normalize_display_name(display_name)?;
     let device_label = normalize_device_label(device_label);
@@ -1474,6 +1501,16 @@ pub fn start_local_runtime_session(
         let session_member_did = Some(member_did.clone());
         let capabilities = room_access_capabilities();
 
+        if actor_id
+            .as_deref()
+            .is_some_and(|actor| actor.starts_with("principal:"))
+        {
+            state.sessions.retain(|session| {
+                session.member_did.as_deref() != Some(member_did.as_str())
+                    || session.actor_id.trim().starts_with("principal:")
+            });
+        }
+
         if let Some(session_member_did) = session_member_did.as_deref() {
             if active_member_record(state, session_member_did).is_none()
                 && room_requires_active_membership(state)
@@ -1485,9 +1522,12 @@ pub fn start_local_runtime_session(
         let canonical_local_token = state
             .sessions
             .iter()
-            .filter(|session| {
-                session.member_did.as_deref() == Some(member_did.as_str())
-                    || (session.member_did.is_none() && session.device_label == device_label)
+            .filter(|session| match actor_id.as_deref() {
+                Some(actor_id) => session.actor_id == actor_id,
+                None => {
+                    session.member_did.as_deref() == Some(member_did.as_str())
+                        || (session.member_did.is_none() && session.device_label == device_label)
+                }
             })
             .max_by_key(|session| {
                 (
@@ -1499,16 +1539,22 @@ pub fn start_local_runtime_session(
             .map(|session| session.token.clone());
 
         if let Some(token) = canonical_local_token {
-            state.sessions.retain(|session| {
-                !(session.member_did.as_deref() == Some(member_did.as_str())
-                    || (session.member_did.is_none() && session.device_label == device_label))
-                    || session.token == token
+            state.sessions.retain(|session| match actor_id.as_deref() {
+                Some(actor_id) => session.actor_id != actor_id || session.token == token,
+                None => {
+                    !(session.member_did.as_deref() == Some(member_did.as_str())
+                        || (session.member_did.is_none() && session.device_label == device_label))
+                        || session.token == token
+                }
             });
             let existing = state
                 .sessions
                 .iter_mut()
                 .find(|session| session.token == token)
                 .expect("canonical local runtime session");
+            if let Some(actor_id) = actor_id.as_deref() {
+                existing.actor_id = actor_id.to_string();
+            }
             existing.display_name = display_name.clone();
             existing.device_label = device_label.clone();
             existing.member_did = session_member_did.clone();
@@ -1523,13 +1569,19 @@ pub fn start_local_runtime_session(
             });
         }
 
-        let had_existing_member_session = session_member_did
-            .as_deref()
-            .is_some_and(|did| active_local_session_count(state, did) > 0);
-        let session = create_session_record(
+        let had_existing_session = match (actor_id.as_deref(), session_member_did.as_deref()) {
+            (Some(actor_id), _) => state
+                .sessions
+                .iter()
+                .any(|session| session.actor_id == actor_id),
+            (None, Some(did)) => active_local_session_count(state, did) > 0,
+            _ => false,
+        };
+        let session = create_session_record_with_actor(
             &display_name,
             &device_label,
             session_member_did.clone(),
+            actor_id.clone(),
             capabilities.clone(),
             now,
         );
@@ -1541,10 +1593,11 @@ pub fn start_local_runtime_session(
         };
         state.sessions.push(session);
         match session_member_did.as_deref() {
-            Some(member_did) if !had_existing_member_session => {
-                push_member_system_object(
+            Some(member_did) if !had_existing_session => {
+                push_member_system_object_for_actor(
                     state,
                     member_did,
+                    actor_id.as_deref(),
                     display_name,
                     "joined the room".to_string(),
                     now,
@@ -1557,6 +1610,15 @@ pub fn start_local_runtime_session(
         }
         Ok(output)
     })
+}
+
+fn local_principal_room_actor_id(principal_id: &str) -> anyhow::Result<String> {
+    let value = principal_id.trim();
+    if value.is_empty() || value.chars().count() > 240 {
+        anyhow::bail!("principal id is invalid for room actor binding");
+    }
+    let digest = sha2::Sha256::digest(format!("elastos.room.actor.v1:{value}").as_bytes());
+    Ok(format!("principal:{}", hex::encode(&digest[..16])))
 }
 
 pub fn approve_next_request(data_dir: &Path) -> anyhow::Result<Option<ApprovalOutcome>> {
@@ -1647,9 +1709,27 @@ fn create_session_record(
     capabilities: Vec<String>,
     now: u64,
 ) -> SessionRecord {
+    create_session_record_with_actor(
+        display_name,
+        device_label,
+        member_did,
+        None,
+        capabilities,
+        now,
+    )
+}
+
+fn create_session_record_with_actor(
+    display_name: &str,
+    device_label: &str,
+    member_did: Option<String>,
+    actor_id: Option<String>,
+    capabilities: Vec<String>,
+    now: u64,
+) -> SessionRecord {
     SessionRecord {
         token: random_hex(32),
-        actor_id: random_hex(16),
+        actor_id: actor_id.unwrap_or_else(|| random_hex(16)),
         display_name: display_name.to_string(),
         device_label: device_label.to_string(),
         member_did,
@@ -2409,26 +2489,32 @@ fn participant_views_from_state(
             continue;
         };
 
-        let participant =
-            members
-                .entry(member_did.to_string())
-                .or_insert_with(|| ParticipantAggregate {
-                    display_name: default_member_display_name(
-                        member_did,
-                        active_member_record(state, member_did).map(|member| &member.role),
-                    ),
-                    device_label: default_member_device_label(
-                        active_member_record(state, member_did).map(|member| &member.role),
-                    ),
-                    last_seen_at: 0,
-                    member_did: Some(member_did.to_string()),
-                    role: active_member_record(state, member_did).map(|member| member.role.clone()),
-                    local_session_count: 0,
-                    active_in_room: false,
-                    is_current_session: current_session
-                        .and_then(|session| session.member_did.as_deref())
-                        .is_some_and(|did| did == member_did),
-                });
+        let participant_key = participant_member_key(member_did, &object.sender_actor_id);
+        let participant = members
+            .entry(participant_key)
+            .or_insert_with(|| ParticipantAggregate {
+                display_name: default_member_display_name(
+                    member_did,
+                    active_member_record(state, member_did).map(|member| &member.role),
+                ),
+                device_label: default_member_device_label(
+                    active_member_record(state, member_did).map(|member| &member.role),
+                ),
+                last_seen_at: 0,
+                member_did: Some(member_did.to_string()),
+                role: active_member_record(state, member_did).map(|member| member.role.clone()),
+                local_session_count: 0,
+                active_in_room: false,
+                is_current_session: current_session
+                    .map(|session| {
+                        if !object.sender_actor_id.trim().is_empty() {
+                            session.actor_id == object.sender_actor_id
+                        } else {
+                            session.member_did.as_deref() == Some(member_did)
+                        }
+                    })
+                    .unwrap_or(false),
+            });
 
         if !object.sender.trim().is_empty() {
             participant.display_name = object.sender.clone();
@@ -2476,21 +2562,21 @@ fn participant_views_from_state(
             continue;
         };
 
-        let participant =
-            members
-                .entry(member_did.to_string())
-                .or_insert_with(|| ParticipantAggregate {
-                    display_name: session.display_name.clone(),
-                    device_label: session.device_label.clone(),
-                    last_seen_at: session.last_seen_at,
-                    member_did: Some(member_did.to_string()),
-                    role: active_member_record(state, member_did).map(|member| member.role.clone()),
-                    local_session_count: 0,
-                    active_in_room: false,
-                    is_current_session: current_session
-                        .and_then(|session| session.member_did.as_deref())
-                        .is_some_and(|did| did == member_did),
-                });
+        let participant_key = participant_member_key(member_did, &session.actor_id);
+        let participant = members
+            .entry(participant_key)
+            .or_insert_with(|| ParticipantAggregate {
+                display_name: session.display_name.clone(),
+                device_label: session.device_label.clone(),
+                last_seen_at: session.last_seen_at,
+                member_did: Some(member_did.to_string()),
+                role: active_member_record(state, member_did).map(|member| member.role.clone()),
+                local_session_count: 0,
+                active_in_room: false,
+                is_current_session: current_session
+                    .map(|current| current.actor_id == session.actor_id)
+                    .unwrap_or(false),
+            });
 
         participant.local_session_count += 1;
         participant.active_in_room = true;
@@ -2508,9 +2594,27 @@ fn participant_views_from_state(
         participant.last_seen_at = participant.last_seen_at.max(session.last_seen_at);
     }
 
+    let principal_session_member_dids = state
+        .sessions
+        .iter()
+        .filter(|session| session.actor_id.trim().starts_with("principal:"))
+        .filter_map(|session| session.member_did.as_deref())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
     let mut participants = members
         .into_values()
-        .filter(|participant| participant.active_in_room)
+        .filter(|participant| {
+            if !participant.active_in_room {
+                return false;
+            }
+            let is_legacy_runtime_actor = participant.local_session_count == 0
+                && participant
+                    .member_did
+                    .as_deref()
+                    .is_some_and(|did| principal_session_member_dids.contains(did));
+            !is_legacy_runtime_actor
+        })
         .map(|participant| ParticipantView {
             display_name: participant.display_name,
             device_label: participant.device_label,
@@ -2543,6 +2647,15 @@ fn participant_role_rank(role: Option<&RoomRole>) -> u8 {
         Some(RoomRole::Admin) => 1,
         Some(RoomRole::Member) => 2,
         None => 3,
+    }
+}
+
+fn participant_member_key(member_did: &str, actor_id: &str) -> String {
+    let actor_id = actor_id.trim();
+    if actor_id.starts_with("principal:") {
+        format!("member:{member_did}:actor:{actor_id}")
+    } else {
+        format!("member:{member_did}")
     }
 }
 
@@ -3079,6 +3192,17 @@ fn push_member_system_object(
     body: String,
     created_at: u64,
 ) -> ConversationObjectRecord {
+    push_member_system_object_for_actor(state, member_did, None, sender, body, created_at)
+}
+
+fn push_member_system_object_for_actor(
+    state: &mut RoomState,
+    member_did: &str,
+    actor_id: Option<&str>,
+    sender: String,
+    body: String,
+    created_at: u64,
+) -> ConversationObjectRecord {
     push_object(
         state,
         ConversationObjectRecord {
@@ -3086,7 +3210,7 @@ fn push_member_system_object(
             event_id: new_object_event_id(),
             sender,
             sender_member_did: Some(member_did.to_string()),
-            sender_actor_id: String::new(),
+            sender_actor_id: actor_id.unwrap_or_default().to_string(),
             kind: ConversationObjectKind::System,
             body: Some(body),
             emoji: None,
@@ -4750,6 +4874,118 @@ mod tests {
             .iter()
             .any(|object| object.body.as_deref() == Some("hello from shell")
                 && object.from_current_session));
+    }
+
+    #[test]
+    fn same_runtime_passkey_principals_remain_distinct_room_actors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_did = "did:key:z6runtime";
+
+        let admin = start_local_principal_runtime_session(
+            tmp.path(),
+            runtime_did,
+            "person:local:admin",
+            "Admin",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let guest = start_local_principal_runtime_session(
+            tmp.path(),
+            runtime_did,
+            "person:local:guest",
+            "Guest",
+            "ElastOS shell",
+        )
+        .unwrap();
+
+        assert_ne!(admin.token, guest.token);
+        let _ = append_object(tmp.path(), &admin.token, "admin hello").unwrap();
+        let _ = append_object(tmp.path(), &guest.token, "guest hello").unwrap();
+
+        let admin_poll = room_poll(tmp.path(), &admin.token, 0).unwrap();
+        let guest_poll = room_poll(tmp.path(), &guest.token, 0).unwrap();
+
+        assert_eq!(admin_poll.participants.len(), 2);
+        assert_eq!(guest_poll.participants.len(), 2);
+        assert!(admin_poll
+            .participants
+            .iter()
+            .any(
+                |participant| participant.display_name == "Admin" && participant.is_current_session
+            ));
+        assert!(admin_poll
+            .participants
+            .iter()
+            .any(|participant| participant.display_name == "Guest"
+                && !participant.is_current_session));
+        assert!(admin_poll.objects.iter().any(|object| {
+            object.body.as_deref() == Some("admin hello") && object.from_current_session
+        }));
+        assert!(admin_poll.objects.iter().any(|object| {
+            object.body.as_deref() == Some("guest hello") && !object.from_current_session
+        }));
+        assert!(guest_poll.objects.iter().any(|object| {
+            object.body.as_deref() == Some("admin hello") && !object.from_current_session
+        }));
+        assert!(guest_poll.objects.iter().any(|object| {
+            object.body.as_deref() == Some("guest hello") && object.from_current_session
+        }));
+    }
+
+    #[test]
+    fn passkey_principal_participants_replace_legacy_runtime_actor_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_did = "did:key:z6runtime";
+
+        let legacy =
+            start_local_runtime_session(tmp.path(), runtime_did, "Legacy", "ElastOS shell")
+                .unwrap();
+        let _ = append_object(tmp.path(), &legacy.token, "legacy hello").unwrap();
+
+        let admin = start_local_principal_runtime_session(
+            tmp.path(),
+            runtime_did,
+            "person:local:admin",
+            "Admin",
+            "ElastOS shell",
+        )
+        .unwrap();
+        let guest = start_local_principal_runtime_session(
+            tmp.path(),
+            runtime_did,
+            "person:local:guest",
+            "Guest",
+            "ElastOS shell",
+        )
+        .unwrap();
+
+        let poll = room_poll(tmp.path(), &admin.token, 0).unwrap();
+
+        assert!(room_poll(tmp.path(), &legacy.token, 0).is_err());
+        assert_eq!(poll.participants.len(), 2);
+        assert!(poll.participants.iter().any(
+            |participant| participant.display_name == "Admin" && participant.is_current_session
+        ));
+        assert!(poll
+            .participants
+            .iter()
+            .any(|participant| participant.display_name == "Guest"
+                && !participant.is_current_session));
+        assert!(!poll
+            .participants
+            .iter()
+            .any(|participant| participant.display_name == "Legacy"));
+        assert!(poll.objects.iter().any(|object| {
+            object.body.as_deref() == Some("legacy hello") && !object.from_current_session
+        }));
+
+        let guest_poll = room_poll(tmp.path(), &guest.token, 0).unwrap();
+        assert!(guest_poll
+            .participants
+            .iter()
+            .any(
+                |participant| participant.display_name == "Guest" && participant.is_current_session
+            ));
     }
 
     #[test]

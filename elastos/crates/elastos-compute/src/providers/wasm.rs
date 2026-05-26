@@ -35,6 +35,10 @@ struct RunningInstance {
 /// The caller (runtime) reads from `capsule_stdout` and writes to `capsule_stdin`
 /// to bridge the capsule's SDK requests to the provider registry.
 pub struct BridgePipes {
+    /// Capsule instance id bound to this bridge.
+    pub capsule_id: String,
+    /// Optional runtime principal for resolving capsule-facing current-user aliases.
+    pub principal_id: Option<String>,
     /// Read end of the capsule's stdout pipe — runtime reads SDK requests here
     pub capsule_stdout: std::fs::File,
     /// Write end of the capsule's stdin pipe — runtime writes SDK responses here
@@ -55,6 +59,7 @@ pub struct WasmProvider {
     /// instead of inherited, and this callback is invoked to handle the
     /// bridge (e.g., dispatching SDK requests to the provider registry).
     bridge_spawner: std::sync::RwLock<Option<BridgeSpawner>>,
+    bridge_principals: Arc<RwLock<HashMap<CapsuleId, Option<String>>>>,
 }
 
 impl WasmProvider {
@@ -72,6 +77,7 @@ impl WasmProvider {
             instances: Arc::new(RwLock::new(HashMap::new())),
             data_base_dir: data_dir.into(),
             bridge_spawner: std::sync::RwLock::new(None),
+            bridge_principals: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -83,6 +89,17 @@ impl WasmProvider {
     pub fn set_bridge_spawner(&self, spawner: BridgeSpawner) {
         let mut guard = self.bridge_spawner.write().unwrap();
         *guard = Some(spawner);
+    }
+
+    pub async fn set_bridge_principal(&self, capsule_id: &CapsuleId, principal_id: Option<String>) {
+        self.bridge_principals
+            .write()
+            .await
+            .insert(capsule_id.clone(), principal_id);
+    }
+
+    pub async fn clear_bridge_principal(&self, capsule_id: &CapsuleId) {
+        self.bridge_principals.write().await.remove(capsule_id);
     }
 
     /// Get or create the data directory for a capsule
@@ -108,6 +125,7 @@ impl WasmProvider {
         capsule_id: &str,
         args: &[String],
         use_bridge: bool,
+        principal_id: Option<&str>,
     ) -> Result<(WasiCtx, Option<PathBuf>, Option<BridgePipes>)> {
         let mut builder = WasiCtxBuilder::new();
 
@@ -230,6 +248,8 @@ impl WasmProvider {
             );
 
             Some(BridgePipes {
+                capsule_id: capsule_id.to_string(),
+                principal_id: principal_id.map(ToOwned::to_owned),
                 capsule_stdout: bridge_request_read,
                 capsule_stdin: bridge_response_write,
             })
@@ -293,14 +313,10 @@ impl WasmProvider {
                     }
                 }
             }
-        } else if let Some(main) = instance.get_func(&mut store, "main") {
-            // Try main() as fallback
-            main.typed::<(), ()>(&store)
-                .map_err(|e| ElastosError::Compute(format!("Invalid main signature: {}", e)))?
-                .call(&mut store, ())
-                .map_err(|e| ElastosError::Compute(format!("WASM execution failed: {}", e)))?;
         } else {
-            tracing::warn!("No _start or main function found in WASM module");
+            return Err(ElastosError::Compute(
+                "WASM capsule missing required WASI _start entrypoint".to_string(),
+            ));
         }
 
         Ok(())
@@ -335,7 +351,7 @@ impl ComputeProvider for WasmProvider {
         let id = CapsuleId::new(format!("wasm-{}", uuid::Uuid::new_v4()));
 
         // Build WASI context to validate permissions early (no bridge for validation)
-        let (_, data_dir, _) = self.build_wasi_context(&manifest, &id.0, &[], false)?;
+        let (_, data_dir, _) = self.build_wasi_context(&manifest, &id.0, &[], false, None)?;
 
         let instance = RunningInstance {
             engine,
@@ -387,8 +403,20 @@ impl ComputeProvider for WasmProvider {
 
         // Build fresh WASI context for this execution (with args from handle)
         let args = handle.args.clone();
-        let (wasi, _, bridge_pipes) =
-            self.build_wasi_context(&manifest, &handle.id.0, &args, use_bridge)?;
+        let principal_id = self
+            .bridge_principals
+            .read()
+            .await
+            .get(&handle.id)
+            .cloned()
+            .flatten();
+        let (wasi, _, bridge_pipes) = self.build_wasi_context(
+            &manifest,
+            &handle.id.0,
+            &args,
+            use_bridge,
+            principal_id.as_deref(),
+        )?;
 
         // Spawn bridge if configured — must happen before WASM execution starts
         if let (Some(spawner), Some(pipes)) = (bridge_spawner, bridge_pipes) {
@@ -450,7 +478,7 @@ impl ComputeProvider for WasmProvider {
             id: handle.id.clone(),
             name: instance.manifest.name.clone(),
             status: instance.status,
-            memory_used_mb: 0, // TODO: Track actual memory usage
+            memory_used_mb: 0, // Memory accounting is not exposed by this provider yet.
         })
     }
 
@@ -520,6 +548,7 @@ mod tests {
             entrypoint: "missing.wasm".into(),
             requires: Vec::new(),
             provides: None,
+            authority: None,
             capabilities: Vec::new(),
             resources: Default::default(),
             permissions: Default::default(),

@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
-use js_sys::{Object as JsObject, Reflect};
+use js_sys::{Array, Function, Object as JsObject, Reflect};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -20,7 +20,8 @@ const BROWSER_SESSION_API_BASE: &str = "/api/browser/session";
 const BROWSER_SESSION_REQUEST_STORAGE_KEY: &str = "elastos.browser_session.request_id";
 const CHAT_ROOM_API_BASE: &str = "/api/apps/chat-room";
 const ROOM_ACCESS_CAPABILITIES: [&str; 1] = ["room.access"];
-const POLL_INTERVAL_MS: u32 = 1200;
+const SHELL_EVENT_SAFETY_POLL_INTERVAL_MS: u32 = 30_000;
+const GATEWAY_POLL_INTERVAL_MS: u32 = 3_000;
 const AUTO_SCROLL_THRESHOLD_PX: i32 = 48;
 const HOME_TOKEN_HEADER: &str = "x-elastos-home-token";
 const DISPLAY_NAME_REQUIRED_ERROR: &str = "Enter your name.";
@@ -54,6 +55,7 @@ struct AppConfig {
 struct AppState {
     request_id: Option<String>,
     session_active: bool,
+    close_leave_sent: bool,
     show_participants: bool,
     show_access_controls: bool,
     force_message_follow: bool,
@@ -437,40 +439,7 @@ pub fn start() -> Result<(), JsValue> {
         app.restore_session();
     }
 
-    let poll_app = Rc::clone(&app);
-    spawn_local(async move {
-        loop {
-            let had_transient_error = {
-                let state = poll_app.state.borrow();
-                state.error_text.is_some() && state.error_transient
-            };
-            match poll_app.poll_once().await {
-                Ok(changed) => {
-                    let mut shell_summary_changed = false;
-                    if poll_app.is_shell_mode() {
-                        match poll_app.refresh_shell_summary().await {
-                            Ok(changed) => shell_summary_changed = changed,
-                            Err(err) => {
-                                poll_app.set_transient_error(Some(err));
-                                shell_summary_changed = true;
-                            }
-                        }
-                    }
-                    if had_transient_error {
-                        poll_app.clear_error();
-                    }
-                    if changed || had_transient_error || shell_summary_changed {
-                        let _ = poll_app.render();
-                    }
-                }
-                Err(err) => {
-                    poll_app.set_transient_error(Some(err));
-                    let _ = poll_app.render();
-                }
-            }
-            TimeoutFuture::new(POLL_INTERVAL_MS).await;
-        }
-    });
+    app.start_poll_loop();
 
     Ok(())
 }
@@ -486,6 +455,55 @@ impl App {
 
     fn default_status_detail(&self) -> String {
         default_status_detail_for_mode(self.config.access_mode)
+    }
+
+    fn poll_interval_ms(&self) -> u32 {
+        if self.is_shell_mode() {
+            SHELL_EVENT_SAFETY_POLL_INTERVAL_MS
+        } else {
+            GATEWAY_POLL_INTERVAL_MS
+        }
+    }
+
+    fn start_poll_loop(self: &Rc<Self>) {
+        let poll_app = Rc::clone(self);
+        spawn_local(async move {
+            loop {
+                poll_app.poll_and_render_once().await;
+                TimeoutFuture::new(poll_app.poll_interval_ms()).await;
+            }
+        });
+    }
+
+    async fn poll_and_render_once(&self) {
+        let had_transient_error = {
+            let state = self.state.borrow();
+            state.error_text.is_some() && state.error_transient
+        };
+        match self.poll_once().await {
+            Ok(changed) => {
+                let mut shell_summary_changed = false;
+                if self.is_shell_mode() {
+                    match self.refresh_shell_summary().await {
+                        Ok(changed) => shell_summary_changed = changed,
+                        Err(err) => {
+                            self.set_transient_error(Some(err));
+                            shell_summary_changed = true;
+                        }
+                    }
+                }
+                if had_transient_error {
+                    self.clear_error();
+                }
+                if changed || had_transient_error || shell_summary_changed {
+                    let _ = self.render();
+                }
+            }
+            Err(err) => {
+                self.set_transient_error(Some(err));
+                let _ = self.render();
+            }
+        }
     }
 
     fn room_api_url(&self, suffix: &str) -> String {
@@ -947,6 +965,42 @@ impl App {
             .add_event_listener_with_callback("message", library_attach.as_ref().unchecked_ref())?;
         library_attach.forget();
 
+        if self.is_shell_mode() {
+            let runtime_events_app = Rc::clone(self);
+            let runtime_events =
+                Closure::<dyn FnMut(MessageEvent)>::wrap(Box::new(move |event: MessageEvent| {
+                    if !runtime_event_is_chat_room(&event) {
+                        return;
+                    }
+                    let app = Rc::clone(&runtime_events_app);
+                    spawn_local(async move {
+                        app.poll_and_render_once().await;
+                    });
+                }));
+            window()
+                .ok_or_else(|| JsValue::from_str("window unavailable"))?
+                .add_event_listener_with_callback(
+                    "message",
+                    runtime_events.as_ref().unchecked_ref(),
+                )?;
+            runtime_events.forget();
+        }
+
+        let close_lifecycle_app = Rc::clone(self);
+        let close_lifecycle = Closure::<dyn FnMut(Event)>::wrap(Box::new(move |_event: Event| {
+            close_lifecycle_app.leave_shell_session_on_close();
+        }));
+        let window = window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
+        window.add_event_listener_with_callback(
+            "pagehide",
+            close_lifecycle.as_ref().unchecked_ref(),
+        )?;
+        window.add_event_listener_with_callback(
+            "beforeunload",
+            close_lifecycle.as_ref().unchecked_ref(),
+        )?;
+        close_lifecycle.forget();
+
         Ok(())
     }
 
@@ -983,6 +1037,28 @@ impl App {
         } else {
             "This browser was removed from the room."
         }
+    }
+
+    fn leave_shell_session_on_close(&self) {
+        if !self.is_shell_mode() {
+            return;
+        }
+        let should_leave = {
+            let mut state = self.state.borrow_mut();
+            if !state.session_active || state.close_leave_sent {
+                false
+            } else {
+                state.close_leave_sent = true;
+                true
+            }
+        };
+        if !should_leave {
+            return;
+        }
+        let _ = send_keepalive_post(
+            &self.room_api_url("/session/leave"),
+            &self.home_token_headers(),
+        );
     }
 
     fn restore_session(self: &Rc<Self>) {
@@ -1040,6 +1116,7 @@ impl App {
             let previous_status_badge = state.status_badge.clone();
             let previous_status_detail = state.status_detail.clone();
             state.session_active = true;
+            state.close_leave_sent = false;
             state.display_name = poll.display_name.clone();
             state.status_badge = "Live".to_string();
             state.status_detail = transport_summary.clone();
@@ -2332,6 +2409,7 @@ fn load_state(session_storage: &Storage, config: &AppConfig) -> AppState {
             None
         },
         session_active: false,
+        close_leave_sent: false,
         show_participants: false,
         show_access_controls: false,
         force_message_follow: true,
@@ -2684,6 +2762,59 @@ async fn api_post_empty_json_with_headers<TResp: DeserializeOwned>(
         .map_err(|err| err.to_string())
 }
 
+fn send_keepalive_post(path: &str, extra_headers: &[(&str, String)]) -> bool {
+    let Some(window) = window() else {
+        return false;
+    };
+    let init = JsObject::new();
+    if Reflect::set(
+        &init,
+        &JsValue::from_str("method"),
+        &JsValue::from_str("POST"),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if Reflect::set(
+        &init,
+        &JsValue::from_str("credentials"),
+        &JsValue::from_str("same-origin"),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if Reflect::set(&init, &JsValue::from_str("keepalive"), &JsValue::TRUE).is_err() {
+        return false;
+    }
+    if !extra_headers.is_empty() {
+        let headers = JsObject::new();
+        for (name, value) in extra_headers {
+            if Reflect::set(
+                &headers,
+                &JsValue::from_str(name),
+                &JsValue::from_str(value),
+            )
+            .is_err()
+            {
+                return false;
+            }
+        }
+        if Reflect::set(&init, &JsValue::from_str("headers"), &headers).is_err() {
+            return false;
+        }
+    }
+    let Ok(fetch) = Reflect::get(window.as_ref(), &JsValue::from_str("fetch"))
+        .and_then(|value| value.dyn_into::<Function>())
+    else {
+        return false;
+    };
+    fetch
+        .call2(window.as_ref(), &JsValue::from_str(path), init.as_ref())
+        .is_ok()
+}
+
 fn element_by_id(document: &Document, id: &str) -> Result<HtmlElement, JsValue> {
     Ok(document
         .get_element_by_id(id)
@@ -2724,6 +2855,37 @@ fn js_string_field(data: &JsValue, key: &str) -> Option<String> {
         .and_then(|value| value.as_string())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn runtime_event_is_chat_room(event: &MessageEvent) -> bool {
+    let Some(window) = window() else {
+        return false;
+    };
+    let Ok(origin) = window.location().origin() else {
+        return false;
+    };
+    if event.origin() != origin {
+        return false;
+    }
+    let data = event.data();
+    if js_string_field(&data, "type").as_deref() != Some("elastos:runtime-events") {
+        return false;
+    }
+    let Ok(events) = Reflect::get(&data, &JsValue::from_str("events")) else {
+        return false;
+    };
+    if !Array::is_array(&events) {
+        return false;
+    }
+    let events = Array::from(&events);
+    for event in events.iter() {
+        let scope = js_string_field(&event, "scope").unwrap_or_default();
+        let kind = js_string_field(&event, "kind").unwrap_or_default();
+        if scope == "chat-room" || kind.starts_with("chat-room.") {
+            return true;
+        }
+    }
+    false
 }
 
 fn js_error(error: JsValue) -> String {

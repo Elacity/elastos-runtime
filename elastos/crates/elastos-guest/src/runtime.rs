@@ -83,6 +83,16 @@ pub enum RuntimeRequest {
         token: String,
     },
 
+    /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
+    CarrierInvoke {
+        uri: String,
+        operation: String,
+        #[serde(default)]
+        body: serde_json::Value,
+        #[serde(default)]
+        token: String,
+    },
+
     /// Get runtime info
     GetRuntimeInfo,
 
@@ -118,6 +128,9 @@ pub enum RuntimeResponse {
 
     /// Provider call result
     ProviderResult { result: serde_json::Value },
+
+    /// Carrier invoke result
+    CarrierResult { result: serde_json::Value },
 
     /// Messages received
     Messages { messages: Vec<IncomingMessage> },
@@ -351,6 +364,24 @@ impl RuntimeClient {
                     Some(cap_token.as_str())
                 },
             ),
+            RuntimeRequest::CarrierInvoke {
+                uri,
+                operation,
+                body,
+                token: cap_token,
+            } => (
+                format!(
+                    "/api/provider/{}/{}",
+                    Self::provider_scheme_for_uri(uri)?,
+                    operation
+                ),
+                Self::carrier_body_for_http(uri, body),
+                if cap_token.is_empty() {
+                    None
+                } else {
+                    Some(cap_token.as_str())
+                },
+            ),
             RuntimeRequest::Ping => {
                 return Ok(RuntimeResponse::Pong);
             }
@@ -452,10 +483,50 @@ impl RuntimeClient {
             RuntimeRequest::ProviderCall { .. } => {
                 Ok(RuntimeResponse::ProviderResult { result: resp_json })
             }
+            RuntimeRequest::CarrierInvoke { .. } => {
+                Ok(RuntimeResponse::CarrierResult { result: resp_json })
+            }
             _ => Ok(RuntimeResponse::Ok {
                 data: Some(resp_json),
             }),
         }
+    }
+
+    fn provider_scheme_for_uri(uri: &str) -> io::Result<String> {
+        if uri.starts_with("localhost://") {
+            return Ok("localhost".to_string());
+        }
+        if let Some(rest) = uri.strip_prefix("elastos://") {
+            let head = rest
+                .split(['/', '?', '#'])
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "elastos URI missing provider")
+                })?;
+            return Ok(head.to_string());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "carrier URI must use elastos:// or localhost://",
+        ))
+    }
+
+    fn carrier_body_for_http(uri: &str, body: &serde_json::Value) -> serde_json::Value {
+        let mut body = body.clone();
+        if uri.starts_with("localhost://") && body.get("path").is_none() {
+            body["path"] = serde_json::Value::String(uri.to_string());
+        }
+        if body.get("network").is_none() {
+            if let Some(network) = uri
+                .strip_prefix("elastos://chain/")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|network| !network.is_empty() && *network != "meta")
+            {
+                body["network"] = serde_json::Value::String(network.to_string());
+            }
+        }
+        body
     }
 
     /// Minimal blocking HTTP GET (no external dependencies).
@@ -1033,6 +1104,35 @@ impl RuntimeClient {
             token: token.to_string(),
         })? {
             RuntimeResponse::ProviderResult { result } => Ok(result),
+            RuntimeResponse::Ok { data } => Ok(data.unwrap_or(serde_json::json!({}))),
+            RuntimeResponse::Error { code, message } => {
+                Err(io::Error::other(format!("{}: {}", code, message)))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
+    /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
+    ///
+    /// Capsule code supplies a resource URI and operation. The runtime decides
+    /// which local or remote provider handles it.
+    pub fn carrier_invoke(
+        &mut self,
+        uri: &str,
+        operation: &str,
+        body: &serde_json::Value,
+        token: &str,
+    ) -> io::Result<serde_json::Value> {
+        match self.call(RuntimeRequest::CarrierInvoke {
+            uri: uri.to_string(),
+            operation: operation.to_string(),
+            body: body.clone(),
+            token: token.to_string(),
+        })? {
+            RuntimeResponse::CarrierResult { result } => Ok(result),
             RuntimeResponse::Ok { data } => Ok(data.unwrap_or(serde_json::json!({}))),
             RuntimeResponse::Error { code, message } => {
                 Err(io::Error::other(format!("{}: {}", code, message)))

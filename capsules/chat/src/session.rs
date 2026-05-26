@@ -28,7 +28,7 @@ pub struct ResolvedIdentity {
 pub fn resolve_identity(requested_nick: &str, nick_explicit: bool) -> Result<ResolvedIdentity> {
     let token = api::acquire_capability("elastos://did/*", "execute")?;
 
-    let did = api::provider_call(&token, "did", "get_did", &serde_json::json!({}))
+    let did = api::carrier_invoke(&token, "elastos://did/*", "get_did", &serde_json::json!({}))
         .ok()
         .and_then(|resp| {
             resp.get("data")
@@ -41,17 +41,22 @@ pub fn resolve_identity(requested_nick: &str, nick_explicit: bool) -> Result<Res
     let nickname = if nick_explicit {
         requested_nick.to_string()
     } else {
-        api::provider_call(&token, "did", "get_nickname", &serde_json::json!({}))
-            .ok()
-            .and_then(|resp| {
-                resp.get("data")
-                    .and_then(|d| d.get("nickname"))
-                    .and_then(|n| n.as_str())
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or_else(|| requested_nick.to_string())
+        api::carrier_invoke(
+            &token,
+            "elastos://did/*",
+            "get_nickname",
+            &serde_json::json!({}),
+        )
+        .ok()
+        .and_then(|resp| {
+            resp.get("data")
+                .and_then(|d| d.get("nickname"))
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| requested_nick.to_string())
     };
 
     Ok(ResolvedIdentity {
@@ -70,9 +75,9 @@ pub fn acquire_storage_token() -> Result<String> {
 }
 
 pub fn set_nickname(identity_token: &str, nickname: &str) -> Result<()> {
-    api::provider_call(
+    api::carrier_invoke(
         identity_token,
-        "did",
+        "elastos://did/*",
         "set_nickname",
         &serde_json::json!({"nickname": nickname}),
     )?;
@@ -86,9 +91,9 @@ pub fn sign_message(
     content: &str,
 ) -> Result<Option<String>> {
     let payload_hex = app::signing_payload_hex(sender_id, ts, content);
-    let response = api::provider_call(
+    let response = api::carrier_invoke(
         identity_token,
-        "did",
+        "elastos://did/*",
         "sign",
         &serde_json::json!({"data": payload_hex}),
     )?;
@@ -108,9 +113,9 @@ pub fn verify_message(identity_token: &str, msg: &Message) -> Result<bool> {
         return Ok(false);
     }
     let payload_hex = app::signing_payload_hex(&msg.sender_id, msg.ts, &msg.content);
-    let response = api::provider_call(
+    let response = api::carrier_invoke(
         identity_token,
-        "did",
+        "elastos://did/*",
         "verify",
         &serde_json::json!({
             "did": msg.sender_id,
@@ -126,9 +131,9 @@ pub fn verify_message(identity_token: &str, msg: &Message) -> Result<bool> {
 }
 
 pub fn connect_peer(peer_token: &str, ticket: &str) -> Result<usize> {
-    let response = api::provider_call(
+    let response = api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "connect",
         &serde_json::json!({"ticket": ticket}),
     )?;
@@ -141,9 +146,9 @@ pub fn connect_peer(peer_token: &str, ticket: &str) -> Result<usize> {
 }
 
 pub fn remember_peer(peer_token: &str, ticket: &str) -> Result<Vec<String>> {
-    let response = api::provider_call(
+    let response = api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "remember_peer",
         &serde_json::json!({"ticket": ticket}),
     )?;
@@ -177,14 +182,14 @@ pub fn join_topic_mode(peer_token: &str, topic: &str, mode: Option<&str>) -> Res
     if let Some(mode) = mode.filter(|value| !value.is_empty()) {
         body["mode"] = serde_json::Value::String(mode.to_string());
     }
-    api::provider_call(peer_token, "peer", "gossip_join", &body)?;
+    api::carrier_invoke(peer_token, "elastos://peer/*", "gossip_join", &body)?;
     Ok(())
 }
 
 pub fn leave_topic(peer_token: &str, topic: &str) -> Result<()> {
-    api::provider_call(
+    api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "gossip_leave",
         &serde_json::json!({"topic": topic}),
     )?;
@@ -192,9 +197,9 @@ pub fn leave_topic(peer_token: &str, topic: &str) -> Result<()> {
 }
 
 pub fn list_topic_peers(peer_token: &str, topic: &str) -> Result<Vec<String>> {
-    let response = api::provider_call(
+    let response = api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "list_topic_peers",
         &serde_json::json!({"topic": topic}),
     )?;
@@ -212,9 +217,9 @@ pub fn list_topic_peers(peer_token: &str, topic: &str) -> Result<Vec<String>> {
 }
 
 pub fn join_topic_peers(peer_token: &str, topic: &str, peers: &[String]) -> Result<()> {
-    api::provider_call(
+    api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "gossip_join_peers",
         &serde_json::json!({
             "topic": topic,
@@ -225,7 +230,12 @@ pub fn join_topic_peers(peer_token: &str, topic: &str, peers: &[String]) -> Resu
 }
 
 pub fn get_ticket(peer_token: &str) -> Result<Option<String>> {
-    let response = api::provider_call(peer_token, "peer", "get_ticket", &serde_json::json!({}))?;
+    let response = api::carrier_invoke(
+        peer_token,
+        "elastos://peer/*",
+        "get_ticket",
+        &serde_json::json!({}),
+    )?;
     Ok(response
         .get("data")
         .and_then(|d| d.get("ticket"))
@@ -234,7 +244,12 @@ pub fn get_ticket(peer_token: &str) -> Result<Option<String>> {
 }
 
 pub fn list_peers(peer_token: &str) -> Result<Vec<String>> {
-    let response = api::provider_call(peer_token, "peer", "list_peers", &serde_json::json!({}))?;
+    let response = api::carrier_invoke(
+        peer_token,
+        "elastos://peer/*",
+        "list_peers",
+        &serde_json::json!({}),
+    )?;
     Ok(response
         .get("data")
         .and_then(|d| d.get("peers"))
@@ -276,7 +291,7 @@ pub fn send_gossip(
     if let Some(signature) = signature.filter(|value| !value.is_empty()) {
         body["signature"] = serde_json::Value::String(signature.to_string());
     }
-    api::provider_call(peer_token, "peer", "gossip_send", &body)?;
+    api::carrier_invoke(peer_token, "elastos://peer/*", "gossip_send", &body)?;
     Ok(())
 }
 
@@ -399,7 +414,7 @@ pub fn recv_messages(
     if let Some(skip_sender_id) = skip_sender_id.filter(|value| !value.is_empty()) {
         payload["skip_sender_id"] = serde_json::Value::String(skip_sender_id.to_string());
     }
-    let response = api::provider_call(peer_token, "peer", "gossip_recv", &payload)?;
+    let response = api::carrier_invoke(peer_token, "elastos://peer/*", "gossip_recv", &payload)?;
     Ok(response
         .get("data")
         .and_then(|d| d.get("messages"))

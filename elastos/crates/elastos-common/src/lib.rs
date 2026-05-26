@@ -4,6 +4,7 @@ pub mod chat_protocol;
 mod error;
 pub mod localhost;
 mod manifest;
+pub mod protected_content;
 pub mod timestamp;
 mod types;
 

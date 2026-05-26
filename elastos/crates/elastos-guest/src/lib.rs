@@ -17,10 +17,9 @@
 //!     #[cfg(feature = "serde")]
 //!     {
 //!         let mut client = RuntimeClient::new();
-//!         let capsules = client.list_capsules().unwrap();
-//!         for cap in capsules {
-//!             println!("  {} - {}", cap.id, cap.name);
-//!         }
+//!         let token = client.request_capability("elastos://did/*", "execute").unwrap();
+//!         let did = client.carrier_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token).unwrap();
+//!         println!("DID: {did}");
 //!     }
 //! }
 //! ```
@@ -37,10 +36,7 @@ pub mod prelude {
 
     // Re-export runtime types when serde is enabled
     #[cfg(feature = "serde")]
-    pub use crate::runtime::{
-        CapabilityConstraints, CapsuleListEntry, IncomingMessage, LaunchConfig, RuntimeClient,
-        RuntimeRequest, RuntimeResponse,
-    };
+    pub use crate::runtime::{RuntimeClient, RuntimeRequest, RuntimeResponse};
 }
 
 /// Information about the running capsule

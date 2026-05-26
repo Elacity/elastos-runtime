@@ -13,12 +13,16 @@
 //! Wire format: newline-delimited JSON matching `RequestEnvelope` / `ResponseEnvelope`
 //! from `elastos-guest::runtime`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::local_http::LoopbackHttpBaseUrl;
+use crate::provider_resource::build_capability_resource;
 use anyhow::{Context, Result};
-use elastos_common::localhost::rooted_localhost_uri;
+use elastos_common::localhost::{
+    is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
+    rooted_localhost_uri,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use elastos_compute::providers::BridgePipes;
@@ -36,6 +40,10 @@ pub struct BridgeContext {
     pub pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     /// Capsule identity for token minting (session ID or capsule name)
     pub capsule_id: String,
+    /// Runtime principal used to resolve capsule-facing `Users/self` aliases.
+    pub principal_id: Option<String>,
+    /// Runtime data directory used by protected principal-root storage helpers.
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Spawn a Carrier bridge handler for a microVM capsule.
@@ -218,6 +226,7 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
 /// host-side bridge performs the HTTP calls.
 pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: String) {
     let tokio_handle = tokio::runtime::Handle::current();
+    let principal_id = pipes.principal_id.clone();
 
     if let Err(e) = std::thread::Builder::new()
         .name("wasm-api-bridge".into())
@@ -241,7 +250,7 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
                 }
 
                 let response = tokio_handle.block_on(async {
-                    match handle_remote_request(&line, &api_url, &client_token).await {
+                    match handle_remote_request(&line, &api_url, &client_token, principal_id.as_deref()).await {
                         Ok(resp) => {
                             tracing::debug!("[wasm-api-bridge] → {}", line.trim());
                             tracing::debug!("[wasm-api-bridge] ← {}", resp);
@@ -273,45 +282,6 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
     }
 }
 
-/// Build the capability resource string from scheme, op, and request body.
-///
-/// For `localhost`: uses `body.path` which may be a full URI or a rooted local
-/// path like `Users/self/.AppData/LocalHost/Chat/channels.json`.
-/// Rootless bare paths are rejected by returning an invalid localhost resource,
-/// which makes capability validation fail closed.
-/// For `did`/`peer`: uses `elastos://scheme/*` (wildcard, matching how tokens are granted).
-/// For `ai`: uses backend-specific path matching the HTTP handler's logic.
-fn build_capability_resource(scheme: &str, op: &str, body: &serde_json::Value) -> String {
-    match scheme {
-        "localhost" => {
-            match body
-                .get("path")
-                .and_then(|v| v.as_str())
-                .filter(|p| !p.is_empty())
-            {
-                Some(p) => {
-                    rooted_localhost_uri(p).unwrap_or_else(|| "localhost://INVALID".to_string())
-                }
-                None => "localhost://INVALID".to_string(),
-            }
-        }
-        "ai" => {
-            let backend = body.get("backend").and_then(|v| v.as_str());
-            match backend {
-                Some(b)
-                    if b.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
-                {
-                    format!("elastos://ai/{}/{}", b, op)
-                }
-                _ => format!("elastos://ai/meta/{}", op),
-            }
-        }
-        "did" | "peer" => format!("elastos://{}/*", scheme),
-        _ => format!("{}://*", scheme),
-    }
-}
-
 /// Parse an action string into a capability Action.
 /// Returns None for unrecognized actions instead of silently defaulting.
 fn parse_action(s: &str) -> Option<elastos_runtime::capability::Action> {
@@ -327,6 +297,352 @@ fn parse_action(s: &str) -> Option<elastos_runtime::capability::Action> {
     })
 }
 
+fn is_runtime_control_request(request_type: &str) -> bool {
+    matches!(
+        request_type,
+        "list_capsules"
+            | "launch_capsule"
+            | "stop_capsule"
+            | "grant_capability"
+            | "revoke_capability"
+            | "send_message"
+            | "receive_messages"
+            | "fetch_content"
+            | "storage_read"
+            | "storage_write"
+            | "provider_call"
+    )
+}
+
+struct CarrierInvokeDispatch {
+    scheme: String,
+    operation: String,
+    request: serde_json::Value,
+    resource: String,
+}
+
+fn carrier_invoke_dispatch(
+    request: &serde_json::Value,
+    principal_id: Option<&str>,
+) -> Result<CarrierInvokeDispatch, String> {
+    let uri = request["uri"]
+        .as_str()
+        .ok_or_else(|| "carrier_invoke missing uri".to_string())?;
+    if !is_supported_resource_scheme(uri) {
+        return Err("carrier URI must use elastos:// or localhost://".to_string());
+    }
+    if is_system_only_backend_resource(uri) {
+        return Err("system backends are not app capabilities; use elastos://content".to_string());
+    }
+    let uri = scope_current_user_alias(uri, principal_id)?;
+
+    let operation = request["operation"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "carrier_invoke missing operation".to_string())?
+        .to_string();
+
+    let scheme = provider_scheme_for_carrier_uri(&uri)?;
+    let mut body = request
+        .get("body")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if scheme == "localhost" {
+        let path = match body.get("path").and_then(|value| value.as_str()) {
+            Some(path) => scope_current_user_alias(path, principal_id)?,
+            None => uri.to_string(),
+        };
+        body["path"] = serde_json::Value::String(path);
+    }
+    if scheme == "chain" && body.get("network").is_none() {
+        if let Some(network) = uri
+            .strip_prefix("elastos://chain/")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|network| !network.is_empty() && *network != "meta")
+        {
+            body["network"] = serde_json::Value::String(network.to_string());
+        }
+    }
+    if scheme == "wallet" && operation == "request_signature" {
+        if let Some((chain_namespace, intent)) = wallet_signature_parts_from_uri(&uri) {
+            if body.get("chain_namespace").is_none() {
+                body["chain_namespace"] = serde_json::Value::String(chain_namespace);
+            }
+            if body.get("intent").is_none() {
+                body["intent"] = serde_json::Value::String(intent);
+            }
+        }
+    }
+
+    let resource = build_capability_resource(&scheme, &operation, &body)?;
+    body["op"] = serde_json::Value::String(operation.clone());
+
+    Ok(CarrierInvokeDispatch {
+        scheme,
+        operation,
+        request: body,
+        resource,
+    })
+}
+
+fn protected_principal_root_carrier_response(
+    bridge_ctx: &BridgeContext,
+    operation: &str,
+    request: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let rooted = principal_root_read_write_uri(operation, request)?;
+
+    let Some(principal_id) = bridge_ctx.principal_id.as_deref() else {
+        return Some(carrier_error_response(
+            "principal_context_required",
+            "localhost://Users requires a principal-scoped launch context",
+        ));
+    };
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    if rooted != localhost_root && !rooted.starts_with(&format!("{localhost_root}/")) {
+        return Some(carrier_error_response(
+            "principal_context_required",
+            "localhost://Users roots must use Users/self or the active principal root",
+        ));
+    }
+    let Some(data_dir) = bridge_ctx.data_dir.as_deref() else {
+        return Some(carrier_error_response(
+            "principal_context_required",
+            "principal-root storage requires a local runtime data directory",
+        ));
+    };
+
+    match crate::auth::load_principal_root_protection(data_dir, principal_id, &localhost_root) {
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
+        Err(err) => {
+            return Some(carrier_error_response(
+                "principal_root_protection_invalid",
+                &err.to_string(),
+            ));
+        }
+    }
+
+    let Some(path) = rooted_localhost_fs_path(data_dir, &rooted) else {
+        return Some(carrier_error_response(
+            "invalid_localhost_path",
+            "invalid principal-root object path",
+        ));
+    };
+
+    match operation {
+        "read" => {
+            let bytes = match crate::auth::read_principal_root_object(
+                data_dir,
+                principal_id,
+                &localhost_root,
+                &rooted,
+                &path,
+            ) {
+                Ok(bytes) => bytes,
+                Err(err) => return Some(provider_error_result("read_failed", &err.to_string())),
+            };
+            let bytes = apply_read_window(
+                bytes,
+                request.get("offset").and_then(|value| value.as_u64()),
+                request.get("length").and_then(|value| value.as_u64()),
+            );
+            Some(provider_ok_result(serde_json::json!({
+                "content": bytes,
+                "size": bytes.len(),
+            })))
+        }
+        "write" => {
+            let content = match request_content_bytes(request) {
+                Ok(content) => content,
+                Err(message) => return Some(carrier_error_response("invalid_content", &message)),
+            };
+            let append = request
+                .get("append")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let bytes = if append && path.is_file() {
+                match crate::auth::read_principal_root_object(
+                    data_dir,
+                    principal_id,
+                    &localhost_root,
+                    &rooted,
+                    &path,
+                ) {
+                    Ok(mut existing) => {
+                        existing.extend_from_slice(&content);
+                        existing
+                    }
+                    Err(err) => {
+                        return Some(provider_error_result("read_failed", &err.to_string()))
+                    }
+                }
+            } else {
+                content.clone()
+            };
+            match crate::auth::write_principal_root_object(
+                data_dir,
+                principal_id,
+                &localhost_root,
+                &rooted,
+                &path,
+                &bytes,
+            ) {
+                Ok(()) => Some(provider_ok_result(serde_json::json!({
+                    "bytes_written": content.len(),
+                }))),
+                Err(err) => Some(provider_error_result("write_failed", &err.to_string())),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn principal_root_read_write_uri(operation: &str, request: &serde_json::Value) -> Option<String> {
+    if !matches!(operation, "read" | "write") {
+        return None;
+    }
+    let object_uri = request
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let rooted = rooted_localhost_uri(object_uri)?;
+    rooted.starts_with("localhost://Users/").then_some(rooted)
+}
+
+fn request_content_bytes(request: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let Some(value) = request.get("content") else {
+        return Err("write request missing content".to_string());
+    };
+    if let Some(text) = value.as_str() {
+        return Ok(text.as_bytes().to_vec());
+    }
+    serde_json::from_value::<Vec<u8>>(value.clone())
+        .map_err(|err| format!("write content must be bytes or string: {err}"))
+}
+
+fn apply_read_window(bytes: Vec<u8>, offset: Option<u64>, length: Option<u64>) -> Vec<u8> {
+    let start = offset.unwrap_or(0) as usize;
+    if start >= bytes.len() {
+        return Vec::new();
+    }
+    let end = match length {
+        Some(length) => start.saturating_add(length as usize).min(bytes.len()),
+        None => bytes.len(),
+    };
+    bytes[start..end].to_vec()
+}
+
+fn provider_ok_result(data: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "carrier_result",
+        "result": {
+            "status": "ok",
+            "data": data,
+        },
+    })
+}
+
+fn provider_error_result(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "carrier_result",
+        "result": {
+            "status": "error",
+            "code": code,
+            "message": message,
+        },
+    })
+}
+
+fn carrier_error_response(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "code": code,
+        "message": message,
+    })
+}
+
+fn scope_current_user_alias(
+    uri_or_resource: &str,
+    principal_id: Option<&str>,
+) -> Result<String, String> {
+    let Some(rooted) = rooted_localhost_uri(uri_or_resource) else {
+        return Ok(uri_or_resource.to_string());
+    };
+
+    if is_unscoped_current_user_alias(&rooted) {
+        let Some(principal_id) = principal_id else {
+            return Err(
+                "localhost://Users/self requires a principal-scoped launch context".to_string(),
+            );
+        };
+        let principal_root = crate::auth::principal_localhost_root(principal_id);
+        if rooted == "localhost://Users/self" {
+            return Ok(principal_root);
+        }
+        let rest = rooted
+            .strip_prefix("localhost://Users/self/")
+            .ok_or_else(|| format!("Invalid current-user alias: {uri_or_resource}"))?;
+        return Ok(format!("{principal_root}/{rest}"));
+    }
+
+    if rooted.starts_with("localhost://Users/") {
+        let Some(principal_id) = principal_id else {
+            return Err("localhost://Users requires a principal-scoped launch context".to_string());
+        };
+        let principal_root = crate::auth::principal_localhost_root(principal_id);
+        if rooted == principal_root || rooted.starts_with(&format!("{principal_root}/")) {
+            return Ok(rooted);
+        }
+        return Err(
+            "localhost://Users roots must use Users/self or the active principal root".to_string(),
+        );
+    }
+
+    Ok(rooted)
+}
+
+fn is_unscoped_current_user_alias(uri_or_resource: &str) -> bool {
+    let Some(rooted) = rooted_localhost_uri(uri_or_resource) else {
+        return false;
+    };
+    rooted == "localhost://Users/self" || rooted.starts_with("localhost://Users/self/")
+}
+
+fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
+    if uri.starts_with("localhost://") {
+        if rooted_localhost_uri(uri).is_none() {
+            return Err(format!("Invalid rooted localhost URI: {}", uri));
+        }
+        return Ok("localhost".to_string());
+    }
+
+    let rest = uri
+        .strip_prefix("elastos://")
+        .ok_or_else(|| "carrier URI must use elastos:// or localhost://".to_string())?;
+    let scheme = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "elastos URI missing provider".to_string())?;
+    Ok(scheme.to_string())
+}
+
+fn wallet_signature_parts_from_uri(uri: &str) -> Option<(String, String)> {
+    let mut segments = uri.strip_prefix("elastos://wallet/")?.split('/');
+    let chain_namespace = segments.next()?.trim();
+    let sign_segment = segments.next()?.trim();
+    let intent = segments.next()?.trim();
+    if chain_namespace.is_empty()
+        || sign_segment != "sign"
+        || intent.is_empty()
+        || segments.next().is_some()
+    {
+        return None;
+    }
+    Some((chain_namespace.to_string(), intent.to_string()))
+}
+
 /// Handle a single request from the guest capsule.
 async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde_json::Value> {
     let envelope: serde_json::Value =
@@ -337,28 +653,34 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
     let request_type = request["type"].as_str().unwrap_or("");
 
     let response = match request_type {
-        "provider_call" => {
+        "carrier_invoke" => {
             let bridge_ctx = ctx
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no bridge context"))?;
 
-            let scheme = request["scheme"].as_str().unwrap_or("");
-            let op = request["op"].as_str().unwrap_or("");
             let token_b64 = request["token"].as_str().unwrap_or("");
+            let dispatch =
+                match carrier_invoke_dispatch(request, bridge_ctx.principal_id.as_deref()) {
+                    Ok(dispatch) => dispatch,
+                    Err(message) => {
+                        return Ok(serde_json::json!({
+                            "id": id,
+                            "response": {
+                                "type": "error",
+                                "code": "invalid_carrier_invoke",
+                                "message": message,
+                            }
+                        }));
+                    }
+                };
 
             // Validate capability token before dispatching to provider.
             // The guest SDK sends the token it received from request_capability.
-            // Resource is built from scheme+op matching the HTTP handler's logic.
             if !token_b64.is_empty() {
                 use elastos_runtime::capability::token::{CapabilityToken, ResourceId};
                 match CapabilityToken::from_base64(token_b64) {
                     Ok(token) => {
-                        let body = request
-                            .get("body")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
-                        let resource = build_capability_resource(scheme, op, &body);
-                        let resource_id = ResourceId::new(&resource);
+                        let resource_id = ResourceId::new(&dispatch.resource);
                         if bridge_ctx
                             .capability_manager
                             .validate(
@@ -399,25 +721,38 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                     "response": {
                         "type": "error",
                         "code": "missing_token",
-                        "message": "provider_call requires a capability token",
+                        "message": "carrier_invoke requires a capability token",
                     }
                 }));
             }
 
-            let body = request
-                .get("body")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            let mut req = body;
-            req["op"] = serde_json::Value::String(op.to_string());
+            if let Some(response) = protected_principal_root_carrier_response(
+                bridge_ctx,
+                &dispatch.operation,
+                &dispatch.request,
+            ) {
+                return Ok(serde_json::json!({
+                    "id": id,
+                    "response": response,
+                }));
+            }
 
-            match bridge_ctx.provider_registry.send_raw(scheme, &req).await {
+            match bridge_ctx
+                .provider_registry
+                .send_raw(&dispatch.scheme, &dispatch.request)
+                .await
+            {
                 Ok(result) => serde_json::json!({
-                    "type": "provider_result",
+                    "type": "carrier_result",
                     "result": result,
                 }),
                 Err(e) => {
-                    tracing::warn!("Bridge provider_call failed for {}/{}: {}", scheme, op, e);
+                    tracing::warn!(
+                        "Bridge carrier_invoke failed for {}/{}: {}",
+                        dispatch.scheme,
+                        dispatch.operation,
+                        e
+                    );
                     serde_json::json!({
                         "type": "error",
                         "code": "provider_error",
@@ -432,6 +767,41 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
             let action_str = request["action"].as_str().unwrap_or("execute");
 
             if let Some(ctx) = ctx {
+                if !is_supported_resource_scheme(resource) {
+                    return Ok(serde_json::json!({
+                        "id": id,
+                        "response": {
+                            "type": "error",
+                            "code": "unsupported_resource",
+                            "message": "capability resources must use elastos:// or localhost://",
+                        },
+                    }));
+                }
+                if is_system_only_backend_resource(resource) {
+                    return Ok(serde_json::json!({
+                        "id": id,
+                        "response": {
+                            "type": "error",
+                            "code": "system_backend_denied",
+                            "message": "system backends are not app capabilities; use elastos://content",
+                        },
+                    }));
+                }
+                let scoped_resource =
+                    match scope_current_user_alias(resource, ctx.principal_id.as_deref()) {
+                        Ok(resource) => resource,
+                        Err(message) => {
+                            return Ok(serde_json::json!({
+                                "id": id,
+                                "response": {
+                                    "type": "error",
+                                    "code": "principal_context_required",
+                                    "message": message,
+                                },
+                            }));
+                        }
+                    };
+                let resource = scoped_resource.as_str();
                 let action = match parse_action(action_str) {
                     Some(a) => a,
                     None => {
@@ -574,6 +944,12 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
             "capsule_count": 0,
         }),
 
+        request_type if is_runtime_control_request(request_type) => serde_json::json!({
+            "type": "error",
+            "code": "not_capsule_kernel_abi",
+            "message": format!("{} is not exposed through the capsule kernel ABI", request_type),
+        }),
+
         _ => serde_json::json!({
             "type": "error",
             "code": "unknown_request",
@@ -597,6 +973,7 @@ async fn handle_remote_request(
     line: &str,
     api_url: &str,
     client_token: &str,
+    principal_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let api_base = LoopbackHttpBaseUrl::parse(api_url).map_err(|e| {
         anyhow::anyhow!(
@@ -614,27 +991,52 @@ async fn handle_remote_request(
     let client = reqwest::Client::new();
 
     let response = match request_type {
-        "provider_call" => {
-            let scheme = request["scheme"].as_str().unwrap_or("");
-            let op = request["op"].as_str().unwrap_or("");
-            let body = request
-                .get("body")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
+        "carrier_invoke" => {
+            let dispatch = match carrier_invoke_dispatch(request, principal_id) {
+                Ok(dispatch) => dispatch,
+                Err(message) => {
+                    return Ok(serde_json::json!({
+                        "id": id,
+                        "response": {
+                            "type": "error",
+                            "code": "invalid_carrier_invoke",
+                            "message": message,
+                        }
+                    }));
+                }
+            };
             let cap_token = request["token"].as_str().unwrap_or("");
 
+            if principal_root_read_write_uri(&dispatch.operation, &dispatch.request).is_some() {
+                return Ok(serde_json::json!({
+                    "id": id,
+                    "response": carrier_error_response(
+                        "principal_context_required",
+                        "principal-root storage requires an in-runtime protected storage bridge",
+                    ),
+                }));
+            }
+
             tracing::debug!(
-                "[wasm-api-bridge] provider_call {}/{} token={} body={}",
-                scheme,
-                op,
+                "[wasm-api-bridge] carrier_invoke {}/{} token={} body={}",
+                dispatch.scheme,
+                dispatch.operation,
                 !cap_token.is_empty(),
-                &body.to_string().chars().take(150).collect::<String>()
+                &dispatch
+                    .request
+                    .to_string()
+                    .chars()
+                    .take(150)
+                    .collect::<String>()
             );
 
             let mut req = client
-                .post(api_base.join(&format!("/api/provider/{}/{}", scheme, op))?)
+                .post(api_base.join(&format!(
+                    "/api/provider/{}/{}",
+                    dispatch.scheme, dispatch.operation
+                ))?)
                 .header("Authorization", format!("Bearer {}", client_token))
-                .json(&body);
+                .json(&dispatch.request);
 
             if !cap_token.is_empty() {
                 req = req.header("X-Capability-Token", cap_token);
@@ -645,19 +1047,34 @@ async fn handle_remote_request(
             let body: serde_json::Value = resp.json().await?;
             tracing::debug!(
                 "[wasm-api-bridge] {}/{} → {} {}",
-                scheme,
-                op,
+                dispatch.scheme,
+                dispatch.operation,
                 status,
                 &body.to_string().chars().take(200).collect::<String>()
             );
             serde_json::json!({
-                "type": "provider_result",
+                "type": "carrier_result",
                 "result": body,
             })
         }
         "request_capability" => {
             let resource = request["resource"].as_str().unwrap_or("");
             let action = request["action"].as_str().unwrap_or("execute");
+
+            let scoped_resource = match scope_current_user_alias(resource, principal_id) {
+                Ok(resource) => resource,
+                Err(message) => {
+                    return Ok(serde_json::json!({
+                        "id": id,
+                        "response": {
+                            "type": "error",
+                            "code": "principal_context_required",
+                            "message": message,
+                        }
+                    }));
+                }
+            };
+            let resource = scoped_resource.as_str();
 
             let resp = client
                 .post(api_base.join("/api/capability/request")?)
@@ -676,6 +1093,19 @@ async fn handle_remote_request(
                     "token": token,
                 })
             } else {
+                match body.get("status").and_then(|s| s.as_str()) {
+                    Some("denied") | Some("auto_denied") | Some("expired") => {
+                        return Ok(serde_json::json!({
+                            "id": id,
+                            "response": {
+                                "type": "error",
+                                "code": body.get("status").and_then(|s| s.as_str()).unwrap_or("denied"),
+                                "message": body.get("reason").and_then(|r| r.as_str()).unwrap_or("capability request denied"),
+                            }
+                        }));
+                    }
+                    _ => {}
+                }
                 let request_id = body
                     .get("request_id")
                     .and_then(|r| r.as_str())
@@ -726,6 +1156,13 @@ async fn handle_remote_request(
             "version": env!("CARGO_PKG_VERSION"),
             "capsule_count": 0,
         }),
+
+        request_type if is_runtime_control_request(request_type) => serde_json::json!({
+            "type": "error",
+            "code": "not_capsule_kernel_abi",
+            "message": format!("{} is not exposed through the capsule kernel ABI", request_type),
+        }),
+
         _ => serde_json::json!({
             "type": "error",
             "code": "unknown_request",
@@ -747,71 +1184,39 @@ mod tests {
         capability::token::{Action, CapabilityToken, ResourceId, TokenConstraints},
         primitives::time::SecureTimestamp,
     };
+    use std::sync::Arc;
 
-    #[test]
-    fn test_build_capability_resource_localhost_full_uri() {
-        let body = serde_json::json!({"path": "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"});
-        let resource = build_capability_resource("localhost", "read", &body);
-        assert_eq!(
-            resource,
-            "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"
+    fn bridge_context() -> BridgeContext {
+        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics,
+        ));
+
+        BridgeContext {
+            provider_registry: Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
+            capability_manager,
+            pending_store: Arc::new(
+                elastos_runtime::capability::pending::PendingRequestStore::new(audit_log),
+            ),
+            capsule_id: "test-capsule".to_string(),
+            principal_id: None,
+            data_dir: None,
+        }
+    }
+
+    fn bridge_token(ctx: &BridgeContext, resource: &str, action: Action) -> String {
+        let token = ctx.capability_manager.grant(
+            &ctx.capsule_id,
+            ResourceId::new(resource),
+            action,
+            TokenConstraints::default(),
+            None,
         );
-    }
-
-    #[test]
-    fn test_build_capability_resource_localhost_bare_path() {
-        let body = serde_json::json!({"path": "Users/self/.AppData/LocalHost/Chat/channels.json"});
-        let resource = build_capability_resource("localhost", "read", &body);
-        assert_eq!(
-            resource,
-            "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"
-        );
-    }
-
-    #[test]
-    fn test_build_capability_resource_localhost_bare_history() {
-        let body =
-            serde_json::json!({"path": "Users/self/.AppData/LocalHost/Chat/history/general.json"});
-        let resource = build_capability_resource("localhost", "write", &body);
-        assert_eq!(
-            resource,
-            "localhost://Users/self/.AppData/LocalHost/Chat/history/general.json"
-        );
-    }
-
-    #[test]
-    fn test_build_capability_resource_localhost_no_path() {
-        let body = serde_json::json!({});
-        let resource = build_capability_resource("localhost", "read", &body);
-        assert_eq!(resource, "localhost://INVALID");
-    }
-
-    #[test]
-    fn test_build_capability_resource_peer() {
-        let body = serde_json::json!({});
-        let resource = build_capability_resource("peer", "gossip_join", &body);
-        assert_eq!(resource, "elastos://peer/*");
-    }
-
-    #[test]
-    fn test_build_capability_resource_did() {
-        let body = serde_json::json!({});
-        let resource = build_capability_resource("did", "get_did", &body);
-        assert_eq!(resource, "elastos://did/*");
-    }
-
-    #[test]
-    fn test_build_capability_resource_ai_with_backend() {
-        let body = serde_json::json!({"backend": "local"});
-        let resource = build_capability_resource("ai", "chat_completions", &body);
-        assert_eq!(resource, "elastos://ai/local/chat_completions");
-    }
-
-    #[test]
-    fn test_build_capability_resource_ai_no_backend() {
-        let body = serde_json::json!({});
-        let resource = build_capability_resource("ai", "chat_completions", &body);
-        assert_eq!(resource, "elastos://ai/meta/chat_completions");
+        encode_bridge_capability_token(&token)
     }
 
     #[test]
@@ -836,6 +1241,198 @@ mod tests {
         assert!(parse_action("READ").is_some());
         assert!(parse_action("Write").is_some());
         assert!(parse_action("EXECUTE").is_some());
+    }
+
+    #[test]
+    fn test_runtime_control_request_classification() {
+        assert!(is_runtime_control_request("launch_capsule"));
+        assert!(is_runtime_control_request("storage_read"));
+        assert!(is_runtime_control_request("provider_call"));
+        assert!(!is_runtime_control_request("carrier_invoke"));
+        assert!(!is_runtime_control_request("request_capability"));
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_uses_uri_resource_contract() {
+        let dispatch = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "localhost://Local/SharedByLocalUsersAndBots/Home/a.md",
+                "operation": "read",
+                "body": {}
+            }),
+            None,
+        )
+        .expect("localhost carrier invoke should dispatch");
+
+        assert_eq!(dispatch.scheme, "localhost");
+        assert_eq!(dispatch.operation, "read");
+        assert_eq!(
+            dispatch.resource,
+            "localhost://Local/SharedByLocalUsersAndBots/Home/a.md"
+        );
+        assert_eq!(
+            dispatch
+                .request
+                .get("path")
+                .and_then(|value| value.as_str()),
+            Some("localhost://Local/SharedByLocalUsersAndBots/Home/a.md")
+        );
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_rejects_unscoped_current_user_alias() {
+        let result = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/Documents/a.md",
+                "operation": "read",
+                "body": {}
+            }),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "capsule-kernel Users/self requires a principal context"
+        );
+        let error = result.err().unwrap();
+
+        assert_eq!(
+            error,
+            "localhost://Users/self requires a principal-scoped launch context"
+        );
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_scopes_current_user_alias_with_principal() {
+        let principal_id = "person:local:test-principal";
+        let expected_root = crate::auth::principal_localhost_root(principal_id);
+        let dispatch = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/Documents/a.md",
+                "operation": "read",
+                "body": {}
+            }),
+            Some(principal_id),
+        )
+        .expect("principal-scoped current-user alias should dispatch");
+
+        let expected_path = format!("{expected_root}/Documents/a.md");
+        assert_eq!(dispatch.resource, expected_path);
+        assert_eq!(
+            dispatch
+                .request
+                .get("path")
+                .and_then(|value| value.as_str()),
+            Some(expected_path.as_str())
+        );
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_allows_active_explicit_principal_root() {
+        let principal_id = "person:local:test-principal";
+        let principal_root = crate::auth::principal_localhost_root(principal_id);
+        let path = format!("{principal_root}/Documents/a.md");
+        let dispatch = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": path,
+                "operation": "read",
+                "body": {}
+            }),
+            Some(principal_id),
+        )
+        .expect("active explicit principal root should dispatch");
+
+        assert_eq!(dispatch.resource, path);
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_rejects_foreign_principal_root() {
+        let active_principal_id = "person:local:active";
+        let foreign_root = crate::auth::principal_localhost_root("person:local:foreign");
+        let result = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": format!("{foreign_root}/Documents/a.md"),
+                "operation": "read",
+                "body": {}
+            }),
+            Some(active_principal_id),
+        );
+
+        assert_eq!(
+            result.err().as_deref(),
+            Some("localhost://Users roots must use Users/self or the active principal root")
+        );
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_derives_chain_network() {
+        let dispatch = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "elastos://chain/esc-mainnet/block_number",
+                "operation": "block_number",
+                "body": {}
+            }),
+            None,
+        )
+        .expect("chain carrier invoke should dispatch");
+
+        assert_eq!(dispatch.scheme, "chain");
+        assert_eq!(
+            dispatch
+                .request
+                .get("network")
+                .and_then(|value| value.as_str()),
+            Some("esc-mainnet")
+        );
+        assert_eq!(
+            dispatch.resource,
+            "elastos://chain/esc-mainnet/block_number"
+        );
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_derives_wallet_chain_and_intent() {
+        let dispatch = carrier_invoke_dispatch(
+            &serde_json::json!({
+                "type": "carrier_invoke",
+                "uri": "elastos://wallet/eip155:20/sign/transaction_intent",
+                "operation": "request_signature",
+                "body": {
+                    "capsule_id": "market",
+                    "resource": "elastos://wallet/eip155:20/sign/transaction_intent",
+                    "reason": "Approve transaction",
+                    "payload": {"schema": "elastos.wallet.test/v1"}
+                }
+            }),
+            None,
+        )
+        .expect("wallet carrier invoke should dispatch");
+
+        assert_eq!(dispatch.scheme, "wallet");
+        assert_eq!(dispatch.operation, "request_signature");
+        assert_eq!(
+            dispatch
+                .request
+                .get("chain_namespace")
+                .and_then(|value| value.as_str()),
+            Some("eip155:20")
+        );
+        assert_eq!(
+            dispatch
+                .request
+                .get("intent")
+                .and_then(|value| value.as_str()),
+            Some("transaction_intent")
+        );
+        assert_eq!(
+            dispatch.resource,
+            "elastos://wallet/eip155:20/sign/transaction_intent"
+        );
     }
 
     #[test]
@@ -870,6 +1467,7 @@ mod tests {
             r#"{"id":1,"request":{"type":"ping"}}"#,
             "https://example.com",
             "client-token",
+            None,
         )
         .await
         .unwrap_err();
@@ -877,5 +1475,274 @@ mod tests {
         assert!(err
             .to_string()
             .contains("attached WASM bridge requires a local runtime API URL"));
+    }
+
+    #[tokio::test]
+    async fn handle_remote_request_rejects_raw_runtime_control_api() {
+        let response = handle_remote_request(
+            r#"{"id":8,"request":{"type":"launch_capsule","cid":"QmExample","config":{}}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            None,
+        )
+        .await
+        .expect("browser host adapter should reject runtime control before HTTP dispatch");
+
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
+    }
+
+    #[tokio::test]
+    async fn handle_remote_request_denies_users_self_before_runtime_prompt() {
+        let response = handle_remote_request(
+            r#"{"id":12,"request":{"type":"request_capability","resource":"localhost://Users/self/Documents/*","action":"read"}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            None,
+        )
+        .await
+        .expect("attached WASM bridge should reject before runtime dispatch");
+
+        assert_eq!(response["id"], 12);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "principal_context_required");
+    }
+
+    #[tokio::test]
+    async fn handle_remote_request_rejects_users_root_storage_without_protected_bridge() {
+        let principal_id = "person:local:active";
+        let response = handle_remote_request(
+            r#"{"id":13,"request":{"type":"carrier_invoke","uri":"localhost://Users/self/Documents/a.md","operation":"read","token":"tok","body":{}}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            Some(principal_id),
+        )
+        .await
+        .expect("attached bridge should reject before provider dispatch");
+
+        assert_eq!(response["id"], 13);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "principal_context_required");
+        assert!(response["response"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("protected storage bridge"));
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_raw_runtime_control_api() {
+        let response = handle_request(
+            r#"{"id":7,"request":{"type":"launch_capsule","cid":"QmExample","config":{}}}"#,
+            &None,
+        )
+        .await
+        .expect("bridge should produce a fail-closed response");
+
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_old_provider_call_shape() {
+        let response = handle_request(
+            r#"{"id":10,"request":{"type":"provider_call","scheme":"did","op":"get_did","body":{},"token":"tok"}}"#,
+            &None,
+        )
+        .await
+        .expect("bridge should reject old provider-call ABI");
+
+        assert_eq!(response["id"], 10);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_system_backend_capability_before_pending() {
+        let ctx = bridge_context();
+        let pending_store = ctx.pending_store.clone();
+        let response = handle_request(
+            r#"{"id":8,"request":{"type":"request_capability","resource":"elastos://ipfs-provider/add","action":"write"}}"#,
+            &Some(ctx),
+        )
+        .await
+        .expect("bridge should fail closed before creating a pending request");
+
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "system_backend_denied");
+        assert!(
+            pending_store.list_pending().await.is_empty(),
+            "system backend denials must not create approval prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_unsupported_capability_scheme_before_pending() {
+        let ctx = bridge_context();
+        let pending_store = ctx.pending_store.clone();
+        let response = handle_request(
+            r#"{"id":9,"request":{"type":"request_capability","resource":"https://example.com/raw","action":"read"}}"#,
+            &Some(ctx),
+        )
+        .await
+        .expect("bridge should fail closed before creating a pending request");
+
+        assert_eq!(response["id"], 9);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "unsupported_resource");
+        assert!(
+            pending_store.list_pending().await.is_empty(),
+            "unsupported resource denials must not create approval prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_users_self_without_principal_before_pending() {
+        let ctx = bridge_context();
+        let pending_store = ctx.pending_store.clone();
+        let response = handle_request(
+            r#"{"id":11,"request":{"type":"request_capability","resource":"localhost://Users/self/Documents/*","action":"read"}}"#,
+            &Some(ctx),
+        )
+        .await
+        .expect("bridge should require principal context before creating a pending request");
+
+        assert_eq!(response["id"], 11);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "principal_context_required");
+        assert!(
+            pending_store.list_pending().await.is_empty(),
+            "principal-context denials must not create approval prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_denies_foreign_user_root_before_pending() {
+        let mut ctx = bridge_context();
+        ctx.principal_id = Some("person:local:active".to_string());
+        let pending_store = ctx.pending_store.clone();
+        let foreign_root = crate::auth::principal_localhost_root("person:local:foreign");
+        let response = handle_request(
+            &format!(
+                r#"{{"id":12,"request":{{"type":"request_capability","resource":"{foreign_root}/Documents/*","action":"read"}}}}"#
+            ),
+            &Some(ctx),
+        )
+        .await
+        .expect("bridge should reject foreign principal roots before creating a pending request");
+
+        assert_eq!(response["id"], 12);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "principal_context_required");
+        assert_eq!(
+            response["response"]["message"],
+            "localhost://Users roots must use Users/self or the active principal root"
+        );
+        assert!(
+            pending_store.list_pending().await.is_empty(),
+            "foreign-root denials must not create approval prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_uses_protected_principal_root_object_for_users_self_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:active";
+        let protection =
+            crate::auth::store_test_principal_root_protection(temp.path(), principal_id);
+        let mut ctx = bridge_context();
+        ctx.principal_id = Some(principal_id.to_string());
+        ctx.data_dir = Some(temp.path().to_path_buf());
+
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/Chat/state.json",
+            protection.localhost_root
+        );
+        let write_token = bridge_token(&ctx, &object_uri, Action::Write);
+        let write_line = serde_json::json!({
+            "id": 21,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
+                "operation": "write",
+                "token": write_token,
+                "body": {
+                    "content": b"secret-chat-state".to_vec(),
+                    "append": false
+                }
+            }
+        })
+        .to_string();
+        let ctx_opt = Some(ctx.clone());
+        let write_response = handle_request(&write_line, &ctx_opt)
+            .await
+            .expect("protected write should produce a bridge response");
+
+        assert_eq!(write_response["id"], 21);
+        assert_eq!(write_response["response"]["type"], "carrier_result");
+        assert_eq!(write_response["response"]["result"]["status"], "ok");
+
+        let path = rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        let stored = std::fs::read_to_string(path).unwrap();
+        assert!(stored.contains("elastos.principal-root.object/v1"));
+        assert!(stored.contains(&protection.data_key_id));
+        assert!(!stored.contains("secret-chat-state"));
+
+        let read_token = bridge_token(&ctx, &object_uri, Action::Read);
+        let read_line = serde_json::json!({
+            "id": 22,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
+                "operation": "read",
+                "token": read_token,
+                "body": {}
+            }
+        })
+        .to_string();
+        let read_response = handle_request(&read_line, &ctx_opt)
+            .await
+            .expect("protected read should produce a bridge response");
+        let content: Vec<u8> =
+            serde_json::from_value(read_response["response"]["result"]["data"]["content"].clone())
+                .unwrap();
+        assert_eq!(content, b"secret-chat-state");
+    }
+
+    #[tokio::test]
+    async fn handle_request_rejects_users_root_carrier_invoke_without_data_dir() {
+        let principal_id = "person:local:active";
+        let mut ctx = bridge_context();
+        ctx.principal_id = Some(principal_id.to_string());
+        let object_uri = format!(
+            "{}/Documents/a.md",
+            crate::auth::principal_localhost_root(principal_id)
+        );
+        let read_token = bridge_token(&ctx, &object_uri, Action::Read);
+        let line = serde_json::json!({
+            "id": 23,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/Documents/a.md",
+                "operation": "read",
+                "token": read_token,
+                "body": {}
+            }
+        })
+        .to_string();
+
+        let response = handle_request(&line, &Some(ctx))
+            .await
+            .expect("missing data dir should produce a fail-closed response");
+
+        assert_eq!(response["id"], 23);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "principal_context_required");
+        assert!(response["response"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("local runtime data directory"));
     }
 }

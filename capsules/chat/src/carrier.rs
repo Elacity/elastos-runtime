@@ -33,17 +33,17 @@ pub fn acquire_capability(resource: &str, action: &str) -> Result<String> {
     })
 }
 
-/// Call a provider operation via the runtime.
-pub fn provider_call(
+/// Invoke an ElastOS resource through the capsule kernel.
+pub fn carrier_invoke(
     cap_token: &str,
-    scheme: &str,
-    op: &str,
+    uri: &str,
+    operation: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     with_client(|client| {
         client
-            .provider_call(scheme, op, body, cap_token)
-            .map_err(|e| anyhow!("Provider call {}/{} failed: {}", scheme, op, e))
+            .carrier_invoke(uri, operation, body, cap_token)
+            .map_err(|e| anyhow!("Carrier invoke {} {} failed: {}", operation, uri, e))
     })
 }
 
@@ -52,24 +52,29 @@ fn rooted_chat_path(path: &str) -> String {
     format!("{}/{}", CHAT_STATE_ROOT, trimmed)
 }
 
+fn rooted_chat_uri(path: &str) -> String {
+    format!("localhost://{}", rooted_chat_path(path))
+}
+
 /// Save a JSON-serializable value to storage.
 pub fn save_json<T: Serialize>(storage_token: &str, path: &str, value: &T) -> Result<()> {
     let json = serde_json::to_string(value)?;
-    let rooted_path = rooted_chat_path(path);
+    let rooted_uri = rooted_chat_uri(path);
     let body = serde_json::json!({
-        "path": rooted_path,
+        "path": rooted_uri,
         "token": storage_token,
         "content": json.as_bytes(),
         "append": false,
     });
-    provider_call(storage_token, "localhost", "write", &body)?;
+    carrier_invoke(storage_token, &rooted_uri, "write", &body)?;
     Ok(())
 }
 
 /// Load a JSON value from storage.
 pub fn load_json<T: DeserializeOwned>(storage_token: &str, path: &str) -> Result<Option<T>> {
-    let body = serde_json::json!({ "path": rooted_chat_path(path), "token": storage_token });
-    let result = provider_call(storage_token, "localhost", "read", &body)?;
+    let rooted_uri = rooted_chat_uri(path);
+    let body = serde_json::json!({ "path": rooted_uri, "token": storage_token });
+    let result = carrier_invoke(storage_token, &rooted_uri, "read", &body)?;
 
     if let Some(data) = result.get("data").and_then(|d| d.get("data")) {
         if let Some(bytes) = data.as_array() {

@@ -69,10 +69,9 @@ pub fn is_own_message(
     if self_did.is_empty() || sender_did != self_did {
         return false;
     }
-    match sender_session_id.filter(|s| !s.is_empty()) {
-        Some(sid) => sid == self_session_id,
-        None => true, // No session_id = assume same instance (legacy compat)
-    }
+    sender_session_id
+        .filter(|s| !s.is_empty())
+        .is_some_and(|sid| sid == self_session_id)
 }
 
 #[cfg(test)]
@@ -140,7 +139,7 @@ mod tests {
             "did:key:z2",
             Some("s1")
         ));
-        assert!(is_own_message("did:key:z1", "s1", "did:key:z1", None)); // legacy
+        assert!(!is_own_message("did:key:z1", "s1", "did:key:z1", None));
         assert!(!is_own_message("", "s1", "did:key:z1", Some("s1"))); // empty self
     }
 

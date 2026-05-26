@@ -7,7 +7,6 @@
 //! crosvm is the sole VM backend. No fallback — KVM is required.
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +53,8 @@ pub enum SupervisorRequest {
         name: String,
         #[serde(default)]
         config: serde_json::Value,
+        #[serde(default)]
+        principal_id: Option<String>,
     },
 
     #[serde(rename = "stop_capsule")]
@@ -421,12 +422,14 @@ impl Supervisor {
                 Ok(path) => SupervisorResponse::ok_with_path(path.display().to_string()),
                 Err(e) => SupervisorResponse::err(format!("ensure_capsule failed: {e}")),
             },
-            SupervisorRequest::LaunchCapsule { name, config } => {
-                match self.launch_capsule(&name, config).await {
-                    Ok((handle, cid)) => SupervisorResponse::ok_with_handle(handle, cid),
-                    Err(e) => SupervisorResponse::err(format!("launch_capsule failed: {e}")),
-                }
-            }
+            SupervisorRequest::LaunchCapsule {
+                name,
+                config,
+                principal_id,
+            } => match self.launch_capsule(&name, config, principal_id).await {
+                Ok((handle, cid)) => SupervisorResponse::ok_with_handle(handle, cid),
+                Err(e) => SupervisorResponse::err(format!("launch_capsule failed: {e}")),
+            },
             SupervisorRequest::StopCapsule { handle } => match self.stop_capsule(&handle).await {
                 Ok(()) => SupervisorResponse::ok(),
                 Err(e) => SupervisorResponse::err(format!("stop_capsule failed: {e}")),
@@ -788,7 +791,7 @@ impl Supervisor {
             let _ = tokio::fs::remove_dir_all(&capsule_dir).await;
         }
 
-        // Download capsule artifact from IPFS gateways
+        // Download capsule artifact through the registered content availability contract.
         self.download_capsule(name, entry, &capsule_dir).await?;
 
         Ok(capsule_dir)
@@ -796,26 +799,24 @@ impl Supervisor {
 
     /// Download a capsule artifact, verify, and extract.
     ///
-    /// Canonical path only: local IPFS node (kubo) managed by ipfs-provider.
-    /// Kubo fetches content over the IPFS/Carrier network using DHT + bitswap.
+    /// Canonical path today: content provider backed by local IPFS/Kubo.
     /// No HTTP fallback is allowed here.
     async fn download_capsule(&self, name: &str, entry: &CapsuleEntry, dest: &Path) -> Result<()> {
-        self.try_download_capsule_via_carrier(name, &entry.cid, &entry.sha256, dest)
+        self.try_download_capsule_via_content_provider(name, &entry.cid, &entry.sha256, dest)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "capsule download failed via elastos://ipfs provider path: {}",
+                    "capsule download failed via elastos://content/fetch provider path: {}",
                     e
                 )
             })
     }
 
-    /// Fetch capsule content via local IPFS node (Carrier network path).
+    /// Fetch capsule content via the content availability provider.
     ///
-    /// This path stays inside the runtime/provider boundary: supervisor talks to
-    /// the registered `elastos://ipfs` provider, which owns Kubo startup and
-    /// the local Elastos fetch policy.
-    async fn try_download_capsule_via_carrier(
+    /// The content provider may use `ipfs-provider` internally, but supervisor
+    /// code does not bind itself to the low-level backend namespace.
+    async fn try_download_capsule_via_content_provider(
         &self,
         name: &str,
         cid: &str,
@@ -825,11 +826,11 @@ impl Supervisor {
         use sha2::Digest;
 
         println!(
-            "  Fetching capsule '{}' via Carrier (IPFS P2P: {})...",
+            "  Fetching capsule '{}' via content provider (CID: {})...",
             name, cid
         );
 
-        let bytes = self.ipfs_cat_via_provider(cid).await?;
+        let bytes = self.content_fetch_via_provider(cid).await?;
 
         // Verify sha256 — fail closed if missing
         if expected_sha256.is_empty() {
@@ -866,44 +867,19 @@ impl Supervisor {
         }
         let _ = ownership::repair_path_recursive(dest);
 
-        println!("  Extracted to {} (via Carrier)", dest.display());
+        println!("  Extracted to {} (via content provider)", dest.display());
         Ok(())
     }
 
-    async fn ipfs_cat_via_provider(&self, cid: &str) -> Result<Vec<u8>> {
+    async fn content_fetch_via_provider(&self, cid: &str) -> Result<Vec<u8>> {
         let registry = self
             .provider_registry
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("runtime provider registry unavailable"))?;
 
-        let request = serde_json::json!({
-            "op": "cat",
-            "cid": cid,
-        });
-        let response = registry
-            .send_raw("ipfs", &request)
+        crate::content::fetch_bytes_via_provider(registry, cid, None)
             .await
-            .map_err(|e| anyhow::anyhow!("elastos://ipfs provider unavailable: {}", e))?;
-
-        if let Some(status) = response.get("status").and_then(|s| s.as_str()) {
-            if status == "error" {
-                let message = response
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                bail!("elastos://ipfs provider error: {}", message);
-            }
-        }
-
-        let encoded = response
-            .get("data")
-            .and_then(|d| d.get("data"))
-            .and_then(|d| d.as_str())
-            .ok_or_else(|| anyhow::anyhow!("elastos://ipfs provider returned no content"))?;
-
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|e| anyhow::anyhow!("elastos://ipfs provider returned invalid base64: {}", e))
+            .map_err(|e| anyhow::anyhow!("elastos://content/fetch unavailable: {}", e))
     }
 
     /// Launch a capsule in a crosvm VM. Returns (handle, vsock_cid).
@@ -911,8 +887,16 @@ impl Supervisor {
     /// `config` is an opaque JSON payload from the CLI command. For the shell
     /// capsule, this contains the forwarded command (e.g. `{"command":"chat",...}`).
     /// It is base64-encoded and passed via the `elastos.command` kernel boot arg.
-    async fn launch_capsule(&self, name: &str, config: serde_json::Value) -> Result<(String, u32)> {
+    async fn launch_capsule(
+        &self,
+        name: &str,
+        config: serde_json::Value,
+        principal_id: Option<String>,
+    ) -> Result<(String, u32)> {
         let (capsule_dir, manifest) = self.load_capsule_manifest(name).await?;
+        if principal_id.is_some() && !manifest.role.is_shell_launchable() {
+            bail!("principal launch grants are only valid for shell-launchable capsules");
+        }
 
         // Carrier-plane services run as host processes, not VMs.
         // Skip if the provider is already registered (e.g., built-in Carrier gossip).
@@ -1113,6 +1097,8 @@ impl Supervisor {
                     capability_manager: cap_mgr.clone(),
                     pending_store: pending.clone(),
                     capsule_id: format!("vm-{}", name),
+                    principal_id: principal_id.clone(),
+                    data_dir: Some(self.data_dir.clone()),
                 }),
                 _ => None,
             };
@@ -1501,6 +1487,7 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::setup::{Component, PlatformInfo};
+    use base64::Engine as _;
     use elastos_runtime::provider::{
         Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
     };
@@ -1548,6 +1535,62 @@ mod tests {
             SupervisorRequest::LaunchCapsule { name, .. } => assert_eq!(name, "chat"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_launch_capsule_rejects_principal_for_provider_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let capsule_dir = data_dir.join("capsules/provider-test");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(capsule_dir.join(CACHED_CID_FILE), "bafy-provider-test\n").unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "provider-test",
+                "version": "0.1.0",
+                "role": "provider",
+                "type": "microvm",
+                "entrypoint": "rootfs.ext4",
+                "provides": "elastos://provider-test/*"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut capsules = std::collections::HashMap::new();
+        capsules.insert(
+            "provider-test".to_string(),
+            CapsuleEntry {
+                cid: "bafy-provider-test".to_string(),
+                sha256: String::new(),
+                size: 0,
+                platforms: vec![],
+            },
+        );
+
+        let supervisor = Supervisor::new(
+            data_dir.to_path_buf(),
+            ComponentsManifest {
+                external: std::collections::HashMap::new(),
+                capsules,
+                profiles: std::collections::HashMap::new(),
+            },
+        );
+
+        let err = supervisor
+            .launch_capsule(
+                "provider-test",
+                serde_json::json!({}),
+                Some("person:local:alice".to_string()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("principal launch grants are only valid for shell-launchable capsules"));
     }
 
     #[test]
@@ -1640,6 +1683,8 @@ mod tests {
         assert_eq!(actual, correct, "matching hashes must equal");
     }
 
+    const TEST_SUPERVISOR_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
     struct MockIpfsProvider {
         response: serde_json::Value,
     }
@@ -1666,9 +1711,33 @@ mod tests {
             request: &serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
             assert_eq!(request.get("op").and_then(|v| v.as_str()), Some("cat"));
-            assert_eq!(request.get("cid").and_then(|v| v.as_str()), Some("QmTest"));
+            assert_eq!(
+                request.get("cid").and_then(|v| v.as_str()),
+                Some(TEST_SUPERVISOR_CID)
+            );
             Ok(self.response.clone())
         }
+    }
+
+    async fn registry_with_content_provider(response: serde_json::Value) -> Arc<ProviderRegistry> {
+        let registry = Arc::new(ProviderRegistry::new());
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let content_provider = Arc::new(crate::content::ContentProvider::new(
+            data_dir,
+            Arc::downgrade(&registry),
+        ));
+        registry.register(content_provider.clone()).await;
+        registry
+            .register_sub_provider("content", content_provider)
+            .await
+            .unwrap();
+
+        let ipfs_provider: Arc<dyn Provider> = Arc::new(MockIpfsProvider { response });
+        registry
+            .register_sub_provider("ipfs", ipfs_provider)
+            .await
+            .unwrap();
+        registry
     }
 
     fn make_test_supervisor() -> Supervisor {
@@ -1879,9 +1948,9 @@ mod tests {
     fn test_verify_carrier_service_binary_accepts_matching_capsule_artifact_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
-        let capsule_dir = data_dir.join("capsules/peer-provider");
+        let capsule_dir = data_dir.join("capsules/carrier-service");
         std::fs::create_dir_all(&capsule_dir).unwrap();
-        std::fs::write(capsule_dir.join("peer-provider"), b"carrier-service").unwrap();
+        std::fs::write(capsule_dir.join("carrier-service"), b"carrier-service").unwrap();
         std::fs::write(capsule_dir.join(CACHED_CID_FILE), "bafy-test-cid\n").unwrap();
         std::fs::write(
             capsule_dir.join(CACHED_ARTIFACT_SHA_FILE),
@@ -1891,7 +1960,7 @@ mod tests {
 
         let mut capsules = std::collections::HashMap::new();
         capsules.insert(
-            "peer-provider".to_string(),
+            "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
                 sha256: "sha256:test-artifact".to_string(),
@@ -1911,9 +1980,9 @@ mod tests {
 
         supervisor
             .verify_carrier_service_binary(
-                "peer-provider",
+                "carrier-service",
                 &capsule_dir,
-                &capsule_dir.join("peer-provider"),
+                &capsule_dir.join("carrier-service"),
             )
             .unwrap();
     }
@@ -1922,9 +1991,9 @@ mod tests {
     fn test_verify_carrier_service_binary_rejects_cached_cid_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
-        let capsule_dir = data_dir.join("capsules/peer-provider");
+        let capsule_dir = data_dir.join("capsules/carrier-service");
         std::fs::create_dir_all(&capsule_dir).unwrap();
-        std::fs::write(capsule_dir.join("peer-provider"), b"carrier-service").unwrap();
+        std::fs::write(capsule_dir.join("carrier-service"), b"carrier-service").unwrap();
         std::fs::write(capsule_dir.join(CACHED_CID_FILE), "bafy-wrong-cid\n").unwrap();
         std::fs::write(
             capsule_dir.join(CACHED_ARTIFACT_SHA_FILE),
@@ -1934,7 +2003,7 @@ mod tests {
 
         let mut capsules = std::collections::HashMap::new();
         capsules.insert(
-            "peer-provider".to_string(),
+            "carrier-service".to_string(),
             CapsuleEntry {
                 cid: "bafy-test-cid".to_string(),
                 sha256: "sha256:test-artifact".to_string(),
@@ -1954,57 +2023,48 @@ mod tests {
 
         let err = supervisor
             .verify_carrier_service_binary(
-                "peer-provider",
+                "carrier-service",
                 &capsule_dir,
-                &capsule_dir.join("peer-provider"),
+                &capsule_dir.join("carrier-service"),
             )
             .unwrap_err();
         assert!(err.to_string().contains("cached CID mismatch"));
     }
 
     #[tokio::test]
-    async fn test_ipfs_cat_via_provider_uses_registered_subprovider() {
-        let registry = Arc::new(ProviderRegistry::new());
+    async fn test_content_fetch_via_provider_uses_content_contract() {
         let expected = b"capsule-bytes";
-        let provider: Arc<dyn Provider> = Arc::new(MockIpfsProvider {
-            response: serde_json::json!({
-                "status": "ok",
-                "data": {
-                    "data": base64::engine::general_purpose::STANDARD.encode(expected),
-                }
-            }),
-        });
-        registry
-            .register_sub_provider("ipfs", provider)
-            .await
-            .unwrap();
+        let registry = registry_with_content_provider(serde_json::json!({
+            "status": "ok",
+            "data": {
+                "data": base64::engine::general_purpose::STANDARD.encode(expected),
+            }
+        }))
+        .await;
 
         let mut supervisor = make_test_supervisor();
         supervisor.set_provider_registry(Arc::clone(&registry));
 
-        let bytes = supervisor.ipfs_cat_via_provider("QmTest").await.unwrap();
+        let bytes = supervisor
+            .content_fetch_via_provider(TEST_SUPERVISOR_CID)
+            .await
+            .unwrap();
         assert_eq!(bytes, expected);
     }
 
     #[tokio::test]
-    async fn test_ipfs_cat_via_provider_surfaces_provider_error() {
-        let registry = Arc::new(ProviderRegistry::new());
-        let provider: Arc<dyn Provider> = Arc::new(MockIpfsProvider {
-            response: serde_json::json!({
-                "status": "error",
-                "message": "kubo not found"
-            }),
-        });
-        registry
-            .register_sub_provider("ipfs", provider)
-            .await
-            .unwrap();
+    async fn test_content_fetch_via_provider_surfaces_provider_error() {
+        let registry = registry_with_content_provider(serde_json::json!({
+            "status": "error",
+            "message": "kubo not found"
+        }))
+        .await;
 
         let mut supervisor = make_test_supervisor();
         supervisor.set_provider_registry(Arc::clone(&registry));
 
         let err = supervisor
-            .ipfs_cat_via_provider("QmTest")
+            .content_fetch_via_provider(TEST_SUPERVISOR_CID)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));

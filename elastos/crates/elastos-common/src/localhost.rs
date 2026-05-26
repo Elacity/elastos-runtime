@@ -1,4 +1,4 @@
-//! Canonical localhost:// roots for the WCI-aligned local PC2 model.
+//! Canonical localhost:// roots for the WCI-aligned local Home model.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,6 @@ pub const FILE_BACKED_ROOTS: &[&str] = &[
     "ElastOS",
     "Local",
     "MyWebSite",
-    "PC2Host",
     "Public",
     "Users",
     "UsersAI",
@@ -24,7 +23,6 @@ pub const ALL_ROOTS: &[&str] = &[
     "ElastOS",
     "Local",
     "MyWebSite",
-    "PC2Host",
     "Public",
     "Users",
     "UsersAI",
@@ -33,6 +31,31 @@ pub const ALL_ROOTS: &[&str] = &[
 
 pub fn is_supported_resource_scheme(uri: &str) -> bool {
     uri.starts_with("elastos://") || uri.starts_with("localhost://")
+}
+
+pub fn is_system_only_backend_resource(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("elastos://") else {
+        return false;
+    };
+
+    matches!(
+        rest.split(['/', '?', '#']).next(),
+        Some(
+            "elacity"
+                | "elacity-sdk"
+                | "gateway"
+                | "ipfs"
+                | "ipfs-cluster"
+                | "ipfs-provider"
+                | "kubo"
+        )
+    )
+}
+
+pub fn is_runtime_system_service_resource(uri: &str) -> bool {
+    uri.strip_prefix("localhost://").is_some_and(|rest| {
+        rest == "ElastOS/SystemServices" || rest.starts_with("ElastOS/SystemServices/")
+    })
 }
 
 pub fn parse_localhost_uri(uri: &str) -> Option<(&str, &str)> {

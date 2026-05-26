@@ -1553,12 +1553,15 @@ async fn sign_via_did_provider(
     ts: u64,
     content: &str,
 ) -> Option<String> {
-    let payload_hex = signing_payload_hex(sender_id, ts, content);
     let resp = client
-        .post(format!("{}/api/provider/did/sign", api))
+        .post(format!("{}/api/provider/did/sign_chat_message", api))
         .header("Authorization", format!("Bearer {}", bearer))
         .header("X-Capability-Token", did_cap)
-        .json(&serde_json::json!({"data": payload_hex}))
+        .json(&serde_json::json!({
+            "sender_id": sender_id,
+            "ts": ts,
+            "content": content,
+        }))
         .send()
         .await
         .ok()?;
@@ -1741,7 +1744,7 @@ async fn peer_provider_request(
             "{}",
             body.get("message")
                 .and_then(|m| m.as_str())
-                .unwrap_or("unknown peer-provider error")
+                .unwrap_or("unknown Carrier provider error")
         );
     }
     Ok(body)

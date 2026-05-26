@@ -166,10 +166,21 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "ai",
     "llama",
     "ipfs",
+    "content",
     "tunnel",
     "storage",
     "namespace",
     "message",
+    "chain",
+    "net",
+    "exit",
+    "browser-engine",
+    "wallet",
+    "drm",
+    "rights",
+    "key",
+    "decrypt",
+    "availability",
 ];
 
 /// Registry of providers

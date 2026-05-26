@@ -12,9 +12,6 @@ const NOTIFICATIONS_SCHEMA: &str = "elastos.notifications/v1";
 const NOTIFICATIONS_ROOT_URI: &str = "localhost://Local/Shared/System/Notifications";
 const NOTIFICATIONS_FILE: &str = "notifications.json";
 const NOTIFICATION_EVENTS_FILE: &str = "events.json";
-const NATIVE_CHAT_RELAY_STATE_FILE: &str = "native-chat-relay.json";
-const NATIVE_CHAT_ROOT_URI: &str = "localhost://Users/self/.AppData/LocalHost/Chat";
-const NATIVE_CHAT_RELAY_CHANNEL: &str = "!home";
 const ROOM_ACCESS_REQUEST_KIND: &str = "room_access_request";
 const ROOM_ACCESS_REQUEST_ID_PREFIX: &str = "room-access-request:";
 const ROOM_ACCESS_REQUEST_TTL_SECS: u64 = 10 * 60;
@@ -130,26 +127,6 @@ enum NotificationEventDisposition {
     Resolved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct NativeChatRelayState {
-    #[serde(default)]
-    processed_event_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatHistoryMessage {
-    sender_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sender_session_id: Option<String>,
-    sender_nick: String,
-    content: String,
-    ts: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    display_ts: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    signature: Option<String>,
-}
-
 pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow::Result<()> {
     let path = notifications_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationStore>(&path)?;
@@ -246,8 +223,7 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
         }
     }
 
-    write_json_atomic(&path, &store)?;
-    sync_native_chat_relay(data_dir)
+    write_json_atomic(&path, &store)
 }
 
 pub fn load_summary(data_dir: &Path) -> anyhow::Result<NotificationSummary> {
@@ -330,7 +306,6 @@ pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result
 
     if updated > 0 {
         write_json_atomic(&path, &store)?;
-        sync_native_chat_relay(data_dir)?;
     }
     Ok(updated)
 }
@@ -352,7 +327,6 @@ pub fn mark_read(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
 
     if updated {
         write_json_atomic(&path, &store)?;
-        sync_native_chat_relay(data_dir)?;
     }
     Ok(updated)
 }
@@ -389,7 +363,6 @@ pub fn dismiss(data_dir: &Path, id: &str) -> anyhow::Result<bool> {
 
     if updated {
         write_json_atomic(&path, &store)?;
-        sync_native_chat_relay(data_dir)?;
     }
     Ok(updated)
 }
@@ -409,15 +382,6 @@ fn notifications_root_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
         .context("failed to resolve notifications root")
 }
 
-fn native_chat_relay_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    Ok(notifications_root_dir(data_dir)?.join(NATIVE_CHAT_RELAY_STATE_FILE))
-}
-
-fn native_chat_root_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, NATIVE_CHAT_ROOT_URI)
-        .context("failed to resolve native chat relay root")
-}
-
 fn record_event(data_dir: &Path, event: NotificationEventRecord) -> anyhow::Result<()> {
     let path = notification_events_path(data_dir)?;
     let mut store = read_json_or_default::<NotificationEventStore>(&path)?;
@@ -434,97 +398,8 @@ fn record_event(data_dir: &Path, event: NotificationEventRecord) -> anyhow::Resu
     write_json_atomic(&path, &store)
 }
 
-fn sync_native_chat_relay(data_dir: &Path) -> anyhow::Result<()> {
-    let relay_path = native_chat_relay_path(data_dir)?;
-    let mut relay = read_json_or_default::<NativeChatRelayState>(&relay_path)?;
-    let mut processed = relay
-        .processed_event_ids
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    let event_store =
-        read_json_or_default::<NotificationEventStore>(&notification_events_path(data_dir)?)?;
-
-    let chat_root = native_chat_root_dir(data_dir)?;
-    let channels_path = chat_root.join("chat/channels.json");
-    let mut channels = read_json_or_default::<Vec<String>>(&channels_path)?;
-    if !channels
-        .iter()
-        .any(|channel| channel == NATIVE_CHAT_RELAY_CHANNEL)
-    {
-        channels.push(NATIVE_CHAT_RELAY_CHANNEL.to_string());
-        write_json_atomic(&channels_path, &channels)?;
-    }
-
-    let history_path = chat_root.join(format!("chat/history/{}.json", NATIVE_CHAT_RELAY_CHANNEL));
-    let mut history = read_json_or_default::<Vec<ChatHistoryMessage>>(&history_path)?;
-    let mut changed = false;
-    for event in &event_store.entries {
-        if !processed.insert(event.id.clone()) {
-            continue;
-        }
-        history.push(render_native_chat_event(event));
-        changed = true;
-    }
-
-    if changed {
-        if history.len() > 1000 {
-            history = history.split_off(history.len() - 1000);
-        }
-        relay.processed_event_ids = processed.into_iter().rev().take(4096).collect::<Vec<_>>();
-        relay.processed_event_ids.reverse();
-        write_json_atomic(&history_path, &history)?;
-        write_json_atomic(&relay_path, &relay)?;
-    }
-
-    Ok(())
-}
-
 fn room_access_request_notification_id(request_id: &str) -> String {
     format!("{ROOM_ACCESS_REQUEST_ID_PREFIX}{request_id}")
-}
-
-fn render_native_chat_event(event: &NotificationEventRecord) -> ChatHistoryMessage {
-    let content = match event.disposition {
-        NotificationEventDisposition::Appeared => {
-            format!(
-                "[{}] {} Open Inbox to review.",
-                source_label(&event.source_app),
-                event.body
-            )
-        }
-        NotificationEventDisposition::Resolved => {
-            let suffix = event
-                .resolution
-                .as_deref()
-                .map(|resolution| format!(" ({resolution})"))
-                .unwrap_or_default();
-            format!(
-                "[{}] {} Resolved in Home{}.",
-                source_label(&event.source_app),
-                event.title,
-                suffix
-            )
-        }
-    };
-
-    ChatHistoryMessage {
-        sender_id: String::new(),
-        sender_session_id: None,
-        sender_nick: "*".to_string(),
-        content,
-        ts: now_ts(),
-        display_ts: Some(now_ts()),
-        signature: None,
-    }
-}
-
-fn source_label(source_app: &str) -> &str {
-    if source_app.trim().is_empty() {
-        "Home"
-    } else {
-        source_app
-    }
 }
 
 fn read_json_or_default<T>(path: &Path) -> anyhow::Result<T>
@@ -651,48 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn sync_room_notifications_relays_into_native_chat_channel() {
+    fn sync_room_notifications_does_not_write_shared_native_chat_state() {
         let tmp = tempfile::tempdir().unwrap();
         sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
 
-        let chat_root = native_chat_root_dir(tmp.path()).unwrap();
-        let channels: Vec<String> =
-            read_json_or_default(&chat_root.join("chat/channels.json")).unwrap();
-        assert!(channels
-            .iter()
-            .any(|channel| channel == NATIVE_CHAT_RELAY_CHANNEL));
-
-        let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
-        assert_eq!(history.len(), 1);
-        assert!(history[0].content.contains("Open Inbox to review."));
-    }
-
-    #[test]
-    fn native_chat_relay_does_not_duplicate_existing_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-
-        let chat_root = native_chat_root_dir(tmp.path()).unwrap();
-        let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
-        assert_eq!(history.len(), 1);
-    }
-
-    #[test]
-    fn dismiss_relays_resolution_into_native_chat_channel() {
-        let tmp = tempfile::tempdir().unwrap();
-        sync_room_notifications(tmp.path(), &sample_summary()).unwrap();
-        let updated = dismiss(tmp.path(), "room-access-request:req-1").unwrap();
-        assert!(updated);
-
-        let chat_root = native_chat_root_dir(tmp.path()).unwrap();
-        let history: Vec<ChatHistoryMessage> =
-            read_json_or_default(&chat_root.join("chat/history/!home.json")).unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(history[1].content.contains("Resolved in Home"));
-        assert!(history[1].content.contains("dismissed"));
+        let shared_native_chat = tmp
+            .path()
+            .join("localhost/Users/self/.AppData/LocalHost/Chat");
+        assert!(!shared_native_chat.exists());
     }
 
     #[test]
