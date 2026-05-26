@@ -270,3 +270,41 @@ events.
 > findings. Harness, seed corpus, and dictionary committed at
 > elastos/crates/elastos-server/fuzz/ for ongoing soaks. 24-hour
 > soak is a one-command invocation."*
+
+---
+
+## Phase 10.5 follow-up — bridge-loop unbounded-read DoS
+
+The fuzz harness exercised `parse_carrier_line` (the pure framing +
+JSON-parse function), but the surrounding **bridge loop** still called
+`BufReader::read_line(&mut line).await` with no upper bound — meaning
+a guest could grow the host `String` to N bytes *before* the line ever
+reached the fuzz-tested parser. The post-read length check fired too
+late: the allocation had already happened.
+
+The Phase 10 pre-review pass flagged this as M1 (Carrier-bridge) and
+M2 (kernel-console forwarder; same shape, sync flavour). Both are
+closed in Phase 10.5 Day 1:
+
+- **M1 — `80ac011`** `phase10.5 M1: byte-budget carrier-bridge line reader`
+  Adds `read_line_byte_budgeted` + `drain_to_newline` async helpers,
+  rewrites `run_carrier_bridge_loop` to cap per-line allocation at
+  `CARRIER_MAX_LINE_BYTES + 1`, resync via drain on overflow, emit
+  the existing `request_too_large` envelope, continue dispatch.
+  Regression test `oversized_line_resyncs_and_continues_dispatch`
+  proves end-to-end bound + resync. Verifier:
+  `cargo test -p elastos-server --lib carrier_bridge::tests::oversized_line_resyncs_and_continues_dispatch -- --nocapture`
+- **M2 — `<see git log for SHA>`** `phase10.5 M2: byte-budget kernel console`
+  Adds sync flavours (`read_line_byte_budgeted_sync`,
+  `drain_to_newline_sync`), rewrites `spawn_console_forwarder` to cap
+  per-line allocation at `KERNEL_CONSOLE_MAX_LINE_BYTES + 1` (64 KiB,
+  two orders of magnitude above Linux `PRINTK_BUF_LEN`). Regression
+  test `forwarder_caps_oversized_kernel_line_and_resyncs` proves
+  end-to-end bound + resync. Verifier:
+  `cargo test -p elastos-vz --lib ffi::console_forwarder::tests::forwarder_caps_oversized_kernel_line_and_resyncs -- --nocapture`
+
+The fuzz harness from this document and the bridge-loop fix from
+Phase 10.5 are complementary: the harness asserts the parser is
+panic-free on arbitrary bytes; the bridge-loop fix asserts the
+allocator never sees more than 1 MiB per framed line in the first
+place. Together they close the M1 finding completely.

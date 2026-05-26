@@ -29,6 +29,18 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+/// **Phase 10.5 M2 — kernel-console line cap.**
+///
+/// Maximum byte length of a single kernel-console line before
+/// the forwarder drops it and resyncs to the next newline.
+/// 64 KiB is two orders of magnitude above Linux's compile-time
+/// `PRINTK_BUF_LEN` (typically 1 KiB), so a well-behaved guest
+/// kernel never trips it. A malicious or buggy guest kernel
+/// emitting an unbounded stream of bytes without a newline is
+/// capped at this size per call — pre-fix the host's `String`
+/// would grow without limit.
+const KERNEL_CONSOLE_MAX_LINE_BYTES: usize = 65_536;
+
 /// Handle returned by [`spawn_console_forwarder`]. Hold it for
 /// the lifetime of the VM. Tokio detaches the `JoinHandle` on
 /// drop, so the forwarder keeps running until the kernel
@@ -79,6 +91,83 @@ impl ConsoleForwarder {
     }
 }
 
+/// **Phase 10.5 M2 — byte-budgeted sync line reader.**
+///
+/// Synchronous counterpart of
+/// `elastos_server::carrier_bridge::read_line_byte_budgeted`.
+/// Reads bytes from `reader` into `buf` until either a newline
+/// is consumed (inclusive) or `max_bytes` bytes have been
+/// buffered, whichever comes first. Returns the number of bytes
+/// pushed onto `buf`.
+///
+/// Why it exists: `BufRead::read_line` is unbounded, so a guest
+/// kernel emitting `b"A" * 10_000_000_000` without a `\n` would
+/// grow the host's receive buffer until OOM. Caller passes
+/// `KERNEL_CONSOLE_MAX_LINE_BYTES + 1` so the post-read check
+/// can distinguish "exactly at limit" from "over limit" without
+/// truncating mid-byte.
+///
+/// Memory footprint: bounded by `max_bytes` plus the inner
+/// `BufReader`'s 8 KiB scratch — constant in attacker input.
+fn read_line_byte_budgeted_sync<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                return Ok(total);
+            }
+            let remaining = max_bytes.saturating_sub(total);
+            let take = chunk.len().min(remaining);
+            let scan = &chunk[..take];
+            if let Some(pos) = scan.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&scan[..=pos]);
+                (pos + 1, true)
+            } else {
+                buf.extend_from_slice(scan);
+                (take, false)
+            }
+        };
+        reader.consume(consumed);
+        total += consumed;
+        if found_newline {
+            return Ok(total);
+        }
+        if total >= max_bytes {
+            return Ok(total);
+        }
+    }
+}
+
+/// **Phase 10.5 M2 — sync resync helper.**
+///
+/// Discard bytes from `reader` until the next `\n` is consumed
+/// or EOF. O(`BufReader`-buffer) memory — bytes are scanned
+/// then consumed, never accumulated.
+fn drain_to_newline_sync<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                (pos + 1, true)
+            } else {
+                (chunk.len(), false)
+            }
+        };
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(());
+        }
+    }
+}
+
 /// Spawn a forwarder that drains `host_read` to `tracing`.
 ///
 /// `vm_id` is attached to every emitted event under the
@@ -87,11 +176,22 @@ impl ConsoleForwarder {
 pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -> ConsoleForwarder {
     let handle = tokio::task::spawn_blocking(move || {
         let mut reader = BufReader::new(host_read);
-        let mut buf = String::new();
+        // Phase 10.5 M2: byte-budgeted reads. Pre-Phase-10.5
+        // this was `read_line(&mut String)`, which is unbounded
+        // — a guest kernel emitting bytes without a newline
+        // could grow this buffer until the host OOMed. The
+        // helper caps the per-call allocation at
+        // `KERNEL_CONSOLE_MAX_LINE_BYTES + 1`.
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
 
         loop {
             buf.clear();
-            match reader.read_line(&mut buf) {
+            let read = read_line_byte_budgeted_sync(
+                &mut reader,
+                &mut buf,
+                KERNEL_CONSOLE_MAX_LINE_BYTES + 1,
+            );
+            match read {
                 Ok(0) => {
                     // EOF — Vz closed the write end. Normal
                     // shutdown path.
@@ -102,11 +202,39 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     );
                     return;
                 }
+                Ok(n) if n > KERNEL_CONSOLE_MAX_LINE_BYTES => {
+                    // Oversized line: drop it, resync to the
+                    // next newline, continue. No response
+                    // channel back to the guest kernel — best
+                    // we can do is log + drain.
+                    tracing::warn!(
+                        target: "vm_console",
+                        vm_id = %vm_id,
+                        bytes = n,
+                        cap = KERNEL_CONSOLE_MAX_LINE_BYTES,
+                        "kernel console line exceeded cap; dropping and resyncing"
+                    );
+                    if let Err(e) = drain_to_newline_sync(&mut reader) {
+                        tracing::warn!(
+                            target: "vm_console",
+                            vm_id = %vm_id,
+                            "kernel console drain-after-overflow error: {e}"
+                        );
+                        return;
+                    }
+                    continue;
+                }
                 Ok(_) => {
                     // Trim the trailing newline (if any) so the
                     // tracing event reads cleanly in JSON
-                    // formatters.
-                    let line = buf.trim_end_matches(['\n', '\r']);
+                    // formatters. Convert via `String::from_utf8_lossy`
+                    // rather than strict UTF-8 because guest
+                    // kernel printk *can* contain non-UTF-8
+                    // bytes (binary panic registers, etc.) and
+                    // we'd rather log a `�`-spotted line than
+                    // tear down the forwarder.
+                    let text = String::from_utf8_lossy(&buf);
+                    let line = text.trim_end_matches(['\n', '\r']);
                     if line.is_empty() {
                         continue;
                     }
@@ -199,6 +327,127 @@ mod tests {
         // Drop the writer so the spawned task can exit, leaving
         // no leaked threads behind the test.
         drop(write);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M2 — bounded read regression tests.
+    //
+    // Pre-Phase-10.5 the forwarder called `BufReader::read_line`
+    // with no upper bound, so a guest kernel emitting bytes
+    // without a newline would grow the host `String` until OOM.
+    // The fix replaces `read_line` with
+    // `read_line_byte_budgeted_sync` capped at
+    // `KERNEL_CONSOLE_MAX_LINE_BYTES + 1`.
+    //
+    // Tests below exercise both the end-to-end pipe path and the
+    // helper in isolation so a future regression on either side
+    // (forwarder loop, byte-budget arithmetic) is caught.
+    // ---------------------------------------------------------------
+
+    /// End-to-end: write 2 x cap bytes of 'A' with no newline,
+    /// then a `\n`, then a normal short line, then EOF. The
+    /// forwarder must drain the oversized burst (proving the
+    /// cap fired and the resync helper succeeded), accept the
+    /// short follow-up line, and shut down cleanly on EOF.
+    /// Pre-fix this test would either OOM the test process or
+    /// hang waiting for a newline that never came inside an
+    /// unbounded `read_line` call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarder_caps_oversized_kernel_line_and_resyncs() {
+        let (read, mut write) = pipe_pair();
+        let forwarder =
+            spawn_console_forwarder(read, "phase10.5-m2-oversized".to_string());
+
+        // Spawn the writer on a blocking thread so the pipe's
+        // kernel buffer (typically 64 KiB on macOS) cannot
+        // deadlock the test: the forwarder is reading
+        // concurrently, so the writer's `write_all` will make
+        // progress in lock-step with the reader.
+        std::thread::spawn(move || {
+            let oversized = vec![b'A'; 2 * KERNEL_CONSOLE_MAX_LINE_BYTES];
+            write
+                .write_all(&oversized)
+                .expect("write oversized burst");
+            // Terminating newline so the forwarder's drain can
+            // resync without waiting for the rest of the
+            // (never-coming) attacker payload.
+            write.write_all(b"\n").expect("write closing newline");
+            // Short follow-up line to prove the loop resumed
+            // dispatch on the same pipe after the overflow.
+            writeln!(&mut write, "post-overflow OK").expect("write follow-up");
+            drop(write);
+        });
+
+        // Forwarder must drain the oversized burst, log the
+        // follow-up line, and exit on EOF — all within the
+        // shutdown timeout. The timeout itself is the
+        // assertion: a pre-fix unbounded `read_line` would
+        // hang inside the oversized burst.
+        forwarder
+            .shutdown_and_join(Duration::from_secs(5))
+            .await
+            .expect(
+                "forwarder must drain oversized burst, accept the short \
+                 follow-up, and exit on EOF within 5s",
+            );
+    }
+
+    /// Helper-level: read a line under the cap returns the full
+    /// line with newline included (shape parity with `read_line`).
+    #[test]
+    fn read_line_byte_budgeted_sync_returns_full_line_under_cap() {
+        let mut reader = BufReader::new(&b"hello\nworld\n"[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted_sync(
+            &mut reader,
+            &mut buf,
+            KERNEL_CONSOLE_MAX_LINE_BYTES + 1,
+        )
+        .expect("read should succeed");
+        assert_eq!(n, 6);
+        assert_eq!(&buf, b"hello\n");
+    }
+
+    /// Helper-level: oversized input with no newline caps the
+    /// returned buf at exactly `max_bytes`. Pre-fix this would
+    /// return the entire 4 KiB even if `max_bytes` was 1 KiB.
+    #[test]
+    fn read_line_byte_budgeted_sync_caps_at_max_bytes_when_no_newline() {
+        let payload = vec![b'A'; 4096];
+        let mut reader = BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let max = 1024usize;
+        let n = read_line_byte_budgeted_sync(&mut reader, &mut buf, max)
+            .expect("read should succeed");
+        assert_eq!(n, max, "must return exactly max_bytes when no newline found");
+        assert_eq!(buf.len(), max, "buf must be capped at max_bytes");
+    }
+
+    /// Helper-level: EOF before any byte returns `Ok(0)`,
+    /// matching `read_line`'s shape so the caller's `match Ok(0)`
+    /// EOF arm continues to work unchanged.
+    #[test]
+    fn read_line_byte_budgeted_sync_returns_zero_on_immediate_eof() {
+        let mut reader = BufReader::new(&b""[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted_sync(&mut reader, &mut buf, 1024)
+            .expect("read should succeed");
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// Helper-level: `drain_to_newline_sync` consumes only up to
+    /// and including the next `\n`, so the next read picks up
+    /// from the start of the following line.
+    #[test]
+    fn drain_to_newline_sync_resyncs_to_next_line_start() {
+        let mut reader = BufReader::new(&b"AAAAAAAA\nBBBB\n"[..]);
+        drain_to_newline_sync(&mut reader).expect("drain should succeed");
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted_sync(&mut reader, &mut buf, 1024)
+            .expect("post-drain read should succeed");
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"BBBB\n");
     }
 
     #[tokio::test(flavor = "multi_thread")]
