@@ -4,7 +4,7 @@
 //! - Bootstrap: Runtime initialization and lifecycle
 //! - Capability: Token-based access control
 //! - Capsule: Capsule lifecycle management
-//! - Handler: Message handling between capsules and runtime
+//! - Handler: internal shell/control message handling
 //! - Messaging: Inter-capsule communication
 //! - Provider: Protocol routing and resource providers
 //! - Primitives: Core types (time, audit, metrics)
@@ -14,6 +14,7 @@
 //! The HTTP API, CLI, and capsule loading logic live in the `elastos-server` crate.
 //! This library is transport-agnostic — it has no HTTP framework dependencies.
 
+pub mod auth;
 pub mod bootstrap;
 pub mod capability;
 pub mod capsule;
@@ -24,6 +25,6 @@ pub mod provider;
 pub mod session;
 pub mod signature;
 
-// Re-export namespace types for backward compatibility
+// Re-export namespace types so existing crate consumers use the same source of truth.
 pub use elastos_namespace as namespace;
 pub use elastos_namespace as content;

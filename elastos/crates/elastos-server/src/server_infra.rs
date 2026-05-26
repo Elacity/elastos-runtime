@@ -368,6 +368,7 @@ async fn setup_server_infrastructure_impl(
                 manager: Arc::new(tokio::sync::Mutex::new(manager)),
                 session_registry: session_registry.clone(),
                 audit_log: Some(audit_log.clone()),
+                data_dir: data_dir.clone(),
             })
         }
         Err(e) => {

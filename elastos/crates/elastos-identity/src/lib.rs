@@ -1,8 +1,9 @@
 //! Identity management for ElastOS
 //!
 //! Two identity primitives:
-//! - **DID** (`did:key:z6Mk...`) — the Carrier identity. Derived from device key
-//!   via `derive_did()`. Used for P2P, signing, and external identity.
+//! - **Device DID** (`did:key:z6Mk...`) — the local Carrier/node identity.
+//!   Derived from device key via `derive_did()`. Used for node signing and
+//!   peer transport, not as the human account root.
 //! - **WebAuthn/Passkey** — local user authentication. Credentials encrypted
 //!   with device key via AES-256-GCM.
 
@@ -15,8 +16,9 @@ pub use store::{
     validate_nickname, IdentityData, IdentityStore, StoredCredential, MULTICODEC_ED25519_PUB,
 };
 pub use webauthn::{
-    AuthenticationResponse, AuthenticatorAssertionResponse, AuthenticatorAttestationResponse,
-    AuthenticatorSelection, CreationOptions, CredentialDescriptor, IdentityManager, IdentityStatus,
-    PubKeyCredParam, PublicKeyCredentialCreationOptions, PublicKeyCredentialRequestOptions,
+    AuthenticationOutcome, AuthenticationResponse, AuthenticatorAssertionResponse,
+    AuthenticatorAttestationResponse, AuthenticatorSelection, CreationOptions,
+    CredentialDescriptor, IdentityManager, IdentityStatus, PubKeyCredParam,
+    PublicKeyCredentialCreationOptions, PublicKeyCredentialRequestOptions, RegistrationOutcome,
     RegistrationResponse, RelyingParty, RequestOptions, UserEntity,
 };

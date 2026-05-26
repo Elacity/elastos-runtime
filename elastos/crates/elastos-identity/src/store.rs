@@ -1,7 +1,8 @@
 //! Credential persistence for passkey identity
 //!
 //! Stores WebAuthn credentials as encrypted JSON on disk using AES-256-GCM.
-//! Single user per device. A shared device key is auto-generated on first run.
+//! Multiple passkey principals may exist on one device. A shared device key is
+//! auto-generated on first run and protects the local credential store at rest.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -61,7 +62,7 @@ pub fn encode_did_key(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
 /// Load the device key and derive a stable DID identity from it.
 ///
 /// Returns `(SigningKey, did_string)`. The device_key file stays on disk
-/// for backwards compatibility (encryption at rest), but identity is always
+/// for existing local profiles (encryption at rest), but identity is always
 /// the derived DID.
 ///
 /// Derivation: `SHA-256("elastos-did-v1" || device_key)` → Ed25519 SigningKey.
@@ -344,6 +345,17 @@ impl IdentityStore {
             }
         }
     }
+
+    /// Remove a passkey credential by ID.
+    pub fn remove_credential(&mut self, credential_id: &str) -> bool {
+        let Some(ref mut data) = self.data else {
+            return false;
+        };
+        let before = data.credentials.len();
+        data.credentials
+            .retain(|cred| cred.credential_id != credential_id);
+        data.credentials.len() != before
+    }
 }
 
 /// Generate a deterministic user ID from a credential ID
@@ -429,6 +441,25 @@ mod tests {
         let key2 = load_or_create_device_key(dir.path()).unwrap();
         assert_eq!(*key1, *key2, "device key should be stable across calls");
         assert_ne!(*key1, [0u8; 32], "device key should not be all zeros");
+    }
+
+    #[test]
+    fn test_remove_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::new(dir.path()).unwrap();
+        store.load().unwrap();
+
+        let cred = StoredCredential {
+            credential_id: "remove-test-cred".to_string(),
+            public_key: "remove-test-key".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        };
+        store.add_credential(cred);
+
+        assert!(store.remove_credential("remove-test-cred"));
+        assert!(!store.is_registered());
+        assert!(!store.remove_credential("remove-test-cred"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Minimal WebAuthn Relying Party implementation
 //!
 //! Implements the server side of WebAuthn passkey registration and authentication
-//! without OpenSSL dependencies. Uses p256 for ES256 signature verification.
+//! without OpenSSL dependencies. Supports ES256 and RS256 passkeys.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +17,9 @@ use crate::store::{IdentityStore, StoredCredential};
 
 /// Challenge expiry duration
 const CHALLENGE_EXPIRY: Duration = Duration::from_secs(300);
+const FLAG_USER_PRESENT: u8 = 0x01;
+const FLAG_USER_VERIFIED: u8 = 0x04;
+const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
 
 /// Challenge type
 enum ChallengeType {
@@ -35,6 +39,22 @@ pub struct IdentityStatus {
     pub registered: bool,
     pub authenticated: bool,
     pub user_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistrationOutcome {
+    pub user_id: String,
+    pub credential: StoredCredential,
+    pub origin: String,
+    pub user_verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticationOutcome {
+    pub user_id: String,
+    pub credential: StoredCredential,
+    pub origin: String,
+    pub user_verified: bool,
 }
 
 // === WebAuthn Protocol Types ===
@@ -85,6 +105,7 @@ pub struct PubKeyCredParam {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticatorSelection {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticator_attachment: Option<String>,
     pub resident_key: String,
     pub require_resident_key: bool,
@@ -117,7 +138,7 @@ pub struct PublicKeyCredentialRequestOptions {
 
 /// Browser → Server: registration response
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistrationResponse {
     #[serde(rename = "id")]
     pub _id: String,
@@ -129,7 +150,7 @@ pub struct RegistrationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatorAttestationResponse {
     pub client_data_json: String,   // base64url
     pub attestation_object: String, // base64url
@@ -137,7 +158,7 @@ pub struct AuthenticatorAttestationResponse {
 
 /// Browser → Server: authentication response
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticationResponse {
     #[serde(rename = "id")]
     pub _id: String,
@@ -148,7 +169,7 @@ pub struct AuthenticationResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatorAssertionResponse {
     pub client_data_json: String,   // base64url
     pub authenticator_data: String, // base64url
@@ -184,9 +205,7 @@ impl IdentityManager {
     /// so passkeys work from any transport (localhost, LAN, Tailscale, etc.)
     pub fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         let mut store = IdentityStore::new(&data_dir)?;
-        store.load().unwrap_or_else(|e| {
-            tracing::warn!("Failed to load identity store: {}", e);
-        });
+        store.load()?;
 
         Ok(Self {
             store,
@@ -204,6 +223,27 @@ impl IdentityManager {
         }
     }
 
+    /// List stored passkey credentials without exposing private key material.
+    pub fn credentials(&self) -> Vec<StoredCredential> {
+        self.store.get_credentials()
+    }
+
+    /// Revoke one passkey credential from the local identity store.
+    pub fn revoke_credential(&mut self, credential_id: &str) -> anyhow::Result<StoredCredential> {
+        let credential = self
+            .store
+            .get_credentials()
+            .into_iter()
+            .find(|credential| credential.credential_id == credential_id)
+            .ok_or_else(|| anyhow::anyhow!("passkey credential not found"))?;
+        if !self.store.remove_credential(credential_id) {
+            anyhow::bail!("passkey credential not found");
+        }
+        self.challenges.clear();
+        self.store.save()?;
+        Ok(credential)
+    }
+
     /// Begin registration flow
     /// Begin registration of an additional passkey.
     ///
@@ -215,6 +255,29 @@ impl IdentityManager {
         session_token: &str,
         rp_id: &str,
     ) -> anyhow::Result<CreationOptions> {
+        self.begin_registration_inner(session_token, rp_id, "ElastOS User", true)
+    }
+
+    /// Begin registration for a separate runtime principal.
+    ///
+    /// This intentionally omits `excludeCredentials`: the runtime model treats
+    /// each passkey as its own principal, so the same platform authenticator may
+    /// create an additional guest credential for the same RP.
+    pub fn begin_principal_registration(
+        &mut self,
+        session_token: &str,
+        rp_id: &str,
+    ) -> anyhow::Result<CreationOptions> {
+        self.begin_registration_inner(session_token, rp_id, "ElastOS Passkey", false)
+    }
+
+    fn begin_registration_inner(
+        &mut self,
+        session_token: &str,
+        rp_id: &str,
+        display_name: &str,
+        exclude_existing: bool,
+    ) -> anyhow::Result<CreationOptions> {
         self.cleanup_expired();
 
         let challenge = generate_challenge();
@@ -223,15 +286,18 @@ impl IdentityManager {
         // User ID is random for registration, real ID derived from credential after
         let user_id = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
 
-        let exclude = self
-            .store
-            .get_credentials()
-            .iter()
-            .map(|c| CredentialDescriptor {
-                type_: "public-key".to_string(),
-                id: c.credential_id.clone(),
-            })
-            .collect();
+        let exclude = if exclude_existing {
+            self.store
+                .get_credentials()
+                .iter()
+                .map(|c| CredentialDescriptor {
+                    type_: "public-key".to_string(),
+                    id: c.credential_id.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let options = CreationOptions {
             public_key: PublicKeyCredentialCreationOptions {
@@ -242,19 +308,25 @@ impl IdentityManager {
                 user: UserEntity {
                     id: user_id,
                     name: "elastos-user".to_string(),
-                    display_name: "ElastOS User".to_string(),
+                    display_name: display_name.to_string(),
                 },
                 challenge: challenge_b64,
-                pub_key_cred_params: vec![PubKeyCredParam {
-                    type_: "public-key".to_string(),
-                    alg: -7, // ES256
-                }],
+                pub_key_cred_params: vec![
+                    PubKeyCredParam {
+                        type_: "public-key".to_string(),
+                        alg: -7, // ES256
+                    },
+                    PubKeyCredParam {
+                        type_: "public-key".to_string(),
+                        alg: -257, // RS256
+                    },
+                ],
                 timeout: 300000,
                 authenticator_selection: AuthenticatorSelection {
                     authenticator_attachment: None, // platform or cross-platform
                     resident_key: "preferred".to_string(),
                     require_resident_key: false,
-                    user_verification: "preferred".to_string(),
+                    user_verification: "required".to_string(),
                 },
                 attestation: "none".to_string(),
                 exclude_credentials: exclude,
@@ -280,7 +352,7 @@ impl IdentityManager {
         response: &RegistrationResponse,
         rp_id: &str,
         rp_origin: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<RegistrationOutcome> {
         let pending = self
             .challenges
             .remove(session_token)
@@ -337,12 +409,9 @@ impl IdentityManager {
         }
 
         let flags = auth_data_bytes[32];
-        // Bit 0: UP (user present)
-        if flags & 0x01 == 0 {
-            anyhow::bail!("User presence flag not set");
-        }
+        require_user_present_and_verified(flags)?;
         // Bit 6: AT (attested credential data included)
-        if flags & 0x40 == 0 {
+        if flags & FLAG_ATTESTED_CREDENTIAL_DATA == 0 {
             anyhow::bail!("No attested credential data");
         }
 
@@ -363,8 +432,8 @@ impl IdentityManager {
         let credential_id = URL_SAFE_NO_PAD.encode(cred_id);
         let public_key = URL_SAFE_NO_PAD.encode(cose_key_bytes);
 
-        // Verify the COSE key is valid ES256 by trying to parse it
-        parse_cose_es256_key(cose_key_bytes)?;
+        // Verify the COSE key uses an algorithm this runtime can validate.
+        parse_cose_public_key(cose_key_bytes)?;
 
         let stored = StoredCredential {
             credential_id,
@@ -373,10 +442,15 @@ impl IdentityManager {
             rp_id: rp_id.to_string(),
         };
 
-        let user_id = self.store.add_credential(stored);
+        let user_id = self.store.add_credential(stored.clone());
         self.store.save()?;
 
-        Ok(user_id)
+        Ok(RegistrationOutcome {
+            user_id,
+            credential: stored,
+            origin: client_data.origin,
+            user_verified: true,
+        })
     }
 
     /// Begin authentication flow
@@ -409,7 +483,7 @@ impl IdentityManager {
                 timeout: 300000,
                 rp_id: rp_id.to_string(),
                 allow_credentials: allow,
-                user_verification: "preferred".to_string(),
+                user_verification: "required".to_string(),
             },
         };
 
@@ -432,7 +506,7 @@ impl IdentityManager {
         response: &AuthenticationResponse,
         rp_id: &str,
         rp_origin: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<AuthenticationOutcome> {
         let pending = self
             .challenges
             .remove(session_token)
@@ -485,9 +559,7 @@ impl IdentityManager {
         }
 
         let flags = auth_data_bytes[32];
-        if flags & 0x01 == 0 {
-            anyhow::bail!("User presence flag not set");
-        }
+        require_user_present_and_verified(flags)?;
 
         let sign_count = u32::from_be_bytes([
             auth_data_bytes[33],
@@ -519,15 +591,10 @@ impl IdentityManager {
         let mut signed_data = auth_data_bytes.clone();
         signed_data.extend_from_slice(&client_data_hash);
 
-        let public_key_bytes = URL_SAFE_NO_PAD.decode(&stored.public_key)?;
-        let verifying_key = parse_cose_es256_key(&public_key_bytes)?;
-
         let sig_bytes = URL_SAFE_NO_PAD.decode(&response.response.signature)?;
-        let signature = Signature::from_der(&sig_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid signature format: {}", e))?;
-
-        verifying_key
-            .verify(&signed_data, &signature)
+        let public_key_bytes = URL_SAFE_NO_PAD.decode(&stored.public_key)?;
+        parse_cose_public_key(&public_key_bytes)?
+            .verify(&signed_data, &sig_bytes)
             .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))?;
 
         // Update sign count
@@ -535,18 +602,34 @@ impl IdentityManager {
             .update_sign_count(&stored.credential_id, sign_count);
         self.store.save()?;
 
-        Ok(self
+        let mut credential = stored.clone();
+        credential.sign_count = sign_count;
+        let user_id = self
             .store
             .user_id()
             .ok_or_else(|| {
                 anyhow::anyhow!("Identity store has no user ID after successful authentication")
             })?
-            .to_string())
+            .to_string();
+
+        Ok(AuthenticationOutcome {
+            user_id,
+            credential,
+            origin: client_data.origin,
+            user_verified: true,
+        })
     }
 
     fn cleanup_expired(&mut self) {
         self.challenges
             .retain(|_, c| c.created.elapsed() < CHALLENGE_EXPIRY);
+    }
+
+    #[cfg(test)]
+    fn expire_challenge_for_test(&mut self, session_token: &str) {
+        if let Some(challenge) = self.challenges.get_mut(session_token) {
+            challenge.created = Instant::now() - CHALLENGE_EXPIRY - Duration::from_secs(1);
+        }
     }
 }
 
@@ -558,8 +641,43 @@ fn generate_challenge() -> Vec<u8> {
     challenge
 }
 
-/// Parse a COSE ES256 public key and return a p256 VerifyingKey
-fn parse_cose_es256_key(cose_bytes: &[u8]) -> anyhow::Result<VerifyingKey> {
+fn require_user_present_and_verified(flags: u8) -> anyhow::Result<()> {
+    if flags & FLAG_USER_PRESENT == 0 {
+        anyhow::bail!("User presence flag not set");
+    }
+    if flags & FLAG_USER_VERIFIED == 0 {
+        anyhow::bail!("User verification flag not set");
+    }
+    Ok(())
+}
+
+enum CosePublicKey {
+    Es256(VerifyingKey),
+    Rs256(RsaPublicKey),
+}
+
+impl CosePublicKey {
+    fn verify(&self, signed_data: &[u8], sig_bytes: &[u8]) -> anyhow::Result<()> {
+        match self {
+            CosePublicKey::Es256(verifying_key) => {
+                let signature = Signature::from_der(sig_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid ES256 signature format: {}", e))?;
+                verifying_key
+                    .verify(signed_data, &signature)
+                    .map_err(|e| anyhow::anyhow!("ES256 verification failed: {}", e))
+            }
+            CosePublicKey::Rs256(public_key) => {
+                let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(public_key.clone());
+                let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes)
+                    .map_err(|e| anyhow::anyhow!("Invalid RS256 signature format: {}", e))?;
+                rsa::signature::Verifier::verify(&verifying_key, signed_data, &signature)
+                    .map_err(|e| anyhow::anyhow!("RS256 verification failed: {}", e))
+            }
+        }
+    }
+}
+
+fn parse_cose_public_key(cose_bytes: &[u8]) -> anyhow::Result<CosePublicKey> {
     let cose_key: ciborium::Value =
         ciborium::from_reader(cose_bytes).map_err(|e| anyhow::anyhow!("COSE CBOR: {}", e))?;
 
@@ -568,6 +686,20 @@ fn parse_cose_es256_key(cose_bytes: &[u8]) -> anyhow::Result<VerifyingKey> {
         _ => anyhow::bail!("COSE key is not a map"),
     };
 
+    let alg = find_cbor_int(map, 3)?;
+    match alg {
+        -7 => parse_cose_es256_key_map(map).map(CosePublicKey::Es256),
+        -257 => parse_cose_rs256_key_map(map).map(CosePublicKey::Rs256),
+        _ => anyhow::bail!(
+            "Unsupported algorithm: {} (expected ES256=-7 or RS256=-257)",
+            alg
+        ),
+    }
+}
+
+fn parse_cose_es256_key_map(
+    map: &[(ciborium::Value, ciborium::Value)],
+) -> anyhow::Result<VerifyingKey> {
     // kty (1) must be EC2 (2)
     let kty = find_cbor_int(map, 1)?;
     if kty != 2 {
@@ -597,6 +729,26 @@ fn parse_cose_es256_key(cose_bytes: &[u8]) -> anyhow::Result<VerifyingKey> {
 
     VerifyingKey::from_sec1_bytes(&point)
         .map_err(|e| anyhow::anyhow!("Invalid EC public key: {}", e))
+}
+
+fn parse_cose_rs256_key_map(
+    map: &[(ciborium::Value, ciborium::Value)],
+) -> anyhow::Result<RsaPublicKey> {
+    // kty (1) must be RSA (3)
+    let kty = find_cbor_int(map, 1)?;
+    if kty != 3 {
+        anyhow::bail!("Unsupported key type: {} (expected RSA=3)", kty);
+    }
+
+    // alg (3) must be RS256 (-257)
+    let alg = find_cbor_int(map, 3)?;
+    if alg != -257 {
+        anyhow::bail!("Unsupported algorithm: {} (expected RS256=-257)", alg);
+    }
+
+    let n = BigUint::from_bytes_be(&find_cbor_bytes(map, -1)?);
+    let e = BigUint::from_bytes_be(&find_cbor_bytes(map, -2)?);
+    RsaPublicKey::new(n, e).map_err(|e| anyhow::anyhow!("Invalid RSA public key: {}", e))
 }
 
 /// Find an integer value in a CBOR map by integer key
@@ -647,4 +799,310 @@ fn extract_cbor_bytes(value: &ciborium::Value, key: &str) -> anyhow::Result<Vec<
         }
     }
     anyhow::bail!("Missing CBOR field: {}", key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn registration_options_require_user_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+
+        let options = manager
+            .begin_registration("session-token", "localhost")
+            .unwrap();
+
+        assert_eq!(
+            options.public_key.authenticator_selection.user_verification,
+            "required"
+        );
+    }
+
+    #[test]
+    fn registration_options_offer_default_algorithms_without_null_attachment() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+
+        let options = manager
+            .begin_principal_registration("session-token", "localhost")
+            .unwrap();
+        let algorithms: Vec<i64> = options
+            .public_key
+            .pub_key_cred_params
+            .iter()
+            .map(|param| param.alg)
+            .collect();
+        assert_eq!(algorithms, vec![-7, -257]);
+
+        let json = serde_json::to_value(&options).unwrap();
+        assert!(json["publicKey"]["authenticatorSelection"]
+            .get("authenticatorAttachment")
+            .is_none());
+    }
+
+    #[test]
+    fn principal_registration_does_not_exclude_existing_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        manager.store.add_credential(StoredCredential {
+            credential_id: "credential-id".to_string(),
+            public_key: "public-key".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+
+        let backup_options = manager
+            .begin_registration("backup-session", "localhost")
+            .unwrap();
+        assert_eq!(backup_options.public_key.exclude_credentials.len(), 1);
+
+        let principal_options = manager
+            .begin_principal_registration("guest-session", "localhost")
+            .unwrap();
+        assert!(principal_options.public_key.exclude_credentials.is_empty());
+    }
+
+    #[test]
+    fn authentication_options_require_user_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        manager.store.add_credential(StoredCredential {
+            credential_id: "credential-id".to_string(),
+            public_key: "public-key".to_string(),
+            sign_count: 0,
+            rp_id: "localhost".to_string(),
+        });
+
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+
+        assert_eq!(options.public_key.user_verification, "required");
+    }
+
+    #[test]
+    fn registration_response_rejects_extension_payloads() {
+        let response = serde_json::json!({
+            "id": "credential-id",
+            "rawId": "credential-id",
+            "type": "public-key",
+            "clientExtensionResults": {
+                "prf": {
+                    "results": { "first": "raw-key-material" }
+                }
+            },
+            "response": {
+                "clientDataJson": "AA",
+                "attestationObject": "AA"
+            }
+        });
+
+        let err = serde_json::from_value::<RegistrationResponse>(response)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("clientExtensionResults"));
+    }
+
+    #[test]
+    fn authentication_response_rejects_extension_payloads() {
+        let response = serde_json::json!({
+            "id": "credential-id",
+            "rawId": "credential-id",
+            "type": "public-key",
+            "response": {
+                "clientDataJson": "AA",
+                "authenticatorData": "AA",
+                "signature": "AA",
+                "userHandle": null,
+                "clientExtensionResults": {
+                    "prf": {
+                        "results": { "first": "raw-key-material" }
+                    }
+                }
+            }
+        });
+
+        let err = serde_json::from_value::<AuthenticationResponse>(response)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("clientExtensionResults"));
+    }
+
+    #[test]
+    fn auth_data_flags_must_include_user_presence_and_verification() {
+        require_user_present_and_verified(FLAG_USER_PRESENT | FLAG_USER_VERIFIED).unwrap();
+
+        let no_presence = require_user_present_and_verified(FLAG_USER_VERIFIED).unwrap_err();
+        assert!(no_presence.to_string().contains("User presence"));
+
+        let no_verification = require_user_present_and_verified(FLAG_USER_PRESENT).unwrap_err();
+        assert!(no_verification.to_string().contains("User verification"));
+    }
+
+    fn manager_with_credential(sign_count: u32) -> IdentityManager {
+        let temp = tempfile::tempdir().unwrap();
+        let mut manager = IdentityManager::new(temp.path().to_path_buf()).unwrap();
+        manager.store.add_credential(StoredCredential {
+            credential_id: "credential-id".to_string(),
+            public_key: "invalid-public-key".to_string(),
+            sign_count,
+            rp_id: "localhost".to_string(),
+        });
+        manager
+    }
+
+    fn auth_data(rp_id: &str, flags: u8, sign_count: u32) -> String {
+        let mut data = Vec::new();
+        data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+        data.push(flags);
+        data.extend_from_slice(&sign_count.to_be_bytes());
+        URL_SAFE_NO_PAD.encode(data)
+    }
+
+    fn assertion_response(
+        challenge: &str,
+        origin: &str,
+        rp_id: &str,
+        flags: u8,
+        sign_count: u32,
+    ) -> AuthenticationResponse {
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": challenge,
+            "origin": origin
+        });
+        AuthenticationResponse {
+            _id: "credential-id".to_string(),
+            raw_id: "credential-id".to_string(),
+            response: AuthenticatorAssertionResponse {
+                client_data_json: URL_SAFE_NO_PAD.encode(client_data.to_string()),
+                authenticator_data: auth_data(rp_id, flags, sign_count),
+                signature: URL_SAFE_NO_PAD.encode(b"not-a-der-signature"),
+                _user_handle: None,
+            },
+            _type: "public-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn authentication_rejects_wrong_origin_and_consumes_challenge() {
+        let mut manager = manager_with_credential(0);
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+        let response = assertion_response(
+            &options.public_key.challenge,
+            "https://evil.example",
+            "localhost",
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            1,
+        );
+
+        let err = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Origin mismatch"));
+
+        let replay = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(replay.contains("No pending authentication challenge"));
+    }
+
+    #[test]
+    fn authentication_rejects_expired_challenge() {
+        let mut manager = manager_with_credential(0);
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+        manager.expire_challenge_for_test("session-token");
+        let response = assertion_response(
+            &options.public_key.challenge,
+            "http://localhost",
+            "localhost",
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            1,
+        );
+
+        let err = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expired"));
+    }
+
+    #[test]
+    fn authentication_rejects_wrong_rp_hash() {
+        let mut manager = manager_with_credential(0);
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+        let response = assertion_response(
+            &options.public_key.challenge,
+            "http://localhost",
+            "evil.example",
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            1,
+        );
+
+        let err = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("RP ID hash mismatch"));
+    }
+
+    #[test]
+    fn authentication_rejects_missing_user_verification() {
+        let mut manager = manager_with_credential(0);
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+        let response = assertion_response(
+            &options.public_key.challenge,
+            "http://localhost",
+            "localhost",
+            FLAG_USER_PRESENT,
+            1,
+        );
+
+        let err = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("User verification"));
+    }
+
+    #[test]
+    fn authentication_rejects_counter_regression_before_signature_check() {
+        let mut manager = manager_with_credential(7);
+        let options = manager
+            .begin_authentication("session-token", "localhost")
+            .unwrap();
+        let response = assertion_response(
+            &options.public_key.challenge,
+            "http://localhost",
+            "localhost",
+            FLAG_USER_PRESENT | FLAG_USER_VERIFIED,
+            7,
+        );
+
+        let err = manager
+            .complete_authentication("session-token", &response, "localhost", "http://localhost")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Credential clone detected"));
+    }
 }

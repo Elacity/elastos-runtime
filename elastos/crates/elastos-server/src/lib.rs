@@ -5,6 +5,7 @@
 //! The security-critical runtime logic lives in `elastos-runtime`.
 
 pub mod api;
+pub mod auth;
 pub mod binaries;
 pub mod browser_app_hosts;
 pub mod carrier;
