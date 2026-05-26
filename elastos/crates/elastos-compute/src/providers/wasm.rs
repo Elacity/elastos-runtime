@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasmtime::*;
-use wasmtime_wasi::sync::WasiCtxBuilder;
-use wasmtime_wasi::WasiCtx;
+use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 use elastos_common::{
     CapsuleId, CapsuleManifest, CapsuleStatus, CapsuleType, ElastosError, Result,
@@ -16,9 +15,13 @@ use elastos_common::{
 
 use crate::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 
-/// State held by a WASI instance
+/// State held by a WASI preview1 instance under wasmtime-wasi 24+.
+///
+/// Replaces the legacy `WasiCtx` from wasmtime-wasi 17. The new `WasiP1Ctx`
+/// is what `preview1::add_to_linker_sync` binds against and what the WASI
+/// host functions read/write through.
 struct WasiState {
-    wasi: WasiCtx,
+    wasi: WasiP1Ctx,
 }
 
 /// A running WASM instance
@@ -66,22 +69,19 @@ pub struct BridgePipes {
 pub type BridgeSpawner = Arc<dyn Fn(BridgePipes) + Send + Sync>;
 
 /// Transport used to wire the carrier bridge between the runtime and a WASM
-/// capsule. Selected per-provider via [`WasmProvider::set_bridge_transport`].
+/// capsule.
 ///
-/// `Fds` (default) uses `wasi.insert_file()` to inject pipe endpoints at
-/// fds 3 and 4. This is the legacy transport. It depends on `wasmtime-wasi`
-/// providing `insert_file`, which was removed in `wasmtime-wasi 24+`.
-///
-/// `Fifos` mounts a per-launch directory containing two named pipes into the
-/// WASI sandbox via `preopened_dir()`. The capsule SDK opens these by path.
-/// This transport survives all known wasmtime-wasi API changes through 36+
-/// and is the migration target for the wasmtime 17 → 24 bump (Day 8).
+/// On wasmtime-wasi 24+ only the `Fifos` transport is supported: the legacy
+/// fd-injection transport (`Fds`) depended on `wasi.insert_file()` which the
+/// upstream 24 release removed. The enum is kept (rather than collapsed into
+/// a unit type) so the runtime API remains forward-compatible if a future
+/// transport variant is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BridgeTransport {
-    /// Legacy fd-injection transport. Selected by default for back-compat.
+    /// FIFO-on-preopened-dir transport. The carrier bridge mounts a per-launch
+    /// directory containing two named pipes into the WASI sandbox via
+    /// `preopened_dir()`; the capsule SDK opens them by path.
     #[default]
-    Fds,
-    /// FIFO-on-preopened-dir transport. The migration target.
     Fifos,
 }
 
@@ -94,9 +94,9 @@ pub struct WasmProvider {
     /// instead of inherited, and this callback is invoked to handle the
     /// bridge (e.g., dispatching SDK requests to the provider registry).
     bridge_spawner: std::sync::RwLock<Option<BridgeSpawner>>,
-    /// Carrier bridge transport. Defaults to [`BridgeTransport::Fds`] for
-    /// back-compat; the runtime can switch to [`BridgeTransport::Fifos`] to
-    /// exercise the wasmtime-24-compatible path.
+    /// Carrier bridge transport. Only [`BridgeTransport::Fifos`] is supported
+    /// on wasmtime-wasi 24+; kept as a `RwLock<BridgeTransport>` for symmetry
+    /// with the existing setter/getter API and future transport variants.
     transport: std::sync::RwLock<BridgeTransport>,
 }
 
@@ -144,12 +144,6 @@ impl WasmProvider {
     fn get_capsule_data_dir(&self, capsule_name: &str) -> PathBuf {
         self.data_base_dir.join(capsule_name)
     }
-
-    /// Carrier channel FD numbers inserted into the WASI context for bridge mode.
-    /// The capsule reads responses from `CARRIER_READ_FD` and writes requests to
-    /// `CARRIER_WRITE_FD`, keeping stdin/stdout free for user I/O.
-    const CARRIER_READ_FD: u32 = 3;
-    const CARRIER_WRITE_FD: u32 = 4;
 
     /// Sandbox path at which the per-capsule carrier directory is preopened
     /// when using the FIFO transport. Capsules see two files inside it:
@@ -273,14 +267,10 @@ impl WasmProvider {
 
     /// Build WASI context based on capsule permissions.
     ///
-    /// When `use_bridge` is true, dedicated Carrier I/O is set up according
-    /// to the selected [`BridgeTransport`]:
-    ///   * `Fds`   — OS pipes injected at fds 3 and 4 (`wasi.insert_file`).
-    ///   * `Fifos` — per-launch directory containing two FIFOs is preopened
-    ///               at `/_carrier` in the sandbox (no fd injection).
-    /// `BridgePipes` and (for `Fifos`) the host-side carrier dir path are
-    /// returned for the caller to set up the bridge and to track cleanup.
-    /// stdin/stdout remain inherited for user I/O in both transports.
+    /// When `use_bridge` is true, a per-launch carrier directory containing
+    /// two FIFOs is created on the host filesystem and preopened into the
+    /// WASI sandbox at [`Self::CARRIER_GUEST_DIR`]. The capsule SDK opens
+    /// the FIFOs by path. stdin/stdout remain inherited for user I/O.
     fn build_wasi_context(
         &self,
         manifest: &CapsuleManifest,
@@ -288,71 +278,45 @@ impl WasmProvider {
         args: &[String],
         use_bridge: bool,
     ) -> Result<(
-        WasiCtx,
+        WasiP1Ctx,
         Option<PathBuf>,
         Option<BridgePipes>,
         Option<PathBuf>,
     )> {
         let mut builder = WasiCtxBuilder::new();
-        let transport = self.bridge_transport();
 
         // Always inherit stdio for user I/O and debug output.
         builder.inherit_stdout();
         builder.inherit_stderr();
         builder.inherit_stdin();
 
-        // Pass CLI args to WASM (prepend capsule name as argv[0] per convention)
+        // Pass CLI args to WASM (prepend capsule name as argv[0] per convention).
         if !args.is_empty() {
             let mut wasi_args = vec![manifest.name.clone()];
             wasi_args.extend_from_slice(args);
-            builder
-                .args(&wasi_args)
-                .map_err(|e| ElastosError::Compute(format!("Failed to set args: {}", e)))?;
+            builder.args(&wasi_args);
         }
 
-        // Set environment variables
-        builder
-            .env("ELASTOS_CAPSULE_NAME", &manifest.name)
-            .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
-        builder
-            .env("ELASTOS_CAPSULE_ID", capsule_id)
-            .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
+        // Set environment variables. wasmtime-wasi 24's `env` returns
+        // `&mut Self` (infallible) — no `.map_err` chain needed.
+        builder.env("ELASTOS_CAPSULE_NAME", &manifest.name);
+        builder.env("ELASTOS_CAPSULE_ID", capsule_id);
 
-        // Tell the SDK how to reach the carrier when bridge is active. The
-        // env-var choice mirrors the transport: capsules detect the variable
-        // they recognise and pick the matching CarrierChannel branch.
+        // Tell the SDK where the carrier FIFOs live inside the sandbox.
         if use_bridge {
-            match transport {
-                BridgeTransport::Fds => {
-                    builder
-                        .env(
-                            "ELASTOS_CARRIER_FDS",
-                            &format!(
-                                "{},{}",
-                                Self::CARRIER_READ_FD,
-                                Self::CARRIER_WRITE_FD
-                            ),
-                        )
-                        .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
-                }
-                BridgeTransport::Fifos => {
-                    builder
-                        .env(
-                            "ELASTOS_CARRIER_FIFOS",
-                            &format!(
-                                "{}/{},{}/{}",
-                                Self::CARRIER_GUEST_DIR,
-                                Self::CARRIER_RESPONSE_FILE,
-                                Self::CARRIER_GUEST_DIR,
-                                Self::CARRIER_REQUEST_FILE
-                            ),
-                        )
-                        .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
-                }
-            }
+            builder.env(
+                "ELASTOS_CARRIER_FIFOS",
+                format!(
+                    "{}/{},{}/{}",
+                    Self::CARRIER_GUEST_DIR,
+                    Self::CARRIER_RESPONSE_FILE,
+                    Self::CARRIER_GUEST_DIR,
+                    Self::CARRIER_REQUEST_FILE
+                ),
+            );
         }
 
-        // Forward select host environment variables to the capsule
+        // Forward select host environment variables to the capsule.
         for key in &[
             "ELASTOS_NICK",
             "ELASTOS_CONNECT",
@@ -366,9 +330,7 @@ impl WasmProvider {
             "TERM",
         ] {
             if let Ok(val) = std::env::var(key) {
-                builder
-                    .env(key, &val)
-                    .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
+                builder.env(key, &val);
             }
         }
 
@@ -376,26 +338,21 @@ impl WasmProvider {
         let data_dir = if !manifest.permissions.storage.is_empty() {
             let dir = self.get_capsule_data_dir(&manifest.name);
 
-            // Create the directory if it doesn't exist
             std::fs::create_dir_all(&dir)
                 .map_err(|e| ElastosError::Compute(format!("Failed to create data dir: {}", e)))?;
 
-            // Determine permissions
             let has_read = manifest.permissions.storage.iter().any(|s| s == "read");
             let has_write = manifest.permissions.storage.iter().any(|s| s == "write");
 
             if has_read || has_write {
-                // Open directory with cap-std
-                let cap_dir = wasmtime_wasi::sync::Dir::open_ambient_dir(
-                    &dir,
-                    wasmtime_wasi::sync::ambient_authority(),
-                )
-                .map_err(|e| ElastosError::Compute(format!("Failed to open data dir: {}", e)))?;
-
-                // Pre-open the data directory at /data in the guest
-                builder.preopened_dir(cap_dir, "/data").map_err(|e| {
-                    ElastosError::Compute(format!("Failed to preopen data dir: {}", e))
-                })?;
+                // wasmtime-wasi 24 takes a host path + guest path + perms
+                // directly; the old `Dir::open_ambient_dir` plumbing is gone.
+                let (dir_perms, file_perms) = Self::wasi_perms(has_read, has_write);
+                builder
+                    .preopened_dir(&dir, "/data", dir_perms, file_perms)
+                    .map_err(|e| {
+                        ElastosError::Compute(format!("Failed to preopen data dir: {}", e))
+                    })?;
 
                 tracing::info!(
                     "Capsule '{}' granted storage access: read={}, write={}",
@@ -412,105 +369,70 @@ impl WasmProvider {
             None
         };
 
-        // For the FIFO transport, the carrier dir + FIFOs must exist and be
-        // preopened on the builder BEFORE `build()` so the WasiCtx records the
-        // preopen. Set them up here and stash the host-side ends for the
-        // post-build assembly below.
-        let pending_fifo = if use_bridge && transport == BridgeTransport::Fifos {
+        // Set up the carrier dir + FIFOs and preopen the dir BEFORE
+        // `build_p1()` so the WasiP1Ctx records the preopen. Only the FIFO
+        // transport is available on wasmtime-wasi 24+ (legacy fd-injection
+        // was removed upstream).
+        let bridge_pipes_and_dir = if use_bridge {
             let (carrier_dir, pipes) = Self::setup_carrier_fifos(capsule_id)?;
-            let cap_dir = wasmtime_wasi::sync::Dir::open_ambient_dir(
-                &carrier_dir,
-                wasmtime_wasi::sync::ambient_authority(),
-            )
-            .map_err(|e| {
-                // Cleanup before propagating so we don't leak the dir on the
-                // configuration-error path.
-                Self::cleanup_carrier_dir(&carrier_dir);
-                ElastosError::Compute(format!("Failed to open carrier dir for preopen: {}", e))
-            })?;
+            // The dir itself only needs READ (no file create/delete from
+            // the guest); the FIFOs need READ + WRITE at the file level so
+            // the capsule can both read responses and write requests.
             builder
-                .preopened_dir(cap_dir, Self::CARRIER_GUEST_DIR)
+                .preopened_dir(
+                    &carrier_dir,
+                    Self::CARRIER_GUEST_DIR,
+                    DirPerms::READ,
+                    FilePerms::READ | FilePerms::WRITE,
+                )
                 .map_err(|e| {
+                    // Cleanup before propagating so we don't leak the dir on
+                    // the configuration-error path.
                     Self::cleanup_carrier_dir(&carrier_dir);
                     ElastosError::Compute(format!("Failed to preopen carrier dir: {}", e))
                 })?;
-            Some((carrier_dir, pipes))
+            Some((pipes, carrier_dir))
         } else {
             None
         };
 
-        let wasi = builder.build();
+        let wasi = builder.build_p1();
 
-        // Assemble the bridge pipes per transport:
-        //   * Fds path: create OS pipes here and `insert_file` them at fds 3/4.
-        //     The bridge thread reads from the other end of fd 4's pipe and
-        //     writes responses to the other end of fd 3's pipe.
-        //   * Fifos path: re-use the FIFO ends we opened above.
-        let (bridge_pipes, carrier_dir) = if use_bridge {
-            match transport {
-                BridgeTransport::Fds => {
-                    use wasi_common::file::FileAccessMode;
-
-                    let (bridge_request_read, capsule_request_write) = Self::create_pipe()?;
-                    let (capsule_response_read, bridge_response_write) = Self::create_pipe()?;
-
-                    wasi.insert_file(
-                        Self::CARRIER_READ_FD,
-                        Box::new(ReadPipe::new(capsule_response_read)),
-                        FileAccessMode::READ,
-                    );
-                    wasi.insert_file(
-                        Self::CARRIER_WRITE_FD,
-                        Box::new(WritePipe::new(capsule_request_write)),
-                        FileAccessMode::WRITE,
-                    );
-
-                    (
-                        Some(BridgePipes {
-                            capsule_stdout: bridge_request_read,
-                            capsule_stdin: bridge_response_write,
-                        }),
-                        None,
-                    )
-                }
-                BridgeTransport::Fifos => {
-                    // Unwrap is safe: `pending_fifo` is Some iff
-                    // `use_bridge && transport == Fifos`, which matches the
-                    // outer + inner conditions here.
-                    let (dir, pipes) = pending_fifo
-                        .expect("FIFO transport branch must have pending_fifo set");
-                    (Some(pipes), Some(dir))
-                }
-            }
-        } else {
-            (None, None)
+        let (bridge_pipes, carrier_dir) = match bridge_pipes_and_dir {
+            Some((pipes, dir)) => (Some(pipes), Some(dir)),
+            None => (None, None),
         };
 
         Ok((wasi, data_dir, bridge_pipes, carrier_dir))
     }
 
-    /// Create an OS pipe pair, returning (read_end, write_end) as `std::fs::File`.
-    fn create_pipe() -> Result<(std::fs::File, std::fs::File)> {
-        let mut fds = [0i32; 2];
-        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if ret != 0 {
-            return Err(ElastosError::Compute(format!(
-                "Failed to create pipe: {}",
-                std::io::Error::last_os_error()
-            )));
+    /// Translate manifest `storage: ["read", "write"]` flags into the
+    /// `wasmtime-wasi 24` capability bitsets. Centralised so the data-dir
+    /// and the carrier-dir call sites (and any future preopens) share one
+    /// truth.
+    fn wasi_perms(has_read: bool, has_write: bool) -> (DirPerms, FilePerms) {
+        let mut dir_perms = DirPerms::empty();
+        let mut file_perms = FilePerms::empty();
+        if has_read {
+            dir_perms |= DirPerms::READ;
+            file_perms |= FilePerms::READ;
         }
-        let read_end = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fds[0]) };
-        let write_end = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fds[1]) };
-        Ok((read_end, write_end))
+        if has_write {
+            dir_perms |= DirPerms::MUTATE;
+            file_perms |= FilePerms::WRITE;
+        }
+        (dir_perms, file_perms)
     }
 
-    /// Execute a WASM module with WASI
-    fn execute_wasm(engine: &Engine, module: &Module, wasi: WasiCtx) -> Result<()> {
+    /// Execute a WASM module with WASI preview1.
+    fn execute_wasm(engine: &Engine, module: &Module, wasi: WasiP1Ctx) -> Result<()> {
         let mut store = Store::new(engine, WasiState { wasi });
 
-        // Create linker and add WASI functions
+        // Create linker and bind WASI preview1 host functions. wasmtime-wasi
+        // 24 split `add_to_linker` into preview1/preview2 variants; the
+        // synchronous preview1 binding lives at `preview1::add_to_linker_sync`.
         let mut linker = Linker::new(engine);
-        wasmtime_wasi::add_to_linker(&mut linker, |state: &mut WasiState| &mut state.wasi)
+        preview1::add_to_linker_sync(&mut linker, |state: &mut WasiState| &mut state.wasi)
             .map_err(|e| ElastosError::Compute(format!("Failed to link WASI: {}", e)))?;
 
         // Instantiate the module
@@ -731,20 +653,6 @@ mod tests {
         assert!(!provider.supports(&CapsuleType::Oci));
     }
 
-    #[test]
-    fn test_create_pipe() {
-        use std::io::{Read, Write};
-
-        let (mut read_end, mut write_end) = WasmProvider::create_pipe().unwrap();
-        write_end.write_all(b"hello\n").unwrap();
-        write_end.flush().unwrap();
-        drop(write_end); // Close write end so read gets EOF
-
-        let mut buf = String::new();
-        read_end.read_to_string(&mut buf).unwrap();
-        assert_eq!(buf, "hello\n");
-    }
-
     #[tokio::test]
     async fn test_bridge_spawner_piped_context() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -768,14 +676,19 @@ mod tests {
     }
 
     #[test]
-    fn test_set_bridge_transport_round_trip() {
+    fn test_default_bridge_transport_is_fifos() {
+        // wasmtime-wasi 24+ removed `insert_file`, so the only supported
+        // carrier-bridge transport is `Fifos`. Both `new()` and `Default`
+        // must produce a provider that reports this transport.
         let provider = WasmProvider::new();
-        // Default must be Fds for back-compat with existing runtimes.
-        assert_eq!(provider.bridge_transport(), BridgeTransport::Fds);
+        assert_eq!(provider.bridge_transport(), BridgeTransport::Fifos);
+
+        let provider = WasmProvider::default();
+        assert_eq!(provider.bridge_transport(), BridgeTransport::Fifos);
+
+        // The setter still round-trips (idempotent self-assignment).
         provider.set_bridge_transport(BridgeTransport::Fifos);
         assert_eq!(provider.bridge_transport(), BridgeTransport::Fifos);
-        provider.set_bridge_transport(BridgeTransport::Fds);
-        assert_eq!(provider.bridge_transport(), BridgeTransport::Fds);
     }
 
     #[test]
