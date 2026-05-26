@@ -39,7 +39,7 @@ What exists today:
   - `elastos site promote <channel> <release>`
   - `elastos site bind-domain`
   - `elastos site serve`
-  - CID-backed `publish` / `activate` require the explicit `kubo` + `ipfs-provider` extras
+  - CID-backed `publish` / `activate` use the `elastos://content/*` availability path, backed by the explicit `kubo` + `ipfs-provider` extras for now
 - a first-party site serving component
   - `site-provider` owns the local HTTP edge for `localhost://MyWebSite`
 - direct local opening
@@ -150,7 +150,7 @@ This is the path that can later map cleanly onto:
 3. `MyWebSite` and `Public` are not the same thing.
    `MyWebSite` is the browser-facing site root. `Public` is the shared-files root.
 
-4. `elastos://` remains the stable shared identity.
+4. `elastos://` remains the stable shared content identity.
    Gateway URLs are transport conveniences, not the canonical object. Active site heads now carry immutable site bundle CIDs, and named releases/channels are only human-friendly promotion layers above those immutable bundles.
 
 5. Ordinary internet access remains explicit.

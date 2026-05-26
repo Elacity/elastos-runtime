@@ -1,9 +1,12 @@
-//! Capsule I/O bridge for stdin/stdout communication
+//! Runtime-control I/O bridge for stdin/stdout communication.
 //!
-//! Connects capsule stdio to the request handler:
-//! - Reads JSON requests from capsule stdout
+//! Connects explicitly authorized stdio flows to the request handler:
+//! - Reads JSON requests from process stdout
 //! - Processes them via RequestHandler
-//! - Writes JSON responses to capsule stdin
+//! - Writes JSON responses to process stdin
+//!
+//! This is not the public capsule-kernel ABI. Ordinary app capsules use the
+//! `elastos-guest` Carrier bridge.
 
 // Used by lib crate (tests, API handlers) but not directly by main.rs binary
 
@@ -20,9 +23,9 @@ use super::RequestHandler;
 /// Maximum line length from a capsule (1 MB). Prevents OOM from malicious guests.
 const MAX_LINE_BYTES: usize = 1_048_576;
 
-/// I/O bridge for a single capsule
+/// I/O bridge for a single runtime-controlled process
 ///
-/// Manages bidirectional communication between a capsule and the runtime.
+/// Manages bidirectional communication between a controlled process and the runtime.
 pub struct CapsuleIoBridge {
     /// Capsule ID
     capsule_id: CapsuleId,

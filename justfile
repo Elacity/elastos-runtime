@@ -132,10 +132,6 @@ publish-local version key:
 chat *args:
     ./scripts/chat.sh {{args}}
 
-# Run notepad demo
-notepad *args:
-    ./scripts/notepad.sh {{args}}
-
 # Run GBA emulator demo
 gba *args:
     ./scripts/gba.sh {{args}}

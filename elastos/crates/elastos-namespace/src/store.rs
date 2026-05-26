@@ -199,7 +199,8 @@ impl NamespaceStore {
         // Cache locally
         self.cache_content(&cid, content.to_vec()).await;
 
-        // TODO: In Phase 7, optionally publish to IPFS
+        // Network availability is handled by the content provider plane, not
+        // by the local namespace cache.
 
         Ok(cid)
     }

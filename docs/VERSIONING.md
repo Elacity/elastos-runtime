@@ -51,12 +51,12 @@ Preferred examples:
 - `0.21.0-rc.4`
 - `0.21.0-beta.3`
 
-Legacy compatibility examples still accepted by release validation for now:
+Rejected examples:
 
 - `0.20.0-rc31`
 - `0.20.0-beta3`
 
-New releases should prefer dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
+Use dotted prerelease identifiers such as `-rc.31`, not `-rc31`.
 
 ## Meaning
 

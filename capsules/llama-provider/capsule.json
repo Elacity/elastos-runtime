@@ -12,6 +12,17 @@
     { "name": "model-qwen3.5-0.8b", "kind": "external" }
   ],
   "provides": "elastos://llama/*",
+  "authority": {
+    "reason": "Owns local llama-server model process access so app capsules receive AI results without model process or TCP-port authority.",
+    "capabilities": [
+      {
+        "resource": "elastos://llama/*",
+        "actions": ["execute"],
+        "operations": ["chat_completions", "status", "health", "list_models"]
+      }
+    ],
+    "audit_events": ["llama.request", "llama.status"]
+  },
   "resources": {
     "memory_mb": 4096,
     "gpu": true

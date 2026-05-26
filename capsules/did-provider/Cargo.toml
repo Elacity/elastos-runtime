@@ -10,6 +10,7 @@ name = "did-provider"
 path = "src/main.rs"
 
 [dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 elastos-guest = { path = "../../elastos/crates/elastos-guest" }
 elastos-identity = { path = "../../elastos/crates/elastos-identity" }
 serde = { version = "1.0", features = ["derive"] }

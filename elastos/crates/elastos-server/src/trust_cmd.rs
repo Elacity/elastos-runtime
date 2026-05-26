@@ -101,18 +101,22 @@ pub async fn run_attest(
     key: Option<PathBuf>,
     content_digest: Option<String>,
 ) -> anyhow::Result<()> {
-    let ipfs = crate::get_ipfs_bridge().await?;
-
     if !elastos_server::shares::is_valid_cid(&cid) {
         anyhow::bail!("Invalid CID: {}", cid);
     }
 
+    let content_registry = crate::get_content_registry().await?;
     let signing_key = load_signing_key_or_default(key)?;
     let digest = match content_digest {
         Some(d) => d,
         None => {
             println!("Fetching _share.json from {}...", cid);
-            let share_bytes = ipfs.cat_with_path(&cid, "_share.json").await?;
+            let share_bytes = elastos_server::content::fetch_bytes_via_provider(
+                &content_registry,
+                &cid,
+                Some("_share.json"),
+            )
+            .await?;
             let share_meta: serde_json::Value = serde_json::from_slice(&share_bytes)?;
             share_meta["content_digest"]
                 .as_str()
@@ -122,8 +126,15 @@ pub async fn run_attest(
     };
 
     let prov_bytes = elastos_server::shares::create_provenance(&cid, &digest, &signing_key)?;
-    let prov_cid = ipfs.add_bytes(&prov_bytes, "provenance.json").await?;
     let did = elastos_server::crypto::encode_did_key(&signing_key.verifying_key());
+    let prov_cid = elastos_server::content::publish_bytes_via_provider(
+        &content_registry,
+        "provenance.json",
+        &prov_bytes,
+        None,
+        Some(&did),
+    )
+    .await?;
     println!("Provenance attestation published!");
     println!("  Subject CID:    {}", cid);
     println!("  Provenance CID: {}", prov_cid);
@@ -218,8 +229,10 @@ async fn run_verify_provenance(cid_str: String, provenance: Option<String>) -> a
     };
 
     println!("Fetching provenance {}...", prov_cid);
-    let ipfs = crate::get_ipfs_bridge().await?;
-    let prov_bytes = ipfs.cat(&prov_cid).await?;
+    let content_registry = crate::get_content_registry().await?;
+    let prov_bytes =
+        elastos_server::content::fetch_bytes_via_provider(&content_registry, &prov_cid, None)
+            .await?;
     match elastos_server::shares::verify_provenance(&prov_bytes, &cid_str) {
         Ok(prov) => {
             println!("Provenance VALID");

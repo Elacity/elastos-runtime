@@ -16,7 +16,6 @@ File-backed localhost roots currently exposed by the runtime:
 - `localhost://UsersAI/...`
 - `localhost://AppCapsules/...`
 - `localhost://ElastOS/...`
-- `localhost://PC2Host/...`
 
 Dynamic special root:
 
@@ -29,35 +28,37 @@ Dynamic special root:
 Current namespace contract:
 
 - `localhost://ElastOS/...` = runtime-owned local system state and services
+- `localhost://Users/<principal-root>/...` = passkey-principal-owned local user area; the first passkey is admin and later passkeys are guests. When a root has verified `elastos.principal.root-protection/v1` state, runtime/provider writers must store protected object envelopes rather than plaintext bytes.
 - `elastos://...` = decentralized identities and provider-routed resources between nodes
 - `localhost://WebSpaces/<moniker>/...` = local mounted resolver view of a broader dynamic named space
+- `localhost://Users/<principal-root>/.AppData/ElastOS/Home/browser-state.json` = Home layout, window-session, and recent-target state for the active runtime principal
 
 For documents, the intended identity split is:
 
 - `localhost://ElastOS/Documents/<doc-did>` = canonical mutable document object
-- `localhost://Users/self/Documents/<file>.md` = local working-copy storage for markdown bytes
-- `elastos://<cid>` = immutable published/shared revision pinned through the IPFS provider
+- `localhost://Users/<principal-root>/Documents/<file>.md` = passkey-principal-owned working-copy storage for markdown bytes
+- `elastos://<cid>` = immutable published/shared revision; current implementation opens and publishes through the higher-level content availability plane described in [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md), backed locally by `ipfs-provider`
 
 For Home appearance, the current identity split is:
 
 - `capsules/home/browser/wallpaper.webp` = signed capsule-bundled default wallpaper
-- `localhost://ElastOS/System/Appearance/background-image.{png,jpg,webp,gif}` = local user override for this runtime
-- `localhost://ElastOS/System/Appearance/background-overlay.json` = local overlay enabled/opacity preference for this runtime; overlay is off by default
+- `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/background-image.{png,jpg,webp,gif}` = passkey-principal-owned wallpaper override
+- `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/background-overlay.json` = passkey-principal-owned overlay enabled/opacity preference; overlay is off by default
 
-This is intentionally local system state today. The DID-aligned next step is a signed profile/settings object anchored to the user's DID that can sync through Carrier/provider policy and then materialize into this local `localhost://ElastOS/System/Appearance/...` projection on each trusted device.
+Appearance is not shared runtime state. System may edit it, but the runtime stores it under the active principal root and uses the protected principal-root object envelope when that root has verified protection. The DID-aligned next step is a signed profile/settings object anchored to the user's DID that can sync through Carrier/provider policy and then materialize into this principal-owned local projection on each trusted device.
 
 Useful current examples:
 
 - `localhost://ElastOS/Documents/<doc-did>`
-- `localhost://ElastOS/System/Appearance/background-overlay.json`
-- `localhost://Users/self/Documents/report.md`
+- `localhost://Users/<principal-root>/.AppData/ElastOS/Home/Appearance/background-overlay.json`
+- `localhost://Users/<principal-root>/Documents/report.md`
 - `localhost://Public/manual.pdf`
 - `localhost://MyWebSite`
 - `localhost://WebSpaces/Elastos`
 - `localhost://WebSpaces/Elastos/content/<cid>`
 - `localhost://WebSpaces/Elastos/peer/<peer-id>`
 - `localhost://ElastOS/SystemServices/Edge/SiteHeads/...`
-- `elastos://<cid>` as the canonical identity returned by `elastos share`
+- `elastos://<cid>` as the canonical content identity returned by `elastos share`
 - `elastos://peer/...` and `elastos://ai/...` as provider-routed surfaces
 
 Useful current WebSpace commands:
@@ -67,7 +68,7 @@ Useful current WebSpace commands:
 - `elastos webspace list Elastos`
 - `elastos webspace resolve Elastos/content/<cid>`
 
-`elastos open elastos://<cid>` opens a share through the local bridge. `elastos share --public` holds an immediate public edge open while the command is running. Plain gateway URLs are convenience transport and may take time to propagate; the CID is the stable shared identity.
+`elastos open elastos://<cid>` opens a share through the local bridge. `elastos share --public` holds an immediate public edge open while the command is running. Plain gateway URLs are convenience transport and may take time to propagate; the CID is the stable shared content identity.
 
 ## Elastos Sites
 

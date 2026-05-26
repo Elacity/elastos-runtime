@@ -8,6 +8,17 @@
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "provides": "elastos://did/*",
+  "authority": {
+    "reason": "Mediates device-backed DID identity and local persona metadata from runtime-managed identity storage.",
+    "capabilities": [
+      {
+        "resource": "elastos://did/*",
+        "actions": ["execute"],
+        "operations": ["get_did", "resolve", "sign_chat_message", "verify", "verify_did_recovery", "get_nickname", "set_nickname", "get_persona_did"]
+      }
+    ],
+    "audit_events": ["did.resolve", "did.sign", "did.profile_update"]
+  },
   "capabilities": ["localhost://ElastOS/SystemServices/Identity/*"],
   "resources": {
     "memory_mb": 64,

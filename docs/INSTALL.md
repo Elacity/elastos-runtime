@@ -35,7 +35,7 @@ Source checkout note:
 Useful extras:
 
 ```bash
-# direct share/open
+# content-backed share/open with the local Kubo backend
 elastos setup --with kubo --with ipfs-provider --with documents
 
 # local site serving / browser preview helper

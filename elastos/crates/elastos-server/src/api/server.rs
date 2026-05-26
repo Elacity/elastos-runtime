@@ -319,7 +319,10 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
 
     // Supervisor routes (shell-only — capsule lifecycle for VM-based supervisor path)
     let supervisor_routes = if let Some(sup) = supervisor {
-        let sup_state = handlers::supervisor_api::SupervisorState { supervisor: sup };
+        let sup_state = handlers::supervisor_api::SupervisorState {
+            supervisor: sup,
+            data_dir: data_dir.clone(),
+        };
         Router::new()
             .route(
                 "/api/supervisor/ensure-external",

@@ -23,7 +23,7 @@ pub struct ComponentsManifest {
     /// External tools (kubo, cloudflared, llama-server, models).
     pub external: HashMap<String, Component>,
 
-    /// Capsule registry (CID-based entries). Empty in legacy format.
+    /// Capsule registry (CID-based entries). Defaults empty when a manifest has no capsules.
     /// Consumed by supervisor in M2+ (ensure_capsule, launch_capsule).
     #[serde(default)]
     pub capsules: HashMap<String, CapsuleEntry>,
@@ -125,6 +125,7 @@ pub async fn run(
         );
         println!("Use `--profile demo` for site/share/browser demo surfaces.");
         println!("Use `--profile chat` for the packaged microVM chat path.");
+        println!("Use `--profile blockchain` for typed chain/wallet/DRM provider development.");
         println!("Use `--profile operator` for explicit serve/node/run/agent flows.");
         println!();
     } else if let Some(selected_profile) = selected_profile {
@@ -139,6 +140,12 @@ pub async fn run(
             }
             "chat" => {
                 println!("Selected profile: chat (packaged microVM chat on a KVM-capable host)");
+                println!();
+            }
+            "blockchain" => {
+                println!(
+                    "Selected profile: blockchain (typed chain/wallet/DRM provider development)"
+                );
                 println!();
             }
             "operator" => {
@@ -320,18 +327,19 @@ pub async fn run(
 
 fn load_manifest() -> anyhow::Result<ComponentsManifest> {
     let exe_path = std::env::current_exe().ok();
-    let installed_paths = [
-        // Installed layout
-        dirs::data_dir().map(|d| d.join("elastos/components.json")),
+    let manifest_paths = [
+        // Source checkout layout: <repo>/elastos/target/{debug,release}/elastos.
+        // Source-run commands should test the checkout, not a stale installed manifest.
+        exe_path.as_deref().and_then(source_checkout_manifest_path),
         // Exe-relative (release tarball)
         exe_path
             .as_deref()
             .and_then(|p| p.parent().map(|d| d.join("components.json"))),
-        // Source checkout layout: <repo>/elastos/target/{debug,release}/elastos
-        exe_path.as_deref().and_then(source_checkout_manifest_path),
+        // Installed layout
+        dirs::data_dir().map(|d| d.join("elastos/components.json")),
     ];
 
-    for path in installed_paths.iter().flatten() {
+    for path in manifest_paths.iter().flatten() {
         if let Ok(content) = fs::read_to_string(path) {
             let manifest: ComponentsManifest = serde_json::from_str(&content).map_err(|e| {
                 anyhow::anyhow!("Invalid components.json at {}: {}", path.display(), e)
@@ -995,12 +1003,13 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     println!("  elastos setup                # default home profile");
     println!("  elastos setup --profile demo # Home + site/share/browser demo surfaces");
     println!("  elastos setup --profile chat # packaged full-screen chat");
+    println!("  elastos setup --profile blockchain # typed chain/wallet/DRM provider development");
     println!("  elastos setup --profile operator # explicit serve/node/run/agent runtime");
     println!();
     print_profile_section(
         "Recommended profiles:",
         manifest,
-        &["home", "demo", "chat", "operator"],
+        &["home", "demo", "chat", "blockchain", "operator"],
     );
     print_profile_section(
         "Advanced profiles:",
@@ -1012,6 +1021,7 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
         "home",
         "demo",
         "chat",
+        "blockchain",
         "operator",
         "minimal",
         "public-gateway",
@@ -1744,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_manifest_from_installed_data_dir() {
+    fn test_load_manifest_finds_current_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let xdg_data_home = temp.path().join("xdg-data");
         let data_dir = xdg_data_home.join("elastos");
@@ -1762,6 +1772,7 @@ mod tests {
         assert!(manifest.external.contains_key("kubo"));
         assert!(manifest.profiles.contains_key("home"));
         assert!(manifest.profiles.contains_key("chat"));
+        assert!(manifest.profiles.contains_key("blockchain"));
         assert!(manifest.profiles.contains_key("operator"));
         assert!(manifest.profiles.contains_key("full"));
     }

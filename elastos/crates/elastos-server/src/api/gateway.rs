@@ -29,6 +29,7 @@ use elastos_common::localhost::{
 };
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
 use elastos_runtime::provider::ProviderRegistry;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use url::form_urlencoded;
@@ -691,7 +692,14 @@ struct HomeLaunchResponse {
 struct HomeLaunchTokenPayload {
     schema: String,
     app: String,
+    iat: u64,
     exp: u64,
+    principal_id: String,
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proof_binding_id: Option<String>,
+    grant_id: String,
+    non_delegatable: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -699,6 +707,19 @@ struct HomeLaunchTokenEnvelope {
     payload: HomeLaunchTokenPayload,
     signature: String,
     signer_did: String,
+}
+
+#[derive(Clone)]
+pub(super) struct HomeLaunchTokenContext {
+    pub principal_id: String,
+    pub session_id: String,
+    pub proof_binding_id: Option<String>,
+    pub grant_id: String,
+}
+
+struct RequiredHomeLaunchToken {
+    app: String,
+    context: HomeLaunchTokenContext,
 }
 
 #[derive(Debug, Serialize)]
@@ -838,13 +859,18 @@ async fn home_runtime_ensure(State(state): State<GatewayState>, headers: HeaderM
 }
 
 async fn system_summary(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    if let Err(err) = require_home_launch_token(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-        return system_error_response(err);
-    }
+    let context =
+        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
+            Ok(context) => context,
+            Err(err) => return system_error_response(err),
+        };
 
     let (runtime, storage, runtime_log) = tokio::join!(
         home_runtime_summary(&state.data_dir),
-        system_storage_summary(state.provider_registry.as_ref().cloned()),
+        system_storage_summary(
+            state.provider_registry.as_ref().cloned(),
+            &context.principal_id
+        ),
         system_runtime_log(&state.data_dir)
     );
     Json(SystemSummaryResponse {
@@ -867,6 +893,7 @@ async fn system_summary(State(state): State<GatewayState>, headers: HeaderMap) -
 
 async fn system_storage_summary(
     provider_registry: Option<Arc<ProviderRegistry>>,
+    principal_id: &str,
 ) -> SystemStorageSummary {
     let Some(registry) = provider_registry else {
         return SystemStorageSummary {
@@ -875,7 +902,10 @@ async fn system_storage_summary(
             ..SystemStorageSummary::default()
         };
     };
-    match DocumentsClient::new(registry).summary().await {
+    match DocumentsClient::for_principal(registry, principal_id)
+        .summary()
+        .await
+    {
         Ok(documents) => {
             let published_count = documents
                 .iter()
@@ -1166,9 +1196,11 @@ async fn gateway_provider_proxy(
         "summary" | "get" => &[DOCUMENTS_CAPSULE_ID, LIBRARY_CAPSULE_ID],
         _ => &[DOCUMENTS_CAPSULE_ID],
     };
-    if let Err(err) = require_home_launch_token_for_any(&state.data_dir, &headers, allowed_apps) {
-        return documents_error_response(err);
-    }
+    let context =
+        match require_home_launch_token_for_any_context(&state.data_dir, &headers, allowed_apps) {
+            Ok(context) => context,
+            Err(err) => return documents_error_response(err),
+        };
     let registry = match state.provider_registry.as_ref().cloned() {
         Some(registry) => registry,
         None => return documents_error_response(anyhow::anyhow!("documents provider unavailable")),
@@ -1189,6 +1221,7 @@ async fn gateway_provider_proxy(
         }
     };
     request["op"] = serde_json::Value::String(op.clone());
+    request["principal_id"] = serde_json::Value::String(context.principal_id);
 
     let response = match registry.send_raw("documents", &request).await {
         Ok(value) => value,
@@ -2624,12 +2657,48 @@ fn home_launch_cookie_header(
 }
 
 fn issue_home_launch_token(data_dir: &std::path::Path, app: &str) -> anyhow::Result<String> {
+    let context = local_home_launch_token_context(data_dir)?;
+    issue_home_launch_token_with_context(data_dir, app, &context)
+}
+
+fn local_home_launch_token_context(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let (_signing_key, did) = elastos_identity::load_or_create_did(data_dir)?;
+    Ok(HomeLaunchTokenContext {
+        principal_id: elastos_runtime::auth::PrincipalId::device_did(&did)
+            .as_str()
+            .to_string(),
+        session_id: format!("local:{}", uuid_like_token()),
+        proof_binding_id: None,
+        grant_id: format!("grant:local:{}", uuid_like_token()),
+    })
+}
+
+fn uuid_like_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+pub(super) fn issue_home_launch_token_with_context(
+    data_dir: &std::path::Path,
+    app: &str,
+    context: &HomeLaunchTokenContext,
+) -> anyhow::Result<String> {
     let (signing_key, _did) = elastos_identity::load_or_create_did(data_dir)?;
+    let now = now_ts();
     let envelope = HomeLaunchTokenEnvelope {
         payload: HomeLaunchTokenPayload {
-            schema: "elastos.home.launch-token/v1".to_string(),
+            schema: "elastos.home.launch-token/v2".to_string(),
             app: app.to_string(),
-            exp: now_ts() + HOME_LAUNCH_TOKEN_TTL_SECS,
+            iat: now,
+            exp: now + HOME_LAUNCH_TOKEN_TTL_SECS,
+            principal_id: context.principal_id.clone(),
+            session_id: context.session_id.clone(),
+            proof_binding_id: context.proof_binding_id.clone(),
+            grant_id: context.grant_id.clone(),
+            non_delegatable: true,
         },
         signature: String::new(),
         signer_did: String::new(),
@@ -2656,12 +2725,39 @@ pub(super) fn require_home_launch_token(
     require_home_launch_token_for_any(data_dir, headers, &[expected_app]).map(|_| ())
 }
 
+pub(super) fn require_home_launch_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    expected_app: &str,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_launch_token_for_any_context(data_dir, headers, &[expected_app])
+}
+
 pub(super) fn require_home_launch_token_for_any(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
     allowed_apps: &[&str],
 ) -> anyhow::Result<String> {
     require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)
+        .map(|required| required.app)
+}
+
+pub(super) fn require_home_launch_token_for_any_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)
+        .map(|required| required.context)
+}
+
+pub(super) fn require_home_launch_token_for_any_app_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<(String, HomeLaunchTokenContext)> {
+    require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)
+        .map(|required| (required.app, required.context))
 }
 
 fn require_home_token(data_dir: &std::path::Path, headers: &HeaderMap) -> anyhow::Result<()> {
@@ -2679,7 +2775,7 @@ fn require_home_launch_token_for_any_from(
     headers: &HeaderMap,
     allowed_apps: &[&str],
     cookie_name: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<RequiredHomeLaunchToken> {
     let token = headers
         .get("x-elastos-home-token")
         .and_then(|value| value.to_str().ok())
@@ -2693,7 +2789,7 @@ fn require_home_launch_token_for_any_from(
         .map_err(|_| anyhow::anyhow!("invalid home launch token encoding"))?;
     let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("invalid home launch token payload"))?;
-    if envelope.payload.schema != "elastos.home.launch-token/v1" {
+    if envelope.payload.schema != "elastos.home.launch-token/v2" {
         anyhow::bail!("unsupported home launch token schema");
     }
     let local_did = load_existing_gateway_runtime_did(data_dir)
@@ -2711,7 +2807,29 @@ fn require_home_launch_token_for_any_from(
     if envelope.payload.exp <= now_ts() {
         anyhow::bail!("home launch token expired");
     }
-    Ok(envelope.payload.app)
+    if !envelope.payload.non_delegatable {
+        anyhow::bail!("home launch token must be non-delegatable");
+    }
+    if envelope.payload.session_id.trim().is_empty()
+        || envelope.payload.principal_id.trim().is_empty()
+        || envelope.payload.grant_id.trim().is_empty()
+    {
+        anyhow::bail!("home launch token is missing authority context");
+    }
+    if envelope.payload.proof_binding_id.is_some()
+        && !crate::auth::is_auth_session_active(data_dir, &envelope.payload.session_id, now_ts())?
+    {
+        anyhow::bail!("home launch token auth session is not active");
+    }
+    Ok(RequiredHomeLaunchToken {
+        app: envelope.payload.app,
+        context: HomeLaunchTokenContext {
+            principal_id: envelope.payload.principal_id,
+            session_id: envelope.payload.session_id,
+            proof_binding_id: envelope.payload.proof_binding_id,
+            grant_id: envelope.payload.grant_id,
+        },
+    })
 }
 
 struct ChatRoomSessionGrant {

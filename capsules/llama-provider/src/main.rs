@@ -24,7 +24,7 @@ const MAX_RESTARTS: u32 = 3;
 // ── Protocol types ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Init {
         #[serde(default)]

@@ -7,6 +7,18 @@
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
+  "provides": "localhost://WebSpaces/*",
+  "authority": {
+    "reason": "Resolves mounted WebSpace objects without exposing provider implementation or transport topology to app capsules.",
+    "capabilities": [
+      {
+        "resource": "localhost://WebSpaces/*",
+        "actions": ["read"],
+        "operations": ["resolve", "read", "list", "stat", "exists", "ping"]
+      }
+    ],
+    "audit_events": ["webspace.resolve", "webspace.read"]
+  },
   "capabilities": ["localhost://WebSpaces/*"],
   "resources": {
     "memory_mb": 64,

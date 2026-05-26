@@ -37,15 +37,6 @@
       ],
       "note": "WASM capsule (wasm32-wasip1) \u2014 platform-independent, runs via runtime bridge"
     },
-    "notepad": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "did-provider": {
       "cid": "",
       "sha256": "",

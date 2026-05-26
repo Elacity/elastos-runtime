@@ -43,6 +43,7 @@ Rules:
 | RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | CLI update status is truthful; compare any surfaced Home/System update action only if visible | same as installed x86_64 |
 | RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
 | RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
+| RS-13 | Protected-content provider boundary is testable | `scripts/protected-content-provider-contract-smoke.sh` | verify DRM/rights/key/decrypt providers expose blocked authority, reject invalid requests, and fail closed until backends exist | n/a until protected-content UI is shipped | n/a until protected-content UI is shipped |
 
 ## Story Details
 
@@ -338,6 +339,26 @@ Pass when:
 - `node room show` returns the remote room summary coherently
 - `node update --check` reports the trusted source coherently
 
+### RS-13 Protected-content provider boundary is testable
+
+Automatic:
+```bash
+cd <repo-root>
+bash scripts/protected-content-provider-contract-smoke.sh
+```
+
+Manual on seed node:
+1. Inspect the smoke output
+2. Confirm the four provider capsules run through their JSON line protocol
+3. Confirm valid requests fail closed until backends are configured
+4. Confirm invalid raw-authority requests are rejected
+5. Confirm `drm-provider.open` reports the provider/runtime sequence
+
+Pass when:
+- DRM, rights, key, and decrypt provider contract checks pass
+- raw authority remains blocked from normal capsules
+- no protected-content UI is shipped ahead of provider/capability proof
+
 ## Minimum Publish Bar
 
 For the new runtime repo, the minimum honest publish set is:
@@ -365,6 +386,7 @@ bash scripts/shared-runtime-gossip-proof.sh
 bash scripts/chat-wasm-local-smoke.sh
 bash scripts/chat-wasm-native-interop-smoke.sh
 bash scripts/gba-demo-smoke.sh
+bash scripts/protected-content-provider-contract-smoke.sh
 
 # Release-context only: canonical publisher signer required
 just verify-release

@@ -431,6 +431,7 @@ mod tests {
                 persistent_storage_mb: None,
             }),
             providers: None,
+            authority: None,
             viewer: None,
             signature: None,
         };
@@ -485,6 +486,7 @@ mod tests {
                 persistent_storage_mb: None,
             }),
             providers: None,
+            authority: None,
             viewer: None,
             signature: None,
         };

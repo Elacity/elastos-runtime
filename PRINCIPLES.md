@@ -22,6 +22,7 @@ That means:
 - `localhost://...` and `elastos://...` are the real nouns
 - HTTP URLs are delivery adapters, not canonical identity
 - mutable heads must point to immutable objects
+- a CID identifies content, not availability; replication and pinning promises must be explicit signed receipts
 
 ## 3. No Ambient Authority
 
@@ -32,13 +33,18 @@ That means:
 - authority must be narrow, auditable, and revocable
 - missing authority should fail closed
 
-## 4. Carrier First Off-Box
+## 4. Carrier Plane For Local And Off-Box
 
-Off-box Elastos communication should default to Carrier and trusted-source paths, not public-web convenience.
+Capsule communication should default to the Carrier capability plane whether the
+target is local or remote.
 
 That means:
-- ordinary public-web substitutes are a bug unless explicitly approved
-- bootstrap exceptions must stay narrow and visible
+- capsules should know Carrier-style capability calls, not host routes, raw sockets, browser endpoints, or provider internals
+- moving a target between same-runtime, same-device, LAN, or remote peer must not require capsule code changes
+- local loopback, HTTP, WebSocket, `postMessage`, stdio, or in-process calls are host adapters below the capsule contract
+- content publication should go through a content/availability provider contract, not raw IPFS/Kubo/gateway calls from app capsules
+- ordinary public-web substitutes are a bug unless explicitly approved as edge adapters
+- bootstrap exceptions must stay narrow, visible, and fail-closed
 - trusted-source, signature, and content identity matter more than web location
 
 ## 5. Small Trusted Core
@@ -144,6 +150,7 @@ Installable capsules and published objects should prove what they are and who ma
 
 That means:
 - trust should anchor in DID, CID, hash, and signature, not gateway location or host path
+- IPLD-compatible object manifests should be preferred for published objects, signed heads, provenance, and availability receipts when content graphs need to be traversed or synchronized
 - encrypted content should be normal, not a special exception
 - decryption and license policy should be mediated by an explicit provider, not reimplemented inside every app
 - the right abstraction is a capability-checked access/decryption plane that can use local storage, Carrier, or other substrates underneath without changing the capsule contract

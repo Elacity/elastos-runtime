@@ -2,7 +2,8 @@
 //!
 //! Manages the device-backed Ed25519 identity as a did:key.
 //! The main DID is derived from the shared device key so every runtime surface
-//! sees the same stable identity.
+//! sees the same stable node/device identity. Human accounts link to it through
+//! runtime principals and proof bindings; they do not inherit this key.
 //! Wire protocol: line-delimited JSON over stdin/stdout.
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -13,11 +14,14 @@ use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as Sha2Digest, Sha256};
 use std::io::{self, BufRead, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 const NONCE_LEN: usize = 12;
+const DID_RECOVERY_PROOF_SCHEMA: &str = "elastos.did.recovery-proof/v1";
+const DID_RECOVERY_MAX_TTL_SECS: u64 = 15 * 60;
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -29,7 +33,7 @@ const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
 // === Wire protocol types ===
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Init {
         #[serde(default)]
@@ -39,12 +43,25 @@ enum Request {
     Resolve {
         did: String,
     },
-    Sign {
-        data: String,
+    SignChatMessage {
+        sender_id: String,
+        ts: u64,
+        content: String,
     },
     Verify {
         did: String,
         data: String,
+        signature: String,
+    },
+    VerifyDidRecovery {
+        did: String,
+        principal_id: String,
+        localhost_root: String,
+        protector_id: String,
+        data_key_id: String,
+        nonce: String,
+        issued_at: u64,
+        expires_at: u64,
         signature: String,
     },
     GetNickname,
@@ -162,12 +179,37 @@ impl DidProvider {
             Request::Init { config } => self.init(config),
             Request::GetDid => self.get_did(),
             Request::Resolve { did } => self.resolve(&did),
-            Request::Sign { data } => self.sign(&data),
+            Request::SignChatMessage {
+                sender_id,
+                ts,
+                content,
+            } => self.sign_chat_message(&sender_id, ts, &content),
             Request::Verify {
                 did,
                 data,
                 signature,
             } => self.verify(&did, &data, &signature),
+            Request::VerifyDidRecovery {
+                did,
+                principal_id,
+                localhost_root,
+                protector_id,
+                data_key_id,
+                nonce,
+                issued_at,
+                expires_at,
+                signature,
+            } => self.verify_did_recovery(
+                &did,
+                &principal_id,
+                &localhost_root,
+                &protector_id,
+                &data_key_id,
+                &nonce,
+                issued_at,
+                expires_at,
+                &signature,
+            ),
             Request::GetNickname => self.get_nickname(),
             Request::SetNickname { nickname } => self.set_nickname(&nickname),
             Request::GetPersonaDid { name } => self.get_persona_did(&name),
@@ -236,21 +278,34 @@ impl DidProvider {
         }
     }
 
-    fn sign(&self, data_hex: &str) -> Response {
+    fn sign_bytes(&self, data: &[u8]) -> Response {
         let signing_key = match &self.signing_key {
             Some(k) => k,
             None => return Response::error("not_init", "DID key not available"),
         };
 
-        let data = match hex::decode(data_hex) {
-            Ok(d) => d,
-            Err(e) => return Response::error("invalid_data", &format!("Invalid hex: {}", e)),
-        };
-
-        let signature = signing_key.sign(&data);
+        let signature = signing_key.sign(data);
         Response::ok(serde_json::json!({
             "signature": hex::encode(signature.to_bytes()),
         }))
+    }
+
+    fn sign_chat_message(&self, sender_id: &str, ts: u64, content: &str) -> Response {
+        if sender_id.trim().is_empty() || ts == 0 {
+            return Response::error(
+                "invalid_intent",
+                "chat message signing requires sender_id and timestamp",
+            );
+        }
+        let payload_hex =
+            elastos_common::chat_protocol::signing_payload_hex(sender_id, ts, content);
+        let payload = match hex::decode(payload_hex) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return Response::error("invalid_intent", &format!("Invalid chat payload: {}", e))
+            }
+        };
+        self.sign_bytes(&payload)
     }
 
     fn verify(&self, did: &str, data_hex: &str, sig_hex: &str) -> Response {
@@ -280,6 +335,66 @@ impl DidProvider {
 
         let valid = vk.verify(&data, &signature).is_ok();
         Response::ok(serde_json::json!({ "valid": valid }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_did_recovery(
+        &self,
+        did: &str,
+        principal_id: &str,
+        localhost_root: &str,
+        protector_id: &str,
+        data_key_id: &str,
+        nonce: &str,
+        issued_at: u64,
+        expires_at: u64,
+        sig_hex: &str,
+    ) -> Response {
+        let recovery = DidRecoveryPayload {
+            did,
+            principal_id,
+            localhost_root,
+            protector_id,
+            data_key_id,
+            nonce,
+            issued_at,
+            expires_at,
+        };
+        let now = now_ts();
+        if let Err(err) = validate_did_recovery_request(&recovery, now) {
+            return Response::error("invalid_recovery_proof", &err);
+        }
+
+        let vk = match decode_did_key(did) {
+            Ok(vk) => vk,
+            Err(e) => return Response::error("invalid_did", &e),
+        };
+        let sig_bytes = match hex::decode(sig_hex) {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::error("invalid_signature", &format!("Invalid hex sig: {}", e))
+            }
+        };
+        let signature = match Signature::from_slice(&sig_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::error("invalid_signature", &format!("Invalid signature: {}", e))
+            }
+        };
+        let payload = recovery.to_payload();
+        let valid = vk.verify(payload.as_bytes(), &signature).is_ok();
+        let payload_sha256 = hex::encode(Sha256::digest(payload.as_bytes()));
+        Response::ok(serde_json::json!({
+            "schema": DID_RECOVERY_PROOF_SCHEMA,
+            "valid": valid,
+            "did": did,
+            "principal_id": principal_id,
+            "localhost_root": localhost_root,
+            "protector_id": protector_id,
+            "data_key_id": data_key_id,
+            "payload_sha256": payload_sha256,
+            "verified_at": now,
+        }))
     }
 
     fn get_nickname(&self) -> Response {
@@ -453,6 +568,118 @@ fn decrypt_data(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Decryption failed: {}", e))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DidRecoveryPayload<'a> {
+    did: &'a str,
+    principal_id: &'a str,
+    localhost_root: &'a str,
+    protector_id: &'a str,
+    data_key_id: &'a str,
+    nonce: &'a str,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+impl DidRecoveryPayload<'_> {
+    fn to_payload(self) -> String {
+        format!(
+            "ElastOS DID recovery request\n\
+             schema: {DID_RECOVERY_PROOF_SCHEMA}\n\
+             did: {did}\n\
+             principal_id: {principal_id}\n\
+             localhost_root: {localhost_root}\n\
+             protector_id: {protector_id}\n\
+             data_key_id: {data_key_id}\n\
+             nonce: {nonce}\n\
+             issued_at: {issued_at}\n\
+             expires_at: {expires_at}\n",
+            did = self.did,
+            principal_id = self.principal_id,
+            localhost_root = self.localhost_root,
+            protector_id = self.protector_id,
+            data_key_id = self.data_key_id,
+            nonce = self.nonce,
+            issued_at = self.issued_at,
+            expires_at = self.expires_at,
+        )
+    }
+}
+
+fn validate_did_recovery_request(
+    recovery: &DidRecoveryPayload<'_>,
+    now: u64,
+) -> Result<(), String> {
+    if !recovery.did.starts_with("did:key:z") {
+        return Err("DID recovery currently supports did:key subjects only".to_string());
+    }
+    validate_token_like_id(recovery.principal_id, "principal_id")?;
+    validate_principal_localhost_root(recovery.principal_id, recovery.localhost_root)?;
+    validate_token_like_id(recovery.protector_id, "protector_id")?;
+    validate_token_like_id(recovery.data_key_id, "data_key_id")?;
+    if !recovery.data_key_id.starts_with("pdek:") {
+        return Err("data_key_id must start with pdek:".to_string());
+    }
+    validate_token_like_id(recovery.nonce, "nonce")?;
+    if recovery.issued_at > now.saturating_add(300) {
+        return Err("DID recovery proof issued_at is in the future".to_string());
+    }
+    if recovery.expires_at <= now {
+        return Err("DID recovery proof expired".to_string());
+    }
+    if recovery.expires_at <= recovery.issued_at
+        || recovery.expires_at.saturating_sub(recovery.issued_at) > DID_RECOVERY_MAX_TTL_SECS
+    {
+        return Err("DID recovery proof expiry is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_principal_localhost_root(
+    principal_id: &str,
+    localhost_root: &str,
+) -> Result<(), String> {
+    let Some(root_segment) = localhost_root.strip_prefix("localhost://Users/") else {
+        return Err("localhost_root must be a principal-owned localhost user root".to_string());
+    };
+    if root_segment.is_empty()
+        || root_segment == "self"
+        || root_segment == "."
+        || root_segment == ".."
+        || root_segment.len() > 256
+        || root_segment
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        return Err("localhost_root must be a principal-owned localhost user root".to_string());
+    }
+    if root_segment != principal_id {
+        return Err("localhost_root must match the DID recovery principal".to_string());
+    }
+    Ok(())
+}
+
+fn validate_token_like_id(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty()
+        || value.len() > 512
+        || value == "."
+        || value == ".."
+        || value
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        Err(format!("{field} is invalid"))
+    } else {
+        Ok(())
+    }
+}
+
+fn now_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
 fn main() {
     eprintln!("did-provider: starting v{} (did:key)", PROVIDER_VERSION);
 
@@ -613,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_and_verify_roundtrip() {
+    fn test_sign_chat_message_and_verify_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let provider = init_provider(Some(dir.path().to_str().unwrap()));
 
@@ -622,8 +849,10 @@ mod tests {
             _ => panic!("Expected DID"),
         };
 
-        let data_hex = hex::encode(b"hello world");
-        let sig_hex = match provider.sign(&data_hex) {
+        let ts = 1_714_000_000;
+        let content = "hello world";
+        let data_hex = elastos_common::chat_protocol::signing_payload_hex(&did, ts, content);
+        let sig_hex = match provider.sign_chat_message(&did, ts, content) {
             Response::Ok { data: Some(d) } => d["signature"].as_str().unwrap().to_string(),
             _ => panic!("Expected signature"),
         };
@@ -644,15 +873,243 @@ mod tests {
             _ => panic!("Expected DID"),
         };
 
-        let sig_hex = match provider.sign(&hex::encode(b"hello")) {
+        let sig_hex = match provider.sign_chat_message(&did, 1_714_000_000, "hello") {
             Response::Ok { data: Some(d) } => d["signature"].as_str().unwrap().to_string(),
             _ => panic!("Expected signature"),
         };
 
         // Verify with different data
-        match provider.verify(&did, &hex::encode(b"tampered"), &sig_hex) {
+        let tampered =
+            elastos_common::chat_protocol::signing_payload_hex(&did, 1_714_000_000, "tampered");
+        match provider.verify(&did, &tampered, &sig_hex) {
             Response::Ok { data: Some(d) } => assert_eq!(d["valid"], false),
             other => panic!("Expected valid=false, got {:?}", other),
+        }
+    }
+
+    fn did_recovery_test_signature(
+        signing_key: &SigningKey,
+        recovery: DidRecoveryPayload<'_>,
+    ) -> String {
+        hex::encode(
+            signing_key
+                .sign(recovery.to_payload().as_bytes())
+                .to_bytes(),
+        )
+    }
+
+    #[test]
+    fn test_did_provider_rejects_hidden_recovery_request_fields() {
+        let request = serde_json::json!({
+            "op": "verify_did_recovery",
+            "did": "did:key:z6Mkh11111111111111111111111111111111111111111",
+            "principal_id": "person:local:abc123",
+            "localhost_root": "localhost://Users/person:local:abc123",
+            "protector_id": "protector:did:abc123",
+            "data_key_id": "pdek:abc123",
+            "nonce": "nonce:abc123",
+            "issued_at": now_ts(),
+            "expires_at": now_ts() + 300,
+            "signature": "00",
+            "raw_data_key": "secret"
+        });
+
+        let err = serde_json::from_value::<Request>(request)
+            .expect_err("DID recovery requests must reject hidden authority fields")
+            .to_string();
+        assert!(err.contains("raw_data_key"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_did_provider_rejects_hidden_chat_signing_fields() {
+        let request = serde_json::json!({
+            "op": "sign_chat_message",
+            "sender_id": "did:key:z6Mkh11111111111111111111111111111111111111111",
+            "ts": 1_714_000_000u64,
+            "content": "hello",
+            "data": "arbitrary"
+        });
+
+        let err = serde_json::from_value::<Request>(request)
+            .expect_err("DID signing intents must reject hidden generic data fields")
+            .to_string();
+        assert!(err.contains("data"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_verify_did_recovery_accepts_typed_did_key_proof() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = encode_did_key(&signing_key.verifying_key());
+        let principal_id = "person:local:abc123";
+        let localhost_root = "localhost://Users/person:local:abc123";
+        let protector_id = "protector:did:abc123";
+        let data_key_id = "pdek:abc123";
+        let nonce = "nonce:abc123";
+        let issued_at = now_ts();
+        let expires_at = issued_at + 300;
+        let recovery = DidRecoveryPayload {
+            did: &did,
+            principal_id,
+            localhost_root,
+            protector_id,
+            data_key_id,
+            nonce,
+            issued_at,
+            expires_at,
+        };
+        let signature = did_recovery_test_signature(&signing_key, recovery);
+        let provider = DidProvider::new();
+
+        match provider.verify_did_recovery(
+            &did,
+            principal_id,
+            localhost_root,
+            protector_id,
+            data_key_id,
+            nonce,
+            issued_at,
+            expires_at,
+            &signature,
+        ) {
+            Response::Ok { data: Some(d) } => {
+                assert_eq!(d["schema"], DID_RECOVERY_PROOF_SCHEMA);
+                assert_eq!(d["valid"], true);
+                assert_eq!(d["did"], did);
+                assert_eq!(d["principal_id"], principal_id);
+                assert!(d["payload_sha256"].as_str().unwrap().len() >= 64);
+            }
+            other => panic!("Expected valid DID recovery proof, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_did_recovery_rejects_noncanonical_root_binding() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = encode_did_key(&signing_key.verifying_key());
+        let provider = DidProvider::new();
+
+        let err = match provider.verify_did_recovery(
+            &did,
+            "person:local:abc123",
+            "localhost://Users/person:local:other",
+            "protector:did:abc123",
+            "pdek:abc123",
+            "nonce:abc123",
+            now_ts(),
+            now_ts() + 300,
+            "00",
+        ) {
+            Response::Error { message, .. } => message,
+            other => panic!("Expected noncanonical root to fail closed, got {:?}", other),
+        };
+        assert!(err.contains("must match"));
+    }
+
+    #[test]
+    fn test_verify_did_recovery_rejects_tampered_payload_binding() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = encode_did_key(&signing_key.verifying_key());
+        let principal_id = "person:local:abc123";
+        let localhost_root = "localhost://Users/person:local:abc123";
+        let protector_id = "protector:did:abc123";
+        let data_key_id = "pdek:abc123";
+        let nonce = "nonce:abc123";
+        let issued_at = now_ts();
+        let expires_at = issued_at + 300;
+        let recovery = DidRecoveryPayload {
+            did: &did,
+            principal_id,
+            localhost_root,
+            protector_id,
+            data_key_id,
+            nonce,
+            issued_at,
+            expires_at,
+        };
+        let signature = did_recovery_test_signature(&signing_key, recovery);
+        let provider = DidProvider::new();
+
+        match provider.verify_did_recovery(
+            &did,
+            principal_id,
+            localhost_root,
+            protector_id,
+            data_key_id,
+            "nonce:other",
+            issued_at,
+            expires_at,
+            &signature,
+        ) {
+            Response::Ok { data: Some(d) } => assert_eq!(d["valid"], false),
+            other => panic!("Expected invalid signature response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_did_recovery_rejects_did_elastos_until_resolver_exists() {
+        let provider = DidProvider::new();
+        let err = match provider.verify_did_recovery(
+            "did:elastos:alice",
+            "person:local:abc123",
+            "localhost://Users/person:local:abc123",
+            "protector:did:abc123",
+            "pdek:abc123",
+            "nonce:abc123",
+            now_ts(),
+            now_ts() + 300,
+            "00",
+        ) {
+            Response::Error { message, .. } => message,
+            other => panic!("Expected did:elastos to fail closed, got {:?}", other),
+        };
+        assert!(err.contains("did:key"));
+    }
+
+    #[test]
+    fn test_verify_did_recovery_rejects_expired_proof() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let did = encode_did_key(&signing_key.verifying_key());
+        let issued_at = now_ts().saturating_sub(600);
+        let expires_at = issued_at + 300;
+        let signature = did_recovery_test_signature(
+            &signing_key,
+            DidRecoveryPayload {
+                did: &did,
+                principal_id: "person:local:abc123",
+                localhost_root: "localhost://Users/person:local:abc123",
+                protector_id: "protector:did:abc123",
+                data_key_id: "pdek:abc123",
+                nonce: "nonce:abc123",
+                issued_at,
+                expires_at,
+            },
+        );
+        let provider = DidProvider::new();
+        let err = match provider.verify_did_recovery(
+            &did,
+            "person:local:abc123",
+            "localhost://Users/person:local:abc123",
+            "protector:did:abc123",
+            "pdek:abc123",
+            "nonce:abc123",
+            issued_at,
+            expires_at,
+            &signature,
+        ) {
+            Response::Error { message, .. } => message,
+            other => panic!("Expected expired proof to fail closed, got {:?}", other),
+        };
+        assert!(err.contains("expired"));
+    }
+
+    #[test]
+    fn test_sign_chat_message_rejects_missing_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = init_provider(Some(dir.path().to_str().unwrap()));
+
+        match provider.sign_chat_message("", 1_714_000_000, "hello") {
+            Response::Error { code, .. } => assert_eq!(code, "invalid_intent"),
+            other => panic!("Expected invalid intent, got {:?}", other),
         }
     }
 
@@ -789,7 +1246,7 @@ mod tests {
     #[test]
     fn test_sign_without_init() {
         let provider = DidProvider::new();
-        match provider.sign("deadbeef") {
+        match provider.sign_chat_message("did:key:zMissing", 1_714_000_000, "hello") {
             Response::Error { code, .. } => assert_eq!(code, "not_init"),
             _ => panic!("Expected not_init error"),
         }

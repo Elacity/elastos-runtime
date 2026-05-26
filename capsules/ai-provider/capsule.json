@@ -11,6 +11,17 @@
     { "name": "llama-provider", "kind": "capsule" }
   ],
   "provides": "elastos://ai/*",
+  "authority": {
+    "reason": "Routes AI requests to configured model providers without exposing model processes or hosted API credentials to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://ai/*",
+        "actions": ["execute"],
+        "operations": ["chat_completions", "list_backends", "ping"]
+      }
+    ],
+    "audit_events": ["ai.request", "ai.backend_select"]
+  },
   "resources": {
     "memory_mb": 64,
     "gpu": false

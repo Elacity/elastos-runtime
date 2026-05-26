@@ -6,13 +6,10 @@
 # Exposes:
 #   REPO_ELASTOS_BIN        canonical repo binary path
 #   INSTALLED_ELASTOS_BIN   canonical installed binary path
-#   ELASTOS_BIN             legacy "repo-or-installed" compatibility value
-#   ELASTOS_BIN_SOURCE      source label for ELASTOS_BIN
 #
 # Root repo launchers should choose explicitly:
 #   - repo binary by default
 #   - installed binary only behind an explicit flag
-# Do not rely on ELASTOS_BIN for canonical launcher behavior.
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 REPO_ELASTOS_BIN="${PROJECT_ROOT}/elastos/target/release/elastos"
@@ -85,6 +82,3 @@ describe_elastos_binary() {
         printf '%s -> %s\n' "$source" "${bin:-missing}"
     fi
 }
-
-ELASTOS_BIN="$(resolve_elastos_binary either || true)"
-ELASTOS_BIN_SOURCE="$(elastos_bin_source "$ELASTOS_BIN")"

@@ -13,11 +13,6 @@ Accepted:
   X.Y.Z-beta.N
   X.Y.Z-rc.N
 
-Temporarily accepted for compatibility:
-  X.Y.Z-alphaN
-  X.Y.Z-betaN
-  X.Y.Z-rcN
-
 Optional SemVer build metadata is also allowed:
   X.Y.Z-rc.N+build.1
 EOF
@@ -38,16 +33,16 @@ fi
 core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 meta='(\+[0-9A-Za-z.-]+)?'
 preferred="^${core}(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?${meta}$"
-legacy="^${core}(-(alpha|beta|rc)(0|[1-9][0-9]*))${meta}$"
+compact_prerelease="^${core}(-(alpha|beta|rc)(0|[1-9][0-9]*))${meta}$"
 
 if [[ "$VERSION" =~ $preferred ]]; then
     exit 0
 fi
 
-if [[ "$VERSION" =~ $legacy ]]; then
-    echo "Warning: legacy prerelease form accepted for compatibility: $VERSION" >&2
-    echo "Preferred form for new releases is X.Y.Z-rc.N / -beta.N / -alpha.N" >&2
-    exit 0
+if [[ "$VERSION" =~ $compact_prerelease ]]; then
+    echo "Error: invalid release version: $VERSION" >&2
+    echo "Use dotted prerelease identifiers: X.Y.Z-{alpha|beta|rc}.N" >&2
+    exit 1
 fi
 
 echo "Error: invalid release version: $VERSION" >&2

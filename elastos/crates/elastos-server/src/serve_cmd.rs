@@ -340,9 +340,6 @@ pub async fn run_serve(
     if let Some(ref cid) = infra.shell_cid {
         println!("  Capsule  shell           {}", cid);
     }
-    if let Some(ref cid) = infra.notepad_cid {
-        println!("  Capsule  notepad         {}", cid);
-    }
     println!("  App:     {}", app_session.token);
     println!("  API:     http://{}", addr);
 

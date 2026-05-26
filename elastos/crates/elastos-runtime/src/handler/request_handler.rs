@@ -1,7 +1,8 @@
-//! Request handler implementation
+//! Runtime-control request handler implementation.
 //!
 //! Processes RuntimeRequest messages and returns RuntimeResponse.
 //! Enforces authorization and delegates to appropriate managers.
+//! This is not the public capsule-kernel ABI exposed by `elastos-guest`.
 
 // Used by lib crate (tests, API handlers) but not directly by main.rs binary
 
@@ -52,7 +53,7 @@ impl Default for ShellId {
     }
 }
 
-/// Request handler for capsule-to-runtime communication
+/// Request handler for shell control and explicitly authorized internal flows.
 pub struct RequestHandler {
     /// Capsule manager
     capsule_manager: Arc<CapsuleManager>,

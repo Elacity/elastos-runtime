@@ -265,12 +265,6 @@ Important boundary:
 ./scripts/chat.sh --nick alice
 ```
 
-### Notepad demo
-
-```bash
-./scripts/notepad.sh
-```
-
 ### GBA demo
 
 ```bash

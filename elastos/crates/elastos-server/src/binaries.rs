@@ -2,9 +2,27 @@ use std::path::{Path, PathBuf};
 
 use crate::{setup, sources::default_data_dir};
 
-/// Find a provider binary from installed runtime paths only.
+/// Find a provider binary from an operator override or installed runtime paths.
 pub fn find_installed_provider_binary(name: &str) -> Option<PathBuf> {
     let data_dir = default_data_dir();
+    let env_name = format!(
+        "ELASTOS_{}_BIN",
+        name.to_ascii_uppercase().replace('-', "_")
+    );
+
+    if let Some(path) = std::env::var_os(env_name) {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(dir) = std::env::var_os("ELASTOS_CAPSULE_BIN_DIR") {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
 
     let installed_component = data_dir.join("bin").join(name);
     if installed_component.is_file() {

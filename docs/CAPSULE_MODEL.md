@@ -50,7 +50,7 @@ A Digital Capsule is not just "a process" and not just "a file." It has several 
 
 2. **Runtime contract**
    - the ABI and execution surface the capsule expects
-   - environment variables, bridge channels, syscalls, provider calls, lifecycle conventions
+   - environment variables, bridge channels, syscalls, `carrier_invoke` calls, lifecycle conventions
    - implemented by the Capsule Runtime
 
 3. **Instance**
@@ -115,6 +115,64 @@ In current repo terms, this concept is implemented across multiple pieces rather
 
 So "Capsule Runtime" is currently a conceptual layer with several implementations, not a monolithic library.
 
+## Capsule Kernel / Carrier ABI
+
+Each executable capsule should boot with a tiny capsule-local system surface: the
+capsule kernel. This is not the node core and not a general-purpose OS kernel.
+It is the in-capsule ABI/SDK that lets capsule code ask ElastOS for effects
+without learning host topology.
+
+The capsule kernel should expose only the stable ElastOS contract:
+
+- lifecycle: boot, suspend, resume, close, checkpoint
+- capability state: inspect granted capabilities and request missing authority
+- Carrier calls: invoke, read, write, subscribe, stream, and cancel
+- object handles: open `localhost://...`, `elastos://...`, and mounted spaces by capability
+- audit context: request ID, principal, session, capsule identity, and reason strings
+
+It should not expose product-facing access to gateway routes, host files, raw
+node RPC, browser-only APIs, IPFS/Kubo APIs, wallet RPC, node RPC, TAP devices,
+or provider implementation details.
+
+When a launched capsule needs a user-root principal, the launcher must provide a
+runtime-verified launch grant. Home-backed launches use a signed, app-scoped,
+non-delegatable Home launch token as that grant; raw principal strings are not a
+launch authority.
+
+The Rust guest SDK (`elastos-guest`) intentionally exposes only this
+capsule-kernel lane: capability requests, `carrier_invoke` calls, runtime info,
+and ping. Shell/runtime-control operations such as list, launch, stop, grant,
+revoke, direct storage, direct provider routing, and direct capsule messaging
+are not capsule-kernel API.
+
+The older `elastos-runtime::handler` protocol is an internal shell/control and
+legacy stdio bridge surface. It may keep privileged orchestration operations,
+but it is not the ordinary app capsule SDK and must not be documented as one.
+
+Manifest validation enforces this for ordinary app, viewer, and content
+capsules: they may not request guest networking, host execution, microVM HTTP
+ports, external host dependencies, provider-source overrides, protocol provider
+namespaces, system-only backend namespaces such as raw gateway/IPFS/Kubo/Elacity
+provider surfaces, or runtime SystemServices storage. Provider capsules are the
+explicit exception and must declare a narrow `provides` namespace plus
+provider-authority metadata: reason, capability schema, operations, and expected
+audit events.
+
+The same capsule kernel call may route to:
+
+- a local object or provider in the same runtime
+- another capsule on the same node
+- a remote runtime over Carrier
+- a provider capsule that owns a protocol such as IPFS, BTC, ELA, DID, or WebSpace
+
+The capsule must not branch on those cases. The runtime and provider plane own
+routing, authorization, transport, and audit. This is the practical meaning of
+"capsules know only Carrier."
+
+DID signing follows the same rule. Provider capsules may hold DID material, but
+ordinary capsules must request typed signing intents such as `sign_chat_message`
+instead of arbitrary `sign(data)` access.
+
 ## First-Principles Rules
 
 These rules keep the model coherent:
@@ -146,7 +204,7 @@ These rules keep the model coherent:
    - app behavior, wire format, and capability semantics should stay the same
 
 7. **Providers own semantics after the scheme**
-   - `elastos://peer/alice/shared` is named data, not a filesystem path
+   - `elastos://peer/<verified-peer>/shared` is named data, not a filesystem path
    - provider capsules define how that namespace is interpreted
 
 ## Trust Domains
@@ -161,6 +219,11 @@ App capsules, agent capsules, and user-facing provider capsules run in the **use
 - Full capability token flow with Ed25519-signed tokens
 - Subject to shell policy (auto, cli, or agent/rules modes)
 - Bridge provides `BridgeContext` with `PendingRequestStore` and `CapabilityManager`
+- User-root aliases such as `localhost://Users/self` require an explicit
+  Runtime-verified principal context. Home-backed WASM launches and
+  shell/supervisor microVM launches carry that context through signed
+  app-scoped launch grants; attached/native CLI launches remain principal-less
+  until they get the same protected bridge.
 
 This is the normal path for `elastos serve` + `elastos run`/`elastos chat`.
 
@@ -172,6 +235,9 @@ Gateway-launched capsules (ipfs-provider, tunnel-provider) run in the **infrastr
 - Not subject to user shell approval — they ARE the service infrastructure
 - No `CapabilityManager` or `PendingRequestStore` attached
 - If an infrastructure capsule ever requests a capability, the bridge returns a clear `infrastructure_capsule` denial
+- Provider-role launches do not receive user principal scope from launch grants;
+  a provider that needs user data must request it through a separate capability
+  path.
 - Launched via `elastos gateway --public`, not through the user shell
 
 The distinction matters: forcing service-plane infrastructure through user shell approval blurs two different trust relationships. The operator who runs `elastos gateway --public` is explicitly trusting those capsules as part of the node's service layer.
@@ -190,7 +256,7 @@ The preferred model is:
 
 - capsules get no ambient network
 - capsules talk to the node through Carrier and the Capsule Runtime bridge
-- the node brokers allowed effects through provider calls and capability grants
+- the node brokers allowed effects through `carrier_invoke` calls and capability grants
 
 That means:
 

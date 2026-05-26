@@ -508,6 +508,7 @@ pub async fn run_update_for_data_dir(
 
     let head_version = head["payload"]["version"].as_str().unwrap_or("unknown");
     let release_cid = head["payload"]["latest_release_cid"].as_str().unwrap_or("");
+    let release_object_cid = optional_release_object_cid(&head)?;
 
     run_upgrade_from_head(
         fetch_fn,
@@ -516,6 +517,7 @@ pub async fn run_update_for_data_dir(
         resolved_head_cid.as_deref(),
         head_version,
         release_cid,
+        release_object_cid,
         &current_version,
         &source,
         data_dir,
@@ -538,6 +540,7 @@ async fn run_upgrade_from_head(
     resolved_head_cid: Option<&str>,
     version: &str,
     release_cid: &str,
+    release_object_cid: Option<&str>,
     current_version: &str,
     source: &TrustedSource,
     data_dir: &std::path::Path,
@@ -601,6 +604,9 @@ async fn run_upgrade_from_head(
         "    Release:   {}...",
         &release_cid[..12.min(release_cid.len())]
     );
+    if let Some(cid) = release_object_cid {
+        println!("    Release object: {}...", &cid[..12.min(cid.len())]);
+    }
 
     if check_only {
         println!();
@@ -835,6 +841,23 @@ async fn run_upgrade_from_head(
     Ok(())
 }
 
+fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Option<&str>> {
+    let Some(cid) = head["payload"]["release_object_cid"].as_str() else {
+        return Ok(None);
+    };
+    if cid.trim().is_empty() {
+        return Ok(None);
+    }
+    cid::Cid::try_from(cid).map_err(|err| {
+        anyhow::anyhow!(
+            "Release head has invalid release_object_cid {}: {}",
+            cid,
+            err
+        )
+    })?;
+    Ok(Some(cid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,13 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn test_optional_release_object_cid_validates_when_present() {
+        let head = serde_json::json!({
+            "payload": {
+                "release_object_cid": "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+            }
+        });
+        assert_eq!(
+            optional_release_object_cid(&head).unwrap(),
+            Some("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG")
+        );
+
+        let invalid = serde_json::json!({
+            "payload": {
+                "release_object_cid": "not-a-cid"
+            }
+        });
+        assert!(optional_release_object_cid(&invalid).is_err());
+    }
+
+    #[test]
     fn test_changed_capsule_names_only_returns_changed_entries() {
         let old = serde_json::json!({
             "external": {},
             "profiles": {},
             "capsules": {
                 "chat": { "cid": "cid-chat-1", "sha256": "a", "size": 1, "platforms": ["x86_64-linux"] },
-                "peer-provider": { "cid": "cid-peer-1", "sha256": "b", "size": 1, "platforms": ["x86_64-linux"] }
+                "did-provider": { "cid": "cid-did-1", "sha256": "b", "size": 1, "platforms": ["x86_64-linux"] }
             }
         });
         let new = serde_json::json!({
@@ -866,8 +909,8 @@ mod tests {
             "profiles": {},
             "capsules": {
                 "chat": { "cid": "cid-chat-2", "sha256": "c", "size": 1, "platforms": ["x86_64-linux"] },
-                "peer-provider": { "cid": "cid-peer-1", "sha256": "b", "size": 1, "platforms": ["x86_64-linux"] },
-                "did-provider": { "cid": "cid-did-1", "sha256": "d", "size": 1, "platforms": ["x86_64-linux"] }
+                "did-provider": { "cid": "cid-did-1", "sha256": "b", "size": 1, "platforms": ["x86_64-linux"] },
+                "chain-provider": { "cid": "cid-chain-1", "sha256": "d", "size": 1, "platforms": ["x86_64-linux"] }
             }
         });
         let old_bytes = serde_json::to_vec(&old).unwrap();
@@ -875,7 +918,7 @@ mod tests {
         let changed = changed_capsule_names(Some(old_bytes.as_slice()), &new_bytes).unwrap();
         assert_eq!(
             changed,
-            vec!["chat".to_string(), "did-provider".to_string()]
+            vec!["chain-provider".to_string(), "chat".to_string()]
         );
     }
 

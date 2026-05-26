@@ -2,7 +2,9 @@
 //!
 //! HTTP handlers for file-backed localhost:// roots.
 //!
-//! Public contract: rooted local paths such as `Users/self/...` or `MyWebSite/...`.
+//! Public contract: rooted local paths such as `MyWebSite/...`.
+//! Principal-owned `Users/...` roots require a runtime principal context and
+//! must use the Home/provider routes that can encrypt protected roots.
 
 use std::sync::Arc;
 
@@ -100,6 +102,7 @@ pub async fn read_file(
 ) -> Result<Response, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Read).await?;
     let uri = canonical_local_uri(&path)?;
 
@@ -134,6 +137,7 @@ pub async fn write_file(
 ) -> Result<Json<WriteOutput>, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Write).await?;
 
     // Enforce storage quota (0 = unlimited)
@@ -196,6 +200,7 @@ pub async fn delete_path(
 ) -> Result<Json<DeleteOutput>, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Delete).await?;
     let uri = canonical_local_uri(&path)?;
     let recursive = query.recursive.unwrap_or(false);
@@ -247,6 +252,7 @@ pub async fn list_dir(
 ) -> Result<Json<ListOutput>, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Read).await?;
     let uri = canonical_local_uri(&path)?;
 
@@ -328,6 +334,7 @@ pub async fn stat_path(
 ) -> Result<Response, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Read).await?;
     let uri = canonical_local_uri(&path)?;
 
@@ -376,6 +383,7 @@ pub async fn mkdir(
 ) -> Result<Json<MkdirOutput>, StorageApiError> {
     let user_id = session_user_id(&session);
     let path = normalize_path(&path);
+    reject_principal_root_storage_path(&path)?;
     enforce_capability(&state, &session, &headers, &path, Action::Write).await?;
     let uri = canonical_local_uri(&path)?;
 
@@ -491,6 +499,15 @@ fn canonical_local_uri(path: &str) -> Result<String, StorageApiError> {
     rooted_localhost_uri(path).ok_or_else(|| {
         StorageApiError::InvalidPath("path must be rooted under localhost://<root>/...".to_string())
     })
+}
+
+fn reject_principal_root_storage_path(path: &str) -> Result<(), StorageApiError> {
+    if path == "Users" || path.starts_with("Users/") {
+        return Err(StorageApiError::PermissionDenied(
+            "principal-root storage requires a runtime principal-scoped provider route".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Guess content type from file extension.
@@ -618,7 +635,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Read,
         )
         .await;
@@ -639,7 +656,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Read,
         )
         .await;
@@ -658,7 +675,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Read,
         )
         .await;
@@ -673,7 +690,7 @@ mod tests {
         // Grant a token for this session's capsule ID
         let token = cap_mgr.grant(
             session.id.as_str(),
-            ResourceId::new("localhost://Users/self/Pictures/*"),
+            ResourceId::new("localhost://MyWebSite/Pictures/*"),
             Action::Read,
             TokenConstraints::default(),
             None,
@@ -688,7 +705,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Read,
         )
         .await;
@@ -703,7 +720,7 @@ mod tests {
         // Grant for photos/*, but access documents/
         let token = cap_mgr.grant(
             session.id.as_str(),
-            ResourceId::new("localhost://Users/self/Pictures/*"),
+            ResourceId::new("localhost://MyWebSite/Pictures/*"),
             Action::Read,
             TokenConstraints::default(),
             None,
@@ -718,7 +735,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Documents/secret.txt",
+            "MyWebSite/Documents/secret.txt",
             Action::Read,
         )
         .await;
@@ -733,7 +750,7 @@ mod tests {
         // Grant read, but try to write
         let token = cap_mgr.grant(
             session.id.as_str(),
-            ResourceId::new("localhost://Users/self/Pictures/*"),
+            ResourceId::new("localhost://MyWebSite/Pictures/*"),
             Action::Read,
             TokenConstraints::default(),
             None,
@@ -748,7 +765,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Write,
         )
         .await;
@@ -765,7 +782,7 @@ mod tests {
             &state,
             &session,
             &headers,
-            "Users/self/Pictures/a.jpg",
+            "MyWebSite/Pictures/a.jpg",
             Action::Read,
         )
         .await;
@@ -773,5 +790,39 @@ mod tests {
             matches!(result, Err(StorageApiError::PermissionDenied(_))),
             "No capability manager must deny access — no ambient authority"
         );
+    }
+
+    #[tokio::test]
+    async fn test_public_storage_rejects_users_root_without_principal_context() {
+        let state = State(make_state(None));
+        let session = Extension(make_session(SessionType::Shell));
+        let headers = HeaderMap::new();
+
+        let write_result = write_file(
+            state.clone(),
+            session.clone(),
+            headers.clone(),
+            Path("Users/self/Documents/a.md".to_string()),
+            Bytes::from_static(b"# draft"),
+        )
+        .await;
+        assert!(matches!(
+            write_result,
+            Err(StorageApiError::PermissionDenied(message))
+                if message.contains("principal-scoped provider route")
+        ));
+
+        let list_result = list_dir(
+            state,
+            session,
+            headers,
+            Path("localhost://Users/foreign-root/Documents".to_string()),
+        )
+        .await;
+        assert!(matches!(
+            list_result,
+            Err(StorageApiError::PermissionDenied(message))
+                if message.contains("principal-scoped provider route")
+        ));
     }
 }

@@ -17,7 +17,6 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
-    pub(crate) notepad_cid: Option<String>,
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
@@ -388,17 +387,6 @@ async fn setup_server_infrastructure_impl(
         })
     });
 
-    let notepad_cid = crate::find_installed_provider_binary("notepad").and_then(|path| {
-        std::fs::read(&path).ok().map(|bytes| {
-            let cid = format!(
-                "sha256:{}",
-                hex::encode(elastos_runtime::signature::hash_content(&bytes))
-            );
-            tracing::debug!("notepad capsule {} from {}", cid, path.display());
-            cid
-        })
-    });
-
     Ok(ServerInfrastructure {
         audit_log,
         session_registry,
@@ -410,6 +398,5 @@ async fn setup_server_infrastructure_impl(
         tls_config,
         provider_cid,
         shell_cid,
-        notepad_cid,
     })
 }

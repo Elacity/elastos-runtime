@@ -198,6 +198,12 @@ const PROVIDER_CAPSULE_NAMES: &[&str] = &[
     "shell",
     "localhost-provider",
     "did-provider",
+    "chain-provider",
+    "wallet-provider",
+    "drm-provider",
+    "rights-provider",
+    "key-provider",
+    "decrypt-provider",
     "ipfs-provider",
     "tunnel-provider",
     "site-provider",
@@ -2517,17 +2523,13 @@ fn root_descriptor(root: &str) -> (&'static str, &'static str) {
             "Browser-facing site root for the current sovereign Home, with preview, releases, and live channels.",
             "localhost://MyWebSite/index.html",
         ),
-        "PC2Host" => (
-            "Host integration layer for browser, device, and system adaptation surfaces.",
-            "localhost://PC2Host/AdaptationLayer",
-        ),
         "Public" => (
             "Shared files root for things you want to open or pass around outside your private site.",
             "localhost://Public/manual.pdf",
         ),
         "Users" => (
             "Personal home directories, documents, settings, saved games, and per-user app data.",
-            "localhost://Users/self/.AppData/LocalHost/Chat",
+            "localhost://Users/<principal-root>/.AppData/LocalHost/Chat",
         ),
         "UsersAI" => (
             "Resident AI home directories mirroring Users for sovereign agent surfaces in this Home.",
@@ -3272,6 +3274,12 @@ mod tests {
     fn provider_capsules_excluded_from_dynamic_actions() {
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"shell"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"did-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"chain-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"wallet-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"drm-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"rights-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"key-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"decrypt-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"home"));
     }
 }

@@ -18,10 +18,8 @@ Top-level directly-invoked entrypoints stay at the root:
 - `chat.sh` — launch the chat demo
 - `gba.sh` — launch the GBA demo
 - `install.sh` — signed installer
-- `notepad.sh` — launch the notepad demo
 - `home-demo-local.sh` — prepare and launch the local source-based Home demo in a clean temp home
 - `publish-release.sh` — low-level release publisher
-- `resolve-binary.sh` — shared binary resolver sourced by root launchers
 - `setup-crosvm.sh` — install runtime VM prerequisites
 - `share-demo.sh` — share project docs/content
 

@@ -11,6 +11,17 @@
     { "name": "cloudflared", "kind": "external" }
   ],
   "provides": "elastos://tunnel/*",
+  "authority": {
+    "reason": "Explicit operator-controlled public tunnel provider for exposing selected local services without giving app capsules raw network authority.",
+    "capabilities": [
+      {
+        "resource": "elastos://tunnel/*",
+        "actions": ["admin"],
+        "operations": ["start", "stop", "status", "ping"]
+      }
+    ],
+    "audit_events": ["tunnel.start", "tunnel.stop", "tunnel.status"]
+  },
   "resources": {
     "memory_mb": 64,
     "gpu": false

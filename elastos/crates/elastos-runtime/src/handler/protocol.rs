@@ -1,13 +1,14 @@
-//! Wire protocol types for capsule-to-runtime communication
+//! Internal runtime-control wire protocol.
 //!
-//! These types mirror the guest SDK types but are defined here to avoid
-//! a dependency from runtime on guest SDK.
+//! This is not the public capsule-kernel ABI. First-party app capsules use the
+//! `elastos-guest` `carrier_invoke` lane; this protocol remains for shell
+//! control, legacy stdio bridge tests, and explicitly authorized internal flows.
 use serde::{Deserialize, Serialize};
 
 /// Request ID for correlating requests and responses
 pub type RequestId = u64;
 
-/// Request from capsule to runtime
+/// Internal request to the runtime control handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeRequest {
@@ -98,7 +99,7 @@ pub enum RuntimeRequest {
     },
 }
 
-/// Response from runtime to capsule
+/// Response from the runtime control handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeResponse {
@@ -271,16 +272,13 @@ mod tests {
         assert!(json.contains("Capsule not found"));
     }
 
-    /// Compatibility test: every SDK request type string must deserialize into RuntimeRequest.
+    /// Compatibility test: every runtime-control request shape must deserialize.
     ///
-    /// If this test fails, it means the SDK and runtime protocol have drifted.
-    /// Fix by adding the missing variant to RuntimeRequest.
-    ///
-    /// SDK types from: packages/elastos-sdk/src/types.ts
+    /// This is intentionally not the public capsule-kernel ABI.
     #[test]
-    fn test_sdk_request_type_compatibility() {
+    fn test_runtime_control_request_type_compatibility() {
         // Each entry: (type string, minimal valid JSON for that type)
-        let sdk_request_types: Vec<(&str, &str)> = vec![
+        let runtime_control_request_types: Vec<(&str, &str)> = vec![
             ("list_capsules", r#"{"type":"list_capsules"}"#),
             (
                 "launch_capsule",
@@ -317,7 +315,6 @@ mod tests {
             ),
             ("get_runtime_info", r#"{"type":"get_runtime_info"}"#),
             ("ping", r#"{"type":"ping"}"#),
-            // Types added to match SDK (previously missing):
             (
                 "window_control",
                 r#"{"type":"window_control","window_id":"w1","action":"setTitle"}"#,
@@ -328,11 +325,11 @@ mod tests {
             ),
         ];
 
-        for (type_name, json) in &sdk_request_types {
+        for (type_name, json) in &runtime_control_request_types {
             let result: Result<RuntimeRequest, _> = serde_json::from_str(json);
             assert!(
                 result.is_ok(),
-                "SDK request type '{}' failed to deserialize: {} (json: {})",
+                "runtime-control request type '{}' failed to deserialize: {} (json: {})",
                 type_name,
                 result.unwrap_err(),
                 json
@@ -340,9 +337,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_capsule_kernel_abi_is_not_runtime_control_protocol() {
+        let kernel_request = r#"{"type":"carrier_invoke","uri":"elastos://did/*","operation":"get_did","body":{},"token":"tok"}"#;
+        let result: Result<RuntimeRequest, _> = serde_json::from_str(kernel_request);
+        assert!(
+            result.is_err(),
+            "carrier_invoke belongs to elastos-guest and the Carrier bridge, not this control protocol"
+        );
+    }
+
     /// Verify response types roundtrip correctly
     #[test]
-    fn test_sdk_response_type_compatibility() {
+    fn test_runtime_control_response_type_compatibility() {
         let response_types: Vec<(&str, RuntimeResponse)> = vec![
             ("ok", RuntimeResponse::ok()),
             ("error", RuntimeResponse::error("test", "test error")),

@@ -72,7 +72,7 @@ pub async fn run_shares(cmd: crate::SharesCommand) -> anyhow::Result<()> {
             if catalog.channels.remove(&channel).is_some() {
                 elastos_server::shares::save_share_catalog(&catalog)?;
                 println!("Removed channel '{}' from local catalog.", channel);
-                println!("Note: Published content remains on IPFS.");
+                println!("Note: published content may remain available while retained by availability providers.");
             } else {
                 println!("Channel '{}' not found.", channel);
             }
@@ -106,7 +106,7 @@ pub async fn run_shares(cmd: crate::SharesCommand) -> anyhow::Result<()> {
                 "",
             )
             .await?;
-            println!("Note: Published content remains on IPFS.");
+            println!("Note: published content may remain available while retained by availability providers.");
         }
         crate::SharesCommand::SetDid { did } => {
             if !did.starts_with("did:key:") {
@@ -118,13 +118,18 @@ pub async fn run_shares(cmd: crate::SharesCommand) -> anyhow::Result<()> {
             println!("Default author DID set: {}", did);
         }
         crate::SharesCommand::Head { channel } => {
-            let ipfs = crate::get_ipfs_bridge().await?;
+            let content_registry = crate::get_content_registry().await?;
             let catalog = elastos_server::shares::load_share_catalog()?;
             match catalog.channels.get(&channel) {
                 Some(share_channel) => match &share_channel.head_cid {
                     Some(head_cid) => {
                         println!("Fetching head {}...", head_cid);
-                        let head_bytes = ipfs.cat(head_cid).await?;
+                        let head_bytes = elastos_server::content::fetch_bytes_via_provider(
+                            &content_registry,
+                            head_cid,
+                            None,
+                        )
+                        .await?;
                         match elastos_server::shares::verify_channel_head(&head_bytes) {
                             Ok(head) => {
                                 let expected_did = share_channel
@@ -182,7 +187,6 @@ async fn mutate_channel_status(
     success_message: &str,
     no_op_message: &str,
 ) -> anyhow::Result<()> {
-    let ipfs = crate::get_ipfs_bridge().await?;
     let mut catalog = elastos_server::shares::load_share_catalog()?;
 
     match catalog.channels.get_mut(channel) {
@@ -212,8 +216,12 @@ async fn mutate_channel_status(
                 .last()
                 .and_then(|entry| entry.provenance_cid.clone());
             let prev_head = share_channel.head_cid.clone();
+            let author_did = share_channel.author_did.clone();
 
-            let head_cid = elastos_server::shares::publish_channel_head(
+            let content_registry = crate::get_content_registry().await?;
+            let signing_key = elastos_server::shares::load_or_create_share_key()?;
+            let head_cid = elastos_server::shares::publish_channel_head_via_provider(
+                &content_registry,
                 channel,
                 &cid,
                 version,
@@ -221,7 +229,8 @@ async fn mutate_channel_status(
                 provenance.as_deref(),
                 prev_head.as_deref(),
                 revoke_reason.as_deref(),
-                &ipfs,
+                author_did.as_deref(),
+                &signing_key,
             )
             .await;
 

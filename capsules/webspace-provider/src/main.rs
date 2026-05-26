@@ -22,7 +22,7 @@ const SUPPORTED_OPS: &[&str] = &[
 const UNSUPPORTED_OPS: &[&str] = &["write", "delete", "mkdir"];
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Init {
         #[serde(default)]

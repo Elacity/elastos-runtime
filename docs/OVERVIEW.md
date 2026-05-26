@@ -117,7 +117,6 @@ First-class file-backed localhost roots in the runtime today:
 - `localhost://UsersAI/...`
 - `localhost://AppCapsules/...`
 - `localhost://ElastOS/...`
-- `localhost://PC2Host/...`
 
 Reserved special root:
 

@@ -22,6 +22,50 @@ for the canonical definition.
 
 The minimal trusted base (`elastos` binary). Enforces isolation, signatures, and capabilities. Everything outside the runtime is a capsule.
 
+## Principal
+
+The runtime authority subject. A principal may represent a human account,
+agent, device, capsule, or provider. Sessions and capability tokens are issued
+to principals. Wallet addresses, passkeys, and DIDs are proof bindings or linked
+identities for a principal, not replacements for the principal itself.
+
+## Passkey
+
+The default human proof for Home. A passkey proves control of a local account to
+the runtime and unlocks short-lived sessions. It is not a wallet, not a DID, and
+normally does not expose raw key material for encryption.
+
+## WebAuthn PRF
+
+A WebAuthn extension that can derive credential-bound secret output during a
+passkey ceremony. In ElastOS this may become a passkey-root protector for
+wrapping a principal data key on the client side. Raw PRF output is key material:
+it must not be sent to runtime auth routes, logged, or stored as ordinary
+session data.
+
+## Device DID (`did:key`)
+
+The self-certifying device/node identity derived from local key material. The
+runtime currently uses `did:key` for Carrier/node signing and local provider
+identity. It is useful without a blockchain, but it does not prove a global
+name claim.
+
+## Account DID (`did:elastos` / EID)
+
+A future or linked global account identity anchored by Elastos DID/EID
+infrastructure. Use it for portable profiles, credentials, publisher identity,
+service endpoints, recovery, DAO actions, and globally unique name claims. It
+is not required for a local passkey account.
+
+## Handle / Name
+
+A human-readable label such as `alice`. Local handles are display names scoped
+to one runtime or space and can collide elsewhere. A globally scarce name needs
+a registry with consensus, ownership, transfer, recovery, and expiry rules, such
+as an EID/DID-chain namespace or a namespace smart contract. Runtime authority
+must bind to principal IDs, DIDs, signatures, and CIDs, not to an unverified
+handle string.
+
 ## Digital Capsule
 
 The portable signed package model in ElastOS. A Digital Capsule is capability-governed and explicitly described. It may be an app capsule, provider capsule, shell capsule, agent capsule, or sealed data/content capsule. User objects such as documents remain first-class objects; they become data capsules only when packaged with capsule metadata and provenance. See [CAPSULE_MODEL.md](CAPSULE_MODEL.md) for the full model.
@@ -52,7 +96,31 @@ A capsule with orchestrator capability. The shell decides whether to grant or de
 
 ## Provider
 
-A capsule that implements a protocol contract for other capsules to consume. Examples: `localhost-provider` (file-backed localhost roots), `did-provider` (identity), `ai-provider` (LLM routing), `ipfs-provider` (IPFS via Kubo). P2P networking is provided by built-in Carrier, not a separate provider capsule. Application capsules use providers through `elastos://` or rooted `localhost://` resources rather than implementing protocols directly.
+A capsule that implements a protocol contract for other capsules to consume. Examples: `localhost-provider` (file-backed localhost roots), `did-provider` (identity), `ai-provider` (LLM routing), `chain-provider` (typed chain reads/proofs), `wallet-provider` (wallet proof, account-link, and approval authority), `drm-provider` (protected-content open boundary), `rights-provider` (protected-content rights questions), `key-provider` (protected-content key release), `decrypt-provider` (protected-content decrypt/render sessions), `availability-provider` (configured replication adapter), and `ipfs-provider` (low-level IPFS via Kubo). P2P networking is provided by built-in Carrier, not a separate provider capsule. Application capsules use providers through `elastos://` or rooted `localhost://` resources rather than implementing protocols directly.
+
+## Content Availability Provider
+
+The intended higher-level provider contract for publishing, fetching, checking,
+repairing, and unpublishing SmartWeb objects. It sits above low-level
+`ipfs-provider` and hides whether bytes are pinned locally, replicated through
+Elacity/supernodes, served by volunteer nodes, or later backed by paid storage
+markets. Normal app capsules should use `elastos://content/*`, not raw
+`elastos://ipfs/*`.
+
+## Protected Content Provider
+
+The Runtime-mediated `elastos://drm/*` contract for sealed/protected content.
+It validates open requests and delegates rights, key release, and decrypt/render
+work to provider-owned authority. Apps do not receive raw CEKs, Lit SDKs, wallet
+RPC, chain RPC, Kubo/IPFS APIs, or Elacity credentials.
+
+## dKMS
+
+Distributed key-management system for protected content. The ElastOS direction is
+PQ-hybrid threshold release for new content: AES-256 CEKs, `t-of-n` shares,
+hybrid X25519 + ML-KEM share wrapping, and provider-owned key/decrypt sessions.
+FROST may help sign classical v0 receipts or cohort decisions, but it is not the
+long-term dKMS security root.
 
 ## Carrier
 
@@ -103,6 +171,22 @@ A cryptographically signed permission (Ed25519). Grants a specific capsule the r
 ## CID (Content ID)
 
 A content-addressed identifier (hash of the content). Used for capsule identity, IPFS references, and the `elastos://` namespace. The identity is the content, not the location.
+
+CID is not an availability guarantee. A CID says what bytes or graph root are
+being referenced; availability receipts say which provider accepted or verified
+responsibility to keep that content reachable.
+
+A CID is also not a person, device, account, or global name claim. A stable
+object may later have a signed head or object DID that points to changing CID
+revisions, but each CID already identifies one immutable byte graph.
+
+## IPLD
+
+InterPlanetary Linked Data: the content-addressed object graph/data model used
+to represent hash-linked structures. In ElastOS it is the right model for
+published object manifests, signed heads, provenance records, sealed-content
+descriptors, and availability receipts. IPLD is not Carrier, not IPFS storage,
+and not an access-control or rights system.
 
 ## WebSpace
 

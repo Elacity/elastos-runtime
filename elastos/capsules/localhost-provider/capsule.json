@@ -8,6 +8,17 @@
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "provides": "localhost://*",
+  "authority": {
+    "reason": "Owns rooted local object storage for approved localhost:// roots without leaking arbitrary host filesystem paths.",
+    "capabilities": [
+      {
+        "resource": "localhost://*",
+        "actions": ["read", "write", "delete"],
+        "operations": ["read", "write", "list", "delete", "stat", "mkdir", "exists"]
+      }
+    ],
+    "audit_events": ["localhost.read", "localhost.write", "localhost.delete"]
+  },
   "resources": {
     "memory_mb": 64,
     "gpu": false
@@ -19,7 +30,6 @@
       "localhost://ElastOS/",
       "localhost://Local/",
       "localhost://MyWebSite/",
-      "localhost://PC2Host/",
       "localhost://Public/",
       "localhost://Users/"
     ],

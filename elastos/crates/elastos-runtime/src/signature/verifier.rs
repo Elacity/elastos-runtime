@@ -181,6 +181,7 @@ mod tests {
             entrypoint: "main.wasm".into(),
             requires: Vec::new(),
             provides: None,
+            authority: None,
             capabilities: Vec::new(),
             resources: ResourceLimits::default(),
             permissions: Permissions::default(),

@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use elastos_common::localhost::is_supported_resource_scheme;
+use elastos_common::localhost::{is_supported_resource_scheme, is_system_only_backend_resource};
 use elastos_runtime::capability::{
     pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
     PolicyOutcome, ResourceId, TokenConstraints,
@@ -29,8 +29,9 @@ pub struct CapabilityState {
 // === Request Capability ===
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestCapabilityInput {
-    /// Resource to request access to (e.g., "localhost://Users/self/Pictures/*")
+    /// Resource to request access to (e.g., "localhost://MyWebSite/Pictures/*")
     pub resource: String,
     /// Action to request (e.g., "read", "write")
     pub action: String,
@@ -51,8 +52,6 @@ pub struct RequestCapabilityOutput {
     pub reason: Option<String>,
 }
 
-/// Return true if the resource URI uses a supported scheme.
-///
 /// POST /api/capability/request
 ///
 /// Request a capability token. Returns immediately with either:
@@ -88,6 +87,17 @@ pub async fn request_capability(
             StatusCode::BAD_REQUEST,
             "Unsupported resource scheme. Allowed: elastos://, localhost://".to_string(),
         ));
+    }
+
+    if is_system_only_backend_resource(&input.resource) {
+        return Ok(Json(RequestCapabilityOutput {
+            status: "denied".to_string(),
+            request_id: None,
+            token: None,
+            reason: Some(
+                "system backends are not app capabilities; use elastos://content".to_string(),
+            ),
+        }));
     }
 
     let resource = ResourceId::new(&input.resource);
@@ -240,6 +250,7 @@ pub async fn list_pending(
 // === Grant Request (Shell Only) ===
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantRequestInput {
     /// Request ID to grant
     pub request_id: String,
@@ -335,6 +346,7 @@ pub async fn grant_request(
 // === Deny Request (Shell Only) ===
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DenyRequestInput {
     /// Request ID to deny
     pub request_id: String,
@@ -484,6 +496,7 @@ pub async fn revoke_capability(
 // === Revoke All Capabilities (Shell Only) ===
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RevokeAllInput {
     /// Reason for revoking all capabilities
     #[serde(default = "default_revoke_reason")]
@@ -561,6 +574,7 @@ pub async fn session_info(
 // === Audit Log API (Shell Only) ===
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditLogQuery {
     /// Maximum number of events to return (default: 100, max: 1000)
     #[serde(default = "default_audit_limit")]
@@ -652,13 +666,14 @@ pub async fn get_audit_event_types(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_supported_resource_schemes() {
         assert!(is_supported_resource_scheme("elastos://did/*"));
         assert!(is_supported_resource_scheme("elastos://ai/local/chat"));
         assert!(is_supported_resource_scheme(
-            "localhost://Users/self/Documents/*"
+            "localhost://MyWebSite/Documents/*"
         ));
     }
 
@@ -668,5 +683,119 @@ mod tests {
         assert!(!is_supported_resource_scheme("localhost:/broken"));
         assert!(!is_supported_resource_scheme("resource-without-scheme"));
         assert!(!is_supported_resource_scheme(""));
+    }
+
+    #[test]
+    fn test_system_only_backend_resource_detection() {
+        assert!(is_system_only_backend_resource("elastos://ipfs/add"));
+        assert!(is_system_only_backend_resource("elastos://ipfs"));
+        assert!(is_system_only_backend_resource("elastos://kubo/rpc"));
+        assert!(is_system_only_backend_resource(
+            "elastos://ipfs-cluster/pins"
+        ));
+        assert!(is_system_only_backend_resource("elastos://elacity-sdk/pin"));
+        assert!(is_system_only_backend_resource(
+            "elastos://ipfs-provider/add"
+        ));
+        assert!(is_system_only_backend_resource("elastos://gateway/raw"));
+        assert!(!is_system_only_backend_resource(
+            "elastos://content/publish"
+        ));
+        assert!(!is_system_only_backend_resource(
+            "localhost://MyWebSite/Documents/x"
+        ));
+    }
+
+    fn assert_rejects_unknown_field<T: serde::de::DeserializeOwned>(value: serde_json::Value) {
+        let err = match serde_json::from_value::<T>(value) {
+            Ok(_) => panic!("expected capability body to reject unknown fields"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn test_capability_inputs_reject_hidden_authority_fields() {
+        assert_rejects_unknown_field::<RequestCapabilityInput>(json!({
+            "resource": "elastos://content/publish",
+            "action": "write",
+            "capability_token": "must-not-be-accepted"
+        }));
+        assert_rejects_unknown_field::<GrantRequestInput>(json!({
+            "request_id": "request:test",
+            "duration": "session",
+            "rationale": "ok",
+            "token": "must-not-be-accepted"
+        }));
+        assert_rejects_unknown_field::<DenyRequestInput>(json!({
+            "request_id": "request:test",
+            "reason": "no",
+            "override": true
+        }));
+        assert_rejects_unknown_field::<RevokeAllInput>(json!({
+            "reason": "rotate",
+            "session_id": "session:other"
+        }));
+        assert_rejects_unknown_field::<AuditLogQuery>(json!({
+            "limit": 10,
+            "type": "capability_grant",
+            "include_private": true
+        }));
+    }
+
+    fn test_state() -> CapabilityState {
+        let audit_log = std::sync::Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = std::sync::Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics =
+            std::sync::Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager =
+            std::sync::Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics));
+
+        CapabilityState {
+            pending_store: std::sync::Arc::new(PendingRequestStore::new(audit_log.clone())),
+            capability_manager,
+            policy_evaluator: std::sync::Arc::new(PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit_log,
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_capability_denies_ipfs_backend() {
+        let output = request_capability(
+            State(test_state()),
+            Extension(Session::new_capsule("capsule-1".to_string())),
+            Json(RequestCapabilityInput {
+                resource: "elastos://ipfs/add".to_string(),
+                action: "write".to_string(),
+            }),
+        )
+        .await
+        .expect("ipfs backend request should return a structured denial")
+        .0;
+
+        assert_eq!(output.status, "denied");
+        assert_eq!(output.request_id, None);
+        assert!(output.reason.unwrap().contains("elastos://content"));
+    }
+
+    #[tokio::test]
+    async fn test_request_capability_allows_content_contract() {
+        let output = request_capability(
+            State(test_state()),
+            Extension(Session::new_capsule("capsule-1".to_string())),
+            Json(RequestCapabilityInput {
+                resource: "elastos://content/publish".to_string(),
+                action: "write".to_string(),
+            }),
+        )
+        .await
+        .expect("content contract request should be accepted")
+        .0;
+
+        assert_eq!(output.status, "pending");
+        assert!(output.request_id.is_some());
+        assert!(output.reason.is_none());
     }
 }

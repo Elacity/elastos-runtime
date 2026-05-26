@@ -1,5 +1,13 @@
 # Share Versioning Spec (v0.3)
 
+> Current share/versioning model.
+>
+> This document describes the existing CID-backed share flow. Publish,
+> unpublish, metadata fetch, and head fetch flow through the
+> `elastos://content/*` availability contract while preserving immutable CIDs,
+> signed heads, and provenance. See
+> [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
+
 ## Purpose
 
 Define how ElastOS manages shared data capsules over time:
@@ -17,12 +25,12 @@ This enables repeatable publishing while preserving content-addressed integrity.
 - Make "what is latest?" easy for humans and tooling
 - Allow old versions to discover newer versions without mutating old content
 - Support safe lifecycle states: active, archived, revoked
-- Make local cleanup possible without pretending global deletion exists on IPFS
-- Treat publish as pinning a CID through the IPFS provider; unpublish removes the local pin and clears the local latest pointer without pretending the CID can be globally erased
+- Make local cleanup possible without pretending global deletion exists across availability providers
+- Treat publish/unpublish as availability-provider operations; unpublish removes local availability intent and clears the local latest pointer without pretending the CID can be globally erased
 
 ## Non-Goals (for v0.3)
 
-- Global hard delete from all IPFS peers
+- Global hard delete from all providers and peers
 - Multi-writer conflict resolution across unrelated publishers
 - Complex semantic merge/diff UI
 
@@ -50,7 +58,7 @@ Forward links are derived from mutable channel state.
 
 ### 1) Immutable capsule metadata (`_share.json`)
 
-Stored inside each shared capsule directory. Written before IPFS publish so it becomes part of the CID.
+Stored inside each shared capsule directory. Written before provider publish so it becomes part of the CID.
 
 ```json
 {
@@ -116,7 +124,7 @@ Catalog writes use atomic tmp-then-rename to prevent corruption on crash or powe
 
 ### 3) Provenance attestation (`provenance.json`, Phase 2.5)
 
-Published as a detached IPFS sidecar (separate CID). Cannot be embedded in the capsule (adding `output_cid` would change the CID — circular hash).
+Published as a detached sidecar through `elastos://content/publish` (separate CID). Cannot be embedded in the capsule (adding `output_cid` would change the CID — circular hash).
 
 ```json
 {
@@ -136,7 +144,7 @@ The `provenance_cid` is stored in each `ShareEntry` in the local catalog for loo
 
 ### 4) Signed channel head (`head.json`, Phase 3)
 
-Published to IPFS as a mutable pointer (new head replaces old per channel). Represents the channel owner's signed assertion of current channel state.
+Published through `elastos://content/publish` as a mutable channel pointer (new head replaces old per channel in the local catalog). Represents the channel owner's signed assertion of current channel state.
 
 ```json
 {
@@ -189,7 +197,7 @@ Backward linking (immutable):
 Forward linking (mutable):
 
 - `elastos open` checks local catalog and prints "Newer version available" hint to stderr
-- `elastos open` fetches signed channel head from IPFS when available — signed+trusted warnings supersede unsigned catalog warnings
+- `elastos open` fetches signed channel head through `elastos://content/fetch` when available; signed+trusted warnings supersede unsigned catalog warnings
 - Old version can link to latest through head/history, without rewriting old capsule
 - Phase 4: viewer resolves network-published signed heads and shows "Newer version available" banner
 
@@ -261,7 +269,7 @@ Channel management:
 ```bash
 elastos shares list                        # list channels with status, DID, [attested], [head]
 elastos shares history <channel>           # show version history with provenance CIDs
-elastos shares head <channel>              # fetch and verify signed channel head from IPFS
+elastos shares head <channel>              # fetch and verify signed channel head through content provider
 elastos shares delete-local <channel>      # remove channel from local catalog
 elastos shares archive <channel>           # mark as archived + publish signed head
 elastos shares unarchive <channel>         # restore to active + publish signed head
@@ -271,13 +279,13 @@ elastos shares set-did <did>               # set default author DID (must start 
 
 Behavior notes:
 
-- `share` updates head/history in local catalog (best-effort; no file locking). Publishes signed channel head to IPFS (opt-out: `--no-head`). Provenance and head are independent (`--no-attest` disables provenance only, `--no-head` disables head only).
-- `delete-local` removes local catalog entry only; published content remains on IPFS
-- `archive` sets status to `archived`; guards against double-archive; publishes signed head
-- `unarchive` restores to `active`; guards against unarchiving non-archived; publishes signed head
-- `revoke` sets status to `revoked` with reason; publishes signed head with `revoke_reason`; published content remains on IPFS
+- `share` updates head/history in local catalog (best-effort; no file locking). Publishes the bundle, provenance, and signed channel head through `elastos://content/*` (opt-out: `--no-head`). Provenance and head are independent (`--no-attest` disables provenance only, `--no-head` disables head only).
+- `delete-local` removes the local catalog entry only; published content may remain available while retained by availability providers.
+- `archive` sets status to `archived`; guards against double-archive; publishes signed head through `elastos://content/*`.
+- `unarchive` restores to `active`; guards against unarchiving non-archived; publishes signed head through `elastos://content/*`.
+- `revoke` sets status to `revoked` with reason; publishes signed head with `revoke_reason`; published content may remain available while retained by availability providers.
 - `set-did` validates `did:key:` prefix, stores as catalog-level default
-- `head` fetches `head_cid` from catalog, downloads from IPFS, verifies signature, displays all fields
+- `head` fetches `head_cid` from catalog through `elastos://content/fetch`, verifies signature, displays all fields
 
 ## Archive and Delete Semantics
 
@@ -296,7 +304,7 @@ Behavior notes:
 `delete-local`:
 
 - Remove local catalog entry
-- Published content remains on IPFS (no unpin in Phase 2)
+- Published content may remain available while retained by availability providers
 - Allow local GC
 
 No "global delete":
@@ -327,11 +335,11 @@ Phase 2.5 (implemented):
 
 Phase 3 (implemented):
 
-- Signed channel heads (`head.json` published to IPFS per channel)
+- Signed channel heads (`head.json` published through `elastos://content/*` per channel)
 - Domain-separated Ed25519 signing (`b"elastos.channel.head.v1\0"` prefix, distinct from provenance)
 - `elastos share` auto-publishes signed head (opt-out: `--no-head`, independent of `--no-attest`)
 - Lifecycle commands (`archive`, `unarchive`, `revoke`) publish signed heads with status transitions
-- `elastos shares head <channel>` fetches and verifies signed head from IPFS
+- `elastos shares head <channel>` fetches and verifies signed head through `elastos://content/fetch`
 - `elastos open` prefers signed+trusted head over unsigned catalog warnings; trust check compares `signer_did` to expected DID
 - `head_cid` tracked in `ShareChannel` (migration-safe with `#[serde(default)]`)
 - `prev_head_cid` for head-chain continuity (genesis head has None)
@@ -389,12 +397,12 @@ Phase 2.5 (implemented):
 - `elastos verify --cid <cid>` with catalog lookup or `--provenance` override
 - `provenance_cid` in catalog `ShareEntry` (migration-safe with `#[serde(default)]`)
 - `[attested]` indicator in `shares list`, truncated provenance CID in `shares history`
-- IPFS single-file publish and fetch helpers
+- Content-provider single-file publish and fetch helpers
 - 11 new unit tests (DID roundtrip, provenance sign/verify, tamper detection, key persistence, domain separator)
 
 Phase 3 (implemented):
 
-- Signed channel heads (`head.json`) published to IPFS per channel
+- Signed channel heads (`head.json`) published through `elastos://content/*` per channel
 - Domain-separated Ed25519 signing (distinct from provenance domain)
 - `head_cid` in `ShareChannel` (migration-safe with `#[serde(default)]`)
 - `prev_head_cid` for head-chain continuity (enables rollback detection)

@@ -12,76 +12,13 @@ use serde::{Deserialize, Serialize};
 /// Request ID for correlating requests and responses
 pub type RequestId = u64;
 
-/// Request from capsule to runtime
+/// Request from capsule to the capsule-kernel bridge.
 #[cfg(feature = "serde")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeRequest {
-    /// List running capsules (shell only)
-    ListCapsules,
-
-    /// Launch a capsule (shell only)
-    LaunchCapsule {
-        cid: String,
-        #[serde(default)]
-        config: LaunchConfig,
-    },
-
-    /// Stop a capsule (shell only)
-    StopCapsule { capsule_id: String },
-
-    /// Grant capability to a capsule (shell only)
-    GrantCapability {
-        capsule_id: String,
-        resource: String,
-        action: String,
-        #[serde(default)]
-        constraints: CapabilityConstraints,
-    },
-
-    /// Revoke a capability (shell only)
-    RevokeCapability { token_id: String },
-
-    /// Send message to another capsule
-    SendMessage {
-        to: String,
-        payload: Vec<u8>,
-        #[serde(default)]
-        reply_to: Option<String>,
-    },
-
-    /// Receive pending messages
-    ReceiveMessages,
-
-    /// Fetch content by elastos:// URI
-    FetchContent {
-        uri: String,
-        #[serde(default)]
-        token: Option<String>,
-    },
-
-    /// Request storage access (invokes capability)
-    StorageRead { token: String, path: String },
-
-    /// Request storage write (invokes capability)
-    StorageWrite {
-        token: String,
-        path: String,
-        content: Vec<u8>,
-    },
-
     /// Request a capability token (capsule→shell, waits for approval)
     RequestCapability { resource: String, action: String },
-
-    /// Call a provider operation (capsule→provider, via runtime routing)
-    ProviderCall {
-        scheme: String,
-        op: String,
-        #[serde(default)]
-        body: serde_json::Value,
-        #[serde(default)]
-        token: String,
-    },
 
     /// Invoke an ElastOS resource through the capsule-kernel Carrier contract.
     CarrierInvoke {
@@ -100,7 +37,7 @@ pub enum RuntimeRequest {
     Ping,
 }
 
-/// Response from runtime to capsule
+/// Response from the capsule-kernel bridge.
 #[cfg(feature = "serde")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -114,32 +51,11 @@ pub enum RuntimeResponse {
     /// Error response
     Error { code: String, message: String },
 
-    /// List of capsules
-    CapsuleList { capsules: Vec<CapsuleListEntry> },
-
-    /// Capsule launched
-    CapsuleLaunched { capsule_id: String },
-
-    /// Capability granted (shell granting to another capsule)
-    CapabilityGranted { token_id: String },
-
     /// Capability token received (capsule requested, shell approved)
     CapabilityToken { token: String },
 
-    /// Provider call result
-    ProviderResult { result: serde_json::Value },
-
     /// Carrier invoke result
     CarrierResult { result: serde_json::Value },
-
-    /// Messages received
-    Messages { messages: Vec<IncomingMessage> },
-
-    /// Content fetched
-    Content { data: Vec<u8> },
-
-    /// Storage read result
-    StorageData { data: Vec<u8> },
 
     /// Runtime info
     RuntimeInfo {
@@ -149,49 +65,6 @@ pub enum RuntimeResponse {
 
     /// Pong response
     Pong,
-}
-
-/// Configuration for launching a capsule
-#[cfg(feature = "serde")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LaunchConfig {
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-    #[serde(default)]
-    pub args: Vec<String>,
-}
-
-/// Constraints for capability grants
-#[cfg(feature = "serde")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CapabilityConstraints {
-    #[serde(default)]
-    pub max_uses: Option<u32>,
-    #[serde(default)]
-    pub expiry_secs: Option<u64>,
-    #[serde(default)]
-    pub delegatable: bool,
-}
-
-/// Entry in capsule list
-#[cfg(feature = "serde")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapsuleListEntry {
-    pub id: String,
-    pub name: String,
-    pub status: String,
-}
-
-/// Incoming message from another capsule
-#[cfg(feature = "serde")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncomingMessage {
-    pub id: String,
-    pub from: String,
-    pub payload: Vec<u8>,
-    pub timestamp: u64,
-    #[serde(default)]
-    pub reply_to: Option<String>,
 }
 
 /// Message envelope for wire protocol
@@ -246,6 +119,22 @@ pub struct RuntimeClient {
 
 #[cfg(feature = "serde")]
 impl RuntimeClient {
+    /// Return true when the host attached a capsule-kernel bridge.
+    ///
+    /// This checks only the boot contract. It does not prove that the runtime
+    /// will grant any capability.
+    pub fn is_bridge_configured() -> bool {
+        if std::env::var_os("ELASTOS_CARRIER_FDS").is_some()
+            || std::env::var_os("ELASTOS_CARRIER_PATH").is_some()
+        {
+            return true;
+        }
+        matches!(
+            (std::env::var("ELASTOS_API"), std::env::var("ELASTOS_TOKEN")),
+            (Ok(api), Ok(token)) if !api.is_empty() && !token.is_empty()
+        )
+    }
+
     /// Create a new runtime client.
     ///
     /// Detects the Carrier channel automatically:
@@ -336,7 +225,7 @@ impl RuntimeClient {
     }
 
     /// Execute an SDK request via HTTP API to the running runtime.
-    /// Maps RuntimeRequest variants to POST /api/provider/:scheme/:op calls.
+    /// Maps capsule-kernel requests to host-adapter HTTP calls.
     #[cfg(feature = "serde")]
     fn http_call(
         _id: RequestId,
@@ -349,20 +238,6 @@ impl RuntimeClient {
                 "/api/capability/request".to_string(),
                 serde_json::json!({"resource": resource, "action": action}),
                 None,
-            ),
-            RuntimeRequest::ProviderCall {
-                scheme,
-                op,
-                body,
-                token: cap_token,
-            } => (
-                format!("/api/provider/{}/{}", scheme, op),
-                body.clone(),
-                if cap_token.is_empty() {
-                    None
-                } else {
-                    Some(cap_token.as_str())
-                },
             ),
             RuntimeRequest::CarrierInvoke {
                 uri,
@@ -389,12 +264,6 @@ impl RuntimeClient {
                 return Ok(RuntimeResponse::RuntimeInfo {
                     version: "attached".to_string(),
                     capsule_count: 0,
-                });
-            }
-            _ => {
-                return Ok(RuntimeResponse::Error {
-                    code: "not_supported".to_string(),
-                    message: "operation not supported in attached-runtime mode".to_string(),
                 });
             }
         };
@@ -480,13 +349,10 @@ impl RuntimeClient {
                     })
                 }
             }
-            RuntimeRequest::ProviderCall { .. } => {
-                Ok(RuntimeResponse::ProviderResult { result: resp_json })
-            }
             RuntimeRequest::CarrierInvoke { .. } => {
                 Ok(RuntimeResponse::CarrierResult { result: resp_json })
             }
-            _ => Ok(RuntimeResponse::Ok {
+            RuntimeRequest::Ping | RuntimeRequest::GetRuntimeInfo => Ok(RuntimeResponse::Ok {
                 data: Some(resp_json),
             }),
         }
@@ -850,195 +716,6 @@ impl RuntimeClient {
     /// Default timeout for `call_with_timeout` (30 seconds).
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// List running capsules
-    pub fn list_capsules(&mut self) -> io::Result<Vec<CapsuleListEntry>> {
-        match self.call(RuntimeRequest::ListCapsules)? {
-            RuntimeResponse::CapsuleList { capsules } => Ok(capsules),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Launch a capsule
-    pub fn launch_capsule(&mut self, cid: &str, config: LaunchConfig) -> io::Result<String> {
-        match self.call(RuntimeRequest::LaunchCapsule {
-            cid: cid.to_string(),
-            config,
-        })? {
-            RuntimeResponse::CapsuleLaunched { capsule_id } => Ok(capsule_id),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Stop a capsule
-    pub fn stop_capsule(&mut self, capsule_id: &str) -> io::Result<()> {
-        match self.call(RuntimeRequest::StopCapsule {
-            capsule_id: capsule_id.to_string(),
-        })? {
-            RuntimeResponse::Ok { .. } => Ok(()),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Grant capability to a capsule
-    pub fn grant_capability(
-        &mut self,
-        capsule_id: &str,
-        resource: &str,
-        action: &str,
-        constraints: CapabilityConstraints,
-    ) -> io::Result<String> {
-        match self.call(RuntimeRequest::GrantCapability {
-            capsule_id: capsule_id.to_string(),
-            resource: resource.to_string(),
-            action: action.to_string(),
-            constraints,
-        })? {
-            RuntimeResponse::CapabilityGranted { token_id } => Ok(token_id),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Revoke a capability
-    pub fn revoke_capability(&mut self, token_id: &str) -> io::Result<()> {
-        match self.call(RuntimeRequest::RevokeCapability {
-            token_id: token_id.to_string(),
-        })? {
-            RuntimeResponse::Ok { .. } => Ok(()),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Send message to another capsule
-    pub fn send_message(&mut self, to: &str, payload: Vec<u8>) -> io::Result<()> {
-        match self.call(RuntimeRequest::SendMessage {
-            to: to.to_string(),
-            payload,
-            reply_to: None,
-        })? {
-            RuntimeResponse::Ok { .. } => Ok(()),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Receive pending messages
-    pub fn receive_messages(&mut self) -> io::Result<Vec<IncomingMessage>> {
-        match self.call(RuntimeRequest::ReceiveMessages)? {
-            RuntimeResponse::Messages { messages } => Ok(messages),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Fetch content by URI
-    pub fn fetch_content(&mut self, uri: &str) -> io::Result<Vec<u8>> {
-        match self.call(RuntimeRequest::FetchContent {
-            uri: uri.to_string(),
-            token: None,
-        })? {
-            RuntimeResponse::Content { data } => Ok(data),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Fetch content by URI with an explicit read capability token.
-    pub fn fetch_content_with_token(&mut self, uri: &str, token: &str) -> io::Result<Vec<u8>> {
-        match self.call(RuntimeRequest::FetchContent {
-            uri: uri.to_string(),
-            token: Some(token.to_string()),
-        })? {
-            RuntimeResponse::Content { data } => Ok(data),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Read from storage
-    pub fn storage_read(&mut self, token: &str, path: &str) -> io::Result<Vec<u8>> {
-        match self.call(RuntimeRequest::StorageRead {
-            token: token.to_string(),
-            path: path.to_string(),
-        })? {
-            RuntimeResponse::StorageData { data } => Ok(data),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Write to storage
-    pub fn storage_write(&mut self, token: &str, path: &str, content: Vec<u8>) -> io::Result<()> {
-        match self.call(RuntimeRequest::StorageWrite {
-            token: token.to_string(),
-            path: path.to_string(),
-            content,
-        })? {
-            RuntimeResponse::Ok { .. } => Ok(()),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
     /// Get runtime info
     pub fn get_runtime_info(&mut self) -> io::Result<(String, usize)> {
         match self.call(RuntimeRequest::GetRuntimeInfo)? {
@@ -1078,33 +755,6 @@ impl RuntimeClient {
             action: action.to_string(),
         })? {
             RuntimeResponse::CapabilityToken { token } => Ok(token),
-            RuntimeResponse::Error { code, message } => {
-                Err(io::Error::other(format!("{}: {}", code, message)))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected response",
-            )),
-        }
-    }
-
-    /// Call a provider operation via the runtime.
-    /// The runtime routes the call to the appropriate provider (e.g., peer, did, storage).
-    pub fn provider_call(
-        &mut self,
-        scheme: &str,
-        op: &str,
-        body: &serde_json::Value,
-        token: &str,
-    ) -> io::Result<serde_json::Value> {
-        match self.call(RuntimeRequest::ProviderCall {
-            scheme: scheme.to_string(),
-            op: op.to_string(),
-            body: body.clone(),
-            token: token.to_string(),
-        })? {
-            RuntimeResponse::ProviderResult { result } => Ok(result),
-            RuntimeResponse::Ok { data } => Ok(data.unwrap_or(serde_json::json!({}))),
             RuntimeResponse::Error { code, message } => {
                 Err(io::Error::other(format!("{}: {}", code, message)))
             }
@@ -1167,27 +817,36 @@ mod tests {
     #[cfg(all(feature = "serde", not(target_os = "wasi")))]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    fn restore_env(key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn test_request_serialization() {
-        let req = RuntimeRequest::ListCapsules;
+        let req = RuntimeRequest::RequestCapability {
+            resource: "elastos://did/*".to_string(),
+            action: "execute".to_string(),
+        };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("list_capsules"));
+        assert!(json.contains("request_capability"));
+        assert!(json.contains("elastos://did/*"));
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn test_response_serialization() {
-        let resp = RuntimeResponse::CapsuleList {
-            capsules: vec![CapsuleListEntry {
-                id: "cap-1".to_string(),
-                name: "test".to_string(),
-                status: "running".to_string(),
-            }],
+        let resp = RuntimeResponse::CarrierResult {
+            result: serde_json::json!({"status": "ok"}),
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("capsule_list"));
-        assert!(json.contains("cap-1"));
+        assert!(json.contains("carrier_result"));
+        assert!(json.contains("ok"));
     }
 
     #[cfg(feature = "serde")]
@@ -1200,6 +859,43 @@ mod tests {
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("42"));
         assert!(json.contains("ping"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_carrier_uri_maps_to_host_adapter_scheme() {
+        assert_eq!(
+            RuntimeClient::provider_scheme_for_uri("localhost://Users/self/Documents/a.md")
+                .unwrap(),
+            "localhost"
+        );
+        assert_eq!(
+            RuntimeClient::provider_scheme_for_uri("elastos://did/*").unwrap(),
+            "did"
+        );
+        assert!(RuntimeClient::provider_scheme_for_uri("https://example.com").is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_carrier_body_adds_host_adapter_defaults() {
+        let localhost = RuntimeClient::carrier_body_for_http(
+            "localhost://Users/self/Documents/a.md",
+            &serde_json::json!({}),
+        );
+        assert_eq!(
+            localhost.get("path").and_then(|value| value.as_str()),
+            Some("localhost://Users/self/Documents/a.md")
+        );
+
+        let chain = RuntimeClient::carrier_body_for_http(
+            "elastos://chain/esc-mainnet/block_number",
+            &serde_json::json!({}),
+        );
+        assert_eq!(
+            chain.get("network").and_then(|value| value.as_str()),
+            Some("esc-mainnet")
+        );
     }
 
     #[test]
@@ -1222,6 +918,40 @@ mod tests {
             RuntimeClient::read_unbuffered_line(&mut cursor).unwrap(),
             "hello"
         );
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    #[test]
+    fn test_bridge_configured_detects_runtime_boot_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_fds = std::env::var("ELASTOS_CARRIER_FDS").ok();
+        let old_path = std::env::var("ELASTOS_CARRIER_PATH").ok();
+        let old_api = std::env::var("ELASTOS_API").ok();
+        let old_token = std::env::var("ELASTOS_TOKEN").ok();
+
+        std::env::remove_var("ELASTOS_CARRIER_FDS");
+        std::env::remove_var("ELASTOS_CARRIER_PATH");
+        std::env::remove_var("ELASTOS_API");
+        std::env::remove_var("ELASTOS_TOKEN");
+        assert!(!RuntimeClient::is_bridge_configured());
+
+        std::env::set_var("ELASTOS_CARRIER_FDS", "3,4");
+        assert!(RuntimeClient::is_bridge_configured());
+        std::env::remove_var("ELASTOS_CARRIER_FDS");
+
+        std::env::set_var("ELASTOS_CARRIER_PATH", "/dev/hvc0");
+        assert!(RuntimeClient::is_bridge_configured());
+        std::env::remove_var("ELASTOS_CARRIER_PATH");
+
+        std::env::set_var("ELASTOS_API", "http://127.0.0.1:3000");
+        assert!(!RuntimeClient::is_bridge_configured());
+        std::env::set_var("ELASTOS_TOKEN", "token");
+        assert!(RuntimeClient::is_bridge_configured());
+
+        restore_env("ELASTOS_CARRIER_FDS", old_fds);
+        restore_env("ELASTOS_CARRIER_PATH", old_path);
+        restore_env("ELASTOS_API", old_api);
+        restore_env("ELASTOS_TOKEN", old_token);
     }
 
     #[cfg(all(feature = "serde", not(target_os = "wasi")))]
@@ -1283,21 +1013,21 @@ mod tests {
 
                 line.clear();
 
-                // Request 2: provider_call(get_did)
+                // Request 2: carrier_invoke(get_did)
                 let _ = reader.read_line(&mut line).unwrap();
                 seen.push(line.clone());
-                if line.contains("\"provider_call\"") {
+                if line.contains("\"carrier_invoke\"") {
                     assert!(
-                        line.contains("\"scheme\":\"did\""),
-                        "unexpected provider scheme: {line}"
+                        line.contains("\"uri\":\"elastos://did/*\""),
+                        "unexpected carrier URI: {line}"
                     );
                     assert!(
-                        line.contains("\"op\":\"get_did\""),
-                        "unexpected provider op: {line}"
+                        line.contains("\"operation\":\"get_did\""),
+                        "unexpected carrier operation: {line}"
                     );
                     master
                         .write_all(
-                            br#"{"id":2,"response":{"type":"provider_result","result":{"data":{"did":"did:key:zTest"}}}}"#,
+                            br#"{"id":2,"response":{"type":"carrier_result","result":{"data":{"did":"did:key:zTest"}}}}"#,
                         )
                         .unwrap();
                     master.write_all(b"\n").unwrap();
@@ -1320,7 +1050,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(token, token_payload);
 
-                client.provider_call("did", "get_did", &serde_json::json!({}), &token)
+                client.carrier_invoke("elastos://did/*", "get_did", &serde_json::json!({}), &token)
             };
 
             if let Some(value) = old_fds {
@@ -1337,7 +1067,7 @@ mod tests {
             let seen = bridge.join().unwrap();
             assert!(
                 result.is_ok(),
-                "provider_call failed: {:?}; bridge saw: {:?}",
+                "carrier_invoke failed: {:?}; bridge saw: {:?}",
                 result,
                 seen
             );

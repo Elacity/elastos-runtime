@@ -129,6 +129,8 @@ struct ReleaseLedgerEntry {
     version: String,
     channel: String,
     release_cid: String,
+    #[serde(default)]
+    release_object_cid: Option<String>,
     head_cid: String,
     published_at: u64,
     signer_did: String,
@@ -176,6 +178,8 @@ struct ReleaseHeadEnvelope {
 #[derive(Debug, serde::Deserialize)]
 struct ReleaseHeadPayload {
     latest_release_cid: String,
+    #[serde(default)]
+    release_object_cid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -668,10 +672,17 @@ fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Resu
             .map(|name| name.to_string())
             .collect::<Vec<_>>(),
         "providers" => vec![
+            "availability-provider".to_string(),
+            "chain-provider".to_string(),
+            "decrypt-provider".to_string(),
             "did-provider".to_string(),
+            "drm-provider".to_string(),
             "ipfs-provider".to_string(),
+            "key-provider".to_string(),
             "localhost-provider".to_string(),
+            "rights-provider".to_string(),
             "tunnel-provider".to_string(),
+            "wallet-provider".to_string(),
         ],
         "full" => available.to_vec(),
         other => {
@@ -1179,6 +1190,7 @@ fn build_release_ledger_entry(
         version: release.payload.version,
         channel: release.payload.channel,
         release_cid: release_cid.to_string(),
+        release_object_cid: head.payload.release_object_cid,
         head_cid: head_cid.to_string(),
         published_at: release.payload.released_at,
         signer_did: release.signer_did,
@@ -1202,6 +1214,9 @@ fn print_release_diff_summary(
     println!("  Version: {}", current.version);
     println!("  Channel: {}", current.channel);
     println!("  Release: {}", current.release_cid);
+    if let Some(cid) = &current.release_object_cid {
+        println!("  Release object: {}", cid);
+    }
     println!("  Head:    {}", current.head_cid);
     println!("  Ledger:  {}", ledger_path.display());
 
@@ -1280,6 +1295,7 @@ async fn announce_release_head(entry: &ReleaseLedgerEntry) -> anyhow::Result<Vec
         let announcement = serde_json::json!({
             "head_cid": entry.head_cid,
             "release_cid": entry.release_cid,
+            "release_object_cid": entry.release_object_cid,
             "version": entry.version,
             "channel": entry.channel,
             "signer_did": entry.signer_did,
@@ -1466,6 +1482,7 @@ mod tests {
                 })
                 .collect(),
             provides: None,
+            authority: None,
             capabilities: Vec::new(),
             resources: ResourceLimits::default(),
             permissions: Permissions::default(),
@@ -1549,16 +1566,29 @@ mod tests {
         let available = vec![
             "chat".to_string(),
             "shell".to_string(),
-            "peer-provider".to_string(),
+            "did-provider".to_string(),
         ];
         assert_eq!(
             publish_profile_capsules("full", &available).unwrap(),
             vec![
                 "chat".to_string(),
-                "peer-provider".to_string(),
+                "did-provider".to_string(),
                 "shell".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_publish_profile_providers_includes_first_party_provider_capsules() {
+        let selected = publish_profile_capsules("providers", &[]).unwrap();
+
+        assert!(selected.contains(&"chain-provider".to_string()));
+        assert!(selected.contains(&"wallet-provider".to_string()));
+        assert!(selected.contains(&"drm-provider".to_string()));
+        assert!(selected.contains(&"rights-provider".to_string()));
+        assert!(selected.contains(&"key-provider".to_string()));
+        assert!(selected.contains(&"decrypt-provider".to_string()));
+        assert!(selected.contains(&"availability-provider".to_string()));
     }
 
     #[test]
@@ -1576,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_release_discovery_topics_include_scoped_and_legacy_topics() {
+    fn test_release_discovery_topics_include_scoped_and_global_topics() {
         let discovery_uri = source_discovery_uri("did:key:z6Mktest", "stable");
         let topics = release_discovery_topics(Some(&discovery_uri), "did:key:z6Mktest", "stable");
         assert_eq!(topics.len(), 3);
@@ -1601,7 +1631,7 @@ mod tests {
             components_cid: "old-components".to_string(),
             capsules: BTreeMap::from([
                 ("chat".to_string(), "cid-chat-1".to_string()),
-                ("peer-provider".to_string(), "cid-peer-1".to_string()),
+                ("removed-provider".to_string(), "cid-removed-1".to_string()),
             ]),
         };
         let current = BTreeMap::from([
@@ -1613,7 +1643,7 @@ mod tests {
             vec![
                 "chat".to_string(),
                 "did-provider".to_string(),
-                "peer-provider".to_string()
+                "removed-provider".to_string()
             ]
         );
     }
@@ -1869,6 +1899,7 @@ mod tests {
             version: "0.11.0".to_string(),
             channel: "stable".to_string(),
             release_cid: "release-cid".to_string(),
+            release_object_cid: Some("release-object-cid".to_string()),
             head_cid: "head-cid".to_string(),
             published_at: 42,
             signer_did: "did:key:z6Mktest".to_string(),
@@ -1893,6 +1924,7 @@ mod tests {
             version: "0.10.0".to_string(),
             channel: "stable".to_string(),
             release_cid: "old-release".to_string(),
+            release_object_cid: None,
             head_cid: "old-head".to_string(),
             published_at: 1,
             signer_did: "did:key:z6Mktest".to_string(),

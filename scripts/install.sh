@@ -808,7 +808,7 @@ cp "${TMPDIR}/release.json" "${PUBLISHER_ROOT}/release.json"
 info "Saved publisher metadata for future upgrades"
 
 # ── Guest-network compatibility mode (optional) ─────────────────────
-# Normal app capsules (chat, notepad, etc.) are Carrier-only and rootless.
+# Normal app capsules (chat, Documents, etc.) are Carrier-only and rootless.
 # CAP_NET_ADMIN belongs only to explicit guest-network capsules, mediated by
 # the runtime. Do NOT print sudo suggestions for normal installs.
 

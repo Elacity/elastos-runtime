@@ -739,7 +739,6 @@ elastos-runtime/                        # Repo root
 │   ├── gba-emulator/                   # GBA emulator web capsule
 │   ├── gba-ucity/                      # Data capsule with included ROM
 │   ├── agent/                          # AI agent capsule
-│   ├── notepad/                        # Capability-aware CLI notepad
 │   ├── did-provider/                   # elastos://did/ identity provider
 │   ├── ipfs-provider/                  # IPFS operations via managed Kubo daemon
 │   ├── ai-provider/                    # elastos://ai/ LLM routing
@@ -750,7 +749,6 @@ elastos-runtime/                        # Repo root
 │
 ├── scripts/                            # Dev convenience scripts
 │   ├── chat.sh                         # P2P chat launcher
-│   ├── notepad.sh                      # Notepad demo launcher
 │   ├── gba.sh                          # GBA emulator launcher
 │   ├── home-demo-local.sh              # Local Home demo launcher
 │   ├── home-smoke.sh                   # Home browser smoke test

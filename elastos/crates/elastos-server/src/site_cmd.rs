@@ -14,7 +14,6 @@ use elastos_common::localhost::{
 };
 use elastos_runtime::provider::{BridgeProviderConfig, ProviderBridge};
 use elastos_server::crypto::domain_separated_sign;
-use elastos_server::ipfs::IpfsBridge;
 use elastos_server::shares::load_or_create_share_key;
 use elastos_server::sources::default_data_dir;
 
@@ -1123,20 +1122,16 @@ async fn publish_site_bundle(target_path: &Path) -> anyhow::Result<(String, Site
     let entries = collect_site_entries(target_path)?;
     let digest = compute_site_digest(&entries);
     let bundle_dir = materialize_site_bundle(&entries)?;
-    let ipfs = get_ipfs_bridge().await?;
-    let bundle_cid = ipfs.add_directory_from_path(bundle_dir.path()).await?;
+    let registry = crate::get_content_registry().await?;
+    let bundle_cid = elastos_server::content::publish_directory_via_provider_with_kind(
+        &registry,
+        bundle_dir.path(),
+        "site",
+        Some(MY_WEBSITE_URI),
+        None,
+    )
+    .await?;
     Ok((bundle_cid, digest))
-}
-
-async fn get_ipfs_bridge() -> anyhow::Result<IpfsBridge> {
-    let binary = crate::resolve_verified_provider_binary(
-        "ipfs-provider",
-        "ipfs-provider not found. Run:\n\n  elastos setup --with kubo --with ipfs-provider",
-    )?;
-    let bridge = ProviderBridge::spawn(&binary, BridgeProviderConfig::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
-    Ok(IpfsBridge::new(std::sync::Arc::new(bridge)))
 }
 
 fn normalize_domain(domain: &str) -> anyhow::Result<String> {

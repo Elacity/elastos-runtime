@@ -63,15 +63,9 @@ struct Args {
     backend: String,
     respond_all: bool,
     connect: Option<String>,
-    api_url: String,
-    session_token: String,
 }
 
 fn parse_args() -> Result<Args> {
-    let api_url =
-        std::env::var("ELASTOS_API").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
-    let session_token = std::env::var("ELASTOS_TOKEN").unwrap_or_default();
-
     let args: Vec<String> = std::env::args().collect();
     let mut nick = "agent".to_string();
     let mut channel = "#general".to_string();
@@ -150,8 +144,6 @@ fn parse_args() -> Result<Args> {
         backend,
         respond_all,
         connect,
-        api_url,
-        session_token,
     })
 }
 
@@ -171,13 +163,11 @@ fn signing_payload_hex(sender_id: &str, ts: u64, content: &str) -> String {
 }
 
 /// Sign a message via the DID provider. Returns the hex signature or None on failure.
-fn sign_message(args: &Args, did_token: &str, sender_id: &str, ts: u64, content: &str) -> Option<String> {
+fn sign_message(did_token: &str, sender_id: &str, ts: u64, content: &str) -> Option<String> {
     let payload_hex = signing_payload_hex(sender_id, ts, content);
-    match api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    match api::carrier_invoke(
         did_token,
-        "did",
+        "elastos://did/*",
         "sign",
         &serde_json::json!({"data": payload_hex}),
     ) {
@@ -194,7 +184,7 @@ fn sign_message(args: &Args, did_token: &str, sender_id: &str, ts: u64, content:
 }
 
 /// Verify a message signature via the DID provider. Returns true if verified.
-fn verify_message(args: &Args, did_token: &str, msg: &Message) -> bool {
+fn verify_message(did_token: &str, msg: &Message) -> bool {
     let signature = match &msg.signature {
         Some(sig) if !sig.is_empty() => sig,
         _ => return false, // unsigned
@@ -203,11 +193,9 @@ fn verify_message(args: &Args, did_token: &str, msg: &Message) -> bool {
         return false;
     }
     let payload_hex = signing_payload_hex(&msg.sender_id, msg.ts, &msg.content);
-    match api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    match api::carrier_invoke(
         did_token,
-        "did",
+        "elastos://did/*",
         "verify",
         &serde_json::json!({
             "did": msg.sender_id,
@@ -259,23 +247,16 @@ fn build_system_prompt(nick: &str) -> String {
     )
 }
 
-fn call_ai(
-    args: &Args,
-    ai_token: &str,
-    system_prompt: &str,
-    user_content: &str,
-) -> Result<String> {
+fn call_ai(args: &Args, ai_token: &str, system_prompt: &str, user_content: &str) -> Result<String> {
     let truncated = if user_content.len() > MAX_INPUT_CHARS {
         &user_content[..MAX_INPUT_CHARS]
     } else {
         user_content
     };
 
-    let resp = api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    let resp = api::carrier_invoke(
         ai_token,
-        "ai",
+        "elastos://ai/*",
         "chat_completions",
         &serde_json::json!({
             "backend": args.backend,
@@ -332,7 +313,14 @@ fn call_ai_with_warmup(
     // Transient error — send warmup notice and retry
     let warmup_msg = "Local model warming up (first run can take a few minutes)...";
     eprintln!("<{}> {}", args.nick, warmup_msg);
-    gossip_send(args, peer_token, did_token, &args.channel, warmup_msg, own_did);
+    gossip_send(
+        args,
+        peer_token,
+        did_token,
+        &args.channel,
+        warmup_msg,
+        own_did,
+    );
 
     let start = Instant::now();
     loop {
@@ -377,12 +365,10 @@ fn gossip_send(
     own_did: &str,
 ) {
     let ts = now_ts();
-    let signature = sign_message(args, did_token, own_did, ts, content);
-    if let Err(e) = api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    let signature = sign_message(did_token, own_did, ts, content);
+    if let Err(e) = api::carrier_invoke(
         peer_token,
-        "peer",
+        "elastos://peer/*",
         "gossip_send",
         &serde_json::json!({
             "topic": topic,
@@ -401,48 +387,34 @@ fn main() -> Result<()> {
     eprintln!("agent: starting v{}", AGENT_VERSION);
     let args = parse_args()?;
 
-    if args.session_token.is_empty() {
-        eprintln!("Error: ELASTOS_TOKEN not set. Agent must run under the runtime.");
+    if let Err(err) = api::ensure_runtime_bridge() {
+        eprintln!("Error: {}. Agent must run under the ElastOS runtime.", err);
         std::process::exit(1);
     }
 
-    eprintln!("Agent '{}' starting (backend={}, channel={})", args.nick, args.backend, args.channel);
+    eprintln!(
+        "Agent '{}' starting (backend={}, channel={})",
+        args.nick, args.backend, args.channel
+    );
 
     // Acquire capabilities
     eprintln!("Acquiring capabilities...");
 
-    let did_token = api::acquire_capability(
-        &args.api_url,
-        &args.session_token,
-        "elastos://did/*",
-        "execute",
-    )?;
+    let did_token = api::acquire_capability("elastos://did/*", "execute")?;
 
-    let peer_token = api::acquire_capability(
-        &args.api_url,
-        &args.session_token,
-        "elastos://peer/*",
-        "execute",
-    )?;
+    let peer_token = api::acquire_capability("elastos://peer/*", "execute")?;
 
     let ai_resource = if args.respond_all {
         "elastos://ai/*".to_string()
     } else {
         format!("elastos://ai/{}/*", args.backend)
     };
-    let ai_token = api::acquire_capability(
-        &args.api_url,
-        &args.session_token,
-        &ai_resource,
-        "execute",
-    )?;
+    let ai_token = api::acquire_capability(&ai_resource, "execute")?;
 
     // Get agent persona DID (separate identity from the user)
-    let (own_did, owner_did) = match api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    let (own_did, owner_did) = match api::carrier_invoke(
         &did_token,
-        "did",
+        "elastos://did/*",
         "get_persona_did",
         &serde_json::json!({"name": args.nick}),
     ) {
@@ -469,16 +441,22 @@ fn main() -> Result<()> {
 
     eprintln!(
         "DID: {} (owner: {})",
-        if own_did.is_empty() { "(none)" } else { &own_did },
-        if owner_did.is_empty() { "(none)" } else { &owner_did },
+        if own_did.is_empty() {
+            "(none)"
+        } else {
+            &own_did
+        },
+        if owner_did.is_empty() {
+            "(none)"
+        } else {
+            &owner_did
+        },
     );
 
     // Join gossip channel (already_joined is OK — shared runtime)
-    match api::provider_call(
-        &args.api_url,
-        &args.session_token,
+    match api::carrier_invoke(
         &peer_token,
-        "peer",
+        "elastos://peer/*",
         "gossip_join",
         &serde_json::json!({"topic": &args.channel}),
     ) {
@@ -494,11 +472,9 @@ fn main() -> Result<()> {
 
     // Connect to peer via ticket if provided (deterministic bootstrap)
     if let Some(ref ticket) = args.connect {
-        match api::provider_call(
-            &args.api_url,
-            &args.session_token,
+        match api::carrier_invoke(
             &peer_token,
-            "peer",
+            "elastos://peer/*",
             "connect",
             &serde_json::json!({"ticket": ticket}),
         ) {
@@ -508,7 +484,14 @@ fn main() -> Result<()> {
     }
 
     // Announce presence (signed)
-    gossip_send(&args, &peer_token, &did_token, &args.channel, &format!("{} joined the chat", args.nick), &own_did);
+    gossip_send(
+        &args,
+        &peer_token,
+        &did_token,
+        &args.channel,
+        &format!("{} joined the chat", args.nick),
+        &own_did,
+    );
 
     // Install Ctrl+C handler (safe signal registration)
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -524,11 +507,9 @@ fn main() -> Result<()> {
 
     while running.load(std::sync::atomic::Ordering::Relaxed) {
         // Poll gossip
-        match api::provider_call(
-            &args.api_url,
-            &args.session_token,
+        match api::carrier_invoke(
             &peer_token,
-            "peer",
+            "elastos://peer/*",
             "gossip_recv",
             &serde_json::json!({"topic": &args.channel, "limit": 50, "consumer_id": &consumer_id}),
         ) {
@@ -565,12 +546,15 @@ fn main() -> Result<()> {
                         }
 
                         // Verify message signature before acting
-                        let verified = verify_message(&args, &did_token, &msg);
+                        let verified = verify_message(&did_token, &msg);
                         if !verified {
                             // Log unverified messages but don't act on them —
                             // prevents forged @mentions from burning LLM tokens
                             if msg.signature.is_some() {
-                                eprintln!("[unverified] <{}> {} (signature invalid)", msg.sender_nick, msg.content);
+                                eprintln!(
+                                    "[unverified] <{}> {} (signature invalid)",
+                                    msg.sender_nick, msg.content
+                                );
                             }
                             // Unsigned messages from older clients: still show but don't trigger AI
                             continue;
@@ -604,7 +588,14 @@ fn main() -> Result<()> {
                         eprintln!("<{}> {}", args.nick, response_text);
 
                         // Send signed response via gossip
-                        gossip_send(&args, &peer_token, &did_token, &args.channel, &response_text, &own_did);
+                        gossip_send(
+                            &args,
+                            &peer_token,
+                            &did_token,
+                            &args.channel,
+                            &response_text,
+                            &own_did,
+                        );
                         last_response = Instant::now();
                     }
                 }
@@ -619,7 +610,14 @@ fn main() -> Result<()> {
 
     // Graceful shutdown (signed)
     eprintln!("Shutting down...");
-    gossip_send(&args, &peer_token, &did_token, &args.channel, &format!("{} left the chat", args.nick), &own_did);
+    gossip_send(
+        &args,
+        &peer_token,
+        &did_token,
+        &args.channel,
+        &format!("{} left the chat", args.nick),
+        &own_did,
+    );
 
     Ok(())
 }
@@ -745,7 +743,9 @@ mod tests {
 
     #[test]
     fn test_is_warmup_error() {
-        assert!(is_warmup_error("[model_loading] Local AI model is still loading."));
+        assert!(is_warmup_error(
+            "[model_loading] Local AI model is still loading."
+        ));
         assert!(is_warmup_error("[local_unavailable] Connection refused"));
         assert!(!is_warmup_error("[timeout] Request timed out after 120s"));
         assert!(!is_warmup_error("[api_error] 500 Internal Server Error"));
@@ -775,7 +775,8 @@ mod tests {
     #[test]
     fn test_message_without_signature() {
         // Backward compatibility: messages without signature field should parse
-        let json = r#"{"sender_id":"did:key:z6Mk123","sender_nick":"alice","content":"hi","ts":1000}"#;
+        let json =
+            r#"{"sender_id":"did:key:z6Mk123","sender_nick":"alice","content":"hi","ts":1000}"#;
         let msg: Message = serde_json::from_str(json).unwrap();
         assert!(msg.signature.is_none());
     }

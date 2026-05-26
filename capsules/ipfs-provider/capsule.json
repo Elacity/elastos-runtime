@@ -11,6 +11,17 @@
     { "name": "kubo", "kind": "external" }
   ],
   "provides": "elastos://ipfs/*",
+  "authority": {
+    "reason": "Low-level Kubo backend for the runtime content provider; ordinary capsules must use elastos://content/* instead.",
+    "capabilities": [
+      {
+        "resource": "elastos://ipfs/*",
+        "actions": ["read", "write", "delete", "admin"],
+        "operations": ["add_bytes", "add_path", "add_directory", "cat", "cat_to_path", "get_bytes", "ls", "download_directory", "pin", "unpin", "health", "status"]
+      }
+    ],
+    "audit_events": ["ipfs.publish", "ipfs.fetch", "ipfs.pin", "ipfs.unpin"]
+  },
   "capabilities": ["localhost://ElastOS/SystemServices/IPFS/*"],
   "resources": {
     "memory_mb": 128,

@@ -400,6 +400,7 @@ mod tests {
             entrypoint: "main.wasm".to_string(),
             requires: Vec::new(),
             provides: None,
+            authority: None,
             capabilities: Vec::new(),
             resources: ResourceLimits::default(),
             permissions: Permissions::default(),

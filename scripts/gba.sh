@@ -66,6 +66,8 @@ show_help() {
     echo '     {"version":"1.0","name":"my-game","type":"data",'
     echo '      "entrypoint":"rom.gba","viewer":"../gba-emulator",'
     echo '      "permissions":{"storage":["localhost://Users/self/.AppData/LocalHost/GBA/my-game/*"]}}'
+    echo "     Note: Users/self is a capsule-local alias resolved by Runtime to"
+    echo "     the active passkey principal; it is not a shared user directory."
     echo "  4. Run:                ./scripts/gba.sh capsules/my-game"
     echo ""
     exit 0

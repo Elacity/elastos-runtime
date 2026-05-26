@@ -276,25 +276,6 @@ pub fn build_share_bundle_with_viewer_dir(
     Ok((bundle_dir, meta))
 }
 
-/// Backfill legacy channels where `latest_version == 0` but `latest_cid` is non-empty.
-pub fn backfill_legacy_catalog(mut catalog: ShareCatalog) -> ShareCatalog {
-    for (_name, ch) in catalog.channels.iter_mut() {
-        if ch.latest_version == 0 && !ch.latest_cid.is_empty() {
-            ch.latest_version = 1;
-            if ch.history.is_empty() {
-                ch.history.push(ShareEntry {
-                    cid: ch.latest_cid.clone(),
-                    version: 1,
-                    created_at: ch.updated_at,
-                    content_digest: None,
-                    provenance_cid: None,
-                });
-            }
-        }
-    }
-    catalog
-}
-
 pub fn load_share_catalog() -> anyhow::Result<ShareCatalog> {
     let path = share_catalog_path();
     if !path.exists() {
@@ -308,7 +289,7 @@ pub fn load_share_catalog() -> anyhow::Result<ShareCatalog> {
     if catalog.schema.is_empty() {
         catalog.schema = "elastos.share.catalog/v1".to_string();
     }
-    Ok(backfill_legacy_catalog(catalog))
+    Ok(catalog)
 }
 
 pub fn save_share_catalog(catalog: &ShareCatalog) -> anyhow::Result<()> {
@@ -391,7 +372,7 @@ pub struct ProvenancePayload {
     pub tool_version: String,
 }
 
-/// Signed provenance — payload + signature. This is what gets published to IPFS.
+/// Signed provenance — payload + signature published through the content provider.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Provenance {
     #[serde(flatten)]
@@ -501,7 +482,7 @@ pub struct ChannelHeadPayload {
     pub revoke_reason: Option<String>,
 }
 
-/// Signed channel head — payload + signature. Published to IPFS as head.json.
+/// Signed channel head — payload + signature published through the content provider.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ChannelHead {
     #[serde(flatten)]
@@ -613,12 +594,12 @@ pub fn is_valid_cid(s: &str) -> bool {
     cid::Cid::try_from(s).is_ok()
 }
 
-/// Create and publish a signed channel head to IPFS.
+/// Create and publish a signed channel head through the content availability provider.
 ///
-/// Returns the head CID if successful, or None if signing/publishing fails
-/// (with warnings printed to stderr).
+/// Returns the head CID if successful, or None if signing/publishing fails with warnings on stderr.
 #[allow(clippy::too_many_arguments)]
-pub async fn publish_channel_head(
+pub async fn publish_channel_head_via_provider(
+    registry: &elastos_runtime::provider::ProviderRegistry,
     channel: &str,
     latest_cid: &str,
     latest_version: u64,
@@ -626,15 +607,9 @@ pub async fn publish_channel_head(
     provenance_cid: Option<&str>,
     prev_head_cid: Option<&str>,
     revoke_reason: Option<&str>,
-    ipfs: &crate::ipfs::IpfsBridge,
+    publisher_did: Option<&str>,
+    signing_key: &signature::SigningKey,
 ) -> Option<String> {
-    let sk = match load_or_create_share_key() {
-        Ok(sk) => sk,
-        Err(e) => {
-            eprintln!("Warning: signing key unavailable: {}", e);
-            return None;
-        }
-    };
     let head_bytes = match create_channel_head(
         channel,
         latest_cid,
@@ -643,7 +618,7 @@ pub async fn publish_channel_head(
         provenance_cid,
         prev_head_cid,
         revoke_reason,
-        &sk,
+        signing_key,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -651,7 +626,15 @@ pub async fn publish_channel_head(
             return None;
         }
     };
-    match ipfs.add_bytes(&head_bytes, "head.json").await {
+    match crate::content::publish_bytes_via_provider(
+        registry,
+        "head.json",
+        &head_bytes,
+        Some(channel),
+        publisher_did,
+    )
+    .await
+    {
         Ok(hcid) => {
             println!("  Head:       elastos://{}", hcid);
             Some(hcid)
@@ -773,16 +756,6 @@ mod tests {
             Some("sensitive".to_string())
         );
         assert_eq!(cat2.author_did, Some("did:key:z6MkTest".to_string()));
-    }
-
-    #[test]
-    fn test_legacy_channel_backfill() {
-        let json = r#"{"channels":{"docs":{"latest_cid":"bafy123"}}}"#;
-        let cat: ShareCatalog = serde_json::from_str(json).unwrap();
-        let cat = backfill_legacy_catalog(cat);
-        assert_eq!(cat.channels["docs"].latest_version, 1);
-        assert_eq!(cat.channels["docs"].history.len(), 1);
-        assert_eq!(cat.channels["docs"].history[0].cid, "bafy123");
     }
 
     #[test]

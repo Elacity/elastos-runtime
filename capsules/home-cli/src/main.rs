@@ -394,23 +394,23 @@ fn request_capability(resource: &str, action: &str) -> Result<String> {
     })
 }
 
-fn provider_call(
+fn carrier_invoke(
     token: &str,
-    scheme: &str,
-    op: &str,
+    uri: &str,
+    operation: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     with_client(|client| {
         client
-            .provider_call(scheme, op, body, token)
-            .map_err(|e| anyhow!("Provider call {}/{} failed: {}", scheme, op, e))
+            .carrier_invoke(uri, operation, body, token)
+            .map_err(|e| anyhow!("Carrier invoke {} {} failed: {}", operation, uri, e))
     })
 }
 
 fn storage_read(token: &str, path: &str) -> Result<Vec<u8>> {
-    let result = provider_call(
+    let result = carrier_invoke(
         token,
-        "localhost",
+        path,
         "read",
         &serde_json::json!({
             "path": path,
@@ -437,9 +437,9 @@ fn storage_read(token: &str, path: &str) -> Result<Vec<u8>> {
 }
 
 fn storage_write(token: &str, path: &str, content: Vec<u8>) -> Result<()> {
-    provider_call(
+    carrier_invoke(
         token,
-        "localhost",
+        path,
         "write",
         &serde_json::json!({
             "path": path,
@@ -1766,7 +1766,7 @@ fn compact_system_summary_lines(snapshot: &HomeSnapshot) -> Vec<String> {
             ready,
             snapshot.system_services.len()
         ),
-        "Roots      ElastOS · PC2Host".to_string(),
+        "Root       ElastOS".to_string(),
     ]
 }
 
@@ -1789,10 +1789,6 @@ fn compact_system_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     lines.push(format!(
         "ElastOS    {}",
         root_example(snapshot, "ElastOS", "localhost://ElastOS/SystemRegistry")
-    ));
-    lines.push(format!(
-        "PC2Host    {}",
-        root_example(snapshot, "PC2Host", "localhost://PC2Host/AdaptationLayer")
     ));
     lines.push("Next       elastos home --status for full detail".to_string());
     lines
@@ -1837,7 +1833,7 @@ fn root_group_name(root: &str) -> &'static str {
         "Users" | "UsersAI" => "People",
         "Local" | "Public" | "MyWebSite" | "WebSpaces" => "Spaces",
         "AppCapsules" => "Apps",
-        "ElastOS" | "PC2Host" => "System",
+        "ElastOS" => "System",
         _ => "World",
     }
 }
@@ -3033,7 +3029,7 @@ mod tests {
                     path: Some("/tmp/Users".to_string()),
                     exists: true,
                     description: "People root".to_string(),
-                    example: "localhost://Users/self".to_string(),
+                    example: "localhost://Users/<principal-root>".to_string(),
                 },
                 RootStatus {
                     name: "UsersAI".to_string(),
@@ -3088,15 +3084,6 @@ mod tests {
                     exists: true,
                     description: "System root".to_string(),
                     example: "localhost://ElastOS/SystemRegistry".to_string(),
-                },
-                RootStatus {
-                    name: "PC2Host".to_string(),
-                    kind: "file-backed".to_string(),
-                    uri: "localhost://PC2Host".to_string(),
-                    path: Some("/tmp/PC2Host".to_string()),
-                    exists: true,
-                    description: "Host root".to_string(),
-                    example: "localhost://PC2Host/AdaptationLayer".to_string(),
                 },
             ],
             actions: vec![
@@ -3903,7 +3890,7 @@ mod tests {
         assert!(lines.len() <= 10);
         assert!(lines.iter().any(|line| line.starts_with("Updates")));
         assert!(lines.iter().any(|line| line.starts_with("ElastOS")));
-        assert!(lines.iter().any(|line| line.starts_with("PC2Host")));
+        assert!(lines.iter().any(|line| line == "Root       ElastOS"));
         assert!(lines.iter().any(|line| line.starts_with("Next")));
         assert!(!lines.iter().any(|line| line.starts_with("API")));
     }

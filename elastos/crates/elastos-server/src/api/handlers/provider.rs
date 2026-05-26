@@ -12,7 +12,7 @@ use axum::{
 };
 use serde_json::Value;
 
-use elastos_common::localhost::rooted_localhost_uri;
+use crate::provider_resource::build_capability_resource;
 use elastos_runtime::capability::{CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::Session;
@@ -65,41 +65,6 @@ pub async fn provider_proxy(
     };
 
     Ok(Json(response))
-}
-
-/// Build the capability resource string for a provider proxy request.
-///
-/// First-party `elastos://` sub-providers (ai, did, peer) use `elastos://<scheme>/...`.
-/// All other schemes use their native `<scheme>://*` format.
-fn build_capability_resource(scheme: &str, op: &str, request: &Value) -> Result<String, String> {
-    match scheme {
-        "localhost" => match request
-            .get("path")
-            .and_then(|value| value.as_str())
-            .filter(|path| !path.is_empty())
-        {
-            Some(path) => rooted_localhost_uri(path)
-                .ok_or_else(|| format!("Invalid rooted localhost path: {}", path)),
-            None => Err("localhost provider request missing path".to_string()),
-        },
-        "ai" => {
-            let backend = request.get("backend").and_then(|v| v.as_str());
-            match backend {
-                Some(b) => {
-                    if !b
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    {
-                        return Err(format!("Invalid backend name: {}", b));
-                    }
-                    Ok(format!("elastos://ai/{}/{}", b, op))
-                }
-                None => Ok(format!("elastos://ai/meta/{}", op)),
-            }
-        }
-        "did" | "peer" => Ok(format!("elastos://{}/*", scheme)),
-        _ => Ok(format!("{}://*", scheme)),
-    }
 }
 
 /// Validate that the session has permission for this provider operation.
@@ -166,59 +131,6 @@ mod tests {
     use axum::Extension;
     use elastos_runtime::provider::ProviderRegistry;
     use elastos_runtime::session::SessionType;
-
-    #[test]
-    fn test_ai_resource_with_backend() {
-        let request = serde_json::json!({"backend": "local", "op": "chat_completions"});
-        let result = build_capability_resource("ai", "chat_completions", &request);
-        assert_eq!(result.unwrap(), "elastos://ai/local/chat_completions");
-    }
-
-    #[test]
-    fn test_ai_resource_without_backend() {
-        let request = serde_json::json!({"op": "list_backends"});
-        let result = build_capability_resource("ai", "list_backends", &request);
-        assert_eq!(result.unwrap(), "elastos://ai/meta/list_backends");
-    }
-
-    #[test]
-    fn test_ai_resource_invalid_backend() {
-        let request = serde_json::json!({"backend": "bad/name", "op": "chat"});
-        let result = build_capability_resource("ai", "chat", &request);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid backend name"));
-    }
-
-    #[test]
-    fn test_non_ai_resource() {
-        let request =
-            serde_json::json!({"op": "read", "path": "Local/SharedByLocalUsersAndBots/Home/demo"});
-        let result = build_capability_resource("localhost", "read", &request);
-        assert_eq!(
-            result.unwrap(),
-            "localhost://Local/SharedByLocalUsersAndBots/Home/demo"
-        );
-    }
-
-    #[test]
-    fn test_first_party_sub_provider_resource() {
-        let request = serde_json::json!({"op": "get_did"});
-        assert_eq!(
-            build_capability_resource("did", "get_did", &request).unwrap(),
-            "elastos://did/*"
-        );
-        assert_eq!(
-            build_capability_resource("peer", "connect", &request).unwrap(),
-            "elastos://peer/*"
-        );
-    }
-
-    #[test]
-    fn test_localhost_resource_requires_path() {
-        let request = serde_json::json!({"op": "read"});
-        let result = build_capability_resource("localhost", "read", &request);
-        assert!(result.is_err());
-    }
 
     #[tokio::test]
     async fn test_provider_proxy_returns_structured_provider_error() {

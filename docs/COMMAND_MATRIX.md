@@ -48,7 +48,7 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | `elastos update` | Carrier-only by default after install; explicit transport override required for web bootstrap/debug paths; unstamped installs fail fast with `No trusted source configured` |
 | `elastos upgrade` | Alias for update |
 | `elastos init` | Scaffolds capsule project |
-| `elastos verify` | Checks signatures offline |
+| `elastos verify` | Checks local capsule signatures offline; provenance CID reads use `elastos://content/*` |
 | `elastos sign` | Signs capsule offline |
 | `elastos keys *` | Key management |
 | `elastos source *` | Trusted source config |
@@ -62,17 +62,17 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | `elastos node room * --peer <did>` | Source-side explicit remote room control over Carrier. Reads room state, reviews pending browser access requests, approves/denies them, and starts/reuses the remote room gateway. The target peer must explicitly allow `room.read`, `room.approve`, `room.deny`, and/or `room.open`. |
 | `elastos node update --peer <did> --check` | Source-side operator command; the target peer should be prepared with `elastos setup --profile operator` and running explicit `elastos serve` |
 | `elastos node update --peer <did> --apply --yes` | Source-side operator command; mutating remote trusted-source update; target restart is still manual and the target peer should be prepared with `elastos setup --profile operator` |
-| `elastos share` | Host-side content bundle using `ipfs-provider`; exits immediately. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
-| `elastos share --public` | Host-side content bundle using `ipfs-provider` plus explicit tunnel-provider public edge; keeps the immediate public link alive until Ctrl+C |
-| `elastos open` | Host-side `ipfs-provider` fetch + local web serve. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
-| `elastos shares *` | Local catalog plus host-side `ipfs-provider` access |
-| `elastos attest` | Provenance signing plus host-side `ipfs-provider` access |
+| `elastos share` | Host-side content bundle published through `elastos://content/*`; exits immediately. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
+| `elastos share --public` | Host-side content bundle published through `elastos://content/*` plus explicit tunnel-provider public edge; keeps the immediate public link alive until Ctrl+C |
+| `elastos open` | Host-side data-capsule materialization through `elastos://content/*` + local web serve. Release object CIDs are opened as verified terminal metadata summaries, not launchable capsules. On a fresh installed layout, add the explicit extras first: `elastos setup --with kubo --with ipfs-provider --with documents` |
+| `elastos shares *` | Local catalog plus content-provider channel-head reads/writes |
+| `elastos attest` | Provenance signing and optional share digest fetch through `elastos://content/*` |
 | `elastos site stage` | Stages a static site into `localhost://MyWebSite` |
 | `elastos site path` | Prints the staged local root and filesystem path |
-| `elastos site publish [--release <name>]` | Packages the current site root as an immutable CID-backed site bundle, prints `elastos://<cid>`, and can store a friendly named release alias under `localhost://ElastOS/SystemServices/Publisher/SiteReleases/...`. On a fresh installed layout, add `elastos setup --with kubo --with ipfs-provider` first |
+| `elastos site publish [--release <name>]` | Packages the current site root through `elastos://content/*` as an immutable CID-backed site bundle, prints `elastos://<cid>`, and can store a friendly named release alias under `localhost://ElastOS/SystemServices/Publisher/SiteReleases/...`. On a fresh installed layout, add `elastos setup --with kubo --with ipfs-provider` first |
 | `elastos site releases` | Lists named site releases stored under `localhost://ElastOS/SystemServices/Publisher/SiteReleases/...` |
 | `elastos site channels` | Lists promotion channels stored under `localhost://ElastOS/SystemServices/Edge/ReleaseChannels/...` |
-| `elastos site activate [--release <name> | --channel <name>]` | Either publishes the current site root as a CID-backed bundle, activates an existing named release, or activates the release currently promoted to a channel, then signs it into Edge site-head state under `localhost://ElastOS/SystemServices/Edge/SiteHeads/...`. On a fresh installed layout, add `elastos setup --with kubo --with ipfs-provider` first when activation needs CID-backed publish/fetch support |
+| `elastos site activate [--release <name> | --channel <name>]` | Either publishes the current site root through `elastos://content/*`, activates an existing named release, or activates the release currently promoted to a channel, then signs it into Edge site-head state under `localhost://ElastOS/SystemServices/Edge/SiteHeads/...`. On a fresh installed layout, add `elastos setup --with kubo --with ipfs-provider` first when activation needs CID-backed publish/fetch support |
 | `elastos site history` | Lists signed site-head activation snapshots from `localhost://ElastOS/SystemServices/Edge/SiteHistory/...` |
 | `elastos site rollback [release-or-bundle-cid]` | Re-points the active site head to a previous published site bundle or named release snapshot and records a new rollback activation |
 | `elastos site promote <channel> <release>` | Promotes a named release into an Edge release channel under `localhost://ElastOS/SystemServices/Edge/ReleaseChannels/...` |
@@ -88,14 +88,14 @@ The detailed runtime/TTY/home contract for those paths lives in [INTERACTIVE_RUN
 | Command | Notes |
 |---------|-------|
 | `elastos` | Default user entrypoint. Opens Home with no subcommand. |
-| `elastos home` | Explicit compatibility alias for Home. Auto-starts/reuses a dedicated managed Home runtime on loopback, renders the local Home surface, and returns Home after launched actions exit. |
+| `elastos home` | Explicit Home entrypoint. Auto-starts/reuses a dedicated managed Home runtime on loopback, renders the local Home surface, and returns Home after launched actions exit. |
 | `elastos capsule <name> --lifecycle interactive --interactive` | Interactive packaged capsule path. Reuses a compatible active runtime when one is already running; otherwise uses the managed Home runtime. |
 
 ### Managed User Runtime (auto-start)
 
 | Command | Policy needed | Notes |
 |---------|---------------|-------|
-| `elastos chat` | peer, did, `Users/self/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed Home runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
+| `elastos chat` | peer, did, `Users/<principal-root>/.AppData/LocalHost/Chat` | Native Carrier chat only. First tries to reuse a healthy managed Home runtime; otherwise starts/reuses a managed chat runtime on loopback. Packaged full-screen chat and `chat-wasm` surfaces launch through `elastos capsule ...`, not `elastos chat`. |
 
 ### Operator Runtime (requires `elastos serve`)
 

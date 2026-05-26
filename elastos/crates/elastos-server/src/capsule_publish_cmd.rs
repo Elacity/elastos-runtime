@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
 pub async fn run_publish(path: PathBuf) -> anyhow::Result<()> {
-    let ipfs = crate::get_ipfs_bridge().await?;
-
     let manifest_path = path.join("capsule.json");
     if !manifest_path.exists() {
         anyhow::bail!("No capsule.json found at {}", path.display());
@@ -20,13 +18,25 @@ pub async fn run_publish(path: PathBuf) -> anyhow::Result<()> {
     }
 
     if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
+        let ipfs = crate::get_operator_ipfs_bridge().await?;
         elastos_server::ipfs::publish_microvm_capsule(&path, &mut manifest, &ipfs).await?;
         return Ok(());
     }
 
-    println!("Publishing capsule '{}' to IPFS...", manifest.name);
+    println!(
+        "Publishing capsule '{}' through content availability...",
+        manifest.name
+    );
 
-    let cid = ipfs.add_directory_from_path(&path).await?;
+    let content_registry = crate::get_content_registry().await?;
+    let cid = elastos_server::content::publish_directory_via_provider_with_kind(
+        &content_registry,
+        &path,
+        "capsule",
+        None,
+        None,
+    )
+    .await?;
 
     println!("\nCapsule published successfully!");
     println!("CID: {}", cid);

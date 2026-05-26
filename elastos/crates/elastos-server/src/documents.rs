@@ -4,7 +4,6 @@ use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail};
-use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
@@ -13,7 +12,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const DOCUMENTS_SCHEMA: &str = "elastos.document/v1";
+const DOCUMENTS_SCHEMA: &str = "elastos.document/v2";
 const DOCUMENTS_DEFAULT_TITLE: &str = "Untitled";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +105,7 @@ pub struct DocumentsUnpublishResponse {
 struct DocumentsMetadata {
     pub schema: String,
     pub doc_did: String,
+    pub principal_id: String,
     pub owner_did: String,
     pub title: String,
     pub file_name: String,
@@ -119,22 +119,28 @@ struct DocumentsMetadata {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum DocumentsProviderRequest {
-    Summary,
+    Summary {
+        principal_id: String,
+    },
     Create {
+        principal_id: String,
         #[serde(default)]
         title: Option<String>,
     },
     Get {
+        principal_id: String,
         doc_did: String,
     },
     Save {
+        principal_id: String,
         doc_did: String,
         title: String,
         body: String,
     },
     SaveAs {
+        principal_id: String,
         doc_did: String,
         #[serde(default)]
         title: Option<String>,
@@ -143,12 +149,15 @@ enum DocumentsProviderRequest {
         body: String,
     },
     Delete {
+        principal_id: String,
         doc_did: String,
     },
     Publish {
+        principal_id: String,
         doc_did: String,
     },
     Unpublish {
+        principal_id: String,
         doc_did: String,
     },
 }
@@ -188,27 +197,38 @@ impl Provider for DocumentsProvider {
         };
 
         let result = match request {
-            DocumentsProviderRequest::Publish { doc_did } => {
+            DocumentsProviderRequest::Publish {
+                principal_id,
+                doc_did,
+            } => {
                 let Some(registry) = self.registry.upgrade() else {
                     return Ok(provider_error(
                         "documents_error",
                         "documents provider registry unavailable",
                     ));
                 };
-                documents_publish_via_provider_plane(&data_dir, &registry, &doc_did)
+                documents_publish_via_provider_plane(&data_dir, &registry, &principal_id, &doc_did)
                     .await
                     .map(|published| json!(published))
             }
-            DocumentsProviderRequest::Unpublish { doc_did } => {
+            DocumentsProviderRequest::Unpublish {
+                principal_id,
+                doc_did,
+            } => {
                 let Some(registry) = self.registry.upgrade() else {
                     return Ok(provider_error(
                         "documents_error",
                         "documents provider registry unavailable",
                     ));
                 };
-                documents_unpublish_via_provider_plane(&data_dir, &registry, &doc_did)
-                    .await
-                    .map(|unpublished| json!(unpublished))
+                documents_unpublish_via_provider_plane(
+                    &data_dir,
+                    &registry,
+                    &principal_id,
+                    &doc_did,
+                )
+                .await
+                .map(|unpublished| json!(unpublished))
             }
             request => tokio::task::spawn_blocking(move || {
                 handle_provider_request_inner(&data_dir, request)
@@ -227,11 +247,15 @@ impl Provider for DocumentsProvider {
 
 pub struct DocumentsClient {
     registry: Arc<ProviderRegistry>,
+    principal_id: String,
 }
 
 impl DocumentsClient {
-    pub fn new(registry: Arc<ProviderRegistry>) -> Self {
-        Self { registry }
+    pub fn for_principal(registry: Arc<ProviderRegistry>, principal_id: impl Into<String>) -> Self {
+        Self {
+            registry,
+            principal_id: principal_id.into(),
+        }
     }
 
     pub async fn summary(&self) -> anyhow::Result<Vec<DocumentsListItem>> {
@@ -351,6 +375,8 @@ impl DocumentsClient {
     }
 
     async fn request(&self, request: Value) -> anyhow::Result<Value> {
+        let mut request = request;
+        request["principal_id"] = Value::String(self.principal_id.clone());
         let response = self
             .registry
             .send_raw("documents", &request)
@@ -394,23 +420,31 @@ fn handle_provider_request_inner(
     request: DocumentsProviderRequest,
 ) -> anyhow::Result<Value> {
     match request {
-        DocumentsProviderRequest::Summary => Ok(json!({
-            "documents": documents_load_summary(data_dir)?,
+        DocumentsProviderRequest::Summary { principal_id } => Ok(json!({
+            "documents": documents_load_summary(data_dir, &principal_id)?,
         })),
-        DocumentsProviderRequest::Create { title } => Ok(json!({
-            "document": documents_create_local(data_dir, title.as_deref())?,
+        DocumentsProviderRequest::Create {
+            principal_id,
+            title,
+        } => Ok(json!({
+            "document": documents_create_local(data_dir, &principal_id, title.as_deref())?,
         })),
-        DocumentsProviderRequest::Get { doc_did } => Ok(json!({
-            "document": documents_load_document(data_dir, &doc_did)?,
+        DocumentsProviderRequest::Get {
+            principal_id,
+            doc_did,
+        } => Ok(json!({
+            "document": documents_load_document(data_dir, &principal_id, &doc_did)?,
         })),
         DocumentsProviderRequest::Save {
+            principal_id,
             doc_did,
             title,
             body,
         } => Ok(json!({
-            "document": documents_save_local(data_dir, &doc_did, &title, &body)?,
+            "document": documents_save_local(data_dir, &principal_id, &doc_did, &title, &body)?,
         })),
         DocumentsProviderRequest::SaveAs {
+            principal_id,
             doc_did,
             title,
             file_name,
@@ -418,14 +452,18 @@ fn handle_provider_request_inner(
         } => Ok(json!({
             "document": documents_save_as_local(
                 data_dir,
+                &principal_id,
                 &doc_did,
                 title.as_deref(),
                 file_name.as_deref(),
                 &body,
             )?,
         })),
-        DocumentsProviderRequest::Delete { doc_did } => {
-            documents_delete_local(data_dir, &doc_did)?;
+        DocumentsProviderRequest::Delete {
+            principal_id,
+            doc_did,
+        } => {
+            documents_delete_local(data_dir, &principal_id, &doc_did)?;
             Ok(json!({}))
         }
         DocumentsProviderRequest::Publish { .. } | DocumentsProviderRequest::Unpublish { .. } => {
@@ -437,9 +475,10 @@ fn handle_provider_request_inner(
 async fn documents_publish_via_provider_plane(
     data_dir: &Path,
     registry: &ProviderRegistry,
+    principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsPublishResponse> {
-    let export = documents_export_publish(data_dir, doc_did)?;
+    let export = documents_export_publish(data_dir, principal_id, doc_did)?;
 
     let publish_input = tempfile::Builder::new()
         .prefix("elastos-documents-publish-")
@@ -461,10 +500,17 @@ async fn documents_publish_via_provider_plane(
         return Ok(existing);
     }
 
-    let cid = ipfs_add_directory_via_provider(registry, bundle.path()).await?;
+    let cid = content_publish_directory_via_provider(
+        registry,
+        bundle.path(),
+        &export.doc_did,
+        &export.owner_did,
+    )
+    .await?;
     let published_at = share_meta.created_at;
     documents_finish_publish(
         data_dir,
+        principal_id,
         &export.doc_did,
         &cid,
         published_at,
@@ -482,15 +528,17 @@ async fn documents_publish_via_provider_plane(
 async fn documents_unpublish_via_provider_plane(
     data_dir: &Path,
     registry: &ProviderRegistry,
+    principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsUnpublishResponse> {
-    let document = documents_load_document(data_dir, doc_did)?;
-    let cid = document
+    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let cid = metadata
         .latest_published_cid
+        .clone()
         .ok_or_else(|| anyhow!("document is not published"))?;
 
-    ipfs_unpin_via_provider(registry, &cid).await?;
-    documents_unpublish_local(data_dir, doc_did)?;
+    content_unpublish_via_provider(registry, &cid, doc_did, &metadata.owner_did).await?;
+    documents_unpublish_local(data_dir, principal_id, doc_did)?;
 
     Ok(DocumentsUnpublishResponse {
         uri: format!("elastos://{cid}"),
@@ -514,65 +562,44 @@ fn documents_existing_publish_response(
     })
 }
 
-async fn ipfs_add_directory_via_provider(
+async fn content_publish_directory_via_provider(
     registry: &ProviderRegistry,
     dir: &Path,
+    object_did: &str,
+    publisher_did: &str,
 ) -> anyhow::Result<String> {
-    let mut files = Vec::new();
-    crate::ipfs::collect_files_for_ipfs(dir, dir, &mut files)?;
-    if files.is_empty() {
-        bail!("No files found in {}", dir.display());
-    }
-
-    let mut entries = Vec::new();
-    for rel_path in &files {
-        let abs_path = dir.join(rel_path);
-        let bytes = std::fs::read(&abs_path)?;
-        entries.push(json!({
-            "path": rel_path.to_string_lossy().replace('\\', "/"),
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-        }));
-    }
-
-    let response = registry
-        .send_raw(
-            "ipfs",
-            &json!({
-                "op": "add_directory",
-                "files": entries,
-                "pin": true,
-            }),
-        )
-        .await
-        .map_err(|err| anyhow!("ipfs provider unavailable: {err}"))?;
-    ipfs_response_cid(&response)
+    crate::content::publish_directory_via_provider_with_kind(
+        registry,
+        dir,
+        "document",
+        Some(object_did),
+        Some(publisher_did),
+    )
+    .await
 }
 
-async fn ipfs_unpin_via_provider(registry: &ProviderRegistry, cid: &str) -> anyhow::Result<()> {
+async fn content_unpublish_via_provider(
+    registry: &ProviderRegistry,
+    cid: &str,
+    object_did: &str,
+    publisher_did: &str,
+) -> anyhow::Result<()> {
     let response = registry
         .send_raw(
-            "ipfs",
+            "content",
             &json!({
-                "op": "unpin",
+                "op": "unpublish",
                 "cid": cid,
+                "object_did": object_did,
+                "publisher_did": publisher_did,
             }),
         )
         .await
-        .map_err(|err| anyhow!("ipfs provider unavailable: {err}"))?;
-    ipfs_response_ok(&response, "ipfs unpin")
+        .map_err(|err| anyhow!("content provider unavailable: {err}"))?;
+    content_response_ok(&response, "content unpublish")
 }
 
-fn ipfs_response_cid(response: &Value) -> anyhow::Result<String> {
-    ipfs_response_ok(response, "ipfs add_directory")?;
-    response
-        .get("data")
-        .and_then(|data| data.get("cid"))
-        .and_then(|cid| cid.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("No CID in ipfs-provider response"))
-}
-
-fn ipfs_response_ok(response: &Value, operation: &str) -> anyhow::Result<()> {
+fn content_response_ok(response: &Value, operation: &str) -> anyhow::Result<()> {
     if response.get("status").and_then(|status| status.as_str()) == Some("error") {
         let message = response
             .get("message")
@@ -585,7 +612,11 @@ fn ipfs_response_ok(response: &Value, operation: &str) -> anyhow::Result<()> {
 
 fn documents_operation_error_message(err: anyhow::Error) -> String {
     let text = err.to_string();
-    if text.contains("ipfs provider unavailable")
+    if text.contains("content provider unavailable")
+        || text.contains("No provider for scheme: content")
+        || text.contains("no provider for scheme: content")
+        || text.contains("content provider")
+        || text.contains("ipfs provider unavailable")
         || text.contains("No provider for scheme: ipfs")
         || text.contains("no provider for scheme: ipfs")
         || text.contains("ipfs-provider")
@@ -616,8 +647,29 @@ fn now_ts() -> u64 {
         .as_secs()
 }
 
-fn documents_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
-    rooted_localhost_fs_path(data_dir, "Users/self/Documents")
+fn documents_validate_principal_id(principal_id: &str) -> anyhow::Result<&str> {
+    if principal_id != principal_id.trim()
+        || principal_id.is_empty()
+        || principal_id
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        bail!("invalid principal");
+    }
+    Ok(principal_id)
+}
+
+fn documents_principal_root_uri(principal_id: &str) -> anyhow::Result<String> {
+    documents_validate_principal_id(principal_id)?;
+    Ok(crate::auth::principal_localhost_root(principal_id))
+}
+
+fn documents_root(data_dir: &Path, principal_id: &str) -> anyhow::Result<PathBuf> {
+    let root_uri = documents_principal_root_uri(principal_id)?;
+    let rooted_path = root_uri
+        .strip_prefix("localhost://")
+        .ok_or_else(|| anyhow!("invalid documents root"))?;
+    rooted_localhost_fs_path(data_dir, &format!("{rooted_path}/Documents"))
         .ok_or_else(|| anyhow!("invalid documents root"))
 }
 
@@ -627,17 +679,47 @@ fn documents_metadata_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn documents_metadata_path(data_dir: &Path, doc_did: &str) -> anyhow::Result<PathBuf> {
+    let doc_did = documents_validate_doc_did(doc_did)?;
     Ok(documents_metadata_root(data_dir)?
         .join(doc_did)
         .join("document.json"))
 }
 
-fn documents_working_copy_uri(file_name: &str) -> String {
-    format!("localhost://Users/self/Documents/{file_name}")
+fn documents_working_copy_uri(principal_id: &str, file_name: &str) -> anyhow::Result<String> {
+    Ok(format!(
+        "{}/Documents/{file_name}",
+        documents_principal_root_uri(principal_id)?
+    ))
 }
 
 fn documents_object_uri(doc_did: &str) -> String {
     format!("localhost://ElastOS/Documents/{doc_did}")
+}
+
+fn documents_validate_doc_did(doc_did: &str) -> anyhow::Result<&str> {
+    if doc_did != doc_did.trim() {
+        bail!("invalid document DID");
+    }
+    if !doc_did.starts_with("did:") {
+        bail!("invalid document DID");
+    }
+    if doc_did.contains('/')
+        || doc_did.contains('\\')
+        || doc_did.split(':').any(str::is_empty)
+        || doc_did
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        bail!("invalid document DID");
+    }
+    if doc_did
+        .split(':')
+        .any(|segment| segment == "." || segment == "..")
+        || doc_did.contains("..")
+    {
+        bail!("invalid document DID");
+    }
+    Ok(doc_did)
 }
 
 fn documents_normalize_title(title: Option<&str>, default_title: &str) -> String {
@@ -720,7 +802,24 @@ fn documents_load_metadata(data_dir: &Path, doc_did: &str) -> anyhow::Result<Doc
     let path = documents_metadata_path(data_dir, doc_did)?;
     let bytes =
         std::fs::read(&path).map_err(|err| anyhow!("document metadata not found: {err}"))?;
-    serde_json::from_slice(&bytes).map_err(Into::into)
+    let metadata = serde_json::from_slice::<DocumentsMetadata>(&bytes)?;
+    if metadata.schema != DOCUMENTS_SCHEMA {
+        bail!("unsupported document schema");
+    }
+    Ok(metadata)
+}
+
+fn documents_load_metadata_for_principal(
+    data_dir: &Path,
+    principal_id: &str,
+    doc_did: &str,
+) -> anyhow::Result<DocumentsMetadata> {
+    documents_validate_principal_id(principal_id)?;
+    let metadata = documents_load_metadata(data_dir, doc_did)?;
+    if metadata.principal_id != principal_id {
+        bail!("document does not belong to this principal");
+    }
+    Ok(metadata)
 }
 
 fn documents_save_metadata(data_dir: &Path, metadata: &DocumentsMetadata) -> anyhow::Result<()> {
@@ -732,10 +831,45 @@ fn documents_save_metadata(data_dir: &Path, metadata: &DocumentsMetadata) -> any
     Ok(())
 }
 
-fn documents_load_body(data_dir: &Path, metadata: &DocumentsMetadata) -> anyhow::Result<String> {
-    let body = std::fs::read_to_string(documents_root(data_dir)?.join(&metadata.file_name))
-        .map_err(|err| anyhow!("document body not found: {err}"))?;
-    Ok(body)
+fn documents_load_body(
+    data_dir: &Path,
+    principal_id: &str,
+    metadata: &DocumentsMetadata,
+) -> anyhow::Result<String> {
+    let body = crate::auth::read_principal_root_object(
+        data_dir,
+        principal_id,
+        &crate::auth::principal_localhost_root(principal_id),
+        &metadata.working_copy_uri,
+        &documents_body_path(data_dir, principal_id, &metadata.file_name)?,
+    )
+    .map_err(|err| anyhow!("document body not found: {err}"))?;
+    String::from_utf8(body).map_err(|err| anyhow!("document body is not valid UTF-8: {err}"))
+}
+
+fn documents_body_path(
+    data_dir: &Path,
+    principal_id: &str,
+    file_name: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(documents_root(data_dir, principal_id)?.join(file_name))
+}
+
+fn documents_write_body(
+    data_dir: &Path,
+    principal_id: &str,
+    file_name: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    let working_copy_uri = documents_working_copy_uri(principal_id, file_name)?;
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        &crate::auth::principal_localhost_root(principal_id),
+        &working_copy_uri,
+        &documents_body_path(data_dir, principal_id, file_name)?,
+        body.as_bytes(),
+    )
 }
 
 fn documents_view(metadata: &DocumentsMetadata, body: String) -> DocumentsDocumentView {
@@ -765,8 +899,12 @@ fn documents_list_item(metadata: &DocumentsMetadata) -> DocumentsListItem {
     }
 }
 
-fn documents_load_metadata_index(data_dir: &Path) -> anyhow::Result<Vec<DocumentsMetadata>> {
-    let docs_root = documents_root(data_dir)?;
+fn documents_load_metadata_index(
+    data_dir: &Path,
+    principal_id: &str,
+) -> anyhow::Result<Vec<DocumentsMetadata>> {
+    documents_validate_principal_id(principal_id)?;
+    let docs_root = documents_root(data_dir, principal_id)?;
     let metadata_root = documents_metadata_root(data_dir)?;
 
     if !docs_root.is_dir() || !metadata_root.is_dir() {
@@ -783,8 +921,18 @@ fn documents_load_metadata_index(data_dir: &Path) -> anyhow::Result<Vec<Document
         if !path.is_file() {
             continue;
         }
-        let bytes = std::fs::read(&path)?;
-        let metadata = serde_json::from_slice::<DocumentsMetadata>(&bytes)?;
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<DocumentsMetadata>(&bytes) else {
+            continue;
+        };
+        if metadata.schema != DOCUMENTS_SCHEMA {
+            continue;
+        }
+        if metadata.principal_id != principal_id {
+            continue;
+        }
         if docs_root.join(&metadata.file_name).is_file() {
             documents.push(metadata);
         }
@@ -799,8 +947,11 @@ fn documents_load_metadata_index(data_dir: &Path) -> anyhow::Result<Vec<Document
     Ok(documents)
 }
 
-fn documents_load_summary(data_dir: &Path) -> anyhow::Result<Vec<DocumentsListItem>> {
-    Ok(documents_load_metadata_index(data_dir)?
+fn documents_load_summary(
+    data_dir: &Path,
+    principal_id: &str,
+) -> anyhow::Result<Vec<DocumentsListItem>> {
+    Ok(documents_load_metadata_index(data_dir, principal_id)?
         .into_iter()
         .map(|metadata| documents_list_item(&metadata))
         .collect())
@@ -808,33 +959,37 @@ fn documents_load_summary(data_dir: &Path) -> anyhow::Result<Vec<DocumentsListIt
 
 pub fn documents_load_document(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let metadata = documents_load_metadata(data_dir, doc_did)?;
-    let body = documents_load_body(data_dir, &metadata)?;
+    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let body = documents_load_body(data_dir, principal_id, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
 fn documents_create_local(
     data_dir: &Path,
+    principal_id: &str,
     requested_title: Option<&str>,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let docs_root = documents_root(data_dir)?;
+    documents_validate_principal_id(principal_id)?;
+    let docs_root = documents_root(data_dir, principal_id)?;
     std::fs::create_dir_all(&docs_root)?;
     let owner_did = elastos_identity::load_or_create_did(data_dir)?.1;
     let title = documents_normalize_title(requested_title, DOCUMENTS_DEFAULT_TITLE);
     let file_name =
         documents_reserve_file_name(&docs_root, &documents_slugify_file_name(&title), None)?;
     let body = String::new();
-    std::fs::write(docs_root.join(&file_name), &body)?;
+    documents_write_body(data_dir, principal_id, &file_name, &body)?;
     let ts = now_ts();
     let metadata = DocumentsMetadata {
         schema: DOCUMENTS_SCHEMA.to_string(),
         doc_did: documents_generate_did(),
+        principal_id: principal_id.to_string(),
         owner_did,
         title,
         file_name: file_name.clone(),
-        working_copy_uri: documents_working_copy_uri(&file_name),
+        working_copy_uri: documents_working_copy_uri(principal_id, &file_name)?,
         created_at: ts,
         updated_at: ts,
         latest_published_cid: None,
@@ -846,13 +1001,14 @@ fn documents_create_local(
 
 pub fn documents_save_local(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
     requested_title: &str,
     body: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let mut metadata = documents_load_metadata(data_dir, doc_did)?;
+    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
     let title = documents_normalize_title(Some(requested_title), DOCUMENTS_DEFAULT_TITLE);
-    std::fs::write(documents_root(data_dir)?.join(&metadata.file_name), body)?;
+    documents_write_body(data_dir, principal_id, &metadata.file_name, body)?;
     metadata.title = title;
     metadata.updated_at = now_ts();
     documents_save_metadata(data_dir, &metadata)?;
@@ -861,13 +1017,14 @@ pub fn documents_save_local(
 
 pub fn documents_save_as_local(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
     requested_title: Option<&str>,
     requested_file_name: Option<&str>,
     body: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let source = documents_load_metadata(data_dir, doc_did)?;
-    let docs_root = documents_root(data_dir)?;
+    let source = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let docs_root = documents_root(data_dir, principal_id)?;
     let owner_did = elastos_identity::load_or_create_did(data_dir)?.1;
     let title = documents_normalize_title(requested_title, &source.title);
     let desired_name = match requested_file_name {
@@ -875,15 +1032,16 @@ pub fn documents_save_as_local(
         _ => documents_slugify_file_name(&title),
     };
     let file_name = documents_reserve_file_name(&docs_root, &desired_name, None)?;
-    std::fs::write(docs_root.join(&file_name), body)?;
+    documents_write_body(data_dir, principal_id, &file_name, body)?;
     let ts = now_ts();
     let metadata = DocumentsMetadata {
         schema: DOCUMENTS_SCHEMA.to_string(),
         doc_did: documents_generate_did(),
+        principal_id: principal_id.to_string(),
         owner_did,
         title,
         file_name: file_name.clone(),
-        working_copy_uri: documents_working_copy_uri(&file_name),
+        working_copy_uri: documents_working_copy_uri(principal_id, &file_name)?,
         created_at: ts,
         updated_at: ts,
         latest_published_cid: None,
@@ -893,9 +1051,13 @@ pub fn documents_save_as_local(
     Ok(documents_view(&metadata, body.to_string()))
 }
 
-pub fn documents_delete_local(data_dir: &Path, doc_did: &str) -> anyhow::Result<()> {
-    let metadata = documents_load_metadata(data_dir, doc_did)?;
-    remove_file_if_exists(documents_root(data_dir)?.join(&metadata.file_name))?;
+pub fn documents_delete_local(
+    data_dir: &Path,
+    principal_id: &str,
+    doc_did: &str,
+) -> anyhow::Result<()> {
+    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    remove_file_if_exists(documents_root(data_dir, principal_id)?.join(&metadata.file_name))?;
     let metadata_dir = documents_metadata_root(data_dir)?.join(&metadata.doc_did);
     match std::fs::remove_dir_all(&metadata_dir) {
         Ok(()) => Ok(()),
@@ -906,10 +1068,11 @@ pub fn documents_delete_local(data_dir: &Path, doc_did: &str) -> anyhow::Result<
 
 fn documents_export_publish(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsPublishExport> {
-    let metadata = documents_load_metadata(data_dir, doc_did)?;
-    let body = documents_load_body(data_dir, &metadata)?;
+    let metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
+    let body = documents_load_body(data_dir, principal_id, &metadata)?;
     let latest_record = documents_latest_publish_record(&metadata);
     let latest_published_content_digest = latest_record.map(|record| record.content_digest.clone());
     let latest_published_at = latest_record.map(|record| record.published_at);
@@ -939,12 +1102,13 @@ fn documents_latest_publish_record(
 
 fn documents_finish_publish(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
     cid: &str,
     published_at: u64,
     content_digest: &str,
 ) -> anyhow::Result<()> {
-    let mut metadata = documents_load_metadata(data_dir, doc_did)?;
+    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
     metadata.latest_published_cid = Some(cid.to_string());
     metadata.publish_history.push(DocumentsPublishRecord {
         cid: cid.to_string(),
@@ -957,16 +1121,17 @@ fn documents_finish_publish(
 
 fn documents_unpublish_local(
     data_dir: &Path,
+    principal_id: &str,
     doc_did: &str,
 ) -> anyhow::Result<DocumentsDocumentView> {
-    let mut metadata = documents_load_metadata(data_dir, doc_did)?;
+    let mut metadata = documents_load_metadata_for_principal(data_dir, principal_id, doc_did)?;
     if metadata.latest_published_cid.is_none() {
         bail!("document is not published");
     }
     metadata.latest_published_cid = None;
     metadata.updated_at = now_ts();
     documents_save_metadata(data_dir, &metadata)?;
-    let body = documents_load_body(data_dir, &metadata)?;
+    let body = documents_load_body(data_dir, principal_id, &metadata)?;
     Ok(documents_view(&metadata, body))
 }
 
@@ -983,6 +1148,8 @@ mod tests {
     use super::*;
 
     const TEST_CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+    const TEST_PRINCIPAL: &str = "person:local:test-documents";
+    const OTHER_PRINCIPAL: &str = "person:local:other-documents";
 
     struct MockIpfsProvider {
         cid: String,
@@ -1064,21 +1231,21 @@ mod tests {
     fn documents_summary_is_read_only_on_empty_store() {
         let dir = tempfile::tempdir().unwrap();
 
-        let summary = documents_load_summary(dir.path()).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
         assert!(summary.is_empty());
-        assert!(!documents_root(dir.path()).unwrap().exists());
+        assert!(!documents_root(dir.path(), TEST_PRINCIPAL).unwrap().exists());
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
     }
 
     #[test]
     fn documents_summary_does_not_import_orphan_markdown() {
         let dir = tempfile::tempdir().unwrap();
-        let docs_root = documents_root(dir.path()).unwrap();
+        let docs_root = documents_root(dir.path(), TEST_PRINCIPAL).unwrap();
         std::fs::create_dir_all(&docs_root).unwrap();
         std::fs::write(docs_root.join("Legacy.md"), "# Legacy\n").unwrap();
 
-        let summary = documents_load_summary(dir.path()).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
         assert!(summary.is_empty());
         assert!(!documents_metadata_root(dir.path()).unwrap().exists());
@@ -1089,8 +1256,9 @@ mod tests {
     fn documents_create_explicitly_adds_summary_object() {
         let dir = tempfile::tempdir().unwrap();
 
-        let document = documents_create_local(dir.path(), Some("Project Plan")).unwrap();
-        let summary = documents_load_summary(dir.path()).unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Project Plan")).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].doc_did, document.doc_did);
@@ -1102,18 +1270,48 @@ mod tests {
     }
 
     #[test]
+    fn documents_working_copy_is_encrypted_for_protected_principal_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let protection =
+            crate::auth::store_test_principal_root_protection(dir.path(), TEST_PRINCIPAL);
+
+        let document = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Secrets")).unwrap();
+        let saved = documents_save_local(
+            dir.path(),
+            TEST_PRINCIPAL,
+            &document.doc_did,
+            "Secrets",
+            "# Secret\n",
+        )
+        .unwrap();
+
+        assert_eq!(saved.body, "# Secret\n");
+        let body_path = documents_body_path(dir.path(), TEST_PRINCIPAL, &saved.file_name).unwrap();
+        let stored = std::fs::read_to_string(&body_path).unwrap();
+        assert!(!stored.contains("# Secret"));
+        assert!(stored.contains("elastos.principal-root.object/v1"));
+        assert!(stored.contains(&protection.localhost_root));
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        assert_eq!(loaded.body, "# Secret\n");
+    }
+
+    #[test]
     fn documents_publish_export_and_finish_records_revision() {
         let dir = tempfile::tempdir().unwrap();
-        let document = documents_create_local(dir.path(), Some("Publish Me")).unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Publish Me")).unwrap();
         let document = documents_save_local(
             dir.path(),
+            TEST_PRINCIPAL,
             &document.doc_did,
             "Publish Me",
             "# Publish Me\n",
         )
         .unwrap();
 
-        let export = documents_export_publish(dir.path(), &document.doc_did).unwrap();
+        let export =
+            documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
 
         assert_eq!(export.doc_did, document.doc_did);
         assert_eq!(export.body, "# Publish Me\n");
@@ -1122,6 +1320,7 @@ mod tests {
 
         documents_finish_publish(
             dir.path(),
+            TEST_PRINCIPAL,
             &document.doc_did,
             "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
             42,
@@ -1129,9 +1328,11 @@ mod tests {
         )
         .unwrap();
 
-        let republish = documents_export_publish(dir.path(), &document.doc_did).unwrap();
-        let loaded = documents_load_document(dir.path(), &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path()).unwrap();
+        let republish =
+            documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        let loaded =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
 
         assert_eq!(republish.next_version, 2);
         assert_eq!(
@@ -1155,9 +1356,11 @@ mod tests {
             Some("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
         );
 
-        let unpublished = documents_unpublish_local(dir.path(), &document.doc_did).unwrap();
-        let summary = documents_load_summary(dir.path()).unwrap();
-        let republish = documents_export_publish(dir.path(), &document.doc_did).unwrap();
+        let unpublished =
+            documents_unpublish_local(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+        let republish =
+            documents_export_publish(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
 
         assert_eq!(unpublished.latest_published_cid, None);
         assert_eq!(unpublished.publish_history.len(), 1);
@@ -1166,7 +1369,76 @@ mod tests {
         assert_eq!(republish.latest_published_content_digest, None);
         assert_eq!(republish.latest_published_at, None);
         assert_eq!(republish.next_version, 2);
-        assert!(documents_unpublish_local(dir.path(), &document.doc_did).is_err());
+        assert!(documents_unpublish_local(dir.path(), TEST_PRINCIPAL, &document.doc_did).is_err());
+    }
+
+    #[test]
+    fn documents_reject_cross_principal_document_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Private Notes")).unwrap();
+
+        let err = documents_load_document(dir.path(), OTHER_PRINCIPAL, &owned.doc_did).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "document does not belong to this principal"
+        );
+        assert!(documents_delete_local(dir.path(), OTHER_PRINCIPAL, &owned.doc_did).is_err());
+        assert!(documents_load_summary(dir.path(), OTHER_PRINCIPAL)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            documents_load_summary(dir.path(), TEST_PRINCIPAL)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn documents_rejects_unsupported_metadata_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Schema Test")).unwrap();
+        let path = documents_metadata_path(dir.path(), &document.doc_did).unwrap();
+        let mut metadata =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        metadata["schema"] = json!("elastos.document/v1");
+        std::fs::write(&path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
+
+        let err =
+            documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap_err();
+        assert_eq!(err.to_string(), "unsupported document schema");
+    }
+
+    #[test]
+    fn documents_summary_skips_incompatible_metadata_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let document = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Current")).unwrap();
+        let legacy_did = "did:key:z6Mklegacydoc";
+        let legacy_dir = documents_metadata_root(dir.path())
+            .unwrap()
+            .join(legacy_did);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("document.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "elastos.document/v1",
+                "doc_did": legacy_did,
+                "title": "Legacy",
+                "file_name": "Legacy.md",
+                "working_copy_uri": format!("{}{}{}", "localhost://Users", "/self", "/Documents/Legacy.md"),
+                "created_at": 1,
+                "updated_at": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
+
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].doc_did, document.doc_did);
     }
 
     #[test]
@@ -1192,11 +1464,39 @@ mod tests {
         assert!(documents_existing_publish_response(&export, "sha256:changed").is_none());
     }
 
+    #[test]
+    fn documents_rejects_doc_did_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        for doc_did in [
+            "../did:key:z6Mkdoc",
+            "did:key:../z6Mkdoc",
+            "did:key:z6Mkdoc/other",
+            "did:key:z6Mkdoc\\other",
+            "not-a-did",
+            " did:key:z6Mkdoc",
+        ] {
+            let err = documents_metadata_path(dir.path(), doc_did).unwrap_err();
+            assert_eq!(err.to_string(), "invalid document DID");
+        }
+        let valid = documents_metadata_path(dir.path(), "did:key:z6Mkdoc").unwrap();
+        assert!(valid.ends_with("did:key:z6Mkdoc/document.json"));
+    }
+
     #[tokio::test]
     async fn documents_publish_and_unpublish_use_provider_plane() {
         let dir = tempfile::tempdir().unwrap();
         install_test_documents_viewer(dir.path());
         let registry = Arc::new(ProviderRegistry::new());
+        let content_provider = Arc::new(crate::content::ContentProvider::new(
+            dir.path().to_path_buf(),
+            Arc::downgrade(&registry),
+        ));
+        let content_provider_for_status = content_provider.clone();
+        registry.register(content_provider.clone()).await;
+        registry
+            .register_sub_provider("content", content_provider)
+            .await
+            .unwrap();
         registry
             .register(Arc::new(DocumentsProvider::new(
                 dir.path().to_path_buf(),
@@ -1209,8 +1509,11 @@ mod tests {
             .await
             .unwrap();
 
-        let client = DocumentsClient::new(registry);
+        let client = DocumentsClient::for_principal(registry, TEST_PRINCIPAL);
         let document = client.create(Some("Provider Plane")).await.unwrap();
+        let document_owner = documents_load_metadata(dir.path(), &document.doc_did)
+            .unwrap()
+            .owner_did;
         client
             .save(
                 &document.doc_did,
@@ -1241,13 +1544,24 @@ mod tests {
             ipfs_provider.unpinned.lock().await.as_slice(),
             [TEST_CID.to_string()]
         );
+        let status = content_provider_for_status
+            .send_raw(&json!({
+                "op": "status",
+                "cid": TEST_CID,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            status["data"]["receipt"]["payload"]["publisher_did"],
+            document_owner
+        );
 
         let loaded = client.get(&document.doc_did).await.unwrap();
         assert_eq!(loaded.latest_published_cid, None);
     }
 
     #[tokio::test]
-    async fn documents_publish_requires_ipfs_provider() {
+    async fn documents_publish_requires_content_provider() {
         let dir = tempfile::tempdir().unwrap();
         install_test_documents_viewer(dir.path());
         let registry = Arc::new(ProviderRegistry::new());
@@ -1257,7 +1571,7 @@ mod tests {
                 Arc::downgrade(&registry),
             )))
             .await;
-        let client = DocumentsClient::new(registry);
+        let client = DocumentsClient::for_principal(registry, TEST_PRINCIPAL);
         let document = client.create(Some("Draft")).await.unwrap();
 
         let err = client.publish(&document.doc_did).await.unwrap_err();
@@ -1267,8 +1581,9 @@ mod tests {
     #[test]
     fn documents_delete_removes_object_and_working_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let document = documents_create_local(dir.path(), Some("Delete Me")).unwrap();
-        let body_path = documents_root(dir.path())
+        let document =
+            documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Delete Me")).unwrap();
+        let body_path = documents_root(dir.path(), TEST_PRINCIPAL)
             .unwrap()
             .join(&document.file_name);
         let metadata_dir = documents_metadata_root(dir.path())
@@ -1278,11 +1593,13 @@ mod tests {
         assert!(body_path.is_file());
         assert!(metadata_dir.join("document.json").is_file());
 
-        documents_delete_local(dir.path(), &document.doc_did).unwrap();
+        documents_delete_local(dir.path(), TEST_PRINCIPAL, &document.doc_did).unwrap();
 
         assert!(!body_path.exists());
         assert!(!metadata_dir.exists());
-        assert!(documents_load_summary(dir.path()).unwrap().is_empty());
-        assert!(documents_load_document(dir.path(), &document.doc_did).is_err());
+        assert!(documents_load_summary(dir.path(), TEST_PRINCIPAL)
+            .unwrap()
+            .is_empty());
+        assert!(documents_load_document(dir.path(), TEST_PRINCIPAL, &document.doc_did).is_err());
     }
 }

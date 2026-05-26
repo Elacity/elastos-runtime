@@ -52,8 +52,12 @@ async fn resolve_capsule_dir(
 ) -> anyhow::Result<PathBuf> {
     if let Some(cid) = cid {
         tracing::info!("Running capsule from CID: {}", cid);
-        let ipfs_bridge = crate::get_ipfs_bridge().await?;
-        return elastos_server::ipfs::prepare_capsule_from_cid(&ipfs_bridge, &cid).await;
+        let content_registry = crate::get_content_registry().await?;
+        return elastos_server::content::prepare_capsule_from_content_provider(
+            &content_registry,
+            &cid,
+        )
+        .await;
     }
 
     if let Some(path) = path {
