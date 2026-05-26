@@ -17,10 +17,13 @@ supervisor, capsule manifests, gateway, Carrier bridge, and identity stack
 validated live on Apple Silicon** — a Linux kernel boots inside Apple's
 hypervisor on a Mac, holds ~400 MB, and serves the same Home shell that
 Linux users see. **It is not yet ready for public release**: Phase 10
-(security hardening) is now in progress. Day 1 (CVE audit) just completed
-and surfaced **2 critical + 4 high vulnerabilities** — all addressable, all
-with a documented remediation plan in `PHASE_10_DAY_1_NOTES.md`. Phase 10
-calendar is ~25 working days end-to-end.
+(Mac-substrate security hardening) is now in progress. Day 1 (CVE audit)
+just completed and confirmed that **zero vulnerabilities were introduced by
+this branch** — all 34 findings are pre-existing in `main` and have been
+handed off to the broader runtime team via `RUNTIME_CVE_HANDOFF.md`. This
+branch's Phase 10 calendar is ~14 working days, focused only on
+Mac-substrate-specific work (threat model, Carrier-bridge fuzz, demo bugs,
+external code review, release CI lane).
 
 ## What this document is — and is not
 
@@ -290,6 +293,14 @@ Principle: the entitlement set is the minimum that makes the substrate work. Not
 > minimum-entitlement set, code-signed binaries). It has **not** been formally
 > reviewed by anyone outside the people who wrote it. Anything below labelled
 > "Not done" is a real gap, not paranoia.
+>
+> **Ownership clarity (added after Day-1 cargo-audit):** Phase 10 work on
+> this branch focuses only on Mac-substrate-scoped security. The 34
+> pre-existing workspace CVEs (wasmtime, TLS chain, etc.) inherited from
+> `main` are handed off to the broader runtime team via
+> `RUNTIME_CVE_HANDOFF.md` for a parallel `chore/runtime-cve-hygiene`
+> branch. Read that file if you want the full inherited-CVE inventory and
+> remediation plan.
 
 ### What we have
 
@@ -304,7 +315,7 @@ Principle: the entitlement set is the minimum that makes the substrate work. Not
 
 | Action | Effort | Why it matters |
 |---|---|---|
-| ~~Run `cargo audit` against the branch~~ **DONE — see `PHASE_10_DAY_1_NOTES.md`** | Completed | **Found 34 vulnerabilities + 12 warnings. 2 are CVSS 9.0 CRITICAL (both in `wasmtime 17.0.3`, both relevant to our usage). 14 in `wasmtime` cluster; closes with a multi-day 17→45 migration. Full triage + remediation plan in the Day 1 notes.** |
+| ~~Run `cargo audit` against the branch~~ **DONE — see `PHASE_10_DAY_1_NOTES.md`** | Completed | **34 vulnerabilities + 12 warnings found. ALL 34 INHERITED from `main` at the same version — zero introduced by this branch. Handed off to broader runtime team via `RUNTIME_CVE_HANDOFF.md` for a `chore/runtime-cve-hygiene` branch off `main`. Our new Mac-only deps (`objc2`, `block2`, `dispatch2`, ...) have zero findings.** |
 | **External code review of `elastos-vz` substrate** | 1-2 dev-weeks for a security engineer who knows Swift FFI + virtualization | 7,724 LOC of new attack surface sitting at the host-guest boundary. The single highest-leverage thing on this list. |
 | **Threat model document for the Mac substrate** | 1 dev-week | Currently no written threat model. Should enumerate: trust boundaries, what a malicious capsule can attempt, what a malicious operator can attempt, what a malicious update server can attempt. The Linux side has implicit threat models from upstream `crosvm` reviews; we don't inherit those on Mac. |
 | **Fuzz the Carrier-bridge framing** | 2-3 dev-days with `cargo-fuzz` | The bridge is a parser sitting on the trust boundary between guest VM and host runtime. Parser bugs there are the highest-impact thing a malicious capsule could exploit. |
@@ -356,4 +367,4 @@ This is roughly a three-week phase, the bulk of which (Days 11-15) is wall-clock
 > external code review of `elastos-vz`, and fuzzes the Carrier-bridge
 > parser."*
 
-Anchors: `PHASE_9_SIGNOFF.md` · `PHASE_6_PLAN.md` (rolling status) · `PHASE_10_PLAN.md` (next, security hardening) · `scripts/dev/mac-local-setup.sh` · `scripts/dev/mac-live-demo.sh` · `elastos/crates/elastos-vz/`
+Anchors: `PHASE_9_SIGNOFF.md` · `PHASE_6_PLAN.md` (rolling status) · `PHASE_10_PLAN.md` (Mac-substrate security hardening, re-scoped) · `PHASE_10_DAY_1_NOTES.md` (CVE audit + ownership analysis) · `RUNTIME_CVE_HANDOFF.md` (inherited CVEs for broader team) · `scripts/dev/mac-local-setup.sh` · `scripts/dev/mac-live-demo.sh` · `elastos/crates/elastos-vz/`
