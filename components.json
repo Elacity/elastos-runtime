@@ -46,6 +46,33 @@
         "aarch64-linux"
       ]
     },
+    "net-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "exit-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "browser-engine-adapter": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
     "ipfs-provider": {
       "cid": "",
       "sha256": "",
@@ -153,6 +180,146 @@
         }
       }
     },
+    "net-provider": {
+      "install_path": "bin/net-provider",
+      "description": "Host Browser/Net provider binary for exit-mediated web connectivity",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "net-provider-linux-amd64",
+          "install_path": "bin/net-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "net-provider-linux-arm64",
+          "install_path": "bin/net-provider"
+        }
+      }
+    },
+    "exit-provider": {
+      "install_path": "bin/exit-provider",
+      "description": "Host Browser Exit provider contract for Runtime-mediated network egress",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "exit-provider-linux-amd64",
+          "install_path": "bin/exit-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "exit-provider-linux-arm64",
+          "install_path": "bin/exit-provider"
+        }
+      }
+    },
+    "browser-engine-adapter": {
+      "install_path": "bin/browser-engine-adapter",
+      "description": "Host Browser Engine Adapter contract for Runtime-mediated browser rendering",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-engine-adapter-linux-amd64",
+          "install_path": "bin/browser-engine-adapter"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-engine-adapter-linux-arm64",
+          "install_path": "bin/browser-engine-adapter"
+        }
+      }
+    },
+    "browser-engine-supervisor": {
+      "install_path": "bin/browser-engine-supervisor",
+      "description": "Linux Browser Engine supervisor helper that launches native engines with Runtime-only network handoff",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-engine-supervisor-linux-amd64",
+          "install_path": "bin/browser-engine-supervisor"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-engine-supervisor-linux-arm64",
+          "install_path": "bin/browser-engine-supervisor"
+        }
+      }
+    },
+    "browser-native-proxy-engine": {
+      "install_path": "bin/browser-native-proxy-engine",
+      "description": "Native Chromium/CEF browser wrapper with loopback proxy and Runtime Exit relay networking",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-native-proxy-engine-linux-amd64",
+          "install_path": "bin/browser-native-proxy-engine"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-native-proxy-engine-linux-arm64",
+          "install_path": "bin/browser-native-proxy-engine"
+        }
+      }
+    },
+    "browser-stream-bridge": {
+      "install_path": "bin/browser-stream-bridge",
+      "description": "Linux Browser Engine Unix stream bridge for Runtime-owned byte transport",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-stream-bridge-linux-amd64",
+          "install_path": "bin/browser-stream-bridge"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-stream-bridge-linux-arm64",
+          "install_path": "bin/browser-stream-bridge"
+        }
+      }
+    },
+    "browser-local-exit": {
+      "install_path": "bin/browser-local-exit",
+      "description": "Linux Browser local Exit relay that dials allowlisted public TCP targets behind Runtime-owned Browser streams",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-local-exit-linux-amd64",
+          "install_path": "bin/browser-local-exit"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser-local-exit-linux-arm64",
+          "install_path": "bin/browser-local-exit"
+        }
+      }
+    },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary required for localhost://WebSpaces/<moniker>/... handles",
@@ -212,6 +379,20 @@
           "release_path": "system.tar.gz",
           "extract_path": "system",
           "install_path": "capsules/system"
+        }
+      }
+    },
+    "browser": {
+      "install_path": "capsules/browser",
+      "description": "General-purpose Browser capsule with Runtime wallet and network boundary",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "browser.tar.gz",
+          "extract_path": "browser",
+          "install_path": "capsules/browser"
         }
       }
     },
@@ -522,10 +703,18 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "net-provider",
+        "exit-provider",
+        "browser-engine-adapter",
+        "browser-engine-supervisor",
+        "browser-native-proxy-engine",
+        "browser-stream-bridge",
+        "browser-local-exit",
         "webspace-provider",
         "home-cli",
         "home",
         "system",
+        "browser",
         "documents",
         "library",
         "inbox"
@@ -537,10 +726,18 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "net-provider",
+        "exit-provider",
+        "browser-engine-adapter",
+        "browser-engine-supervisor",
+        "browser-native-proxy-engine",
+        "browser-stream-bridge",
+        "browser-local-exit",
         "webspace-provider",
         "home-cli",
         "home",
         "system",
+        "browser",
         "chat",
         "chat-wasm",
         "gba-emulator",
@@ -581,10 +778,18 @@
         "shell",
         "localhost-provider",
         "did-provider",
+        "net-provider",
+        "exit-provider",
+        "browser-engine-adapter",
+        "browser-engine-supervisor",
+        "browser-native-proxy-engine",
+        "browser-stream-bridge",
+        "browser-local-exit",
         "webspace-provider",
         "home-cli",
         "home",
         "system",
+        "browser",
         "kubo",
         "ipfs-provider",
         "documents",
@@ -601,9 +806,17 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
+        "net-provider",
+        "exit-provider",
+        "browser-engine-adapter",
+        "browser-engine-supervisor",
+        "browser-native-proxy-engine",
+        "browser-stream-bridge",
+        "browser-local-exit",
         "home-cli",
         "home",
         "system",
+        "browser",
         "kubo",
         "ipfs-provider",
         "site-provider",
@@ -621,9 +834,17 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
+        "net-provider",
+        "exit-provider",
+        "browser-engine-adapter",
+        "browser-engine-supervisor",
+        "browser-native-proxy-engine",
+        "browser-stream-bridge",
+        "browser-local-exit",
         "home-cli",
         "home",
         "system",
+        "browser",
         "chat",
         "chat-wasm",
         "gba-emulator",

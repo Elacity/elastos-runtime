@@ -85,6 +85,15 @@ The gateway edge must stay thin. It authenticates browser/host adapters, checks
 capabilities, and routes operations. It should not quietly become the provider
 implementation for IPFS, social drives, wallet signing, or collaboration logic.
 
+Browser follows the same rule. The contract/gate layer is one Browser/Net/Exit
+ABI: Browser UI asks Runtime, Runtime talks to Browser Engine Adapter + Net +
+Exit providers, and engine/provider candidates do not get their own Browser
+protocols. Selkies is useful as the current self-hosted baseline, but it is
+not the final product and not the acceptance answer. Browser work should stop when
+the structured provider `next_action` says to move to an operator-owned hosted
+bake-off or native/local browser adapters for lowest-latency, real audio/video,
+and a cleaner product path.
+
 ### 1. Keep Home as the runtime-owned browser-host adapter
 
 - keep `/apps/home/` as the runtime-owned browser-hosted adapter for the Home capsule

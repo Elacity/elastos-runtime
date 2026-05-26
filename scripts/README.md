@@ -39,6 +39,7 @@ Proof, smoke, and audit helpers also currently live at the root. Common examples
 - `chat-room-session-reuse-camofox-smoke.sh`
 - `chat-room-guest-identity-camofox-smoke.sh`
 - `chat-room-runtime-activity-smoke.sh`
+- `browser-session-capacity-smoke.sh`
 - `public-install-identity-smoke.sh`
 - `public-install-operator-smoke.sh`
 - `public-install-home-frontdoor-smoke.sh`

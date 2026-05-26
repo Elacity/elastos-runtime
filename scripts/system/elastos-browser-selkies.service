@@ -1,0 +1,19 @@
+[Unit]
+Description=ElastOS Browser Selkies hosted product target
+Documentation=file:/opt/elastos-runtime/docs/BROWSER_CAPSULE.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/elastos/browser-selkies.env
+ExecStart=/opt/elastos-runtime/scripts/system/elastos-browser-selkies.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=360
+TimeoutStopSec=30
+KillSignal=SIGINT
+WorkingDirectory=/opt/elastos-runtime
+
+[Install]
+WantedBy=multi-user.target

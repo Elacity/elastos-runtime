@@ -18,6 +18,9 @@ Do not add new product surface area until the `Now` section is materially tighte
 - [ ] Treat HTTP/browser routes as host adapters only. A browser-hosted capsule may use an HTTP endpoint to reach the local runtime, but the product contract must remain `capsule -> runtime capability -> Carrier/provider -> object/service`.
 - [ ] Add a fail-closed check that normal app capsules stay Carrier-only by default: no `guest_network`, no host execution, no raw off-box transport, and no provider-specific protocol knowledge in app UI.
 - [ ] Keep provider capsules as explicit exceptions with narrow manifests, capability schemas, audit events, and user/operator-visible reason strings.
+- [ ] Keep Browser on one Browser/Net/Exit ABI: Browser UI asks Runtime to open a page, Runtime routes through Browser Engine Adapter + Net + Exit providers, and candidate-specific details stay behind provider contracts.
+- [ ] Treat Selkies as the current self-hosted baseline, not the acceptance answer; do not spend more branch time tuning Selkies as the product path unless the structured `next_action` explicitly says that is the next gate.
+- [ ] Freeze new Browser provider implementation on this branch after the current proof gates; the next Browser path should be a native Chromium/CEF-style adapter or an operator-owned hosted candidate proven through the same Browser/Net/Exit ABI.
 
 ### 1. Home environment
 - [ ] Keep `home` as the browser capsule ID and `home-cli` as the terminal capsule ID; visible product language is `Home`.
