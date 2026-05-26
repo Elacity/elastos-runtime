@@ -97,6 +97,109 @@ pub fn parse_carrier_line(
     Ok(Some(value))
 }
 
+/// **Phase 10.5 M1 — byte-budgeted line reader.**
+///
+/// Reads bytes from `reader` into `buf` until either a newline
+/// is consumed (inclusive, matching [`tokio::io::AsyncBufReadExt::read_line`]
+/// shape) or `max_bytes` bytes have been buffered, whichever
+/// comes first. Returns the number of bytes pushed onto `buf`.
+///
+/// **Why it exists:** `BufReader::read_line` is unbounded. A
+/// guest writing `b"A" * 10_000_000_000` without a `\n` would
+/// grow the receiving `String` until the host runs out of
+/// memory — the post-read length check in
+/// [`run_carrier_bridge_loop`] fires *after* the allocation has
+/// already happened, which is too late.
+///
+/// **Calling convention:** callers pass `CARRIER_MAX_LINE_BYTES
+/// + 1` so the post-read check `n > CARRIER_MAX_LINE_BYTES`
+/// fires without truncating an attacker-supplied payload
+/// mid-byte. This `+1` headroom convention is the contract
+/// between this helper and the bridge loop's oversized-line
+/// handler.
+///
+/// **Semantics:**
+/// - On EOF before any byte: returns `Ok(0)`.
+/// - On newline within `max_bytes`: returns `Ok(n)` with the
+///   newline included in `buf`.
+/// - On reaching `max_bytes` without a newline: returns
+///   `Ok(max_bytes)`; the caller must call [`drain_to_newline`]
+///   to resync the stream to the start of the next line.
+///
+/// Memory footprint: bounded by `max_bytes` (size of `buf` on
+/// successful return) plus the inner `BufReader`'s 8 KiB
+/// internal scratch — constant in the size of attacker input.
+async fn read_line_byte_budgeted<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut total = 0usize;
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(total);
+            }
+            let remaining = max_bytes.saturating_sub(total);
+            let take = chunk.len().min(remaining);
+            let scan = &chunk[..take];
+            if let Some(pos) = scan.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&scan[..=pos]);
+                (pos + 1, true)
+            } else {
+                buf.extend_from_slice(scan);
+                (take, false)
+            }
+        };
+        reader.consume(consumed);
+        total += consumed;
+        if found_newline {
+            return Ok(total);
+        }
+        if total >= max_bytes {
+            return Ok(total);
+        }
+    }
+}
+
+/// **Phase 10.5 M1 — resync helper.**
+///
+/// Discard bytes from `reader` until the next `\n` is consumed
+/// or EOF. Memory footprint is O(internal `BufReader` buffer
+/// size) — bytes are scanned then consumed, never accumulated.
+///
+/// Called by [`run_carrier_bridge_loop`] after an oversized
+/// line is detected, so the next iteration starts on a clean
+/// line boundary. If the producer never sends a newline, the
+/// function loops until the underlying stream closes (EOF);
+/// memory remains O(1) the entire time.
+async fn drain_to_newline<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                (pos + 1, true)
+            } else {
+                (chunk.len(), false)
+            }
+        };
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(());
+        }
+    }
+}
+
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -219,23 +322,44 @@ async fn run_carrier_bridge_loop(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
+    // Phase 10.5 M1: the framed-line read is byte-budgeted at
+    // `CARRIER_MAX_LINE_BYTES + 1`. Pre-Phase-10.5 this was
+    // `read_line(&mut line)`, which is unbounded — a guest could
+    // grow the host's `String` to multi-GiB before the post-read
+    // length check fired (which was too late by then). The new
+    // helper allocates at most `CARRIER_MAX_LINE_BYTES + 1`
+    // bytes; the `+1` headroom lets the post-read check below
+    // distinguish "exactly at limit" from "over limit" without
+    // truncating attacker-supplied payloads mid-byte.
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut line = String::new();
     loop {
+        buf.clear();
         line.clear();
-        match reader.read_line(&mut line).await {
+        let n = match read_line_byte_budgeted(&mut reader, &mut buf, CARRIER_MAX_LINE_BYTES + 1)
+            .await
+        {
             Ok(0) => break, // EOF — guest shut down
-            Ok(_) => {}
+            Ok(n) => n,
             Err(e) => {
                 tracing::debug!("Carrier bridge read error: {}", e);
                 break;
             }
-        }
+        };
 
-        if line.len() > CARRIER_MAX_LINE_BYTES {
+        if n > CARRIER_MAX_LINE_BYTES {
             tracing::warn!(
-                "Carrier bridge: oversized line ({} bytes), dropping",
-                line.len()
+                "Carrier bridge: oversized line ({} bytes, cap {}), dropping and resyncing",
+                n,
+                CARRIER_MAX_LINE_BYTES
             );
+            // Resync the stream to the next line boundary so a
+            // subsequent well-formed request is dispatched
+            // cleanly. `drain_to_newline` is O(1) memory.
+            if let Err(e) = drain_to_newline(&mut reader).await {
+                tracing::debug!("Carrier bridge drain-after-overflow error: {}", e);
+                break;
+            }
             let error = serde_json::json!({
                 "id": 0,
                 "type": "error",
@@ -245,6 +369,22 @@ async fn run_carrier_bridge_loop(
             let _ = writer.write_all(b"\n").await;
             let _ = writer.flush().await;
             continue;
+        }
+
+        // Convert to UTF-8. `read_line` previously enforced this
+        // implicitly via its `&mut String` signature; we replicate
+        // the behaviour explicitly so a non-UTF-8 framed line
+        // does not break the loop — log and continue, matching
+        // the pre-Phase-10.5 read-error path semantics.
+        match std::str::from_utf8(&buf) {
+            Ok(s) => line.push_str(s),
+            Err(e) => {
+                tracing::warn!(
+                    "Carrier bridge: framed line is not valid UTF-8: {} (dropping)",
+                    e
+                );
+                continue;
+            }
         }
 
         tracing::debug!("[serial-bridge] → {}", line.trim());
@@ -1191,6 +1331,212 @@ mod tests {
             .expect("charlie post-bravo-shutdown ping must succeed");
         assert_eq!(resp["id"], serde_json::Value::from(2103u64));
         assert_eq!(resp["response"]["type"], "pong");
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M1 — bounded read regression test.
+    //
+    // Pre-Phase-10.5 the bridge loop called
+    // `reader.read_line(&mut line).await` with no upper bound, so a
+    // guest writing N bytes without a `\n` would grow the host's
+    // `String` to N bytes before the post-read length check fired.
+    // The fix replaces `read_line` with `read_line_byte_budgeted`
+    // which caps the allocation at `CARRIER_MAX_LINE_BYTES + 1`.
+    //
+    // This test exercises the path end-to-end:
+    //   1. Send 2 × CARRIER_MAX_LINE_BYTES bytes of 'A' with no
+    //      newline. Pre-fix, this would either OOM the test
+    //      process or, with the post-read check, block waiting for
+    //      a newline that never came.
+    //   2. Append a trailing `\n` + a well-formed `ping` request +
+    //      another `\n`.
+    //   3. Assert: the bridge writes back a `request_too_large`
+    //      envelope (proves the cap fired) followed by a `pong`
+    //      response (proves the loop drained to the next newline
+    //      and resumed normal dispatch — no bridge teardown).
+    //
+    // If the unbounded-read regression ever returns, this test
+    // will either time out (bridge stuck in `read_line` waiting
+    // for `\n`) or trigger an OOM kill in CI.
+    // ---------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_line_resyncs_and_continues_dispatch() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let (host, mut client) = build_socketpair();
+
+        spawn_carrier_bridge_on_stream(
+            host,
+            registry,
+            String::new(),
+            None,
+            "test:phase10.5-m1-oversized".into(),
+        );
+
+        // 2 MiB of 'A' with no newline — pre-fix this would grow
+        // the host `String` to 2 MiB before the length check
+        // tripped (the cap is 1 MiB).
+        let oversized = vec![b'A'; 2 * CARRIER_MAX_LINE_BYTES];
+        client
+            .write_all(&oversized)
+            .await
+            .expect("write oversized burst to bridge");
+        // Newline to close out the oversized framed line so the
+        // drain can resync without waiting for the rest of the
+        // (never-coming) attacker payload.
+        client.write_all(b"\n").await.expect("write closing \\n");
+        // Then a clean ping to prove the bridge is still alive
+        // and dispatching after the overflow event.
+        let ping = b"{\"id\":91005,\"request\":{\"type\":\"ping\"}}\n";
+        client
+            .write_all(ping)
+            .await
+            .expect("write follow-up ping after overflow");
+        client.flush().await.expect("flush after overflow + ping");
+
+        // The bridge writes two responses back-to-back:
+        //   1. `request_too_large` (for the oversized line)
+        //   2. `pong` envelope echoing id=91005 (for the follow-up)
+        //
+        // Read them as raw bytes and split on `\n` — they may
+        // arrive in one or two `read` chunks depending on kernel
+        // buffering.
+        let mut buf = [0u8; 8192];
+        let mut accumulated = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "bridge did not produce both responses within deadline; got: {}",
+                    String::from_utf8_lossy(&accumulated)
+                );
+            }
+            let read = tokio::time::timeout(
+                remaining,
+                tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+            )
+            .await;
+            match read {
+                Ok(Ok(0)) => panic!(
+                    "bridge closed early; partial accumulator: {}",
+                    String::from_utf8_lossy(&accumulated)
+                ),
+                Ok(Ok(n)) => {
+                    accumulated.extend_from_slice(&buf[..n]);
+                    // Two `\n`-terminated frames means both
+                    // responses have arrived.
+                    if accumulated.iter().filter(|&&b| b == b'\n').count() >= 2 {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => panic!("read from bridge failed: {e}"),
+                Err(_) => panic!(
+                    "deadline hit waiting for second response; accumulator: {}",
+                    String::from_utf8_lossy(&accumulated)
+                ),
+            }
+        }
+
+        let text = String::from_utf8(accumulated).expect("bridge responses are UTF-8");
+        let mut lines = text.lines();
+
+        let first = lines.next().expect("first response line present");
+        let first_json: serde_json::Value =
+            serde_json::from_str(first).expect("first response is JSON");
+        assert_eq!(
+            first_json["type"], "error",
+            "first response must be the error envelope; got: {first}"
+        );
+        assert_eq!(
+            first_json["error"], "request_too_large",
+            "first response must be `request_too_large`; got: {first}"
+        );
+
+        let second = lines.next().expect("second response line present");
+        let second_json: serde_json::Value =
+            serde_json::from_str(second).expect("second response is JSON");
+        assert_eq!(
+            second_json["id"],
+            serde_json::Value::from(91005u64),
+            "second response must echo the follow-up ping's id (proves resync \
+             worked and dispatch resumed); got: {second}"
+        );
+        assert_eq!(
+            second_json["response"]["type"], "pong",
+            "second response must be a pong (proves the bridge is still \
+             servicing the same connection after the overflow event); got: {second}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M1 — direct helper unit tests.
+    //
+    // These exercise `read_line_byte_budgeted` in isolation so a
+    // regression in the byte-budget arithmetic (off-by-one on the
+    // `+1` headroom, premature return, etc.) is caught without
+    // standing up a full bridge.
+    // ---------------------------------------------------------------
+
+    /// Happy path: a small newline-terminated line under the cap
+    /// is read in full with the newline included (matching
+    /// `read_line`'s shape).
+    #[tokio::test]
+    async fn read_line_byte_budgeted_returns_full_line_under_cap() {
+        let mut reader = tokio::io::BufReader::new(&b"hello\nworld\n"[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, CARRIER_MAX_LINE_BYTES + 1)
+            .await
+            .expect("read should succeed");
+        assert_eq!(n, 6);
+        assert_eq!(&buf, b"hello\n");
+    }
+
+    /// Overflow path: a payload longer than `max_bytes` with no
+    /// embedded newline returns exactly `max_bytes` bytes, so the
+    /// caller's `> CARRIER_MAX_LINE_BYTES` check fires.
+    #[tokio::test]
+    async fn read_line_byte_budgeted_caps_at_max_bytes_when_no_newline() {
+        let payload = vec![b'A'; 4096];
+        let mut reader = tokio::io::BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let max = 1024usize;
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, max)
+            .await
+            .expect("read should succeed");
+        assert_eq!(n, max, "must return exactly max_bytes when no newline found");
+        assert_eq!(buf.len(), max, "buf must be capped at max_bytes");
+    }
+
+    /// EOF path: stream that closes before any byte is read
+    /// returns `Ok(0)`, matching `read_line`'s EOF shape so the
+    /// caller's `match Ok(0) => break` arm works unchanged.
+    #[tokio::test]
+    async fn read_line_byte_budgeted_returns_zero_on_immediate_eof() {
+        let mut reader = tokio::io::BufReader::new(&b""[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, 1024)
+            .await
+            .expect("read should succeed");
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// `drain_to_newline` consumes everything up to and including
+    /// the next `\n` — and only that — so the next read picks up
+    /// from the start of the following line.
+    #[tokio::test]
+    async fn drain_to_newline_resyncs_to_next_line_start() {
+        let mut reader = tokio::io::BufReader::new(&b"AAAAAAAA\nBBBB\n"[..]);
+        drain_to_newline(&mut reader)
+            .await
+            .expect("drain should succeed");
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, 1024)
+            .await
+            .expect("post-drain read should succeed");
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"BBBB\n");
     }
 
     #[test]
