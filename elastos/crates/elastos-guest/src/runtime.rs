@@ -220,7 +220,10 @@ enum CarrierChannel {
 ///
 /// Communicates with the ElastOS runtime via Carrier. The transport is
 /// detected automatically:
-/// - `ELASTOS_CARRIER_FDS` set (e.g., "3,4") → use those fds (WASM bridge mode)
+/// - `ELASTOS_CARRIER_FIFOS` set (e.g., "/_carrier/response,/_carrier/request")
+///   → open those FIFO paths (WASM bridge mode, wasmtime 24+ compatible)
+/// - `ELASTOS_CARRIER_FDS` set (e.g., "3,4") → use those fds (WASM bridge mode,
+///   legacy fd-injection — kept for back-compat during the transition)
 /// - `ELASTOS_CARRIER_PATH` set → use that file (e.g., /dev/hvc0 for microVM virtio-console)
 /// - Otherwise → use stdin/stdout (standalone host-process mode, no bridge)
 ///
@@ -236,12 +239,18 @@ impl RuntimeClient {
     /// Create a new runtime client.
     ///
     /// Detects the Carrier channel automatically:
-    /// 1. `ELASTOS_CARRIER_FDS=read_fd,write_fd` → dedicated fd pair (WASM bridge, in-process)
-    /// 2. `ELASTOS_CARRIER_PATH=/dev/hvc0` → file-based (microVM virtio-console device)
-    /// 3. `ELASTOS_API` + `ELASTOS_TOKEN` → HTTP API to running runtime (attached mode)
-    /// 4. Otherwise → stdin/stdout (standalone host-process mode)
+    /// 1. `ELASTOS_CARRIER_FIFOS=reader_path,writer_path` → FIFO pair via
+    ///    preopened-dir (WASM bridge, wasmtime 24+ compatible)
+    /// 2. `ELASTOS_CARRIER_FDS=read_fd,write_fd` → dedicated fd pair
+    ///    (legacy WASM bridge — back-compat fallback)
+    /// 3. `ELASTOS_CARRIER_PATH=/dev/hvc0` → file-based (microVM virtio-console device)
+    /// 4. `ELASTOS_API` + `ELASTOS_TOKEN` → HTTP API to running runtime (attached mode)
+    /// 5. Otherwise → stdin/stdout (standalone host-process mode)
     pub fn new() -> Self {
-        let channel = if std::env::var_os("ELASTOS_CARRIER_FDS").is_some() {
+        let channel = if std::env::var_os("ELASTOS_CARRIER_FIFOS").is_some() {
+            Self::channel_from_fifos()
+                .unwrap_or_else(|e| panic!("ELASTOS_CARRIER_FIFOS is set but invalid: {e}"))
+        } else if std::env::var_os("ELASTOS_CARRIER_FDS").is_some() {
             Self::channel_from_fds()
                 .unwrap_or_else(|e| panic!("ELASTOS_CARRIER_FDS is set but invalid: {e}"))
         } else if let Ok(path) = std::env::var("ELASTOS_CARRIER_PATH") {
@@ -567,11 +576,67 @@ impl RuntimeClient {
         }
     }
 
+    /// Try to open a Carrier channel from ELASTOS_CARRIER_FIFOS env var.
+    ///
+    /// Format: `"reader_path,writer_path"` — sandbox-relative paths (e.g.,
+    /// `"/_carrier/response,/_carrier/request"`). `reader_path` is the FIFO the
+    /// capsule reads from (host writes SDK responses to it); `writer_path` is
+    /// the FIFO the capsule writes to (host reads SDK requests from it).
+    ///
+    /// This transport replaces `channel_from_fds()` for capsules running under
+    /// `wasmtime-wasi 24+`, which removed the `insert_file` API used to inject
+    /// custom fds. The runtime preopens a per-launch directory containing both
+    /// FIFOs via `WasiCtxBuilder::preopened_dir()`; the capsule opens them by
+    /// path. stdin/stdout remain inherited for user I/O, matching the design
+    /// goal that motivated the original fd-injection scheme.
+    fn channel_from_fifos() -> io::Result<CarrierChannel> {
+        let env = std::env::var("ELASTOS_CARRIER_FIFOS")
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let parts: Vec<&str> = env.split(',').collect();
+        if parts.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected ELASTOS_CARRIER_FIFOS=reader_path,writer_path",
+            ));
+        }
+        let reader_path = parts[0].trim();
+        let writer_path = parts[1].trim();
+        if reader_path.is_empty() || writer_path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ELASTOS_CARRIER_FIFOS paths must be non-empty",
+            ));
+        }
+
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(reader_path)
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("open {reader_path} (read): {e}"))
+            })?;
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("open {writer_path} (write): {e}"))
+            })?;
+
+        Ok(CarrierChannel::FilePair {
+            reader: io::BufReader::new(reader),
+            writer,
+        })
+    }
+
     /// Try to open a Carrier channel from ELASTOS_CARRIER_FDS env var.
     ///
     /// Format: "read_fd,write_fd" (e.g., "3,4").
     /// Used by the WASM bridge: the runtime inserts pipe endpoints at these fds
     /// in the WASI context, keeping stdin/stdout free for user I/O.
+    ///
+    /// **Deprecated** as the preferred transport in favour of
+    /// [`Self::channel_from_fifos`]. Kept as a back-compat fallback so existing
+    /// runtimes that still use fd-injection continue to work during the
+    /// transition. New runtimes should set `ELASTOS_CARRIER_FIFOS` instead.
     fn channel_from_fds() -> io::Result<CarrierChannel> {
         let fds_str = std::env::var("ELASTOS_CARRIER_FDS")
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -1135,12 +1200,16 @@ mod tests {
             let mut slave_fd = -1;
             let mut name = [0i8; 128];
 
+            // NB: libc 0.2 (post Day-1 Cluster-C cascade) changed openpty's
+            // last two parameters (`termp: *mut termios`, `winp: *mut winsize`)
+            // from `*const` to `*mut`. Use `null_mut()` rather than `null()`
+            // so this compiles cleanly with the bumped libc.
             let rc = libc::openpty(
                 &mut master_fd,
                 &mut slave_fd,
                 name.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
             assert!(master_fd >= 0);
@@ -1250,5 +1319,236 @@ mod tests {
                 Some("did:key:zTest")
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FIFO carrier-channel tests (Path 2A — host-FIFO transport).
+    // These exercise `channel_from_fifos` directly and prove that
+    // `RuntimeClient::new()` prefers ELASTOS_CARRIER_FIFOS over the legacy
+    // ELASTOS_CARRIER_FDS when both are present.
+    // ------------------------------------------------------------------
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    fn fifo_test_dir(label: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "elastos-guest-fifo-test-{}-{}-{}",
+            std::process::id(),
+            label,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    fn mkfifo_for_test(path: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let cstr = CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+        let ret = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
+        assert_eq!(
+            ret,
+            0,
+            "mkfifo({}) failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Opens both FIFOs RDWR on the host side to anchor them, so subsequent
+    /// one-directional opens by `channel_from_fifos` don't block. Caller must
+    /// keep the returned handles alive for the duration of the test.
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    fn anchor_fifos(
+        request_path: &std::path::Path,
+        response_path: &std::path::Path,
+    ) -> (std::fs::File, std::fs::File) {
+        let req = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(request_path)
+            .expect("anchor request");
+        let resp = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(response_path)
+            .expect("anchor response");
+        (req, resp)
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    #[test]
+    fn channel_from_fifos_rejects_missing_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ELASTOS_CARRIER_FIFOS").ok();
+        std::env::remove_var("ELASTOS_CARRIER_FIFOS");
+        match RuntimeClient::channel_from_fifos() {
+            Ok(_) => panic!("missing env must yield Err, not Ok"),
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput),
+        }
+        if let Some(v) = saved {
+            std::env::set_var("ELASTOS_CARRIER_FIFOS", v);
+        }
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    #[test]
+    fn channel_from_fifos_rejects_malformed_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ELASTOS_CARRIER_FIFOS").ok();
+
+        for (label, value) in &[
+            ("single-path", "/tmp/only-one"),
+            ("three-paths", "/a,/b,/c"),
+            ("empty-reader", ",/tmp/writer"),
+            ("empty-writer", "/tmp/reader,"),
+        ] {
+            std::env::set_var("ELASTOS_CARRIER_FIFOS", value);
+            match RuntimeClient::channel_from_fifos() {
+                Ok(_) => panic!("{label}: malformed env must produce Err, got Ok"),
+                Err(err) => assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "{label}: wrong error kind"
+                ),
+            }
+        }
+
+        if let Some(v) = saved {
+            std::env::set_var("ELASTOS_CARRIER_FIFOS", v);
+        } else {
+            std::env::remove_var("ELASTOS_CARRIER_FIFOS");
+        }
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    #[test]
+    fn channel_from_fifos_round_trip() {
+        use std::io::Read as _;
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ELASTOS_CARRIER_FIFOS").ok();
+
+        let dir = fifo_test_dir("round-trip");
+        let request_path = dir.join("request");
+        let response_path = dir.join("response");
+        mkfifo_for_test(&request_path);
+        mkfifo_for_test(&response_path);
+
+        // Anchor before opening one-directional. Keep alive until cleanup.
+        let (mut host_req_rw, mut host_resp_rw) = anchor_fifos(&request_path, &response_path);
+
+        // ELASTOS_CARRIER_FIFOS spec: "reader_path,writer_path" from the
+        // capsule's perspective. reader = response (capsule reads SDK
+        // responses); writer = request (capsule writes SDK requests).
+        std::env::set_var(
+            "ELASTOS_CARRIER_FIFOS",
+            format!("{},{}", response_path.display(), request_path.display()),
+        );
+
+        let mut channel =
+            RuntimeClient::channel_from_fifos().expect("channel_from_fifos must succeed");
+
+        // Send a request through the channel and read it via the host's
+        // RDWR anchor on the request FIFO. Tests that the writer side of
+        // the channel is wired to the right FIFO.
+        if let CarrierChannel::FilePair {
+            ref mut writer, ..
+        } = channel
+        {
+            writeln!(writer, "{{\"id\":1,\"request\":{{\"type\":\"ping\"}}}}").unwrap();
+            writer.flush().unwrap();
+        } else {
+            panic!("channel must be a FilePair");
+        }
+
+        let mut buf = String::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = host_req_rw.read(&mut byte).expect("host read");
+            if n == 0 || byte[0] == b'\n' {
+                if byte[0] == b'\n' {
+                    buf.push('\n');
+                }
+                break;
+            }
+            buf.push(byte[0] as char);
+        }
+        assert_eq!(buf, "{\"id\":1,\"request\":{\"type\":\"ping\"}}\n");
+
+        // Host writes a response; channel reader on the SDK side must see it.
+        writeln!(host_resp_rw, "{{\"id\":1,\"response\":{{\"type\":\"pong\"}}}}").unwrap();
+        host_resp_rw.flush().unwrap();
+
+        if let CarrierChannel::FilePair {
+            ref mut reader, ..
+        } = channel
+        {
+            let mut resp_buf = String::new();
+            reader
+                .read_line(&mut resp_buf)
+                .expect("channel reader must read line");
+            assert_eq!(resp_buf, "{\"id\":1,\"response\":{\"type\":\"pong\"}}\n");
+        }
+
+        // Drop the channel and the anchors before unlinking.
+        drop(channel);
+        drop(host_req_rw);
+        drop(host_resp_rw);
+
+        if let Some(v) = saved {
+            std::env::set_var("ELASTOS_CARRIER_FIFOS", v);
+        } else {
+            std::env::remove_var("ELASTOS_CARRIER_FIFOS");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(all(feature = "serde", not(target_os = "wasi")))]
+    #[test]
+    fn runtime_client_new_prefers_fifos_over_fds() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved_fifos = std::env::var("ELASTOS_CARRIER_FIFOS").ok();
+        let saved_fds = std::env::var("ELASTOS_CARRIER_FDS").ok();
+
+        let dir = fifo_test_dir("prefer-fifos");
+        let request_path = dir.join("request");
+        let response_path = dir.join("response");
+        mkfifo_for_test(&request_path);
+        mkfifo_for_test(&response_path);
+        let (host_req_rw, host_resp_rw) = anchor_fifos(&request_path, &response_path);
+
+        // Valid FIFOS + GARBAGE FDS. If RuntimeClient::new() checked FDS
+        // first, parsing "not_a_number" would fail and the function would
+        // panic (`unwrap_or_else(|e| panic!(...))`). If FIFOS is checked
+        // first, construction succeeds.
+        std::env::set_var(
+            "ELASTOS_CARRIER_FIFOS",
+            format!("{},{}", response_path.display(), request_path.display()),
+        );
+        std::env::set_var("ELASTOS_CARRIER_FDS", "not_a_number");
+
+        let _client = RuntimeClient::new();
+
+        drop(host_req_rw);
+        drop(host_resp_rw);
+        if let Some(v) = saved_fifos {
+            std::env::set_var("ELASTOS_CARRIER_FIFOS", v);
+        } else {
+            std::env::remove_var("ELASTOS_CARRIER_FIFOS");
+        }
+        if let Some(v) = saved_fds {
+            std::env::set_var("ELASTOS_CARRIER_FDS", v);
+        } else {
+            std::env::remove_var("ELASTOS_CARRIER_FDS");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

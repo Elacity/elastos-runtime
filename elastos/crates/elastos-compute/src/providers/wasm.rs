@@ -29,11 +29,30 @@ struct RunningInstance {
     manifest: CapsuleManifest,
     /// Data directory for this capsule (if storage permissions granted)
     _data_dir: Option<PathBuf>,
+    /// Per-launch carrier directory (only set when bridge ran via FIFO transport).
+    /// Cleaned up on `Drop` so dropped instances don't leak FIFOs into /tmp.
+    carrier_dir: Option<PathBuf>,
+}
+
+impl Drop for RunningInstance {
+    fn drop(&mut self) {
+        // Defensive cleanup: remove the carrier dir (with its FIFOs) when the
+        // instance is dropped. The bridge spawner is expected to have already
+        // dropped its File handles by this point, so the FIFOs are unreferenced.
+        // Best-effort — a leaked dir under /tmp is harmless on macOS/Linux.
+        if let Some(dir) = self.carrier_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// Pipe handles returned when bridge mode is active.
 /// The caller (runtime) reads from `capsule_stdout` and writes to `capsule_stdin`
 /// to bridge the capsule's SDK requests to the provider registry.
+///
+/// The field names reflect the historical fd-injection design (capsule_stdout =
+/// "data flowing out of the capsule"; capsule_stdin = "data flowing into the
+/// capsule"). The same shape is reused by the FIFO transport.
 pub struct BridgePipes {
     /// Read end of the capsule's stdout pipe — runtime reads SDK requests here
     pub capsule_stdout: std::fs::File,
@@ -46,6 +65,26 @@ pub struct BridgePipes {
 /// The callback should spawn a bridge thread/task and return immediately.
 pub type BridgeSpawner = Arc<dyn Fn(BridgePipes) + Send + Sync>;
 
+/// Transport used to wire the carrier bridge between the runtime and a WASM
+/// capsule. Selected per-provider via [`WasmProvider::set_bridge_transport`].
+///
+/// `Fds` (default) uses `wasi.insert_file()` to inject pipe endpoints at
+/// fds 3 and 4. This is the legacy transport. It depends on `wasmtime-wasi`
+/// providing `insert_file`, which was removed in `wasmtime-wasi 24+`.
+///
+/// `Fifos` mounts a per-launch directory containing two named pipes into the
+/// WASI sandbox via `preopened_dir()`. The capsule SDK opens these by path.
+/// This transport survives all known wasmtime-wasi API changes through 36+
+/// and is the migration target for the wasmtime 17 → 24 bump (Day 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BridgeTransport {
+    /// Legacy fd-injection transport. Selected by default for back-compat.
+    #[default]
+    Fds,
+    /// FIFO-on-preopened-dir transport. The migration target.
+    Fifos,
+}
+
 /// WASM compute provider using wasmtime with WASI support
 pub struct WasmProvider {
     instances: Arc<RwLock<HashMap<CapsuleId, RunningInstance>>>,
@@ -55,6 +94,10 @@ pub struct WasmProvider {
     /// instead of inherited, and this callback is invoked to handle the
     /// bridge (e.g., dispatching SDK requests to the provider registry).
     bridge_spawner: std::sync::RwLock<Option<BridgeSpawner>>,
+    /// Carrier bridge transport. Defaults to [`BridgeTransport::Fds`] for
+    /// back-compat; the runtime can switch to [`BridgeTransport::Fifos`] to
+    /// exercise the wasmtime-24-compatible path.
+    transport: std::sync::RwLock<BridgeTransport>,
 }
 
 impl WasmProvider {
@@ -72,6 +115,7 @@ impl WasmProvider {
             instances: Arc::new(RwLock::new(HashMap::new())),
             data_base_dir: data_dir.into(),
             bridge_spawner: std::sync::RwLock::new(None),
+            transport: std::sync::RwLock::new(BridgeTransport::default()),
         }
     }
 
@@ -85,6 +129,17 @@ impl WasmProvider {
         *guard = Some(spawner);
     }
 
+    /// Select the carrier bridge transport. See [`BridgeTransport`].
+    pub fn set_bridge_transport(&self, transport: BridgeTransport) {
+        let mut guard = self.transport.write().unwrap();
+        *guard = transport;
+    }
+
+    /// Read the currently selected carrier bridge transport.
+    pub fn bridge_transport(&self) -> BridgeTransport {
+        *self.transport.read().unwrap()
+    }
+
     /// Get or create the data directory for a capsule
     fn get_capsule_data_dir(&self, capsule_name: &str) -> PathBuf {
         self.data_base_dir.join(capsule_name)
@@ -96,20 +151,150 @@ impl WasmProvider {
     const CARRIER_READ_FD: u32 = 3;
     const CARRIER_WRITE_FD: u32 = 4;
 
+    /// Sandbox path at which the per-capsule carrier directory is preopened
+    /// when using the FIFO transport. Capsules see two files inside it:
+    /// `response` (capsule reads, host writes) and `request` (capsule writes,
+    /// host reads). The directory name is chosen to be unlikely to collide
+    /// with any guest-facing app path.
+    const CARRIER_GUEST_DIR: &'static str = "/_carrier";
+
+    /// Filename for the FIFO the capsule reads (= host writes SDK responses).
+    const CARRIER_RESPONSE_FILE: &'static str = "response";
+
+    /// Filename for the FIFO the capsule writes (= host reads SDK requests).
+    const CARRIER_REQUEST_FILE: &'static str = "request";
+
+    /// Compute the per-launch host-side carrier directory. Always returns a
+    /// path under the system temp dir so cleanup-on-crash is bounded by the
+    /// OS's temp-reaper rather than persisting next to capsule data.
+    pub(crate) fn carrier_dir_for(capsule_id: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("elastos-carrier")
+            .join(capsule_id)
+    }
+
+    /// Create a FIFO at `path` with the given mode. Returns an
+    /// `ElastosError::Compute` on failure rather than panicking, so callers
+    /// can surface configuration errors cleanly.
+    fn mkfifo(path: &Path, mode: u32) -> Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let cstr = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+            ElastosError::Compute(format!("invalid fifo path {}: {}", path.display(), e))
+        })?;
+        let ret = unsafe { libc::mkfifo(cstr.as_ptr(), mode as libc::mode_t) };
+        if ret != 0 {
+            return Err(ElastosError::Compute(format!(
+                "mkfifo({}, {:o}) failed: {}",
+                path.display(),
+                mode,
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Create the per-launch carrier dir (mode 0700) and two FIFOs (mode 0600)
+    /// inside it, then return the dir path plus host-side [`BridgePipes`] with
+    /// both ends opened for read+write.
+    ///
+    /// Rationale for `O_RDWR` on the host: a FIFO blocks on `open()` until both
+    /// a reader and a writer exist. Opening both ends as RDWR from the host
+    /// anchors the FIFO so the capsule's later one-directional opens succeed
+    /// immediately without a handshake thread. EOF semantics: the host's
+    /// read side will NOT see EOF when the capsule exits because the host
+    /// itself is still counted as a writer; the bridge thread should rely on
+    /// EPIPE-on-write (response FIFO) or explicit shutdown signalling. This is
+    /// adequate for Day 7 plumbing; cleaner exit detection is a Day 8+ concern.
+    pub(crate) fn setup_carrier_fifos(capsule_id: &str) -> Result<(PathBuf, BridgePipes)> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = Self::carrier_dir_for(capsule_id);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            ElastosError::Compute(format!(
+                "failed to create carrier dir {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            ElastosError::Compute(format!(
+                "failed to chmod carrier dir {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+
+        let request_path = dir.join(Self::CARRIER_REQUEST_FILE);
+        let response_path = dir.join(Self::CARRIER_RESPONSE_FILE);
+        Self::mkfifo(&request_path, 0o600)?;
+        Self::mkfifo(&response_path, 0o600)?;
+
+        let capsule_stdout = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&request_path)
+            .map_err(|e| {
+                ElastosError::Compute(format!(
+                    "failed to open request fifo {}: {}",
+                    request_path.display(),
+                    e
+                ))
+            })?;
+        let capsule_stdin = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&response_path)
+            .map_err(|e| {
+                ElastosError::Compute(format!(
+                    "failed to open response fifo {}: {}",
+                    response_path.display(),
+                    e
+                ))
+            })?;
+
+        Ok((
+            dir,
+            BridgePipes {
+                capsule_stdout,
+                capsule_stdin,
+            },
+        ))
+    }
+
+    /// Best-effort removal of a carrier dir and its FIFOs. Idempotent — safe to
+    /// call multiple times or against an already-removed path.
+    pub(crate) fn cleanup_carrier_dir(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Build WASI context based on capsule permissions.
     ///
-    /// When `use_bridge` is true, dedicated Carrier fds (3 and 4) are created
-    /// via OS pipes and `BridgePipes` is returned for the caller to set up the
-    /// bridge. stdin/stdout remain inherited for user I/O.
-    /// When false, host stdio is inherited directly with no bridge.
+    /// When `use_bridge` is true, dedicated Carrier I/O is set up according
+    /// to the selected [`BridgeTransport`]:
+    ///   * `Fds`   — OS pipes injected at fds 3 and 4 (`wasi.insert_file`).
+    ///   * `Fifos` — per-launch directory containing two FIFOs is preopened
+    ///               at `/_carrier` in the sandbox (no fd injection).
+    /// `BridgePipes` and (for `Fifos`) the host-side carrier dir path are
+    /// returned for the caller to set up the bridge and to track cleanup.
+    /// stdin/stdout remain inherited for user I/O in both transports.
     fn build_wasi_context(
         &self,
         manifest: &CapsuleManifest,
         capsule_id: &str,
         args: &[String],
         use_bridge: bool,
-    ) -> Result<(WasiCtx, Option<PathBuf>, Option<BridgePipes>)> {
+    ) -> Result<(
+        WasiCtx,
+        Option<PathBuf>,
+        Option<BridgePipes>,
+        Option<PathBuf>,
+    )> {
         let mut builder = WasiCtxBuilder::new();
+        let transport = self.bridge_transport();
 
         // Always inherit stdio for user I/O and debug output.
         builder.inherit_stdout();
@@ -133,14 +318,38 @@ impl WasmProvider {
             .env("ELASTOS_CAPSULE_ID", capsule_id)
             .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
 
-        // Tell the SDK to use dedicated carrier fds when bridge is active
+        // Tell the SDK how to reach the carrier when bridge is active. The
+        // env-var choice mirrors the transport: capsules detect the variable
+        // they recognise and pick the matching CarrierChannel branch.
         if use_bridge {
-            builder
-                .env(
-                    "ELASTOS_CARRIER_FDS",
-                    &format!("{},{}", Self::CARRIER_READ_FD, Self::CARRIER_WRITE_FD),
-                )
-                .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
+            match transport {
+                BridgeTransport::Fds => {
+                    builder
+                        .env(
+                            "ELASTOS_CARRIER_FDS",
+                            &format!(
+                                "{},{}",
+                                Self::CARRIER_READ_FD,
+                                Self::CARRIER_WRITE_FD
+                            ),
+                        )
+                        .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
+                }
+                BridgeTransport::Fifos => {
+                    builder
+                        .env(
+                            "ELASTOS_CARRIER_FIFOS",
+                            &format!(
+                                "{}/{},{}/{}",
+                                Self::CARRIER_GUEST_DIR,
+                                Self::CARRIER_RESPONSE_FILE,
+                                Self::CARRIER_GUEST_DIR,
+                                Self::CARRIER_REQUEST_FILE
+                            ),
+                        )
+                        .map_err(|e| ElastosError::Compute(format!("Failed to set env: {}", e)))?;
+                }
+            }
         }
 
         // Forward select host environment variables to the capsule
@@ -203,41 +412,81 @@ impl WasmProvider {
             None
         };
 
-        let wasi = builder.build();
-
-        // Insert dedicated carrier channel fds when bridge is active.
-        // fd 3 = capsule reads SDK responses (ReadPipe)
-        // fd 4 = capsule writes SDK requests (WritePipe)
-        // The bridge thread reads from the other end of fd 4's pipe
-        // and writes responses to the other end of fd 3's pipe.
-        let bridge_pipes = if use_bridge {
-            use wasi_common::file::FileAccessMode;
-
-            // Pipe for capsule → bridge (SDK requests)
-            let (bridge_request_read, capsule_request_write) = Self::create_pipe()?;
-            // Pipe for bridge → capsule (SDK responses)
-            let (capsule_response_read, bridge_response_write) = Self::create_pipe()?;
-
-            wasi.insert_file(
-                Self::CARRIER_READ_FD,
-                Box::new(ReadPipe::new(capsule_response_read)),
-                FileAccessMode::READ,
-            );
-            wasi.insert_file(
-                Self::CARRIER_WRITE_FD,
-                Box::new(WritePipe::new(capsule_request_write)),
-                FileAccessMode::WRITE,
-            );
-
-            Some(BridgePipes {
-                capsule_stdout: bridge_request_read,
-                capsule_stdin: bridge_response_write,
-            })
+        // For the FIFO transport, the carrier dir + FIFOs must exist and be
+        // preopened on the builder BEFORE `build()` so the WasiCtx records the
+        // preopen. Set them up here and stash the host-side ends for the
+        // post-build assembly below.
+        let pending_fifo = if use_bridge && transport == BridgeTransport::Fifos {
+            let (carrier_dir, pipes) = Self::setup_carrier_fifos(capsule_id)?;
+            let cap_dir = wasmtime_wasi::sync::Dir::open_ambient_dir(
+                &carrier_dir,
+                wasmtime_wasi::sync::ambient_authority(),
+            )
+            .map_err(|e| {
+                // Cleanup before propagating so we don't leak the dir on the
+                // configuration-error path.
+                Self::cleanup_carrier_dir(&carrier_dir);
+                ElastosError::Compute(format!("Failed to open carrier dir for preopen: {}", e))
+            })?;
+            builder
+                .preopened_dir(cap_dir, Self::CARRIER_GUEST_DIR)
+                .map_err(|e| {
+                    Self::cleanup_carrier_dir(&carrier_dir);
+                    ElastosError::Compute(format!("Failed to preopen carrier dir: {}", e))
+                })?;
+            Some((carrier_dir, pipes))
         } else {
             None
         };
 
-        Ok((wasi, data_dir, bridge_pipes))
+        let wasi = builder.build();
+
+        // Assemble the bridge pipes per transport:
+        //   * Fds path: create OS pipes here and `insert_file` them at fds 3/4.
+        //     The bridge thread reads from the other end of fd 4's pipe and
+        //     writes responses to the other end of fd 3's pipe.
+        //   * Fifos path: re-use the FIFO ends we opened above.
+        let (bridge_pipes, carrier_dir) = if use_bridge {
+            match transport {
+                BridgeTransport::Fds => {
+                    use wasi_common::file::FileAccessMode;
+
+                    let (bridge_request_read, capsule_request_write) = Self::create_pipe()?;
+                    let (capsule_response_read, bridge_response_write) = Self::create_pipe()?;
+
+                    wasi.insert_file(
+                        Self::CARRIER_READ_FD,
+                        Box::new(ReadPipe::new(capsule_response_read)),
+                        FileAccessMode::READ,
+                    );
+                    wasi.insert_file(
+                        Self::CARRIER_WRITE_FD,
+                        Box::new(WritePipe::new(capsule_request_write)),
+                        FileAccessMode::WRITE,
+                    );
+
+                    (
+                        Some(BridgePipes {
+                            capsule_stdout: bridge_request_read,
+                            capsule_stdin: bridge_response_write,
+                        }),
+                        None,
+                    )
+                }
+                BridgeTransport::Fifos => {
+                    // Unwrap is safe: `pending_fifo` is Some iff
+                    // `use_bridge && transport == Fifos`, which matches the
+                    // outer + inner conditions here.
+                    let (dir, pipes) = pending_fifo
+                        .expect("FIFO transport branch must have pending_fifo set");
+                    (Some(pipes), Some(dir))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok((wasi, data_dir, bridge_pipes, carrier_dir))
     }
 
     /// Create an OS pipe pair, returning (read_end, write_end) as `std::fs::File`.
@@ -335,7 +584,7 @@ impl ComputeProvider for WasmProvider {
         let id = CapsuleId::new(format!("wasm-{}", uuid::Uuid::new_v4()));
 
         // Build WASI context to validate permissions early (no bridge for validation)
-        let (_, data_dir, _) = self.build_wasi_context(&manifest, &id.0, &[], false)?;
+        let (_, data_dir, _, _) = self.build_wasi_context(&manifest, &id.0, &[], false)?;
 
         let instance = RunningInstance {
             engine,
@@ -343,6 +592,7 @@ impl ComputeProvider for WasmProvider {
             status: CapsuleStatus::Loading,
             manifest: manifest.clone(),
             _data_dir: data_dir,
+            carrier_dir: None,
         };
 
         self.instances.write().await.insert(id.clone(), instance);
@@ -387,8 +637,17 @@ impl ComputeProvider for WasmProvider {
 
         // Build fresh WASI context for this execution (with args from handle)
         let args = handle.args.clone();
-        let (wasi, _, bridge_pipes) =
+        let (wasi, _, bridge_pipes, carrier_dir) =
             self.build_wasi_context(&manifest, &handle.id.0, &args, use_bridge)?;
+
+        // Record the carrier dir (if any) on the instance so Drop can clean it
+        // up even if the bridge spawner forgets to close its File handles.
+        if carrier_dir.is_some() {
+            let mut instances = self.instances.write().await;
+            if let Some(instance) = instances.get_mut(&handle.id) {
+                instance.carrier_dir = carrier_dir;
+            }
+        }
 
         // Spawn bridge if configured — must happen before WASM execution starts
         if let (Some(spawner), Some(pipes)) = (bridge_spawner, bridge_pipes) {
@@ -502,6 +761,216 @@ mod tests {
         // Verify bridge_spawner is set
         let spawner = provider.bridge_spawner.read().unwrap();
         assert!(spawner.is_some());
+    }
+
+    fn unique_test_capsule_id(label: &str) -> String {
+        format!("wasm-test-{label}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn test_set_bridge_transport_round_trip() {
+        let provider = WasmProvider::new();
+        // Default must be Fds for back-compat with existing runtimes.
+        assert_eq!(provider.bridge_transport(), BridgeTransport::Fds);
+        provider.set_bridge_transport(BridgeTransport::Fifos);
+        assert_eq!(provider.bridge_transport(), BridgeTransport::Fifos);
+        provider.set_bridge_transport(BridgeTransport::Fds);
+        assert_eq!(provider.bridge_transport(), BridgeTransport::Fds);
+    }
+
+    #[test]
+    fn test_setup_carrier_fifos_creates_dir_and_fifos_with_correct_modes() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+        let cid = unique_test_capsule_id("setup");
+        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid)
+            .expect("setup_carrier_fifos must succeed in a writable temp dir");
+
+        // Dir created with mode 0o700 (owner-only).
+        let dir_meta = std::fs::metadata(&dir).expect("dir must exist");
+        assert!(dir_meta.is_dir());
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+        // Both FIFOs created with mode 0o600 (owner read/write only).
+        for filename in &["request", "response"] {
+            let path = dir.join(filename);
+            let meta = std::fs::metadata(&path)
+                .unwrap_or_else(|_| panic!("{} fifo must exist", filename));
+            assert!(meta.file_type().is_fifo(), "{} must be a fifo", filename);
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "{} fifo must have mode 0600",
+                filename
+            );
+        }
+
+        WasmProvider::cleanup_carrier_dir(&dir);
+    }
+
+    #[test]
+    fn test_cleanup_carrier_dir_is_idempotent() {
+        let cid = unique_test_capsule_id("cleanup-idempotent");
+        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid)
+            .expect("setup_carrier_fifos must succeed");
+        assert!(dir.exists(), "dir must exist after setup");
+
+        WasmProvider::cleanup_carrier_dir(&dir);
+        assert!(!dir.exists(), "dir must be gone after first cleanup");
+
+        // Idempotency: a second cleanup on the already-removed dir must not panic.
+        WasmProvider::cleanup_carrier_dir(&dir);
+        assert!(!dir.exists(), "dir must still be gone after second cleanup");
+    }
+
+    #[test]
+    fn test_setup_carrier_fifos_round_trip_via_host_ends() {
+        use std::io::{Read, Write};
+
+        let cid = unique_test_capsule_id("round-trip");
+        let (dir, mut pipes) = WasmProvider::setup_carrier_fifos(&cid)
+            .expect("setup_carrier_fifos must succeed");
+
+        // Simulate a capsule by opening the FIFOs by their *host* paths. Inside
+        // a real WASM sandbox these would be /_carrier/request and
+        // /_carrier/response; the on-disk semantics are identical because the
+        // preopened-dir layer only constrains *which* paths the capsule can
+        // see, not how FIFO bytes flow.
+        let request_path = dir.join("request");
+        let response_path = dir.join("response");
+
+        // Capsule writes a request to its WRITE FIFO; host reads from
+        // pipes.capsule_stdout (which is opened RDWR on request_path).
+        let request_handle = std::thread::spawn(move || {
+            let mut cap_writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&request_path)
+                .expect("capsule must open request fifo for write");
+            cap_writer
+                .write_all(b"{\"id\":1,\"request\":{\"type\":\"ping\"}}\n")
+                .expect("capsule write must succeed");
+            cap_writer.flush().expect("flush");
+            // Hold the writer open just long enough for the host to read,
+            // then drop to release the FIFO from the capsule side.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        let response_handle = std::thread::spawn(move || {
+            let mut cap_reader = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&response_path)
+                .expect("capsule must open response fifo for read");
+            let mut buf = String::new();
+            // Read a single newline-terminated envelope.
+            let mut byte = [0u8; 1];
+            loop {
+                let n = cap_reader.read(&mut byte).expect("capsule read");
+                if n == 0 {
+                    break;
+                }
+                buf.push(byte[0] as char);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            buf
+        });
+
+        // Host reads the request from capsule_stdout.
+        let mut req_buf = String::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = pipes
+                .capsule_stdout
+                .read(&mut byte)
+                .expect("host read request");
+            if n == 0 || byte[0] == b'\n' {
+                if byte[0] == b'\n' {
+                    req_buf.push('\n');
+                }
+                break;
+            }
+            req_buf.push(byte[0] as char);
+        }
+        request_handle.join().expect("capsule writer thread");
+        assert_eq!(req_buf, "{\"id\":1,\"request\":{\"type\":\"ping\"}}\n");
+
+        // Host writes a response to capsule_stdin.
+        pipes
+            .capsule_stdin
+            .write_all(b"{\"id\":1,\"response\":{\"type\":\"pong\"}}\n")
+            .expect("host write response");
+        pipes.capsule_stdin.flush().expect("flush");
+
+        let resp = response_handle.join().expect("capsule reader thread");
+        assert_eq!(resp, "{\"id\":1,\"response\":{\"type\":\"pong\"}}\n");
+
+        // Drop the pipes (closes host-side RDWR handles), then clean up.
+        drop(pipes);
+        WasmProvider::cleanup_carrier_dir(&dir);
+    }
+
+    #[test]
+    fn test_mkfifo_returns_typed_error_on_invalid_path() {
+        // A path containing an interior NUL is invalid for the C string we
+        // pass to `mkfifo(2)`. The helper must surface this as an
+        // `ElastosError::Compute` rather than panicking.
+        let bad_path = PathBuf::from("/tmp/elastos-carrier/bad\0path");
+        let result = WasmProvider::mkfifo(&bad_path, 0o600);
+        assert!(
+            matches!(result, Err(ElastosError::Compute(_))),
+            "expected ElastosError::Compute, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_running_instance_drop_cleans_carrier_dir() {
+        let cid = unique_test_capsule_id("drop");
+        let dir = WasmProvider::carrier_dir_for(&cid);
+        // Materialise the dir without going through setup_carrier_fifos so the
+        // test isolates the Drop behaviour from the FIFO-handle lifecycle.
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        assert!(dir.exists());
+
+        let dummy_manifest = CapsuleManifest {
+            schema: elastos_common::SCHEMA_V1.into(),
+            version: "0.1.0".into(),
+            name: "drop-test".into(),
+            description: None,
+            author: None,
+            role: elastos_common::CapsuleRole::App,
+            capsule_type: CapsuleType::Wasm,
+            entrypoint: "missing.wasm".into(),
+            requires: Vec::new(),
+            provides: None,
+            capabilities: Vec::new(),
+            resources: Default::default(),
+            permissions: Default::default(),
+            microvm: None,
+            providers: None,
+            viewer: None,
+            signature: None,
+        };
+
+        {
+            let engine = Engine::default();
+            let module = Module::new(&engine, b"(module)").expect("trivial wasm module");
+            let _instance = RunningInstance {
+                engine,
+                module,
+                status: CapsuleStatus::Stopped,
+                manifest: dummy_manifest,
+                _data_dir: None,
+                carrier_dir: Some(dir.clone()),
+            };
+            assert!(dir.exists(), "dir must still exist while instance is alive");
+        }
+        // After drop, the carrier dir must be gone.
+        assert!(
+            !dir.exists(),
+            "RunningInstance Drop must clean up carrier_dir"
+        );
     }
 
     #[tokio::test]
