@@ -51,11 +51,18 @@ mod vz_stubs {
     pub struct VzErrorReport;
 
     #[derive(Debug, Clone, Default)]
-    pub struct VzConfig;
+    pub struct VzConfig {
+        // Phase 10.7 — fields the Linux side of supervisor.rs reads to
+        // mirror the Mac-side control flow shape (without doing the work).
+        // All defaults are zero-valued; nothing here is ever consulted at
+        // runtime on Linux because every consumer is gated behind
+        // `#[cfg(target_os = "macos")]` for the actual side-effects.
+        pub prune_orphans_on_startup: bool,
+    }
 
     impl VzConfig {
         pub fn new() -> Self {
-            Self
+            Self::default()
         }
     }
 }
