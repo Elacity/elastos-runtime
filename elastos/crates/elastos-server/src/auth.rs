@@ -10,12 +10,14 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use anyhow::{anyhow, Context};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use elastos_runtime::auth::{
-    validate_principal_root_protection, AuthChallengeV1, AuthSessionGrantV1,
-    PrincipalRootProtectionV1, PrincipalRootProtectorKind, PrincipalRootRecoveryArchiveV1,
-    ProofBinding, RecoveryKitV1, RuntimeAuditEventV1, DEFAULT_PRINCIPAL_ROOT_CIPHER,
+    validate_principal_root_protection, validate_recovery_kit_package, AuthChallengeV1,
+    AuthSessionGrantV1, PrincipalRootProtectionV1, PrincipalRootProtectorKind,
+    PrincipalRootRecoveryArchiveV1, ProofBinding, RecoveryKitPackageProtectionV1,
+    RecoveryKitPackageV1, RecoveryKitV1, RuntimeAuditEventV1, DEFAULT_PRINCIPAL_ROOT_CIPHER,
 };
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -33,6 +35,8 @@ const PRINCIPAL_ROOT_OBJECT_SCHEMA: &str = "elastos.principal-root.object/v1";
 pub const PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED: &str =
     "protected principal-root object is not encrypted";
 const PRINCIPAL_ROOT_OBJECT_AAD_DOMAIN: &str = "elastos.principal-root.object.v1";
+const RECOVERY_KIT_PACKAGE_AAD_DOMAIN: &str = "elastos.recovery-kit.package.v1";
+const RECOVERY_KIT_PACKAGE_KDF_PARAMS: &str = "m=19456,t=2,p=1,len=32";
 
 static AUTH_AUDIT_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -556,7 +560,6 @@ pub fn write_principal_root_object(
     atomic_write(path, &bytes)
 }
 
-#[cfg(test)]
 pub(crate) fn recovery_archive_from_kit(
     data_dir: &Path,
     kit: &RecoveryKitV1,
@@ -588,6 +591,86 @@ pub(crate) fn recovery_kit_from_archive(
     let ciphertext = b64_url_decode(&archive.encrypted_recovery_kit)?;
     let plaintext = decrypt_aes256_gcm_bytes(&archive_key, &nonce, &ciphertext)?;
     serde_json::from_slice(&plaintext).map_err(Into::into)
+}
+
+pub(crate) fn password_protected_recovery_kit_package(
+    kit: &RecoveryKitV1,
+    password: &str,
+) -> anyhow::Result<RecoveryKitPackageV1> {
+    let mut salt = [0u8; 32];
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let key = derive_recovery_package_key(
+        password,
+        &salt,
+        &kit.principal_id,
+        &kit.localhost_root,
+        &kit.kit_id,
+    )?;
+    let bytes = serde_json::to_vec(kit)?;
+    let encrypted_recovery_kit = encrypt_aes256_gcm_bytes_with_aad(
+        &key,
+        &nonce,
+        &bytes,
+        recovery_kit_package_aad(kit).as_bytes(),
+    )?;
+    let package = RecoveryKitPackageV1 {
+        schema: elastos_runtime::auth::RECOVERY_KIT_PACKAGE_SCHEMA.to_string(),
+        principal_id: kit.principal_id.clone(),
+        localhost_root: kit.localhost_root.clone(),
+        kit_id: kit.kit_id.clone(),
+        created_at: kit.created_at,
+        protection: RecoveryKitPackageProtectionV1 {
+            cipher: DEFAULT_PRINCIPAL_ROOT_CIPHER.to_string(),
+            kdf: "argon2id".to_string(),
+            kdf_params: RECOVERY_KIT_PACKAGE_KDF_PARAMS.to_string(),
+            salt: b64_url(&salt),
+            nonce: b64_url(&nonce),
+            encrypted_recovery_kit,
+        },
+    };
+    validate_recovery_kit_package(&package).map_err(anyhow::Error::msg)?;
+    Ok(package)
+}
+
+pub(crate) fn recovery_kit_from_password_package(
+    package: &RecoveryKitPackageV1,
+    password: &str,
+) -> anyhow::Result<RecoveryKitV1> {
+    validate_recovery_kit_package(package).map_err(anyhow::Error::msg)?;
+    let salt = b64_url_decode(&package.protection.salt)?;
+    let nonce = b64_url_decode(&package.protection.nonce)?;
+    if salt.len() != 32 {
+        anyhow::bail!("recovery kit package salt must be 32 bytes");
+    }
+    if nonce.len() != 12 {
+        anyhow::bail!("recovery kit package nonce must be 12 bytes");
+    }
+    let key = derive_recovery_package_key(
+        password,
+        &salt,
+        &package.principal_id,
+        &package.localhost_root,
+        &package.kit_id,
+    )?;
+    let ciphertext = b64_url_decode(&package.protection.encrypted_recovery_kit)?;
+    let plaintext = decrypt_aes256_gcm_bytes_with_aad(
+        &key,
+        &nonce,
+        &ciphertext,
+        recovery_kit_package_aad(package).as_bytes(),
+    )
+    .map_err(|_| anyhow!("invalid recovery kit package password or ciphertext"))?;
+    let kit: RecoveryKitV1 = serde_json::from_slice(&plaintext)?;
+    if kit.principal_id != package.principal_id
+        || kit.localhost_root != package.localhost_root
+        || kit.kit_id != package.kit_id
+    {
+        anyhow::bail!("recovery kit package binding mismatch");
+    }
+    verify_recovery_kit_material(&kit)?;
+    Ok(kit)
 }
 
 pub(crate) fn verify_recovery_kit_material(kit: &RecoveryKitV1) -> anyhow::Result<()> {
@@ -647,7 +730,68 @@ pub(crate) fn derive_recovery_wrapping_key(
     Ok(key)
 }
 
-#[cfg(test)]
+fn derive_recovery_package_key(
+    password: &str,
+    salt: &[u8],
+    principal_id: &str,
+    localhost_root: &str,
+    kit_id: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let params = Params::new(19 * 1024, 2, 1, Some(32))
+        .map_err(|err| anyhow!("invalid recovery package KDF params: {err}"))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    let input = format!("{principal_id}:{localhost_root}:{kit_id}:{password}");
+    argon2
+        .hash_password_into(input.as_bytes(), salt, &mut key)
+        .map_err(|err| anyhow!("recovery package key derivation failed: {err}"))?;
+    Ok(key)
+}
+
+fn recovery_kit_package_aad(binding: impl RecoveryKitPackageBinding) -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        RECOVERY_KIT_PACKAGE_AAD_DOMAIN,
+        binding.principal_id(),
+        binding.localhost_root(),
+        binding.kit_id()
+    )
+}
+
+trait RecoveryKitPackageBinding {
+    fn principal_id(&self) -> &str;
+    fn localhost_root(&self) -> &str;
+    fn kit_id(&self) -> &str;
+}
+
+impl RecoveryKitPackageBinding for &RecoveryKitV1 {
+    fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    fn localhost_root(&self) -> &str {
+        &self.localhost_root
+    }
+
+    fn kit_id(&self) -> &str {
+        &self.kit_id
+    }
+}
+
+impl RecoveryKitPackageBinding for &RecoveryKitPackageV1 {
+    fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    fn localhost_root(&self) -> &str {
+        &self.localhost_root
+    }
+
+    fn kit_id(&self) -> &str {
+        &self.kit_id
+    }
+}
+
 pub(crate) fn encrypt_aes256_gcm_bytes(
     key: &[u8],
     nonce: &[u8],

@@ -5,6 +5,7 @@ mod capsule_cmd;
 mod capsule_publish_cmd;
 mod chat_cmd;
 mod config_cmd;
+mod content_cmd;
 mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
@@ -149,7 +150,7 @@ enum Commands {
         provenance: Option<String>,
     },
 
-    /// Publish a capsule to IPFS
+    /// Publish a capsule through the content availability provider
     Publish {
         /// Path to capsule directory
         path: PathBuf,
@@ -223,7 +224,7 @@ enum Commands {
         allow_no_bootstrap: bool,
     },
 
-    /// Share a file or directory via IPFS (on a fresh install add `--with kubo --with ipfs-provider --with documents`)
+    /// Share a file or directory through content availability
     Share {
         /// File or directory to share (e.g., README.md, docs/)
         path: PathBuf,
@@ -248,6 +249,10 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         public_timeout: u64,
     },
+
+    /// Content availability operator commands
+    #[command(subcommand)]
+    Content(content_cmd::ContentCommand),
 
     /// TLS certificate management
     #[command(subcommand)]
@@ -320,7 +325,7 @@ enum Commands {
         r#type: String,
     },
 
-    /// Open a shared capsule by URI (on a fresh install add `--with kubo --with ipfs-provider --with documents`)
+    /// Open a shared capsule by URI through content availability
     Open {
         /// elastos://<cid>, bare CID, https://gateway/ipfs/<cid>/, or localhost://MyWebSite
         uri: String,
@@ -414,7 +419,7 @@ enum Commands {
 
     /// Install the default runtime profile or an explicit setup profile
     Setup {
-        /// Profile name. Default is `home`. Use `demo` for site/share/browser extras, or `chat` for the packaged full-screen chat path.
+        /// Profile name. Default is `home`. Use `demo` for extras, `chat` for full-screen chat, or `blockchain` for chain/wallet provider development.
         #[arg(long)]
         profile: Option<String>,
 
@@ -502,7 +507,7 @@ enum SharesCommand {
         /// Channel name
         channel: String,
     },
-    /// Remove a channel from local catalog (published content remains on IPFS)
+    /// Remove a channel from local catalog only
     DeleteLocal {
         /// Channel name
         channel: String,
@@ -517,7 +522,7 @@ enum SharesCommand {
         /// Channel name
         channel: String,
     },
-    /// Mark a channel as revoked with a reason (published content remains on IPFS)
+    /// Mark a channel as revoked with a reason
     Revoke {
         /// Channel name
         channel: String,
@@ -1144,6 +1149,10 @@ async fn main() -> anyhow::Result<()> {
             return shares_cmd::run_shares(cmd).await;
         }
 
+        Commands::Content(cmd) => {
+            return content_cmd::run(cmd).await;
+        }
+
         Commands::Site(cmd) => {
             return site_cmd::run(cmd).await;
         }
@@ -1349,8 +1358,44 @@ impl TunnelBridge {
     }
 }
 
-/// Create an IpfsBridge by spawning ipfs-provider capsule.
-async fn get_ipfs_bridge() -> anyhow::Result<IpfsBridge> {
+/// Explicit low-level operator bridge for commands that still need local Kubo
+/// mechanics, such as microVM packaging and immediate public-share tunneling.
+pub(crate) async fn get_operator_ipfs_bridge() -> anyhow::Result<IpfsBridge> {
+    let binary = verified_ipfs_provider_binary()?;
+    let bridge = provider::ProviderBridge::spawn(&binary, Default::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
+    Ok(IpfsBridge::new(Arc::new(bridge)))
+}
+
+pub(crate) async fn get_content_registry() -> anyhow::Result<Arc<provider::ProviderRegistry>> {
+    let (registry, _) = get_content_registry_with_local_ipfs_backend().await?;
+    Ok(registry)
+}
+
+async fn get_content_registry_with_local_ipfs_backend(
+) -> anyhow::Result<(Arc<provider::ProviderRegistry>, IpfsBridge)> {
+    let binary = verified_ipfs_provider_binary()?;
+    let bridge = Arc::new(
+        provider::ProviderBridge::spawn(&binary, Default::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?,
+    );
+    let ipfs_bridge = IpfsBridge::new(bridge.clone());
+    let registry = Arc::new(provider::ProviderRegistry::new());
+    let ipfs = Arc::new(provider::CapsuleProvider::with_scheme(bridge, "ipfs"));
+    registry.register_sub_provider("ipfs", ipfs).await?;
+
+    let content = Arc::new(elastos_server::content::ContentProvider::new(
+        sources::default_data_dir(),
+        Arc::downgrade(&registry),
+    ));
+    registry.register(content.clone()).await;
+    registry.register_sub_provider("content", content).await?;
+    Ok((registry, ipfs_bridge))
+}
+
+fn verified_ipfs_provider_binary() -> anyhow::Result<PathBuf> {
     let binary = find_installed_provider_binary("ipfs-provider").ok_or_else(|| {
         anyhow::anyhow!(
             "ipfs-provider not found. Run: elastos setup --with kubo --with ipfs-provider"
@@ -1362,10 +1407,7 @@ async fn get_ipfs_bridge() -> anyhow::Result<IpfsBridge> {
             err
         )
     })?;
-    let bridge = provider::ProviderBridge::spawn(&binary, Default::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn ipfs-provider: {}", e))?;
-    Ok(IpfsBridge::new(Arc::new(bridge)))
+    Ok(binary)
 }
 
 async fn get_tunnel_bridge() -> anyhow::Result<TunnelBridge> {
@@ -1570,6 +1612,7 @@ async fn serve_web_capsule(
         supervisor: None,
         ready_tx: None,
         attach_secret: None,
+        host_helpers: infra.host_helpers,
     })
     .await;
 
@@ -1602,16 +1645,16 @@ fn parse_tunnel_status_response(resp: serde_json::Value, op: &str) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("Invalid tunnel-provider {} response: {}", op, e))
 }
 
-fn tunnel_public_share_url(base_url: &str, cid: &str) -> String {
-    format!("{}/ipfs/{}/", base_url.trim_end_matches('/'), cid)
-}
-
 fn tunnel_status_detail(status: &TunnelStatus) -> String {
     status
         .last_log
         .as_deref()
         .map(|log| format!(" Last status: {}", log))
         .unwrap_or_default()
+}
+
+fn tunnel_public_share_url(base_url: &str, cid: &str) -> String {
+    format!("{}/ipfs/{}/", base_url.trim_end_matches('/'), cid)
 }
 
 async fn start_public_preview_tunnel(
@@ -1675,7 +1718,7 @@ async fn start_public_preview_tunnel(
     }
 }
 
-async fn start_public_share_tunnel(
+pub(crate) async fn start_operator_public_share_tunnel(
     ipfs: &IpfsBridge,
     cid: &str,
     timeout_secs: u64,
@@ -1754,7 +1797,7 @@ pub(crate) fn choose_local_open_addr(port: Option<u16>) -> anyhow::Result<String
 }
 
 async fn print_share_open_warnings(
-    ipfs: &elastos_server::ipfs::IpfsBridge,
+    content_registry: &provider::ProviderRegistry,
     catalog: &elastos_server::shares::ShareCatalog,
     cid: &str,
     meta: &ShareMeta,
@@ -1766,7 +1809,10 @@ async fn print_share_open_warnings(
     let expected_did = channel.author_did.as_deref().or(meta.author_did.as_deref());
 
     if let Some(head_cid) = channel.head_cid.as_deref() {
-        if let Ok(head_bytes) = ipfs.cat(head_cid).await {
+        if let Ok(head_bytes) =
+            elastos_server::content::fetch_bytes_via_provider(content_registry, head_cid, None)
+                .await
+        {
             if let Ok(head) = verify_channel_head(&head_bytes) {
                 let trusted = match expected_did {
                     Some(did) => head.payload.signer_did == did,

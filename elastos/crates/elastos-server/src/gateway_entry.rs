@@ -8,6 +8,7 @@ pub async fn run_gateway(
         let infra = crate::server_infra::setup_control_plane_infrastructure().await?;
         Ok(elastos_server::gateway_cmd::GatewayControlPlane {
             provider_registry: infra.provider_registry,
+            host_helpers: infra.host_helpers,
         })
     })
     .await

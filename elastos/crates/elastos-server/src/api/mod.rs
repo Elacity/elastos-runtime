@@ -5,9 +5,10 @@
 //! - Capability request/grant/deny flow
 //! - Health and status endpoints
 
+pub mod auth_gateway;
 pub mod browser_capsules;
 pub mod browser_sessions;
-pub mod capsule_inventory;
+pub(crate) mod capsule_inventory;
 pub mod gateway;
 pub mod handlers;
 pub mod middleware;

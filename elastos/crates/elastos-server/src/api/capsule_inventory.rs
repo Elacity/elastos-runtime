@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use elastos_common::CapsuleManifest;
@@ -46,4 +46,32 @@ pub(crate) fn load_capsule_manifest(dir: &Path, expected_name: &str) -> Option<C
         return None;
     }
     Some(manifest)
+}
+
+pub(crate) fn list_capsule_manifests(data_dir: &Path) -> Vec<CapsuleManifest> {
+    let mut capsules = BTreeMap::new();
+    let active_components = active_component_names(data_dir);
+    for root in capsule_roots(data_dir) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(name) = dir.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if installed_capsule_is_inactive(data_dir, &dir, name, active_components.as_ref()) {
+                continue;
+            }
+            let Some(manifest) = load_capsule_manifest(&dir, name) else {
+                continue;
+            };
+            capsules.entry(manifest.name.clone()).or_insert(manifest);
+        }
+    }
+
+    capsules.into_values().collect()
 }

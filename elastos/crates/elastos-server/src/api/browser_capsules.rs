@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{header::SET_COOKIE, HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
 
@@ -10,10 +10,7 @@ use super::capsule_inventory::{
     active_component_names, capsule_dir_candidates, capsule_roots, installed_capsule_is_inactive,
     load_capsule_manifest,
 };
-use super::gateway::{
-    content_type, home_session_cookie_header, request_uses_tls, validate_file_path, GatewayState,
-    HOME_CAPSULE_ID,
-};
+use super::gateway::{content_type, validate_file_path, GatewayState};
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
 const BROWSER_CAPSULE_COOP: &str = "same-origin";
@@ -48,21 +45,10 @@ pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Redirect
 
 pub async fn serve_browser_app_index(
     State(state): State<GatewayState>,
-    headers: HeaderMap,
+    _headers: axum::http::HeaderMap,
     AxumPath(app): AxumPath<String>,
 ) -> Response {
-    let mut response = serve_browser_capsule_path(&state.data_dir, &app, None).await;
-    if app == HOME_CAPSULE_ID {
-        match home_session_cookie_header(&state.data_dir, request_uses_tls(&headers)) {
-            Ok(cookie) => {
-                response.headers_mut().append(SET_COOKIE, cookie);
-            }
-            Err(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        }
-    }
-    response
+    serve_browser_capsule_path(&state.data_dir, &app, None).await
 }
 
 pub async fn serve_browser_app_asset(

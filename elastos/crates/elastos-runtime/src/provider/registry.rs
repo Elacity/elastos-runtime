@@ -666,6 +666,22 @@ mod tests {
             .unwrap();
         assert!(registry.get_sub_provider("did").await.is_some());
 
+        for name in [
+            "chain",
+            "wallet",
+            "drm",
+            "rights",
+            "key",
+            "decrypt",
+            "availability",
+        ] {
+            registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await
+                .unwrap();
+            assert!(registry.get_sub_provider(name).await.is_some());
+        }
+
         // Unregister removes the route (case-insensitive)
         registry.unregister_sub_provider("DiD").await;
         assert!(registry.get_sub_provider("did").await.is_none());

@@ -1,10 +1,10 @@
 //! HTTP server implementation
 //!
-//! Provides server configurations:
-//! - Basic server (no auth, for local-only `elastos serve` without MicroVM)
-//! - Server with sessions (full auth + capability flow, used by MicroVM capsules)
+//! Provides the session/capability HTTP surface used by the runtime, Home, and
+//! browser-hosted capsule adapters.
 
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Arc;
 
 use axum::{
@@ -68,54 +68,6 @@ fn is_allowed_local_origin(origin: &HeaderValue) -> bool {
     }
 }
 
-/// Start the HTTP API server (legacy, no auth)
-pub async fn start_server(runtime: Arc<Runtime>, addr: &str) -> anyhow::Result<()> {
-    start_server_with_capsules(runtime, addr, None).await
-}
-
-/// Start the HTTP API server with optional web capsule serving (legacy, no auth)
-pub async fn start_server_with_capsules(
-    runtime: Arc<Runtime>,
-    addr: &str,
-    capsule_dir: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let audit_log = Arc::new(AuditLog::new());
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let mut app = Router::new()
-        .route("/api/health", get(routes::health))
-        .route("/api/capsules", get(routes::list_capsules))
-        .route("/api/capsules", post(routes::launch_capsule))
-        .route("/api/capsules/:id", delete(routes::stop_capsule))
-        .layer(cors.clone())
-        .layer(Extension(audit_log))
-        .layer(Extension(runtime));
-
-    // Add static file serving for web capsules if directory is provided
-    let has_capsule = capsule_dir.is_some();
-    if let Some(dir) = capsule_dir {
-        tracing::info!("Serving web capsule from: {}", dir.display());
-        let serve_dir = ServeDir::new(&dir).append_index_html_on_directories(true);
-        app = app
-            .layer(axum_middleware::from_fn(cross_origin_isolation))
-            .fallback_service(serve_dir);
-    }
-
-    let listener = TcpListener::bind(addr).await?;
-    if has_capsule {
-        tracing::info!("Web capsule server listening on http://{}", addr);
-    } else {
-        tracing::info!("API server listening on http://{}", addr);
-    }
-
-    axum::serve(listener, app).await?;
-
-    Ok(())
-}
-
 /// Bootstrap state for web capsules (provides token + manifest info to the frontend)
 #[derive(Clone)]
 pub struct CapsuleBootstrapState {
@@ -150,6 +102,21 @@ pub struct ServerConfig {
     /// presenting this secret (read from the chmod-600 runtime-coords file) to
     /// mint short-lived session tokens.  When `None` the attach endpoint is disabled.
     pub attach_secret: Option<String>,
+    /// Operator-approved host helpers that must live as long as this API server.
+    pub host_helpers: Vec<HostHelperProcess>,
+}
+
+pub struct HostHelperProcess {
+    pub name: &'static str,
+    pub child: Child,
+}
+
+impl Drop for HostHelperProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        tracing::info!("{} host helper stopped", self.name);
+    }
 }
 
 /// Start the HTTP API server with full session and capability support
@@ -179,7 +146,9 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
         supervisor,
         ready_tx,
         attach_secret,
+        host_helpers,
     } = config;
+    let _host_helpers = host_helpers;
     // CORS: allow localhost origins for browser-based capsule UIs and
     // local development. Parses the Origin URL and compares the host
     // to prevent bypass via domains like localhost.evil.com.
@@ -513,6 +482,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             api_state.clone(),
             auth_middleware,
         ))
+        .layer(Extension(data_dir.clone()))
         .layer(Extension(capsule_audit_log))
         .layer(Extension(runtime));
 

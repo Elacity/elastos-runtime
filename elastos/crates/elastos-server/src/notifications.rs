@@ -15,6 +15,7 @@ const NOTIFICATION_EVENTS_FILE: &str = "events.json";
 const ROOM_ACCESS_REQUEST_KIND: &str = "room_access_request";
 const ROOM_ACCESS_REQUEST_ID_PREFIX: &str = "room-access-request:";
 const ROOM_ACCESS_REQUEST_TTL_SECS: u64 = 10 * 60;
+const EXTERNAL_HTTP_REQUEST_KIND: &str = "external_http_request";
 const NOTIFICATION_EVENTS_SCHEMA: &str = "elastos.notification-events/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -266,6 +267,86 @@ pub fn load_summary(data_dir: &Path) -> anyhow::Result<NotificationSummary> {
             .count(),
         entries,
     })
+}
+
+pub fn upsert_external_http_request(
+    data_dir: &Path,
+    request_id: &str,
+    source_app: &str,
+    title: &str,
+    body: &str,
+    approve_action_id: &str,
+    created_at: u64,
+) -> anyhow::Result<()> {
+    let id = external_http_request_notification_id(request_id);
+    let path = notifications_path(data_dir)?;
+    let mut store = read_json_or_default::<NotificationStore>(&path)?;
+    let already_exists = store.entries.iter().any(|entry| entry.id == id);
+    if store.schema.trim().is_empty() {
+        store.schema = NOTIFICATIONS_SCHEMA.to_string();
+    }
+
+    if let Some(existing) = store.entries.iter_mut().find(|entry| entry.id == id) {
+        existing.source_app = source_app.to_string();
+        existing.kind = EXTERNAL_HTTP_REQUEST_KIND.to_string();
+        existing.title = title.to_string();
+        existing.body = body.to_string();
+        existing.action_ref = Some(NotificationActionRef {
+            app: source_app.to_string(),
+            action_id: approve_action_id.to_string(),
+        });
+        existing.severity = NotificationSeverity::Attention;
+        existing.dismissed = false;
+        existing.acted = false;
+        write_json_atomic(&path, &store)?;
+        return Ok(());
+    }
+
+    store.entries.push(NotificationEntryRecord {
+        id: id.clone(),
+        source_app: source_app.to_string(),
+        kind: EXTERNAL_HTTP_REQUEST_KIND.to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+        action_ref: Some(NotificationActionRef {
+            app: source_app.to_string(),
+            action_id: approve_action_id.to_string(),
+        }),
+        created_at,
+        expires_at: None,
+        severity: NotificationSeverity::Attention,
+        read: false,
+        acted: false,
+        dismissed: false,
+    });
+    if !already_exists {
+        record_event(
+            data_dir,
+            NotificationEventRecord {
+                id: format!("appeared:{id}"),
+                notification_id: id,
+                source_app: source_app.to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+                action_ref: Some(NotificationActionRef {
+                    app: source_app.to_string(),
+                    action_id: approve_action_id.to_string(),
+                }),
+                created_at,
+                disposition: NotificationEventDisposition::Appeared,
+                resolution: None,
+            },
+        )?;
+    }
+    write_json_atomic(&path, &store)
+}
+
+pub fn dismiss_external_http_request(data_dir: &Path, request_id: &str) -> anyhow::Result<bool> {
+    dismiss(data_dir, &external_http_request_notification_id(request_id))
+}
+
+fn external_http_request_notification_id(request_id: &str) -> String {
+    format!("external-http-request:{request_id}")
 }
 
 pub fn mark_acted_for_action(data_dir: &Path, action_id: &str) -> anyhow::Result<usize> {
@@ -568,5 +649,43 @@ mod tests {
             NotificationEventDisposition::Resolved
         );
         assert_eq!(events.entries[1].resolution.as_deref(), Some("dismissed"));
+    }
+    #[test]
+    fn external_http_request_appears_once_and_can_be_dismissed() {
+        let tmp = tempfile::tempdir().unwrap();
+        upsert_external_http_request(
+            tmp.path(),
+            "wallet-prices",
+            "wallet",
+            "Wallet requests market prices",
+            "Wallet wants approved HTTP access to CoinGecko.",
+            "wallet-price-http-approve:coingecko",
+            42,
+        )
+        .unwrap();
+        upsert_external_http_request(
+            tmp.path(),
+            "wallet-prices",
+            "wallet",
+            "Wallet requests market prices",
+            "Wallet wants approved HTTP access to CoinGecko.",
+            "wallet-price-http-approve:coingecko",
+            43,
+        )
+        .unwrap();
+
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1);
+        assert_eq!(summary.entries[0].kind, EXTERNAL_HTTP_REQUEST_KIND);
+        assert_eq!(
+            summary.entries[0]
+                .action_ref
+                .as_ref()
+                .map(|action| action.action_id.as_str()),
+            Some("wallet-price-http-approve:coingecko")
+        );
+
+        assert!(dismiss_external_http_request(tmp.path(), "wallet-prices").unwrap());
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
     }
 }

@@ -1,7 +1,11 @@
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use elastos_common::localhost::{ensure_file_backed_roots, file_backed_prefixes};
 use elastos_runtime::{capability, content, namespace, primitives, provider, session};
+use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
 use elastos_server::{api, fetcher, ownership};
@@ -17,6 +21,7 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
+    pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
@@ -63,6 +68,18 @@ async fn setup_server_infrastructure_impl(
 
     ensure_file_backed_roots(&data_dir).ok();
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
+    let mut managed_host_processes = Vec::new();
+    let content_provider = Arc::new(ContentProvider::new(
+        data_dir.clone(),
+        Arc::downgrade(&provider_registry),
+    ));
+    provider_registry.register(content_provider.clone()).await;
+    if let Err(err) = provider_registry
+        .register_sub_provider("content", content_provider)
+        .await
+    {
+        tracing::warn!("Failed to register elastos://content sub-provider: {}", err);
+    }
     provider_registry
         .register(Arc::new(DocumentsProvider::new(
             data_dir.clone(),
@@ -71,17 +88,17 @@ async fn setup_server_infrastructure_impl(
         .await;
     let device_key = elastos_identity::load_or_create_device_key(&data_dir)?;
     let mut provider_cid = "sha256:unavailable".to_string();
-    if spawn_host_providers {
-        let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
-            let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
-            tracing::info!(
-                "{} binary verified against installed manifest ({})",
-                name,
-                checksum
-            );
-            Ok(())
-        };
+    let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
+        let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
+        tracing::info!(
+            "{} binary verified against installed manifest ({})",
+            name,
+            checksum
+        );
+        Ok(())
+    };
 
+    if spawn_host_providers {
         let binary_path =
             crate::find_installed_provider_binary("localhost-provider").ok_or_else(|| {
                 anyhow::anyhow!(
@@ -302,6 +319,301 @@ async fn setup_server_infrastructure_impl(
                 }
             }
         }
+
+        if let Some(availability_config) = availability_provider_config_from_env() {
+            if let Some(path) = crate::find_installed_provider_binary("availability-provider") {
+                if let Err(e) = verify_provider_binary("availability-provider", &path) {
+                    tracing::warn!(
+                        "Skipping availability-provider due to verification failure: {}",
+                        e
+                    );
+                } else {
+                    let config = provider::BridgeProviderConfig {
+                        extra: availability_config,
+                        ..Default::default()
+                    };
+                    match provider::ProviderBridge::spawn(&path, config).await {
+                        Ok(bridge) => {
+                            let availability_provider: Arc<dyn provider::Provider> =
+                                Arc::new(provider::CapsuleProvider::with_scheme(
+                                    Arc::new(bridge),
+                                    "availability",
+                                ));
+                            if let Err(e) = provider_registry
+                                .register_sub_provider("availability", availability_provider)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to register elastos://availability sub-provider: {}",
+                                    e
+                                );
+                            }
+                            tracing::info!("availability-provider capsule from {}", path.display());
+                        }
+                        Err(e) => tracing::warn!("Failed to spawn availability-provider: {}", e),
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Availability provider configured but availability-provider binary is not installed"
+                );
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("chain-provider") {
+        if let Err(e) = verify_provider_binary("chain-provider", &path) {
+            tracing::warn!("Skipping chain-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let chain_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "chain"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("chain", chain_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://chain sub-provider: {}", e);
+                    }
+                    tracing::info!("chain-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("net-provider") {
+        if let Err(e) = verify_provider_binary("net-provider", &path) {
+            tracing::warn!("Skipping net-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let net_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "net"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("net", net_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://net sub-provider: {}", e);
+                    }
+                    tracing::info!("net-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn net-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
+        if let Some(path) = crate::find_installed_provider_binary("browser-local-exit") {
+            if let Err(e) = verify_provider_binary("browser-local-exit", &path) {
+                tracing::warn!(
+                    "Skipping browser-local-exit due to verification failure: {}",
+                    e
+                );
+            } else {
+                match spawn_browser_local_exit(&path, &local_exit_config) {
+                    Ok(child) => {
+                        tracing::info!("browser-local-exit helper from {}", path.display());
+                        managed_host_processes.push(api::server::HostHelperProcess {
+                            name: "browser-local-exit",
+                            child,
+                        });
+                    }
+                    Err(e) => tracing::warn!("Failed to spawn browser-local-exit: {}", e),
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Browser local Exit configured but browser-local-exit binary is not installed"
+            );
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("exit-provider") {
+        if let Err(e) = verify_provider_binary("exit-provider", &path) {
+            tracing::warn!("Skipping exit-provider due to verification failure: {}", e);
+        } else {
+            let exit_config = provider::BridgeProviderConfig {
+                extra: exit_provider_config_from_env(&data_dir).unwrap_or(serde_json::Value::Null),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, exit_config).await {
+                Ok(bridge) => {
+                    let exit_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "exit"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("exit", exit_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://exit sub-provider: {}", e);
+                    }
+                    tracing::info!("exit-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn exit-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("browser-engine-adapter") {
+        if let Err(e) = verify_provider_binary("browser-engine-adapter", &path) {
+            tracing::warn!(
+                "Skipping browser-engine-adapter due to verification failure: {}",
+                e
+            );
+        } else {
+            let browser_engine_config = provider::BridgeProviderConfig {
+                extra: browser_engine_adapter_config_from_env(&data_dir)
+                    .unwrap_or(serde_json::Value::Null),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, browser_engine_config).await {
+                Ok(bridge) => {
+                    let browser_engine_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "browser-engine"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("browser-engine", browser_engine_provider)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to register elastos://browser-engine sub-provider: {}",
+                            e
+                        );
+                    }
+                    tracing::info!("browser-engine-adapter capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn browser-engine-adapter: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("wallet-provider") {
+        if let Err(e) = verify_provider_binary("wallet-provider", &path) {
+            tracing::warn!(
+                "Skipping wallet-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            let wallet_config = provider::BridgeProviderConfig {
+                base_path: data_dir.to_string_lossy().to_string(),
+                allowed_paths: file_backed_prefixes(),
+                read_only: false,
+                encryption_key: hex::encode(&device_key),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, wallet_config).await {
+                Ok(bridge) => {
+                    let wallet_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "wallet"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("wallet", wallet_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://wallet sub-provider: {}", e);
+                    }
+                    tracing::info!("wallet-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn wallet-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("drm-provider") {
+        if let Err(e) = verify_provider_binary("drm-provider", &path) {
+            tracing::warn!("Skipping drm-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let drm_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "drm"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("drm", drm_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://drm sub-provider: {}", e);
+                    }
+                    tracing::info!("drm-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn drm-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("rights-provider") {
+        if let Err(e) = verify_provider_binary("rights-provider", &path) {
+            tracing::warn!(
+                "Skipping rights-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let rights_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "rights"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("rights", rights_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://rights sub-provider: {}", e);
+                    }
+                    tracing::info!("rights-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn rights-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("key-provider") {
+        if let Err(e) = verify_provider_binary("key-provider", &path) {
+            tracing::warn!("Skipping key-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let key_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "key"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("key", key_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://key sub-provider: {}", e);
+                    }
+                    tracing::info!("key-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn key-provider: {}", e),
+            }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("decrypt-provider") {
+        if let Err(e) = verify_provider_binary("decrypt-provider", &path) {
+            tracing::warn!(
+                "Skipping decrypt-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let decrypt_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "decrypt"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("decrypt", decrypt_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://decrypt sub-provider: {}", e);
+                    }
+                    tracing::info!("decrypt-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn decrypt-provider: {}", e),
+            }
+        }
     }
 
     // Built-in Carrier node — ALWAYS starts, not conditional on spawn_host_providers.
@@ -398,5 +710,395 @@ async fn setup_server_infrastructure_impl(
         tls_config,
         provider_cid,
         shell_cid,
+        host_helpers: managed_host_processes,
     })
+}
+
+fn spawn_browser_local_exit(path: &Path, config: &serde_json::Value) -> anyhow::Result<Child> {
+    let relay_path = browser_local_exit_relay_path(config)?;
+    if config
+        .get("replace_existing_socket")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        remove_existing_browser_local_exit_socket(&relay_path)?;
+    }
+    let mut child = Command::new(path)
+        .env(
+            "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG",
+            serde_json::to_string(config)?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            anyhow::bail!("browser-local-exit exited during startup with {status}");
+        }
+        match browser_local_exit_socket_ready(&relay_path) {
+            Ok(true) => return Ok(child),
+            Ok(false) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    anyhow::bail!("browser-local-exit did not create relay socket");
+}
+
+fn browser_local_exit_socket_ready(path: &Path) -> anyhow::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            anyhow::bail!(
+                "failed to inspect browser-local-exit relay socket {}: {}",
+                path.display(),
+                err
+            )
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            anyhow::bail!(
+                "browser-local-exit relay_ipc_path is not a Unix socket: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+
+    Ok(true)
+}
+
+fn browser_local_exit_relay_path(config: &serde_json::Value) -> anyhow::Result<PathBuf> {
+    let relay_path = config
+        .get("relay_ipc_path")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("browser-local-exit config missing relay_ipc_path"))?;
+    if relay_path.is_empty()
+        || relay_path
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b'\0')
+    {
+        anyhow::bail!(
+            "browser-local-exit relay_ipc_path must be an absolute path without whitespace"
+        );
+    }
+    let path = PathBuf::from(relay_path);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "browser-local-exit relay_ipc_path must be an absolute path without whitespace"
+        );
+    }
+    Ok(path)
+}
+
+fn remove_existing_browser_local_exit_socket(path: &Path) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            anyhow::bail!(
+                "failed to inspect existing browser-local-exit relay socket {}: {}",
+                path.display(),
+                err
+            )
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            anyhow::bail!(
+                "refusing to remove browser-local-exit relay_ipc_path because it is not a Unix socket: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        anyhow::bail!(
+            "browser-local-exit replace_existing_socket is only supported for Unix socket paths"
+        );
+    }
+
+    std::fs::remove_file(path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to remove existing browser-local-exit relay socket {}: {}",
+            path.display(),
+            err
+        )
+    })
+}
+
+fn availability_provider_config_from_env() -> Option<serde_json::Value> {
+    if let Ok(raw) = std::env::var("ELASTOS_AVAILABILITY_PROVIDER_CONFIG") {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => return Some(value),
+            Err(err) => {
+                tracing::warn!(
+                    "Ignoring invalid ELASTOS_AVAILABILITY_PROVIDER_CONFIG JSON: {}",
+                    err
+                );
+                return None;
+            }
+        }
+    }
+
+    let ensure_url = std::env::var("ELASTOS_AVAILABILITY_ENSURE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let mut target = serde_json::json!({
+        "id": std::env::var("ELASTOS_AVAILABILITY_PROVIDER_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "configured-supernode".to_string()),
+        "ensure_url": ensure_url,
+    });
+    if let Ok(value) = std::env::var("ELASTOS_AVAILABILITY_AUTHORIZATION") {
+        let value = value.trim();
+        if !value.is_empty() {
+            target["authorization"] = serde_json::Value::String(value.to_string());
+        }
+    }
+
+    Some(serde_json::json!({
+        "targets": [target]
+    }))
+}
+
+fn exit_provider_config_from_env(data_dir: &std::path::Path) -> Option<serde_json::Value> {
+    provider_config_from_env_or_file(
+        data_dir,
+        "ELASTOS_EXIT_PROVIDER_CONFIG",
+        "exit-provider.json",
+    )
+}
+
+fn browser_engine_adapter_config_from_env(data_dir: &std::path::Path) -> Option<serde_json::Value> {
+    provider_config_from_env_or_file(
+        data_dir,
+        "ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG",
+        "browser-engine-adapter.json",
+    )
+}
+
+fn browser_local_exit_config_from_env(data_dir: &std::path::Path) -> Option<serde_json::Value> {
+    provider_config_from_env_or_file(
+        data_dir,
+        "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG",
+        "browser-local-exit.json",
+    )
+}
+
+fn provider_config_from_env_or_file(
+    data_dir: &std::path::Path,
+    env_name: &str,
+    file_name: &str,
+) -> Option<serde_json::Value> {
+    if let Ok(raw) = std::env::var(env_name) {
+        return match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                tracing::warn!("Ignoring invalid {} JSON: {}", env_name, err);
+                None
+            }
+        };
+    }
+    let path = data_dir.join("config").join(file_name);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(
+                "Ignoring invalid provider config {}: {}",
+                path.display(),
+                err
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        keys: &'static [&'static str],
+    }
+
+    impl EnvGuard {
+        fn new(keys: &'static [&'static str]) -> Self {
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self { keys }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in self.keys {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn availability_provider_config_uses_explicit_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "ELASTOS_AVAILABILITY_PROVIDER_CONFIG",
+            "ELASTOS_AVAILABILITY_ENSURE_URL",
+        ]);
+        std::env::set_var(
+            "ELASTOS_AVAILABILITY_PROVIDER_CONFIG",
+            r#"{"targets":[{"id":"test","ensure_url":"https://example.invalid/ensure"}]}"#,
+        );
+
+        let config = availability_provider_config_from_env().unwrap();
+        assert_eq!(config["targets"][0]["id"], "test");
+    }
+
+    #[test]
+    fn availability_provider_config_uses_env_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "ELASTOS_AVAILABILITY_PROVIDER_CONFIG",
+            "ELASTOS_AVAILABILITY_ENSURE_URL",
+            "ELASTOS_AVAILABILITY_PROVIDER_ID",
+            "ELASTOS_AVAILABILITY_AUTHORIZATION",
+        ]);
+        std::env::set_var(
+            "ELASTOS_AVAILABILITY_ENSURE_URL",
+            "https://example.invalid/ensure",
+        );
+        std::env::set_var("ELASTOS_AVAILABILITY_PROVIDER_ID", "elacity");
+        std::env::set_var("ELASTOS_AVAILABILITY_AUTHORIZATION", "Bearer secret");
+
+        let config = availability_provider_config_from_env().unwrap();
+        assert_eq!(config["targets"][0]["id"], "elacity");
+        assert_eq!(
+            config["targets"][0]["ensure_url"],
+            "https://example.invalid/ensure"
+        );
+        assert_eq!(config["targets"][0]["authorization"], "Bearer secret");
+    }
+
+    #[test]
+    fn exit_provider_config_prefers_explicit_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["ELASTOS_EXIT_PROVIDER_CONFIG"]);
+        std::env::set_var(
+            "ELASTOS_EXIT_PROVIDER_CONFIG",
+            r#"{"backends":[{"id":"local","kind":"http_fetch","allowed_hosts":["example.com"]}]}"#,
+        );
+
+        let data_dir = crate::sources::default_data_dir();
+        let config = exit_provider_config_from_env(&data_dir).unwrap();
+        assert_eq!(config["backends"][0]["id"], "local");
+        assert_eq!(config["backends"][0]["kind"], "http_fetch");
+    }
+
+    #[test]
+    fn browser_engine_adapter_config_prefers_explicit_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG"]);
+        std::env::set_var(
+            "ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG",
+            r#"{"adapters":[{"id":"linux-proof","kind":"contract_proof","display_modes":["diagnostic_frame"]}]}"#,
+        );
+
+        let data_dir = crate::sources::default_data_dir();
+        let config = browser_engine_adapter_config_from_env(&data_dir).unwrap();
+        assert_eq!(config["adapters"][0]["id"], "linux-proof");
+        assert_eq!(config["adapters"][0]["kind"], "contract_proof");
+        assert_eq!(
+            config["adapters"][0]["display_modes"][0],
+            "diagnostic_frame"
+        );
+    }
+
+    #[test]
+    fn browser_local_exit_config_prefers_explicit_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["ELASTOS_BROWSER_LOCAL_EXIT_CONFIG"]);
+        std::env::set_var(
+            "ELASTOS_BROWSER_LOCAL_EXIT_CONFIG",
+            r#"{"schema":"elastos.browser.local-exit.config/v1","relay_ipc_path":"/tmp/elastos-browser-local-exit.sock","allowed_hosts":["*"],"replace_existing_socket":true}"#,
+        );
+
+        let data_dir = crate::sources::default_data_dir();
+        let config = browser_local_exit_config_from_env(&data_dir).unwrap();
+        assert_eq!(config["schema"], "elastos.browser.local-exit.config/v1");
+        assert_eq!(config["allowed_hosts"][0], "*");
+    }
+
+    #[test]
+    fn browser_local_exit_relay_path_rejects_relative_and_whitespace_paths() {
+        let relative = serde_json::json!({
+            "relay_ipc_path": "relative.sock"
+        });
+        assert!(browser_local_exit_relay_path(&relative).is_err());
+
+        let whitespace = serde_json::json!({
+            "relay_ipc_path": "/tmp/elastos browser.sock"
+        });
+        assert!(browser_local_exit_relay_path(&whitespace).is_err());
+    }
+
+    #[test]
+    fn browser_local_exit_replace_existing_socket_refuses_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay_path = dir.path().join("relay.sock");
+        std::fs::write(&relay_path, b"not a socket").unwrap();
+
+        let err = remove_existing_browser_local_exit_socket(&relay_path).unwrap_err();
+        assert!(
+            err.to_string().contains("not a Unix socket")
+                || err
+                    .to_string()
+                    .contains("replace_existing_socket is only supported")
+        );
+        assert!(relay_path.exists());
+    }
+
+    #[test]
+    fn browser_local_exit_socket_ready_requires_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let relay_path = dir.path().join("relay.sock");
+        assert!(!browser_local_exit_socket_ready(&relay_path).unwrap());
+        std::fs::write(&relay_path, b"not a socket").unwrap();
+        #[cfg(unix)]
+        {
+            let err = browser_local_exit_socket_ready(&relay_path).unwrap_err();
+            assert!(err.to_string().contains("not a Unix socket"), "{err}");
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(browser_local_exit_socket_ready(&relay_path).unwrap());
+        }
+    }
 }

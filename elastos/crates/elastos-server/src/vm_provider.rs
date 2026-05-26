@@ -21,7 +21,8 @@ struct VmIo {
     raw_fd: i32, // For poll() — the underlying socket fd
 }
 
-const VM_PROVIDER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const VM_PROVIDER_DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const VM_PROVIDER_LAUNCH_READ_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(test)]
 const VM_PROVIDER_CONNECT_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
@@ -107,10 +108,10 @@ impl VmRawBridge {
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
             .map_err(|e| ProviderError::Provider(format!("tcp connect attempt failed: {}", e)))?;
         stream
-            .set_read_timeout(Some(VM_PROVIDER_READ_TIMEOUT))
+            .set_read_timeout(Some(VM_PROVIDER_DEFAULT_READ_TIMEOUT))
             .map_err(|e| ProviderError::Provider(format!("tcp read timeout setup failed: {e}")))?;
         stream
-            .set_write_timeout(Some(VM_PROVIDER_READ_TIMEOUT))
+            .set_write_timeout(Some(VM_PROVIDER_DEFAULT_READ_TIMEOUT))
             .map_err(|e| ProviderError::Provider(format!("tcp write timeout setup failed: {e}")))?;
 
         let raw_fd = stream.as_raw_fd();
@@ -255,7 +256,11 @@ impl VmRawBridge {
                 serde_json::to_string(&init_req).unwrap_or_default()
             );
             let init_start = std::time::Instant::now();
-            let init_resp = match Self::send_line_and_read_json(io, &init_req) {
+            let init_resp = match Self::send_line_and_read_json(
+                io,
+                &init_req,
+                VM_PROVIDER_DEFAULT_READ_TIMEOUT,
+            ) {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -294,7 +299,8 @@ impl VmRawBridge {
         let io = guard
             .as_mut()
             .ok_or_else(|| ProviderError::Provider("vm bridge unavailable".into()))?;
-        match Self::send_line_and_read_json(io, request) {
+        let read_timeout = Self::read_timeout_for_request(request);
+        match Self::send_line_and_read_json(io, request, read_timeout) {
             Ok(v) => Ok(v),
             Err(e) => {
                 *guard = None;
@@ -306,6 +312,7 @@ impl VmRawBridge {
     fn send_line_and_read_json(
         io: &mut VmIo,
         request: &serde_json::Value,
+        read_timeout: Duration,
     ) -> Result<serde_json::Value, ProviderError> {
         let payload = serde_json::to_string(request)
             .map_err(|e| ProviderError::Provider(format!("serialize request failed: {e}")))?;
@@ -327,7 +334,7 @@ impl VmRawBridge {
         const MAX_LINE_LEN: usize = 1_048_576; // 1 MB
         let mut raw = Vec::new();
         for _ in 0..256 {
-            Self::wait_for_readable(io, VM_PROVIDER_READ_TIMEOUT)?;
+            Self::wait_for_readable(io, read_timeout)?;
             raw.clear();
             // Bounded read: accumulate raw bytes until newline or EOF,
             // enforcing the size limit before allocating. UTF-8 decoding
@@ -378,6 +385,13 @@ impl VmRawBridge {
         Err(ProviderError::Provider(
             "did not receive JSON response from provider VM".into(),
         ))
+    }
+
+    fn read_timeout_for_request(request: &serde_json::Value) -> Duration {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("launch") => VM_PROVIDER_LAUNCH_READ_TIMEOUT,
+            _ => VM_PROVIDER_DEFAULT_READ_TIMEOUT,
+        }
     }
 
     fn wait_for_readable(io: &VmIo, timeout: Duration) -> Result<(), ProviderError> {
@@ -648,9 +662,9 @@ mod tests {
     #[test]
     fn test_to_raw_request_read() {
         let req = ResourceRequest {
-            uri: "localhost://Users/self/Documents/a.txt".into(),
+            uri: "localhost://MyWebSite/Documents/a.txt".into(),
             _scheme: "localhost".into(),
-            path: "Users/self/Documents/a.txt".into(),
+            path: "MyWebSite/Documents/a.txt".into(),
             _capsule_id: "capsule-1".into(),
             action: ResourceAction::Read,
             content: None,
@@ -660,7 +674,7 @@ mod tests {
         assert_eq!(raw.get("op").and_then(|v| v.as_str()), Some("read"));
         assert_eq!(
             raw.get("path").and_then(|v| v.as_str()),
-            Some("Users/self/Documents/a.txt")
+            Some("MyWebSite/Documents/a.txt")
         );
     }
 

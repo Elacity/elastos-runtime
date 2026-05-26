@@ -28,8 +28,175 @@ pub const RUNTIME_KIND_MANAGED_HOME: &str = "managed-home";
 pub const OPERATOR_RUNTIME_REQUIRED_MESSAGE: &str =
     "This command requires a running runtime.\n\n  elastos serve\n\nThen run this command again.";
 
+enum ManagedRuntimeStart {
+    Owner(ManagedRuntimeStartGuard),
+    Waiter,
+}
+
+struct ManagedRuntimeStartGuard {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
 fn default_runtime_kind() -> String {
     RUNTIME_KIND_OPERATOR.to_string()
+}
+
+fn managed_runtime_start_lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("managed-runtime-start.lock")
+}
+
+fn acquire_managed_runtime_start_lock(data_dir: &Path) -> anyhow::Result<ManagedRuntimeStart> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = managed_runtime_start_lock_path(data_dir);
+    match create_managed_runtime_start_marker(&path) {
+        Ok(file) => Ok(ManagedRuntimeStart::Owner(ManagedRuntimeStartGuard {
+            path,
+            _file: file,
+        })),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            if managed_runtime_start_marker_is_stale(&path) {
+                let _ = std::fs::remove_file(&path);
+                let file = create_managed_runtime_start_marker(&path).map_err(|retry| {
+                    anyhow::anyhow!(
+                        "create managed runtime start lock {} after stale cleanup: {}",
+                        path.display(),
+                        retry
+                    )
+                })?;
+                return Ok(ManagedRuntimeStart::Owner(ManagedRuntimeStartGuard {
+                    path,
+                    _file: file,
+                }));
+            }
+            Ok(ManagedRuntimeStart::Waiter)
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "create managed runtime start lock {}: {}",
+            path.display(),
+            err
+        )),
+    }
+}
+
+fn create_managed_runtime_start_marker(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    use std::io::Write as _;
+    writeln!(
+        file,
+        "{{\"pid\":{},\"created_at_ms\":{}}}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    )?;
+    Ok(file)
+}
+
+fn managed_runtime_start_marker_is_stale(path: &Path) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed > Duration::from_secs(60))
+}
+
+impl Drop for ManagedRuntimeStartGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn wait_for_managed_runtime_ready(
+    coords_path: &Path,
+    expected_version: &str,
+    timeout: Duration,
+) -> Option<RuntimeCoords> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(coords) = managed_runtime_ready(coords_path, expected_version).await {
+            return Some(coords);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn current_process_managed_runtime_child(runtime_kind: &str) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        current_process_child_pids()
+            .into_iter()
+            .find(|child_pid| process_env_contains_runtime_kind(*child_pid, runtime_kind))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_kind;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn current_process_child_pids() -> Vec<u32> {
+    let pid = std::process::id();
+    let task_dir = format!("/proc/{pid}/task");
+    let Ok(tasks) = std::fs::read_dir(task_dir) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        let children_path = task.path().join("children");
+        let Ok(contents) = std::fs::read_to_string(children_path) else {
+            continue;
+        };
+        children.extend(
+            contents
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok()),
+        );
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+#[cfg(unix)]
+fn process_env_contains_runtime_kind(pid: u32, runtime_kind: &str) -> bool {
+    let env_path = format!("/proc/{pid}/environ");
+    let Ok(env) = std::fs::read(env_path) else {
+        return false;
+    };
+    env.split(|byte| *byte == 0)
+        .any(|entry| entry == format!("ELASTOS_RUNTIME_KIND={runtime_kind}").as_bytes())
+}
+
+fn terminate_sibling_managed_runtime_children(runtime_kind: &str, keep_pid: u32) {
+    #[cfg(unix)]
+    {
+        for child_pid in current_process_child_pids() {
+            if child_pid == keep_pid {
+                continue;
+            }
+            if process_env_contains_runtime_kind(child_pid, runtime_kind) {
+                unsafe {
+                    libc::kill(child_pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_kind;
+        let _ = keep_pid;
+    }
 }
 
 fn is_managed_user_runtime_kind(kind: &str) -> bool {
@@ -554,7 +721,9 @@ fn managed_chat_allow_resources() -> &'static [&'static str] {
     &[
         "elastos://peer/*",
         "elastos://did/*",
-        "localhost://Users/self/.AppData/LocalHost/Chat/*",
+        // The capsule bridge maps `Users/self` to the active principal root
+        // before policy evaluation and rejects foreign user roots.
+        "localhost://Users/*",
     ]
 }
 
@@ -562,8 +731,9 @@ fn managed_home_allow_resources() -> &'static [&'static str] {
     &[
         "elastos://peer/*",
         "elastos://did/*",
-        "localhost://Users/self/.AppData/LocalHost/Chat/*",
-        "localhost://Users/self/.AppData/LocalHost/GBA/*",
+        // Broad namespace allowance is safe only because the bridge scopes
+        // `Users/self` and rejects explicit non-active `Users/<root>` requests.
+        "localhost://Users/*",
         "localhost://Local/SharedByLocalUsersAndBots/Home/*",
     ]
 }
@@ -583,6 +753,27 @@ async fn ensure_managed_runtime(
     surface_name: &str,
 ) -> anyhow::Result<RuntimeCoords> {
     let coords_path = runtime_coord_path(data_dir);
+    // Home boot can issue concurrent app/system/browser requests. Serialize the
+    // check/start sequence across processes so only one managed runtime can be
+    // spawned for a runtime data directory.
+    let start_guard = match acquire_managed_runtime_start_lock(data_dir)? {
+        ManagedRuntimeStart::Owner(guard) => guard,
+        ManagedRuntimeStart::Waiter => {
+            let expected = env!("ELASTOS_VERSION");
+            if let Some(coords) =
+                wait_for_managed_runtime_ready(&coords_path, expected, Duration::from_secs(45))
+                    .await
+            {
+                terminate_sibling_managed_runtime_children(runtime_kind, coords.pid);
+                return Ok(coords);
+            }
+            anyhow::bail!(
+                "managed {} runtime start is already in progress but did not become ready within 45s",
+                surface_name
+            );
+        }
+    };
+
     let self_exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Failed to determine runtime binary: {}", e))?;
     let binary_sha256 = sha256_file(&self_exe)?;
@@ -614,6 +805,10 @@ async fn ensure_managed_runtime(
                             if coords.binary_sha256 == binary_sha256
                                 && coords.policy_sha256 == policy_sha256
                             {
+                                terminate_sibling_managed_runtime_children(
+                                    runtime_kind,
+                                    coords.pid,
+                                );
                                 return Ok(coords);
                             }
                             if runtime_notices_enabled() {
@@ -655,6 +850,31 @@ async fn ensure_managed_runtime(
         Some(owner) => anyhow::bail!(managed_runtime_lane_conflict_message(surface_name, &owner)),
         None => false,
     };
+
+    if let Some(pid) = current_process_managed_runtime_child(runtime_kind) {
+        if runtime_notices_enabled() {
+            eprintln!(
+                "Managed {} runtime is already starting (pid {}). Waiting for readiness...",
+                surface_name, pid
+            );
+        }
+        if let Some(coords) = wait_for_managed_runtime_ready(
+            &coords_path,
+            env!("ELASTOS_VERSION"),
+            Duration::from_secs(45),
+        )
+        .await
+        {
+            terminate_sibling_managed_runtime_children(runtime_kind, coords.pid);
+            drop(start_guard);
+            return Ok(coords);
+        }
+        anyhow::bail!(
+            "managed {} runtime child {} did not become ready within 45s",
+            surface_name,
+            pid
+        );
+    }
 
     if runtime_notices_enabled() {
         eprintln!(
@@ -755,6 +975,8 @@ async fn ensure_managed_runtime(
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if let Some(coords) = managed_runtime_ready(&coords_path, expected_version).await {
+            terminate_sibling_managed_runtime_children(runtime_kind, coords.pid);
+            drop(start_guard);
             return Ok(coords);
         }
     }
@@ -995,9 +1217,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_home_policy_includes_gba_localhost_root() {
+    fn managed_home_policy_uses_principal_root_namespace() {
         let allow = managed_home_allow_resources();
-        assert!(allow.contains(&"localhost://Users/self/.AppData/LocalHost/GBA/*"));
+        assert!(allow.contains(&"localhost://Users/*"));
+        assert!(!allow
+            .iter()
+            .any(|resource| resource.contains("localhost://Users/self")));
+        assert!(allow.contains(&"localhost://Local/SharedByLocalUsersAndBots/Home/*"));
     }
 
     #[test]

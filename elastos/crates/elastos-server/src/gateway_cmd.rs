@@ -17,6 +17,7 @@ const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 
 pub struct GatewayControlPlane {
     pub provider_registry: Arc<provider::ProviderRegistry>,
+    pub host_helpers: Vec<api::server::HostHelperProcess>,
 }
 
 pub async fn run_gateway_direct<F, Fut>(
@@ -42,6 +43,7 @@ where
     let cache_path = cache_dir.unwrap_or_else(|| data_dir.join("gateway-cache"));
     std::fs::create_dir_all(&cache_path)?;
     let control_plane = setup_control_plane().await?;
+    let _host_helpers = control_plane.host_helpers;
 
     api::gateway::start_gateway_server(
         &addr,
@@ -85,6 +87,7 @@ where
     let registry: setup::ComponentsManifest = serde_json::from_str(&components_data)?;
 
     let control_plane = setup_control_plane().await?;
+    let _host_helpers = control_plane.host_helpers;
     for external in ["ipfs-provider", "kubo"] {
         if registry.external.contains_key(external) {
             eprintln!("[gateway] ensuring external '{}'", external);
@@ -233,7 +236,8 @@ where
     }
 
     if let Some(ref publish_path) = publish {
-        match publish_to_ipfs(&control_plane.provider_registry, publish_path).await {
+        match publish_to_content_availability(&control_plane.provider_registry, publish_path).await
+        {
             Ok(cid) => {
                 let filename = publish_path
                     .file_name()
@@ -400,7 +404,7 @@ async fn wait_for_public_tunnel_url(
     }
 }
 
-async fn publish_to_ipfs(
+async fn publish_to_content_availability(
     registry: &Arc<provider::ProviderRegistry>,
     path: &Path,
 ) -> anyhow::Result<String> {
@@ -411,15 +415,17 @@ async fn publish_to_ipfs(
         .unwrap_or_else(|| "file".to_string());
     let data_b64 = base64::engine::general_purpose::STANDARD.encode(&content);
     eprintln!(
-        "[gateway] publishing {} ({} bytes) to IPFS...",
+        "[gateway] publishing {} ({} bytes) through content availability...",
         filename,
         content.len()
     );
     let resp = provider_send_raw_retry(
         registry,
-        "ipfs",
+        "content",
         &serde_json::json!({
-            "op": "add_directory",
+            "op": "publish",
+            "kind": "directory",
+            "object_kind": "release",
             "files": [{ "path": filename, "data": data_b64 }],
             "pin": true,
         }),
@@ -430,7 +436,89 @@ async fn publish_to_ipfs(
         .get("data")
         .and_then(|d| d.get("cid"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no CID in ipfs-provider response: {}", resp))?;
+        .ok_or_else(|| anyhow::anyhow!("no CID in content provider response: {}", resp))?;
     eprintln!("[gateway] published {} as CID {}", filename, cid);
     Ok(cid.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
+    use tokio::sync::Mutex;
+
+    struct MockContentProvider {
+        requests: Mutex<Vec<serde_json::Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockContentProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "mock content provider only supports raw requests".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-content-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_publish_uses_content_provider_release_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let installer = temp.path().join("install.sh");
+        tokio::fs::write(&installer, b"#!/bin/sh\n").await.unwrap();
+
+        let registry = Arc::new(provider::ProviderRegistry::new());
+        let content = Arc::new(MockContentProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        registry
+            .register_sub_provider("content", content.clone())
+            .await
+            .unwrap();
+
+        let cid = publish_to_content_availability(&registry, &installer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cid,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        );
+        let requests = content.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request["op"], "publish");
+        assert_eq!(request["kind"], "directory");
+        assert_eq!(request["object_kind"], "release");
+        assert_eq!(request["pin"], true);
+        assert_eq!(request["files"][0]["path"], "install.sh");
+        let data = request["files"][0]["data"].as_str().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert_eq!(bytes, b"#!/bin/sh\n");
+    }
 }

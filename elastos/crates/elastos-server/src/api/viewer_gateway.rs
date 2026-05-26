@@ -9,8 +9,8 @@ use elastos_common::localhost::rooted_localhost_fs_path;
 use serde::Serialize;
 
 use super::gateway::{
-    content_type, require_home_launch_token, require_home_launch_token_for_any,
-    viewer_object_shell_description, viewer_object_shell_title, GatewayState,
+    content_type, require_home_launch_token_for_any, viewer_object_shell_description,
+    viewer_object_shell_title, GatewayState, HomeLaunchTokenContext,
 };
 
 #[derive(Debug, Serialize)]
@@ -38,13 +38,15 @@ pub async fn viewer_library_summary(
     if !super::browser_capsules::is_viewer_capsule(&state.data_dir, &viewer) {
         return (StatusCode::NOT_FOUND, "viewer capsule not found").into_response();
     }
-    if let Err(err) = require_viewer_library_launch_token(&state.data_dir, &headers, &viewer) {
-        return viewer_error_response(err);
-    }
+    let token_app = match require_viewer_library_launch_token(&state.data_dir, &headers, &viewer) {
+        Ok(token_app) => token_app,
+        Err(err) => return viewer_error_response(err),
+    };
 
     Json(ViewerLibraryResponse {
         items: super::browser_capsules::list_viewer_bound_capsules(&state.data_dir, &viewer)
             .into_iter()
+            .filter(|capsule| token_app == viewer || capsule.name == token_app)
             .map(|capsule| ViewerLibraryItem {
                 title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
                 description: viewer_object_shell_description(
@@ -76,7 +78,7 @@ pub async fn viewer_content(
         return (StatusCode::NOT_FOUND, "viewer capsule not found").into_response();
     }
     if let Err(err) =
-        require_viewer_bound_launch_token(&state.data_dir, &headers, &viewer, &capsule)
+        require_viewer_bound_launch_token_context(&state.data_dir, &headers, &viewer, &capsule)
     {
         return viewer_error_response(err);
     }
@@ -113,12 +115,21 @@ pub async fn viewer_storage_get(
     Path((viewer, capsule, scope, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let path =
-        match viewer_storage_file(&state.data_dir, &headers, &viewer, &capsule, &scope, &name) {
-            Ok(path) => path,
+    let target =
+        match viewer_storage_target(&state.data_dir, &headers, &viewer, &capsule, &scope, &name) {
+            Ok(target) => target,
             Err(err) => return viewer_error_response(err),
         };
-    match tokio::fs::read(path).await {
+    if !target.path.is_file() {
+        return (StatusCode::NOT_FOUND, "viewer storage file not found").into_response();
+    }
+    match crate::auth::read_principal_root_object(
+        &state.data_dir,
+        &target.principal_id,
+        &target.localhost_root,
+        &target.object_uri,
+        &target.path,
+    ) {
         Ok(bytes) => (
             StatusCode::OK,
             [
@@ -128,10 +139,7 @@ pub async fn viewer_storage_get(
             bytes,
         )
             .into_response(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "viewer storage file not found").into_response()
-        }
-        Err(err) => viewer_error_response(err.into()),
+        Err(err) => viewer_error_response(err),
     }
 }
 
@@ -141,27 +149,36 @@ pub async fn viewer_storage_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let path =
-        match viewer_storage_file(&state.data_dir, &headers, &viewer, &capsule, &scope, &name) {
-            Ok(path) => path,
+    let target =
+        match viewer_storage_target(&state.data_dir, &headers, &viewer, &capsule, &scope, &name) {
+            Ok(target) => target,
             Err(err) => return viewer_error_response(err),
         };
-    if let Some(parent) = path.parent() {
-        if let Err(err) = tokio::fs::create_dir_all(parent).await {
-            return viewer_error_response(err.into());
-        }
-    }
-    match tokio::fs::write(path, body).await {
+    match crate::auth::write_principal_root_object(
+        &state.data_dir,
+        &target.principal_id,
+        &target.localhost_root,
+        &target.object_uri,
+        &target.path,
+        body.as_ref(),
+    ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => viewer_error_response(err.into()),
+        Err(err) => viewer_error_response(err),
     }
+}
+
+struct ViewerStorageTarget {
+    path: PathBuf,
+    principal_id: String,
+    localhost_root: String,
+    object_uri: String,
 }
 
 fn require_viewer_library_launch_token(
     data_dir: &FsPath,
     headers: &HeaderMap,
     viewer: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let mut allowed_apps = vec![viewer.to_string()];
     allowed_apps.extend(
         super::browser_capsules::list_viewer_bound_capsules(data_dir, viewer)
@@ -169,53 +186,91 @@ fn require_viewer_library_launch_token(
             .map(|capsule| capsule.name),
     );
     let allowed_app_refs = allowed_apps.iter().map(String::as_str).collect::<Vec<_>>();
-    require_home_launch_token_for_any(data_dir, headers, &allowed_app_refs).map(|_| ())
+    require_home_launch_token_for_any(data_dir, headers, &allowed_app_refs)
 }
 
-fn require_viewer_bound_launch_token(
+fn require_viewer_bound_launch_token_context(
     data_dir: &FsPath,
     headers: &HeaderMap,
     viewer: &str,
     capsule: &str,
-) -> anyhow::Result<()> {
-    require_home_launch_token(data_dir, headers, capsule)
-        .or_else(|_| require_home_launch_token(data_dir, headers, viewer))
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    super::gateway::require_home_launch_token_for_any_context(data_dir, headers, &[capsule])
+        .or_else(|_| {
+            super::gateway::require_home_launch_token_for_any_context(data_dir, headers, &[viewer])
+        })
 }
 
-fn viewer_storage_file(
+fn viewer_storage_target(
     data_dir: &FsPath,
     headers: &HeaderMap,
     viewer: &str,
     capsule: &str,
     scope: &str,
     name: &str,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ViewerStorageTarget> {
     let viewer = clean_capsule_ref(viewer, "viewer")?;
     let capsule = clean_capsule_ref(capsule, "capsule")?;
     if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
         anyhow::bail!("viewer capsule not found");
     }
-    require_viewer_bound_launch_token(data_dir, headers, &viewer, &capsule)?;
-    let root = viewer_storage_root(data_dir, &viewer, &capsule)?;
+    let context = require_viewer_bound_launch_token_context(data_dir, headers, &viewer, &capsule)?;
+    let root_uri = viewer_storage_root_uri(data_dir, &context, &viewer, &capsule)?;
+    let root = rooted_localhost_fs_path(data_dir, &root_uri)
+        .ok_or_else(|| anyhow::anyhow!("invalid viewer storage root"))?;
     let file_name = clean_storage_file_name(name)?;
-    let dir = match scope {
-        "save" => root,
-        "state" => root.join("states"),
+    let (dir, object_uri) = match scope {
+        "save" => (root, format!("{root_uri}/{file_name}")),
+        "state" => (
+            root.join("states"),
+            format!("{root_uri}/states/{file_name}"),
+        ),
         _ => anyhow::bail!("invalid viewer storage scope"),
     };
-    Ok(dir.join(file_name))
+    let principal_id = context.principal_id;
+    let localhost_root = crate::auth::principal_localhost_root(&principal_id);
+    Ok(ViewerStorageTarget {
+        path: dir.join(file_name),
+        principal_id,
+        localhost_root,
+        object_uri,
+    })
 }
 
-fn viewer_storage_root(data_dir: &FsPath, viewer: &str, capsule: &str) -> anyhow::Result<PathBuf> {
+fn viewer_storage_root_uri(
+    data_dir: &FsPath,
+    context: &HomeLaunchTokenContext,
+    viewer: &str,
+    capsule: &str,
+) -> anyhow::Result<String> {
     let capsule = super::browser_capsules::resolve_viewer_bound_capsule(data_dir, capsule, viewer)
         .ok_or_else(|| anyhow::anyhow!("viewer content capsule not found"))?;
     let storage = capsule
         .storage
         .first()
         .ok_or_else(|| anyhow::anyhow!("viewer content capsule has no storage grant"))?;
+    let root_uri = principal_scoped_storage_uri(storage, context);
+    let localhost_root = crate::auth::principal_localhost_root(&context.principal_id);
+    if root_uri != localhost_root
+        && !root_uri
+            .strip_prefix(&localhost_root)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        anyhow::bail!("viewer storage must be scoped to the launch principal root");
+    }
+    Ok(root_uri)
+}
+
+fn principal_scoped_storage_uri(storage: &str, context: &HomeLaunchTokenContext) -> String {
     let root_uri = storage.trim_end_matches('*').trim_end_matches('/');
-    rooted_localhost_fs_path(data_dir, root_uri)
-        .ok_or_else(|| anyhow::anyhow!("invalid viewer storage root"))
+    let principal_root = crate::auth::principal_localhost_root(&context.principal_id);
+    if root_uri == "localhost://Users/self" {
+        return principal_root;
+    }
+    if let Some(rest) = root_uri.strip_prefix("localhost://Users/self/") {
+        return format!("{principal_root}/{rest}");
+    }
+    root_uri.to_string()
 }
 
 fn clean_capsule_ref(value: &str, label: &str) -> anyhow::Result<String> {

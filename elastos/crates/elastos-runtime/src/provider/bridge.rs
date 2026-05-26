@@ -29,7 +29,7 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Request from runtime to provider capsule
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderRequest {
     /// Initialize the provider
     Init { config: ProviderConfig },
@@ -139,6 +139,8 @@ pub enum BridgeError {
     Io(std::io::Error),
     /// Provider returned an error
     Provider { code: String, message: String },
+    /// Background provider I/O task failed
+    TaskJoin(String),
 }
 
 impl std::fmt::Display for BridgeError {
@@ -152,6 +154,9 @@ impl std::fmt::Display for BridgeError {
             BridgeError::Io(e) => write!(f, "I/O error: {}", e),
             BridgeError::Provider { code, message } => {
                 write!(f, "provider error [{}]: {}", code, message)
+            }
+            BridgeError::TaskJoin(message) => {
+                write!(f, "provider bridge task failed: {}", message)
             }
         }
     }
@@ -173,7 +178,7 @@ struct ProviderIo {
 /// All requests are serialized through a mutex (the provider processes
 /// them one at a time).
 pub struct ProviderBridge {
-    io: Mutex<ProviderIo>,
+    io: Arc<Mutex<ProviderIo>>,
     child: Mutex<Option<Child>>,
 }
 
@@ -199,10 +204,10 @@ impl ProviderBridge {
         })?;
 
         let bridge = Self {
-            io: Mutex::new(ProviderIo {
+            io: Arc::new(Mutex::new(ProviderIo {
                 writer: Box::new(stdin),
                 reader: Box::new(tokio::io::BufReader::new(stdout)),
-            }),
+            })),
             child: Mutex::new(Some(child)),
         };
 
@@ -227,10 +232,10 @@ impl ProviderBridge {
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Self {
         Self {
-            io: Mutex::new(ProviderIo {
+            io: Arc::new(Mutex::new(ProviderIo {
                 writer: Box::new(writer),
                 reader: Box::new(reader),
-            }),
+            })),
             child: Mutex::new(None),
         }
     }
@@ -244,29 +249,7 @@ impl ProviderBridge {
 
     /// Send a request and receive a response (no timeout).
     async fn request_raw(&self, req: ProviderRequest) -> Result<ProviderResponse, BridgeError> {
-        let mut io = self.io.lock().await;
-
-        // Serialize and write request
-        let json = serde_json::to_string(&req).map_err(BridgeError::Serde)?;
-        io.writer
-            .write_all(json.as_bytes())
-            .await
-            .map_err(BridgeError::Io)?;
-        io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
-        io.writer.flush().await.map_err(BridgeError::Io)?;
-
-        // Read response line
-        let mut line = String::new();
-        let n = io
-            .reader
-            .read_line(&mut line)
-            .await
-            .map_err(BridgeError::Io)?;
-
-        if n == 0 {
-            return Err(BridgeError::ProcessExited);
-        }
-
+        let line = self.send_json_line(req).await?;
         serde_json::from_str(line.trim()).map_err(BridgeError::Serde)
     }
 
@@ -276,28 +259,49 @@ impl ProviderBridge {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, BridgeError> {
-        let mut io = self.io.lock().await;
-
-        let json = serde_json::to_string(request).map_err(BridgeError::Serde)?;
-        io.writer
-            .write_all(json.as_bytes())
-            .await
-            .map_err(BridgeError::Io)?;
-        io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
-        io.writer.flush().await.map_err(BridgeError::Io)?;
-
-        let mut line = String::new();
-        let n = io
-            .reader
-            .read_line(&mut line)
-            .await
-            .map_err(BridgeError::Io)?;
-
-        if n == 0 {
-            return Err(BridgeError::ProcessExited);
-        }
-
+        let line = self.send_json_line(request.clone()).await?;
         serde_json::from_str(line.trim()).map_err(BridgeError::Serde)
+    }
+
+    /// Write one request and always drain exactly one response line.
+    ///
+    /// This runs in a detached task so caller cancellation cannot leave a stale
+    /// provider response in the pipe for the next request. Without this, a
+    /// cancelled HTTP request can cause the following provider call to receive
+    /// the previous call's response, crossing authority/data boundaries.
+    async fn send_json_line<T>(&self, request: T) -> Result<String, BridgeError>
+    where
+        T: Serialize + Send + 'static,
+    {
+        let io = Arc::clone(&self.io);
+        tokio::spawn(async move {
+            let mut io = io.lock().await;
+
+            // Serialize and write request
+            let json = serde_json::to_string(&request).map_err(BridgeError::Serde)?;
+            io.writer
+                .write_all(json.as_bytes())
+                .await
+                .map_err(BridgeError::Io)?;
+            io.writer.write_all(b"\n").await.map_err(BridgeError::Io)?;
+            io.writer.flush().await.map_err(BridgeError::Io)?;
+
+            // Read response line
+            let mut line = String::new();
+            let n = io
+                .reader
+                .read_line(&mut line)
+                .await
+                .map_err(BridgeError::Io)?;
+
+            if n == 0 {
+                return Err(BridgeError::ProcessExited);
+            }
+
+            Ok(line)
+        })
+        .await
+        .map_err(|err| BridgeError::TaskJoin(err.to_string()))?
     }
 
     /// Gracefully shut down the provider.
@@ -336,7 +340,7 @@ pub struct CapsuleProvider {
 
 impl CapsuleProvider {
     /// Create a new CapsuleProvider wrapping a ProviderBridge.
-    /// Defaults to "localhost" scheme for backwards compatibility.
+    /// Defaults to the current first-party localhost provider scheme.
     pub fn new(bridge: Arc<ProviderBridge>) -> Self {
         Self::with_scheme(bridge, "localhost")
     }
@@ -646,6 +650,58 @@ mod tests {
         .await;
 
         assert!(result.is_err()); // Timed out
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_raw_request_drains_response_before_next_request() {
+        let (client_read, mut server_write) = tokio::io::duplex(4096);
+        let (server_read_raw, client_write) = tokio::io::duplex(4096);
+        let bridge = ProviderBridge::from_io(tokio::io::BufReader::new(client_read), client_write);
+
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut reader = tokio::io::BufReader::new(server_read_raw);
+
+            let mut first = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(first.trim()).unwrap()["op"],
+                "first"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server_write
+                .write_all(b"{\"status\":\"ok\",\"data\":{\"op\":\"first\"}}\n")
+                .await
+                .unwrap();
+            server_write.flush().await.unwrap();
+
+            let mut second = String::new();
+            reader.read_line(&mut second).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(second.trim()).unwrap()["op"],
+                "second"
+            );
+            server_write
+                .write_all(b"{\"status\":\"ok\",\"data\":{\"op\":\"second\"}}\n")
+                .await
+                .unwrap();
+            server_write.flush().await.unwrap();
+        });
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            bridge.send_raw(&serde_json::json!({"op": "first"})),
+        )
+        .await;
+        assert!(first.is_err());
+
+        let second = bridge
+            .send_raw(&serde_json::json!({"op": "second"}))
+            .await
+            .unwrap();
+        assert_eq!(second["data"]["op"], "second");
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
