@@ -11,19 +11,21 @@ import {
   toolbarHomeButton,
   toolbarInboxButton,
   toolbarFullscreenButton,
+  toolbarSignOutButton,
   SHELL_APP_ID,
   shellState,
   fetchJson,
   initializeShellLayout,
   initializeRecentTargets,
   shouldIgnoreDesktopKeydown,
+  shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260427b";
+} from "./shell-core.js?v=home-20260526d";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260427b";
+} from "./shell-chrome.js?v=home-20260526d";
 import {
   renderDesktop,
   renderTaskbar,
@@ -42,7 +44,7 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260427b";
+} from "./shell-surface.js?v=home-20260526d";
 import {
   configureWindowHooks,
   renderBootError,
@@ -53,22 +55,39 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260427b";
+} from "./shell-windows.js?v=home-20260526d";
+import {
+  bindHomeUnlock,
+  hideHomeUnlock,
+  isHomeAuthError,
+  refreshHomeSession,
+  showHomeUnlock,
+  signOutHome,
+} from "./shell-auth.js?v=home-20260526d";
 
 configureWindowHooks({
   clearIdentitySurface,
   hideLauncher,
+  requestHomeUnlock: () => showHomeUnlock(() => boot(), { presentation: "prompt" }),
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
   updateTaskbarState,
 });
 
-const SUMMARY_REFRESH_MS = 2500;
+const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
+const SUMMARY_REFRESH_AFTER_INTERACTION_MS = 700;
+const HOME_EVENTS_WAIT_MS = 25_000;
+const HOME_EVENTS_RETRY_MS = 2_000;
+const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
+const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
+const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
   library: new Set(["documents"]),
+  system: "visible-target",
+  "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
@@ -150,6 +169,7 @@ boot().catch((error) => {
 });
 
 registerHomeServiceWorker();
+bindHomeUnlock();
 
 toolbarHomeButton.addEventListener("click", () => {
   showDesktopHome();
@@ -174,6 +194,17 @@ if (toolbarFullscreenButton) {
     syncFullscreenButton();
   }
 }
+
+toolbarSignOutButton?.addEventListener("click", () => {
+  document.body.dataset.homeStatus = "booting";
+  signOutHome()
+    .catch((error) => {
+      console.error("home sign out failed", error);
+    })
+    .finally(() => {
+      window.location.reload();
+    });
+});
 
 launcherToggleButton.addEventListener("click", () => {
   toggleLauncher();
@@ -333,9 +364,7 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:refresh-summary") {
-    refreshShellSummary().catch((error) => {
-      console.error("home summary refresh failed", error);
-    });
+    requestShellSummaryRefresh({ reason: "child-message" });
     return;
   }
   if (data.type === "home:open-uri") {
@@ -377,6 +406,16 @@ window.addEventListener("message", (event) => {
       return;
     }
     closeWindow(context.windowId);
+    return;
+  }
+  if (data.type === "home:relaunch-self") {
+    if (context.kind !== "app-frame" || !context.windowId || !context.targetId) {
+      console.warn("home ignored unauthorized relaunch-self message", context.targetId);
+      return;
+    }
+    const target = context.targetId;
+    closeWindow(context.windowId);
+    window.setTimeout(() => openTarget(target), 0);
     return;
   }
   if (data.type !== "home:open-target") {
@@ -506,25 +545,110 @@ function resolveOpenUri(data) {
 
 async function boot() {
   document.body.dataset.homeStatus = "booting";
+  let summary = null;
+  try {
+    summary = await refreshShellSummary({ initialize: true });
+  } catch (error) {
+    if (isHomeAuthError(error)) {
+      await showHomeUnlock(() => boot());
+      return;
+    }
+    throw error;
+  }
+  if (!homeSummarySignedIn(summary)) {
+    document.body.dataset.homeStatus = "ready";
+    await showHomeUnlock(() => boot(), { presentation: "prompt" });
+    startShellTimers();
+    return;
+  }
   const runtimeReady = fetchJson("/api/apps/home/runtime/ensure", { method: "POST" })
     .catch((error) => {
       console.error("home runtime ensure failed", error);
       return null;
     });
-  await refreshShellSummary({ initialize: true });
   await restoreShellSession();
   document.body.dataset.homeStatus = "ready";
+  hideHomeUnlock();
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
   });
+  refreshSignedHomeSession();
 
+  startShellTimers();
+}
+
+function startShellTimers() {
   updateClock();
-  shellState.clockTimer = window.setInterval(updateClock, 30_000);
-  window.setInterval(() => {
-    refreshShellSummary().catch((error) => {
-      console.error("home summary refresh failed", error);
+  if (!shellState.clockTimer) {
+    shellState.clockTimer = window.setInterval(updateClock, 30_000);
+  }
+  if (!shellState.sessionRefreshTimer) {
+    shellState.sessionRefreshTimer = window.setInterval(() => {
+      refreshSignedHomeSession();
+    }, SESSION_REFRESH_MS);
+  }
+  if (!shellState.summaryVisibilityRefreshBound) {
+    shellState.summaryVisibilityRefreshBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        return;
+      }
+      requestShellSummaryRefresh({ reason: "visibilitychange", delay: 0 });
+      ensureHomeEventChannel();
     });
-  }, SUMMARY_REFRESH_MS);
+  }
+}
+
+function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRESH_DEBOUNCE_MS } = {}) {
+  window.clearTimeout(shellState.summaryRefreshDebounceTimer);
+  const nextDelay = shellInteractionActive()
+    ? Math.max(delay, SUMMARY_REFRESH_AFTER_INTERACTION_MS)
+    : delay;
+  shellState.summaryRefreshDebounceTimer = window.setTimeout(() => {
+    if (document.hidden || shellInteractionActive()) {
+      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_AFTER_INTERACTION_MS });
+      return;
+    }
+    if (shellState.summaryRefreshInFlight) {
+      requestShellSummaryRefresh({ reason, delay: SUMMARY_REFRESH_AFTER_INTERACTION_MS });
+      return;
+    }
+    shellState.summaryRefreshInFlight = true;
+    refreshShellSummary().catch((error) => {
+      if (isHomeAuthError(error)) {
+        showHomeUnlock(() => boot()).catch((unlockError) => {
+          console.error("home unlock failed", unlockError);
+        });
+        return;
+      }
+      console.error(`home summary refresh failed (${reason})`, error);
+    })
+      .finally(() => {
+        shellState.summaryRefreshInFlight = false;
+      });
+  }, nextDelay);
+}
+
+function homeSummarySignedIn(summary) {
+  return summary?.authority?.signed_in === true;
+}
+
+function refreshSignedHomeSession() {
+  if (!homeSummarySignedIn(shellState.currentSummary)) {
+    return Promise.resolve(null);
+  }
+  return refreshHomeSession()
+    .then(() => refreshShellSummary())
+    .catch((error) => {
+      if (isHomeAuthError(error)) {
+        showHomeUnlock(() => boot(), { presentation: "prompt" }).catch((unlockError) => {
+          console.error("home unlock failed", unlockError);
+        });
+        return null;
+      }
+      console.error("home session refresh failed", error);
+      return null;
+    });
 }
 
 async function refreshShellSummary({ initialize = false } = {}) {
@@ -532,8 +656,10 @@ async function refreshShellSummary({ initialize = false } = {}) {
   const previous = shellState.currentSummary;
   shellState.currentSummary = summary;
   shellState.requestSummaryRefresh = refreshShellSummary;
+  document.body.dataset.homeAuthority = homeSummarySignedIn(summary) ? "signed" : "unsigned";
 
-  if (initialize) {
+  const principalChanged = browserStatePrincipal(previous) !== browserStatePrincipal(summary);
+  if (initialize || principalChanged) {
     initializeShellLayout(summary);
     initializeRecentTargets(summary);
   }
@@ -541,8 +667,13 @@ async function refreshShellSummary({ initialize = false } = {}) {
   syncIdentity(summary);
   syncAppearance(summary);
   renderInboxBadge(summary);
+  if (homeSummarySignedIn(summary)) {
+    ensureHomeEventChannel();
+  } else {
+    stopHomeEventChannel();
+  }
 
-  if (initialize || targetsChanged(previous, summary)) {
+  if (initialize || principalChanged || targetsChanged(previous, summary)) {
     renderDesktop(summary);
     renderTaskbar(summary);
     renderLauncher(summary);
@@ -554,6 +685,158 @@ async function refreshShellSummary({ initialize = false } = {}) {
     renderLauncher(summary);
   }
   return summary;
+}
+
+function ensureHomeEventChannel() {
+  if (
+    !homeSummarySignedIn(shellState.currentSummary)
+  ) {
+    return;
+  }
+  if (window.EventSource && !shellState.homeEventsStreamFailed) {
+    ensureHomeEventStream();
+    return;
+  }
+  if (shellState.homeEventsInFlight) {
+    return;
+  }
+  window.clearTimeout(shellState.homeEventsTimer);
+  shellState.homeEventsTimer = window.setTimeout(pollHomeEvents, 0);
+}
+
+function stopHomeEventChannel() {
+  shellState.homeEventsCursor = "";
+  shellState.homeEventsInFlight = false;
+  shellState.homeEventsStreamFailed = false;
+  if (shellState.homeEventsSource) {
+    shellState.homeEventsSource.close();
+    shellState.homeEventsSource = null;
+  }
+  window.clearTimeout(shellState.homeEventsTimer);
+  shellState.homeEventsTimer = null;
+}
+
+function ensureHomeEventStream() {
+  if (shellState.homeEventsSource) {
+    return;
+  }
+  window.clearTimeout(shellState.homeEventsTimer);
+  const source = new EventSource(HOME_EVENTS_STREAM_URL, { withCredentials: true });
+  shellState.homeEventsSource = source;
+  source.addEventListener("runtime-events", (event) => {
+    try {
+      handleHomeEventsPayload(JSON.parse(event.data || "{}"), { broadcastInitial: true });
+    } catch (error) {
+      console.warn("home event stream returned invalid payload", error);
+    }
+  });
+  source.onerror = () => {
+    if (!homeSummarySignedIn(shellState.currentSummary)) {
+      stopHomeEventChannel();
+      return;
+    }
+    shellState.homeEventsStreamFailed = true;
+    source.close();
+    if (shellState.homeEventsSource === source) {
+      shellState.homeEventsSource = null;
+    }
+    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
+  };
+}
+
+async function pollHomeEvents() {
+  if (!homeSummarySignedIn(shellState.currentSummary)) {
+    stopHomeEventChannel();
+    return;
+  }
+  if (document.hidden) {
+    scheduleHomeEventPoll(HOME_EVENTS_HIDDEN_RETRY_MS);
+    return;
+  }
+  shellState.homeEventsInFlight = true;
+  const params = new URLSearchParams({
+    wait_ms: String(HOME_EVENTS_WAIT_MS),
+  });
+  if (shellState.homeEventsCursor) {
+    params.set("cursor", shellState.homeEventsCursor);
+  }
+  const hadCursor = Boolean(shellState.homeEventsCursor);
+  try {
+    const payload = await fetchJson(`/api/apps/home/events?${params.toString()}`);
+    handleHomeEventsPayload(payload, { broadcastInitial: hadCursor });
+    scheduleHomeEventPoll(Number(payload.retry_after_ms || HOME_EVENTS_RETRY_MS));
+  } catch (error) {
+    if (isHomeAuthError(error)) {
+      stopHomeEventChannel();
+      showHomeUnlock(() => boot(), { presentation: "prompt" }).catch((unlockError) => {
+        console.error("home unlock failed", unlockError);
+      });
+      return;
+    }
+    console.warn("home event channel failed", error);
+    scheduleHomeEventPoll(HOME_EVENTS_RETRY_MS);
+  } finally {
+    shellState.homeEventsInFlight = false;
+  }
+}
+
+function handleHomeEventsPayload(payload, { broadcastInitial = true } = {}) {
+  if (payload?.schema !== "elastos.home.events/v1") {
+    throw new Error("Home event channel returned an invalid schema.");
+  }
+  const hadCursor = Boolean(shellState.homeEventsCursor);
+  shellState.homeEventsCursor = String(payload.cursor || "");
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  if ((hadCursor || broadcastInitial || events.length > 0) && events.length > 0) {
+    broadcastHomeRuntimeEvents(events);
+    if (homeEventsRequireShellSummary(events)) {
+      requestShellSummaryRefresh({ reason: "runtime-events", delay: 0 });
+    }
+  }
+}
+
+function homeEventsRequireShellSummary(events) {
+  return events.some((event) => {
+    const scope = typeof event?.scope === "string" ? event.scope : "";
+    const kind = typeof event?.kind === "string" ? event.kind : "";
+    return (
+      scope === "home" ||
+      scope === "inbox" ||
+      scope === "wallet" ||
+      kind === "home.summary.changed" ||
+      kind === "inbox.changed" ||
+      kind === "wallet.requests.changed"
+    );
+  });
+}
+
+function scheduleHomeEventPoll(delayMs) {
+  window.clearTimeout(shellState.homeEventsTimer);
+  shellState.homeEventsTimer = window.setTimeout(
+    pollHomeEvents,
+    Math.max(250, Number(delayMs) || HOME_EVENTS_RETRY_MS),
+  );
+}
+
+function broadcastHomeRuntimeEvents(events) {
+  const message = {
+    type: "elastos:runtime-events",
+    schema: "elastos.home.runtime-events/v1",
+    events,
+  };
+  for (const frame of document.querySelectorAll(".window-frame")) {
+    try {
+      frame.contentWindow?.postMessage(message, window.location.origin);
+    } catch (error) {
+      console.warn("could not deliver runtime event to app frame", error);
+    }
+  }
+}
+
+function browserStatePrincipal(summary) {
+  return typeof summary?.browser_state?.principal_id === "string"
+    ? summary.browser_state.principal_id
+    : "";
 }
 
 function syncAppearance(summary) {

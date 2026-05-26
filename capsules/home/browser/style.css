@@ -53,6 +53,18 @@ input {
   font: inherit;
 }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 button {
   border: 0;
   padding: 0;
@@ -77,6 +89,175 @@ img {
   min-height: 100vh;
   min-height: 100dvh;
   isolation: isolate;
+}
+
+.home-unlock {
+  position: fixed;
+  inset: 0;
+  z-index: 200000;
+  display: grid;
+  place-items: center;
+  padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
+  background:
+    radial-gradient(circle at 50% 28%, rgba(246, 146, 26, 0.18), transparent 30%),
+    rgba(0, 0, 0, 0.74);
+  backdrop-filter: blur(6px);
+  animation: home-unlock-fade 180ms ease-out both;
+}
+
+.home-unlock[hidden] {
+  display: none;
+}
+
+.home-unlock[data-mode="prompt"] {
+  inset: 0;
+  display: grid;
+  width: auto;
+  padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
+  background:
+    radial-gradient(circle at 50% 28%, rgba(246, 146, 26, 0.14), transparent 30%),
+    rgba(0, 0, 0, 0.58);
+  backdrop-filter: blur(4px);
+}
+
+.home-unlock-card {
+  width: min(390px, 100%);
+  padding: 28px 30px 30px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: #1c1c1e;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+  text-align: center;
+  animation: home-unlock-pop 220ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.home-unlock[data-mode="prompt"] .home-unlock-card {
+  width: min(370px, 100%);
+  padding: 26px 28px 28px;
+}
+
+.home-unlock-logo {
+  width: 118px;
+  height: auto;
+  margin: 0 auto 22px;
+}
+
+.home-unlock[data-mode="prompt"] .home-unlock-logo {
+  width: 108px;
+  margin-bottom: 20px;
+}
+
+.home-unlock h1 {
+  margin: 0;
+  font-size: clamp(26px, 6vw, 34px);
+  line-height: 1.04;
+  letter-spacing: -0.045em;
+}
+
+.home-unlock[data-mode="prompt"] h1 {
+  font-size: 30px;
+}
+
+.home-unlock p {
+  margin: 12px 0 0;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.home-unlock-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 24px;
+}
+
+.home-unlock-input {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 22px;
+  padding: 0 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 14px;
+  text-align: center;
+}
+
+.home-unlock-input[hidden] {
+  display: none;
+}
+
+.home-unlock-input::placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.home-unlock-input:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 3px;
+}
+
+.home-unlock-button {
+  min-height: 42px;
+  padding: 0 18px;
+  border-radius: 999px;
+  background: var(--brand);
+  color: #161616;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+}
+
+.home-unlock-button-secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.home-unlock-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.home-unlock-button:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 3px;
+}
+
+.home-unlock-status[data-tone="success"] {
+  color: var(--brand-strong);
+}
+
+.home-unlock-status[data-tone="error"] {
+  color: #ff8f8f;
+}
+
+@media (max-width: 720px) {
+  .home-unlock-card,
+  .home-unlock[data-mode="prompt"] .home-unlock-card {
+    width: min(360px, 100%);
+    padding: 24px 22px 26px;
+  }
+
+  .home-unlock-actions {
+    display: grid;
+  }
+
+  .home-unlock-button {
+    width: 100%;
+  }
+}
+
+@keyframes home-unlock-fade {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes home-unlock-pop {
+  0% { opacity: 0; transform: scale(0.96); }
+  100% { opacity: 1; transform: scale(1); }
 }
 
 .desktop-backdrop {
@@ -117,7 +298,7 @@ img {
   gap: 0;
   width: max-content;
   min-height: var(--toolbar-h);
-  padding-right: 10px;
+  padding: 0 10px 0 0;
   max-width: calc(100vw - 24px);
   background-color: rgba(0, 0, 0, 0.25);
   border-bottom-left-radius: 10px;
@@ -185,6 +366,16 @@ img {
 .fullscreen-btn[aria-pressed="true"] {
   opacity: 1;
   background-color: rgba(246, 146, 26, 0.18);
+}
+
+.sign-out-btn {
+  display: none;
+  flex: 0 0 22px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 5H6.8A2.8 2.8 0 0 0 4 7.8v8.4A2.8 2.8 0 0 0 6.8 19H9'/%3E%3Cpath d='M13 8l4 4-4 4'/%3E%3Cpath d='M17 12H8'/%3E%3C/svg%3E");
+}
+
+body[data-home-authority="signed"] .sign-out-btn {
+  display: flex;
 }
 
 .inbox-btn {
@@ -405,6 +596,18 @@ img {
 .taskbar-item-icon[data-tone="games"],
 .window-head-icon[data-tone="games"] {
   background: linear-gradient(180deg, #efe7ff 0%, #a985ff 56%, #5b2ac0 100%);
+}
+
+.app-glyph[data-tone="wallet"],
+.taskbar-item-icon[data-tone="wallet"],
+.window-head-icon[data-tone="wallet"] {
+  background: linear-gradient(180deg, #fff3df 0%, #ffbd5a 55%, #d56511 100%);
+}
+
+.app-glyph[data-tone="browser"],
+.taskbar-item-icon[data-tone="browser"],
+.window-head-icon[data-tone="browser"] {
+  background: linear-gradient(180deg, #eff8ff 0%, #8ed4ff 52%, #1c789b 100%);
 }
 
 .taskbar {
@@ -1126,11 +1329,11 @@ body.dragging-target {
 
 @media (max-width: 640px) {
   .toolbar {
-    padding-right: 6px;
+    padding-right: 8px;
   }
 
   .toolbar-btn {
-    margin-left: 8px;
+    margin-left: 7px;
   }
 
   .toolbar-clock {

@@ -7,6 +7,7 @@ const HOST_ORIGIN = new URL(HOME_URL).origin;
 const USER_ID = process.env.CAMOFOX_USER_ID || `home-smoke-${Date.now()}`;
 const TEST_DOCUMENT_CID = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 const REQUIRE_DOCUMENT_PUBLISH = process.env.REQUIRE_DOCUMENT_PUBLISH === "1";
+const PRESERVE_CAMOFOX_SESSION = process.env.HOME_SMOKE_PRESERVE_SESSION === "1";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,6 +92,9 @@ async function request(path, options = {}) {
 }
 
 async function cleanupSession() {
+  if (PRESERVE_CAMOFOX_SESSION) {
+    return;
+  }
   await fetch(`${CAMOFOX_BASE}/sessions/${USER_ID}`, { method: "DELETE" }).catch(() => {});
 }
 
@@ -322,6 +326,10 @@ async function shellState(tabId) {
   return evaluate(tabId, `(() => ({
     pageTitle: document.title,
     homeStatus: document.body?.dataset?.homeStatus || "",
+    homeAuthority: document.body?.dataset?.homeAuthority || "",
+    unlockVisible: !document.querySelector("#home-unlock")?.hidden,
+    unlockTitle: document.querySelector("#home-unlock-title")?.textContent?.trim() || "",
+    unlockCopy: document.querySelector("#home-unlock-copy")?.textContent?.trim() || "",
     launcherVisible: !document.querySelector("#launcher").hidden,
     launcherExpanded: {
       taskbar: document.querySelector("#launcher-toggle")?.getAttribute("aria-expanded"),
@@ -584,6 +592,36 @@ async function main() {
       assert(state.launcherExpanded.taskbar === "true", "taskbar launcher did not expose expanded state", state);
     });
 
+    await runCase("unsigned-launch-prompts-passkey", async (tabId) => {
+      const initial = await shellState(tabId);
+      if (initial.homeAuthority === "signed") {
+        return;
+      }
+      await openLauncher(tabId);
+      await delay(500);
+      await activate(tabId, '.launcher-card[data-target="system"]');
+      const prompted = await waitFor(async () => {
+        const state = await shellState(tabId);
+        return state.unlockVisible && state.unlockTitle === "Sign in";
+      }, 5000, 250);
+      const state = await shellState(tabId);
+      assert(prompted, "unsigned Home launch did not prompt for passkey", state);
+      assert(state.windows.length === 0, "unsigned Home launch should not open System before passkey approval", state);
+      assert(
+        state.unlockCopy === "Use your passkey to unlock your data, apps and desktop.",
+        "unsigned Home launch prompt copy drifted",
+        state,
+      );
+    });
+
+    const probeTabId = await createTab();
+    const signedProbe = await shellState(probeTabId);
+    await closeTab(probeTabId);
+    if (signedProbe.homeAuthority !== "signed") {
+      console.log("SKIP signed Home app journeys: passkey-backed Camofox session unavailable; set HOME_SMOKE_PRESERVE_SESSION=1 with a signed Camofox profile to run them");
+      return;
+    }
+
     await runCase("launcher-card-opens-system", async (tabId) => {
       await openLauncher(tabId);
       await delay(1000);
@@ -608,10 +646,21 @@ async function main() {
         ok: true,
         title: doc.title || "",
         heading: doc.querySelector("h1")?.textContent?.trim() || "",
+        panelLabels: [...doc.querySelectorAll(".system-panel h2")].map((node) => node.textContent?.trim() || ""),
         fieldLabels: [...doc.querySelectorAll(".system-field dt")].map((node) => node.textContent?.trim() || ""),
+        walletControlsRemoved: !doc.querySelector("#wallet-create") && !doc.querySelector("#wallet-approvals"),
         handleLabel: doc.querySelector('label[for="handle-input"]')?.textContent?.trim() || "",
         handleInputDisabled: doc.querySelector('#handle-input')?.disabled ?? null,
         handleSaveDisabled: doc.querySelector('#handle-save')?.disabled ?? null,
+        recoveryPasswordPresent: !!doc.querySelector("#recovery-password"),
+        recoveryPasswordPlaceholder: doc.querySelector("#recovery-password")?.getAttribute("placeholder") || "",
+        recoveryDownloadLabel: doc.querySelector("#recovery-download")?.textContent?.trim() || "",
+        recoveryImportPresent: !!doc.querySelector("#recovery-import"),
+        recoveryImportLabel: doc.querySelector('label[for="recovery-import"]')?.textContent?.trim() || "",
+        recoveryPendingPresent: !!doc.querySelector("#recovery-pending"),
+        recoveryPendingHidden: !!doc.querySelector("#recovery-pending")?.hidden,
+        recoveryAttachLabel: doc.querySelector("#recovery-attach")?.textContent?.trim() || "",
+        recoveryCancelLabel: doc.querySelector("#recovery-cancel")?.textContent?.trim() || "",
         runtimeStatus: doc.querySelector('[data-field="runtime-status"]')?.textContent?.trim() || "",
         runtimeNote: doc.querySelector('[data-field="runtime-note"]')?.textContent?.trim() || "",
         storageStatus: doc.querySelector('[data-field="storage-status"]')?.textContent?.trim() || "",
@@ -646,12 +695,29 @@ async function main() {
       assert(system.ok, "System frame was not reachable", system);
       assert(system.title === "System · ElastOS", "System frame title mismatch", system);
       assert(system.heading === "", "System frame should not duplicate the window title", system);
+      assert(system.panelLabels.includes("Account"), "System frame is missing Account", system);
+      assert(system.panelLabels.includes("Appearance"), "System frame is missing Appearance", system);
+      assert(system.panelLabels.includes("Advanced"), "System frame is missing Advanced", system);
       assert(system.fieldLabels.includes("Device identity"), "System frame is missing the Device identity section", system);
       assert(system.fieldLabels.includes("Version"), "System frame is missing the runtime version", system);
       assert(system.fieldLabels.includes("Documents"), "System frame is missing the storage summary", system);
-      assert(system.handleLabel === "Handle", "System frame handle label drifted", system);
+      assert(system.fieldLabels.includes("Accounts"), "System frame is missing account management", system);
+      assert(system.fieldLabels.includes("Recovery"), "System frame is missing Recovery Kit controls", system);
+      assert(system.fieldLabels.includes("Guest access"), "System frame is missing guest access control", system);
+      assert(!system.fieldLabels.includes("Wallet"), "System frame should not duplicate Wallet controls", system);
+      assert(system.walletControlsRemoved, "System frame should not include wallet account or approval controls", system);
+      assert(system.fieldLabels.includes("Network status"), "System frame is missing network status diagnostics", system);
+      assert(system.handleLabel === "Name", "System frame name label drifted", system);
       assert(system.handleInputDisabled === false, "Home-launched System should allow handle edits", system);
       assert(system.handleSaveDisabled === false, "Home-launched System should allow handle saves", system);
+      assert(system.recoveryPasswordPresent, "System frame did not expose Recovery Kit password protection", system);
+      assert(system.recoveryPasswordPlaceholder === "Optional password", "System Recovery Kit password copy drifted", system);
+      assert(system.recoveryDownloadLabel.toLowerCase().includes("recovery kit"), "System frame did not expose Recovery Kit download", system);
+      assert(system.recoveryImportPresent, "System frame did not expose Recovery Kit import", system);
+      assert(system.recoveryImportLabel === "Import kit", "System Recovery Kit import label drifted", system);
+      assert(system.recoveryPendingPresent && system.recoveryPendingHidden, "System Recovery Kit reassignment review should exist but stay hidden until needed", system);
+      assert(system.recoveryAttachLabel === "Recover account", "System Recovery Kit recover action drifted", system);
+      assert(system.recoveryCancelLabel === "Cancel", "System Recovery Kit cancel action drifted", system);
       assert(system.runtimeStatus.length > 0, "System did not show the managed local runtime version", system);
       assert(!system.runtimeNote.includes("No active local runtime"), "System still reported no local runtime after shell bootstrap", system);
       assert(system.storageStatus.length > 0, "System did not expose storage status", system);

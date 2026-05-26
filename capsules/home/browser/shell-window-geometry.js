@@ -7,15 +7,107 @@ import {
   WINDOW_SIDE_INSET,
   WINDOW_TOP_INSET,
   WINDOW_BOTTOM_INSET,
+  beginShellInteraction,
   clamp,
-} from "./shell-core.js?v=home-20260427b";
+  endShellInteraction,
+} from "./shell-core.js?v=home-20260526d";
 
 const WINDOW_MIN_VISIBLE_DRAG_WIDTH = 96;
 const WINDOW_MIN_VISIBLE_DRAG_HEIGHT = 32;
 const WINDOW_SNAP_ACTIVATION_DISTANCE = 12;
+const BROWSER_TARGET_ID = "browser";
+const BROWSER_REMOTE_ASPECT_RATIO = 16 / 9;
+const BROWSER_DEFAULT_CHROME_HEIGHT = 46;
 
 function safeClamp(value, min, max) {
   return max < min ? min : clamp(value, min, max);
+}
+
+function browserAspectConfig(node) {
+  if (node?.dataset?.target !== BROWSER_TARGET_ID || node.dataset.maximized === "true" || node.dataset.snap) {
+    return null;
+  }
+  const headHeight = Math.round(
+    node.querySelector(".window-head")?.getBoundingClientRect().height || 38,
+  );
+  let appChromeHeight = BROWSER_DEFAULT_CHROME_HEIGHT;
+  try {
+    const frame = node.querySelector(".window-frame");
+    const chrome = frame?.contentDocument?.querySelector(".browser-chrome");
+    appChromeHeight = Math.round(chrome?.getBoundingClientRect().height || appChromeHeight);
+  } catch (_error) {
+    // Cross-origin or not-yet-loaded frames use the stable Browser chrome default.
+  }
+  return {
+    aspectRatio: BROWSER_REMOTE_ASPECT_RATIO,
+    extraHeight: headHeight + appChromeHeight,
+  };
+}
+
+function browserAspectBoundsFromWidth(node, bounds) {
+  const config = browserAspectConfig(node);
+  if (!config) {
+    return bounds;
+  }
+  const height = Math.round(config.extraHeight + bounds.width / config.aspectRatio);
+  let fitted = fitWindowBounds({ ...bounds, height }, { allowPartial: true });
+  if (fitted.height < height - 1) {
+    const stageHeight = Math.max(1, fitted.height - config.extraHeight);
+    const width = Math.round(stageHeight * config.aspectRatio);
+    fitted = fitWindowBounds({ ...fitted, width, height: fitted.height }, { allowPartial: true });
+  }
+  return fitted;
+}
+
+function browserAspectResizeBounds(node, bounds, resizing, limits) {
+  const config = browserAspectConfig(node);
+  if (!config) {
+    return bounds;
+  }
+  const horizontal = resizing.directions.includes("e") || resizing.directions.includes("w");
+  const vertical = resizing.directions.includes("n") || resizing.directions.includes("s");
+  const deltaX = Math.abs((bounds.x + bounds.width) - resizing.right) + Math.abs(bounds.x - resizing.left);
+  const deltaY = Math.abs((bounds.y + bounds.height) - resizing.bottom) + Math.abs(bounds.y - resizing.top);
+  const deriveFromWidth = horizontal && (!vertical || deltaX >= deltaY);
+
+  let next = { ...bounds };
+  if (deriveFromWidth) {
+    next.height = Math.round(config.extraHeight + next.width / config.aspectRatio);
+    if (resizing.directions.includes("n") && !resizing.directions.includes("s")) {
+      next.y = bounds.y + bounds.height - next.height;
+    }
+  } else {
+    const stageHeight = Math.max(1, next.height - config.extraHeight);
+    next.width = Math.round(stageHeight * config.aspectRatio);
+    if (resizing.directions.includes("w") && !resizing.directions.includes("e")) {
+      next.x = bounds.x + bounds.width - next.width;
+    }
+  }
+
+  if (next.x < WINDOW_SIDE_INSET) {
+    next.x = WINDOW_SIDE_INSET;
+  }
+  if (next.y < WINDOW_TOP_INSET) {
+    next.y = WINDOW_TOP_INSET;
+  }
+  if (next.x + next.width > limits.maxRight) {
+    if (resizing.directions.includes("w") && !resizing.directions.includes("e")) {
+      next.x = Math.max(WINDOW_SIDE_INSET, limits.maxRight - next.width);
+    } else {
+      next.width = limits.maxRight - next.x;
+      next.height = Math.round(config.extraHeight + next.width / config.aspectRatio);
+    }
+  }
+  if (next.y + next.height > limits.maxBottom) {
+    if (resizing.directions.includes("n") && !resizing.directions.includes("s")) {
+      next.y = Math.max(WINDOW_TOP_INSET, limits.maxBottom - next.height);
+    } else {
+      next.height = limits.maxBottom - next.y;
+      const stageHeight = Math.max(1, next.height - config.extraHeight);
+      next.width = Math.round(stageHeight * config.aspectRatio);
+    }
+  }
+  return next;
 }
 
 function partialDragBoundsForWindow(width) {
@@ -94,6 +186,14 @@ export function fitWindowBounds({ x, y, width, height }, { allowPartial = false 
     width: fittedWidth,
     height: fittedHeight,
   };
+}
+
+export function fitWindowToBrowserAspect(node) {
+  const config = browserAspectConfig(node);
+  if (!config) {
+    return;
+  }
+  applyWindowBounds(node, browserAspectBoundsFromWidth(node, normalWindowBounds(node)));
 }
 
 export function rememberWindowRestoreBounds(node) {
@@ -200,6 +300,7 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
       startClientY: event.clientY,
       snapTarget: null,
     };
+    beginShellInteraction();
     handle.setPointerCapture(event.pointerId);
   });
 
@@ -238,6 +339,7 @@ export function attachWindowDrag(windowNode, handle, focusWindow, onWindowGeomet
     }
     const snapTarget = dragging.snapTarget;
     dragging = null;
+    endShellInteraction();
     try {
       handle.releasePointerCapture(event.pointerId);
     } catch (_error) {
@@ -287,6 +389,7 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
         right: bounds.x + bounds.width,
         bottom: bounds.y + bounds.height,
       };
+      beginShellInteraction();
       handle.setPointerCapture(event.pointerId);
     });
 
@@ -332,12 +435,13 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
         );
       }
 
-      applyWindowBounds(windowNode, {
+      const nextBounds = browserAspectResizeBounds(windowNode, {
         x: left,
         y: top,
         width: right - left,
         height: bottom - top,
-      });
+      }, resizing, { maxRight, maxBottom });
+      applyWindowBounds(windowNode, nextBounds);
     });
 
     const stopResize = (event) => {
@@ -345,6 +449,7 @@ export function attachWindowResize(windowNode, focusWindow, onWindowGeometryChan
         return;
       }
       resizing = null;
+      endShellInteraction();
       try {
         handle.releasePointerCapture(event.pointerId);
       } catch (_error) {

@@ -13,6 +13,7 @@ export const toolbarHomeButton = document.querySelector("#toolbar-home");
 export const toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export const toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
 export const toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
+export const toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
 export const taskbarTargets = document.querySelector("#taskbar-targets");
 export const clockNode = document.querySelector("#clock");
 export const windowSnapPreview = document.querySelector("#window-snap-preview");
@@ -24,9 +25,6 @@ export const taskbarItemTemplate = document.querySelector("#taskbar-item-templat
 
 export const SHELL_APP_ID = "home";
 export const SYSTEM_APP_ID = "system";
-const SHELL_LAYOUT_STORAGE_KEY = "home-layout";
-const SHELL_SESSION_STORAGE_KEY = "home-session";
-const RECENT_TARGETS_STORAGE_KEY = "home-recent-targets";
 const MAX_RECENT_TARGETS = 10;
 export const ICON_DRAG_THRESHOLD = 6;
 const DESKTOP_ICON_WIDTH = 92;
@@ -34,6 +32,7 @@ const DESKTOP_ICON_HEIGHT = 98;
 const DESKTOP_ICON_MARGIN = 12;
 const DESKTOP_ICON_GAP_X = 96;
 const DESKTOP_ICON_GAP_Y = 104;
+const HOME_BROWSER_CONTEXT_KEY = "elastos.home.browser-context-id";
 export const WINDOW_MIN_WIDTH = 320;
 export const WINDOW_MIN_HEIGHT = 220;
 export const WINDOW_SNAP_THRESHOLD = 28;
@@ -49,8 +48,24 @@ export const shellState = {
   browserWindowSerial: 0,
   activeWindowId: null,
   clockTimer: null,
+  summaryRefreshDebounceTimer: null,
+  summaryRefreshInFlight: false,
+  summaryVisibilityRefreshBound: false,
+  homeEventsCursor: "",
+  homeEventsTimer: null,
+  homeEventsInFlight: false,
+  homeEventsSource: null,
+  homeEventsStreamFailed: false,
+  sessionRefreshTimer: null,
+  browserContextId: ensureBrowserContextId(),
   contextMenuOpen: false,
   currentSummary: null,
+  homeBrowserState: {
+    principalId: "",
+    layout: null,
+    session: null,
+    recentTargets: [],
+  },
   shellLayoutState: {
     taskbar: [],
     desktop: {},
@@ -59,6 +74,8 @@ export const shellState = {
     desktopIconsVisible: true,
   },
   dragState: null,
+  geometryInteractionCount: 0,
+  lastInteractionEndedAt: 0,
   contextMenuTarget: { kind: "desktop" },
   contextMenuIgnoreOutsideUntil: 0,
   selectedDesktopTargetId: null,
@@ -74,6 +91,21 @@ export const shellState = {
   requestSummaryRefresh: null,
 };
 
+export function beginShellInteraction() {
+  shellState.geometryInteractionCount += 1;
+}
+
+export function endShellInteraction() {
+  shellState.geometryInteractionCount = Math.max(0, shellState.geometryInteractionCount - 1);
+  shellState.lastInteractionEndedAt = Date.now();
+}
+
+export function shellInteractionActive(graceMs = 250) {
+  return Boolean(shellState.dragState)
+    || shellState.geometryInteractionCount > 0
+    || Date.now() - shellState.lastInteractionEndedAt < graceMs;
+}
+
 export async function fetchJson(url, init) {
   const response = await fetch(url, {
     ...init,
@@ -83,13 +115,44 @@ export async function fetchJson(url, init) {
     },
   });
   if (!response.ok) {
-    throw new Error(`request failed: ${response.status} ${response.statusText}`);
+    const detail = await response.text().catch(() => "");
+    const error = new Error(
+      `request failed: ${response.status} ${response.statusText}${detail ? ` ${detail}` : ""}`,
+    );
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
 
 export function allVisibleTargets(summary) {
   return (summary && Array.isArray(summary.targets)) ? summary.targets : [];
+}
+
+function syncHomeBrowserState(summary) {
+  const state = summary && summary.browser_state && typeof summary.browser_state === "object"
+    ? summary.browser_state
+    : {};
+  shellState.homeBrowserState = {
+    principalId: normalizeText(state.principal_id),
+    layout: state.layout && typeof state.layout === "object" ? state.layout : null,
+    session: state.session && typeof state.session === "object" ? state.session : null,
+    recentTargets: Array.isArray(state.recent_targets) ? state.recent_targets : [],
+  };
+}
+
+function saveHomeBrowserState(patch) {
+  if (!shellState.homeBrowserState.principalId) {
+    return;
+  }
+  const body = JSON.stringify(patch || {});
+  fetchJson("/api/apps/home/state", {
+    method: "POST",
+    keepalive: body.length < 60_000,
+    body,
+  }).catch((error) => {
+    console.warn("home state save failed", error);
+  });
 }
 
 export function targetById(summary, targetId) {
@@ -129,7 +192,8 @@ function sortedDesktopTargets(summary) {
 }
 
 export function initializeShellLayout(summary) {
-  const stored = loadShellLayoutState();
+  syncHomeBrowserState(summary);
+  const stored = shellState.homeBrowserState.layout;
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
     stored ? stored.desktopHidden : null,
     summary,
@@ -164,70 +228,34 @@ export function initializeShellLayout(summary) {
   }
 }
 
-function loadShellLayoutState() {
-  try {
-    const raw = window.localStorage.getItem(SHELL_LAYOUT_STORAGE_KEY);
-    if (!raw) {
-      return null;
-    }
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    return parsed;
-  } catch (_error) {
-    return null;
-  }
-}
-
 export function saveShellLayoutState() {
-  try {
-    window.localStorage.setItem(
-      SHELL_LAYOUT_STORAGE_KEY,
-      JSON.stringify(shellState.shellLayoutState),
-    );
-  } catch (_error) {
-    // Storage can be unavailable in private or transient contexts.
-  }
+  shellState.homeBrowserState.layout = shellState.shellLayoutState;
+  saveHomeBrowserState({ layout: shellState.shellLayoutState });
 }
 
 export function loadShellSessionState() {
-  try {
-    const raw = window.localStorage.getItem(SHELL_SESSION_STORAGE_KEY);
-    if (!raw) {
-      return null;
-    }
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    return parsed;
-  } catch (_error) {
+  const session = shellState.homeBrowserState.session;
+  if (!session || typeof session !== "object") {
     return null;
   }
+  return session.browser_context_id === shellState.browserContextId ? session : null;
 }
 
 export function saveShellSessionState(session) {
-  try {
-    window.localStorage.setItem(
-      SHELL_SESSION_STORAGE_KEY,
-      JSON.stringify(session),
-    );
-  } catch (_error) {
-    // Storage can be unavailable in private or transient contexts.
-  }
+  shellState.homeBrowserState.session = session && typeof session === "object"
+    ? { ...session, browser_context_id: shellState.browserContextId }
+    : null;
+  saveHomeBrowserState({ session: shellState.homeBrowserState.session });
 }
 
 export function clearShellSessionState() {
-  try {
-    window.localStorage.removeItem(SHELL_SESSION_STORAGE_KEY);
-  } catch (_error) {
-    // Storage can be unavailable in private or transient contexts.
-  }
+  shellState.homeBrowserState.session = null;
+  saveHomeBrowserState({ session: null });
 }
 
 export function initializeRecentTargets(summary) {
-  const stored = loadRecentTargets();
+  syncHomeBrowserState(summary);
+  const stored = shellState.homeBrowserState.recentTargets;
   const normalized = normalizeRecentTargets(stored, summary);
   shellState.recentTargetIds = normalized;
   if (!arrayEquals(stored, normalized)) {
@@ -235,28 +263,9 @@ export function initializeRecentTargets(summary) {
   }
 }
 
-function loadRecentTargets() {
-  try {
-    const raw = window.localStorage.getItem(RECENT_TARGETS_STORAGE_KEY);
-    if (!raw) {
-      return [];
-    }
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_error) {
-    return [];
-  }
-}
-
 function saveRecentTargets() {
-  try {
-    window.localStorage.setItem(
-      RECENT_TARGETS_STORAGE_KEY,
-      JSON.stringify(shellState.recentTargetIds),
-    );
-  } catch (_error) {
-    // Storage can be unavailable in private or transient contexts.
-  }
+  shellState.homeBrowserState.recentTargets = shellState.recentTargetIds;
+  saveHomeBrowserState({ recent_targets: shellState.recentTargetIds });
 }
 
 function normalizeRecentTargets(targetIds, summary) {
@@ -276,6 +285,33 @@ function normalizeRecentTargets(targetIds, summary) {
     }
   }
   return normalized;
+}
+
+function ensureBrowserContextId() {
+  try {
+    const stored = window.localStorage?.getItem(HOME_BROWSER_CONTEXT_KEY);
+    if (typeof stored === "string" && stored.startsWith("browser:")) {
+      return stored;
+    }
+    const next = newBrowserContextId();
+    window.localStorage?.setItem(HOME_BROWSER_CONTEXT_KEY, next);
+    return next;
+  } catch (_error) {
+    return newBrowserContextId();
+  }
+}
+
+function newBrowserContextId() {
+  if (window.crypto?.randomUUID) {
+    return `browser:${window.crypto.randomUUID()}`;
+  }
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `browser:${token}`;
+  }
+  throw new Error("Home requires browser crypto for session isolation");
 }
 
 export function rememberRecentTarget(targetId) {
@@ -533,6 +569,12 @@ export function glyphTone(targetId) {
   if (targetId === "inbox") {
     return "docs";
   }
+  if (targetId.includes("wallet")) {
+    return "wallet";
+  }
+  if (targetId === "browser") {
+    return "browser";
+  }
   if (targetId.includes("file")) {
     return "docs";
   }
@@ -600,6 +642,26 @@ function glyphSvg(targetId) {
         <path d="M10 10v4" />
         <circle cx="15.5" cy="11" r="0.9" fill="currentColor" stroke="none" />
         <circle cx="17.8" cy="13" r="0.9" fill="currentColor" stroke="none" />
+      </svg>
+    `;
+  }
+  if (targetId.includes("wallet")) {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 8.2A2.2 2.2 0 0 1 6.2 6h11.6A2.2 2.2 0 0 1 20 8.2v7.6a2.2 2.2 0 0 1-2.2 2.2H6.2A2.2 2.2 0 0 1 4 15.8Z" />
+        <path d="M17 10.25h3v3.5h-3a1.75 1.75 0 1 1 0-3.5Z" />
+        <path d="M6.5 8.25h7" />
+      </svg>
+    `;
+  }
+  if (targetId === "browser") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="7.75" />
+        <path d="M4.6 10h14.8" />
+        <path d="M4.6 14h14.8" />
+        <path d="M12 4.25c2.15 2.1 3.2 4.68 3.2 7.75s-1.05 5.65-3.2 7.75" />
+        <path d="M12 4.25C9.85 6.35 8.8 8.93 8.8 12s1.05 5.65 3.2 7.75" />
       </svg>
     `;
   }

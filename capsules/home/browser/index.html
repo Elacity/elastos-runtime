@@ -5,14 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="application-name" content="ElastOS Home" />
     <meta name="theme-color" content="#050608" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260427b" />
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260526d" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260427b" />
+    <link rel="stylesheet" href="./style.css?v=home-20260526d" />
   </head>
   <body data-home-status="booting">
     <div class="desktop-shell">
@@ -42,6 +43,13 @@
         >
           <img src="./fullscreen.svg" alt="" draggable="false" />
         </button>
+        <button
+          id="toolbar-sign-out"
+          class="toolbar-btn sign-out-btn"
+          type="button"
+          aria-label="Sign out"
+          title="Sign out"
+        ></button>
         <div id="clock" class="toolbar-clock">--:--</div>
       </header>
 
@@ -99,6 +107,29 @@
       </aside>
 
       <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" hidden></div>
+
+      <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" hidden>
+        <div class="home-unlock-card" role="dialog" aria-modal="true">
+          <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
+          <h1 id="home-unlock-title">Sign in</h1>
+          <p id="home-unlock-copy">Use your passkey to unlock your data, apps and desktop.</p>
+          <label class="visually-hidden" for="home-unlock-name">Name this passkey</label>
+          <input
+            id="home-unlock-name"
+            class="home-unlock-input"
+            type="text"
+            maxlength="64"
+            autocomplete="name"
+            placeholder="Your name"
+            hidden
+          />
+          <div class="home-unlock-actions">
+            <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
+            <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Create guest account</button>
+          </div>
+          <p id="home-unlock-status" class="home-unlock-status" data-tone="muted" role="status">One moment.</p>
+        </div>
+      </section>
     </div>
 
     <template id="window-template">
@@ -175,6 +206,6 @@
       </div>
     </template>
 
-    <script type="module" src="./shell.js?v=home-20260427b"></script>
+    <script type="module" src="./shell.js?v=home-20260526d"></script>
   </body>
 </html>

@@ -36,7 +36,7 @@ import {
   clamp,
   pointInRect,
   CONTEXT_MENU_IGNORE_OUTSIDE_MS,
-} from "./shell-core.js?v=home-20260427b";
+} from "./shell-core.js?v=home-20260526d";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -50,7 +50,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260427b";
+} from "./shell-windows.js?v=home-20260526d";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -1196,7 +1196,9 @@ export function renderInboxBadge(summary) {
   }
   const notifications = summary && summary.notifications ? summary.notifications : {};
   const entries = Array.isArray(notifications.entries) ? notifications.entries : [];
-  const badgeCount = entries.length;
+  const semanticCount =
+    Number(notifications.attention_count || 0) || Number(notifications.unread_count || 0);
+  const badgeCount = Math.max(0, semanticCount || entries.length);
   toolbarInboxCount.hidden = badgeCount === 0;
   toolbarInboxCount.textContent = String(badgeCount);
   toolbarInboxButton.title = badgeCount === 0

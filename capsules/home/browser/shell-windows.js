@@ -18,16 +18,17 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260427b";
+} from "./shell-core.js?v=home-20260526d";
 import {
   fitWindowBounds,
+  fitWindowToBrowserAspect,
   applyWindowPlacement,
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260427b";
+} from "./shell-window-geometry.js?v=home-20260526d";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -43,6 +44,55 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const MAX_SESSION_WINDOWS = 24;
+const SINGLE_SESSION_TARGETS = new Set(["browser"]);
+const COMMON_IFRAME_SANDBOX = [
+  "allow-downloads",
+  "allow-forms",
+  "allow-modals",
+  "allow-pointer-lock",
+  "allow-same-origin",
+  "allow-scripts",
+];
+const BROWSER_IFRAME_SANDBOX_EXTRAS = [
+  "allow-popups",
+  "allow-popups-to-escape-sandbox",
+];
+const WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS = [
+  "allow-popups",
+  "allow-popups-to-escape-sandbox",
+];
+const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
+  "allow-top-navigation-by-user-activation",
+  "allow-top-navigation-to-custom-protocols",
+];
+const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
+const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
+const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["wallet"]);
+
+function iframeSandboxForLaunch(launched) {
+  const tokens = [...COMMON_IFRAME_SANDBOX];
+  if (launched?.target === "browser") {
+    tokens.push(...BROWSER_IFRAME_SANDBOX_EXTRAS);
+  }
+  if (launched?.target === "wallet-unisat") {
+    tokens.push(...WALLET_CONNECTOR_IFRAME_SANDBOX_EXTRAS);
+  }
+  if (launched?.target === SYSTEM_APP_ID) {
+    tokens.push(...SYSTEM_IFRAME_SANDBOX_EXTRAS);
+  }
+  return tokens.join(" ");
+}
+
+function iframeAllowForLaunch(launched) {
+  const tokens = [...COMMON_IFRAME_ALLOW];
+  if (launched?.target === "browser") {
+    tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
+  }
+  if (WEBAUTHN_IFRAME_ALLOW_TARGETS.has(launched?.target)) {
+    tokens.push("publickey-credentials-get");
+  }
+  return tokens.join("; ");
+}
 
 export function configureWindowHooks(nextHooks) {
   if (windowHooks) {
@@ -118,7 +168,7 @@ function persistBrowserSession() {
   }
   const windows = persistedBrowserSessionEntries();
   if (windows.length === 0) {
-    clearShellSessionState();
+    saveShellSessionState({ windows: [] });
     return;
   }
   saveShellSessionState({ windows });
@@ -126,12 +176,14 @@ function persistBrowserSession() {
 
 function normalizeRestorableSession(summary, storedSession) {
   const storedWindows = Array.isArray(storedSession?.windows) ? storedSession.windows : [];
+  const seenTargets = new Set();
   const normalized = [];
   for (const item of storedWindows) {
     const targetId = typeof item?.target === "string" ? item.target : "";
-    if (!targetId || !targetById(summary, targetId)) {
+    if (!targetId || seenTargets.has(targetId) || !targetById(summary, targetId)) {
       continue;
     }
+    seenTargets.add(targetId);
     normalized.push({
       target: targetId,
       hidden: item?.hidden === true,
@@ -355,6 +407,7 @@ function removeWindowEntries(entries) {
     (entry) => shellState.activeWindowId === entry.id,
   );
   for (const entry of entries) {
+    releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
     shellState.windows.delete(entry.id);
     entry.node.remove();
@@ -543,13 +596,40 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
-  if (ignoreRepeatedAction(launchActionKey(targetId, options.query))) {
+  if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
+    activateTargetGroup(targetId);
     return;
   }
-  launchBrowserTargetWindow(targetId, options).catch((error) => {
+  const launchOptions = targetId === "browser"
+    ? withBrowserInstanceQuery(options)
+    : options;
+  if (ignoreRepeatedAction(launchActionKey(targetId, launchOptions.query))) {
+    return;
+  }
+  launchBrowserTargetWindow(targetId, launchOptions).catch((error) => {
+    const status = Number(error && error.status);
+    if (status === 401 || status === 403) {
+      requireWindowHooks().requestHomeUnlock?.();
+      return;
+    }
     console.error(`failed to open ${targetId}`, error);
     renderTargetLaunchError(targetId, error);
   });
+}
+
+function withBrowserInstanceQuery(options) {
+  const query = normalizedLaunchQuery(options.query);
+  if (!query.browser_instance) {
+    query.browser_instance = nextBrowserInstanceId();
+  }
+  return { ...options, query };
+}
+
+function nextBrowserInstanceId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return `browser:${window.crypto.randomUUID()}`;
+  }
+  return `browser:${Date.now()}:${Math.random().toString(16).slice(2)}`;
 }
 
 export function showDesktopHome() {
@@ -628,9 +708,8 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     <iframe
       class="window-frame"
       title="${escapeHtml(launched.title)}"
-      allow="fullscreen"
-      allowfullscreen
-      sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts"
+      allow="${iframeAllowForLaunch(launched)}"
+      sandbox="${iframeSandboxForLaunch(launched)}"
     ></iframe>
   `;
 
@@ -677,8 +756,10 @@ function syncBrowserWindow(entry, launched) {
   cleanupFrameAutoFit(node);
 
   const syncLoadedFrame = () => {
-    installFrameAutoFit(node, frame);
-    fitWindowToFrame(node, frame);
+    if (entry.targetId !== "browser") {
+      installFrameAutoFit(node, frame);
+    }
+    fitLaunchedWindow(entry);
   };
 
   frame.onload = syncLoadedFrame;
@@ -688,6 +769,17 @@ function syncBrowserWindow(entry, launched) {
     return;
   }
   syncLoadedFrame();
+}
+
+function fitLaunchedWindow(entry) {
+  if (!entry || entry.kind !== "browser") {
+    return;
+  }
+  if (entry.targetId === "browser") {
+    fitWindowToBrowserAspect(entry.node);
+    return;
+  }
+  fitWindowToFrame(entry.node, entry.node.querySelector(".window-frame"));
 }
 
 function installFrameAutoFit(node, frame) {
@@ -744,7 +836,11 @@ function installFrameAutoFit(node, frame) {
       resizeObserver.disconnect();
     }
     if (frameWindow) {
-      frameWindow.removeEventListener("resize", scheduleFit);
+      try {
+        frameWindow.removeEventListener("resize", scheduleFit);
+      } catch (_error) {
+        // The frame may have navigated into a cross-origin or failed state.
+      }
     }
   });
 }
@@ -754,8 +850,27 @@ function cleanupFrameAutoFit(node) {
   if (!cleanup) {
     return;
   }
-  cleanup();
+  try {
+    cleanup();
+  } catch (_error) {
+    // Cross-origin teardown can throw when a frame navigates before cleanup.
+  }
   shellState.frameAutoFitCleanup.delete(node);
+}
+
+function releaseFrameRuntimePage(node) {
+  const frame = node.querySelector(".window-frame");
+  if (!frame) {
+    return;
+  }
+  try {
+    const release = frame.contentWindow?.__elastosBrowserReleaseRuntimePage;
+    if (typeof release === "function") {
+      release();
+    }
+  } catch (_error) {
+    // Cross-origin or failed frames cannot expose the Browser cleanup hook.
+  }
 }
 
 function hideWindow(id) {
@@ -794,10 +909,10 @@ function focusTopVisibleWindow() {
 function browserWindowSpec(launched, offset) {
   if (launched.target === SYSTEM_APP_ID) {
     return {
-      x: 48,
-      y: 60,
-      width: 760,
-      height: 560,
+      x: 36,
+      y: 44,
+      width: 980,
+      height: 620,
     };
   }
   if (typeof launched.route === "string" && launched.route.startsWith("/apps/gba-emulator/")) {
@@ -806,6 +921,14 @@ function browserWindowSpec(launched, offset) {
       y: 62 + offset * 20,
       width: 900,
       height: 620,
+    };
+  }
+  if (launched.target === "browser") {
+    return {
+      x: 48 + offset * 18,
+      y: 54 + offset * 18,
+      width: 1280,
+      height: 804,
     };
   }
   return {
@@ -891,7 +1014,7 @@ export function focusWindow(id) {
   shellState.activeWindowId = id;
   if (entry.kind === "browser") {
     rememberRecentTarget(entry.targetId);
-    fitWindowToFrame(entry.node, entry.node.querySelector(".window-frame"));
+    fitLaunchedWindow(entry);
   }
   refreshWindowUi();
   persistBrowserSession();
@@ -906,7 +1029,7 @@ function toggleWindowMaximize(id) {
   armWindowControlGuard(node, { closeMs: WINDOW_MAXIMIZE_CLOSE_GUARD_MS });
   if (node.dataset.maximized === "true") {
     restoreWindowFromSpecialState(node);
-    fitWindowToFrame(node, node.querySelector(".window-frame"));
+    fitLaunchedWindow(entry);
     focusWindow(id);
     persistBrowserSession();
     return;
@@ -933,12 +1056,21 @@ export async function restoreShellSession() {
 
   shellState.restoringSession = true;
   const restoredEntries = [];
+  const restoredSingleSessionTargets = new Set();
   for (const restoredWindow of restoredWindows) {
+    if (SINGLE_SESSION_TARGETS.has(restoredWindow.target)) {
+      if (restoredSingleSessionTargets.has(restoredWindow.target)) {
+        continue;
+      }
+      restoredSingleSessionTargets.add(restoredWindow.target);
+    }
     try {
       const entry = await launchBrowserTargetWindow(restoredWindow.target, {
         restoredPlacement: restoredWindow,
       });
-      restoredEntries.push({ entry, restoredWindow });
+      if (entry) {
+        restoredEntries.push({ entry, restoredWindow });
+      }
     } catch (_error) {
       // Skip targets that can no longer be opened and normalize the saved session below.
     }
@@ -966,6 +1098,7 @@ export function cleanupBeforeUnload() {
     window.clearInterval(shellState.clockTimer);
   }
   for (const entry of shellState.windows.values()) {
+    releaseFrameRuntimePage(entry.node);
     cleanupFrameAutoFit(entry.node);
   }
 }
@@ -976,7 +1109,7 @@ export function handleShellResize() {
     if (entry.kind !== "browser") {
       continue;
     }
-    fitWindowToFrame(entry.node, entry.node.querySelector(".window-frame"));
+    fitLaunchedWindow(entry);
   }
   if (clampDesktopLayoutToViewport()) {
     saveShellLayoutState();

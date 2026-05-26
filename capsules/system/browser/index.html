@@ -4,97 +4,155 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
-<link rel="stylesheet" href="./style.css?v=system-20260426a">
+<link rel="stylesheet" href="./style.css?v=system-20260525a">
 </head>
-<body data-shell-window-fit="fixed">
+<body>
   <main class="system-shell" aria-label="System">
-    <section class="system-grid" aria-label="System details">
-      <section class="system-panel" aria-labelledby="identity-title">
-        <h2 id="identity-title">Identity</h2>
-        <dl class="system-fields">
-          <div class="system-field">
-            <dt>Device identity</dt>
-            <dd class="system-value">
-              <code data-field="device-did"></code>
-            </dd>
-          </div>
-          <div class="system-field">
-            <dt>Handle</dt>
-            <dd class="system-control">
-              <form id="handle-form" class="system-inline-form">
-                <label class="visually-hidden" for="handle-input">Handle</label>
+    <section class="system-layout" aria-label="System settings">
+      <div class="system-column system-column-main">
+        <section class="system-panel" aria-labelledby="account-title">
+          <h2 id="account-title">Account</h2>
+          <dl class="system-fields">
+            <div class="system-field">
+              <dt>Name</dt>
+              <dd class="system-control">
+                <form id="handle-form" class="system-inline-form">
+                  <label class="visually-hidden" for="handle-input">Name</label>
+                  <div class="system-inline-row">
+                    <input id="handle-input" class="system-input" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
+                    <button id="handle-save" class="system-button" type="submit">Save</button>
+                  </div>
+                </form>
+              </dd>
+              <dd class="system-note system-status" data-field="handle-status" hidden></dd>
+            </div>
+            <div class="system-field">
+              <dt>Accounts</dt>
+              <dd class="system-control">
+                <span class="system-value-text system-value-muted" data-field="passkey-status" hidden></span>
+                <div id="account-list" class="account-list" aria-live="polite"></div>
+              </dd>
+            </div>
+            <div class="system-field">
+              <dt>Recovery</dt>
+              <dd class="system-control">
                 <div class="system-inline-row">
-                  <input id="handle-input" class="system-input" type="text" maxlength="32" autocomplete="nickname" placeholder="Your handle">
-                  <button id="handle-save" class="system-button" type="submit">Save</button>
+                  <label class="visually-hidden" for="recovery-password">Recovery Kit password</label>
+                  <input id="recovery-password" class="system-input" type="password" autocomplete="new-password" placeholder="Optional password">
+                  <button id="recovery-download" class="system-button" type="button">Download Recovery Kit</button>
+                  <label class="system-button system-button-secondary system-file-button" for="recovery-import">Import Recovery Kit</label>
+                  <input id="recovery-import" class="visually-hidden" type="file" accept="application/json,.json" aria-label="Import Recovery Kit">
+                  <span class="system-value-text system-value-muted" data-field="recovery-status">Not set</span>
                 </div>
-              </form>
-            </dd>
-            <dd class="system-note system-status" data-field="handle-status" hidden></dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="system-panel" aria-labelledby="runtime-title">
-        <h2 id="runtime-title">Runtime</h2>
-        <dl class="system-fields">
-          <div class="system-field">
-            <dt>Version</dt>
-            <dd class="system-value">
-              <span class="system-value-text" data-field="runtime-status" hidden></span>
-            </dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="system-panel" aria-labelledby="storage-title">
-        <h2 id="storage-title">Storage</h2>
-        <dl class="system-fields">
-          <div class="system-field">
-            <dt>Documents</dt>
-            <dd class="system-value">
-              <span class="system-value-text" data-field="storage-status" hidden></span>
-            </dd>
-            <dd class="system-note" data-field="storage-note" hidden></dd>
-          </div>
-        </dl>
-      </section>
-
-      <section class="system-panel" aria-labelledby="appearance-title">
-        <h2 id="appearance-title">Appearance</h2>
-        <dl class="system-fields">
-          <div class="system-field">
-            <dt>Background</dt>
-            <dd class="system-control background-control">
-              <div id="background-preview" class="background-preview" aria-hidden="true"></div>
-              <div class="system-inline-row background-actions">
-                <label class="system-button system-file-button" for="background-input">Choose image</label>
-                <input id="background-input" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Choose background image">
-                <button id="background-reset" class="system-button system-button-secondary" type="button">Reset</button>
-              </div>
-              <div class="background-overlay-panel">
+              </dd>
+              <dd class="system-note">Downloads everything recoverable for this account: Home data root plus built-in Wallet account keys. Use a password when saving funds; external wallet private keys stay in their own wallets.</dd>
+              <dd class="system-note system-status" data-field="recovery-note" hidden></dd>
+              <dd id="recovery-pending" class="recovery-pending" hidden>
+                <span class="recovery-pending-text" data-field="recovery-pending-text"></span>
+                <span class="recovery-pending-actions">
+                  <button id="recovery-attach" class="system-button" type="button">Recover account</button>
+                  <button id="recovery-cancel" class="system-button system-button-secondary" type="button">Cancel</button>
+                </span>
+              </dd>
+            </div>
+            <div class="system-field">
+              <dt>Guest access</dt>
+              <dd class="system-control">
                 <label class="system-switch">
-                  <input id="background-overlay" type="checkbox" aria-label="Add contrast over background">
+                  <input id="guest-registration" type="checkbox" aria-label="Allow new guest accounts">
                   <span class="system-switch-track" aria-hidden="true"></span>
-                  <span class="system-switch-text">Add contrast over background</span>
+                  <span class="system-switch-text">Allow new guests</span>
                 </label>
-                <div id="background-overlay-range" class="system-range" hidden>
-                  <label class="system-range-label" for="background-overlay-opacity">
-                    <span>Overlay strength</span>
-                    <output id="background-overlay-opacity-value" for="background-overlay-opacity">55%</output>
-                  </label>
-                  <input id="background-overlay-opacity" class="system-range-input" type="range" min="0" max="80" step="5" value="55" aria-label="Overlay strength">
+              </dd>
+              <dd class="system-note">Lets new people create their own guest account from Home. Existing guests are not revoked.</dd>
+              <dd class="system-note system-status" data-field="guest-registration-status" hidden></dd>
+            </div>
+          </dl>
+        </section>
+
+      </div>
+
+      <div class="system-column system-column-main">
+        <section class="system-panel" aria-labelledby="appearance-title">
+          <h2 id="appearance-title">Appearance</h2>
+          <dl class="system-fields">
+            <div class="system-field">
+              <dt>Background</dt>
+              <dd class="system-control background-control">
+                <div id="background-preview" class="background-preview" aria-hidden="true"></div>
+                <div class="system-inline-row background-actions">
+                  <label class="system-button system-file-button" for="background-input">Choose image</label>
+                  <input id="background-input" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" aria-label="Choose background image">
+                  <button id="background-reset" class="system-button system-button-secondary" type="button">Reset</button>
                 </div>
-              </div>
-            </dd>
-            <dd class="system-note system-status" data-field="background-status" hidden></dd>
-            <dd class="system-note system-status" data-field="overlay-status" hidden></dd>
-          </div>
-        </dl>
+                <div class="background-overlay-panel">
+                  <label class="system-switch">
+                    <input id="background-overlay" type="checkbox" aria-label="Add contrast over background">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                    <span class="system-switch-text">Add contrast over background</span>
+                  </label>
+                  <div id="background-overlay-range" class="system-range" hidden>
+                    <label class="system-range-label" for="background-overlay-opacity">
+                      <span>Overlay strength</span>
+                      <output id="background-overlay-opacity-value" for="background-overlay-opacity">55%</output>
+                    </label>
+                    <input id="background-overlay-opacity" class="system-range-input" type="range" min="0" max="80" step="5" value="55" aria-label="Overlay strength">
+                  </div>
+                </div>
+              </dd>
+              <dd class="system-note system-status" data-field="background-status" hidden></dd>
+              <dd class="system-note system-status" data-field="overlay-status" hidden></dd>
+            </div>
+          </dl>
+        </section>
+
+      </div>
+
+      <section class="system-panel system-panel-advanced" aria-labelledby="advanced-title">
+        <h2 id="advanced-title">Advanced</h2>
+        <div class="system-advanced-body">
+          <dl class="system-fields system-fields-split">
+            <div class="system-field system-field-advanced-top">
+              <dt>Device identity</dt>
+              <dd class="system-value">
+                <code data-field="device-did"></code>
+              </dd>
+            </div>
+            <div class="system-field system-field-advanced-top">
+              <dt>Documents</dt>
+              <dd class="system-value">
+                <span class="system-value-text" data-field="storage-status" hidden></span>
+              </dd>
+              <dd class="system-note" data-field="storage-note" hidden></dd>
+            </div>
+            <div class="system-field system-field-advanced-top">
+              <dt>Version</dt>
+              <dd class="system-value">
+                <span class="system-value-text" data-field="runtime-status" hidden></span>
+              </dd>
+            </div>
+            <div class="system-field system-field-webspace">
+              <dt>Elastos webspace</dt>
+              <dd class="system-control">
+                <div id="webspace-list" class="webspace-list" aria-live="polite"></div>
+              </dd>
+              <dd class="system-note">Capsules request scoped Runtime capabilities. Provider capsules own concrete backends behind their declared <code>elastos://</code> or <code>localhost://</code> URI.</dd>
+            </div>
+            <div class="system-field system-field-network">
+              <dt>Network status</dt>
+              <dd class="system-control">
+                <div class="network-table-card">
+                  <div id="chain-table" class="network-table" aria-live="polite"></div>
+                </div>
+              </dd>
+            </div>
+          </dl>
+        </div>
       </section>
     </section>
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260426a"></script>
+  <script type="module" src="./system.js?v=system-20260525a"></script>
 </body>
 </html>
