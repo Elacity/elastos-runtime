@@ -27,7 +27,7 @@ use elastos_common::localhost::{
     publisher_install_script_path, publisher_release_head_path, publisher_release_manifest_path,
     publisher_site_releases_dir, rooted_localhost_fs_path, MY_WEBSITE_URI,
 };
-use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
+use elastos_common::{CapsuleRole, CapsuleType};
 use elastos_runtime::provider::ProviderRegistry;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -1482,7 +1482,7 @@ async fn launch_runtime_backed_home_target(
     target: &str,
 ) -> Option<GatewayRuntimeLaunchOutcome> {
     let capsule_dir = resolve_capsule_dir(data_dir, target)?;
-    let manifest = load_capsule_manifest(&capsule_dir, target)?;
+    let manifest = super::capsule_inventory::load_capsule_manifest(&capsule_dir, target)?;
     if !manifest.role.is_shell_launchable() || manifest.capsule_type == CapsuleType::Data {
         return None;
     }
@@ -1763,32 +1763,14 @@ fn system_runtime_event_summary(
 }
 
 fn resolve_capsule_dir(data_dir: &FsPath, app: &str) -> Option<PathBuf> {
-    for candidate in super::browser_capsules::capsule_dir_candidates(data_dir, app) {
-        if let Some(manifest) = load_capsule_manifest(&candidate, app) {
+    for candidate in super::capsule_inventory::capsule_dir_candidates(data_dir, app) {
+        if let Some(manifest) = super::capsule_inventory::load_capsule_manifest(&candidate, app) {
             if manifest.name == app {
                 return Some(candidate);
             }
         }
     }
     None
-}
-
-fn load_capsule_manifest(dir: &FsPath, expected_name: &str) -> Option<CapsuleManifest> {
-    let manifest_path = dir.join("capsule.json");
-    if !manifest_path.is_file() {
-        return None;
-    }
-    let Ok(bytes) = std::fs::read(&manifest_path) else {
-        return None;
-    };
-    let Ok(manifest) = serde_json::from_slice::<CapsuleManifest>(&bytes) else {
-        return None;
-    };
-    if manifest.validate().is_ok() && manifest.name == expected_name {
-        Some(manifest)
-    } else {
-        None
-    }
 }
 
 fn now_ts() -> u64 {

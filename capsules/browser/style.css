@@ -1,0 +1,320 @@
+:root {
+  color-scheme: light;
+  --bg: #f7f3ea;
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-strong: #ffffff;
+  --ink: #16130e;
+  --ink-soft: rgba(22, 19, 14, 0.66);
+  --ink-mute: rgba(22, 19, 14, 0.44);
+  --line: rgba(22, 19, 14, 0.12);
+  --line-strong: rgba(22, 19, 14, 0.22);
+  --accent: #d46f24;
+  --accent-soft: rgba(212, 111, 36, 0.14);
+  --shadow: 0 10px 34px rgba(38, 29, 18, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.4 "Geist", "Inter Tight", ui-sans-serif, system-ui, sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.browser-shell {
+  display: grid;
+  grid-template-rows: 46px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background: var(--surface-strong);
+  overflow: hidden;
+}
+
+.browser-chrome {
+  display: grid;
+  grid-template-columns: 34px 34px 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  padding: 6px;
+  backdrop-filter: blur(14px);
+}
+
+.browser-nav-button {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 650;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    opacity 140ms ease;
+}
+
+.browser-nav-button:hover,
+.browser-nav-button:focus-visible {
+  border-color: var(--line-strong);
+  background: var(--accent-soft);
+  outline: none;
+}
+
+.browser-nav-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.34;
+}
+
+.browser-address-row {
+  min-width: 0;
+}
+
+.browser-address {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--ink);
+  padding: 0 12px;
+  outline: none;
+  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.browser-address:focus {
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.browser-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-strong);
+}
+
+.browser-render-panel {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  outline: none;
+  background: #fff;
+  touch-action: none;
+}
+
+.browser-render-panel:focus-visible {
+  box-shadow: inset 0 0 0 3px var(--accent-soft);
+}
+
+.browser-keyboard-capture {
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.browser-render {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+  cursor: default;
+  object-fit: fill;
+  object-position: top left;
+  touch-action: none;
+}
+
+.browser-remote-display {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #fff;
+  object-fit: fill;
+  object-position: top left;
+  touch-action: none;
+}
+
+.browser-render[hidden] {
+  display: none;
+}
+
+.browser-remote-display[hidden] {
+  display: none;
+}
+
+.browser-render-empty {
+  display: none;
+}
+
+.browser-render-empty strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.browser-status {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  max-width: min(520px, calc(100% - 24px));
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow);
+  color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+.browser-status[data-visible="true"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.browser-status[data-visible="true"][data-copyable="true"] {
+  pointer-events: auto;
+}
+
+.browser-status-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-status-copy {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-strong);
+  color: var(--ink);
+  cursor: pointer;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.browser-status-copy:hover,
+.browser-status-copy:focus-visible {
+  border-color: var(--line-strong);
+  background: var(--accent-soft);
+  outline: none;
+}
+
+.browser-metrics {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  max-width: min(720px, calc(100% - 24px));
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: var(--shadow);
+  color: var(--ink-soft);
+  padding: 6px 10px;
+  font-family: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+body[data-loading="true"] .browser-address {
+  color: var(--ink-mute);
+}
+
+@media (max-width: 640px) {
+  .browser-shell {
+    grid-template-rows: 42px minmax(0, 1fr);
+  }
+
+  .browser-chrome {
+    grid-template-columns: 30px 30px 30px minmax(0, 1fr);
+    gap: 5px;
+    padding: 5px;
+  }
+
+  .browser-nav-button,
+  .browser-address {
+    height: 30px;
+    border-radius: 9px;
+  }
+
+  .browser-nav-button {
+    width: 30px;
+    font-size: 14px;
+  }
+
+  .browser-address {
+    padding: 0 9px;
+    font-size: 11px;
+  }
+
+  .browser-status {
+    right: 8px;
+    bottom: 8px;
+    max-width: calc(100% - 16px);
+    border-radius: 12px;
+  }
+
+  .browser-metrics {
+    left: 8px;
+    bottom: 8px;
+    max-width: calc(100% - 16px);
+    border-radius: 12px;
+  }
+}

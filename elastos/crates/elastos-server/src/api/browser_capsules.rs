@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as AxumPath, State};
@@ -6,15 +6,20 @@ use axum::http::{header::SET_COOKIE, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
 
-use super::gateway::{content_type, validate_file_path, GatewayState};
+use super::capsule_inventory::{
+    active_component_names, capsule_dir_candidates, capsule_roots, installed_capsule_is_inactive,
+    load_capsule_manifest,
+};
+use super::gateway::{
+    content_type, home_session_cookie_header, request_uses_tls, validate_file_path, GatewayState,
+    HOME_CAPSULE_ID,
+};
 
-const DEV_CAPSULES_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules");
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
 const BROWSER_CAPSULE_COOP: &str = "same-origin";
 const BROWSER_CAPSULE_COEP: &str = "require-corp";
 const BROWSER_CAPSULE_CORP: &str = "same-origin";
 const BROWSER_CAPSULE_OAC: &str = "?1";
-
 struct BrowserCapsule {
     root: PathBuf,
     manifest: CapsuleManifest,
@@ -37,17 +42,6 @@ pub(crate) struct ViewerBoundCapsule {
     pub storage: Vec<String>,
 }
 
-pub(crate) fn capsule_dir_candidates(data_dir: &Path, app: &str) -> [PathBuf; 2] {
-    [
-        data_dir.join("capsules").join(app),
-        PathBuf::from(DEV_CAPSULES_ROOT).join(app),
-    ]
-}
-
-fn browser_capsule_roots(data_dir: &Path) -> [PathBuf; 2] {
-    [data_dir.join("capsules"), PathBuf::from(DEV_CAPSULES_ROOT)]
-}
-
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Redirect {
     Redirect::permanent(&format!("/apps/{app}/"))
 }
@@ -58,11 +52,8 @@ pub async fn serve_browser_app_index(
     AxumPath(app): AxumPath<String>,
 ) -> Response {
     let mut response = serve_browser_capsule_path(&state.data_dir, &app, None).await;
-    if app == super::gateway::HOME_CAPSULE_ID && response.status().is_success() {
-        match super::gateway::home_session_cookie_header(
-            &state.data_dir,
-            super::gateway::request_uses_tls(&headers),
-        ) {
+    if app == HOME_CAPSULE_ID {
+        match home_session_cookie_header(&state.data_dir, request_uses_tls(&headers)) {
             Ok(cookie) => {
                 response.headers_mut().append(SET_COOKIE, cookie);
             }
@@ -119,7 +110,7 @@ async fn serve_browser_capsule_path(
 pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<LaunchableBrowserCapsule> {
     let mut capsules = BTreeMap::new();
     let active_components = active_component_names(data_dir);
-    for root in browser_capsule_roots(data_dir) {
+    for root in capsule_roots(data_dir) {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
@@ -156,7 +147,7 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
 pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<ViewerBoundCapsule> {
     let mut capsules = BTreeMap::new();
     let active_components = active_component_names(data_dir);
-    for root in browser_capsule_roots(data_dir) {
+    for root in capsule_roots(data_dir) {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
@@ -260,24 +251,6 @@ fn resolve_browser_capsule(data_dir: &Path, app: &str) -> Result<BrowserCapsule,
     Err(StatusCode::NOT_FOUND)
 }
 
-fn active_component_names(data_dir: &Path) -> Option<BTreeSet<String>> {
-    let bytes = std::fs::read(data_dir.join("components.json")).ok()?;
-    let manifest: crate::setup::ComponentsManifest = serde_json::from_slice(&bytes).ok()?;
-    let mut names: BTreeSet<String> = manifest.external.keys().cloned().collect();
-    names.extend(manifest.capsules.keys().cloned());
-    Some(names)
-}
-
-fn installed_capsule_is_inactive(
-    data_dir: &Path,
-    dir: &Path,
-    name: &str,
-    active_components: Option<&BTreeSet<String>>,
-) -> bool {
-    dir == data_dir.join("capsules").join(name)
-        && active_components.is_some_and(|components| !components.contains(name))
-}
-
 fn is_launchable_viewer_capsule(data_dir: &Path, viewer: &str) -> bool {
     matches!(
         resolve_browser_capsule(data_dir, viewer),
@@ -310,20 +283,6 @@ fn load_browser_capsule(dir: &Path, expected_name: &str) -> Option<BrowserCapsul
     }
 
     None
-}
-
-fn load_capsule_manifest(dir: &Path, expected_name: &str) -> Option<CapsuleManifest> {
-    if !dir.is_dir() {
-        return None;
-    }
-
-    let manifest_path = dir.join("capsule.json");
-    let bytes = std::fs::read(&manifest_path).ok()?;
-    let manifest: CapsuleManifest = serde_json::from_slice(&bytes).ok()?;
-    if manifest.validate().is_err() || manifest.name != expected_name {
-        return None;
-    }
-    Some(manifest)
 }
 
 #[cfg(test)]
@@ -513,6 +472,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn general_browser_capsule_assets_remain_cross_origin_isolated_for_home_embedding() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(data_dir.path(), "browser", "Browser", "app");
+
+        let response = serve_browser_capsule_path(data_dir.path(), "browser", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("cross-origin-opener-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_CAPSULE_COOP)
+        );
+        assert_eq!(
+            headers
+                .get("cross-origin-embedder-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_CAPSULE_COEP)
+        );
+        assert_eq!(
+            headers
+                .get("cross-origin-resource-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_CAPSULE_CORP)
+        );
+        assert_eq!(
+            headers
+                .get("origin-agent-cluster")
+                .and_then(|value| value.to_str().ok()),
+            Some(BROWSER_CAPSULE_OAC)
+        );
+    }
+
     #[test]
     fn list_launchable_browser_capsules_prefers_installed_metadata() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -536,7 +529,7 @@ mod tests {
     fn list_launchable_browser_capsules_hides_installed_capsules_missing_from_registry() {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_browser_capsule(data_dir.path(), "system", "System", "app");
-        write_test_browser_capsule(data_dir.path(), "elastos-manager", "Elastos Manager", "app");
+        write_test_browser_capsule(data_dir.path(), "removed-capsule", "Removed Capsule", "app");
         write_test_components_manifest(data_dir.path(), &["system"]);
 
         let names: Vec<_> = list_launchable_browser_capsules(data_dir.path())
@@ -544,8 +537,8 @@ mod tests {
             .map(|capsule| capsule.name)
             .collect();
         assert!(names.contains(&"system".to_string()));
-        assert!(!names.contains(&"elastos-manager".to_string()));
-        assert!(resolve_browser_capsule(data_dir.path(), "elastos-manager").is_err());
+        assert!(!names.contains(&"removed-capsule".to_string()));
+        assert!(resolve_browser_capsule(data_dir.path(), "removed-capsule").is_err());
     }
 
     #[test]

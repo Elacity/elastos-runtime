@@ -7,6 +7,7 @@
 
 pub mod browser_capsules;
 pub mod browser_sessions;
+pub mod capsule_inventory;
 pub mod gateway;
 pub mod handlers;
 pub mod middleware;

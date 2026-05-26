@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ElastOS Browser</title>
+    <link rel="stylesheet" href="./style.css?v=browser-20260524d" />
+  </head>
+  <body data-shell-window-fit="fixed">
+    <main class="browser-shell">
+      <section class="browser-chrome" aria-label="Browser controls">
+        <button id="browser-back" class="browser-nav-button" type="button" aria-label="Back" disabled>
+          &larr;
+        </button>
+        <button id="browser-forward" class="browser-nav-button" type="button" aria-label="Forward" disabled>
+          &rarr;
+        </button>
+        <button id="browser-refresh" class="browser-nav-button" type="button" aria-label="Refresh" disabled>
+          &#8635;
+        </button>
+        <form id="browser-form" class="browser-address-row">
+          <label class="sr-only" for="browser-url">Web address</label>
+          <input
+            id="browser-url"
+            class="browser-address"
+            aria-label="Web address"
+            autocomplete="url"
+            inputmode="url"
+            spellcheck="false"
+            value="https://ela.city/"
+          />
+        </form>
+      </section>
+
+      <section class="browser-stage" aria-label="Web page">
+        <div id="browser-render-panel" class="browser-render-panel" tabindex="0">
+          <div id="browser-render-empty" class="browser-render-empty" hidden></div>
+          <textarea
+            id="browser-keyboard-capture"
+            class="browser-keyboard-capture"
+            aria-label="Browser keyboard and clipboard capture"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          ></textarea>
+          <video
+            id="browser-remote-display"
+            class="browser-remote-display"
+            autoplay
+            playsinline
+            muted
+            hidden
+          ></video>
+          <img id="browser-render" class="browser-render" alt="Rendered browser page" hidden />
+        </div>
+        <div id="browser-metrics" class="browser-metrics" hidden></div>
+        <div id="browser-status" class="browser-status" role="status"></div>
+      </section>
+    </main>
+
+    <script type="module" src="./browser.js?v=browser-20260524d"></script>
+  </body>
+</html>

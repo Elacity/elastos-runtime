@@ -1,0 +1,33 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "exit-provider",
+  "version": "0.1.0",
+  "description": "Internal Browser Exit provider contract for Runtime-mediated network egress",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://exit/*",
+  "authority": {
+    "reason": "Defines the internal exit-provider contract behind net-provider without exposing raw sockets, DNS, HTTP clients, or host internet access to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://exit/*",
+        "actions": ["read", "write"],
+        "operations": ["status", "quote", "open_stream", "close_stream", "http_fetch"]
+      }
+    ],
+    "audit_events": [
+      "exit.status",
+      "exit.quote",
+      "exit.open.denied",
+      "exit.stream.reserved",
+      "exit.http.denied"
+    ]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

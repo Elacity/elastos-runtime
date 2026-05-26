@@ -1,0 +1,22 @@
+[package]
+name = "browser-engine-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Browser Engine Adapter provider capsule"
+license = "MIT"
+
+[[bin]]
+name = "browser-engine-adapter"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

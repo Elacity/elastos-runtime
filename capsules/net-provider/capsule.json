@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "net-provider",
+  "version": "0.1.0",
+  "description": "Runtime Browser/Net boundary for exit-mediated web connectivity",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://net/*",
+  "authority": {
+    "reason": "Owns Browser/Net requests and keeps raw sockets, DNS, HTTP clients, wallet authority, and host internet access out of app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://net/*",
+        "actions": ["read", "write"],
+        "operations": ["status", "resolve", "connect", "stream", "http"]
+      }
+    ],
+    "audit_events": ["net.status", "net.request.denied", "net.exit.unavailable"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

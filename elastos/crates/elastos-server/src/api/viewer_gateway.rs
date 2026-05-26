@@ -87,7 +87,7 @@ pub async fn viewer_content(
         return (StatusCode::NOT_FOUND, "viewer content capsule not found").into_response();
     };
     let Some(capsule_dir) =
-        super::browser_capsules::capsule_dir_candidates(&state.data_dir, &capsule.name)
+        super::capsule_inventory::capsule_dir_candidates(&state.data_dir, &capsule.name)
             .into_iter()
             .find(|candidate| candidate.join(&capsule.entrypoint).is_file())
     else {

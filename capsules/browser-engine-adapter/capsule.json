@@ -1,0 +1,33 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "browser-engine-adapter",
+  "version": "0.1.0",
+  "description": "Internal Browser Engine Adapter contract for attaching real browser engines to Runtime stream sessions",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://browser-engine/*",
+  "authority": {
+    "reason": "Defines the internal browser-engine adapter contract without exposing raw sockets, host browser APIs, wallet injection, filesystem access, or host internet access to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://browser-engine/*",
+        "actions": ["read", "write"],
+        "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "screenshot", "frame", "input", "webrtc_signal"]
+      }
+    ],
+    "audit_events": [
+      "browser_engine.status",
+      "browser_engine.launch.denied",
+      "browser_engine.stream.attach.denied",
+      "browser_engine.page.close",
+      "browser_engine.webrtc.signal"
+    ]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}
