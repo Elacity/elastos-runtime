@@ -421,13 +421,84 @@ fi
 DEBUG_ELASTOS="$REPO_ROOT/elastos/target/debug/elastos"
 SIGN_SCRIPT="$REPO_ROOT/scripts/dev/sign-elastos-vz/sign.sh"
 
-if [[ -x "$DEBUG_ELASTOS" ]]; then
-  if ! codesign -d --entitlements - --xml "$DEBUG_ELASTOS" 2>&1 \
+# resign_binary_if_missing_entitlement <binary_path>
+#
+# Idempotent codesign helper: re-runs the dev-sign script only
+# when the Vz entitlement is missing. Same XML-substring check
+# as the main-binary loop above, factored out so the
+# test-binary loop below can use it without duplicating the
+# `codesign | grep` recipe.
+resign_binary_if_missing_entitlement() {
+  local binary_path="$1"
+  local label="$2"
+  if ! codesign -d --entitlements - --xml "$binary_path" 2>&1 \
         | grep -q "com.apple.security.virtualization"; then
-    echo "[mac-local-setup] debug binary missing Vz/JIT entitlements — re-signing"
-    "$SIGN_SCRIPT" "$DEBUG_ELASTOS" 2>&1 | sed 's/^/  /'
+    echo "[mac-local-setup] $label missing Vz/JIT entitlements — re-signing"
+    "$SIGN_SCRIPT" "$binary_path" 2>&1 | sed 's/^/  /'
   fi
+}
+
+if [[ -x "$DEBUG_ELASTOS" ]]; then
+  resign_binary_if_missing_entitlement "$DEBUG_ELASTOS" "debug binary"
 fi
+
+# ── 6b. Auto re-sign elastos-vz integration test binaries ────────────
+#
+# `cargo test -p elastos-vz --test <name>` produces a per-test
+# binary at `elastos/target/{debug,release}/deps/<name>-<hash>`,
+# and like the main binary, every rebuild strips the codesign
+# signature. Without the Vz entitlement the tests `panic!` on
+# Apple's `VZVirtualMachineConfiguration.validateWithError`,
+# which contributors then mistake for genuine test failures.
+#
+# Day-4 of Phase 9 added auto-resign for `target/debug/elastos`
+# (above); this section extends the same idempotent recipe to
+# every integration-test binary that exercises Vz. The plist is
+# the same — Vz + JIT entitlements — because tests load both
+# Apple's framework and `wasmtime` indirectly through the
+# crate's build matrix.
+#
+# Why a fixed list of test names rather than `find … deps/*`:
+# `deps/` also holds compiled dependency rlibs and helper
+# binaries we must not sign. An allow-list mirrors the
+# `tests/*.rs` source layout and is easy to audit when a new
+# test is added.
+
+ELASTOS_VZ_TEST_BINARIES=(concurrent_launch smoke)
+
+resign_vz_test_binaries_for_profile() {
+  local profile="$1"
+  local deps_dir="$REPO_ROOT/elastos/target/$profile/deps"
+
+  if [[ ! -d "$deps_dir" ]]; then
+    return 0
+  fi
+
+  shopt -s nullglob
+  local test_name
+  for test_name in "${ELASTOS_VZ_TEST_BINARIES[@]}"; do
+    local candidate
+    for candidate in "$deps_dir/${test_name}-"*; do
+      # Skip cargo's dep-info sidecar files — only the matching
+      # executable carries the codesign signature.
+      [[ "$candidate" == *.d ]] && continue
+      # Skip directories (cargo occasionally creates per-test
+      # incremental dirs alongside the binaries).
+      [[ -d "$candidate" ]] && continue
+      # An executable Mach-O is the only thing worth signing.
+      [[ -x "$candidate" && -f "$candidate" ]] || continue
+
+      resign_binary_if_missing_entitlement \
+        "$candidate" \
+        "$profile/${candidate##*/}"
+    done
+  done
+  shopt -u nullglob
+}
+
+for profile in debug release; do
+  resign_vz_test_binaries_for_profile "$profile"
+done
 
 # ── 7. Self-verify ───────────────────────────────────────────────────
 
