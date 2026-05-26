@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "wallet",
+  "version": "0.1.0",
+  "description": "View Wallet accounts, balances, approvals, and approval methods",
+  "author": "elastos",
+  "role": "app",
+  "type": "data",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 16,
+    "gpu": false
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "wallet-provider",
+  "version": "0.1.0",
+  "description": "Wallet authority provider for proof challenges, linked accounts, and typed signing approvals",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://wallet/*",
+  "authority": {
+    "reason": "Owns wallet proof challenges, connector-bound account-link metadata, explicit approval flows, and passkey-gated managed recovery export without exposing wallet RPC or provider SDK objects to ordinary app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://wallet/*",
+        "actions": ["read", "write", "execute"],
+        "operations": ["status", "accounts", "create_managed_account", "link_account", "revoke_account", "rename_account", "export_managed_secret", "set_default_account", "default_account", "challenge", "bitcoin_challenge", "verify_proof", "verify_bip322_proof", "verify_contract_proof", "request_signature", "approval_requests", "reject_approval", "approve_approval", "complete_approval", "sign_approved"]
+      }
+    ],
+    "audit_events": ["wallet.status", "wallet.managed.created", "wallet.account_link", "wallet.account_revoke", "wallet.account.deleted", "wallet.account.renamed", "wallet.recovery_key.viewed", "wallet.default.updated", "wallet.proof", "wallet.sign_request", "wallet.approval_reject", "wallet.approval_approve", "wallet.approval_complete"]
+  },
+  "capabilities": ["localhost://ElastOS/SystemServices/Wallet/*"],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

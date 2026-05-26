@@ -1,0 +1,209 @@
+use super::*;
+use k256::ecdsa::SigningKey;
+
+mod bitcoin;
+mod evm;
+
+pub(super) use bitcoin::*;
+pub(super) use evm::*;
+
+pub(super) fn account_id(chain_namespace: &str, address: &str) -> String {
+    format!("wallet:{chain_namespace}:{address}")
+}
+
+pub(super) fn managed_address_for_signing_key(
+    signing_key: &SigningKey,
+    chain_namespace: &str,
+) -> Result<String, String> {
+    match managed_proof_type(chain_namespace)? {
+        MANAGED_EVM_PROOF_TYPE => Ok(evm_address_for_signing_key(signing_key)),
+        MANAGED_BTC_P2WPKH_PROOF_TYPE => btc_p2wpkh_address_for_signing_key(signing_key),
+        _ => Err("unsupported managed wallet proof type".to_string()),
+    }
+}
+
+pub(super) fn managed_signature_envelope(request: &WalletApprovalRequest) -> Value {
+    json!({
+        "schema": "elastos.wallet.managed_signature_payload/v1",
+        "request_id": request.request_id.clone(),
+        "principal_id": request.principal_id.clone(),
+        "account_id": request.account_id.clone(),
+        "chain_namespace": request.chain_namespace.clone(),
+        "address": request.address.clone(),
+        "intent": request.intent.clone(),
+        "capsule_id": request.capsule_id.clone(),
+        "resource": request.resource.clone(),
+        "reason": request.reason.clone(),
+        "payload_hash": request.payload_hash.clone(),
+        "payload": request.payload.clone(),
+    })
+}
+
+pub(super) struct ManagedSignatureOutput {
+    pub(super) kind: ManagedSignatureKind,
+    pub(super) authority: String,
+    pub(super) payload: Value,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ManagedSignatureKind {
+    Message,
+    Transaction,
+}
+
+pub(super) fn sign_managed_approval(
+    signing_key: &SigningKey,
+    request: &WalletApprovalRequest,
+) -> Result<ManagedSignatureOutput, String> {
+    if request.intent == "bitcoin_bip322_proof" {
+        let (signature, payload) = sign_bip322_simple_p2wpkh_approval(signing_key, request)?;
+        return Ok(ManagedSignatureOutput {
+            kind: ManagedSignatureKind::Message,
+            authority: signature,
+            payload,
+        });
+    }
+    if request.chain_namespace.starts_with("bip122:") {
+        return Err(
+            "managed Bitcoin accounts only support bitcoin_bip322_proof signing".to_string(),
+        );
+    }
+    if request.intent == "browser_personal_sign" {
+        let (signature, payload) = sign_browser_personal_sign_approval(signing_key, request)?;
+        return Ok(ManagedSignatureOutput {
+            kind: ManagedSignatureKind::Message,
+            authority: signature,
+            payload,
+        });
+    }
+    if request.intent == "browser_typed_data_sign" {
+        let (signature, payload) = sign_browser_typed_data_approval(signing_key, request)?;
+        return Ok(ManagedSignatureOutput {
+            kind: ManagedSignatureKind::Message,
+            authority: signature,
+            payload,
+        });
+    }
+    if request.intent == "transaction_intent" {
+        let (signed_transaction, payload) = sign_eip155_legacy_transaction(signing_key, request)?;
+        return Ok(ManagedSignatureOutput {
+            kind: ManagedSignatureKind::Transaction,
+            authority: signed_transaction,
+            payload,
+        });
+    }
+
+    let envelope = managed_signature_envelope(request);
+    let envelope_bytes = serde_json::to_vec(&envelope).map_err(|err| err.to_string())?;
+    let signature = sign_evm_message(signing_key, &envelope_bytes)?;
+    Ok(ManagedSignatureOutput {
+        kind: ManagedSignatureKind::Message,
+        authority: signature,
+        payload: envelope,
+    })
+}
+
+pub(super) fn external_wallet_handoff(request: &WalletApprovalRequest) -> Result<Value, String> {
+    if request.intent == "transaction_intent" {
+        let chain_id = payload_u64(&request.payload, "chain_id")?;
+        let transaction = json!({
+            "from": payload_str(&request.payload, "from")?,
+            "to": payload_str(&request.payload, "to")?,
+            "value": payload_str(&request.payload, "value")?,
+            "data": payload_str(&request.payload, "data")?,
+            "gas": payload_str(&request.payload, "gas_limit")?,
+            "gasPrice": payload_str(&request.payload, "gas_price")?,
+            "nonce": payload_str(&request.payload, "nonce")?,
+            "chainId": format!("0x{chain_id:x}"),
+        });
+        return Ok(json!({
+            "schema": "elastos.wallet.webconnect_handoff/v1",
+            "request_id": request.request_id,
+            "intent": request.intent,
+            "payload_hash": request.payload_hash,
+            "signer": request.address,
+            "transaction": transaction,
+            "status": "awaiting_wallet_transaction"
+        }));
+    }
+    let message = external_signature_message(request)?;
+    Ok(json!({
+        "schema": "elastos.wallet.webconnect_handoff/v1",
+        "request_id": request.request_id,
+        "intent": request.intent,
+        "payload_hash": request.payload_hash,
+        "signer": request.address,
+        "message": message,
+        "signature_type": if request.intent == "bitcoin_bip322_proof" {
+            bitcoin_signature_type_for_proof_type(&request.proof_type)
+        } else {
+            "personal_sign"
+        },
+        "status": "awaiting_wallet_signature"
+    }))
+}
+
+pub(super) fn managed_signed_result(
+    request: &WalletApprovalRequest,
+    signed: &ManagedSignatureOutput,
+) -> Option<Value> {
+    if request.intent == "browser_personal_sign" {
+        return browser_personal_sign_result(request, &signed.authority);
+    }
+    if request.intent == "browser_typed_data_sign" {
+        return browser_typed_data_sign_result(request, &signed.authority);
+    }
+    if request.intent == "transaction_intent" && signed.kind == ManagedSignatureKind::Transaction {
+        return Some(json!({
+            "schema": "elastos.wallet.signed-transaction-result/v1",
+            "request_id": request.request_id,
+            "method": "eth_sendTransaction",
+            "signed_transaction": signed.authority,
+            "transaction_hash": signed.payload.get("transaction_hash").cloned().unwrap_or(Value::Null),
+            "signer": request.address,
+            "chain_namespace": request.chain_namespace,
+            "payload_hash": request.payload_hash,
+        }));
+    }
+    None
+}
+
+pub(super) fn external_signature_message(
+    request: &WalletApprovalRequest,
+) -> Result<String, String> {
+    if request.intent == "browser_personal_sign" {
+        return request
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "Browser wallet signature payload missing message".to_string());
+    }
+    if request.intent == "browser_typed_data_sign" {
+        return request
+            .payload
+            .get("typed_data_canonical")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "Browser typed-data payload missing canonical typed data".to_string());
+    }
+    if request.intent == "bitcoin_bip322_proof" {
+        return request
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| "Bitcoin BIP-322 payload missing message".to_string());
+    }
+    Ok(format!(
+        "ElastOS Wallet Approval\n\nRequest: {}\nIntent: {}\nCapsule: {}\nResource: {}\nReason: {}\nPayload SHA-256: {}\nAccount: {}\nExpires At: {}",
+        request.request_id,
+        request.intent,
+        request.capsule_id,
+        request.resource,
+        request.reason,
+        request.payload_hash,
+        request.address,
+        request.expires_at
+    ))
+}

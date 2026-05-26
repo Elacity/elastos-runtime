@@ -406,9 +406,12 @@
   </section>
 
   <script>
+    const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
+
     const state = {
       homeToken: new URLSearchParams(window.location.search).get("home_token") || "",
       entries: [],
+      refreshInFlight: null,
     };
 
     const elements = {
@@ -445,6 +448,25 @@
       }
     }
 
+    function runtimeEventIsRelevant(event) {
+      const kind = String(event && event.kind || "");
+      const scope = String(event && event.scope || "");
+      return scope === "inbox" || scope === "wallet" || kind.startsWith("inbox.") || kind.startsWith("wallet.");
+    }
+
+    function onRuntimeEvents(event) {
+      if (event.origin !== window.location.origin) {
+        return;
+      }
+      const message = event.data || {};
+      if (message.type !== "elastos:runtime-events" || !Array.isArray(message.events)) {
+        return;
+      }
+      if (message.events.some(runtimeEventIsRelevant)) {
+        requestInboxRefresh().catch(() => {});
+      }
+    }
+
     async function api(path, options) {
       const request = Object.assign({ method: "GET" }, options || {});
       request.headers = Object.assign({}, request.headers || {}, {
@@ -475,6 +497,21 @@
       renderInbox(notifications);
       markVisibleRead(notifications);
       notifyHome();
+    }
+
+    function requestInboxRefresh() {
+      if (state.refreshInFlight) {
+        return state.refreshInFlight;
+      }
+      state.refreshInFlight = loadInbox()
+        .catch((error) => {
+          setStatus(error.message || "Could not refresh inbox.");
+          throw error;
+        })
+        .finally(() => {
+          state.refreshInFlight = null;
+        });
+      return state.refreshInFlight;
     }
 
     function renderInbox(notifications) {
@@ -541,9 +578,21 @@
       if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
+        const requestId = actionId.slice("wallet-approve-request:".length);
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId }), "primary"));
+        actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
       }
 
-      actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "external_http_request") {
+        actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
+      }
       article.append(copy, actions);
       return article;
     }
@@ -584,7 +633,7 @@
       elements.refresh.disabled = disabled;
     }
 
-    function openSource(sourceApp) {
+    function openSource(sourceApp, query = {}) {
       const target = typeof sourceApp === "string" ? sourceApp.trim() : "";
       if (!target || !window.parent || window.parent === window) {
         return;
@@ -592,14 +641,14 @@
       window.parent.postMessage({
         type: "home:open-target",
         target,
-        query: {},
+        query,
         homeToken: state.homeToken,
       }, window.location.origin);
     }
 
     function markVisibleRead(notifications) {
       const unreadIds = state.entries
-        .filter((entry) => entry && entry.id && !entry.read)
+        .filter((entry) => entry && entry.id && !entry.read && entry.kind !== "wallet_approval_request")
         .map((entry) => entry.id);
       if (unreadIds.length === 0) {
         return;
@@ -645,7 +694,20 @@
       showLocked();
     } else {
       showInbox();
-      loadInbox().catch((error) => setStatus(error.message || "Could not load inbox."));
+      requestInboxRefresh().catch(() => {});
+      window.addEventListener("message", onRuntimeEvents);
+      window.setInterval(() => {
+        if (document.hidden) {
+          return;
+        }
+        requestInboxRefresh().catch(() => {});
+      }, INBOX_SAFETY_REFRESH_MS);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          return;
+        }
+        requestInboxRefresh().catch(() => {});
+      });
     }
   </script>
 </body>

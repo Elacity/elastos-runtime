@@ -1,0 +1,246 @@
+:root {
+  color-scheme: light;
+  --bg: #edf1fb;
+  --panel: rgba(255, 255, 255, 0.9);
+  --line: rgba(83, 103, 164, 0.14);
+  --line-strong: rgba(83, 103, 164, 0.22);
+  --ink: #1d2438;
+  --muted: #66708a;
+  --brand: #f6921a;
+  --brand-soft: #fff1dc;
+  --accent: #5f76d8;
+  --accent-soft: #e8edff;
+  --accent-deep: #3c53a7;
+  --danger: #b14c5a;
+  --shadow: 0 24px 60px rgba(34, 49, 88, 0.12);
+  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  padding: clamp(0.45rem, 1.35vw, 0.85rem);
+  background:
+    radial-gradient(circle at top left, rgba(95, 118, 216, 0.14), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(126, 149, 226, 0.12), transparent 24%),
+    linear-gradient(180deg, #f7f9ff 0%, var(--bg) 100%);
+  color: var(--ink);
+}
+
+button {
+  border: 0;
+  font: inherit;
+  color: inherit;
+}
+
+h2,
+p {
+  margin: 0;
+}
+
+.wallet-shell {
+  width: min(760px, 100%);
+  margin: 0 auto;
+  display: grid;
+  gap: 0.72rem;
+}
+
+.wallet-panel {
+  display: grid;
+  gap: 0.78rem;
+  min-width: 0;
+  padding: clamp(0.78rem, 2vw, 1rem);
+  border: 1px solid var(--line);
+  border-radius: 1.18rem;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(12px);
+}
+
+.wallet-heading,
+.wallet-section-heading,
+.wallet-actions,
+.wallet-request {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.wallet-heading,
+.wallet-section-heading {
+  justify-content: space-between;
+}
+
+.wallet-section-heading {
+  align-items: flex-start;
+}
+
+.wallet-section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.eyebrow {
+  color: var(--brand);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+h2 {
+  font-size: 1.02rem;
+  line-height: 1.1;
+}
+
+.wallet-request small,
+.wallet-state {
+  color: var(--muted);
+}
+
+.wallet-state {
+  flex: 0 0 auto;
+  padding: 0.34rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.58);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.wallet-actions {
+  flex-wrap: wrap;
+}
+
+.wallet-button {
+  min-height: 2.35rem;
+  padding: 0.58rem 0.9rem;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--brand), #ffb24c);
+  color: #1d2438;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: 0 12px 26px rgba(246, 146, 26, 0.25);
+}
+
+.wallet-button-secondary {
+  border: 1px solid var(--line-strong);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  box-shadow: none;
+}
+
+.wallet-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.wallet-status {
+  padding: 0.6rem 0.72rem;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--muted);
+}
+
+.wallet-status[data-tone="success"] {
+  color: #2d6b48;
+}
+
+.wallet-status[data-tone="error"] {
+  border-color: rgba(177, 76, 90, 0.24);
+  background: rgba(177, 76, 90, 0.1);
+  color: var(--danger);
+}
+
+.wallet-accounts,
+.wallet-requests {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.wallet-empty,
+.wallet-account,
+.wallet-request {
+  padding: 0.72rem;
+  border: 1px solid var(--line);
+  border-radius: 0.95rem;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.wallet-empty {
+  color: var(--muted);
+}
+
+.wallet-account,
+.wallet-request {
+  justify-content: space-between;
+}
+
+.wallet-account {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.wallet-account-main,
+.wallet-request-main {
+  display: grid;
+  min-width: 0;
+  gap: 0.18rem;
+}
+
+.wallet-account-main strong,
+.wallet-request-main strong,
+.wallet-request-main span,
+.wallet-request-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wallet-address {
+  display: block;
+  max-width: 100%;
+  color: var(--accent-deep);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.wallet-copy-button {
+  min-width: 4.5rem;
+  box-shadow: none;
+}
+
+@media (max-width: 560px) {
+  body {
+    padding: 0.35rem;
+  }
+
+  .wallet-panel {
+    padding: 0.7rem;
+    border-radius: 1rem;
+  }
+
+  .wallet-account,
+  .wallet-request {
+    grid-template-columns: 1fr;
+  }
+}

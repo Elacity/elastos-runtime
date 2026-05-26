@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallet · ElastOS</title>
+<link rel="stylesheet" href="./style.css?v=wallet-walletconnect-20260508b">
+</head>
+<body>
+  <main class="wallet-shell" aria-label="WalletConnect approval method">
+    <section class="wallet-panel">
+      <div class="wallet-heading">
+        <p class="eyebrow">Add approval method</p>
+      </div>
+      <div class="wallet-actions">
+        <button id="wallet-connect" class="wallet-button" type="button">Connect wallet</button>
+      </div>
+      <p id="wallet-status" class="wallet-status" hidden></p>
+    </section>
+
+    <section class="wallet-panel">
+      <div class="wallet-section-heading">
+        <div class="wallet-section-title">
+          <h2>Connected accounts</h2>
+          <span id="wallet-state" class="wallet-state">0 linked</span>
+        </div>
+      </div>
+      <div id="wallet-accounts" class="wallet-accounts" aria-live="polite"></div>
+    </section>
+
+    <section class="wallet-panel">
+      <div class="wallet-section-heading">
+        <h2>Approval requests</h2>
+      </div>
+      <div id="wallet-requests" class="wallet-requests" aria-live="polite"></div>
+    </section>
+  </main>
+  <script type="module" src="./wallet-walletconnect.js?v=wallet-walletconnect-20260508b"></script>
+</body>
+</html>
