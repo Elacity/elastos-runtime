@@ -5,6 +5,21 @@
 > Anchor: this document is the single shareable summary of the branch. For
 > day-by-day detail see `PHASE_*_DAY_*_NOTES.md`; for the formal sign-off see
 > `PHASE_9_SIGNOFF.md`; for product framing see `../ELASTOS_PRD.md`.
+>
+> ## ⚠️ Substrate-CI status callout (added 2026-05-26 post-Phase-10.5)
+>
+> The Mac-substrate security hardening (Phase 10 + Phase 10.5 M1-M4) is closed
+> and reviewable. However, this branch's **Linux CI has been continuously red
+> since 2026-05-25T11:46Z** (commit `30cccce`, Phase 6 Day 6) due to
+> pre-existing Phase 4/5/6 cross-OS regressions in `supervisor.rs`,
+> `doctor_cmd.rs`, and the `elastos-vz` crate's own internal hygiene.
+> A follow-up Phase 10.6 session closed two of the regressions and **paused
+> on documenting the rest**. See **[`PHASE_10_6_GAP_REPORT.md`](./PHASE_10_6_GAP_REPORT.md)**
+> for the full list of remaining issues with file/line/fix-pattern for each.
+>
+> **Operator implication:** branch is **NOT merge-ready** until Phase 10.7
+> closes the gap-report issues. The Mac VM functional milestone, the M1-M4
+> security work, and the inherited-CVE handoff document are all unaffected.
 
 ## Executive summary (30 seconds)
 

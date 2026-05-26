@@ -1,5 +1,33 @@
 # Phase 10.5 — Sign-off
 
+> ## ⚠️ Branch status callout (added 2026-05-26 post-sign-off)
+>
+> **M1-M4 findings: CLOSED.** Code fixes, regression tests, and operator verifiers
+> for the four medium-severity Phase 10 findings are all on this branch and verified.
+> Nothing in this section retracts that.
+>
+> **Branch `sash/local-test` merge-readiness: NOT YET CLAIMED.** A post-sign-off CI
+> sanity check (the one the original Phase 10.5 sign-off should have included but
+> didn't) revealed this branch's **Linux CI has been continuously red since
+> 2026-05-25T11:46Z** (commit `30cccce`, Phase 6 Day 6) due to pre-existing
+> Phase 4/5/6 cross-OS substrate regressions unrelated to M1-M4. The original
+> sign-off's phrasing implied "branch ready for reviewer" — that was overclaiming.
+>
+> A follow-up Phase 10.6 session closed two of the substrate regressions
+> (`cargo fmt` drift and 5 unconditional `elastos_vz::*` references in
+> `supervisor.rs`) and **explicitly paused** on documenting the four remaining
+> issue classes. See **[`PHASE_10_6_GAP_REPORT.md`](./PHASE_10_6_GAP_REPORT.md)**
+> for the full breakdown.
+>
+> **What this means for the operator:**
+> - The Mac substrate security work (M1-M4) is genuinely done and reviewable.
+> - The branch is **NOT** ready to merge to `main` until Phase 10.7 closes the
+>   four substrate regressions catalogued in the gap report.
+> - The parallel Step 2 work (inherited CVE remediation) is on its own clean
+>   branch (`chore/runtime-cve-hygiene`) and is not affected by this red CI.
+>
+> ---
+
 > **Outcome (2026-05-26):** the four medium-severity findings the
 > Phase 10 pre-review pass surfaced (M1, M2, M3, M4) are closed.
 > Each has a code fix or empirical verification on this branch, a
@@ -11,6 +39,9 @@
 > dependencies, no `main` touched. Inherited workspace CVEs
 > remain on the parallel `chore/runtime-cve-hygiene` handoff
 > (separate branch off `main`, owned by the broader runtime team).
+>
+> ⚠️ See the branch-status callout above for the substrate-CI
+> caveat that this original outcome statement did not cover.
 
 ---
 
@@ -343,7 +374,7 @@ underlying threat, or just satisfy the regression test?** and
 | Owner | Owns |
 |---|---|
 | **This branch's agent** | Nothing further on M1–M4. Standing by for any operator feedback or test-failure surfaced during the operator's own verifier replay. |
-| **Operator** | Run the §3 verifier matrix on a clean checkout to confirm the Phase 10.5 baseline reproduces. Decide whether to (a) start the Step 2 `chore/runtime-cve-hygiene` branch off `main` next, (b) ship the alpha now and defer Step 2, or (c) wait for external `elastos-vz` review first. |
+| **Operator** | Run the §3 verifier matrix on a clean checkout to confirm the Phase 10.5 M1-M4 baseline reproduces. Decide whether to (a) start the Step 2 `chore/runtime-cve-hygiene` branch off `main` next, (b) wait for Phase 10.7 to close the substrate-CI regressions catalogued in `PHASE_10_6_GAP_REPORT.md` before considering merge, or (c) wait for external `elastos-vz` review first. **The "ship the alpha now" option that originally appeared here is retracted** — branch is NOT merge-ready until Phase 10.7 lands. |
 | **Broader runtime team** | Pick up `RUNTIME_CVE_HANDOFF.md` and the `chore/runtime-cve-hygiene` branch when scheduled. Phase 10.5 does not affect their work; the 34 inherited CVEs reproduce on `main` at the same crate versions, untouched by this branch. |
 | **Phase 11 lead** | M5 (typed-dispatch fuzz), notarization automation, operator-tuning ergonomics for `VmConfigLimits`, M1/M2 CPU-thrash escalation toggle (optional). |
 
@@ -360,7 +391,15 @@ test, and ships with an operator verifier the operator can
 paste into their shell.
 
 The substrate is materially safer than at Phase 10 close. The
-next decision is the operator's: ship the alpha, or first
-schedule the Step 2 inherited-CVE branch.
+next decision is the operator's: schedule the Step 2 inherited-
+CVE branch, or schedule Phase 10.7 (substrate-CI cleanup per
+`PHASE_10_6_GAP_REPORT.md`) first.
+
+**Retraction**: an earlier version of this paragraph offered
+"ship the alpha" as an option. That was overclaiming. Branch
+`sash/local-test` is NOT merge-ready until Phase 10.7 closes the
+four substrate regressions catalogued in `PHASE_10_6_GAP_REPORT.md`.
+The Mac-substrate security work (M1-M4) is genuinely closed and
+unaffected by this retraction.
 
 End of Phase 10.5.
