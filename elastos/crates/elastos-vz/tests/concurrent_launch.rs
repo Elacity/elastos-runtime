@@ -461,12 +461,13 @@ fn observed_boot_markers(buf: &LineBuffer) -> Option<&'static str> {
     // is filtered by a `quiet` boot arg or a custom printk level.
     const MARKERS: &[&str] = &["Linux version", "Booting Linux", "Run /init"];
     let lines = buf.lock().ok()?;
-    for marker in MARKERS {
-        if lines.iter().any(|l| l.contains(marker)) {
-            return Some(marker);
-        }
-    }
-    None
+    // Phase 10.7 — clippy `manual_find` (RUSTSEC equivalent: idiomatic Iterator::find).
+    // The original explicit `for + return Some` was caught by `-D warnings` under
+    // clippy after the Phase 10.6 cargo-fmt commit invalidated clippy's cached analysis.
+    MARKERS
+        .iter()
+        .find(|&marker| lines.iter().any(|l| l.contains(marker)))
+        .copied()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
