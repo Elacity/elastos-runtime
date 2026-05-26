@@ -79,6 +79,14 @@ fn build_quiet_subscriber() -> impl tracing::Subscriber + Send + Sync {
 /// Write the substrate report to `out`. Extracted from [`run`] so unit
 /// tests can drive it with a synthetic `data_dir` + manifest and capture
 /// the output into a buffer.
+///
+/// Phase 10.7 — the body is Mac-only because it reads four absolute paths
+/// off `elastos_vz::VzConfig` and calls `elastos_vz::VzConfig::validate()`.
+/// `elastos-vz` is a `target.'cfg(target_os = "macos")'.dependencies`
+/// entry, so on Linux the doctor inspector has no Vz substrate to report
+/// on. The Linux stub below prints a one-line "not available on this
+/// platform" notice so the command still exits cleanly and CI builds.
+#[cfg(target_os = "macos")]
 pub(crate) fn print_report(
     out: &mut dyn Write,
     data_dir: &Path,
@@ -172,6 +180,38 @@ pub(crate) fn print_report(
     print_dir_row(out, "state_dir", &vz_config.state_dir)?;
     print_dir_row(out, "rootfs_cache_dir", &vz_config.rootfs_cache_dir)?;
 
+    Ok(())
+}
+
+/// Phase 10.7 — Linux stub for `print_report`. On Linux the `elastos-vz`
+/// crate is not built (target-gated in `Cargo.toml`), so there is no
+/// substrate to inspect. The stub emits a single notice and returns Ok
+/// so `elastos doctor` exits 0 on Linux without misleading the operator
+/// into thinking artifacts are missing — they are absent by design.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn print_report(
+    out: &mut dyn Write,
+    data_dir: &Path,
+    _manifest: &ComponentsManifest,
+    platform: &str,
+    _verbose: bool,
+) -> anyhow::Result<()> {
+    writeln!(out, "ElastOS doctor — substrate path resolution check")?;
+    writeln!(out, "  platform:   {platform}")?;
+    writeln!(out, "  data_dir:   {}", data_dir.display())?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  vz substrate: not available on this platform (Mac-only)"
+    )?;
+    writeln!(
+        out,
+        "                doctor inspects elastos-vz artifacts (kernel, initrd,"
+    )?;
+    writeln!(
+        out,
+        "                state_dir, rootfs_cache_dir); nothing to report on Linux."
+    )?;
     Ok(())
 }
 
