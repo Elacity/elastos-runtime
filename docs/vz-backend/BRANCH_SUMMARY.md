@@ -16,9 +16,11 @@ supervisor, capsule manifests, gateway, Carrier bridge, and identity stack
 **byte-identical to Linux**. The engineering milestone is **complete and
 validated live on Apple Silicon** — a Linux kernel boots inside Apple's
 hypervisor on a Mac, holds ~400 MB, and serves the same Home shell that
-Linux users see. **It is not yet ready for public release**: a defined
-~3-week security-hardening phase (Phase 10) is required first, covering CVE
-audit, external code review, Carrier-bridge fuzzing, and notarized-build CI.
+Linux users see. **It is not yet ready for public release**: Phase 10
+(security hardening) is now in progress. Day 1 (CVE audit) just completed
+and surfaced **2 critical + 4 high vulnerabilities** — all addressable, all
+with a documented remediation plan in `PHASE_10_DAY_1_NOTES.md`. Phase 10
+calendar is ~25 working days end-to-end.
 
 ## What this document is — and is not
 
@@ -302,7 +304,7 @@ Principle: the entitlement set is the minimum that makes the substrate work. Not
 
 | Action | Effort | Why it matters |
 |---|---|---|
-| **Run `cargo audit` against the branch** | 5 min after `cargo install cargo-audit` | 158 files of new dependency churn; we haven't checked any of them against the RustSec advisory DB. |
+| ~~Run `cargo audit` against the branch~~ **DONE — see `PHASE_10_DAY_1_NOTES.md`** | Completed | **Found 34 vulnerabilities + 12 warnings. 2 are CVSS 9.0 CRITICAL (both in `wasmtime 17.0.3`, both relevant to our usage). 14 in `wasmtime` cluster; closes with a multi-day 17→45 migration. Full triage + remediation plan in the Day 1 notes.** |
 | **External code review of `elastos-vz` substrate** | 1-2 dev-weeks for a security engineer who knows Swift FFI + virtualization | 7,724 LOC of new attack surface sitting at the host-guest boundary. The single highest-leverage thing on this list. |
 | **Threat model document for the Mac substrate** | 1 dev-week | Currently no written threat model. Should enumerate: trust boundaries, what a malicious capsule can attempt, what a malicious operator can attempt, what a malicious update server can attempt. The Linux side has implicit threat models from upstream `crosvm` reviews; we don't inherit those on Mac. |
 | **Fuzz the Carrier-bridge framing** | 2-3 dev-days with `cargo-fuzz` | The bridge is a parser sitting on the trust boundary between guest VM and host runtime. Parser bugs there are the highest-impact thing a malicious capsule could exploit. |
