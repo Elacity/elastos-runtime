@@ -1,5 +1,18 @@
 # Runtime CVE hygiene — handoff to broader team
 
+> ## 🟢 STATUS: COMPLETED — `chore/runtime-cve-hygiene` ready for review
+>
+> **Branch HEAD**: `ce8c1e4` (2026-05-27)
+> **Closure**: **32 of 34 CVEs closed (94 %)** + **2 of 6 warnings closed**
+> **Residual**: 2 hickory CVEs + 4 unmaintained warnings, all deferred with documented unblock conditions and named follow-up branches.
+> **Sign-off doc**: [`cve-hygiene/RUNTIME_CVE_HYGIENE_SIGNOFF.md`](cve-hygiene/RUNTIME_CVE_HYGIENE_SIGNOFF.md)
+> **Merge plan**: [`cve-hygiene/MERGE_PLAN.md`](cve-hygiene/MERGE_PLAN.md)
+> **Final audit snapshot**: [`cve-hygiene/final-audit-2026-05-27.json`](cve-hygiene/final-audit-2026-05-27.json)
+>
+> The plan below is **kept as a historical record** of the Day-0 (2026-05-26) cluster classification. Each cluster header carries an inline closure-status line so you can see at a glance what landed and what was deferred.
+
+---
+
 > **Audience:** the broader ElastOS runtime team (whoever owns
 > `elastos-compute`, `elastos-server`, `elastos-storage`, `elastos-common`
 > and shared dep selection).
@@ -58,6 +71,11 @@ misleading PR title.
 
 ### Cluster A — `wasmtime` 17 → 45 (15 vulnerabilities, both 9.0 criticals)
 
+> **🟢 CLOSED 2026-05-27 — Days 4-9 on `chore/runtime-cve-hygiene`.**
+> **Closed:** 18 CVEs (12 from wasmtime 17→24 on Day 8, 6 from 24→36 on Day 9).
+> **Method:** Migrated to FIFO carrier-bridge transport first (Days 5-7) to escape the WASI Preview1 → Preview2 `insert_file` cliff, then bumped wasmtime in two steps. Zero CVEs remaining in this cluster.
+> See: `DAY_4_NOTES.md` … `DAY_9_NOTES.md`, `PATH_2_DESIGN_MEMO.md`.
+
 | Crate | Version | Findings |
 |---|---|---|
 | `wasmtime` | 17.0.3 | 13 (incl. RUSTSEC-2026-0020 CVSS 9.0, RUSTSEC-2025-0118 CVSS 9.0) |
@@ -87,6 +105,10 @@ exploitable from inside guest WASM if shared memory is enabled.
 
 ### Cluster B — TLS chain refresh (10 vulnerabilities)
 
+> **🟢 CLOSED 2026-05-26 — Day 1 + Day 10 on `chore/runtime-cve-hygiene`.**
+> **Closed:** All Cluster B CVEs were subsumed by the Day-1 `cargo update` cascade (Cluster C). Day-10 finished the `rustls-pemfile` warning by migrating to in-tree `rustls-pki-types::pem::PemObject` and bumping `axum-server 0.7 → 0.8` (which dropped its transitive `rustls-pemfile`).
+> See: `DAY_2_NOTES.md` (audit confirmation), `DAY_10_NOTES.md`.
+
 | Crate | Version | Findings |
 |---|---|---|
 | `aws-lc-sys` | 0.37.0 | 5 (incl. RUSTSEC-2026-0046 CVSS 7.5, RUSTSEC-2026-0047 CVSS 7.4) |
@@ -111,6 +133,10 @@ during `elastos setup`, Carrier handshakes, registry fetches.
 
 ### Cluster C — `cargo update` cascade fix (would close ~14 vulnerabilities)
 
+> **🟢 CLOSED 2026-05-26 — Day 1 on `chore/runtime-cve-hygiene`.**
+> **Closed:** Exactly 14 CVEs in a single commit (`e3433a0`). Resolved the pkcs8/ed25519-dalek peer-pin conflict via surgical `cargo update --precise ed25519@3.0.0-rc.4` + `--precise pkcs8@0.11.0-rc.11` rollbacks (preserved `iroh = "0.96.1"`'s hard-pin on `ed25519-dalek = "=3.0.0-pre.1"`). Zero new warnings introduced.
+> See: `DAY_1_NOTES.md`.
+
 **Background:** when we tried `cargo update` (passive patch-level updates)
 during Day 1 triage, it pulled `pkcs8 0.11.0-rc.11 → 0.11.0` (RC to
 stable). The stable release changed the `Error::KeyMalformed` variant
@@ -131,6 +157,13 @@ reverted the lockfile.
 
 ### Cluster D — Targeted bumps (5-7 vulnerabilities)
 
+> **🟡 PARTIALLY CLOSED 2026-05-26 — Day 3 on `chore/runtime-cve-hygiene`.**
+> **Closed via cascade:** `bytes`, `tar`, `time`, `quinn-proto`, `rand` (all picked up by Day 1's Cluster-C cargo-update cascade).
+> **Deferred:** `hickory-proto` (blocked by `iroh 0.96/0.97`'s hard-pin on `hickory-resolver = "^0.25"`), `cap-primitives` (blocked by `wasmtime-wasi 17` — auto-closed once wasmtime bumped to 24+ on Day 8).
+> **Lru:** Closed on Day 10 via `lru 0.12 → 0.18` bump + removal of `ratatui` dead-dep that was the secondary consumer.
+> **Residual:** 2 hickory CVEs only. Follow-up branch: `chore/runtime-cve-residuals-iroh-rev` opens when iroh ecosystem updates.
+> See: `DAY_3_NOTES.md`, `DAY_10_NOTES.md`.
+
 | Crate | Version | Finding |
 |---|---|---|
 | `bytes` | 1.11.0 | RUSTSEC-2026-0007 CVSS 7.5 (integer overflow in `BytesMut::reserve`) |
@@ -149,6 +182,19 @@ reverted the lockfile.
 - Expected close: 5-7 advisories.
 
 ### Cluster E — Unmaintained-crate replacements (6 warnings)
+
+> **🟡 PARTIALLY CLOSED 2026-05-27 — Day 10 on `chore/runtime-cve-hygiene`.**
+> **Closed:**
+> - `rustls-pemfile` — migrated `elastos-tls` to in-tree `rustls-pki-types::pem::PemObject`; `axum-server 0.8` dropped its transitive dep too.
+> - `lru` (unsoundness, **RUSTSEC-2026-0002**) — bumped `elastos-storage` direct dep 0.12 → 0.18 + removed dead `ratatui` dep that was the second consumer.
+> - `mach` — auto-cleaned by Day-1 cascade (no longer in tree).
+> - `core2` — auto-cleaned by Day-1 cascade (no longer in tree).
+> **Deferred (all transitive in upstream ecosystems we don't control):**
+> - `atomic-polyfill` — iroh→postcard 1→heapless 0.7 chain
+> - `bincode 1` — needs coordinated client+server wire-format roll; follow-up branch `chore/bincode-2-migration`
+> - `fxhash` — wasmtime→fxprof-processed-profile
+> - `paste` — iroh→netlink-packet-core (was also ratatui until Day 10)
+> See: `DAY_10_NOTES.md`.
 
 | Crate | Version | Replacement candidate |
 |---|---|---|
