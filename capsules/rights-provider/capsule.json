@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "rights-provider",
+  "version": "0.1.0",
+  "description": "Runtime rights boundary for protected-content access checks",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://rights/*",
+  "authority": {
+    "reason": "Answers typed protected-content rights questions without exposing contract SDKs, chain RPC, wallet RPC, key-backend SDKs, raw CEKs, or provider credentials to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://rights/*",
+        "actions": ["read"],
+        "operations": ["status", "has_access_by_content_id", "is_subscription_active", "can_stream", "can_download"]
+      }
+    ],
+    "audit_events": ["rights.status", "rights.check.denied"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "key-provider",
+  "version": "0.1.0",
+  "description": "Runtime key-release boundary for protected-content decrypt sessions",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://key/*",
+  "authority": {
+    "reason": "Validates protected-content key-release requests and owns PQ-hybrid dKMS backend authority without exposing raw CEKs, KMS node credentials, chain RPC, or wallet RPC to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://key/*",
+        "actions": ["read"],
+        "operations": ["status", "release"]
+      }
+    ],
+    "audit_events": ["key.status", "key.release.denied", "key.rewrap.denied"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

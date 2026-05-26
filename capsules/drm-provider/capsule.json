@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "drm-provider",
+  "version": "0.1.0",
+  "description": "Runtime protected-content boundary for rights-gated open requests",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://drm/*",
+  "authority": {
+    "reason": "Owns protected-content open requests and keeps raw CEKs, key-backend adapters, wallet authority, chain RPC, IPFS, and Elacity APIs out of app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://drm/*",
+        "actions": ["read"],
+        "operations": ["status", "open"]
+      }
+    ],
+    "audit_events": ["drm.status", "drm.open.denied"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

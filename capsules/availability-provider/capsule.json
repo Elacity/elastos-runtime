@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "availability-provider",
+  "version": "0.1.0",
+  "description": "Configured SmartWeb content availability adapter",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://availability/*",
+  "authority": {
+    "reason": "Replicates or verifies published CIDs with configured SmartWeb availability targets without exposing Elacity, IPFS Cluster, or supernode APIs to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://availability/*",
+        "actions": ["write", "read"],
+        "operations": ["ensure", "status"]
+      }
+    ],
+    "audit_events": ["content.availability.ensure", "content.availability.status"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

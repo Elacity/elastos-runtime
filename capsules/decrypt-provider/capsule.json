@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "decrypt-provider",
+  "version": "0.1.0",
+  "description": "Runtime decrypt/render boundary for protected-content sessions",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://decrypt/*",
+  "authority": {
+    "reason": "Validates protected-content decrypt/render session requests and keeps raw CEKs, raw plaintext, filesystem authority, key-backend SDKs, KMS credentials, chain RPC, and wallet RPC out of app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://decrypt/*",
+        "actions": ["read"],
+        "operations": ["status", "open_session", "render"]
+      }
+    ],
+    "audit_events": ["decrypt.status", "decrypt.session.denied", "decrypt.render.denied"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}
