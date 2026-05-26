@@ -467,6 +467,13 @@ mod tests {
         String::from_utf8(buf).expect("report output is utf-8")
     }
 
+    // Phase 10.7 — Mac-only tests below assert on substrings produced by
+    // the full Vz-substrate-aware print_report (kernel rows, [absent]
+    // tags, install-path remediation hints). On Linux print_report is a
+    // stub that prints "vz substrate: not available on this platform";
+    // those assertions don't apply. A Linux-specific test below covers
+    // the stub output instead.
+    #[cfg(target_os = "macos")]
     #[test]
     fn doctor_reports_absent_artifact_with_remediation() {
         let tmp = tempfile::tempdir().unwrap();
@@ -575,6 +582,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn doctor_reports_rootfs_with_remediation_when_absent() {
         // Phase 8 Day 3 — the rootfs row is doctor's "are you ready
@@ -617,6 +625,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn doctor_reports_rootfs_present_with_size() {
         // Phase 8 Day 3 — when the install loop has landed the
@@ -673,6 +682,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn doctor_reports_present_artifact_with_size_and_verbose_metadata() {
         let tmp = tempfile::tempdir().unwrap();
@@ -708,6 +718,41 @@ mod tests {
         assert!(
             out.contains("compression: gzip"),
             "expected verbose compression line, got:\n{out}"
+        );
+    }
+
+    // Phase 10.7 — Linux-side coverage for the print_report stub that
+    // replaces the Vz-substrate-aware report when this crate is built
+    // for Linux (where `elastos-vz` is target-gated out). Asserts that
+    // doctor exits 0, prints the header (platform + data_dir), and
+    // explains why no substrate rows follow.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn doctor_linux_stub_prints_not_available_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest = fixture_manifest();
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("ElastOS doctor"),
+            "expected report header, got:\n{out}"
+        );
+        assert!(
+            out.contains("platform:"),
+            "expected platform line in header, got:\n{out}"
+        );
+        assert!(
+            out.contains("data_dir:"),
+            "expected data_dir line in header, got:\n{out}"
+        );
+        assert!(
+            out.contains("not available on this platform"),
+            "expected Mac-only notice line, got:\n{out}"
+        );
+        assert!(
+            out.contains("Mac-only"),
+            "expected Mac-only marker, got:\n{out}"
         );
     }
 }
