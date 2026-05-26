@@ -1,8 +1,10 @@
 # ElastOS Runtime
 
-Signed capsules, explicit capabilities, and sovereign local execution for humans and AI.
+Signed capsules, explicit capabilities, passkey-fronted accounts, and
+sovereign local execution for humans and AI.
 
-Pre-release and unstable. Verified on Linux `x86_64` and `aarch64`. Not for production or important workloads.
+Pre-release and unstable. Verified primarily on Linux `x86_64` and `aarch64`.
+Not for production or important workloads.
 
 ## Install
 
@@ -32,7 +34,7 @@ One ElastOS home may have only one live host owner at a time.
 
 - Home lane: `elastos setup` or `elastos setup --profile demo`, then `elastos`.
 - Operator lane: `elastos setup --profile operator`, then `elastos serve`.
-- Hosted room/browser lane on the installed path: `elastos setup --profile demo`, `elastos setup --profile operator`, `elastos serve`, then `elastos room open`.
+- Hosted room lane on the installed path: `elastos setup --profile demo`, `elastos setup --profile operator`, `elastos serve`, then `elastos room open`.
 - `elastos room open` is not a second host. It reuses the live `elastos serve` runtime and opens the room gateway through it.
 - `elastos` and `elastos serve` are not two parallel entrypoints for the same home. Stop one before starting the other, or use separate homes if you intentionally need both.
 
@@ -53,6 +55,14 @@ Or manually:
 ```bash
 cd elastos && cargo build --workspace --release
 ```
+
+Developer orientation:
+
+- `state.md` is the factual current-state surface.
+- `TASKS.md` is the open-work driver; the `Now` section is strict priority order.
+- `ROADMAP.md` is direction, not proof.
+- `docs/README.md` lists the active documentation set.
+- `scripts/README.md` explains which scripts are public entrypoints and which are proof/operator helpers.
 
 Source-built setup notes:
 
@@ -99,7 +109,7 @@ No-runtime content-plane and site commands:
 # One-time extras for direct share/open
 elastos setup --with kubo --with ipfs-provider --with documents
 
-# Share a file over the IPFS-backed content path
+# Share a file over the current content availability path
 elastos share README.md
 
 # Preview a shared CID locally (or on another machine with the same extras)
@@ -115,7 +125,7 @@ Important:
 - `elastos` is the Home front door. It does not currently attach to an already-running operator runtime in the same home.
 - The hosted room route is `/apps/chat-room/`. `/apps/room/` is not a public route. Inside Home, that same surface stays under Home-scoped authority; outside Home it uses browser-session capability policy.
 
-Direct `share`/`open` are content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only Home profile.
+Direct `share`/`open` are current content-plane commands backed by `ipfs-provider` and `kubo`. They are not part of the default Carrier-only Home profile; the app-facing contract is `elastos://content/*`.
 
 Power-user paths such as `elastos run` require an explicit runtime and the correct working directory. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for source builds, capsule development, and explicit runtime workflows.
 
@@ -131,36 +141,77 @@ See [docs/INTERACTIVE_RUNTIME_CONTRACT.md](docs/INTERACTIVE_RUNTIME_CONTRACT.md)
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Runtime (elastos binary) — minimal trusted base    │
-│  Isolation · Signatures · Capabilities              │
-└─────────────────────────────────────────────────────┘
-                        │
-┌─────────────────────────────────────────────────────┐
-│  Home / policy capsule with orchestrator capability │
-│  Permission prompts · App orchestration             │
-└─────────────────────────────────────────────────────┘
-                        │
-┌─────────────────────────────────────────────────────┐
-│  Capsules (sandboxed apps and providers)            │
-│  WASM · microVM · data · zero ambient authority     │
-└─────────────────────────────────────────────────────┘
+```text
+Home / System / Wallet / Browser
+  -> Runtime principals, sessions, capabilities, audit
+  -> Provider plane: content, wallet, chain, browser-engine, net, exit
+  -> Carrier / local providers / explicit operator services
 ```
 
-The runtime is the small trusted base. Everything above it, including Home and System, runs as sandboxed capsules with explicit capability tokens. Humans and AI agents use the same capability model and the same action contracts. See [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) for the current first-party surface palette and interaction rules.
+The runtime is the small trusted base: isolation, signatures, principal/session
+binding, capability validation, object routing, and audit. Everything above it,
+including Home, System, Wallet, Browser, apps, viewers, and providers, runs with
+scoped authority. Humans and AI agents use the same capability model and the
+same action contracts.
+
+The current planning frame is four quadrants:
+
+- **Home / PC2:** human front door, account UX, object browsing, capsule launch
+- **Runtime:** trusted capability core and provider routing
+- **Carrier:** authenticated object/message/stream plane
+- **Blockchain:** wallet, DID/EID, node, provenance, and rights adapters
+
+Normal capsules do not receive raw wallet RPC, node RPC, IPFS/Kubo APIs, browser
+engine handles, private keys, or host internals. They ask Runtime for scoped
+capabilities; providers perform the dangerous work.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+[docs/CARRIER.md](docs/CARRIER.md), and
+[docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md).
 
 ## What Works Today
 
 - fresh install → setup → Home
+- passkey-first Home unlock, with first-account admin, admin-controlled guest
+  enrollment, self-created guest accounts, sign-out, and per-principal Home
+  state
+- System account policy, background controls, full Recovery Kit import/export
+  for the principal Home root plus recoverable built-in Wallet keys, and
+  advanced runtime/network diagnostics
+- one Wallet surface for passkey-managed accounts, MetaMask, Bitcoin, and the
+  dormant WalletConnect connector path; Wallet owns account naming, defaults,
+  balances, QR receive, approvals, and connector handoffs. WalletConnect stays
+  hidden until operator-pinned Reown/AppKit config and local adapter assets are
+  present
+- typed wallet approvals through Wallet/Inbox, including managed EVM/BTC
+  signing, external connector completion, and signed receipts without exposing
+  private keys or raw wallet objects to apps
+- typed `chain-provider` access for supported chain status, balances, proofs,
+  transaction prepare/broadcast, and fail-closed local-node lifecycle status
+- a Browser capsule proof that opens as a Home window and routes website access
+  through the Runtime Browser/Net/Exit/Engine boundary instead of host iframes
+  or app-level wallet injection
+- a bounded protected-content proof for the known `ela.city` test path through
+  Runtime Browser, including funded purchase/playback evidence, without claiming
+  arbitrary protected-content readiness or completed dDRM/dKMS providers
 - native P2P chat, plus local/source proof for WASM chat interop
 - sovereign room membership/invite flow, hosted chat-room access under the explicit operator lane, and local cross-runtime Carrier room sync proof
 - signed publish, install, and update flow
 - operator-only remote node status and trusted-source update control over Carrier via `elastos node ...`
 - explicit operator runtime prep via `elastos setup --profile operator`
-- content sharing and local site hosting
-- DID-backed identity across surfaces
+- content sharing, content-availability manifests, and local site hosting through
+  the `elastos://content/*` path, with `ipfs-provider` kept as a low-level
+  backend
+- device DID, passkey principals, wallet proof bindings, and Recovery Kit
+  foundations without making wallet addresses the Runtime identity root
 - agent capsule with signed gossip and verified-only AI responses
+
+Important Browser status: the Browser ABI and hosted proof path are real, but
+the final product browser is not complete. Stable arbitrary-site media, accepted
+provider selection, principal-scoped Browser profile persistence, and
+cross-platform native/microVM adapters remain open. See
+[docs/BROWSER_CAPSULE.md](docs/BROWSER_CAPSULE.md)
+and [docs/BROWSER_PROVIDER_BAKEOFF.md](docs/BROWSER_PROVIDER_BAKEOFF.md).
 
 Release-trust verification against the canonical publisher path is separate from local dev proof. See `state.md` and [docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md](docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md) for the current scope.
 
@@ -189,9 +240,17 @@ elastos-runtime/
 │   └── crates/            # elastos-server, elastos-runtime, elastos-common, ...
 ├── capsules/              # User/provider/demo capsules
 ├── docs/                  # Architecture, guides, status
-├── scripts/               # Build, publish, install, proof scripts
-└── tests/                 # Integration tests
+└── scripts/               # Build, publish, install, proof scripts
 ```
+
+Rust tests live in the `elastos/` workspace. Product and release proof scripts
+live under `scripts/`; they are listed in [scripts/README.md](scripts/README.md)
+and the release-facing checklist.
+
+For 0.3.0 branch review, do not treat a green workspace test as sufficient by
+itself. Use the relevant narrow provider/UI smokes from `TASKS.md` for the slice
+being reviewed, especially Wallet, System, Browser ABI/provider, Browser proof
+tools, and release/docs slices.
 
 ## Documentation
 
@@ -204,6 +263,11 @@ elastos-runtime/
 | [docs/COMMAND_MATRIX.md](docs/COMMAND_MATRIX.md) | Runtime expectation per command |
 | [docs/NAMESPACES.md](docs/NAMESPACES.md) | localhost:// and elastos:// namespace model |
 | [docs/CARRIER.md](docs/CARRIER.md) | P2P transport model |
+| [docs/CONTENT_AVAILABILITY.md](docs/CONTENT_AVAILABILITY.md) | SmartWeb content availability, IPLD-compatible manifests, and provider boundary |
+| [docs/WALLET_PROVIDER.md](docs/WALLET_PROVIDER.md) | Wallet, account, approval, proof, and signer/provider boundary |
+| [docs/CHAIN_PROVIDER.md](docs/CHAIN_PROVIDER.md) | Typed blockchain provider boundary |
+| [docs/BROWSER_CAPSULE.md](docs/BROWSER_CAPSULE.md) | Browser/Net/Exit/Engine ABI and current proof boundary |
+| [docs/BROWSER_PROVIDER_BAKEOFF.md](docs/BROWSER_PROVIDER_BAKEOFF.md) | Browser provider comparison and acceptance gates |
 | [docs/SITES.md](docs/SITES.md) | Local site hosting and public exposure |
 | [docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md](docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md) | Release-facing test matrix and manual runbook |
 | [docs/GLOSSARY.md](docs/GLOSSARY.md) | Terminology |

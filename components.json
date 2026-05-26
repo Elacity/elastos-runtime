@@ -46,6 +46,15 @@
         "aarch64-linux"
       ]
     },
+    "chain-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
     "net-provider": {
       "cid": "",
       "sha256": "",
@@ -73,7 +82,61 @@
         "aarch64-linux"
       ]
     },
+    "wallet-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "drm-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "rights-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "key-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "decrypt-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
     "ipfs-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "availability-provider": {
       "cid": "",
       "sha256": "",
       "size": 0,
@@ -180,6 +243,26 @@
         }
       }
     },
+    "chain-provider": {
+      "install_path": "bin/chain-provider",
+      "description": "Host chain provider binary for typed production chain access",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chain-provider-linux-amd64",
+          "install_path": "bin/chain-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "chain-provider-linux-arm64",
+          "install_path": "bin/chain-provider"
+        }
+      }
+    },
     "net-provider": {
       "install_path": "bin/net-provider",
       "description": "Host Browser/Net provider binary for exit-mediated web connectivity",
@@ -226,8 +309,8 @@
       "platforms": {
         "linux-amd64": {
           "cid": "",
-          "checksum": "",
-          "size": 0,
+          "checksum": "sha256:015cffd1c5d7f2ea2ec1dccfb1bfd6f59bcb376989dab014210998339ebda102",
+          "size": 901184,
           "release_path": "browser-engine-adapter-linux-amd64",
           "install_path": "bin/browser-engine-adapter"
         },
@@ -320,6 +403,106 @@
         }
       }
     },
+    "wallet-provider": {
+      "install_path": "bin/wallet-provider",
+      "description": "Host wallet provider binary for proof challenges, linked-account metadata, and typed wallet authority",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "sha256:c4171501996c2fa137b21569bdc19a85c18f72b80ddbca92d837ff5c80c9c05f",
+          "size": 2702312,
+          "release_path": "wallet-provider-linux-amd64",
+          "install_path": "bin/wallet-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet-provider-linux-arm64",
+          "install_path": "bin/wallet-provider"
+        }
+      }
+    },
+    "drm-provider": {
+      "install_path": "bin/drm-provider",
+      "description": "Host DRM provider binary for Runtime-mediated protected content requests",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "drm-provider-linux-amd64",
+          "install_path": "bin/drm-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "drm-provider-linux-arm64",
+          "install_path": "bin/drm-provider"
+        }
+      }
+    },
+    "rights-provider": {
+      "install_path": "bin/rights-provider",
+      "description": "Host rights provider binary for typed protected-content access checks",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "rights-provider-linux-amd64",
+          "install_path": "bin/rights-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "rights-provider-linux-arm64",
+          "install_path": "bin/rights-provider"
+        }
+      }
+    },
+    "key-provider": {
+      "install_path": "bin/key-provider",
+      "description": "Host key provider binary for fail-closed protected-content key release",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "key-provider-linux-amd64",
+          "install_path": "bin/key-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "key-provider-linux-arm64",
+          "install_path": "bin/key-provider"
+        }
+      }
+    },
+    "decrypt-provider": {
+      "install_path": "bin/decrypt-provider",
+      "description": "Host decrypt/render provider binary for fail-closed protected-content sessions",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "decrypt-provider-linux-amd64",
+          "install_path": "bin/decrypt-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "decrypt-provider-linux-arm64",
+          "install_path": "bin/decrypt-provider"
+        }
+      }
+    },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary required for localhost://WebSpaces/<moniker>/... handles",
@@ -379,6 +562,48 @@
           "release_path": "system.tar.gz",
           "extract_path": "system",
           "install_path": "capsules/system"
+        }
+      }
+    },
+    "wallet-metamask": {
+      "install_path": "capsules/wallet-metamask",
+      "description": "Optional MetaMask approval-method connector capsule",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet-metamask.tar.gz",
+          "extract_path": "wallet-metamask",
+          "install_path": "capsules/wallet-metamask"
+        }
+      }
+    },
+    "wallet-unisat": {
+      "install_path": "capsules/wallet-unisat",
+      "description": "Optional UniSat Bitcoin approval-method connector capsule",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet-unisat.tar.gz",
+          "extract_path": "wallet-unisat",
+          "install_path": "capsules/wallet-unisat"
+        }
+      }
+    },
+    "wallet": {
+      "install_path": "capsules/wallet",
+      "description": "Wallet accounts, balances, approvals, and approval methods",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet.tar.gz",
+          "extract_path": "wallet",
+          "install_path": "capsules/wallet"
         }
       }
     },
@@ -449,6 +674,26 @@
           "size": 0,
           "release_path": "ipfs-provider-linux-arm64",
           "install_path": "bin/ipfs-provider"
+        }
+      }
+    },
+    "availability-provider": {
+      "install_path": "bin/availability-provider",
+      "description": "Configured SmartWeb availability adapter for Elacity or supernode replication targets",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "availability-provider-linux-amd64",
+          "install_path": "bin/availability-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "availability-provider-linux-arm64",
+          "install_path": "bin/availability-provider"
         }
       }
     },
@@ -714,6 +959,9 @@
         "home-cli",
         "home",
         "system",
+        "wallet-metamask",
+        "wallet-unisat",
+        "wallet",
         "browser",
         "documents",
         "library",
@@ -737,6 +985,9 @@
         "home-cli",
         "home",
         "system",
+        "wallet-metamask",
+        "wallet-unisat",
+        "wallet",
         "browser",
         "chat",
         "chat-wasm",
@@ -772,6 +1023,20 @@
         "did-provider"
       ]
     },
+    "blockchain": {
+      "description": "Runtime plus typed chain, wallet, DRM, rights, key, and decrypt providers for blockchain/auth/protected-content development",
+      "components": [
+        "shell",
+        "localhost-provider",
+        "did-provider",
+        "chain-provider",
+        "wallet-provider",
+        "drm-provider",
+        "rights-provider",
+        "key-provider",
+        "decrypt-provider"
+      ]
+    },
     "agent-local-ai": {
       "description": "Local AI agent with IPFS",
       "components": [
@@ -789,6 +1054,9 @@
         "home-cli",
         "home",
         "system",
+        "wallet-metamask",
+        "wallet-unisat",
+        "wallet",
         "browser",
         "kubo",
         "ipfs-provider",
@@ -806,6 +1074,7 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
+        "chain-provider",
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
@@ -813,12 +1082,17 @@
         "browser-native-proxy-engine",
         "browser-stream-bridge",
         "browser-local-exit",
+        "wallet-provider",
         "home-cli",
         "home",
         "system",
+        "wallet-metamask",
+        "wallet-unisat",
+        "wallet",
         "browser",
         "kubo",
         "ipfs-provider",
+        "availability-provider",
         "site-provider",
         "tunnel-provider",
         "documents",
@@ -834,6 +1108,7 @@
         "localhost-provider",
         "did-provider",
         "webspace-provider",
+        "chain-provider",
         "net-provider",
         "exit-provider",
         "browser-engine-adapter",
@@ -841,9 +1116,17 @@
         "browser-native-proxy-engine",
         "browser-stream-bridge",
         "browser-local-exit",
+        "wallet-provider",
+        "drm-provider",
+        "rights-provider",
+        "key-provider",
+        "decrypt-provider",
         "home-cli",
         "home",
         "system",
+        "wallet-metamask",
+        "wallet-unisat",
+        "wallet",
         "browser",
         "chat",
         "chat-wasm",
@@ -851,6 +1134,7 @@
         "gba-ucity",
         "chat-room",
         "ipfs-provider",
+        "availability-provider",
         "site-provider",
         "tunnel-provider",
         "documents",

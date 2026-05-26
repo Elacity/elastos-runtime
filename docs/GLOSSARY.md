@@ -111,7 +111,7 @@ markets. Normal app capsules should use `elastos://content/*`, not raw
 
 The Runtime-mediated `elastos://drm/*` contract for sealed/protected content.
 It validates open requests and delegates rights, key release, and decrypt/render
-work to provider-owned authority. Apps do not receive raw CEKs, Lit SDKs, wallet
+work to provider-owned authority. Apps do not receive raw CEKs, key-backend SDKs, wallet
 RPC, chain RPC, Kubo/IPFS APIs, or Elacity credentials.
 
 ## dKMS

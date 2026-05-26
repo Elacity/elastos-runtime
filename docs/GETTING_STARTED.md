@@ -299,6 +299,20 @@ Rule:
 - a chat-managed runtime does not satisfy operator-runtime commands
 - `room open` is the explicit room/browser helper on top of `elastos serve`; it is not a separate host lane
 
+### Browser Proof Lane
+
+The Browser capsule is currently a Runtime Browser proof, not a completed
+general-purpose browser. It should be tested through the Browser/Net/Exit/Engine
+contract and the slice-specific smokes named in `TASKS.md`; do not validate it
+by opening a host iframe or a raw external browser tab and calling that done.
+
+For developer review, the important distinction is:
+
+- Browser UI receives a page/display session and input routes.
+- Runtime owns Net/Exit validation, wallet mediation, chain reads, and audit.
+- Operator Browser service scripts live in `scripts/system/` and are proof
+  packaging for the current hosted baseline, not the final architecture.
+
 ## Capsule Development
 
 Create a new capsule:
@@ -327,7 +341,8 @@ Capsules and agents start with no ambient authority. Access is granted through e
 Current trust model:
 
 - runtime validates capabilities
-- providers expose scoped actions like storage, DID, peer, IPFS, and AI
+- providers expose scoped actions like storage, DID, peer, content, chain, and AI
+- low-level IPFS/Kubo access stays behind provider/system-service boundaries
 - Carrier owns networking semantics; capsules do not get raw networking by default
 
 ## Installed-Host Notes

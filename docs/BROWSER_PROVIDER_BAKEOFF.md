@@ -351,17 +351,19 @@ Selkies tuning. In the current non-accepted state it must exit non-zero and keep
 fails, do not trust prose status or run another provider bake-off until the
 report contract is fixed.
 
-For review of the whole Browser proof-tools/decision-gates slice, use the
-combined gate:
+For Browser proof-tool review, use the focused gates directly:
 
 ```bash
-scripts/browser-proof-tools-decision-gates-smoke.sh
+scripts/browser-objective-audit-smoke.sh
+scripts/browser-provider-decision-report-smoke.sh
+scripts/browser-provider-runbook-smoke.sh
+scripts/browser-hosted-product-config-smoke.sh
 ```
 
-It validates the focused review slice, runs the objective-audit,
-provider-decision, runbook, and hosted-product config smokes, then checks that
-the live decision report and objective audit either exit accepted with matching
-accepted state or fail closed with the current audio/manual UX blockers visible.
+These gates keep the objective audit, provider-decision report, runbook, and
+hosted-product config structured. The live decision report and objective audit
+must either exit accepted with matching accepted state or fail closed with the
+current audio/manual UX blockers visible.
 
 Use the runbook view when handing this to an operator:
 

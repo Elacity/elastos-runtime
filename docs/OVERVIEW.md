@@ -30,7 +30,7 @@ Trusted core:
 
 Everything else should live above that core as capsules, providers, or operator-managed services.
 
-Carrier owns networking semantics. Application capsules should consume provider contracts such as `elastos://peer/`, `elastos://ipfs/`, and `elastos://tunnel/` rather than depending on transport details like QUIC, TAP, Kubo, or cloudflared.
+Carrier owns networking semantics. Application capsules should consume product/provider contracts such as `elastos://peer/` and the current `elastos://content/` surface rather than depending on transport details like QUIC, TAP, Kubo, IPFS Cluster, Elacity APIs, or cloudflared. Low-level `elastos://ipfs/` remains a system/provider backend, not the normal app contract.
 
 ## What Works Now
 
@@ -42,6 +42,16 @@ The current preview is grounded in code and recorded proof, but not every path h
 - `elastos setup --profile operator` for the explicit operator lane
 - `elastos` opens Home on the current live public `x86_64` line
 - `elastos home` is the explicit Home alias
+- passkey-first Home unlock with admin/guest account policy, scoped sessions,
+  explicit sign-out, and separate principal roots
+- System account, Recovery Kit, Appearance, and advanced runtime/network
+  diagnostics without duplicating Wallet approval surfaces
+- one Wallet surface for accounts and approval methods, backed by
+  `wallet-provider`, connector capsules, and typed Inbox approvals
+- typed `chain-provider` status/balance/proof/transaction surfaces without raw
+  app-visible node RPC
+- a Browser capsule proof that uses the Runtime Browser/Net/Exit/Engine ABI
+  instead of host iframe browsing; final product Browser acceptance remains open
 - one-terminal native `elastos chat`
 - sovereign room invite/accept control plus hosted chat-room access on top of the explicit operator lane
 - operator peer control over Carrier with `elastos node info`, `peer`, `status`, `room`, and `update` flows
@@ -50,6 +60,8 @@ The current preview is grounded in code and recorded proof, but not every path h
 - signed publish, install, and update
 - native chat as the default proving surface, with explicit WASM and microVM chat proving paths
 - initial read-only `webspace-provider` resolution under `localhost://WebSpaces/Elastos`
+- content availability manifests and signed local availability receipts above
+  the low-level `ipfs-provider`
 
 Further installed-host front-door re-proof remains open. See [state.md](../state.md) and [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for the current proof surface.
 
@@ -126,7 +138,7 @@ Reserved special root:
 Useful current examples:
 
 - `localhost://ElastOS/Documents/<doc-did>`
-- `localhost://Users/self/Documents/report.md`
+- `localhost://Users/<principal-root>/Documents/report.md`
 - `localhost://Public/manual.pdf`
 - `localhost://MyWebSite`
 - `elastos://<cid>`
@@ -143,7 +155,7 @@ The current relationship is:
 For documents specifically:
 
 - `localhost://ElastOS/Documents/<doc-did>` = the mutable document object Home and Documents should open
-- `localhost://Users/self/Documents/<file>.md` = the local working-copy storage path for markdown bytes
+- `localhost://Users/<principal-root>/Documents/<file>.md` = the active passkey principal's working-copy storage path for markdown bytes
 - `elastos://<cid>` = an immutable published revision of a document
 
 For browser-facing local sites, the root is:
@@ -161,7 +173,7 @@ The intended layering is:
 
 - local site root
   - `localhost://MyWebSite`
-- stable shared identity
+- stable shared content identity
   - `elastos://<cid>`
 - explicit public exposure
   - local domain
@@ -192,7 +204,7 @@ What remains open:
 - stronger root-aware substrate cleanup across the remaining internal tests/examples
 - broader system-service mapping
 
-See [ARCHITECTURE.md](ARCHITECTURE.md), [NAMESPACES.md](NAMESPACES.md), and [state.md](../state.md) for the current direction and proof boundary.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [NAMESPACES.md](NAMESPACES.md), [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md), and [state.md](../state.md) for the current direction and proof boundary.
 See [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) for the shared first-party surface palette and human/agent interaction contract.
 
 ## Humans And AI
@@ -232,6 +244,7 @@ Gateway URLs are convenience transport only. They may take time to propagate and
 - [state.md](../state.md) for factual current state
 - [GETTING_STARTED.md](GETTING_STARTED.md) for install and source flows
 - [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical design
+- [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) for IPLD, CID sync, availability receipts, and the SmartWeb content-plane direction
 - [SITES.md](SITES.md) for the site/public exposure model
 - [GLOSSARY.md](GLOSSARY.md) for quick term lookups
 

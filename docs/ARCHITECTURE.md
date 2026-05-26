@@ -53,10 +53,159 @@ Carrier or a provider performs the effect. Protocol-specific code belongs in
 provider capsules or explicit system services, not in ordinary apps and not in
 the gateway edge.
 
+For executable capsules, this contract should appear as a capsule-local kernel
+or ABI. The capsule boots against that kernel, uses Carrier-style calls such as
+invoke/read/write/subscribe, and receives object handles and capability grants.
+HTTP routes, browser messages, stdio, loopback, and in-process calls may still be
+used by host adapters, but they are below the capsule contract and must not
+become product APIs.
+
+The browser follows the same rule. The target browser capsule is not an iframe
+and not a normal host tab with ambient internet. It is a Browser Engine Adapter
+behind the same capability model: the engine may render real websites, but its
+only off-box network path is the Runtime Net provider and selected Carrier/Exit
+provider. Dapp wallet access is injected only as a Runtime-mediated wallet
+bridge. See [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md).
+
+COMO is tracked as a runtime-framework research input, not an architectural
+dependency. Its C++ component model, runtime reflection, MetaClass-style
+packaging, Android aarch64 history, and safety/redundancy lessons may inform
+typed interface descriptors and generated capsule-kernel glue. It must not
+introduce a second authority model, shared vendor address space, or ambient host
+access. See [RUNTIME_FRAMEWORK_RESEARCH.md](RUNTIME_FRAMEWORK_RESEARCH.md).
+
 The near-term balancing sequence is:
-1. **Wallet-backed identity + WebConnect** to connect PC2/Home, Runtime, Carrier, and Blockchain around real principals and session-bound capabilities.
-2. **Spaces / network drives** to make Carrier a real object plane and PC2/Home a real object browser.
-3. **Capsule publish/install registry** to make signed software identity and install/update trust real before token or NFT mechanics.
+1. **Passkey-first Runtime authority** to give Home a phishing-resistant default unlock, principal binding, short-lived sessions, scoped capabilities, and human/agent delegation before wallet-first UX.
+2. **Content availability and IPLD-compatible manifests** to make published objects sync through the SmartWeb availability network with signed receipts instead of raw CID creation.
+3. **Wallet/DID/node proof adapters** to connect Blockchain services through Runtime authority without exposing wallet RPC, node RPC, or private keys to app capsules.
+4. **Spaces / network drives** to make Carrier a real object plane and PC2/Home a real object browser.
+5. **Capsule publish/install registry** to make signed software identity and install/update trust real before token or NFT mechanics.
+
+Passkey ceremonies require browser user verification. A passkey proof is a
+runtime proof binding for a principal, not a replacement for DID, wallet, or
+capability semantics.
+Browser host adapters may expose passkey ceremonies for Home/System unlock, but
+ordinary app capsules should only receive the resulting scoped launch or
+capability grants.
+
+Home is passkey-fronted by default. The first passkey created on a runtime is
+the admin. Guest creation is disabled until an admin enables it in System. After
+that, guests create their own passkey and principal from Home; the admin controls
+whether enrollment is open, not the guest's authenticator. Each passkey principal
+owns a separate rooted user area such as `localhost://Users/<principal-root>`.
+Turning guest creation off blocks new guest roots; it does not revoke existing
+guest passkeys.
+
+Guest roots are intended to be private from the runtime operator/admin by
+default once principal-root encryption is implemented. Admin authority may manage
+runtime policy, revoke local access, and administer availability, but it should
+not decrypt a guest root without the guest's explicit sharing/recovery path or a
+future threshold/legal policy. A guest should be able to export recovery material
+and migrate the encrypted principal root to another ElastOS runtime.
+
+Passkey removal revokes access, not storage. The user root stays on disk under
+its principal-derived localhost path. If all passkeys are removed and a new admin
+is created, the new admin receives a new principal root; old roots are orphaned
+until an explicit recovery/reassignment flow proves authority and records audit.
+System now provides the first explicit reassignment path: a verified Recovery Kit
+can recover the original principal/root under the active passkey, revoke sessions
+for the replacement passkey and any replaced passkey-root binding, reissue
+Home/System tokens, restore included built-in Wallet keys, and record signed
+audit. This treats the Recovery Kit like an emergency seed phrase: possession of
+the kit plus its password is authority to replace a lost still-registered
+passkey.
+
+Principal data encryption starts with an explicit root-protection contract.
+Current passkeys prove authority to the runtime; they are not raw decryption
+keys. ElastOS now creates a random per-principal data key, wraps it to a
+Recovery Kit phrase with AES-256-GCM, stores a runtime-encrypted downloadable
+archive plus verified protector metadata, can package downloads behind an
+optional user password, and verifies imports against the encrypted root
+descriptor. Protected roots now use a runtime-owned AES-256-GCM
+object envelope for Documents working copies, Home browser state, and
+viewer/content storage. The envelope is bound to the principal, localhost root,
+data-key ID, and object URI. Protected roots reject plaintext reads instead of
+silently migrating or falling back. A lost RP domain or deleted passkey must not
+be papered over by a device-global key; if no recovery protector exists, the
+encrypted root is intentionally unrecoverable.
+Recovery envelopes should be crypto-agile and quantum-conscious: AES-256 or
+ChaCha20-Poly1305 for bulk encryption, ML-KEM-768 or stronger for future
+public-key wrapping, HQC as a later backup KEM when standardized, ML-DSA plus
+optional SLH-DSA for durable signatures, and explicit algorithm metadata on
+every envelope. Classical passkeys, EVM/BTC/ELA wallet proofs, and Ed25519 DIDs
+are useful proof bindings but not permanent post-quantum recovery roots.
+
+The runtime exposes this through proof-bound recovery status and Recovery Kit
+routes. Creating a kit returns the kit once and stores a runtime-encrypted archive
+so the active principal can download it again from System. Import verifies the
+phrase-wrapped data key and encrypted descriptor before storing protection state.
+If a typed DID recovery proof is supplied, import verifies it through
+`did-provider` and accepts it only when it matches an existing DID recovery
+protector for the recovered root. That preserves the DID protector, but it does
+not replace the Recovery Kit until DID-envelope unwrap/rewrap exists.
+If the import is explicitly marked as reassignment, the recovered root must be
+canonical for the recovered principal. Any previous passkey-root binding for
+that recovered root is removed and its sessions are revoked as part of recovery.
+Until a principal has matching verified protection, status must report that
+protection is not configured, and malformed or cross-principal requests must fail
+closed with signed audit.
+
+WebAuthn PRF is a future protector for wrapping the principal data key on the
+client side. The PRF result is key material. It must not be serialized into
+passkey registration/authentication responses, logged, or posted to runtime auth
+routes. The runtime should store only the protector metadata and wrapped data-key
+envelope. If a browser, authenticator, or native host cannot provide the PRF
+extension, the flow must fail honestly or use another explicit protector such as
+Recovery Kit or DID-backed recovery.
+
+Recovery status may report a root as recoverable only when a matching
+`PrincipalRootProtectionV1` record exists for the active principal and rooted
+localhost user area and at least one protector has been verified. Cross-principal
+protection records must not affect another user's status, and malformed matching
+records fail closed instead of silently downgrading into an unprotected status.
+
+### Identity, Names, and Object Claims
+
+ElastOS should not collapse passkeys, DIDs, CIDs, and human-readable names into
+one identity bucket:
+
+- **Runtime principal**: the local authority subject for sessions and
+  capabilities.
+- **Passkey**: the default proof that unlocks a human principal.
+- **Device DID (`did:key`)**: the self-certifying node/Carrier identity shown in
+  System as Device identity.
+- **Account DID (`did:elastos` / EID)**: a linked global identity for portable
+  profile, credentials, publisher identity, recovery, service endpoints, DAO
+  actions, and globally unique names.
+- **CID**: one immutable content graph or object revision.
+- **IPLD**: the hash-linked object graph that connects CIDs, heads, manifests,
+  provenance, rights policy, and availability receipts.
+
+There should be no `did:localhost` shortcut unless ElastOS intentionally defines
+and implements a DID method. Local accounts already have runtime principals and
+`localhost://Users/<principal-root>` roots. If a user wants to claim `alice`
+globally, that claim must go through an EID/DID-chain namespace or equivalent
+registry with consensus-backed uniqueness, transfer, expiry, recovery, and
+signed ownership. Local display handles can collide; global names cannot.
+
+Capabilities must bind to principal IDs, DIDs, signatures, CIDs, and signed
+heads, not to an unverified handle string. A CID does not need its own DID by
+default. A mutable object or collection may later have a signed object identity
+or object DID that points to successive CID revisions.
+
+WebAuthn relying-party scope is part of the authority contract. Hosted Home
+uses the hosted HTTPS origin; localhost development uses loopback HTTP origins;
+installed PWAs inherit their install origin. These worlds do not share passkeys
+unless a future native/mobile adapter is modeled as an explicit proof adapter.
+Malformed or insecure browser origins must fail closed instead of falling back
+to the runtime host authority.
+
+Content availability cuts across that sequence. Published objects should be
+modeled as IPLD-compatible content graphs where that helps traversal,
+provenance, signed heads, and availability receipts. IPLD is the object graph
+model; Carrier is the secure coordination/transport substrate; IPFS/Kubo is the
+first block backend; the content provider owns publish/fetch/status/repair
+policy. See [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
 ## Object-Oriented Personal OS Model
 
@@ -180,7 +329,7 @@ Browser access is modeled around the browser principal, not around one-off per-a
 
 The host member DID is an approval boundary, not delegated identity. A paired browser guest may be admitted by a member runtime, but it does not inherit that member DID or gain member-signed Carrier transport rights.
 
-Home authority is also explicit. Serving `/apps/home/` mints a Home-scoped capability for that browser context. Home summary, runtime ensure, and app launch APIs require that capability; app-specific APIs such as Inbox and System require their own app-scoped launch token. Public summaries may expose counts, names, and pending request IDs, but never bearer session tokens. When the same browser has both a native Home room session and a paired browser session, the native Home room session wins so direct Chat Room access in that browser stays aligned with Home.
+Home authority is also explicit. Serving `/apps/home/` may show a standard unsigned desktop so a new browser understands where it is, but that desktop is not a user-owned workspace. The Home summary marks `authority.signed_in=false` and omits identity, appearance, browser state, runtime state, and notifications until passkey sign-in. Runtime ensure, Home state writes, and app launch APIs require a Home-scoped capability; app-specific APIs such as Inbox and System require their own app-scoped launch token. Public summaries may expose the standard app/object catalog, but never bearer session tokens or user-owned state. When the same browser has both a native Home room session and a paired browser session, the native Home room session wins so direct Chat Room access in that browser stays aligned with Home.
 
 ---
 
@@ -249,9 +398,9 @@ Within the capsule packaging/runtime model, these are role variants of the same 
 
 The per-capsule execution surface that lets these run across WASM and microVM is the **Capsule Runtime** (AppCapsule Runtime), not the trusted node core.
 
-Carrier owns decentralized peer/content semantics. Application capsules consume provider
-contracts such as `elastos://peer/`, `elastos://ipfs/`, and `elastos://tunnel/`.
-Transport details (QUIC, cloudflared, Kubo, TAP plumbing, local HTTP bridges) are implementation
+Carrier owns decentralized peer/content semantics. Application capsules consume product/provider
+contracts such as `elastos://peer/` and the current `elastos://content/` surface.
+Transport details (QUIC, cloudflared, Kubo, IPFS Cluster, TAP plumbing, local HTTP bridges) are implementation
 details of the runtime, Carrier, and providers, not part of the app capsule contract.
 
 ## Capsule Network Model
@@ -281,7 +430,7 @@ This keeps the abstraction boundary where it belongs: capsules express intent, a
 - A background service
 
 All actors:
-- Authenticate with Ed25519 keys
+- Prove authority through runtime-managed proof bindings such as passkeys, DID keys, wallet proofs, or delegated agent keys
 - Request capabilities through the same API
 - Receive the same token format
 - Are evaluated by the same capability machinery
@@ -325,12 +474,12 @@ protocol://path/to/resource
 
 elastos://Qm123abc              → Content-addressed (built-in)
 localhost://ElastOS/Documents/<doc-did>   → Mutable document object
-localhost://Users/self/Documents/report.pdf → Local user file
+localhost://Users/<principal-root>/Documents/report.pdf → Principal-owned local file
 localhost://MyWebSite/index.html            → Local browser-facing site root
 localhost://Public/manual.pdf               → Locally shared public file
-google://drive/vacation-photos  → Third-party provider example (aspirational, not implemented)
-elastos://peer/alice@home/shared/music  → P2P from Alice's device
-elastos://ai/claude/chat        → AI provider
+google://drive/vacation-photos              → Third-party provider example (aspirational, not implemented)
+elastos://peer/did:key:z6Mk.../shared/music → P2P from a verified peer
+elastos://ai/claude/chat                    → AI provider
 ```
 
 ### Provider + Content Separation
@@ -350,6 +499,42 @@ This means:
 - Content can be shared without sharing credentials
 - Provider can be swapped without losing data
 
+### Content Availability And IPLD
+
+The product-level content contract is `elastos://content/*`, not raw
+`elastos://ipfs/*`.
+
+`elastos://content/*` is where the runtime asks for publish, fetch, status,
+ensure, repair, and unpublish. The provider behind that contract can use
+`ipfs-provider`, Kubo, Elacity, IPFS Cluster-like replication, volunteer nodes,
+or future paid storage networks. Normal app/viewer/content capsules should not
+know which backend won.
+
+IPLD belongs inside this content plane as the shape of published object graphs:
+
+- object manifests
+- signed channel heads
+- provenance records
+- availability receipts
+- sealed-content descriptors
+- release/package indexes
+
+This makes CID-linked SmartWeb objects traversable without turning IPLD into a
+network, a storage guarantee, or an access-control system.
+
+Clean publication flow:
+
+```
+capsule -> runtime capability -> elastos://content/publish
+        -> IPLD-compatible manifest
+        -> local Kubo pin through ipfs-provider
+        -> Elacity/supernode/volunteer replication
+        -> signed availability receipt
+        -> elastos:// object/CID link
+```
+
+See [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) for the detailed contract.
+
 ## Trusted And Encrypted Content
 
 ElastOS should assume that many installable capsules and published objects are both
@@ -359,6 +544,8 @@ The trust and access model should therefore be:
 
 - CID, DID, hash, and signature prove what the capsule or object is
 - encryption protects content at rest, in transit, and in shared storage
+- sealed objects carry algorithm metadata so encryption, signatures, KEMs, and
+  share schemes can evolve without changing the object model
 - capability and policy decide who may decrypt or execute it
 
 The right architecture is not to embed custom license logic inside every app capsule.
@@ -372,8 +559,7 @@ like a rights gate:
 - authorized callers receive a short-lived decryption capability, plaintext stream,
   or derived working key for that session only
 
-This is conceptually similar to a Lit-style policy gate, but the product contract
-should stay ElastOS-native:
+This is a Runtime-native protected-content policy gate:
 
 - the capsule talks to the provider plane, not to a bespoke third-party license SDK
 - the provider hides whether the sealed bytes live locally, in Carrier-backed storage,
@@ -419,8 +605,9 @@ struct CapabilityToken {
 ### Flow
 
 ```
-1. Capsule → Runtime: "I need to read localhost://Users/self/Pictures/cat.jpg"
-2. Runtime → Home/System/Inbox: capability request for review
+1. Capsule → Runtime: "I need to read localhost://Users/<principal-root>/Pictures/cat.jpg"
+2. Runtime → owning review surface: Wallet/Inbox for wallet authority,
+   System/Inbox for runtime policy, or Inbox for generic capability review
 3. User or authorized agent approves
 4. Runtime → localhost-provider: scoped fetch through provider registry
 5. Provider returns content or object metadata
@@ -502,13 +689,19 @@ MITM impossible - content is self-authenticating
    - builds the provider registry
    - registers built-in Carrier peer transport
    - registers first-party providers such as localhost, did, webspace, documents,
-     and optional IPFS/tunnel/AI providers when installed
+     and optional chain/content-backend/tunnel/AI providers when installed
    - starts the local API/gateway routes for Home and app-scoped capabilities
 
 3. Serve Home
    - `/apps/home/` is the browser-hosted adapter for the `home` capsule
    - Home receives a Home-scoped capability for its browser context
    - app launches mint app-scoped launch tokens; child apps do not inherit Home authority
+   - runtime-backed app launches pass a signed app-scoped `launch_grant` into
+     `/api/capsules`; raw `principal_id` injection is rejected for principal
+     launches
+   - shell/supervisor microVM launches use the same signed grant shape before a
+     principal enters `BridgeContext`; provider-role launches cannot receive
+     user scope
 
 4. Runtime waits
    - validates capability-scoped requests
@@ -610,7 +803,7 @@ fn clear_capsule_memory(capsule: CapsuleId);
 
   "permissions": {
     "network": false,
-    "storage": ["localhost://Users/self/Pictures/*", "localhost://Users/self/Pictures/Edited/*"],
+    "storage": ["localhost://Users/<principal-root>/Pictures/*", "localhost://Users/<principal-root>/Pictures/Edited/*"],
     "messaging": []
   }
 }
@@ -647,10 +840,66 @@ trait Provider {
 | Provider | Responsibilities |
 |----------|-----------------|
 | `localhost://<file-backed roots>/` | Encrypt/decrypt, rooted local filesystem access |
-| `elastos://did/` | DID key management, sign/verify |
+| `elastos://did/` | Device DID resolution, typed DID signatures/verification, and fail-closed recovery-proof checks |
 | `elastos://peer/` | Carrier network plane for peer discovery, gossip, and P2P transport |
+| `elastos://content/` | SmartWeb publish/fetch/status/repair contract above IPFS/Kubo/Elacity/supernode backends |
+| `elastos://availability/` | Internal availability-provider seam for configured replication targets; not normal app contract |
+| `elastos://ipfs/` | Low-level system/provider backend for local Kubo operations; not normal app contract |
+| `elastos://chain/` | Typed chain reads/proofs through `chain-provider`; no raw RPC URLs or node ports |
+| `elastos://net/` | Browser/Net requests through `net-provider`; no raw sockets, DNS, host internet, or LAN/private targets without explicit Exit Provider policy |
+| `elastos://exit/` | Internal Browser egress contract through `exit-provider`; not normal app contract, not app-visible authority, and no direct host networking without configured backend |
+| `elastos://browser-engine/` | Internal Browser Engine Adapter contract; not app-visible authority and no page launch without attached Runtime stream byte transport |
+| `elastos://wallet/` | Wallet proof, account-link, approval, typed-signing, and transaction requests through `wallet-provider`; no raw wallet RPC or private-key access |
+| `elastos://drm/` | Protected-content open contract through `drm-provider`; no raw CEKs, key-backend SDKs, wallet RPC, chain RPC, Kubo/IPFS APIs, or Elacity credentials |
+| `elastos://rights/` | Typed protected-content rights questions through `rights-provider`; no contract SDKs, chain RPC, wallet RPC, or raw key authority |
+| `elastos://key/` | Protected-content key-release requests through `key-provider`; no raw CEKs, KMS credentials, chain RPC, or wallet RPC |
+
+The visible Browser capsule uses `/api/apps/browser/open` as its product route.
+That route validates the Browser launch grant, reserves a Runtime Net/Exit
+stream, and calls the internal Browser Engine Adapter. When an operator
+configures the Playwright proof helper, Browser UI receives only a page id plus
+Runtime screenshot/input routes for the rendered page. Ordinary apps do not get
+raw `elastos://exit/*` or `elastos://browser-engine/*` provider access.
+Raw `elastos.adapter-ipc/v1` endpoint descriptors are internal handoff data and
+are stripped from Browser UI responses.
+Native browser engines are also behind a supervisor proof contract:
+`elastos.browser.engine.launch-request/v1` is sent through
+`ELASTOS_BROWSER_ENGINE_REQUEST`, and Runtime accepts only a validated
+`elastos.browser.engine.supervisor-result/v1` that preserves runtime-net-only,
+no-direct-network, and no-wallet-injection invariants.
+The matching `browser-stream-bridge` helper is the first local byte-transport
+piece: it accepts one private `elastos.adapter-ipc/v1` Unix-socket connection
+from the engine side and forwards bytes to a Runtime-owned Unix stream socket.
+It does not open TCP sockets, perform DNS, or contact the host internet. Gateway
+owns the Runtime stream socket and relays it only to a private
+`elastos.exit.relay-ipc/v1` Unix socket returned by the Exit provider; without
+that relay, the socket closes fail-closed. Runtime stream sockets use the short
+host temp directory `elastos-browser-streams/` to avoid Unix socket path-length
+failures while keeping the descriptors private. Browser UI responses never
+expose `adapter_ipc` or `relay_ipc`.
+
+The first renderable Browser proof is
+`elastos/tools/browser-playwright-engine`. It launches Playwright Chromium
+through the Browser Engine Adapter contract, routes page requests through the
+configured Exit relay, and exposes a constrained EIP-1193 account/chain bridge
+whose signing operations fail closed until the wallet approval path is wired.
+The first server-side Exit relay is `browser-local-exit`, a typed Unix-socket
+daemon that dials only operator-allowlisted public TCP/TLS targets after Runtime
+has validated the Browser stream request. It is the current Browser path's only
+DNS/TCP dialer; Browser UI, Browser Engine Adapter, and stream bridge still have
+no direct host network authority.
+| `elastos://decrypt/` | Protected-content decrypt/render sessions through `decrypt-provider`; no raw CEKs, raw plaintext, filesystem authority, key-backend SDKs, KMS credentials, chain RPC, or wallet RPC |
 | `google://` | OAuth, Google API, caching (aspirational example, not implemented) |
 | `elastos://ai/` | Model routing, API keys, response handling |
+
+New provider families should document their typed contract before becoming a
+Home-visible product surface. For the first blockchain provider slice, see
+[Chain Provider](CHAIN_PROVIDER.md), [Wallet Provider](WALLET_PROVIDER.md),
+[Rights Provider](RIGHTS_PROVIDER.md), [Key Provider](KEY_PROVIDER.md),
+[Decrypt Provider](DECRYPT_PROVIDER.md), and
+[Protected Content Provider](PROTECTED_CONTENT.md).
+For the content availability direction, see [Content Availability and
+IPLD](CONTENT_AVAILABILITY.md).
 
 ---
 
@@ -678,6 +927,9 @@ scoped grant.
 ### Core Principle
 
 Capsules don't know about "the internet." Either content exists (by CID) or it doesn't.
+For published objects, the content provider may also return an availability
+state such as local-only, syncing, network-available, or repair-needed. The
+capsule still sees object state, not Kubo, gateway, relay, or cluster topology.
 
 ### Provider Responsibility
 
@@ -711,6 +963,7 @@ elastos-runtime/                        # Repo root
 │   ├── crates/
 │   │   ├── elastos-server/             # CLI binary + HTTP API server
 │   │   ├── elastos-runtime/            # Core runtime library (the trusted base)
+│   │   ├── elastos-auth/               # Shared proof/session authority primitives
 │   │   ├── elastos-common/             # Shared types (CapsuleManifest, ContentId)
 │   │   ├── elastos-guest/              # Guest SDK for capsule developers
 │   │   ├── elastos-namespace/          # Content-addressed namespace manager
@@ -723,7 +976,11 @@ elastos-runtime/                        # Repo root
 │   │   ├── shell/                      # Capability policy shell (orchestrator)
 │   │   ├── localhost-provider/         # rooted localhost file-backed resources
 │   └── tools/
-│       └── vsock-proxy/               # Guest bridge helper for Carrier control/network provider wiring
+│       ├── vsock-proxy/               # Guest bridge helper for Carrier control/network provider wiring
+│       ├── browser-engine-supervisor/ # Linux native Browser Engine launch supervisor
+│       ├── browser-playwright-engine/ # Server/headless Browser Engine screenshot-input proof
+│       ├── browser-stream-bridge/     # Linux Browser Engine Unix stream bridge
+│       └── browser-local-exit/        # Server-side allowlisted Browser Exit relay
 │
 ├── capsules/                           # First-party and demo capsules
 │   ├── home/                           # Home browser shell-role capsule
@@ -740,7 +997,17 @@ elastos-runtime/                        # Repo root
 │   ├── gba-ucity/                      # Data capsule with included ROM
 │   ├── agent/                          # AI agent capsule
 │   ├── did-provider/                   # elastos://did/ identity provider
+│   ├── chain-provider/                 # elastos://chain/ typed chain provider
+│   ├── net-provider/                   # elastos://net/ Browser/Net fail-closed boundary
+│   ├── exit-provider/                  # elastos://exit/ internal Browser egress contract
+│   ├── browser-engine-adapter/         # elastos://browser-engine/ internal engine adapter contract
+│   ├── wallet-provider/                # elastos://wallet/ account-link and approval provider
+│   ├── drm-provider/                   # elastos://drm/ protected-content boundary
+│   ├── rights-provider/                # elastos://rights/ protected-content rights provider
+│   ├── key-provider/                   # elastos://key/ protected-content key release provider
+│   ├── decrypt-provider/               # elastos://decrypt/ protected-content decrypt/render provider
 │   ├── ipfs-provider/                  # IPFS operations via managed Kubo daemon
+│   ├── availability-provider/          # elastos://availability/ configured replication adapter
 │   ├── ai-provider/                    # elastos://ai/ LLM routing
 │   ├── llama-provider/                 # Local llama.cpp inference
 │   ├── site-provider/                  # Local site serving provider

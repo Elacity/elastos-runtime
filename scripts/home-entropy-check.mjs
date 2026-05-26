@@ -11,6 +11,10 @@ function read(path) {
   return readFileSync(new URL(path, repoRoot), "utf8");
 }
 
+function readAll(paths) {
+  return paths.map((path) => read(path)).join("\n");
+}
+
 function readBytes(path) {
   return readFileSync(new URL(path, repoRoot));
 }
@@ -18,7 +22,10 @@ function readBytes(path) {
 function pngDimensions(path) {
   const bytes = readBytes(path);
   const pngSignature = "89504e470d0a1a0a";
-  assert(bytes.subarray(0, 8).toString("hex") === pngSignature, `${path} must be a PNG image`);
+  assert(
+    bytes.subarray(0, 8).toString("hex") === pngSignature,
+    `${path} must be a PNG image`,
+  );
   return {
     width: bytes.readUInt32BE(16),
     height: bytes.readUInt32BE(20),
@@ -45,11 +52,54 @@ function assert(condition, message, details = undefined) {
   }
 }
 
+function sourceBlock(source, needle, label) {
+  const start = source.indexOf(needle);
+  assert(start >= 0, `${label} must exist`);
+  const open = source.indexOf("{", start);
+  assert(open >= 0, `${label} must have a body`);
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+  throw new Error(`${label} body is not balanced`);
+}
+
+function assertProtectedPrincipalRootAccessor(source, needle, helper, label) {
+  const block = sourceBlock(source, needle, label);
+  assert(block.includes(helper), `${label} must use ${helper}`);
+  const forbidden = [
+    "std::fs::read(",
+    "std::fs::read_to_string(",
+    "tokio::fs::read(",
+    "std::fs::write(",
+    "tokio::fs::write(",
+    "atomic_write(",
+  ].filter((pattern) => pattern !== helper);
+  const hits = forbidden.filter((pattern) => block.includes(pattern));
+  assert(
+    hits.length === 0,
+    `${label} must not bypass protected principal-root object helpers`,
+    hits,
+  );
+}
+
 function listMarkdownFiles(dir = repoRootPath) {
   const entries = readdirSync(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (entry.name === ".git" || entry.name === "target" || entry.name === "node_modules") {
+    if (
+      entry.name === ".git" ||
+      entry.name === "target" ||
+      entry.name === "node_modules"
+    ) {
       continue;
     }
     const full = resolve(dir, entry.name);
@@ -60,6 +110,116 @@ function listMarkdownFiles(dir = repoRootPath) {
     }
   }
   return files;
+}
+
+function listTextFiles(dir) {
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    if (
+      entry.name === ".git" ||
+      entry.name === "target" ||
+      entry.name === "node_modules"
+    ) {
+      continue;
+    }
+    const full = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listTextFiles(full));
+    } else if (
+      entry.isFile() &&
+      /\.(rs|json|md|html|js|css|toml)$/.test(entry.name)
+    ) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+function assertProviderOperationEnumsRejectUnknownFields() {
+  const unguarded = listTextFiles(repoRootPath)
+    .filter((file) => file.endsWith(".rs"))
+    .filter((file) =>
+      readFileSync(file, "utf8").includes(
+        '#[serde(tag = "op", rename_all = "snake_case")]',
+      ),
+    )
+    .map((file) => file.slice(repoRootPath.length + 1));
+  assert(
+    unguarded.length === 0,
+    "Provider operation enums must use deny_unknown_fields so hidden authority fields fail closed",
+    unguarded,
+  );
+}
+
+function assertGatewayRequestStructsRejectUnknownFields() {
+  const names = [
+    "HomeBrowserStateUpdate",
+    "SystemHandleUpdateRequest",
+    "SystemBackgroundOverlayRequest",
+    "SystemGuestRegistrationRequest",
+    "WalletApprovalRejectRequest",
+    "WalletApprovalApproveRequest",
+    "WalletApprovalCompleteRequest",
+    "SystemWalletManagedCreateRequest",
+    "SystemWalletDefaultRequest",
+    "HomeLaunchRequest",
+    "InboxActionRequest",
+    "RoomPollBody",
+    "RoomSendBody",
+    "ChatRoomAccessPolicyBody",
+    "ChatRoomMemberInviteBody",
+    "ChatRoomMemberRemoveBody",
+    "ChatRoomInviteRevokeBody",
+    "RoomUploadStartBody",
+  ];
+  const missing = names.filter((name) => {
+    const pattern = new RegExp(
+      `#\\[serde\\(deny_unknown_fields\\)\\]\\s*(?:pub\\([^)]*\\)\\s+)?struct ${name}\\b`,
+    );
+    return !pattern.test(gatewayApi);
+  });
+  assert(
+    missing.length === 0,
+    "Browser-facing gateway request bodies must reject hidden authority fields at decode time",
+    missing,
+  );
+  assert(
+    gatewayTests.includes(
+      "test_wallet_request_bodies_reject_hidden_authority_fields",
+    ) &&
+      gatewayTests.includes(
+        "test_chat_request_bodies_reject_hidden_identity_fields",
+      ),
+    "Gateway request-body strictness must keep regression tests for wallet and chat authority fields",
+  );
+}
+
+function assertCapabilityRequestStructsRejectUnknownFields() {
+  const names = [
+    "RequestCapabilityInput",
+    "GrantRequestInput",
+    "DenyRequestInput",
+    "RevokeAllInput",
+    "AuditLogQuery",
+  ];
+  const missing = names.filter((name) => {
+    const pattern = new RegExp(
+      `#\\[serde\\(deny_unknown_fields\\)\\]\\s*pub struct ${name}\\b`,
+    );
+    return !pattern.test(capabilityHandler);
+  });
+  assert(
+    missing.length === 0,
+    "Capability API request bodies must reject hidden authority fields at decode time",
+    missing,
+  );
+  assert(
+    capabilityHandler.includes(
+      "test_capability_inputs_reject_hidden_authority_fields",
+    ),
+    "Capability API request-body strictness must keep regression tests",
+  );
 }
 
 function assertMarkdownLocalLinksResolve() {
@@ -93,12 +253,49 @@ function assertMarkdownLocalLinksResolve() {
   assert(failures.length === 0, "Markdown local links must resolve", failures);
 }
 
+function assertUsersSelfReferencesAreApproved() {
+  const allowed = new Set([
+    "capsules/chat/capsule.json",
+    "capsules/chat/src/carrier.rs",
+    "capsules/chat/src/session.rs",
+    "capsules/chat-wasm/capsule.json",
+    "capsules/gba-emulator/capsule.json",
+    "capsules/gba-ucity/capsule.json",
+    "elastos/crates/elastos-server/src/api/browser_capsules.rs",
+    "elastos/crates/elastos-server/src/api/gateway_tests/documents.rs",
+    "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
+    "elastos/crates/elastos-server/src/api/gateway_tests/mod.rs",
+    "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
+    "elastos/crates/elastos-server/src/api/handlers/storage.rs",
+    "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
+    "elastos/crates/elastos-server/src/carrier_bridge.rs",
+    "elastos/crates/elastos-server/src/notifications.rs",
+    "elastos/crates/elastos-server/src/runtime_control.rs",
+  ]);
+  const files = [
+    ...listTextFiles(resolve(repoRootPath, "capsules")),
+    ...listTextFiles(
+      resolve(repoRootPath, "elastos/crates/elastos-server/src"),
+    ),
+  ];
+  const unexpected = files
+    .map((file) => file.slice(repoRootPath.length).replaceAll("\\", "/"))
+    .filter((file) => read(file).includes("Users/self") && !allowed.has(file));
+  assert(
+    unexpected.length === 0,
+    "`Users/self` may only appear in approved scoped-alias code/tests",
+    unexpected,
+  );
+}
+
 function assertMarkdownScriptReferencesResolve() {
   const failures = [];
   for (const file of listMarkdownFiles()) {
     const source = readFileSync(file, "utf8");
     const relativeFile = file.slice(repoRootPath.length);
-    for (const match of source.matchAll(/(?:^|[^A-Za-z0-9_./-])(scripts\/[A-Za-z0-9_./-]+(?:\.sh|\.mjs))/g)) {
+    for (const match of source.matchAll(
+      /(?:^|[^A-Za-z0-9_./-])(scripts\/[A-Za-z0-9_./-]+(?:\.sh|\.mjs))/g,
+    )) {
       const script = match[1];
       const resolved = resolve(repoRootPath, script);
       if (!existsSync(resolved) || !statSync(resolved).isFile()) {
@@ -106,20 +303,197 @@ function assertMarkdownScriptReferencesResolve() {
       }
     }
   }
-  assert(failures.length === 0, "Markdown script references must point to existing scripts", failures);
+  assert(
+    failures.length === 0,
+    "Markdown script references must point to existing scripts",
+    failures,
+  );
+}
+
+function listFilesRecursive(dir) {
+  if (!existsSync(dir)) {
+    return [];
+  }
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    if (
+      entry.name === ".git" ||
+      entry.name === "target" ||
+      entry.name === "node_modules"
+    ) {
+      continue;
+    }
+    const full = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listFilesRecursive(full));
+    } else if (entry.isFile()) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+function isTestOrGeneratedPath(path) {
+  const parts = path.slice(repoRootPath.length).split(/[\\/]/);
+  const name = parts.at(-1)?.toLowerCase() || "";
+  return (
+    parts.includes("target") ||
+    parts.includes("tests") ||
+    parts.includes("test") ||
+    parts.includes("__tests__") ||
+    name.includes("test") ||
+    name.includes("spec")
+  );
+}
+
+function relativeToRepo(path) {
+  return path.slice(repoRootPath.length);
+}
+
+function assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority() {
+  const allowedRoles = new Set([
+    "shell",
+    "app",
+    "viewer",
+    "provider",
+    "content",
+  ]);
+  const ordinaryRoles = new Set(["app", "viewer", "content"]);
+  // System is the runtime-owned approval/diagnostic surface. Dedicated wallet
+  // connector capsules and the Browser shell are privileged adapter UIs, not
+  // general app authority.
+  const privilegedOrdinaryAuthorityUi = new Set([
+    "system",
+    "wallet-metamask",
+    "wallet-unisat",
+    "wallet",
+    "wallet-walletconnect",
+    "browser",
+  ]);
+  const forbiddenAuthorityPatterns = new Map([
+    ["elastos://chain", "raw chain provider namespace"],
+    ["elastos://net", "raw Browser/Net provider namespace"],
+    ["elastos://exit", "raw Browser Exit provider namespace"],
+    ["elastos://wallet", "raw wallet provider namespace"],
+    ["/api/provider/chain", "direct chain provider route"],
+    ["/api/provider/net", "direct Browser/Net provider route"],
+    ["/api/provider/exit", "direct Browser Exit provider route"],
+    ["/api/provider/wallet", "direct wallet provider route"],
+    ["chain-provider", "raw chain backend provider"],
+    ["net-provider", "raw Browser/Net backend provider"],
+    ["exit-provider", "raw Browser Exit backend provider"],
+    ["wallet-provider", "raw wallet backend provider"],
+    ["WalletConnect", "direct browser wallet adapter authority"],
+    ["walletconnect", "direct browser wallet adapter authority"],
+    ["MetaMask", "direct browser wallet adapter authority"],
+    ["metamask", "direct browser wallet adapter authority"],
+    ["UniSat", "direct browser wallet adapter authority"],
+    ["unisat", "direct browser wallet adapter authority"],
+    ["window.ethereum", "direct injected wallet authority"],
+    ["window.unisat", "direct injected wallet authority"],
+    ["ethereum.request", "direct injected wallet authority"],
+    ["signMessage", "direct wallet signing authority"],
+    ["personal_sign", "direct wallet signing authority"],
+    ["eth_requestAccounts", "direct wallet account authority"],
+    ["eth_sendTransaction", "direct wallet transaction authority"],
+    ["wallet_switchEthereumChain", "direct wallet chain-switch authority"],
+    ["rpc_url", "raw RPC endpoint authority"],
+    ["RPC_URL", "raw RPC endpoint authority"],
+    ["JSON-RPC", "raw RPC protocol authority"],
+    ["jsonrpc", "raw RPC protocol authority"],
+    ["eth_call", "raw EVM RPC authority"],
+    ["eth_chainId", "raw EVM RPC authority"],
+    ["bitcoin-cli", "raw node CLI authority"],
+    ["bitcoind", "raw node daemon authority"],
+    ["Bitcoin Core RPC", "raw node RPC authority"],
+    ["blockchain provider", "raw blockchain provider authority"],
+  ]);
+  const sourceExtensions = new Set([
+    ".html",
+    ".rs",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".mjs",
+  ]);
+  const manifests = [
+    ...listFilesRecursive(resolve(repoRootPath, "capsules")).filter((path) =>
+      path.endsWith("/capsule.json"),
+    ),
+    ...listFilesRecursive(resolve(repoRootPath, "elastos/capsules")).filter(
+      (path) => path.endsWith("/capsule.json"),
+    ),
+  ].sort();
+  const failures = [];
+
+  for (const manifestPath of manifests) {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const role = manifest.role;
+    const name = manifest.name || relativeToRepo(manifestPath);
+    assert(
+      allowedRoles.has(role),
+      `${relativeToRepo(manifestPath)} has unknown capsule role: ${role}`,
+    );
+    if (!ordinaryRoles.has(role) || privilegedOrdinaryAuthorityUi.has(name)) {
+      continue;
+    }
+
+    const manifestText = readFileSync(manifestPath, "utf8");
+    for (const [pattern, reason] of forbiddenAuthorityPatterns) {
+      if (manifestText.includes(pattern)) {
+        failures.push(`${relativeToRepo(manifestPath)}: ${reason}`);
+      }
+    }
+
+    const capsuleRoot = dirname(manifestPath);
+    for (const source of listFilesRecursive(capsuleRoot)) {
+      if (source === manifestPath || isTestOrGeneratedPath(source)) {
+        continue;
+      }
+      if (
+        !sourceExtensions.has(source.match(/\.[^.]+$/)?.[0] || "") ||
+        source.endsWith("/mgba.js")
+      ) {
+        continue;
+      }
+      const sourceText = readFileSync(source, "utf8");
+      for (const [pattern, reason] of forbiddenAuthorityPatterns) {
+        if (sourceText.includes(pattern)) {
+          failures.push(`${relativeToRepo(source)}: ${reason}`);
+        }
+      }
+    }
+  }
+
+  assert(
+    failures.length === 0,
+    "Ordinary app/viewer/content capsules must not reference raw wallet, chain, node, RPC, WalletConnect, MetaMask, or blockchain provider authority",
+    failures,
+  );
 }
 
 function assertToken(source, file, token, value) {
-  const pattern = new RegExp(`${escapeRegExp(token)}\\s*:\\s*${escapeRegExp(value)}\\s*;`);
-  assert(pattern.test(source), `${file} is missing canonical token ${token}: ${value}`);
+  const pattern = new RegExp(
+    `${escapeRegExp(token)}\\s*:\\s*${escapeRegExp(value)}\\s*;`,
+  );
+  assert(
+    pattern.test(source),
+    `${file} is missing canonical token ${token}: ${value}`,
+  );
 }
 
 function stripTags(value) {
-  return value.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  return value
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function attributeValue(markup, name) {
-  const match = new RegExp(`${name}\\s*=\\s*["']([^"']*)["']`, "i").exec(markup);
+  const match = new RegExp(`${name}\\s*=\\s*["']([^"']*)["']`, "i").exec(
+    markup,
+  );
   return match ? match[1].trim() : "";
 }
 
@@ -153,7 +527,9 @@ function assertStaticControlsAreNamed(file) {
   const source = read(file);
   for (const match of source.matchAll(/<button\b[\s\S]*?<\/button>/gi)) {
     const markup = match[0];
-    const isHidden = hasAttribute(markup, "hidden") || attributeValue(markup, "aria-hidden") === "true";
+    const isHidden =
+      hasAttribute(markup, "hidden") ||
+      attributeValue(markup, "aria-hidden") === "true";
     assert(
       isHidden || isDynamicTemplateButton(markup) || hasAccessibleName(markup),
       `${file} has a static button without a human-readable label`,
@@ -191,6 +567,38 @@ const activeUiFiles = [
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
   "capsules/system/browser/style.css",
+  "capsules/wallet-metamask/index.html",
+  "capsules/wallet-metamask/wallet-metamask.js",
+  "capsules/wallet-metamask/style.css",
+  "capsules/wallet-unisat/index.html",
+  "capsules/wallet-unisat/wallet-unisat.js",
+  "capsules/wallet-unisat/style.css",
+  "capsules/wallet/index.html",
+  "capsules/wallet/wallet.js",
+  "capsules/wallet/wallet-account-actions.js",
+  "capsules/wallet/wallet-activity.js",
+  "capsules/wallet/wallet-api.js",
+  "capsules/wallet/wallet-create-account-flow.js",
+  "capsules/wallet/wallet-flows.js",
+  "capsules/wallet/wallet-format.js",
+  "capsules/wallet/wallet-preferences.js",
+  "capsules/wallet/wallet-receive-flow.js",
+  "capsules/wallet/wallet-requests.js",
+  "capsules/wallet/wallet-render.js",
+  "capsules/wallet/wallet-state.js",
+  "capsules/wallet/style.css",
+  "capsules/browser/index.html",
+  "capsules/browser/browser.js",
+  "capsules/browser/browser-clipboard.js",
+  "capsules/browser/browser-history.js",
+  "capsules/browser/browser-input.js",
+  "capsules/browser/browser-input-surface.js",
+  "capsules/browser/browser-location.js",
+  "capsules/browser/browser-remote-display.js",
+  "capsules/browser/browser-runtime-api.js",
+  "capsules/browser/browser-status.js",
+  "capsules/browser/browser-webrtc.js",
+  "capsules/browser/style.css",
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
   "capsules/library/index.html",
@@ -204,6 +612,10 @@ const activeUiFiles = [
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
   "capsules/system/browser/index.html",
+  "capsules/wallet-metamask/index.html",
+  "capsules/wallet-unisat/index.html",
+  "capsules/wallet/index.html",
+  "capsules/browser/index.html",
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
   "capsules/library/index.html",
@@ -227,7 +639,10 @@ const staleCopy = [
 for (const file of activeUiFiles) {
   const source = read(file);
   for (const phrase of staleCopy) {
-    assert(!source.includes(phrase), `${file} still contains stale UI copy: ${phrase}`);
+    assert(
+      !source.includes(phrase),
+      `${file} still contains stale UI copy: ${phrase}`,
+    );
   }
 }
 
@@ -270,8 +685,18 @@ for (const file of lightTokenFiles) {
 }
 
 const shellStyle = read("capsules/home/browser/style.css");
-assertToken(shellStyle, "capsules/home/browser/style.css", "--brand", "#f6921a");
-assertToken(shellStyle, "capsules/home/browser/style.css", "--brand-strong", "#ffb457");
+assertToken(
+  shellStyle,
+  "capsules/home/browser/style.css",
+  "--brand",
+  "#f6921a",
+);
+assertToken(
+  shellStyle,
+  "capsules/home/browser/style.css",
+  "--brand-strong",
+  "#ffb457",
+);
 assert(
   (shellStyle.match(/#f6921a/g) || []).length === 1,
   "Home brand orange should be defined once as --brand",
@@ -280,130 +705,1224 @@ assert(
   (shellStyle.match(/#ffb457/g) || []).length === 1,
   "Home hover brand orange should be defined once as --brand-strong",
 );
-assert(shellStyle.includes("min-height: 100dvh;"), "Home must use dynamic viewport height for mobile browsers");
-assert(shellStyle.includes("env(safe-area-inset-top"), "Home chrome/window layout must respect mobile safe-area top inset");
-assert(shellStyle.includes("env(safe-area-inset-bottom"), "Home chrome/window layout must respect mobile safe-area bottom inset");
-assert(shellStyle.includes("max-height: calc(100dvh - 54px);"), "Home context menu must stay inside short viewports");
-assert(shellStyle.includes(".taskbar-sortable::-webkit-scrollbar"), "Home taskbar must remain scroll-safe on narrow screens");
-assert(shellStyle.includes(".window[data-maximized=\"true\"]") && shellStyle.includes("inset: 0 !important;"), "Home maximized windows must own the full viewport");
-assert(shellStyle.includes(".window[data-maximized=\"true\"].window-active"), "Home active maximized windows must stack above Home chrome");
+assert(
+  shellStyle.includes("min-height: 100dvh;"),
+  "Home must use dynamic viewport height for mobile browsers",
+);
+assert(
+  shellStyle.includes("env(safe-area-inset-top"),
+  "Home chrome/window layout must respect mobile safe-area top inset",
+);
+assert(
+  shellStyle.includes("env(safe-area-inset-bottom"),
+  "Home chrome/window layout must respect mobile safe-area bottom inset",
+);
+assert(
+  shellStyle.includes("max-height: calc(100dvh - 54px);"),
+  "Home context menu must stay inside short viewports",
+);
+assert(
+  shellStyle.includes(".taskbar-sortable::-webkit-scrollbar"),
+  "Home taskbar must remain scroll-safe on narrow screens",
+);
+assert(
+  shellStyle.includes('.window[data-maximized="true"]') &&
+    shellStyle.includes("inset: 0 !important;"),
+  "Home maximized windows must own the full viewport",
+);
+assert(
+  shellStyle.includes('.window[data-maximized="true"].window-active'),
+  "Home active maximized windows must stack above Home chrome",
+);
 
 const shellIndex = read("capsules/home/browser/index.html");
-const shellManifest = JSON.parse(read("capsules/home/browser/manifest.webmanifest"));
+const shellManifest = JSON.parse(
+  read("capsules/home/browser/manifest.webmanifest"),
+);
 const shellServiceWorker = read("capsules/home/browser/service-worker.js");
 const shellSurface = read("capsules/home/browser/shell-surface.js");
 const shellJs = read("capsules/home/browser/shell.js");
 const shellCore = read("capsules/home/browser/shell-core.js");
+const shellWindows = read("capsules/home/browser/shell-windows.js");
+const shellWindowGeometry = read(
+  "capsules/home/browser/shell-window-geometry.js",
+);
 const shellCmd = read("elastos/crates/elastos-server/src/shell_cmd.rs");
-const operatorControl = read("elastos/crates/elastos-server/src/operator_control.rs");
+const homeCmd = read("elastos/crates/elastos-server/src/home_cmd.rs");
+const operatorControl = read(
+  "elastos/crates/elastos-server/src/operator_control.rs",
+);
 const chatRoomUi = read("capsules/chat-room-ui/src/lib.rs");
 const roomService = read("elastos/crates/elastos-server/src/room_service.rs");
-const gatewayApi = read("elastos/crates/elastos-server/src/api/gateway.rs");
+const gatewayApi = readAll([
+  "elastos/crates/elastos-server/src/api/gateway.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_runtime.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_token.rs",
+  "elastos/crates/elastos-server/src/api/gateway_inbox.rs",
+  "elastos/crates/elastos-server/src/api/gateway_models.rs",
+  "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
+  "elastos/crates/elastos-server/src/api/gateway_room.rs",
+  "elastos/crates/elastos-server/src/api/gateway_server.rs",
+  "elastos/crates/elastos-server/src/api/gateway_site.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_accounts.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_app.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_approvals.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_connectors.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_prices.rs",
+  "elastos/crates/elastos-server/src/api/gateway_wallet_send.rs",
+]);
+const gatewayBrowserApi = readAll([
+  "elastos/crates/elastos-server/src/api/gateway_browser.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_response.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_stream.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_validation.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_wallet.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_wallet_bridge.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_wallet_reads.rs",
+]);
+const authGatewayApi = read(
+  "elastos/crates/elastos-server/src/api/auth_gateway.rs",
+);
+const recoveryKitLiveSmoke = read("scripts/recovery-kit-live-smoke.sh");
+const browserCapsulesApi = read(
+  "elastos/crates/elastos-server/src/api/browser_capsules.rs",
+);
+const viewerGatewayApi = read(
+  "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
+);
+const documentsProvider = read(
+  "elastos/crates/elastos-server/src/documents.rs",
+);
+const documentsReadme = read("capsules/documents/README.md");
+const authContract = read("elastos/crates/elastos-auth/src/lib.rs");
+const webauthnIdentity = read(
+  "elastos/crates/elastos-identity/src/webauthn.rs",
+);
+const didProvider = read("capsules/did-provider/src/main.rs");
+const didProviderManifest = read("capsules/did-provider/capsule.json");
+const runtimeAuth = read("elastos/crates/elastos-server/src/auth.rs");
+const apiRoutes = read("elastos/crates/elastos-server/src/api/routes.rs");
+const supervisorApi = read(
+  "elastos/crates/elastos-server/src/api/handlers/supervisor_api.rs",
+);
+const supervisorCore = read("elastos/crates/elastos-server/src/supervisor.rs");
+const serveCmd = read("elastos/crates/elastos-server/src/serve_cmd.rs");
+const storageHandler = read(
+  "elastos/crates/elastos-server/src/api/handlers/storage.rs",
+);
+const identityHandler = read(
+  "elastos/crates/elastos-server/src/api/handlers/identity.rs",
+);
+const capabilityHandler = read(
+  "elastos/crates/elastos-server/src/api/handlers/capability.rs",
+);
+const providerResource = read(
+  "elastos/crates/elastos-server/src/provider_resource.rs",
+);
+const vmProvider = read("elastos/crates/elastos-server/src/vm_provider.rs");
+const notifications = read(
+  "elastos/crates/elastos-server/src/notifications.rs",
+);
+const carrierBridge = read(
+  "elastos/crates/elastos-server/src/carrier_bridge.rs",
+);
+const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
+const runtimeControl = read(
+  "elastos/crates/elastos-server/src/runtime_control.rs",
+);
+const serverInfra = read("elastos/crates/elastos-server/src/server_infra.rs");
+const wasmProvider = read(
+  "elastos/crates/elastos-compute/src/providers/wasm.rs",
+);
+const protectedContent = read(
+  "elastos/crates/elastos-common/src/protected_content.rs",
+);
+const chainProvider = readAll([
+  "capsules/chain-provider/src/main.rs",
+  "capsules/chain-provider/src/abi.rs",
+  "capsules/chain-provider/src/backends.rs",
+  "capsules/chain-provider/src/config.rs",
+  "capsules/chain-provider/src/lifecycle.rs",
+  "capsules/chain-provider/src/protocol.rs",
+  "capsules/chain-provider/src/rpc.rs",
+  "capsules/chain-provider/src/validation.rs",
+  "capsules/chain-provider/src/tests.rs",
+  "capsules/chain-provider/src/tests/support.rs",
+]);
+const netProvider = read("capsules/net-provider/src/main.rs");
+const exitProvider = read("capsules/exit-provider/src/main.rs");
+const browserEngineAdapter = readAll([
+  "capsules/browser-engine-adapter/src/main.rs",
+  "capsules/browser-engine-adapter/src/display.rs",
+  "capsules/browser-engine-adapter/src/ids.rs",
+  "capsules/browser-engine-adapter/src/supervisor.rs",
+  "capsules/browser-engine-adapter/src/validation.rs",
+  "capsules/browser-engine-adapter/src/tests.rs",
+]);
+const browserEngineSupervisor = read(
+  "elastos/tools/browser-engine-supervisor/src/main.rs",
+);
+const browserStreamBridge = read(
+  "elastos/tools/browser-stream-bridge/src/main.rs",
+);
+const browserLocalExit = read("elastos/tools/browser-local-exit/src/main.rs");
+const browserNativeHostCapability = read(
+  "scripts/browser-native-host-capability.mjs",
+);
+const browserNativeOperatorConfig = read(
+  "scripts/browser-native-operator-config.mjs",
+);
+const browserNativeTargetPreflight = read(
+  "scripts/browser-native-target-preflight.sh",
+);
+const browserNativeSupervisorSmoke = read(
+  "scripts/browser-native-supervisor-smoke.sh",
+);
+const browserNativeSupervisorProxySmoke = read(
+  "scripts/browser-native-supervisor-proxy-smoke.sh",
+);
+const browserHostedProductOperatorConfig = read(
+  "scripts/browser-hosted-product-operator-config.mjs",
+);
+const browserHostedProductSupervisor = read(
+  "scripts/browser-hosted-product-supervisor.mjs",
+);
+const browserHostedProductWebrtcSmoke = read(
+  "scripts/browser-hosted-product-webrtc-smoke.mjs",
+);
+const browserHostedProductWebrtcSmokeShell = read(
+  "scripts/browser-hosted-product-webrtc-smoke.sh",
+);
+const browserHostedProductNavigationSmoke = read(
+  "scripts/browser-hosted-product-navigation-smoke.mjs",
+);
+const browserHostedProductNavigationSmokeShell = read(
+  "scripts/browser-hosted-product-navigation-smoke.sh",
+);
+const browserHostedProductWalletSmoke = read(
+  "scripts/browser-hosted-product-wallet-smoke.sh",
+);
+const browserHostedProductGlideWalletSmoke = read(
+  "scripts/browser-hosted-product-glide-wallet-smoke.sh",
+);
+const browserKasmControlService = read(
+  "scripts/browser-kasm-control-service.mjs",
+);
+const browserKasmControlServiceSmoke = read(
+  "scripts/browser-kasm-control-service-smoke.sh",
+);
+const browserDisplayModeSmoke = read("scripts/browser-display-mode-smoke.mjs");
+const browserHostedProviderCandidateSmoke = read(
+  "scripts/browser-hosted-provider-candidate-smoke.sh",
+);
+const browserHostedProviderBakeoff = read(
+  "scripts/browser-hosted-provider-bakeoff.sh",
+);
+const browserObjectiveAudit = read("scripts/browser-objective-audit.mjs");
+const browserObjectiveAuditSmoke = read(
+  "scripts/browser-objective-audit-smoke.sh",
+);
+const browserProviderDecisionReport = read(
+  "scripts/browser-provider-decision-report.mjs",
+);
+const browserProviderDecisionReportSmoke = read(
+  "scripts/browser-provider-decision-report-smoke.sh",
+);
+const browserProviderRunbook = read("scripts/browser-provider-runbook.mjs");
+const browserProviderRunbookSmoke = read(
+  "scripts/browser-provider-runbook-smoke.sh",
+);
+const browserManualUxChecks = read("scripts/browser-manual-ux-checks.mjs");
+const browserManualUxReport = read("scripts/browser-manual-ux-report.mjs");
+const browserManualUxValidation = read(
+  "scripts/browser-manual-ux-validation.mjs",
+);
+const browserExperimentCleanup = read("scripts/browser-experiment-cleanup.mjs");
+const currentState = read("state.md");
+const browserSelkiesControlService = read(
+  "scripts/browser-selkies-control-service.mjs",
+);
+const browserSelkiesControlServiceSmoke = read(
+  "scripts/browser-selkies-control-service-smoke.sh",
+);
+const browserSelkiesTargetPreflight = read(
+  "scripts/browser-selkies-target-preflight.sh",
+);
+const browserSelkiesCurrentWheelSmoke = read(
+  "scripts/browser-selkies-current-wheel-smoke.sh",
+);
+const browserSelkiesRealChromiumSmoke = read(
+  "scripts/browser-selkies-real-chromium-smoke.sh",
+);
+const browserSelkiesRuntimeExitSmoke = read(
+  "scripts/browser-selkies-runtime-exit-smoke.sh",
+);
+const browserSelkiesRuntimeExitTarget = read(
+  "scripts/browser-selkies-runtime-exit-target.sh",
+);
+const browserSelkiesOperatorImageBuild = read(
+  "scripts/browser-selkies-operator-image-build.sh",
+);
+const browserSelkiesOperatorDockerfile = read(
+  "deploy/browser-selkies-runtime-target/Dockerfile",
+);
+const browserSelkiesSystemService = read(
+  "scripts/system/elastos-browser-selkies.service",
+);
+const browserSelkiesSystemScript = read(
+  "scripts/system/elastos-browser-selkies.sh",
+);
+const browserSelkiesSystemEnv = read(
+  "scripts/system/elastos-browser-selkies.env.example",
+);
+const publishReleaseScript = read("scripts/publish-release.sh");
+const walletProvider = readAll([
+  "capsules/wallet-provider/src/main.rs",
+  "capsules/wallet-provider/src/approval.rs",
+  "capsules/wallet-provider/src/crypto.rs",
+  "capsules/wallet-provider/src/crypto/bitcoin.rs",
+  "capsules/wallet-provider/src/crypto/evm.rs",
+  "capsules/wallet-provider/src/models.rs",
+  "capsules/wallet-provider/src/protocol.rs",
+  "capsules/wallet-provider/src/storage.rs",
+  "capsules/wallet-provider/src/validation.rs",
+  "capsules/wallet-provider/src/tests/accounts.rs",
+  "capsules/wallet-provider/src/tests/approvals.rs",
+  "capsules/wallet-provider/src/tests/approvals/external.rs",
+  "capsules/wallet-provider/src/tests/approvals/managed.rs",
+  "capsules/wallet-provider/src/tests/approvals/transactions.rs",
+  "capsules/wallet-provider/src/tests/approvals/validation.rs",
+  "capsules/wallet-provider/src/tests/browser_signing.rs",
+  "capsules/wallet-provider/src/tests/mod.rs",
+  "capsules/wallet-provider/src/tests/proofs.rs",
+  "capsules/wallet-provider/src/tests/support.rs",
+]);
+const walletProviderManifest = read("capsules/wallet-provider/capsule.json");
+const gatewayTests = readAll([
+  "elastos/crates/elastos-server/src/api/gateway_tests/mod.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/support_providers.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/support_runtime.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/documents.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/home_system.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/recovery.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/room.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/site_publication.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/accounts.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/auth.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/chain.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/connectors.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/inbox.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/managed_approvals.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/prices.rs",
+  "elastos/crates/elastos-server/src/api/gateway_tests/wallet/send.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs",
+]);
+const gatewayBrowserRouteTests = read(
+  "elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs",
+);
 const debugPolicy = read("DEBUG.md");
-assert(shellIndex.includes('role="listbox"'), "Home items must expose keyboard-selectable structure");
-assert(shellIndex.includes('aria-label="Home items"'), "Home items list must be labeled");
-assert(shellIndex.includes('data-home-status="booting"'), "Home readiness state must use Home naming");
-assert(!shellIndex.includes("data-shell-status"), "Home readiness state must not preserve shell naming");
-assert(shellIndex.includes('data-action="minimize"'), "Window minimize action must remain explicit");
-assert(shellIndex.includes('data-action="maximize"'), "Window maximize action must remain explicit");
-assert(shellIndex.includes('data-action="close"'), "Window close action must remain explicit");
-assert(shellIndex.includes('rel="manifest"'), "Home must expose a web app manifest for mobile install");
-assert(shellIndex.includes('manifest.webmanifest?v=home-20260427b'), "Home manifest URL must be cache-busted after PWA icon changes");
-assert(shellIndex.includes('id="toolbar-fullscreen"'), "Home must expose a fullscreen control in the top toolbar");
-assert(shellManifest.name === "ElastOS Home", "Home PWA manifest must install as ElastOS Home");
-assert(shellManifest.display === "standalone", "Home PWA manifest must use standalone display mode");
-assert(Array.isArray(shellManifest.icons) && shellManifest.icons.some((icon) => icon.src === "./elastos-home-icon.svg"), "Home PWA manifest must use the Elastos app icon");
-assert(shellManifest.icons.some((icon) => icon.src === "./elastos-home-icon-192.png" && icon.sizes === "192x192"), "Home PWA manifest must include a 192px install icon");
-assert(shellManifest.icons.some((icon) => icon.src === "./elastos-home-icon-512.png" && icon.sizes === "512x512"), "Home PWA manifest must include a 512px install icon");
-assert(shellServiceWorker.includes("elastos-home-20260427b"), "Home service worker cache key must match the browser asset version");
-assert(!shellServiceWorker.includes("elastos-home-shell"), "Home service worker must not preserve the old shell cache namespace");
+const gbaScript = read("scripts/gba.sh");
+const homeAssetVersion = "home-20260526d";
+assertUsersSelfReferencesAreApproved();
+assert(
+  shellIndex.includes('role="listbox"'),
+  "Home items must expose keyboard-selectable structure",
+);
+assert(
+  shellIndex.includes('aria-label="Home items"'),
+  "Home items list must be labeled",
+);
+assert(
+  shellIndex.includes('data-home-status="booting"'),
+  "Home readiness state must use Home naming",
+);
+assert(
+  !shellIndex.includes("data-shell-status"),
+  "Home readiness state must not preserve shell naming",
+);
+assert(
+  shellIndex.includes('data-action="minimize"'),
+  "Window minimize action must remain explicit",
+);
+assert(
+  shellIndex.includes('data-action="maximize"'),
+  "Window maximize action must remain explicit",
+);
+assert(
+  shellIndex.includes('data-action="close"'),
+  "Window close action must remain explicit",
+);
+assert(
+  shellIndex.includes('rel="manifest"'),
+  "Home must expose a web app manifest for mobile install",
+);
+assert(
+  shellIndex.includes(`manifest.webmanifest?v=${homeAssetVersion}`),
+  "Home manifest URL must be cache-busted after PWA icon changes",
+);
+assert(
+  shellIndex.includes('name="mobile-web-app-capable" content="yes"'),
+  "Home PWA metadata must include mobile-web-app-capable",
+);
+assert(
+  shellIndex.includes('id="toolbar-fullscreen"'),
+  "Home must expose a fullscreen control in the top toolbar",
+);
+assert(
+  shellManifest.name === "ElastOS Home",
+  "Home PWA manifest must install as ElastOS Home",
+);
+assert(
+  shellManifest.display === "standalone",
+  "Home PWA manifest must use standalone display mode",
+);
+assert(
+  Array.isArray(shellManifest.icons) &&
+    shellManifest.icons.some((icon) => icon.src === "./elastos-home-icon.svg"),
+  "Home PWA manifest must use the Elastos app icon",
+);
+assert(
+  shellManifest.icons.some(
+    (icon) =>
+      icon.src === "./elastos-home-icon-192.png" && icon.sizes === "192x192",
+  ),
+  "Home PWA manifest must include a 192px install icon",
+);
+assert(
+  shellManifest.icons.some(
+    (icon) =>
+      icon.src === "./elastos-home-icon-512.png" && icon.sizes === "512x512",
+  ),
+  "Home PWA manifest must include a 512px install icon",
+);
+assert(
+  shellServiceWorker.includes(
+    `elastos-home-${homeAssetVersion.slice("home-".length)}`,
+  ),
+  "Home service worker cache key must match the browser asset version",
+);
+assert(
+  !shellServiceWorker.includes("elastos-home-shell"),
+  "Home service worker must not preserve the old shell cache namespace",
+);
 const homePwaIcon = read("capsules/home/browser/elastos-home-icon.svg");
-assert(homePwaIcon.includes("M669.61 232.852"), "Home PWA icon must use the same Elastos mark geometry as the top navbar logo");
-assert(homePwaIcon.includes("paint0_linear_47_14"), "Home PWA icon must preserve the official Elastos mark gradient identity");
-assert(!homePwaIcon.includes("M256 78 420 172"), "Home PWA icon must not use the old approximate mark");
-assert(!homePwaIcon.includes("M256 206 420 300"), "Home PWA icon must not use the old approximate mark");
-assertPngDimensions("capsules/home/browser/elastos-home-icon-192.png", 192, 192);
-assertPngDimensions("capsules/home/browser/elastos-home-icon-512.png", 512, 512);
-assert(shellJs.includes("registerHomeServiceWorker"), "Home must register its service worker from the shell entrypoint");
-assert(shellJs.includes("dataset.homeStatus"), "Home runtime status must be exposed under data-home-status");
-assert(!shellJs.includes("dataset.shellStatus"), "Home runtime status must not preserve data-shell-status");
-assert(shellJs.includes("toggleShellFullscreen"), "Home fullscreen control must be wired to shell behavior");
-assert(shellCore.includes("toolbarFullscreenButton"), "Home fullscreen control must be exported by shell-core");
-assert(shellSurface.includes('card.setAttribute("aria-label", `Open ${app.title}`);'), "Launcher cards must expose human-readable action labels");
-assert(shellSurface.includes('button.setAttribute("aria-label", desktopShortcutAriaLabel(label));'), "Desktop shortcuts must expose human-readable action labels");
-assert(shellSurface.includes("shouldFocusLauncherSearch"), "Home launcher search focus must be gated for touch devices");
-assert(!shellSurface.includes("ensureLauncherSelection(activeBrowserTargetId());\n  launcherSearch.focus();"), "Home launcher must not focus search unconditionally on mobile");
-assert(shellJs.includes("SHELL_MESSAGE_OPEN_TARGET_SOURCES"), "Home open-target messages must stay source-gated");
-assert(shellIndex.includes('shell.js?v=home-20260427b'), "Home entry module must cache-bust after shell browser changes");
-assert(shellIndex.includes('style.css?v=home-20260427b'), "Home stylesheet must cache-bust after shell browser changes");
-assert(shellJs.includes('shell-core.js?v=home-20260427b'), "Home shell.js must import the current shell-core module instance");
-assert(shellJs.includes('shell-surface.js?v=home-20260427b'), "Home must not mix old shell-surface module instances with current shell-windows");
-assert(shellJs.includes('shell-windows.js?v=home-20260427b'), "Home shell.js must import the current shell-windows module instance");
-assert(shellSurface.includes('shell-core.js?v=home-20260427b'), "Home shell-surface must import the current shell-core module instance");
-assert(shellSurface.includes('shell-windows.js?v=home-20260427b'), "Home shell-surface must import the same shell-windows module instance as shell.js");
-assert(shellSurface.includes("shouldOpenDesktopShortcutFromClick"), "Home desktop icons must use touch-specific tap-open behavior");
-assert(shellSurface.includes("longPressReady"), "Home desktop icons must require long-press before touch dragging");
-assert(shellSurface.includes("clearDragSelection"), "Home desktop drag must actively clear browser text selection");
-assert(shellSurface.includes('document.body.classList.add("dragging-target")'), "Home desktop drag must mark the selection-suppression lifetime");
-assert(shellStyle.includes("body.dragging-target"), "Home desktop drag must suppress text selection while moving icons");
-assert(shellCore.includes("desktopHidden: []"), "Home layout state must track per-target desktop icon removal");
-assert(shellCore.includes("addTargetToDesktop") && shellCore.includes("removeTargetFromDesktop"), "Home must support reversible desktop icon presence");
-assert(shellSurface.includes('action: "remove-desktop-icon"') && shellSurface.includes('action: "add-desktop-icon"'), "Home menus must expose remove/add desktop icon actions");
-assert(shellJs.includes('type: "home:open-target"') || shellJs.includes('"home:open-target"'), "Home must keep the open-target message contract");
-assert(shellJs.includes('type: "home:open-uri"') || shellJs.includes('"home:open-uri"'), "Home must keep the open-uri message contract");
-assert(!shellJs.includes("pc2-shell:"), "Home postMessage contract must not preserve old pc2-shell message types");
-assert(!shellJs.includes("shell_token"), "Home browser route tokens must use home_token");
-assert(!shellJs.includes("x-elastos-shell-token"), "Home browser API tokens must use x-elastos-home-token");
-assert(shellJs.includes("SHELL_MESSAGE_DELIVER_TARGET_SOURCES"), "Home must source-gate capsule-to-capsule picker returns");
-assert(shellJs.includes('library: new Set(["chat-room"])'), "Home must allow Library picker results to return to Chat Room only");
-assert(shellJs.includes('"home:close-self"'), "Home must allow token-bound picker windows to close themselves after selection");
-assert(shellJs.includes('"chat-room": new Set(["library"])'), "Chat Room Attach must be allowed to open Library through Home message policy");
-assert(shellJs.includes('new Set(["documents", "chat-room"])'), "Home must allow Chat Room to open elastos:// links through the same URI contract as Documents");
-assert(roomService.includes('parsed.scheme() == "elastos"'), "Chat Room service must classify elastos:// document links as first-class room links");
-assert(chatRoomUi.includes('data-open-uri'), "Chat Room must render elastos:// room links as shell-openable actions");
-assert(chatRoomUi.includes("home:open-uri"), "Chat Room must open elastos:// room links through Home URI orchestration");
-assert(!chatRoomUi.includes("/api/provider/documents/"), "Chat Room must not call the Documents provider directly");
-assert(!chatRoomUi.includes("/ipfs/"), "Chat Room must not call IPFS routes directly");
-assert(chatRoomUi.includes("data-guest-action"), "Chat Room must expose guest kick actions in shell mode");
-assert(chatRoomUi.includes("data-node-action"), "Chat Room must expose runtime node block/cancel actions in shell mode");
-assert(chatRoomUi.includes("data-room-policy"), "Chat Room must expose room policy controls in shell mode");
-assert(chatRoomUi.includes("show_access_controls"), "Chat Room access controls must stay behind an explicit settings toggle");
-assert(chatRoomUi.includes("home:open-target"), "Chat Room Attach must ask Home to open Library instead of directly opening host files in shell mode");
-assert(chatRoomUi.includes("Open Home to attach from Library."), "Chat Room Attach must fail visibly when Home is unavailable");
-assert(!chatRoomUi.includes("attachment_input.click()"), "Chat Room Attach must not open the host browser file picker");
-assert(chatRoomUi.includes('"returnTarget"') && chatRoomUi.includes('"attach"'), "Chat Room Attach must launch Library in explicit attach mode");
-assert(chatRoomUi.includes("chat-room:attach-library-item"), "Chat Room must accept Library picker results through Home delivery");
-assert(chatRoomUi.includes("summary.local_runtime_role.is_none() && !summary.browser_access_allowed"), "Chat Room shell sessions must remain openable when guest requests are disabled for active members");
-assert(gatewayApi.includes('"/api/apps/chat-room/guests/:session_id/kick"'), "Chat Room guest kicking must go through the gateway capacity-token API");
-assert(gatewayApi.includes('"/api/apps/chat-room/members/invite"'), "Chat Room runtime node invites must go through the gateway capacity-token API");
-assert(gatewayApi.includes('"/api/apps/chat-room/members/remove"'), "Chat Room runtime node blocking must go through the gateway capacity-token API");
-assert(!gatewayApi.includes("ProviderBridge::spawn"), "Gateway must not spawn provider bridges directly");
-assert(!gatewayApi.includes("ipfs_provider_binary") && !gatewayApi.includes("ipfs_bridge"), "Gateway must not keep a direct IPFS bridge fallback");
-const gatewayActiveSession = gatewayApi.match(/struct GatewayActiveSessionSummary \{([\s\S]*?)\n\}/)?.[1] || "";
-assert(gatewayActiveSession.includes("session_id: String"), "Gateway summaries must expose only a public active-session id");
-assert(!gatewayActiveSession.includes("token:"), "Gateway summaries must not expose room session tokens");
-assert(shellCore.includes("desktopIconsVisible: true"), "Home layout state must track global desktop icon visibility");
-assert(shellSurface.includes('action: "toggle-desktop-icons"'), "Home desktop menu must expose desktop icon visibility");
-assert(!shellSurface.includes('label: "Go Home"'), "Home desktop menu must not expose redundant Go Home");
-assert(!shellSurface.includes('label: "Open Launcher"'), "Home desktop menu must not expose redundant Open Launcher");
-assert(!shellSurface.includes('label: "Open System"'), "Home desktop menu must not expose redundant Open System");
-assert(!shellCmd.includes("Legacy fields"), "Runtime coords must not preserve legacy token fields");
-const runtimeCoordsBlock = shellCmd.match(/pub struct RuntimeCoords \{([\s\S]*?)\n\}/)?.[1] || "";
-assert(!runtimeCoordsBlock.includes("shell_token") && !runtimeCoordsBlock.includes("client_token"), "Runtime coords must only persist attach_secret, not bearer tokens");
-assert(!operatorControl.includes("struct RuntimeCoords"), "Operator control must use canonical shell_cmd runtime coords");
-assert(operatorControl.includes("crate::runtime_control::read_operator_runtime_coords"), "Operator control must use canonical runtime coord validation");
-assert(!operatorControl.includes("async fn attach_secret_matches"), "Operator control must not duplicate attach-secret validation");
-assert(debugPolicy.includes("# Debugging Policy"), "Root DEBUG.md must stay a stable developer policy, not a work log");
-assert(!debugPolicy.includes("pc2-shell") && !debugPolicy.includes("md-viewer"), "Root DEBUG.md must not preserve stale route history");
+assert(
+  homePwaIcon.includes("M669.61 232.852"),
+  "Home PWA icon must use the same Elastos mark geometry as the top navbar logo",
+);
+assert(
+  homePwaIcon.includes("paint0_linear_47_14"),
+  "Home PWA icon must preserve the official Elastos mark gradient identity",
+);
+assert(
+  !homePwaIcon.includes("M256 78 420 172"),
+  "Home PWA icon must not use the old approximate mark",
+);
+assert(
+  !homePwaIcon.includes("M256 206 420 300"),
+  "Home PWA icon must not use the old approximate mark",
+);
+assertPngDimensions(
+  "capsules/home/browser/elastos-home-icon-192.png",
+  192,
+  192,
+);
+assertPngDimensions(
+  "capsules/home/browser/elastos-home-icon-512.png",
+  512,
+  512,
+);
+assert(
+  shellJs.includes("registerHomeServiceWorker"),
+  "Home must register its service worker from the shell entrypoint",
+);
+assert(
+  shellJs.includes("dataset.homeStatus"),
+  "Home runtime status must be exposed under data-home-status",
+);
+assert(
+  !shellJs.includes("dataset.shellStatus"),
+  "Home runtime status must not preserve data-shell-status",
+);
+assert(
+  shellJs.includes("toggleShellFullscreen"),
+  "Home fullscreen control must be wired to shell behavior",
+);
+assert(
+  shellCore.includes("toolbarFullscreenButton"),
+  "Home fullscreen control must be exported by shell-core",
+);
+assert(
+  shellSurface.includes(
+    'card.setAttribute("aria-label", `Open ${app.title}`);',
+  ),
+  "Launcher cards must expose human-readable action labels",
+);
+assert(
+  shellSurface.includes(
+    'button.setAttribute("aria-label", desktopShortcutAriaLabel(label));',
+  ),
+  "Desktop shortcuts must expose human-readable action labels",
+);
+assert(
+  shellSurface.includes("shouldFocusLauncherSearch"),
+  "Home launcher search focus must be gated for touch devices",
+);
+assert(
+  !shellSurface.includes(
+    "ensureLauncherSelection(activeBrowserTargetId());\n  launcherSearch.focus();",
+  ),
+  "Home launcher must not focus search unconditionally on mobile",
+);
+assert(
+  shellJs.includes("SHELL_MESSAGE_OPEN_TARGET_SOURCES"),
+  "Home open-target messages must stay source-gated",
+);
+assert(
+  shellIndex.includes(`shell.js?v=${homeAssetVersion}`),
+  "Home entry module must cache-bust after shell browser changes",
+);
+assert(
+  shellIndex.includes(`style.css?v=${homeAssetVersion}`),
+  "Home stylesheet must cache-bust after shell browser changes",
+);
+assert(
+  shellJs.includes(`shell-core.js?v=${homeAssetVersion}`),
+  "Home shell.js must import the current shell-core module instance",
+);
+assert(
+  shellJs.includes(`shell-surface.js?v=${homeAssetVersion}`),
+  "Home must not mix old shell-surface module instances with current shell-windows",
+);
+assert(
+  shellJs.includes(`shell-windows.js?v=${homeAssetVersion}`),
+  "Home shell.js must import the current shell-windows module instance",
+);
+assert(
+  shellSurface.includes(`shell-core.js?v=${homeAssetVersion}`),
+  "Home shell-surface must import the current shell-core module instance",
+);
+assert(
+  shellSurface.includes(`shell-windows.js?v=${homeAssetVersion}`),
+  "Home shell-surface must import the same shell-windows module instance as shell.js",
+);
+assert(
+  !shellWindows.includes("allowfullscreen") &&
+    shellWindows.includes('const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"]') &&
+    shellWindows.includes('allow="${iframeAllowForLaunch(launched)}"'),
+  "Home iframes must allow autoplay and fullscreen through the allow policy without deprecated allowfullscreen",
+);
+assert(
+  shellWindows.includes('const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"]') &&
+    shellWindows.includes('launched?.target === "browser"') &&
+    shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)"),
+  "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
+);
+assert(
+  shellWindows.includes('const WEBAUTHN_IFRAME_ALLOW_TARGETS = new Set(["wallet"])') &&
+    shellWindows.includes('tokens.push("publickey-credentials-get")'),
+  "Home must grant WebAuthn only to Wallet iframe approvals so passkey-gated signing works without broad capsule authority",
+);
+assert(
+  shellJs.includes('scope === "wallet"') &&
+    shellJs.includes('kind === "wallet.requests.changed"') &&
+    shellJs.includes("hadCursor || broadcastInitial || events.length > 0"),
+  "Home event handling must refresh the shell summary when Wallet request events change, including the first long-poll payload after SSE fallback",
+);
+assert(
+  shellSurface.includes("notifications.attention_count") &&
+    shellSurface.includes("notifications.unread_count") &&
+    shellSurface.includes("Math.max(0, semanticCount || entries.length)"),
+  "Home Inbox bell must prefer semantic notification counts over entries length so approval alerts survive payload-shape changes",
+);
+assert(
+  shellWindows.includes("cross-origin or failed state") &&
+    shellWindows.includes("frameWindow.removeEventListener"),
+  "Home frame cleanup must tolerate cross-origin failed iframe states on close",
+);
+assert(
+  shellWindows.includes("releaseFrameRuntimePage(entry.node)") &&
+    shellWindows.includes("__elastosBrowserReleaseRuntimePage"),
+  "Home must ask same-origin Browser frames to release hosted runtime pages before removing iframes so singleton Browser providers do not retain stale pages",
+);
+const persistSessionBlock = sourceBlock(
+  shellWindows,
+  "function persistBrowserSession()",
+  "Home browser session persistence",
+);
+assert(
+  persistSessionBlock.includes("saveShellSessionState({ windows: [] });"),
+  "Home must persist an explicit empty session after the last window closes",
+);
+assert(
+  !persistSessionBlock.includes("clearShellSessionState();"),
+  "Home must not clear session state from the last-window-close path",
+);
+assert(
+  shellSurface.includes("shouldOpenDesktopShortcutFromClick"),
+  "Home desktop icons must use touch-specific tap-open behavior",
+);
+assert(
+  shellSurface.includes("longPressReady"),
+  "Home desktop icons must require long-press before touch dragging",
+);
+assert(
+  shellSurface.includes("clearDragSelection"),
+  "Home desktop drag must actively clear browser text selection",
+);
+assert(
+  shellSurface.includes('document.body.classList.add("dragging-target")'),
+  "Home desktop drag must mark the selection-suppression lifetime",
+);
+assert(
+  shellStyle.includes("body.dragging-target"),
+  "Home desktop drag must suppress text selection while moving icons",
+);
+assert(
+  shellCore.includes("desktopHidden: []"),
+  "Home layout state must track per-target desktop icon removal",
+);
+assert(
+  shellCore.includes("addTargetToDesktop") &&
+    shellCore.includes("removeTargetFromDesktop"),
+  "Home must support reversible desktop icon presence",
+);
+assert(
+  shellSurface.includes('action: "remove-desktop-icon"') &&
+    shellSurface.includes('action: "add-desktop-icon"'),
+  "Home menus must expose remove/add desktop icon actions",
+);
+assert(
+  shellJs.includes('type: "home:open-target"') ||
+    shellJs.includes('"home:open-target"'),
+  "Home must keep the open-target message contract",
+);
+assert(
+  shellJs.includes('type: "home:open-uri"') ||
+    shellJs.includes('"home:open-uri"'),
+  "Home must keep the open-uri message contract",
+);
+assert(
+  !shellJs.includes("pc2-shell:"),
+  "Home postMessage contract must not preserve old pc2-shell message types",
+);
+assert(
+  !shellJs.includes("shell_token"),
+  "Home browser route tokens must use home_token",
+);
+assert(
+  !shellJs.includes("x-elastos-shell-token"),
+  "Home browser API tokens must use x-elastos-home-token",
+);
+assert(
+  shellJs.includes("SHELL_MESSAGE_DELIVER_TARGET_SOURCES"),
+  "Home must source-gate capsule-to-capsule picker returns",
+);
+assert(
+  shellJs.includes('library: new Set(["chat-room"])'),
+  "Home must allow Library picker results to return to Chat Room only",
+);
+assert(
+  shellJs.includes('"home:close-self"'),
+  "Home must allow token-bound picker windows to close themselves after selection",
+);
+assert(
+  shellJs.includes('"chat-room": new Set(["library"])'),
+  "Chat Room Attach must be allowed to open Library through Home message policy",
+);
+assert(
+  shellJs.includes('new Set(["documents", "chat-room"])'),
+  "Home must allow Chat Room to open elastos:// links through the same URI contract as Documents",
+);
+assert(
+  roomService.includes('parsed.scheme() == "elastos"'),
+  "Chat Room service must classify elastos:// document links as first-class room links",
+);
+assert(
+  chatRoomUi.includes("data-open-uri"),
+  "Chat Room must render elastos:// room links as shell-openable actions",
+);
+assert(
+  chatRoomUi.includes("home:open-uri"),
+  "Chat Room must open elastos:// room links through Home URI orchestration",
+);
+assert(
+  !chatRoomUi.includes("/api/provider/documents/"),
+  "Chat Room must not call the Documents provider directly",
+);
+assert(
+  !chatRoomUi.includes("/ipfs/"),
+  "Chat Room must not call IPFS routes directly",
+);
+assert(
+  chatRoomUi.includes("data-guest-action"),
+  "Chat Room must expose guest kick actions in shell mode",
+);
+assert(
+  chatRoomUi.includes("data-node-action"),
+  "Chat Room must expose runtime node block/cancel actions in shell mode",
+);
+assert(
+  chatRoomUi.includes("data-room-policy"),
+  "Chat Room must expose room policy controls in shell mode",
+);
+assert(
+  chatRoomUi.includes("show_access_controls"),
+  "Chat Room access controls must stay behind an explicit settings toggle",
+);
+assert(
+  chatRoomUi.includes("home:open-target"),
+  "Chat Room Attach must ask Home to open Library instead of directly opening host files in shell mode",
+);
+assert(
+  chatRoomUi.includes("Open Home to attach from Library."),
+  "Chat Room Attach must fail visibly when Home is unavailable",
+);
+assert(
+  !chatRoomUi.includes("attachment_input.click()"),
+  "Chat Room Attach must not open the host browser file picker",
+);
+assert(
+  chatRoomUi.includes('"returnTarget"') && chatRoomUi.includes('"attach"'),
+  "Chat Room Attach must launch Library in explicit attach mode",
+);
+assert(
+  chatRoomUi.includes("chat-room:attach-library-item"),
+  "Chat Room must accept Library picker results through Home delivery",
+);
+assert(
+  chatRoomUi.includes('"/session/leave"') &&
+    chatRoomUi.includes('"pagehide"') &&
+    chatRoomUi.includes('"beforeunload"') &&
+    chatRoomUi.includes('"keepalive"'),
+  "Chat Room shell close must send a scoped leave request before Home removes the capsule frame",
+);
+assert(
+  chatRoomUi.includes(
+    "summary.local_runtime_role.is_none() && !summary.browser_access_allowed",
+  ),
+  "Chat Room shell sessions must remain openable when guest requests are disabled for active members",
+);
+assert(
+  gatewayApi.includes('"/api/apps/chat-room/guests/:session_id/kick"'),
+  "Chat Room guest kicking must go through the gateway capacity-token API",
+);
+assert(
+  gatewayApi.includes('"/api/apps/chat-room/members/invite"'),
+  "Chat Room runtime node invites must go through the gateway capacity-token API",
+);
+assert(
+  gatewayApi.includes('"/api/apps/chat-room/members/remove"'),
+  "Chat Room runtime node blocking must go through the gateway capacity-token API",
+);
+assert(
+  !gatewayApi.includes("ProviderBridge::spawn"),
+  "Gateway must not spawn provider bridges directly",
+);
+assert(
+  !gatewayApi.includes("ipfs_provider_binary") &&
+    !gatewayApi.includes("ipfs_bridge"),
+  "Gateway must not keep a direct IPFS bridge fallback",
+);
+assert(
+  authGatewayApi.includes("admin passkey required to remove another passkey"),
+  "Passkey revocation must enforce admin authority in the runtime route",
+);
+assert(
+  authGatewayApi.includes(
+    "last admin passkey cannot be removed while guest passkeys remain",
+  ),
+  "Passkey revocation must not strand guest accounts without an admin",
+);
+assert(
+  gatewayApi.includes('"/api/auth/recovery/status"'),
+  "Principal-root recovery status must be a runtime auth route, not app-local state",
+);
+assert(
+  gatewayApi.includes('"/api/auth/recovery/export"') &&
+    gatewayApi.includes('"/api/auth/recovery/import"') &&
+    gatewayApi.includes('"/api/auth/recovery/full-export"') &&
+    gatewayApi.includes('"/api/auth/recovery/full-import"'),
+  "Recovery Kit import/export handlers must be wired as runtime auth routes",
+);
+assert(
+  recoveryKitLiveSmoke.includes("elastos.principal.root-recovery.status/v1"),
+  "Recovery Kit live smoke must validate the current runtime recovery-status schema",
+);
+assert(
+  gatewayTests.includes(
+    "test_recovery_kit_routes_create_export_and_import_password_package",
+  ),
+  "Recovery Kit route journey must be covered at the public gateway route layer",
+);
+assert(
+  gatewayTests.includes(
+    "test_recovery_kit_routes_prevent_admin_exporting_guest_kit",
+  ),
+  "Recovery Kit route coverage must prove admins cannot export another principal's kit",
+);
+assert(
+  authGatewayApi.includes("PrincipalRootRecoveryStatusV1::unprotected"),
+  "Recovery status must fail honest until encrypted roots and recovery kits exist",
+);
+assert(
+  authGatewayApi.includes("recovery_archive_from_kit") &&
+    authGatewayApi.includes("recovery_kit_from_archive"),
+  "Recovery Kit routes must store a principal-bound encrypted archive for later System downloads",
+);
+assert(
+  authContract.includes("PRINCIPAL_ROOT_PROTECTION_SCHEMA") &&
+    authContract.includes("RECOVERY_KIT_SCHEMA"),
+  "Auth contract must declare principal-root protection and recovery kit schemas",
+);
+assert(
+  authContract.includes("ml-kem-768") &&
+    authContract.includes("ml-dsa-65") &&
+    authContract.includes("slh-dsa"),
+  "Principal-root recovery contract must keep PQ-ready algorithm metadata",
+);
+assert(
+  authContract.includes(
+    "principal_root_protection_rejects_unknown_contract_fields_at_decode",
+  ) &&
+    authContract.includes(
+      "recovery_kit_import_request_rejects_unknown_nested_fields_at_decode",
+    ),
+  "Principal-root recovery contracts must reject unknown hidden fields at decode time",
+);
+assert(
+  authContract.includes("validate_principal_root_protector_kind_envelope") &&
+    authContract.includes(
+      "principal_root_protection_accepts_webauthn_prf_protector",
+    ) &&
+    authContract.includes(
+      "principal_root_protection_rejects_webauthn_prf_with_wrong_kdf",
+    ) &&
+    authContract.includes(
+      "principal_root_protection_rejects_archive_on_non_recovery_kit_protector",
+    ),
+  "WebAuthn PRF root protectors must stay distinct from generic Recovery Kit protectors",
+);
+assert(
+  authContract.includes("validate_principal_root_protector_subject") &&
+    authContract.includes(
+      "principal_root_protection_accepts_did_recovery_protector",
+    ) &&
+    authContract.includes(
+      "principal_root_protection_rejects_did_recovery_without_did_subject",
+    ) &&
+    authContract.includes(
+      "principal_root_protection_rejects_did_recovery_with_wrong_kdf",
+    ),
+  "DID recovery root protectors must carry DID-bound metadata and fail closed without a DID subject",
+);
+assert(
+  didProvider.includes("VerifyDidRecovery") &&
+    didProvider.includes("DID_RECOVERY_PROOF_SCHEMA") &&
+    didProvider.includes(
+      "test_verify_did_recovery_accepts_typed_did_key_proof",
+    ) &&
+    didProvider.includes(
+      "test_verify_did_recovery_rejects_did_elastos_until_resolver_exists",
+    ) &&
+    didProvider.includes(
+      "test_verify_did_recovery_rejects_noncanonical_root_binding",
+    ) &&
+    didProvider.includes("deny_unknown_fields") &&
+    didProvider.includes(
+      "test_did_provider_rejects_hidden_recovery_request_fields",
+    ) &&
+    didProvider.includes(
+      "test_did_provider_rejects_hidden_chat_signing_fields",
+    ) &&
+    didProviderManifest.includes("verify_did_recovery"),
+  "did-provider must keep typed did:key recovery-proof verification fail-closed and reject hidden authority fields until did:elastos resolver wiring exists",
+);
+assert(
+  authGatewayApi.includes("verify_did_recovery_import_proof") &&
+    authGatewayApi.includes("DID provider rejected the recovery proof") &&
+    authGatewayApi.includes(
+      "recovery_kit_import_consumes_matching_did_recovery_proof",
+    ) &&
+    authGatewayApi.includes(
+      "recovery_kit_import_rejects_unverified_did_recovery_proof",
+    ),
+  "Recovery Kit import must verify DID recovery proofs through did-provider and fail closed on invalid proofs",
+);
+assert(
+  runtimeAuth.includes(
+    'PRINCIPAL_ROOT_OBJECT_SCHEMA: &str = "elastos.principal-root.object/v1"',
+  ),
+  "Runtime auth must declare a versioned protected principal-root object envelope",
+);
+assert(
+  runtimeAuth.includes("struct PrincipalRootObjectEnvelopeV1") &&
+    runtimeAuth.includes("principal_root_object_aad"),
+  "Runtime auth must bind protected principal-root objects with envelope metadata and AAD",
+);
+assert(
+  runtimeAuth.includes("validate_principal_root_object_binding") &&
+    runtimeAuth.includes(
+      "principal-root object URI is outside the principal root",
+    ),
+  "Runtime auth must reject protected-object URI/root binding mismatches",
+);
+assert(
+  runtimeAuth.includes("protected principal-root object is not encrypted"),
+  "Protected principal roots must reject plaintext object reads",
+);
+assert(
+  storageHandler.includes("reject_principal_root_storage_path") &&
+    storageHandler.includes(
+      "principal-root storage requires a runtime principal-scoped provider route",
+    ),
+  "Generic localhost storage handlers must fail closed for Users roots without principal-scoped provider context",
+);
+assert(
+  storageHandler.includes(
+    "test_public_storage_rejects_users_root_without_principal_context",
+  ),
+  "Generic localhost storage handlers must have coverage proving Users roots are rejected without principal context",
+);
+assert(
+  storageHandler.split("Users/self").length - 1 === 1,
+  "Generic localhost storage tests must only mention Users/self in the explicit rejection case",
+);
+assert(
+  !capabilityHandler.includes("Users/self") &&
+    !providerResource.includes("Users/self"),
+  "Generic capability/provider-resource examples must not preserve shared Users/self storage examples",
+);
+assert(
+  !vmProvider.includes("Users/self"),
+  "VM provider path-shaping tests must not preserve shared Users/self storage examples",
+);
+assert(
+  gbaScript.includes("Users/self is a capsule-local alias resolved by Runtime"),
+  "GBA helper must explain Users/self as a runtime-scoped capsule alias",
+);
+assertProtectedPrincipalRootAccessor(
+  documentsProvider,
+  "fn documents_load_body(",
+  "read_principal_root_object(",
+  "Documents body reads",
+);
+assertProtectedPrincipalRootAccessor(
+  documentsProvider,
+  "fn documents_write_body(",
+  "write_principal_root_object(",
+  "Documents body writes",
+);
+assertProtectedPrincipalRootAccessor(
+  gatewayApi,
+  "fn home_browser_state(\n",
+  "read_principal_root_object(",
+  "Home browser state reads",
+);
+assertProtectedPrincipalRootAccessor(
+  gatewayApi,
+  "fn home_save_browser_state(",
+  "write_principal_root_object(",
+  "Home browser state writes",
+);
+assert(
+  gatewayApi.includes("is_unencrypted_home_browser_state") &&
+    gatewayTests.includes(
+      "test_home_browser_state_resets_plaintext_for_protected_principal_root",
+    ),
+  "Home must reset untrusted plaintext browser state for protected roots without accepting the plaintext",
+);
+assertProtectedPrincipalRootAccessor(
+  viewerGatewayApi,
+  "pub async fn viewer_storage_get(",
+  "read_principal_root_object(",
+  "Viewer/content storage reads",
+);
+assertProtectedPrincipalRootAccessor(
+  viewerGatewayApi,
+  "pub async fn viewer_storage_put(",
+  "write_principal_root_object(",
+  "Viewer/content storage writes",
+);
+assert(
+  chainProvider.includes("NODE_LIFECYCLE_STATE_SCHEMA") &&
+    chainProvider.includes("PersistedNodeLifecycleState"),
+  "Chain provider node lifecycle status must persist typed state instead of remaining request-local",
+);
+assert(
+  chainProvider.includes(
+    "node_lifecycle_state_survives_provider_reload_without_raw_rpc",
+  ),
+  "Chain provider lifecycle persistence must have a reload regression that does not expose raw RPC",
+);
+assert(
+  gatewayApi.includes('"sync_health"') &&
+    gatewayTests.includes(
+      "test_gateway_blocks_chain_proof_prepare_and_broadcast_routes",
+    ),
+  "Gateway must expose only read-only chain sync health to System and keep proof/prepare/broadcast blocked until a capability approval path exists",
+);
+assert(
+  chainProvider.includes('id: "base-mainnet"') &&
+    chainProvider.includes("chain_id: Some(8453)") &&
+    chainProvider.includes('"https://mainnet.base.org"'),
+  "Chain provider must include Base mainnet using the PC2 Base RPC default",
+);
+assert(
+  viewerGatewayApi.includes("principal_scoped_storage_uri") &&
+    viewerGatewayApi.includes("principal_localhost_root"),
+  "Viewer/content storage must resolve Users/self through the launch-token principal before hitting disk",
+);
+assert(
+  documentsProvider.includes("DocumentsClient::for_principal"),
+  "Documents provider clients must be bound to an explicit runtime principal",
+);
+assert(
+  documentsProvider.includes("documents_load_metadata_for_principal"),
+  "Documents provider must verify document ownership before document operations",
+);
+assert(
+  documentsProvider.includes("principal_localhost_root") &&
+    !documentsProvider.includes("Users/self/Documents"),
+  "Documents working copies must resolve through the runtime principal root, not shared Users/self storage",
+);
+assert(
+  documentsReadme.includes("signed Home launch-token principal"),
+  "Documents README must document provider requests as principal-scoped",
+);
+assert(
+  documentsReadme.includes("localhost://Users/<principal-root>/Documents/..."),
+  "Documents README must document the real working-copy root as the runtime principal root",
+);
+assert(
+  !documentsReadme.includes("localhost://Users/self/Documents"),
+  "Documents README must not present shared Users/self storage as the real working-copy path",
+);
+assert(
+  !notifications.includes("NATIVE_CHAT_ROOT_URI") &&
+    !notifications.includes("sync_native_chat_relay"),
+  "Notifications must not relay into shared native Chat Users/self storage without a principal",
+);
+assert(
+  carrierBridge.includes("scope_current_user_alias") &&
+    carrierBridge.includes("principal_context_required"),
+  "Capsule-kernel bridge must scope Users/self through a principal context or fail closed",
+);
+assert(
+  carrierBridge.includes("protected_principal_root_carrier_response") &&
+    carrierBridge.includes("write_principal_root_object("),
+  "Capsule-kernel bridge must route protected Users/self object writes through runtime principal-root encryption",
+);
+assert(
+  wasmProvider.includes("principal_id: Option<String>") &&
+    wasmProvider.includes("bridge_principals"),
+  "WASM bridge pipes must carry an explicit runtime principal context",
+);
+assert(
+  runtimeCore.includes("run_local_with_principal") &&
+    runtimeCore.includes("set_bridge_principal"),
+  "Runtime WASM launches must bind the launch principal before bridge startup",
+);
+assert(
+  runtimeCore.includes("self.run_local_with_principal(path, args, None).await"),
+  "Default runtime run_local must stay principal-less and fail closed for Users/self until a principal context is explicit",
+);
+assert(
+  apiRoutes.includes("reject_raw_launch_principal_id") &&
+    apiRoutes.includes("launch_principal_id_rejects_raw_values") &&
+    apiRoutes.includes(
+      "principal_launch_rejects_raw_principal_id_even_with_grant",
+    ),
+  "/api/capsules must reject raw principal_id authority even when it looks opaque or arrives beside a grant",
+);
+assert(
+  gatewayApi.includes(
+    '"launch_grant": issue_home_launch_token_with_context(data_dir, capsule_name, context)?',
+  ) &&
+    !gatewayApi.includes('"principal_id": context.principal_id.as_str()') &&
+    apiRoutes.includes("principal_launch_accepts_home_launch_grant") &&
+    apiRoutes.includes("principal_launch_rejects_wrong_app_grant"),
+  "Home runtime-backed launch must attach principals through a signed launch grant, not a raw principal_id",
+);
+assert(
+  apiRoutes.includes(
+    "principal_launch_rejects_grant_without_runtime_data_dir",
+  ) && serveCmd.includes("data_dir: Some(data_dir.clone())"),
+  "Managed runtime API must receive data_dir so /api/capsules can validate Home principal launch grants",
+);
+assert(
+  supervisorApi.includes("supervisor_launch_principal_from_input") &&
+    supervisorApi.includes("supervisor_launch_accepts_signed_launch_grant") &&
+    supervisorApi.includes("supervisor_launch_rejects_wrong_app_grant") &&
+    supervisorApi.includes(
+      "supervisor_launch_rejects_top_level_principal_authority",
+    ) &&
+    supervisorApi.includes(
+      "supervisor_launch_rejects_config_principal_authority",
+    ) &&
+    supervisorCore.includes(
+      "principal launch grants are only valid for shell-launchable capsules",
+    ) &&
+    supervisorCore.includes(
+      "test_launch_capsule_rejects_principal_for_provider_role",
+    ),
+  "Supervisor/microVM launch path must accept signed app-scoped launch grants, reject raw principal authority, and keep provider launches out of user scope",
+);
+assert(
+  runtimeControl.includes('"localhost://Users/*"') &&
+    !runtimeControl.includes(
+      '"localhost://Users/self/.AppData/LocalHost/Chat/*"',
+    ) &&
+    !runtimeControl.includes(
+      '"localhost://Users/self/.AppData/LocalHost/GBA/*"',
+    ),
+  "Managed runtime policy must allow principal roots, not shared Users/self paths",
+);
+assert(
+  carrierBridge.includes(
+    "localhost://Users roots must use Users/self or the active principal root",
+  ),
+  "Capsule-kernel bridge must reject explicit foreign principal roots",
+);
+assert(
+  gatewayApi.includes("let principal_id = context.principal_id.clone()") &&
+    gatewayApi.includes(
+      'request["principal_id"] = serde_json::Value::String(principal_id.clone())',
+    ),
+  "Gateway must inject the Home launch-token principal into Documents provider calls",
+);
+assert(
+  !homeCmd.includes("localhost://Users/self/.AppData/LocalHost/Chat") &&
+    homeCmd.includes(
+      "localhost://Users/<principal-root>/.AppData/LocalHost/Chat",
+    ),
+  "Home CLI root descriptors must describe principal-root Users storage, not shared Users/self examples",
+);
+assert(
+  !gatewayApi.includes("save_nickname(&state.data_dir, &req.handle)"),
+  "System handle updates must not use the device-global nickname path",
+);
+assert(
+  !gatewayApi.includes("load_nickname(data_dir)"),
+  "Home/System/Chat gateway identity must not use the device-global nickname path",
+);
+const gatewayActiveSession =
+  gatewayApi.match(
+    /struct GatewayActiveSessionSummary \{([\s\S]*?)\n\}/,
+  )?.[1] || "";
+assert(
+  gatewayActiveSession.includes("session_id: String"),
+  "Gateway summaries must expose only a public active-session id",
+);
+assert(
+  !gatewayActiveSession.includes("token:"),
+  "Gateway summaries must not expose room session tokens",
+);
+assert(
+  shellCore.includes("desktopIconsVisible: true"),
+  "Home layout state must track global desktop icon visibility",
+);
+assert(
+  shellSurface.includes('action: "toggle-desktop-icons"'),
+  "Home desktop menu must expose desktop icon visibility",
+);
+assert(
+  !shellSurface.includes('label: "Go Home"'),
+  "Home desktop menu must not expose redundant Go Home",
+);
+assert(
+  !shellSurface.includes('label: "Open Launcher"'),
+  "Home desktop menu must not expose redundant Open Launcher",
+);
+assert(
+  !shellSurface.includes('label: "Open System"'),
+  "Home desktop menu must not expose redundant Open System",
+);
+assert(
+  !shellCmd.includes("Legacy fields"),
+  "Runtime coords must not preserve legacy token fields",
+);
+const runtimeCoordsBlock =
+  shellCmd.match(/pub struct RuntimeCoords \{([\s\S]*?)\n\}/)?.[1] || "";
+assert(
+  !runtimeCoordsBlock.includes("shell_token") &&
+    !runtimeCoordsBlock.includes("client_token"),
+  "Runtime coords must only persist attach_secret, not bearer tokens",
+);
+assert(
+  !operatorControl.includes("struct RuntimeCoords"),
+  "Operator control must use canonical shell_cmd runtime coords",
+);
+assert(
+  operatorControl.includes(
+    "crate::runtime_control::read_operator_runtime_coords",
+  ),
+  "Operator control must use canonical runtime coord validation",
+);
+assert(
+  !operatorControl.includes("async fn attach_secret_matches"),
+  "Operator control must not duplicate attach-secret validation",
+);
+assert(
+  debugPolicy.includes("# Debugging Policy"),
+  "Root DEBUG.md must stay a stable developer policy, not a work log",
+);
+assert(
+  !debugPolicy.includes("pc2-shell") && !debugPolicy.includes("md-viewer"),
+  "Root DEBUG.md must not preserve stale route history",
+);
 
 const components = JSON.parse(read("components.json"));
 const homeProfile = new Set(components.profiles.home.components);
-for (const component of ["home", "system", "documents", "library", "inbox"]) {
-  assert(homeProfile.has(component), `Home profile must install first-party ${component} assets`);
-  assert(components.external[component], `${component} must be a first-party external setup asset`);
+for (const component of [
+  "net-provider",
+  "exit-provider",
+  "browser-engine-adapter",
+  "browser-engine-supervisor",
+  "browser-native-proxy-engine",
+  "browser-stream-bridge",
+  "browser-local-exit",
+]) {
+  assert(homeProfile.has(component), `Home profile must install ${component}`);
+  assert(
+    components.external[component],
+    `${component} must be a first-party external setup asset`,
+  );
+  assert(
+    publishReleaseScript.includes(`    ${component}\n`),
+    `publish-release must include ${component} in support binary assets`,
+  );
   for (const platform of ["linux-amd64", "linux-arm64"]) {
-    const metadata = components.external[component].platforms[platform] || components.external[component].platforms["*"];
-    assert(metadata?.release_path && metadata?.extract_path, `${component} must publish archive metadata for ${platform}`);
+    const metadata =
+      components.external[component].platforms[platform] ||
+      components.external[component].platforms["*"];
+    assert(
+      metadata?.release_path,
+      `${component} must publish binary metadata for ${platform}`,
+    );
+  }
+}
+for (const component of ["home", "system", "documents", "library", "inbox"]) {
+  assert(
+    homeProfile.has(component),
+    `Home profile must install first-party ${component} assets`,
+  );
+  assert(
+    components.external[component],
+    `${component} must be a first-party external setup asset`,
+  );
+  for (const platform of ["linux-amd64", "linux-arm64"]) {
+    const metadata =
+      components.external[component].platforms[platform] ||
+      components.external[component].platforms["*"];
+    assert(
+      metadata?.release_path && metadata?.extract_path,
+      `${component} must publish archive metadata for ${platform}`,
+    );
   }
 }
 
@@ -414,120 +1933,3500 @@ const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/index.html");
 const gbaStyle = read("capsules/gba-emulator/style.css");
 const gbaJs = read("capsules/gba-emulator/emulator.js");
-const gbaScript = read("scripts/gba.sh");
 const system = read("capsules/system/browser/index.html");
+const systemJs = read("capsules/system/browser/system.js");
 const systemStyle = read("capsules/system/browser/style.css");
-assert(!documents.includes("home:open-uri"), "Documents published URI sharing must copy the elastos:// link, not reopen itself");
-assert(documents.includes("/api/provider/documents/"), "Documents must use the runtime documents provider API");
-assert(documents.includes('"x-elastos-home-token"'), "Documents provider API calls must carry the Home capacity token");
-assert(!documents.includes("/ipfs/"), "Documents capsule must not call direct IPFS HTTP routes");
-assert(!documents.includes("IpfsBridge"), "Documents capsule must not instantiate IPFS directly");
-assert(!documents.includes("ipfs-provider"), "Documents capsule must not know provider-specific IPFS errors");
-assert(documents.includes("item.latest_published_cid === requestedCid"), "Documents shell CID launches must resolve local published documents before public CID loading");
-assert(documents.includes('id="copy-published-link"'), "Documents published URI must be copied from the toolbar action row");
-assert(documents.includes("navigator.clipboard.writeText"), "Documents Copy link must write the elastos:// URI to the clipboard");
-assert(!documents.includes("Open elastos://"), "Documents must not label published URIs as an Open action");
-assert(documents.includes("confirmInCapsule"), "Documents destructive actions must use in-surface confirmation");
-assert(!documents.includes("window.confirm"), "Documents must not use browser confirm for destructive actions");
-assert(!documents.includes("object-uri-pill"), "Documents shell must not render a duplicate document URI pill");
-assert(!documents.includes("published-pill"), "Documents shell must not render a duplicate published CID pill");
-assert(!documents.includes("document-list-badge"), "Documents list must not use a text Published badge");
-assert(documents.includes("document-list-published-icon"), "Documents list must show published state with an icon");
-assert(documents.includes("document-list-item.published"), "Documents published rows must be visually distinct");
-assert(documents.includes('aria-label="New document"'), "Documents create control must keep an accessible label");
-assert(documents.includes("sidebar-controls"), "Documents create/search controls must share one compact row");
-assert(!documents.includes('id="documents-count"'), "Documents sidebar must not render a duplicate document count");
-assert(!documents.includes("sidebar-meta-label"), "Documents sidebar must not render duplicate section labels");
-assert(!documents.includes("Start writing, then save."), "Documents must not show redundant draft instruction copy");
-assert(!documents.includes("meta-pill"), "Documents must not use generic pill chrome for document state");
-assert(!documents.includes("local-state-chip"), "Documents shell must not render duplicate draft state under the title");
-assert(!documents.includes("updated-text"), "Documents shell must not render duplicate last-saved text under the title");
-assert(!documents.includes("Delete document?"), "Documents delete confirmation must not repeat a modal title");
-assert(documents.includes('class="action-primary action-icon-button"'), "Documents primary action must use compact icon buttons");
-assert(documents.includes('aria-label="Save"'), "Documents Save icon button must keep an accessible label");
-assert(documents.includes('aria-label="Hide list"'), "Documents Hide list icon button must keep an accessible label");
-assert(documents.includes(".page-shell {\n    padding: 0;"), "Documents mobile shell must not add an extra outer gutter");
-assert(documents.includes(".documents-main,\n  .share-main {\n    padding: 0.38rem;"), "Documents mobile panels must use compact padding");
-assert(inbox.includes("button.dataset.actionId = actionId;"), "Inbox actions must expose stable action ids");
-assert(inbox.includes("home:open-target"), "Inbox source-app opens must use Home orchestration");
-assert(inbox.includes("min-height: 100dvh;"), "Inbox must use dynamic viewport height");
-assert(inbox.includes("padding: 4px;") && inbox.includes("border-radius: 14px;"), "Inbox mobile panels must use compact Home-aligned spacing");
-assert(library.includes("home:open-target"), "Library opens must use Home orchestration");
-assert(library.includes("home:deliver-to-target"), "Library picker returns must use Home orchestration");
-assert(library.includes("home:close-self"), "Library picker must close itself through Home after a successful attach");
-assert(library.includes("chat-room:attach-library-item"), "Library must return selected documents using the Chat Room attach contract");
-assert(library.includes("Publish the document before attaching it."), "Library must fail clearly when a draft is selected for Chat Room attachment");
-assert(library.includes("data-attach-uri"), "Library attach mode must expose published URI selection state");
-assert(!library.includes("entry-details"), "Library cards must not expose raw technical detail drawers");
-assert(!library.includes("Working copy") && !library.includes("Published revision"), "Library cards must not show raw storage addresses by default");
-assert(library.includes("min-height: 100dvh;"), "Library must use dynamic viewport height");
-assert(library.includes(".toolbar {\n        display: grid;"), "Library toolbar must stack on narrow screens");
-assert(library.includes("padding: 4px;") && library.includes("border-radius: 14px;"), "Library mobile panels must use compact Home-aligned spacing");
-assert(chatStyle.includes("width: 100%;") && chatStyle.includes("padding-top: 0.35rem;"), "Chat Room mobile shell must avoid nested browser gutters");
-assert(chatStyle.includes("border-radius: 0.82rem;") && chatStyle.includes("padding: 0.48rem;"), "Chat Room mobile cards must use compact Home-aligned spacing");
-assert(gba.includes('aria-label="D-pad up, keyboard Arrow Up"'), "GBA directional controls must expose keyboard mapping labels");
-assert(gba.includes('aria-label="Save state slot 1"'), "GBA save slots must expose slot-specific labels");
-assert(gba.includes('aria-label="Load state slot 1"'), "GBA load slots must expose slot-specific labels");
-assert(gba.includes("Insert Game"), "GBA empty state must use the concise Insert Game copy");
-assert(gbaStyle.includes("--control-size: clamp(2.75rem, 13vw, 3.25rem);"), "GBA mobile d-pad buttons must stay touch-sized");
-assert(gbaStyle.includes("grid-template-areas:") && gbaStyle.includes('"left select start right"') && gbaStyle.includes('"dpad dpad actions actions"'), "GBA mobile controls must place Select/Start in the L/R row");
-assert(gbaStyle.includes(".shoulder-buttons,\n  .controls-row {\n    display: contents;"), "GBA mobile controls must let the full controller share one grid");
-assert(gbaStyle.includes("#btn-select {\n    grid-area: select;") && gbaStyle.includes("#btn-start {\n    grid-area: start;"), "GBA mobile Select/Start must be direct grid items in the shoulder row");
-assert(gbaStyle.includes("grid-area: left;\n    width: 100%;") && gbaStyle.includes("grid-area: right;\n    width: 100%;"), "GBA mobile L/R controls must be full shoulder targets, not content-width dots");
-assert(gbaStyle.includes("#screen-container:focus"), "GBA screen focus must not show a browser outline");
-assert(gbaStyle.includes("grid-template-rows: auto auto;"), "GBA mobile screen must not be starved by a flexible row");
-assert(gbaStyle.includes("touch-action: none;"), "GBA virtual controls must own touch gestures");
-assert(gbaStyle.includes("width: max-content;"), "GBA mobile collapsed Options must be a small centered Show control");
-assert(gbaStyle.includes("max-height: min(8.25rem, 22dvh);"), "GBA mobile expanded Options must stay compact");
-assert(gbaStyle.includes("grid-template-columns: repeat(3, minmax(0, 1fr));"), "GBA mobile save slots must use one row");
-assert(gbaStyle.includes(".shell {\n    width: 100%;\n    padding: 0.2rem;"), "GBA mobile shell must not waste viewport on outer gutters");
-assert(gbaStyle.includes(".screen-card {\n    grid-template-rows: auto auto;\n    align-content: start;\n    padding: 0.38rem;"), "GBA mobile screen card must keep compact chrome");
-assert(gbaJs.includes("activeInputPointers"), "GBA touch controls must track pointer-specific presses");
-assert(gbaJs.includes("pointerdown") && gbaJs.includes("pointerup"), "GBA controls must use a single pointer-event input path");
-assert(!gbaJs.includes("touchstart") && !gbaJs.includes("mousedown"), "GBA controls must not mix touch and mouse input handlers");
-assert(gbaJs.includes("syncUtilityDefaultForViewport"), "GBA Options must collapse automatically on compact viewports");
-assert(gbaJs.includes("assertEmulatorRuntimeSupported"), "GBA startup must preflight threaded WebAssembly support before mGBA init");
-assert(gbaJs.includes("EMULATOR_INIT_TIMEOUT_MS"), "GBA startup must fail visibly instead of hanging during mGBA init");
-assert(gbaJs.includes("SharedArrayBuffer"), "GBA startup must explicitly guard WebAssembly thread requirements");
-assert(gbaJs.includes("This device cannot run the current GBA engine"), "GBA unsupported-runtime copy must explain WebAssembly thread requirements");
-assert(gbaJs.includes("Insert Game") && !gbaJs.includes("Choose an installed ROM"), "GBA runtime copy must stay concise");
-assert(gbaScript.includes('echo "  X              A button"'), "GBA launcher help must match the emulator X -> A mapping");
-assert(gbaScript.includes('echo "  Z              B button"'), "GBA launcher help must match the emulator Z -> B mapping");
-assert(!gbaScript.includes('echo "  Z              A button"') && !gbaScript.includes('echo "  X              B button"'), "GBA launcher help must not preserve the old inverted action mapping");
-assert(!system.includes("<dt>Overlay</dt>"), "System overlay controls must live inside the Background box");
-assert(system.includes('class="system-inline-row background-actions"'), "System background image actions must stay in one row");
-assert(system.includes("background-overlay-panel"), "System overlay controls must be integrated into the Background control panel");
-assert(system.indexOf('id="background-preview"') < system.indexOf('id="background-overlay"'), "System background preview and overlay controls must share one field flow");
-assert(systemStyle.includes("body {\n    padding: 0.2rem;") && systemStyle.includes("padding: 0.48rem;"), "System mobile panel must use compact Home-aligned spacing");
+const walletMetamask = read("capsules/wallet-metamask/index.html");
+const walletMetamaskJs = read("capsules/wallet-metamask/wallet-metamask.js");
+const walletUnisat = read("capsules/wallet-unisat/index.html");
+const walletUnisatJs = read("capsules/wallet-unisat/wallet-unisat.js");
+const wallet = read("capsules/wallet/index.html");
+const walletJs = readAll([
+  "capsules/wallet/wallet.js",
+  "capsules/wallet/wallet-account-actions.js",
+  "capsules/wallet/wallet-activity.js",
+  "capsules/wallet/wallet-api.js",
+  "capsules/wallet/wallet-create-account-flow.js",
+  "capsules/wallet/wallet-flows.js",
+  "capsules/wallet/wallet-format.js",
+  "capsules/wallet/wallet-preferences.js",
+  "capsules/wallet/wallet-receive-flow.js",
+  "capsules/wallet/wallet-requests.js",
+  "capsules/wallet/wallet-render.js",
+  "capsules/wallet/wallet-send-flow.js",
+  "capsules/wallet/wallet-state.js",
+]);
+const walletStyle = read("capsules/wallet/style.css");
+const browserManifest = read("capsules/browser/capsule.json");
+const browser = read("capsules/browser/index.html");
+const browserJs = readAll([
+  "capsules/browser/browser.js",
+  "capsules/browser/browser-clipboard.js",
+  "capsules/browser/browser-history.js",
+  "capsules/browser/browser-input.js",
+  "capsules/browser/browser-input-surface.js",
+  "capsules/browser/browser-location.js",
+  "capsules/browser/browser-remote-display.js",
+  "capsules/browser/browser-runtime-api.js",
+  "capsules/browser/browser-status.js",
+  "capsules/browser/browser-webrtc.js",
+]);
+const browserStyle = read("capsules/browser/style.css");
+assert(
+  browserJs.includes(
+    "window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload",
+  ) &&
+    browserJs.includes("window.__elastosBrowserCurrentPageId") &&
+    gatewayApi.includes('"/api/apps/browser/pages/:page_id/close"') &&
+    gatewayBrowserApi.includes("pub(super) async fn browser_app_page_close") &&
+    gatewayBrowserRouteTests.includes(
+      "/api/apps/browser/pages/page%3Amock-browser-engine/close",
+    ),
+  "Browser must expose only its same-origin hosted-page release hook/current page id to Home and the gateway must route close_page so iframe teardown can release singleton providers",
+);
+const walletWalletconnect = read("capsules/wallet-walletconnect/index.html");
+const walletWalletconnectJs = read(
+  "capsules/wallet-walletconnect/wallet-walletconnect.js",
+);
+const homeSmoke = read("scripts/home-camofox-smoke.mjs");
+const systemSmoke = read("scripts/system-camofox-smoke.mjs");
+const homeVirtualAuthSmoke = read(
+  "scripts/home-passkey-virtual-auth-smoke.mjs",
+);
+const authWalletSmoke = read("scripts/auth-wallet-focus-smoke.sh");
+const walletconnectVendorScript = read(
+  "scripts/vendor-walletconnect-adapter.sh",
+);
+const walletconnectConfigScript = read(
+  "scripts/configure-walletconnect-connector.mjs",
+);
+const walletconnectConfigSmoke = read(
+  "scripts/walletconnect-connector-config-smoke.sh",
+);
+const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
+const systemAssetVersion = "system-20260525a";
+const shellAuth = read("capsules/home/browser/shell-auth.js");
+const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
+assert(
+  !documents.includes("home:open-uri"),
+  "Documents published URI sharing must copy the elastos:// link, not reopen itself",
+);
+assert(
+  documents.includes("/api/provider/documents/"),
+  "Documents must use the runtime documents provider API",
+);
+assert(
+  documents.includes('"x-elastos-home-token"'),
+  "Documents provider API calls must carry the Home capacity token",
+);
+assert(
+  !documents.includes("/ipfs/"),
+  "Documents capsule must not call direct IPFS HTTP routes",
+);
+assert(
+  !documents.includes("IpfsBridge"),
+  "Documents capsule must not instantiate IPFS directly",
+);
+assert(
+  !documents.includes("ipfs-provider"),
+  "Documents capsule must not know provider-specific IPFS errors",
+);
+assert(
+  documents.includes("item.latest_published_cid === requestedCid"),
+  "Documents shell CID launches must resolve local published documents before public CID loading",
+);
+assert(
+  documents.includes('id="copy-published-link"'),
+  "Documents published URI must be copied from the toolbar action row",
+);
+assert(
+  documents.includes("navigator.clipboard.writeText"),
+  "Documents Copy link must write the elastos:// URI to the clipboard",
+);
+assert(
+  !documents.includes("Open elastos://"),
+  "Documents must not label published URIs as an Open action",
+);
+assert(
+  documents.includes("confirmInCapsule"),
+  "Documents destructive actions must use in-surface confirmation",
+);
+assert(
+  !documents.includes("window.confirm"),
+  "Documents must not use browser confirm for destructive actions",
+);
+assert(
+  !documents.includes("object-uri-pill"),
+  "Documents shell must not render a duplicate document URI pill",
+);
+assert(
+  !documents.includes("published-pill"),
+  "Documents shell must not render a duplicate published CID pill",
+);
+assert(
+  !documents.includes("document-list-badge"),
+  "Documents list must not use a text Published badge",
+);
+assert(
+  documents.includes("document-list-published-icon"),
+  "Documents list must show published state with an icon",
+);
+assert(
+  documents.includes("document-list-item.published"),
+  "Documents published rows must be visually distinct",
+);
+assert(
+  documents.includes('aria-label="New document"'),
+  "Documents create control must keep an accessible label",
+);
+assert(
+  documents.includes("sidebar-controls"),
+  "Documents create/search controls must share one compact row",
+);
+assert(
+  !documents.includes('id="documents-count"'),
+  "Documents sidebar must not render a duplicate document count",
+);
+assert(
+  !documents.includes("sidebar-meta-label"),
+  "Documents sidebar must not render duplicate section labels",
+);
+assert(
+  !documents.includes("Start writing, then save."),
+  "Documents must not show redundant draft instruction copy",
+);
+assert(
+  !documents.includes("meta-pill"),
+  "Documents must not use generic pill chrome for document state",
+);
+assert(
+  !documents.includes("local-state-chip"),
+  "Documents shell must not render duplicate draft state under the title",
+);
+assert(
+  !documents.includes("updated-text"),
+  "Documents shell must not render duplicate last-saved text under the title",
+);
+assert(
+  !documents.includes("Delete document?"),
+  "Documents delete confirmation must not repeat a modal title",
+);
+assert(
+  documents.includes('class="action-primary action-icon-button"'),
+  "Documents primary action must use compact icon buttons",
+);
+assert(
+  documents.includes('aria-label="Save"'),
+  "Documents Save icon button must keep an accessible label",
+);
+assert(
+  documents.includes('aria-label="Hide list"'),
+  "Documents Hide list icon button must keep an accessible label",
+);
+assert(
+  documents.includes(".page-shell {\n    padding: 0;"),
+  "Documents mobile shell must not add an extra outer gutter",
+);
+assert(
+  documents.includes(
+    ".documents-main,\n  .share-main {\n    padding: 0.38rem;",
+  ),
+  "Documents mobile panels must use compact padding",
+);
+assert(
+  inbox.includes("button.dataset.actionId = actionId;"),
+  "Inbox actions must expose stable action ids",
+);
+assert(
+  inbox.includes("home:open-target"),
+  "Inbox source-app opens must use Home orchestration",
+);
+assert(
+  inbox.includes("Review in Wallet") &&
+    inbox.includes("wallet_request: requestId") &&
+    walletJs.includes('readQueryParam("wallet_request")') &&
+    walletJs.includes("wallet-request-focused"),
+  "Inbox wallet approval notifications must deep-link to Wallet request review instead of executing signing authority in Inbox",
+);
+assert(
+  inbox.includes("capability-approve-request:") &&
+    inbox.includes("capability-deny-request:") &&
+    inbox.includes("wallet-price-http-approve:") &&
+    inbox.includes("wallet-price-http-deny:") &&
+    gatewayApi.includes("append_runtime_capability_notifications") &&
+    gatewayApi.includes("/api/capability/pending") &&
+    gatewayTests.includes(
+      "test_capsule_capability_requests_render_as_inbox_notifications",
+    ),
+  "Capsule capability and approved external HTTP requests must surface in Inbox with approve/deny actions",
+);
+assert(
+  inbox.includes("min-height: 100dvh;"),
+  "Inbox must use dynamic viewport height",
+);
+assert(
+  inbox.includes("padding: 4px;") && inbox.includes("border-radius: 14px;"),
+  "Inbox mobile panels must use compact Home-aligned spacing",
+);
+assert(
+  library.includes("home:open-target"),
+  "Library opens must use Home orchestration",
+);
+assert(
+  library.includes("home:deliver-to-target"),
+  "Library picker returns must use Home orchestration",
+);
+assert(
+  library.includes("home:close-self"),
+  "Library picker must close itself through Home after a successful attach",
+);
+assert(
+  library.includes("chat-room:attach-library-item"),
+  "Library must return selected documents using the Chat Room attach contract",
+);
+assert(
+  library.includes("Publish the document before attaching it."),
+  "Library must fail clearly when a draft is selected for Chat Room attachment",
+);
+assert(
+  library.includes("data-attach-uri"),
+  "Library attach mode must expose published URI selection state",
+);
+assert(
+  !library.includes("entry-details"),
+  "Library cards must not expose raw technical detail drawers",
+);
+assert(
+  !library.includes("Working copy") && !library.includes("Published revision"),
+  "Library cards must not show raw storage addresses by default",
+);
+assert(
+  library.includes("min-height: 100dvh;"),
+  "Library must use dynamic viewport height",
+);
+assert(
+  library.includes(".toolbar {\n        display: grid;"),
+  "Library toolbar must stack on narrow screens",
+);
+assert(
+  library.includes("padding: 4px;") && library.includes("border-radius: 14px;"),
+  "Library mobile panels must use compact Home-aligned spacing",
+);
+assert(
+  chatStyle.includes("width: 100%;") &&
+    chatStyle.includes("padding-top: 0.35rem;"),
+  "Chat Room mobile shell must avoid nested browser gutters",
+);
+assert(
+  chatStyle.includes("border-radius: 0.82rem;") &&
+    chatStyle.includes("padding: 0.48rem;"),
+  "Chat Room mobile cards must use compact Home-aligned spacing",
+);
+assert(
+  gba.includes('aria-label="D-pad up, keyboard Arrow Up"'),
+  "GBA directional controls must expose keyboard mapping labels",
+);
+assert(
+  gba.includes('aria-label="Save state slot 1"'),
+  "GBA save slots must expose slot-specific labels",
+);
+assert(
+  gba.includes('aria-label="Load state slot 1"'),
+  "GBA load slots must expose slot-specific labels",
+);
+assert(
+  gba.includes("Insert Game"),
+  "GBA empty state must use the concise Insert Game copy",
+);
+assert(
+  gbaStyle.includes("--control-size: clamp(2.75rem, 13vw, 3.25rem);"),
+  "GBA mobile d-pad buttons must stay touch-sized",
+);
+assert(
+  gbaStyle.includes("grid-template-areas:") &&
+    gbaStyle.includes('"left select start right"') &&
+    gbaStyle.includes('"dpad dpad actions actions"'),
+  "GBA mobile controls must place Select/Start in the L/R row",
+);
+assert(
+  gbaStyle.includes(
+    ".shoulder-buttons,\n  .controls-row {\n    display: contents;",
+  ),
+  "GBA mobile controls must let the full controller share one grid",
+);
+assert(
+  gbaStyle.includes("#btn-select {\n    grid-area: select;") &&
+    gbaStyle.includes("#btn-start {\n    grid-area: start;"),
+  "GBA mobile Select/Start must be direct grid items in the shoulder row",
+);
+assert(
+  gbaStyle.includes("grid-area: left;\n    width: 100%;") &&
+    gbaStyle.includes("grid-area: right;\n    width: 100%;"),
+  "GBA mobile L/R controls must be full shoulder targets, not content-width dots",
+);
+assert(
+  gbaStyle.includes("#screen-container:focus"),
+  "GBA screen focus must not show a browser outline",
+);
+assert(
+  gbaStyle.includes("grid-template-rows: auto auto;"),
+  "GBA mobile screen must not be starved by a flexible row",
+);
+assert(
+  gbaStyle.includes("touch-action: none;"),
+  "GBA virtual controls must own touch gestures",
+);
+assert(
+  gbaStyle.includes("width: max-content;"),
+  "GBA mobile collapsed Options must be a small centered Show control",
+);
+assert(
+  gbaStyle.includes("max-height: min(8.25rem, 22dvh);"),
+  "GBA mobile expanded Options must stay compact",
+);
+assert(
+  gbaStyle.includes("grid-template-columns: repeat(3, minmax(0, 1fr));"),
+  "GBA mobile save slots must use one row",
+);
+assert(
+  gbaStyle.includes(".shell {\n    width: 100%;\n    padding: 0.2rem;"),
+  "GBA mobile shell must not waste viewport on outer gutters",
+);
+assert(
+  gbaStyle.includes(
+    ".screen-card {\n    grid-template-rows: auto auto;\n    align-content: start;\n    padding: 0.38rem;",
+  ),
+  "GBA mobile screen card must keep compact chrome",
+);
+assert(
+  gbaJs.includes("activeInputPointers"),
+  "GBA touch controls must track pointer-specific presses",
+);
+assert(
+  gbaJs.includes("pointerdown") && gbaJs.includes("pointerup"),
+  "GBA controls must use a single pointer-event input path",
+);
+assert(
+  !gbaJs.includes("touchstart") && !gbaJs.includes("mousedown"),
+  "GBA controls must not mix touch and mouse input handlers",
+);
+assert(
+  gbaJs.includes("syncUtilityDefaultForViewport"),
+  "GBA Options must collapse automatically on compact viewports",
+);
+assert(
+  gbaJs.includes("assertEmulatorRuntimeSupported"),
+  "GBA startup must preflight threaded WebAssembly support before mGBA init",
+);
+assert(
+  gbaJs.includes("EMULATOR_INIT_TIMEOUT_MS"),
+  "GBA startup must fail visibly instead of hanging during mGBA init",
+);
+assert(
+  gbaJs.includes("SharedArrayBuffer"),
+  "GBA startup must explicitly guard WebAssembly thread requirements",
+);
+assert(
+  gbaJs.includes("This device cannot run the current GBA engine"),
+  "GBA unsupported-runtime copy must explain WebAssembly thread requirements",
+);
+assert(
+  gbaJs.includes("Insert Game") && !gbaJs.includes("Choose an installed ROM"),
+  "GBA runtime copy must stay concise",
+);
+assert(
+  gbaScript.includes('echo "  X              A button"'),
+  "GBA launcher help must match the emulator X -> A mapping",
+);
+assert(
+  gbaScript.includes('echo "  Z              B button"'),
+  "GBA launcher help must match the emulator Z -> B mapping",
+);
+assert(
+  !gbaScript.includes('echo "  Z              A button"') &&
+    !gbaScript.includes('echo "  X              B button"'),
+  "GBA launcher help must not preserve the old inverted action mapping",
+);
+assert(
+  !system.includes("<dt>Overlay</dt>"),
+  "System overlay controls must live inside the Background box",
+);
+assert(
+  system.includes('<h2 id="account-title">Account</h2>'),
+  "System must lead with Account, not runtime diagnostics",
+);
+assert(
+  system.includes(`style.css?v=${systemAssetVersion}`) &&
+    system.includes(`system.js?v=${systemAssetVersion}`),
+  "System browser assets must be cache-busted after UI changes",
+);
+assert(
+  !system.includes("wallet-create") && !system.includes("Approval requests"),
+  "System Advanced must not duplicate Wallet accounts or Wallet/Inbox approval review",
+);
+const systemBootBlock = sourceBlock(
+  systemJs,
+  "async function boot()",
+  "System boot",
+);
+const systemPasskeyConfigBlock = sourceBlock(
+  systemJs,
+  "function configurePasskeyAccess()",
+  "System passkey setup",
+);
+assert(
+  systemBootBlock.indexOf("await refreshSystemSummary();") >= 0 &&
+    systemBootBlock.indexOf("await refreshAccountList().catch(() => {});") >
+      systemBootBlock.indexOf("await refreshSystemSummary();"),
+  "System must load access role before rendering account admin actions",
+);
+assert(
+  !systemPasskeyConfigBlock.includes("refreshAccountList()"),
+  "System must not render accounts before access role is known",
+);
+assert(
+  system.includes('<h2 id="appearance-title">Appearance</h2>'),
+  "System must keep appearance as a first-class settings area",
+);
+assert(
+  system.includes('<h2 id="advanced-title">Advanced</h2>'),
+  "System must collapse technical runtime details under Advanced",
+);
+assert(
+  !system.includes('<h2 id="identity-title">Profile</h2>') &&
+    !system.includes('<h2 id="status-title">Local state</h2>') &&
+    !system.includes('<h2 id="access-title">Access</h2>') &&
+    !system.includes('<h2 id="networks-title">Networks</h2>'),
+  "System must not preserve the old Profile/Local state/Access/Networks dashboard structure",
+);
+const staleSystemIdentityLabel = "<dt>Runtime " + "identity</dt>";
+assert(
+  !system.includes(staleSystemIdentityLabel),
+  "System must not label the device DID as runtime identity",
+);
+assert(
+  system.includes("<dt>Device identity</dt>"),
+  "System must label the DID as device identity",
+);
+assert(
+  system.indexOf('<h2 id="advanced-title">Advanced</h2>') <
+    system.indexOf("<dt>Device identity</dt>"),
+  "System device DID must live under Advanced, not the primary account surface",
+);
+assert(
+  system.includes("<dt>Accounts</dt>") &&
+    !system.includes("<dt>Access keys</dt>") &&
+    !system.includes("<dt>Passkeys</dt>"),
+  "System must show accounts as the user-facing ontology",
+);
+assert(
+  systemJs.includes("function accountRow(") &&
+    systemStyle.includes(".account-table"),
+  "System accounts must render as a responsive table instead of a long card list",
+);
+assert(
+  system.includes("<dt>Name</dt>") &&
+    !system.includes("<dt>Handle</dt>") &&
+    system.includes('placeholder="Your name"'),
+  "System Account must use local display-name language, not global handle language",
+);
+assert(
+  !system.includes('id="passkey-name"') &&
+    !system.includes("Create guest") &&
+    !system.includes('id="passkey-signin"'),
+  "System must not create guest passkeys; guests self-register from Home when enrollment is open",
+);
+assert(
+  system.includes("Lets new people create their own guest account from Home."),
+  "System guest policy copy must say admins open enrollment, not create guest keys",
+);
+assert(
+  !system.includes("Passkeys unlock Home and scope app access."),
+  "System must not show stale internal passkey explainer copy",
+);
+assert(
+  system.includes('id="account-list"'),
+  "System must expose account management through the existing passkey provider routes",
+);
+assert(
+  system.includes("<dt>Guest access</dt>"),
+  "System must expose the admin-controlled guest enrollment gate",
+);
+assert(
+  systemJs.includes("guest_registration_enabled"),
+  "System must render guest enrollment from runtime auth state",
+);
+assert(
+  !systemJs.includes("navigator.credentials.get") ||
+    (systemJs.includes("requestFreshPasskeyHomeToken") &&
+      systemJs.includes("/api/auth/recovery/full-export") &&
+      systemJs.includes("elastos.full-recovery-bundle.export.request/v1")),
+  "System must not duplicate general Home sign-in; fresh passkey verification is allowed only for Full Recovery Bundle export",
+);
+assert(
+  !systemJs.includes("navigator.credentials.create") &&
+    !systemJs.includes("serializeCreatedCredential"),
+  "System must not create guest passkeys for other people",
+);
+assert(
+  !systemJs.includes('showPasskeyStatus("Signed in"'),
+  "System must not show redundant Signed in passkey status",
+);
+assert(
+  systemJs.includes("protectsLastAdmin"),
+  "System passkey UI must reflect the runtime last-admin protection rule",
+);
+assert(
+  systemJs.includes("data-passkey-promote") &&
+    systemJs.includes("promote-admin") &&
+    gatewayApi.includes("/api/auth/passkeys/:proof_binding_id/promote-admin"),
+  "System must expose admin-only guest passkey promotion through a runtime auth route",
+);
+assert(
+  systemJs.includes("data-passkey-demote") &&
+    systemJs.includes("demote-guest") &&
+    systemJs.includes("Make guest") &&
+    gatewayApi.includes("/api/auth/passkeys/:proof_binding_id/demote-guest"),
+  "System must expose admin-only admin-to-guest demotion through a runtime auth route",
+);
+assert(
+  systemJs.includes('passkeyRole === "admin" && !passkey.current'),
+  "System must only show demotion for another admin passkey",
+);
+assert(
+  !systemJs.includes('showRecoveryStatus("Ready"'),
+  "System Account must not show redundant Ready recovery copy",
+);
+assert(
+  systemJs.includes("recoveryStatusNode.hidden = text.length === 0"),
+  "System Account must hide empty recovery status text instead of rendering a blank chip",
+);
+assert(
+  shellAuth.includes("guest_registration_enabled"),
+  "Home unlock must respect the guest enrollment gate before creating guests",
+);
+assert(
+  shellAuth.includes("/api/auth/sessions/refresh"),
+  "Home auth client must use the runtime session refresh route",
+);
+assert(
+  shellJs.includes("refreshHomeSession"),
+  "Home shell must refresh proof-bound sessions after sign-in",
+);
+assert(
+  shellJs.includes("SESSION_REFRESH_MS"),
+  "Home shell must keep signed sessions fresh on long-lived desktops",
+);
+assert(
+  shellCore.includes("HOME_BROWSER_CONTEXT_KEY") &&
+    shellCore.includes("browser_context_id"),
+  "Home open-window restore must be bound to a browser-context id so clearing site data cannot replay stale windows",
+);
+assert(
+  shellCore.includes("newBrowserContextId") &&
+    shellCore.includes("getRandomValues") &&
+    !shellCore.includes("Math.random()"),
+  "Home browser context ids must use browser crypto instead of random fallback ids",
+);
+assert(
+  shellWindows.includes("seenTargets") &&
+    shellWindows.includes("seenTargets.has(targetId)"),
+  "Home session restore must de-dupe targets so one stale session cannot spawn repeated System windows",
+);
+assert(
+  protectedHomeStateSmoke.includes("home_browser_state"),
+  "Protected Home state smoke must run the source HTTP regression",
+);
+assert(
+  protectedHomeStateSmoke.includes("/api/apps/home/summary"),
+  "Protected Home state smoke must prove the live Home summary path",
+);
+assert(
+  protectedHomeStateSmoke.includes("ELASTOS_HOME_TOKEN"),
+  "Protected Home state smoke must support an explicit signed Home state proof",
+);
+assert(
+  !shellIndex.includes("home-unlock-kicker") &&
+    shellAuth.includes(
+      "Use your passkey to unlock your data, apps and desktop.",
+    ),
+  "Home passkey login must use concise data/apps/desktop copy without redundant kicker text",
+);
+assert(
+  shellIndex.includes('id="home-unlock-name"') &&
+    shellAuth.includes("display_name: displayName"),
+  "Home passkey creation must collect and persist a passkey/user display name",
+);
+assert(
+  shellAuth.includes("Enter a name for this passkey."),
+  "Home must not create anonymous Passkey/guest principals",
+);
+assert(
+  shellAuth.includes("Create guest account") &&
+    shellAuth.includes("create your own guest account"),
+  "Home must present guest enrollment as self-registration",
+);
+assert(
+  shellAuth.includes("startAutomaticPasskeySignIn") &&
+    shellAuth.includes("Choose your passkey."),
+  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+);
+assert(
+  shellAuth.includes('unlockMode === "create_guest"') &&
+    shellAuth.includes("Back to sign in"),
+  "Home guest creation must be a distinct state, not blended into sign-in",
+);
+assert(
+  shellAuth.includes("setUnlockNameVisible(canCreate)") &&
+    !shellAuth.includes(
+      "const canCreate = !registered || guestRegistrationEnabled",
+    ),
+  "Home sign-in must not show the passkey-name input unless a passkey is being created",
+);
+assert(
+  shellAuth.includes("isPasskeyNotSelected") &&
+    shellAuth.includes('setUnlockStatus("No passkey selected.", "muted")'),
+  "Home sign-in must suppress raw WebAuthn cancellation errors and keep onboarding actionable",
+);
+assert(
+  shellAuth.includes(
+    "unlockSecondary.hidden = !registered || !guestRegistrationEnabled",
+  ),
+  "Home guest creation must stay available in both modal and prompt unlock presentations",
+);
+assert(
+  !shellAuth.includes("getClientExtensionResults"),
+  "Home must not capture or serialize raw WebAuthn extension output until client-side PRF wrapping exists",
+);
+assert(
+  !authGatewayApi.includes("clientExtensionResults") &&
+    !authGatewayApi.includes("prf_output"),
+  "Runtime auth routes must not accept raw WebAuthn PRF output",
+);
+assert(
+  webauthnIdentity.includes(
+    'serde(rename_all = "camelCase", deny_unknown_fields)',
+  ) &&
+    webauthnIdentity.includes(
+      "registration_response_rejects_extension_payloads",
+    ) &&
+    webauthnIdentity.includes(
+      "authentication_response_rejects_extension_payloads",
+    ),
+  "Runtime WebAuthn response structs must reject hidden extension payloads until client-side PRF wrapping exists",
+);
+assert(
+  protectedContent.includes("pub struct SealedObjectV1") &&
+    protectedContent.includes("#[serde(deny_unknown_fields)]") &&
+    protectedContent.includes(
+      "sealed_object_rejects_unknown_contract_fields",
+    ) &&
+    protectedContent.includes(
+      "sealed_object_rejects_unknown_nested_key_envelope_fields",
+    ) &&
+    protectedContent.includes(
+      "key_release_request_rejects_unknown_contract_fields",
+    ) &&
+    protectedContent.includes(
+      "decrypt_session_request_rejects_unknown_contract_fields",
+    ),
+  "Protected-content contracts must reject hidden object, key-release, and decrypt-session authority fields at decode time",
+);
+assert(
+  shellStyle.includes(".visually-hidden") &&
+    shellIndex.includes('class="visually-hidden"'),
+  "Home unlock labels must use a real visually-hidden utility instead of leaking form labels into the UI",
+);
+assert(
+  !shellStyle.includes("home-unlock-kicker"),
+  "Home passkey login must not keep dead kicker CSS after removing the label",
+);
+assert(
+  !shellAuth.includes("No password. No wallet required."),
+  "Home passkey login must not show redundant no-password/no-wallet copy",
+);
+assert(
+  shellAuth.includes("unlockStatus.hidden = !message;"),
+  "Home passkey login must hide the status row when no status copy is shown",
+);
+assert(
+  !shellIndex.includes("Checking passkey status.") &&
+    !shellAuth.includes("Checking passkey status.") &&
+    shellAuth.includes("Opening Home"),
+  "Home passkey flow must not flicker from checking copy before the final unlock card",
+);
+assert(
+  shellIndex.includes("toolbar-sign-out") &&
+    shellAuth.includes("/api/auth/sessions/sign-out"),
+  "Home must expose an explicit sign-out path that clears the browser session through Runtime",
+);
+assert(
+  shellStyle.includes(".sign-out-btn") &&
+    shellStyle.includes('background-image: url("data:image/svg+xml'),
+  "Home sign-out toolbar icon must use a complete SVG glyph",
+);
+assert(
+  !shellStyle.includes(".sign-out-btn::before") &&
+    !shellStyle.includes(".sign-out-btn::after"),
+  "Home sign-out icon must not use clipped pseudo-element borders",
+);
+assert(
+  !identityHandler.includes("host_fallback") &&
+    !identityHandler.includes("Fallback to Referer"),
+  "WebAuthn RP handling must not describe host authority as a fallback path",
+);
+assert(
+  !system.includes("<dt>Wallet</dt>") &&
+    !system.includes("wallet-create") &&
+    !systemJs.includes("/api/apps/system/wallet/managed"),
+  "System must not duplicate Wallet account creation or approval controls",
+);
+assert(
+  system.includes('id="recovery-password"') &&
+    system.includes("Download Recovery Kit") &&
+    system.includes("Downloads everything recoverable for this account") &&
+    systemJs.includes("download_password") &&
+    systemJs.includes("recoveryDownloadPassword") &&
+    systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&
+    systemJs.includes("/api/auth/recovery/full-export") &&
+    authGatewayApi.includes("elastos.full-recovery-bundle/v1") &&
+    authGatewayApi.includes("wallet_recovery_keys_for_principal"),
+  "System Recovery Kit download must be the full recover-everything path: data root plus built-in Wallet keys with optional password wrapping",
+);
+assert(
+    system.includes('id="recovery-import"') &&
+    system.includes('id="recovery-pending"') &&
+    system.includes("Recover account") &&
+    systemJs.includes("pendingRecoveryImport") &&
+    systemJs.includes("onRecoveryAttach"),
+  "System Recovery Kit import must expose an explicit in-surface reassignment review before recovering an existing account",
+);
+assert(
+  systemJs.includes(
+    "reassign_to_current_principal: Boolean(reassign && allowReassign)",
+  ) && !systemJs.includes("reassign_to_current_principal: reassign,"),
+  "System Recovery Kit import must not silently infer root reassignment",
+);
+assert(
+  !systemJs.includes("window.confirm") &&
+    !systemJs.includes("confirm(") &&
+    !systemJs.includes("alert("),
+  "System Recovery Kit import must not use browser prompts for reassignment authority",
+);
+assert(
+  !system.includes('data-field="wallet-status"') &&
+    !system.includes(
+      "Passkey-controlled built-in wallet. Apps never receive wallet authority.",
+    ),
+  "System wallet surface must stay removed after Wallet becomes the owner of accounts and approvals",
+);
+assert(
+  !systemJs.includes("MANAGED_WALLET_SUPPORTED_CHAIN_NAMESPACES") &&
+    gatewayApi.includes("MANAGED_WALLET_CHAIN_NAMESPACES") &&
+    gatewayApi.includes('"bip122:000000000019d6689c085ae165831e93"'),
+  "Built-in managed wallet creation belongs to Gateway/Wallet, not System browser code",
+);
+assert(
+  !systemJs.includes("/api/apps/system/wallet/default") &&
+    walletProvider.includes("set_default_account") &&
+    walletProvider.includes("default_account"),
+  "Default wallet selection must live in Wallet provider surfaces, not System Advanced",
+);
+assert(
+  walletProvider.includes("chain_namespace is required") &&
+    walletProvider.includes(
+      "wallet account does not match requested chain_namespace",
+    ) &&
+    gatewayApi.includes('"op": "set_default_account"') &&
+    gatewayTests.includes('"chain_namespace": "eip155:20"'),
+  "Wallet signing must be chain-and-intent scoped before resolving a default or explicit account",
+);
+assert(
+  walletProvider.includes("managed_key_aad") &&
+    walletProvider.includes("Payload {") &&
+    walletProvider.includes("tampered_principal") &&
+    walletProvider.includes("tampered_chain"),
+  "Managed wallet private-key envelopes must be principal/metadata-bound and tamper-tested",
+);
+assert(
+  !walletProvider.includes(
+    '"managed_wallet_storage": "localhost://ElastOS/SystemServices/Wallet/wallet-key.hex"',
+  ) &&
+    !walletProvider.includes(
+      '"storage": "localhost://ElastOS/SystemServices/Wallet/wallet-state.json"',
+    ),
+  "Wallet-provider status/init responses must not expose internal wallet storage object paths",
+);
+assert(
+  walletProvider.includes("deny_unknown_fields") &&
+    walletProvider.includes(
+      "wallet_provider_rejects_hidden_signature_request_fields",
+    ) &&
+    walletProvider.includes(
+      "wallet_provider_rejects_hidden_connector_completion_fields",
+    ),
+  "Wallet-provider wire requests must reject hidden signing, connector, and wallet-object fields at decode time",
+);
+assert(
+  gatewayApi.includes("WALLET_CAPSULE_ID") &&
+    gatewayApi.includes("WALLET_WALLETCONNECT_CAPSULE_ID") &&
+    gatewayApi.includes("WALLET_LINK_CAPSULE_IDS") &&
+    gatewayApi.includes("WALLET_WALLETCONNECT_CAPSULE_ID") &&
+    authGatewayApi.includes(
+      '"connector_id": wallet_connector_id_for_wallet_link(&app)?',
+    ) &&
+    !authGatewayApi.includes("app == super::gateway::WALLET_CAPSULE_ID"),
+  "External wallet linking must be owned by dedicated connector capsules instead of Home/System/Wallet manual proof",
+);
+assert(
+  gatewayApi.includes("/api/apps/:wallet_connector/wallet/approvals") &&
+    gatewayApi.includes("unknown wallet connector capsule") &&
+    gatewayTests.includes(
+      "test_wallet_connector_route_rejects_unknown_connector_capsule",
+    ),
+  "Wallet connector approval routes must be generic connector-capsule routes and reject unknown connector IDs",
+);
+assert(
+  gatewayApi.includes("WALLET_CONNECTOR_CAPSULE_IDS") &&
+    gatewayApi.includes("/api/apps/:wallet_connector/wallet/config") &&
+    gatewayApi.includes("WALLETCONNECT_CONFIG_SCHEMA") &&
+    gatewayApi.includes("WALLETCONNECT_SDK_PATH") &&
+    gatewayTests.includes(
+      "test_walletconnect_connector_requires_pinned_config",
+    ) &&
+    gatewayTests.includes(
+      "test_walletconnect_connector_accepts_pinned_config",
+    ) &&
+    gatewayTests.includes(
+      "test_walletconnect_connector_config_returns_pinned_sdk_contract",
+    ) &&
+    browserCapsulesApi.includes(
+      "walletconnect_browser_capsule_requires_pinned_runtime_config",
+    ) &&
+    browserCapsulesApi.includes(
+      "ensure_wallet_connector_configured(data_dir, app)",
+    ) &&
+    !shellJs.includes("wallet-walletconnect") &&
+    !systemJs.includes("wallet-walletconnect") &&
+    !read("components.json").includes('"wallet-walletconnect"'),
+  "WalletConnect must remain invisible and fail-closed until its SDK/configuration are pinned and tested",
+);
+assert(
+  walletWalletconnect.includes('id="wallet-connect"') &&
+    walletWalletconnect.includes('id="wallet-accounts"') &&
+    walletWalletconnect.includes('id="wallet-requests"') &&
+    walletWalletconnectJs.includes('CONNECTOR_ID = "wallet-walletconnect"') &&
+    walletWalletconnectJs.includes(
+      `/api/apps/\${CONNECTOR_ID}/wallet/config`,
+    ) &&
+    walletWalletconnectJs.includes("connectWalletConnectEvm") &&
+    walletWalletconnectJs.includes("/api/auth/evm/challenge") &&
+    walletWalletconnectJs.includes("/api/auth/evm/verify") &&
+    walletWalletconnectJs.includes(
+      `/api/apps/\${CONNECTOR_ID}/wallet/accounts`,
+    ) &&
+    walletWalletconnectJs.includes(
+      `/api/apps/\${CONNECTOR_ID}/wallet/approvals`,
+    ),
+  "WalletConnect source capsule must use the pinned connector config and runtime wallet-link/approval routes only",
+);
+assert(
+  !walletWalletconnectJs.includes("https://") &&
+    !walletWalletconnectJs.includes("unpkg") &&
+    !walletWalletconnectJs.includes("jsdelivr") &&
+    walletWalletconnectJs.includes("sdk_asset_path"),
+  "WalletConnect connector must import the pinned local SDK asset, not an unpinned CDN",
+);
+assert(
+  walletconnectVendorScript.includes(
+    'APPKIT_VERSION="${APPKIT_VERSION:-1.8.19}"',
+  ) &&
+    walletconnectVendorScript.includes("@reown/appkit-adapter-wagmi") &&
+    walletconnectVendorScript.includes("@walletconnect/ethereum-provider") &&
+    walletconnectVendorScript.includes("@metamask/connect-evm") &&
+    walletconnectVendorScript.includes("connectWalletConnectEvm") &&
+    walletconnectVendorScript.includes("defineChain") &&
+    walletconnectVendorScript.includes("sha256sum") &&
+    authWalletSmoke.includes("bash -n scripts/vendor-walletconnect-adapter.sh"),
+  "WalletConnect adapter vendoring must use exact package pins and stay syntax-checked",
+);
+assert(
+  walletconnectConfigScript.includes(
+    'CONFIG_SCHEMA = "elastos.walletconnect.connector/v1"',
+  ) &&
+    walletconnectConfigScript.includes('SDK_PACKAGE = "@reown/appkit"') &&
+    walletconnectConfigScript.includes("sdk_sha256") &&
+    walletconnectConfigScript.includes("connectWalletConnectEvm(options)") &&
+    walletconnectConfigSmoke.includes(
+      "configure-walletconnect-connector.mjs",
+    ) &&
+    authWalletSmoke.includes("walletconnect-connector-config-smoke.sh"),
+  "WalletConnect operator config must have a smoke-tested local SDK hash pinning path",
+);
+assert(
+  walletconnectConfigScript.includes('requiredFlag(flags, "project-id")') &&
+    !walletconnectConfigScript.includes("ELASTOS_WALLETCONNECT_PROJECT_ID"),
+  "WalletConnect config must require an explicit operator Project ID instead of environment or repository defaults",
+);
+assert(
+  walletProviderDoc.includes(
+    "WalletConnect is a dedicated connector capsule",
+  ) &&
+    walletProviderDoc.includes("wallet-provider SDK backend") &&
+    walletProviderDoc.includes(
+      "Do not commit a bundled default Reown Project ID",
+    ),
+  "WalletConnect docs must keep the connector/authority split and no bundled Project ID rule",
+);
+assert(
+  walletProviderDoc.includes("User-Facing Wallet Ontology") &&
+    walletProviderDoc.includes("Approval method") &&
+    walletMetamask.includes("Add approval method") &&
+    walletUnisat.includes("Add approval method") &&
+    wallet.includes("Approval methods") &&
+    wallet.includes("Total balance") &&
+    walletWalletconnect.includes("Add approval method") &&
+    !walletMetamask.includes("Wallet Connector") &&
+    !walletUnisat.includes("Wallet Connector") &&
+    !walletWalletconnect.includes("Wallet Connector"),
+  "Wallet UI and docs must present connector capsules as approval methods under one Wallet model",
+);
+assert(
+  walletProvider.includes("external wallet links require a connector_id") &&
+    walletProvider.includes(
+      "wallet approval request belongs to a different connector",
+    ) &&
+    walletJs.includes("connector_id"),
+  "External wallet approvals must carry connector_id and fail closed when a connector does not match",
+);
+assert(
+  !walletProvider.includes("PrepareTransaction") &&
+    !walletProvider.includes("BroadcastTransaction") &&
+    !read("capsules/wallet-provider/capsule.json").includes(
+      "broadcast_transaction",
+    ),
+  "Wallet-provider must not duplicate chain-provider transaction prepare/broadcast authority",
+);
+assert(
+  walletProvider.includes("sign_eip155_legacy_transaction") &&
+    walletProvider.includes("external_transaction_result") &&
+    walletProvider.includes("awaiting_wallet_transaction") &&
+    walletProvider.includes("elastos.wallet.signed_transaction/v1") &&
+    walletMetamaskJs.includes("eth_sendTransaction") &&
+    walletWalletconnectJs.includes("eth_sendTransaction"),
+  "Built-in EVM transaction signing must be typed and external transaction completion must stay connector-bound",
+);
+assert(
+  chainProvider.includes("deny_unknown_fields") &&
+    chainProvider.includes(
+      "chain_provider_rejects_hidden_prepare_transaction_fields",
+    ) &&
+    chainProvider.includes(
+      "chain_provider_rejects_hidden_node_lifecycle_fields",
+    ),
+  "Chain-provider wire requests must reject hidden raw transaction and node RPC authority fields at decode time",
+);
+assert(
+  walletProvider.includes("verify_contract_proof") &&
+    walletProvider.includes("siwe_erc1271") &&
+    chainProvider.includes("erc1271_is_valid_signature") &&
+    authGatewayApi.includes("verify_contract_proof"),
+  "ERC-1271 wallet proofs must be chain-provider verified before wallet-provider consumes the Runtime challenge",
+);
+assert(
+  walletProvider.includes("verify_bip322_simple") &&
+    walletProvider.includes("verify_bitcoin_signed_message") &&
+    walletProvider.includes("bip322_simple_p2tr_verifies") &&
+    walletProvider.includes("bitcoin_signed_message_p2pkh_verifies") &&
+    walletProvider.includes("bitcoin_signed_message_p2shwpkh_verifies") &&
+    walletProvider.includes("challenge_and_verify_bitcoin_taproot_bip322_proof") &&
+    walletProvider.includes(
+      "challenge_and_verify_bitcoin_legacy_signed_message_proof",
+    ) &&
+    walletProvider.includes(
+      "managed_btc_account_signs_bip322_after_runtime_approval",
+    ) &&
+    walletProvider.includes(
+      "managed_btc_account_rejects_unbound_bip322_messages",
+    ) &&
+    walletProvider.includes(
+      "bitcoin_bip322_challenge_rejects_unsupported_p2wsh_script",
+    ) &&
+    read("elastos/crates/elastos-server/src/provider_resource.rs").includes(
+      "elastos://wallet/proof/bip322/verify",
+    ),
+  "Bitcoin wallet proof must use typed BIP-322/signed-message capability resources with fail-closed verification coverage",
+);
+assert(
+  gatewayApi.includes("/api/auth/btc/challenge") &&
+    gatewayApi.includes("/api/auth/btc/verify") &&
+    authGatewayApi.includes('"op": "bitcoin_challenge"') &&
+    authGatewayApi.includes('"op": "verify_bip322_proof"') &&
+    gatewayTests.includes(
+      "test_btc_wallet_link_rejects_system_token_without_connector",
+    ) &&
+    gatewayTests.includes("test_wallet_token_cannot_link_bip322_account"),
+  "Bitcoin wallet proof linking must require a connector token and stay covered at the browser auth boundary",
+);
+assert(
+  walletProvider.includes(
+    "approval_external_bitcoin_request_completes_with_bip322_connector_signature",
+  ) &&
+    walletProvider.includes(
+      "Bitcoin proof signing requires a supported Bitcoin account",
+    ) &&
+    walletJs.includes("/api/apps/wallet/wallet/approvals") &&
+    walletJs.includes('actionButton("Open UniSat"') &&
+    !walletJs.includes("Paste Bitcoin wallet signature") &&
+    !wallet.includes('id="bitcoin-address"') &&
+    !wallet.includes("Manual proof"),
+  "Wallet must use built-in managed Bitcoin signing or connector handoff, not manual BIP-322 forms",
+);
+assert(
+  read("elastos/crates/elastos-server/src/provider_resource.rs").includes(
+    "wallet/{chain_namespace}/sign/{intent}",
+  ) && carrierBridge.includes("wallet_signature_parts_from_uri"),
+  "Wallet capability resources must bind chain namespace and intent through the Carrier/provider path",
+);
+assert(
+  systemJs.includes('["eip155:1", "Ethereum"]') &&
+    systemJs.includes("CHAIN_NAMESPACE_LABELS") &&
+    systemJs.includes("`EVM ${chainId}`"),
+  "System external wallet labels must use human network names instead of raw eip155 namespaces",
+);
+assert(
+  gatewayApi.includes("MANAGED_WALLET_CHAIN_NAMESPACES") &&
+    gatewayApi.includes("managed_wallet_label"),
+  "System gateway must own the wallet-supported chain list and labels",
+);
+assert(
+  !system.includes('id="wallet-metamask"') &&
+    !system.includes('id="wallet-connect"'),
+  "System must not host optional browser wallet connectors",
+);
+assert(
+  !systemJs.includes("selectedMetaMaskProvider") &&
+    !systemJs.includes("personal_sign") &&
+    !systemJs.includes("eth_requestAccounts") &&
+    !systemJs.includes("window.ethereum"),
+  "System must not hold browser wallet adapter authority",
+);
+const tasks = read("TASKS.md");
+const browserPlanningSurface = [
+  tasks,
+  read("docs/BROWSER_CAPSULE.md"),
+  read("docs/BROWSER_PROVIDER_BAKEOFF.md"),
+].join("\n");
+assert(
+  browserManifest.includes('"name": "browser"') &&
+    browserManifest.includes('"elastos://wallet/*"') &&
+    browserManifest.includes('"elastos://net/stream"') &&
+    !browserManifest.includes("guest_network") &&
+    !browserManifest.includes('"provides"'),
+  "Browser capsule manifest must declare wallet/net capability intent without provider or guest-network authority",
+);
+assert(
+  netProvider.includes("exit_unavailable") &&
+    netProvider.includes("private_network_blocked") &&
+    netProvider.includes("direct host networking") &&
+    netProvider.includes("deny_unknown_fields") &&
+    read("capsules/net-provider/capsule.json").includes(
+      '"provides": "elastos://net/*"',
+    ),
+  "Net provider must be a fail-closed Browser/Net boundary, not raw host networking",
+);
+assert(
+  exitProvider.includes("exit_policy_blocked") &&
+    exitProvider.includes("private_network_blocked") &&
+    exitProvider.includes("direct host networking") &&
+    exitProvider.includes('allowed == "*"') &&
+    exitProvider.includes("deny_unknown_fields") &&
+    exitProvider.includes("allowed_hosts") &&
+    exitProvider.includes("max_body_bytes") &&
+    exitProvider.includes("elastos.exit.http-fetch.result/v1") &&
+    exitProvider.includes("elastos.exit.stream-session/v1") &&
+    exitProvider.includes("elastos.adapter-ipc/v1") &&
+    exitProvider.includes("elastos.exit.relay-ipc/v1") &&
+    exitProvider.includes("AdapterIpcConfig") &&
+    exitProvider.includes("RelayIpcConfig") &&
+    exitProvider.includes("StreamRelay") &&
+    !exitProvider.includes("runtime_stream_path") &&
+    serverInfra.includes("ELASTOS_EXIT_PROVIDER_CONFIG") &&
+    gatewayBrowserApi.includes("gateway_browser_net_http") &&
+    gatewayBrowserApi.includes("gateway_browser_net_stream") &&
+    gatewayBrowserApi.includes('"op": "http_fetch"') &&
+    gatewayBrowserApi.includes('"op": "open_stream"') &&
+    !gatewayApi.includes("fn gateway_browser_net_http(") &&
+    !gatewayApi.includes("fn gateway_browser_net_stream(") &&
+    read("capsules/exit-provider/capsule.json").includes(
+      '"provides": "elastos://exit/*"',
+    ),
+  "Exit provider must be an internal fail-closed egress contract with operator-configured http_fetch/stream_relay and private adapter_ipc/relay_ipc descriptors, public-web wildcard support, and no raw host networking or Runtime stream-path authority",
+);
+assert(
+  browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
+    browserEngineAdapter.includes("elastos.adapter-ipc/v1") &&
+    browserEngineAdapter.includes("runtime_stream_path") &&
+    browserEngineAdapter.includes("elastos.browser.engine.launch-request/v1") &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine.supervisor-result/v1",
+    ) &&
+    browserEngineAdapter.includes("ELASTOS_BROWSER_ENGINE_REQUEST") &&
+    browserEngineAdapter.includes("byte_transport_unavailable") &&
+    browserEngineAdapter.includes("engine_process_unavailable") &&
+    browserEngineAdapter.includes("validate_supervisor_result") &&
+    browserEngineAdapter.includes("adapter_ipc") &&
+    browserEngineAdapter.includes("display_modes") &&
+    browserEngineAdapter.includes("webrtc_signal") &&
+    browserEngineAdapter.includes("direct_network") &&
+    browserEngineAdapter.includes("wallet_injection") &&
+    serverInfra.includes("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG") &&
+    gatewayBrowserApi.includes("browser_engine_summary") &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_app_summary_reports_registered_engine_adapter_status",
+    ) &&
+    read("capsules/browser-engine-adapter/capsule.json").includes(
+      '"provides": "elastos://browser-engine/*"',
+    ),
+  "Browser Engine Adapter must be an internal fail-closed contract with explicit adapter_ipc transport, explicit display modes, WebRTC signaling, and supervisor launch proof, not host browser authority or fake native page launches",
+);
+assert(
+  browserEngineSupervisor.includes(
+    "ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG",
+  ) &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_REQUEST") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG") &&
+    browserEngineSupervisor.includes("BrowserDisplayMode") &&
+    browserEngineSupervisor.includes("NativeSurface") &&
+    browserEngineSupervisor.includes('"mode": "native_surface"') &&
+    browserEngineSupervisor.includes('"input": "native_ipc"') &&
+    browserEngineSupervisor.includes("CLONE_NEWNET") &&
+    browserEngineSupervisor.includes("bring_loopback_up") &&
+    browserEngineSupervisor.includes("SIOCSIFFLAGS") &&
+    browserEngineSupervisor.includes(
+      "elastos.browser.engine.supervisor-config/v1",
+    ) &&
+    browserEngineSupervisor.includes(
+      "elastos.browser.engine.supervisor-result/v1",
+    ) &&
+    browserEngineSupervisor.includes(
+      "elastos.browser.stream-bridge.config/v1",
+    ) &&
+    browserEngineSupervisor.includes("stream_bridge_pid") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_IPC") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_RELAY_IPC") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_STREAM_ID") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_TARGET") &&
+    browserEngineSupervisor.includes("ELASTOS_BROWSER_ENGINE_URL") &&
+    browserEngineSupervisor.includes(
+      "display_capabilities: DisplayCapabilities",
+    ) &&
+    browserEngineSupervisor.includes("config.display_capabilities.audio") &&
+    browserEngineSupervisor.includes(
+      "supervisor_result_does_not_claim_media_without_operator_capability",
+    ),
+  "Browser Engine Supervisor must enforce the typed Linux host-helper contract, return native_surface display sessions, optionally launch the stream bridge, bring loopback up for the local browser proxy, pass only explicit stream/IPC/relay/target/URL/operator environment to the native engine, and never claim native audio/video without explicit operator display capabilities",
+);
+assert(
+  browserStreamBridge.includes("ELASTOS_BROWSER_STREAM_BRIDGE_CONFIG") &&
+    browserStreamBridge.includes("elastos.browser.stream-bridge.config/v1") &&
+    browserStreamBridge.includes("elastos.browser.stream-bridge.ready/v1") &&
+    browserStreamBridge.includes("UnixListener") &&
+    browserStreamBridge.includes("UnixStream") &&
+    browserStreamBridge.includes("runtime_net_only") &&
+    browserStreamBridge.includes("direct_network") &&
+    browserStreamBridge.includes("adapter_ipc_path") &&
+    browserStreamBridge.includes("runtime_stream_path") &&
+    !browserStreamBridge.includes("TcpStream") &&
+    !browserStreamBridge.includes("ToSocketAddrs"),
+  "Browser Stream Bridge must be a typed Unix-socket byte transport only, with no TCP/DNS host-network path",
+);
+assert(
+  browserLocalExit.includes("ELASTOS_BROWSER_LOCAL_EXIT_CONFIG") &&
+    browserLocalExit.includes("elastos.browser.local-exit.config/v1") &&
+    browserLocalExit.includes("elastos.exit.relay-open/v1") &&
+    browserLocalExit.includes("allowed_hosts") &&
+    browserLocalExit.includes('allowed == "*"') &&
+    browserLocalExit.includes("address_family") &&
+    browserLocalExit.includes("PreferIpv4") &&
+    browserLocalExit.includes("TcpStream") &&
+    browserLocalExit.includes("ToSocketAddrs") &&
+    browserLocalExit.includes("private resolved IP blocked"),
+  "Browser Local Exit must be the only explicit server-side TCP/DNS relay and must require typed handshakes, public-web wildcard support, address-family policy, private-IP blocking, and allowlists",
+);
+assert(
+  browserNativeOperatorConfig.includes("browser-engine-adapter.json") &&
+    browserNativeOperatorConfig.includes("exit-provider.json") &&
+    browserNativeOperatorConfig.includes("browser-local-exit.json") &&
+    browserNativeOperatorConfig.includes(
+      "ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG",
+    ) &&
+    browserNativeOperatorConfig.includes(
+      "ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG",
+    ) &&
+    browserNativeOperatorConfig.includes("--proxy-server={proxy_url}") &&
+    browserNativeOperatorConfig.includes("--address-family") &&
+    browserNativeOperatorConfig.includes("runtime_net_only") &&
+    browserNativeOperatorConfig.includes("native_surface") &&
+    browserNativeOperatorConfig.includes("nativeAudio: false") &&
+    browserNativeOperatorConfig.includes("nativeVideo: false") &&
+    browserNativeOperatorConfig.includes("--native-audio") &&
+    browserNativeOperatorConfig.includes("--native-video") &&
+    browserNativeOperatorConfig.includes("display_capabilities") &&
+    browserPlanningSurface.includes("browser-native-operator-config.mjs") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-native-operator-config.mjs",
+    ),
+  "Native Browser operator config generator must keep Browser Engine Adapter, Exit provider, local Exit relay, address-family policy, supervisor, and proxy wrapper on one explicit runtime-net-only config path while defaulting native audio/video false unless explicitly declared by the operator",
+);
+assert(
+  browserNativeSupervisorSmoke.includes(
+    'result["display_session"]["audio"] is False',
+  ) &&
+    browserNativeSupervisorSmoke.includes(
+      'result["display_session"]["video"] is False',
+    ) &&
+    browserNativeSupervisorSmoke.includes("native_audio_proven") &&
+    browserNativeSupervisorProxySmoke.includes(
+      'result["display_session"]["audio"] is False',
+    ) &&
+    browserNativeSupervisorProxySmoke.includes(
+      'result["display_session"]["video"] is False',
+    ) &&
+    browserNativeSupervisorProxySmoke.includes("native_audio_proven"),
+  "Native Browser namespace/proxy smokes must not pretend fake browser processes prove native audio or video",
+);
+assert(
+  browserLocalExit.includes("upstream_http_proxy") &&
+    browserLocalExit.includes("Proxy-Authorization") &&
+    browserNativeOperatorConfig.includes("--upstream-http-proxy") &&
+    browserNativeOperatorConfig.includes("upstream_http_proxy"),
+  "Browser Local Exit must support operator-approved upstream HTTP CONNECT exits without exposing raw networking to capsules",
+);
+assert(
+  read("docs/BROWSER_CAPSULE.md").includes("--upstream-http-proxy") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "scripts/browser-youtube-acceptance-smoke.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("decoded video and audio bytes"),
+  "Browser docs must explain how an operator-approved upstream Exit is configured and gated by the YouTube media smoke",
+);
+assert(
+  read("scripts/browser-native-target-preflight.sh").includes("--version") &&
+    read("scripts/browser-native-target-preflight.sh").includes(
+      "does not look like a Chromium/CEF-compatible browser",
+    ),
+  "Native Browser target preflight must reject non-browser executables before treating a host as proven",
+);
+assert(
+  browserNativeHostCapability.includes(
+    "elastos.browser.native-host-capability/v1",
+  ) &&
+    browserNativeHostCapability.includes("--require-product-native") &&
+    browserNativeHostCapability.includes("host_compositor_display") &&
+    browserNativeHostCapability.includes("host_audio_service") &&
+    browserNativeHostCapability.includes("linux_network_namespace") &&
+    browserNativeHostCapability.includes(
+      "It does not install anything, launch a",
+    ) &&
+    browserNativeHostCapability.includes("or use Docker"),
+  "Native Browser host capability probe must check browser/display/audio/network prerequisites without installing software or using Docker",
+);
+assert(
+  browserNativeTargetPreflight.includes("browser-native-host-capability.mjs") &&
+    browserNativeTargetPreflight.includes("--require-network-isolation") &&
+    browserNativeTargetPreflight.includes(
+      "native host capability probe failed",
+    ) &&
+    browserNativeTargetPreflight.includes('cat "$host_capability_report"') &&
+    browserNativeTargetPreflight.includes(
+      "browser-native-operator-config.mjs",
+    ) &&
+    browserNativeTargetPreflight.includes(
+      "browser-native-supervisor-proxy-smoke.sh",
+    ) &&
+    browserNativeTargetPreflight.includes("target host is not proven") &&
+    browserNativeTargetPreflight.includes(
+      "capsules/exit-provider/Cargo.toml",
+    ) &&
+    browserNativeTargetPreflight.includes(
+      "capsules/browser-engine-adapter/Cargo.toml",
+    ) &&
+    browserNativeTargetPreflight.includes(
+      "--require-native-media requires both --native-audio and --native-video",
+    ) &&
+    browserNativeTargetPreflight.includes(
+      "native media readiness requires display_capabilities audio=true and video=true",
+    ) &&
+    browserNativeTargetPreflight.includes(
+      "native media readiness requires the target proof to report native_audio_proven=true and native_video_proven=true",
+    ) &&
+    browserNativeTargetPreflight.includes("native_audio_proven") &&
+    browserNativeTargetPreflight.includes("native_video_proven") &&
+    browserNativeTargetPreflight.includes(
+      "elastos.browser.native-target-preflight/v1",
+    ) &&
+    browserNativeTargetPreflight.includes("native_media_required") &&
+    browserPlanningSurface.includes("browser-native-host-capability.mjs") &&
+    browserPlanningSurface.includes("browser-native-target-preflight.sh") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-native-target-preflight.sh",
+    ),
+  "Native Browser target preflight must run the host capability probe, print fail-closed probe details, generate configs, validate provider capsule init, fail closed when host-gated namespace proof skips, and require explicit typed native media proof before claiming product audio/video readiness",
+);
+assert(
+  browserManualUxReport.includes("--machine-artifact") &&
+    browserManualUxReport.includes("validateManualUxReport") &&
+    browserManualUxReport.includes("artifact.candidate") &&
+    browserManualUxReport.includes("artifact.browser_program") &&
+    browserManualUxValidation.includes('crypto.createHash("sha256")') &&
+    browserManualUxValidation.includes(
+      "machine_artifact.sha256 must be a 64-character hex SHA-256 digest",
+    ) &&
+    browserManualUxValidation.includes(
+      "machine_artifact.schema must identify the accepted hosted bake-off or native preflight schema",
+    ) &&
+    browserManualUxValidation.includes(
+      "machine_artifact.path must point to the reviewed machine artifact JSON",
+    ) &&
+    browserManualUxValidation.includes(
+      "machine_artifact.sha256 must match machine_artifact.path",
+    ) &&
+    browserManualUxValidation.includes(
+      "machine_artifact.schema must match machine_artifact.path",
+    ) &&
+    browserManualUxValidation.includes(
+      "machine_artifact.path must point to a successful machine artifact",
+    ) &&
+    browserManualUxReport.includes(
+      "evidence.display_session_audio_advertised",
+    ) &&
+    browserManualUxReport.includes("evidence.received_audio_evidence") &&
+    browserManualUxValidation.includes(
+      "must describe the observed hosted WebRTC audio proof",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "--machine-artifact /path/to/accepted-hosted-or-native-proof.json",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "pre-fills provider and target from the machine artifact",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("checkmarks alone") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "not sufficient audio evidence",
+    ) &&
+    browserProviderRunbook.includes(
+      "--machine-artifact <accepted-hosted-or-native-proof.json>",
+    ),
+  "Browser manual UX report must generate and validate a hash-bound machine artifact reference, pre-fill provider/target from the artifact, and require text evidence for hosted WebRTC audio proof through the shared validator",
+);
+assert(
+  browserObjectiveAudit.includes("elastos.browser.objective-audit/v1") &&
+    browserObjectiveAudit.includes("Browser objective is not complete") &&
+    !browserObjectiveAudit.includes("TODAY.md") &&
+    browserObjectiveAudit.includes("hosted_provider_product_accepted") &&
+    browserObjectiveAudit.includes("native_product_media_accepted") &&
+    browserObjectiveAudit.includes("manual_ux_accepted") &&
+    browserObjectiveAudit.includes("provider_decision_next_action_defined") &&
+    browserObjectiveAudit.includes("consult_provider_decision_report") &&
+    browserObjectiveAudit.indexOf("consult_provider_decision_report") <
+      browserObjectiveAudit.indexOf("run_hosted_provider_bakeoff") &&
+    browserObjectiveAudit.includes("function nextAction(") &&
+    browserObjectiveAudit.includes("next_action: nextAction") &&
+    browserObjectiveAudit.includes(
+      "structured provider decision next_action",
+    ) &&
+    browserObjectiveAudit.includes("next_actions") &&
+    browserObjectiveAudit.includes("--candidate kasm-workspaces") &&
+    browserObjectiveAudit.includes("--candidate browserbox") &&
+    browserObjectiveAudit.includes(
+      "--native-audio --native-video --require-native-media",
+    ) &&
+    browserObjectiveAudit.includes("native_audio_proven === true") &&
+    browserObjectiveAudit.includes("native_video_proven === true") &&
+    browserObjectiveAudit.includes("qualityGateAccepted") &&
+    browserObjectiveAudit.includes("Number(candidate.held_ms || 0) >= 5000") &&
+    browserObjectiveAudit.includes("Number(youtube.held_ms || 0) >= 5000") &&
+    browserObjectiveAudit.includes(
+      'candidate.backend_class === "product_compositor"',
+    ) &&
+    browserObjectiveAudit.includes(
+      "bakeoff.youtube_stress?.skipped !== true",
+    ) &&
+    browserObjectiveAudit.includes(
+      "Number(youtube.media?.audio_decoded_delta || 0) > 0",
+    ) &&
+    browserObjectiveAudit.includes("acceptedMachineArtifacts") &&
+    browserObjectiveAudit.includes("sha256File") &&
+    browserObjectiveAudit.includes("validateManualUxReport") &&
+    browserManualUxValidation.includes("realpath") &&
+    browserManualUxValidation.includes("artifact.path") &&
+    browserManualUxValidation.includes("machine_artifact.sha256") &&
+    browserObjectiveAudit.includes("elastos.browser.manual-ux/v1") &&
+    browserObjectiveAudit.includes(
+      "elastos.browser.native-target-preflight/v1",
+    ) &&
+    browserPlanningSurface.includes("browser-objective-audit.mjs") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-objective-audit.mjs",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "path, schema, or hash does not",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "match the accepted machine proof",
+    ),
+  "Browser objective audit must remain the fail-closed completion gate for hosted/native media proof plus path/hash-bound manual UX evidence and must require the structured provider next-action path before encouraging bake-offs or native preflights",
+);
+assert(
+  browserObjectiveAudit.includes("current_host_stop_condition_defined") &&
+    browserObjectiveAudit.includes(
+      "Current-host blockers stop local Browser provider tuning",
+    ) &&
+    browserObjectiveAudit.includes("busy_selkies_next_action_exercised") &&
+    browserObjectiveAudit.includes(
+      "do not spend more branch time tuning Selkies as the product path",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "current_host_stop_condition_defined criterion must pass",
+    ) &&
+    browserObjectiveAuditSmoke.includes("provider decision report smoke") &&
+    browserProviderDecisionReportSmoke.includes(
+      "busy_selkies_next_action_exercised",
+    ) &&
+    browserPlanningSurface.includes(
+      "Freeze new Browser provider implementation",
+    ) &&
+    read("ROADMAP.md").includes("Browser work should stop") &&
+    read("ROADMAP.md").includes("contract/gate layer"),
+  "Browser objective audit must expose the current-host stop condition so local work does not keep tuning the running Selkies baseline as product architecture",
+);
+assert(
+  browserManualUxChecks.includes("COMMON_MANUAL_CHECKS") &&
+    browserManualUxChecks.includes("HOSTED_WEBRTC_MANUAL_CHECKS") &&
+    browserManualUxChecks.includes("display_session_audio_advertised") &&
+    browserManualUxChecks.includes("received_audio_evidence") &&
+    browserManualUxReport.includes("browser-manual-ux-validation.mjs") &&
+    browserObjectiveAudit.includes("browser-manual-ux-validation.mjs") &&
+    browserManualUxValidation.includes("browser-manual-ux-checks.mjs") &&
+    browserManualUxValidation.includes("HOSTED_WEBRTC_MANUAL_CHECKS") &&
+    browserManualUxValidation.includes("report.evidence[name]") &&
+    !browserManualUxReport.includes("const COMMON_REQUIRED_CHECKS") &&
+    !browserObjectiveAudit.includes("const COMMON_MANUAL_CHECKS"),
+  "Browser manual UX report and objective audit must share one validation module so hosted WebRTC audio evidence cannot drift between scripts",
+);
+assert(
+  browserObjectiveAuditSmoke.includes("native-declared-only.json") &&
+    browserObjectiveAuditSmoke.includes('native_audio_proven": false') &&
+    browserObjectiveAuditSmoke.includes(
+      "declared_only_native_media_rejected",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "native_product_media_accepted must fail",
+    ) &&
+    browserObjectiveAuditSmoke.includes("planned_evidence_is_durable") &&
+    browserObjectiveAuditSmoke.includes(
+      "planned_and_iterated evidence must use durable docs/scripts",
+    ) &&
+    browserObjectiveAuditSmoke.includes("hosted-shallow-ok.json") &&
+    browserObjectiveAuditSmoke.includes("shallow_hosted_ok_rejected") &&
+    browserObjectiveAuditSmoke.includes("hosted-skipped-youtube.json") &&
+    browserObjectiveAuditSmoke.includes("skipped_youtube_rejected") &&
+    browserObjectiveAuditSmoke.includes("manual-template-hosted.json") &&
+    browserObjectiveAuditSmoke.includes("manual_template_prefilled") &&
+    browserObjectiveAuditSmoke.includes(
+      "manual UX template must prefill hosted provider",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "manual UX template must prefill hosted target",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "manual UX template must include empty hosted WebRTC audio evidence field",
+    ) &&
+    browserObjectiveAuditSmoke.includes("manual-hosted-detached.json") &&
+    browserObjectiveAuditSmoke.includes("manual_hash_mismatch_rejected") &&
+    browserObjectiveAuditSmoke.includes("machine artifact hash mismatch") &&
+    browserObjectiveAuditSmoke.includes("manual-hosted-schema-mismatch.json") &&
+    browserObjectiveAuditSmoke.includes("manual_schema_mismatch_rejected") &&
+    browserObjectiveAuditSmoke.includes("machine artifact schema mismatch") &&
+    browserObjectiveAuditSmoke.includes("manual-hosted-copy-path.json") &&
+    browserObjectiveAuditSmoke.includes(
+      "manual_artifact_path_mismatch_rejected",
+    ) &&
+    browserObjectiveAuditSmoke.includes("copied machine artifact") &&
+    browserObjectiveAuditSmoke.includes("detached_manual_ux_rejected") &&
+    browserObjectiveAuditSmoke.includes(
+      "manual-hosted-missing-audio-evidence.json",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "checkmarks without text-backed audio evidence",
+    ) &&
+    browserObjectiveAuditSmoke.includes(
+      "hosted_manual_audio_evidence_required",
+    ) &&
+    browserObjectiveAuditSmoke.includes("manual-hosted-stale-check.json") &&
+    browserObjectiveAuditSmoke.includes("legacy_frame_preview_audio") &&
+    browserObjectiveAuditSmoke.includes("stale_manual_fields_rejected") &&
+    browserObjectiveAuditSmoke.includes("manual-hosted-matched.json") &&
+    browserObjectiveAuditSmoke.includes(
+      "display session reported audio=true",
+    ) &&
+    browserObjectiveAuditSmoke.includes("matched_manual_ux_accepted"),
+  "Browser objective audit smoke must prove declaration-only native audio/video, durable planned evidence, shallow hosted ok=true artifacts, skipped YouTube hosted artifacts, detached/manual hash-schema-or-path-mismatched UX, text-backed hosted audio evidence, stale manual fields, and ambiguous manual templates cannot satisfy the completion gate while a strict artifact with matching manual hash can pass",
+);
+assert(
+  browserHostedProviderBakeoff.includes(
+    "!skipYoutube && youtubeStatus === 0",
+  ) &&
+    browserHostedProviderBakeoff.includes(
+      "rejected because product-compositor YouTube stress was skipped",
+    ) &&
+    browserHostedProviderBakeoff.includes("partial_candidate_ok") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "Do not use `--skip-youtube` for acceptance",
+    ),
+  "Hosted provider bake-off must not produce accepted artifacts when YouTube/audio stress is skipped",
+);
+assert(
+  browserHostedProviderBakeoff.includes("browser-manual-ux-checks.mjs") &&
+    browserHostedProviderBakeoff.includes("manual_ux_schema") &&
+    browserHostedProviderBakeoff.includes(
+      'requiredManualChecksForSchema("elastos.browser.hosted-provider-bakeoff/v1")',
+    ) &&
+    read("scripts/browser-objective-audit-smoke.sh").includes(
+      "display_session_audio_advertised",
+    ) &&
+    read("scripts/browser-objective-audit-smoke.sh").includes(
+      "checks.display_session_audio_advertised must be true",
+    ),
+  "Hosted provider bake-off artifacts must emit the shared hosted WebRTC manual UX checklist instead of a stale prose checklist",
+);
+assert(
+  read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("`manual_ux_schema`") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("`manual_ux_checks`") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "review guidance, not as a",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "substitute for a signed-off manual UX report",
+    ),
+  "Browser provider bake-off docs must explain that artifact manual_ux_checks are guidance, not manual UX acceptance",
+);
+assert(
+  browserProviderDecisionReport.includes("native_host_capability") &&
+    browserProviderDecisionReport.includes(
+      "browser-native-host-capability.mjs",
+    ) &&
+    browserProviderDecisionReport.includes("--require-product-native") &&
+    browserProviderDecisionReport.indexOf(
+      "This host appears ready for the native product path",
+    ) < browserProviderDecisionReport.indexOf("single-session and has an active page") &&
+    browserProviderDecisionReport.includes(
+      "This host is not ready for native product media",
+    ) &&
+    browserProviderRunbook.includes("Current native host blockers") &&
+    browserProviderRunbook.includes("Native host product-ready") &&
+    browserProviderRunbook.includes("## Current Host Stop Condition") &&
+    browserProviderRunbook.includes(
+      "Do not keep tuning the running Selkies baseline as product architecture.",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "not accepted as product Browser proof",
+    ),
+  "Browser provider decision report/runbook must include native host readiness, an explicit current-host stop condition, and prioritize a native-ready host over more Docker/Selkies tuning",
+);
+assert(
+  browserProviderDecisionReport.includes(
+    "elastos.browser.provider-decision-report/v1",
+  ) &&
+    browserProviderDecisionReport.includes("candidate_readiness") &&
+    browserProviderDecisionReport.includes("control_status") &&
+    browserProviderDecisionReport.includes("active_pages") &&
+    browserProviderDecisionReport.includes("single_session") &&
+    browserProviderDecisionReport.includes("single-session and has an active page") &&
+    browserProviderDecisionReport.includes("generateCandidateConfig") &&
+    browserProviderDecisionReport.includes("generated_config_removed") &&
+    browserProviderDecisionReport.includes(
+      "operator_control_socket not provisioned",
+    ) &&
+    browserProviderDecisionReport.includes("fs.rmSync(prepared.cleanupDir") &&
+    browserProviderDecisionReport.includes('hostedPreflight("browserbox"') &&
+    browserProviderDecisionReport.includes(
+      'hostedPreflight("kasm-workspaces"',
+    ) &&
+    browserProviderDecisionReport.includes('hostedPreflight("kasmvnc"') &&
+    browserProviderDecisionReport.includes("goalStatus") &&
+    browserProviderDecisionReport.includes('status: "blocked"') &&
+    browserProviderDecisionReport.includes(
+      "external provider/native evidence",
+    ) &&
+    browserProviderDecisionReport.includes("blockedBy") &&
+    browserProviderDecisionReport.includes("return []") &&
+    browserProviderDecisionReport.includes("nextAction") &&
+    browserProviderDecisionReport.includes("next_action: nextAction") &&
+    browserProviderDecisionReport.includes(
+      "free_or_isolate_selkies_before_bakeoff",
+    ) &&
+    browserProviderDecisionReport.includes("keep_accepted_browser_artifacts") &&
+    browserProviderDecisionReport.includes("provision_kasm_workspaces_first") &&
+    browserProviderDecisionReport.includes("selkies_single_session_busy") &&
+    browserProviderDecisionReport.includes("native_host_not_product_ready") &&
+    browserProviderDecisionReport.includes("hostedBakeoffSummary") &&
+    browserProviderDecisionReport.includes("hosted_bakeoff_rejected") &&
+    browserProviderDecisionReport.includes("nativePreflightSummary") &&
+    browserProviderDecisionReport.includes("native_preflight_rejected") &&
+    browserProviderDecisionReport.includes(
+      "native preflight did not prove required native audio/video media readiness",
+    ) &&
+    browserProviderDecisionReport.includes(
+      "docker_is_product_architecture: false",
+    ) &&
+    browserProviderDecisionReport.includes(
+      "managed_baseline_not_final_product",
+    ) &&
+    browserProviderDecisionReport.includes("Kasm Workspaces first") &&
+    browserProviderDecisionReport.includes("BrowserBox if licensed") &&
+    browserProviderDecisionReport.includes("objectiveAudit") &&
+    browserProviderDecisionReportSmoke.includes(
+      "elastos.browser.provider-decision-report-smoke/v1",
+    ) &&
+    browserProviderDecisionReportSmoke.includes("structured_next_action") &&
+    browserProviderDecisionReportSmoke.includes("blocked_by_visible") &&
+    browserProviderDecisionReportSmoke.includes(
+      "candidate_readiness_visible",
+    ) &&
+    browserProviderDecisionReportSmoke.includes(
+      "native_preflight_rejection_visible",
+    ) &&
+    browserProviderDecisionReportSmoke.includes(
+      "native_preflight_acceptance_visible",
+    ) &&
+    browserProviderDecisionReportSmoke.includes(
+      "accepted decision report must not keep unrelated live-host/provider blockers",
+    ) &&
+    browserProviderDecisionReportSmoke.includes(
+      "temporary placeholder socket paths",
+    ) &&
+    browserProviderDecisionReportSmoke.includes("audio_product_proven") &&
+    browserProviderDecisionReportSmoke.includes("manual_user_acceptance") &&
+    browserPlanningSurface.includes("browser-provider-decision-report.mjs") &&
+    browserPlanningSurface.includes("structured `next_action`") &&
+    browserPlanningSurface.includes("hosted-candidate readiness matrix") &&
+    browserPlanningSurface.includes("serialization blocker") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-provider-decision-report.mjs",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "hosted-candidate readiness matrix",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "top-level `goal_status`",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "structured `next_action`",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "top-level `native_preflight` summary",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "native_preflight_rejected",
+    ) &&
+    read("state.md").includes(
+      "summarizes supplied `hosted_bakeoff` and `native_preflight` artifacts",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "removes it and reports the real blockers",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "Generated placeholder socket paths must not be shown as operator instructions",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "active single-session target is a serialization limit",
+    ),
+  "Browser provider decision reporting must inspect live adapter/service state, report BrowserBox/Kasm/Selkies readiness, clean up generated temporary configs, expose blocked goal status, structured next action, rejected hosted/native artifact summaries, accepted artifact preservation with no stale blockers, and Selkies active single-session state, and point toward provider/native gates instead of treating the running Selkies Docker service as product completion",
+);
+assert(
+  browserProviderDecisionReportSmoke.includes(
+    "free_or_isolate_selkies_before_bakeoff",
+  ) &&
+    browserProviderDecisionReportSmoke.includes('owner !== "operator"') &&
+    browserProviderDecisionReportSmoke.includes("separate provider instance") &&
+    browserProviderDecisionReportSmoke.includes(
+      "must not recommend more Selkies tuning",
+    ) &&
+    browserProviderDecisionReportSmoke.includes(
+      "busy_selkies_next_action_exercised",
+    ) &&
+    browserPlanningSurface.includes("separate provider instance") &&
+    browserPlanningSurface.includes("Selkies tuning") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "using a separate provider instance",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("instead of more") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("Selkies tuning"),
+  "Browser provider decision-report smoke must keep busy single-session Selkies as an operator-owned serialization blocker, not a local tuning instruction",
+);
+assert(
+  browserProviderRunbook.includes("## Objective Checklist") &&
+    browserProviderRunbook.includes("objectiveChecklistBlock") &&
+    browserProviderRunbook.includes("prompt_to_artifact_checklist") &&
+    browserProviderRunbook.includes("This runbook is read-only guidance") &&
+    browserProviderRunbook.includes("It does not install vendors, launch") &&
+    browserProviderRunbook.includes(
+      "preserve it and use a separate provider instance",
+    ) &&
+    browserProviderRunbook.includes("--hosted-bakeoff") &&
+    browserProviderRunbook.includes("--native-preflight") &&
+    browserProviderRunbook.includes("--manual-ux") &&
+    browserProviderRunbook.includes("regenerates the decision report") &&
+    browserProviderRunbook.includes(
+      "cannot be combined with proof artifacts",
+    ) &&
+    browserProviderRunbook.includes("Goal status:") &&
+    browserProviderRunbook.includes("Selkies session: single-session=") &&
+    browserProviderRunbook.includes("active-pages=") &&
+    browserProviderRunbook.includes("## Current Host Stop Condition") &&
+    browserProviderRunbook.includes("currentHostStopConditionBlock") &&
+    browserProviderRunbook.includes("## Blocking Summary") &&
+    browserProviderRunbook.includes("blockingSummaryBlock") &&
+    browserProviderRunbook.includes("## Next Action") &&
+    browserProviderRunbook.includes("nextActionBlock") &&
+    browserProviderRunbook.includes("## Local Pass Checks") &&
+    browserProviderRunbook.includes(
+      "scripts/browser-provider-decision-report-smoke.sh",
+    ) &&
+    browserProviderRunbook.includes("## Expected-Failing Completion Audit") &&
+    browserProviderRunbook.includes(
+      "It should exit non-zero until product audio evidence",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "elastos.browser.provider-runbook-smoke/v1",
+    ) &&
+    browserProviderRunbookSmoke.includes("audio_product_proven") &&
+    browserProviderRunbookSmoke.includes("manual_user_acceptance") &&
+    browserProviderRunbookSmoke.includes(
+      "This runbook is read-only guidance",
+    ) &&
+    browserProviderRunbookSmoke.includes("Goal status: `blocked`") &&
+    browserProviderRunbookSmoke.includes(
+      "Selkies session: single-session=`true`, active-pages=`1`, page-ids=`page:selkies-test`",
+    ) &&
+    browserProviderRunbookSmoke.includes("Goal status: `accepted`") &&
+    browserProviderRunbookSmoke.includes(
+      "Browser/audio objective has accepted product proof and manual UX evidence.",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "native_manual_artifact_forwarding_checked",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "hosted_artifact_forwarding_checked",
+    ) &&
+    browserProviderRunbookSmoke.includes("## Current Host Stop Condition") &&
+    browserProviderRunbookSmoke.includes(
+      "Do not keep tuning the running Selkies baseline as product architecture.",
+    ) &&
+    browserProviderRunbookSmoke.includes("## Blocking Summary") &&
+    browserProviderRunbookSmoke.includes("## Next Action") &&
+    browserProviderRunbookSmoke.includes(
+      "free_or_isolate_selkies_before_bakeoff",
+    ) &&
+    browserProviderRunbookSmoke.includes("objective_checklist_rendered") &&
+    browserProviderRunbookSmoke.includes("missing_audio_visible") &&
+    browserProviderRunbookSmoke.includes("missing_manual_ux_visible") &&
+    browserProviderRunbookSmoke.includes("local_pass_checks_rendered") &&
+    browserProviderRunbookSmoke.includes(
+      "expected_failing_completion_audit_rendered",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "--hosted-bakeoff /path/to/bakeoff.json",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "cannot be combined with proof artifacts",
+    ) &&
+    browserProviderRunbookSmoke.includes("hosted_bakeoff_rejected") &&
+    browserProviderRunbookSmoke.includes("## Local Pass Checks") &&
+    browserProviderRunbookSmoke.includes(
+      "scripts/browser-provider-decision-report-smoke.sh",
+    ) &&
+    browserProviderRunbookSmoke.includes(
+      "## Expected-Failing Completion Audit",
+    ) &&
+    browserPlanningSurface.includes("Current Host Stop Condition") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "Current Host Stop Condition",
+    ) &&
+    browserPlanningSurface.includes(
+      "scripts/browser-provider-runbook-smoke.sh",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-provider-runbook.mjs",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "When a hosted/native proof or manual UX report already exists",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "Do not combine these proof flags with `--decision-report`",
+    ) &&
+    read("TASKS.md").includes(
+      "artifact-aware `scripts/browser-provider-runbook.mjs --hosted-bakeoff/--native-preflight --manual-ux`",
+    ) &&
+    read("state.md").includes(
+      "operator guidance is generated from the actual evidence",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "structured next action",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("`blocked_by` summary"),
+  "Browser provider runbook must render, document, and smoke-test the objective checklist plus blocked goal, Selkies session occupancy, artifact-bound decision reports, current-host stop condition, structured next action, read-only safety boundary, and blocking summary so missing product audio, manual UX proof, and provider blockers stay visible before operator commands",
+);
+assert(
+  currentState.includes("Last updated: 2026-05-25 UTC") &&
+    currentState.includes(
+      "Browser architecture is coherent enough to preserve",
+    ) &&
+    currentState.includes(
+      "fails product audio proof and hash-bound manual UX evidence",
+    ) &&
+    currentState.includes(
+      "Docker/Selkies is only `managed_baseline_not_final_product`",
+    ) &&
+    currentState.includes(
+      "single-session; active pages are a serialization blocker",
+    ) &&
+    currentState.includes("not a product native-browser proof target") &&
+    currentState.includes(
+      "lacks a real host compositor/display, host audio service, and working network namespace support",
+    ) &&
+    currentState.includes(
+      "Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies",
+    ) &&
+    currentState.includes("operator_control_socket not provisioned") &&
+    currentState.includes(
+      "hosted Selkies/GStreamer service is a managed baseline",
+    ) &&
+    currentState.includes("not accepted as the final Browser"),
+  "state.md must preserve the current Browser truth: architecture valid, Selkies/Docker baseline-only, native proof blocked on this server, hosted candidates unprovisioned, and product audio/manual UX still incomplete",
+);
+assert(
+  read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("bbx install") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "BROWSERBOX_LICENSE_CONFIRMED=1",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "display_backend=browserbox_webrtc",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("KASM_BASE_URL") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("request_kasm") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("get_kasm_status") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes("allow_kasm_audio") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "must not leak Kasm API",
+    ) &&
+    browserPlanningSurface.includes("Kasm Workspaces") &&
+    browserPlanningSurface.includes("BrowserBox") &&
+    browserPlanningSurface.includes("Selkies tuning"),
+  "BrowserBox/Kasm operator prerequisites must be explicit, provider-owned, and capability-aligned before more Selkies tuning",
+);
+assert(
+  browserKasmControlService.includes("ELASTOS_BROWSER_KASM_CONTROL_CONFIG") &&
+    browserKasmControlService.includes("request_kasm") &&
+    browserKasmControlService.includes("get_kasm_status") &&
+    browserKasmControlService.includes("delete_kasm") &&
+    browserKasmControlService.includes(
+      "kasm_product_display_bridge_required",
+    ) &&
+    browserKasmControlService.includes("product_display_bridge_socket") &&
+    browserKasmControlService.includes(
+      "Kasm display bridge must not leak raw Kasm session URLs",
+    ) &&
+    browserKasmControlService.includes("allow_kasm_audio") &&
+    browserKasmControlServiceSmoke.includes("url_only_rejected_before_api") &&
+    browserKasmControlServiceSmoke.includes(
+      "product_bridge_preflight_passed",
+    ) &&
+    browserKasmControlServiceSmoke.includes("delete_called_on_close") &&
+    browserPlanningSurface.includes(
+      "scripts/browser-kasm-control-service.mjs",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "scripts/browser-kasm-control-service.mjs",
+    ),
+  "Kasm hosted provider path must have a fail-closed lifecycle control service that rejects URL-only sessions before Kasm API calls, delegates display to a product bridge, and deletes Kasm sessions on Browser close",
+);
+assert(
+  browserManualUxReport.includes("elastos.browser.manual-ux/v1") &&
+    browserManualUxReport.includes("--template") &&
+    browserManualUxReport.includes("--input") &&
+    browserManualUxReport.includes("--machine-artifact") &&
+    browserManualUxReport.includes("browser-manual-ux-checks.mjs") &&
+    browserManualUxChecks.includes("youtube_audible_audio") &&
+    browserManualUxChecks.includes("glide_wallet_connect") &&
+    browserManualUxChecks.includes("display_session_audio_advertised") &&
+    browserManualUxChecks.includes("received_audio_evidence") &&
+    browserPlanningSurface.includes("browser-manual-ux-report.mjs") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-manual-ux-report.mjs",
+    ),
+  "Browser manual UX evidence must have a template/validator with machine artifact hashing, shared hosted WebRTC audio checks, and stay wired into the completion gate docs",
+);
+assert(
+  browserExperimentCleanup.includes("elastos.browser.experiment-cleanup/v1") &&
+    browserExperimentCleanup.includes("dry_run: !args.apply") &&
+    browserExperimentCleanup.includes("1x1x24") &&
+    browserExperimentCleanup.includes("elastos-selkies-runtime-exit-target-") &&
+    browserExperimentCleanup.includes("running_containers_preserved") &&
+    !browserExperimentCleanup.includes("docker rm -f") &&
+    browserPlanningSurface.includes("browser-experiment-cleanup.mjs") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-experiment-cleanup.mjs",
+    ),
+  "Browser experiment cleanup must stay dry-run by default, preserve running Selkies targets, and avoid force-removing active containers",
+);
+assert(
+  read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+    "Page.startScreencast",
+  ) &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      'DISPLAY_BACKEND = "cdp_screencast_i420"',
+    ) &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      'DISPLAY_BACKEND_CLASS = "proof_surface"',
+    ) &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      "startRuntimeProxy",
+    ) &&
+    !read(
+      "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
+    ).includes("page.route(") &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      "webrtc_remote_display",
+    ) &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      "config_fingerprint",
+    ) &&
+    read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+      "supported_display_modes",
+    ) &&
+    read("elastos/tools/browser-playwright-engine/package.json").includes(
+      "@roamhq/wrtc",
+    ) &&
+    read("scripts/browser-runtime-proxy-smoke.sh").includes(
+      'display_backend === "cdp_screencast_i420"',
+    ) &&
+    read("scripts/browser-runtime-proxy-smoke.sh").includes("audio === false"),
+  "Hosted Browser proof must expose an explicit WebRTC remote-display sender, mark CDP screencast as a proof backend, advertise audio=false until real capture exists, use the Runtime proxy path instead of Playwright request interception, and reject stale diagnostic-only daemons instead of using HTTP frames as the product display",
+);
+assert(
+  browserJs.includes(
+    "Diagnostic Browser display mode requires debug=1 or metrics=1.",
+  ) &&
+    browserJs.includes(
+      'if (value === "diagnostic" || value === "diagnostic_frame")',
+    ) &&
+    !browserJs.includes(
+      '["webrtc_remote_display", "native_surface", "diagnostic_frame"].includes(value)',
+    ) &&
+    browserDisplayModeSmoke.includes("elastos.browser.display-mode-smoke/v1") &&
+    browserDisplayModeSmoke.includes("diagnostic_requires_debug") &&
+    browserDisplayModeSmoke.includes("display=diagnostic&debug=1") &&
+    browserDisplayModeSmoke.includes("display=diagnostic") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "`diagnostic_frame` is accepted only when Browser is opened with explicit",
+    ) &&
+    browserPlanningSurface.includes("debug=1") &&
+    browserPlanningSurface.includes("diagnostic_frame"),
+  "Browser UI must keep diagnostic_frame debug-only instead of accepting frame/image rendering as a normal display mode",
+);
+assert(
+  browserEngineAdapter.includes("SelkiesGstreamer") &&
+    browserEngineAdapter.includes(
+      "engine-offer WebRTC display sessions require initial_offer",
+    ) &&
+    browserEngineAdapter.includes("elastos.browser.webrtc-answer/v1") &&
+    browserJs.includes('displaySession.offerer === "engine"') &&
+    browserJs.includes("initial_offer") &&
+    browserJs.includes('type: "answer"') &&
+    gatewayBrowserApi.includes(
+      '"schema": "elastos.browser.webrtc-answer/v1"',
+    ) &&
+    browserHostedProductOperatorConfig.includes("selkies_gstreamer") &&
+    browserHostedProductOperatorConfig.includes("selkies_gstreamer_webrtc") &&
+    browserHostedProductOperatorConfig.includes("audio_required") &&
+    browserHostedProductOperatorConfig.includes("control_socket_path") &&
+    browserHostedProductSupervisor.includes(
+      "elastos.browser.hosted-product.open/v1",
+    ) &&
+    browserHostedProductSupervisor.includes("product_compositor") &&
+    browserHostedProductSupervisor.includes("audio=true") &&
+    browserHostedProductSupervisor.includes("offerer=engine") &&
+    browserHostedProductSupervisor.includes("cdp_screencast_i420") &&
+    browserSelkiesControlService.includes(
+      "ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG",
+    ) &&
+    browserSelkiesControlService.includes(
+      "browser_control.kind=cdp_http is required",
+    ) &&
+    browserSelkiesControlService.includes(
+      "browser_control.endpoint must be loopback/private",
+    ) &&
+    browserSelkiesControlService.includes(
+      "basic_auth.user must be a non-empty string",
+    ) &&
+    browserSelkiesControlService.includes("Authorization: Basic") &&
+    browserSelkiesControlService.includes(
+      "browser CDP navigation did not return a page debugger URL",
+    ) &&
+    browserSelkiesControlService.includes("HELLO client") &&
+    browserSelkiesControlService.includes("SESSION server") &&
+    browserSelkiesControlService.includes('offerer: "engine"') &&
+    browserSelkiesControlService.includes("elastos.browser.webrtc-answer/v1") &&
+    browserSelkiesControlServiceSmoke.includes("fake-selkies") &&
+    browserSelkiesControlServiceSmoke.includes("fake-cdp") &&
+    browserSelkiesControlServiceSmoke.includes(
+      "browser-selkies-target-preflight.sh",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes(
+      "scripts/browser-selkies-control-service.mjs",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes("m=audio") &&
+    browserSelkiesControlServiceSmoke.includes(
+      "elastos.browser.webrtc-answer/v1",
+    ) &&
+    browserSelkiesTargetPreflight.includes(
+      "browser-selkies-control-service.mjs",
+    ) &&
+    browserSelkiesTargetPreflight.includes(
+      "browser-hosted-product-target-preflight.sh",
+    ) &&
+    browserSelkiesTargetPreflight.includes(
+      "--browser-cdp-endpoint must be loopback/private",
+    ) &&
+    browserSelkiesTargetPreflight.includes("--selkies-basic-auth-user") &&
+    browserSelkiesTargetPreflight.includes("--selkies-basic-auth-password") &&
+    browserSelkiesCurrentWheelSmoke.includes(
+      "ghcr.io/selkies-project/selkies/py-build:main",
+    ) &&
+    browserSelkiesCurrentWheelSmoke.includes(
+      "browser-selkies-target-preflight.sh",
+    ) &&
+    browserSelkiesCurrentWheelSmoke.includes("audio-enabled=true") &&
+    browserSelkiesRealChromiumSmoke.includes(
+      "BROWSER_SELKIES_CHROMIUM_PROGRAM",
+    ) &&
+    browserSelkiesRealChromiumSmoke.includes(
+      "--host-resolver-rules='MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'",
+    ) &&
+    browserSelkiesRealChromiumSmoke.includes(
+      "browser-selkies-target-preflight.sh",
+    ) &&
+    browserSelkiesRealChromiumSmoke.includes("real_chromium_cdp") &&
+    browserSelkiesRuntimeExitTarget.includes("browser-local-exit") &&
+    browserSelkiesRuntimeExitTarget.includes("browser-native-proxy-engine") &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "browser-hosted-product-operator-config.mjs",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "elastos.browser.selkies-runtime-exit-target/v1",
+    ) &&
+    browserSelkiesRuntimeExitSmoke.includes(
+      "browser-selkies-runtime-exit-target.sh",
+    ) &&
+    browserSelkiesRuntimeExitSmoke.includes("--cleanup-after-verify") &&
+    read("scripts/browser-hosted-product-target-preflight.sh").includes(
+      "browser-hosted-product-display-smoke.sh",
+    ) &&
+    read("scripts/browser-hosted-product-target-preflight.sh").includes(
+      "hosted product control socket is not available",
+    ) &&
+    read("scripts/browser-hosted-product-display-smoke.sh").includes(
+      "Selkies/GStreamer hosted display must use engine-offer WebRTC negotiation",
+    ) &&
+    read("scripts/browser-hosted-product-display-smoke.sh").includes(
+      "backend_class = product_compositor",
+    ) &&
+    read("scripts/browser-hosted-product-display-smoke.sh").includes(
+      "audio = true",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "browser-hosted-product-target-preflight.sh",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "elastos.browser.hosted-product.open/v1",
+    ) &&
+    browserPlanningSurface.includes("browser-selkies-control-service.mjs") &&
+    browserPlanningSurface.includes(
+      "browser-selkies-control-service-smoke.sh",
+    ) &&
+    browserPlanningSurface.includes("browser-selkies-target-preflight.sh") &&
+    browserPlanningSurface.includes("browser-selkies-current-wheel-smoke.sh") &&
+    browserPlanningSurface.includes("browser-selkies-real-chromium-smoke.sh") &&
+    browserPlanningSurface.includes("browser-selkies-runtime-exit-target.sh") &&
+    browserPlanningSurface.includes("browser-selkies-runtime-exit-smoke.sh") &&
+    browserPlanningSurface.includes("--selkies-basic-auth-user") &&
+    browserPlanningSurface.includes("gst-py-example") &&
+    browserPlanningSurface.includes("legacy/numeric signaling flow") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "Hosted Product Control Service",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("browser_control.kind=cdp_http") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-target-preflight.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-current-wheel-smoke.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-real-chromium-smoke.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-runtime-exit-target.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-runtime-exit-smoke.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("--selkies-basic-auth-password") &&
+    read("docs/BROWSER_CAPSULE.md").includes("gst-py-example") &&
+    read("docs/BROWSER_CAPSULE.md").includes("legacy/numeric signaling flow") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-control-service.mjs",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("offerer=engine") &&
+    read("docs/BROWSER_CAPSULE.md").includes("POST /pages/{page_id}/webrtc"),
+  "Hosted Browser product display must have a first-class Selkies/GStreamer adapter config path, engine-offer WebRTC negotiation, a strict control-socket supervisor bridge, a Selkies control bridge smoke, authenticated target support, current-wheel product decision smoke, real Chromium/CDP smoke, canonical Runtime Exit target launcher, private CDP page control, a target-host preflight, documented rejection of incompatible example containers, an explicit control service API, and a fail-closed product compositor/audio gate, not just prose",
+);
+assert(
+  browserEngineAdapter.includes("HostedRemoteBrowser") &&
+    browserHostedProductOperatorConfig.includes("--candidate") &&
+    browserHostedProductOperatorConfig.includes("candidatePreset") &&
+    browserHostedProductOperatorConfig.includes("browserbox_webrtc") &&
+    browserHostedProductOperatorConfig.includes("kasm_workspaces_webrtc") &&
+    browserHostedProductOperatorConfig.includes("hosted_remote_browser") &&
+    browserHostedProductOperatorConfig.includes("--display-backend") &&
+    read("scripts/browser-hosted-product-target-preflight.sh").includes(
+      "--candidate",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "--candidate browserbox",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "--candidate kasm-workspaces",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "--candidate kasmvnc",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "kasm_url",
+    ) &&
+    read("scripts/browser-hosted-product-config-smoke.sh").includes(
+      "Kasm URL-only rejection",
+    ) &&
+    browserPlanningSurface.includes("kind=hosted_remote_browser") &&
+    browserPlanningSurface.includes(
+      "browser-hosted-product-operator-config.mjs",
+    ) &&
+    browserPlanningSurface.includes("Kasm's `kasm_url`") &&
+    read("docs/BROWSER_CAPSULE.md").includes("hosted_remote_browser") &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "--candidate browserbox",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "Returning only Kasm's `kasm_url` is not an ElastOS Browser proof",
+    ),
+  "Hosted Browser product path must allow KasmVNC/BrowserBox-style provider spikes through named candidate presets behind the same product-compositor contract, reject Kasm URL-only adapters, and avoid hardcoding Selkies or relying on hand-matched engine/backend strings",
+);
+assert(
+  read("scripts/browser-hosted-provider-preflight.mjs").includes(
+    "elastos.browser.hosted-provider-preflight/v1",
+  ) &&
+    read("scripts/browser-hosted-provider-preflight.mjs").includes(
+      "BROWSERBOX_LICENSE_CONFIRMED",
+    ) &&
+    read("scripts/browser-hosted-provider-preflight.mjs").includes(
+      "KASM_BASE_URL",
+    ) &&
+    read("scripts/browser-hosted-provider-preflight.mjs").includes(
+      "operator_control_socket",
+    ) &&
+    read("scripts/browser-hosted-provider-preflight.mjs").includes(
+      "--artifact-out <hosted-bakeoff.json>",
+    ) &&
+    read("docs/BROWSER_PROVIDER_BAKEOFF.md").includes(
+      "browser-hosted-provider-preflight.mjs",
+    ) &&
+    browserPlanningSurface.includes(
+      "scripts/browser-hosted-provider-preflight.mjs",
+    ),
+  "Hosted Browser provider bake-off must have a fail-closed preflight for BrowserBox/Kasm prerequisites and return an artifact-producing bake-off next_command before running candidate gates or vendor installers",
+);
+assert(
+  read("scripts/browser-hosted-provider-candidate-smoke.sh").includes(
+    "browser-hosted-product-display-smoke.sh",
+  ) &&
+    read("scripts/browser-hosted-provider-candidate-smoke.sh").includes(
+      "browser-hosted-product-webrtc-smoke.sh",
+    ) &&
+    read("scripts/browser-hosted-provider-candidate-smoke.sh").includes(
+      "browser-hosted-product-navigation-smoke.sh",
+    ) &&
+    read("scripts/browser-hosted-provider-candidate-smoke.sh").includes(
+      "browser-hosted-product-wallet-smoke.sh",
+    ) &&
+    read("scripts/browser-hosted-provider-candidate-smoke.sh").includes(
+      "browser-hosted-product-glide-wallet-smoke.sh",
+    ) &&
+    browserHostedProductNavigationSmoke.includes('command: "navigate"') &&
+    browserHostedProductNavigationSmoke.includes('command: "back"') &&
+    browserHostedProductNavigationSmoke.includes('command: "forward"') &&
+    browserHostedProductNavigationSmoke.includes('command: "reload"') &&
+    browserHostedProductNavigationSmokeShell.includes(
+      "browser-hosted-product-navigation-smoke.mjs",
+    ) &&
+    browserPlanningSurface.includes(
+      "browser-hosted-provider-candidate-smoke.sh",
+    ) &&
+    browserPlanningSurface.includes("Runtime/provider navigation") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-hosted-provider-candidate-smoke.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-hosted-product-navigation-smoke.sh",
+    ),
+  "Hosted Browser provider replacement decisions must have one candidate gate covering product display, Runtime/provider navigation, media/audio quality, wallet bridge, and Glide instead of subjective provider preference",
+);
+assert(
+  browserSelkiesControlService.includes("sendFrame(0xa, frame.payload)") &&
+    browserSelkiesControlServiceSmoke.includes("keepalive") &&
+    browserSelkiesControlServiceSmoke.includes("masked pong") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "client-to-server pong frames are masked",
+    ),
+  "Hosted Selkies control bridge must preserve WebSocket ping/pong keepalive semantics so long media sessions are not torn down by signaling disconnects",
+);
+assert(
+  browserHostedProductWebrtcSmoke.includes("playwright") &&
+    browserHostedProductWebrtcSmoke.includes(
+      'state.tracks.includes("audio")',
+    ) &&
+    browserHostedProductWebrtcSmoke.includes(
+      'state.tracks.includes("video")',
+    ) &&
+    browserHostedProductWebrtcSmoke.includes("dataChannelOpen") &&
+    browserHostedProductWebrtcSmoke.includes("iceConnectionState") &&
+    browserHostedProductWebrtcSmoke.includes("holdMs") &&
+    browserHostedProductWebrtcSmokeShell.includes("--hold-ms") &&
+    browserHostedProductWebrtcSmokeShell.includes(
+      "browser-hosted-product-webrtc-smoke.mjs",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "browser-hosted-product-webrtc-smoke.sh",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes("--target-image") &&
+    browserSelkiesRuntimeExitTarget.includes("prebuilt_target_image") &&
+    browserSelkiesOperatorImageBuild.includes(
+      "deploy/browser-selkies-runtime-target/Dockerfile",
+    ) &&
+    browserSelkiesOperatorDockerfile.includes(
+      "selkies-0.0.0.dev0-py3-none-any.whl",
+    ) &&
+    browserSelkiesOperatorDockerfile.includes("libnss3") &&
+    browserSelkiesOperatorDockerfile.includes("xclip") &&
+    browserSelkiesOperatorDockerfile.includes("PIXELFLUX_VERSION=1.4.7") &&
+    browserSelkiesOperatorDockerfile.includes("ctypes.CDLL") &&
+    browserSelkiesOperatorDockerfile.includes("screen_capture_module.so") &&
+    browserPlanningSurface.includes(
+      "browser-selkies-operator-image-build.sh",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "browser-selkies-operator-image-build.sh",
+    ),
+  "Hosted Browser product path must verify real WebRTC audio/video/input tracks, support a long-session hold gate, and have a controlled prebuilt Selkies target image path with required runtime dependencies and screen-capture import proof",
+);
+assert(
+  browserSelkiesControlService.includes('input_protocol: "selkies_v1"') &&
+    browserSelkiesControlServiceSmoke.includes(
+      "Selkies display must declare datachannel selkies_v1 input",
+    ) &&
+    browserHostedProductWebrtcSmoke.includes(
+      'session.input_protocol !== "selkies_v1"',
+    ) &&
+    browserHostedProductWebrtcSmoke.includes("selkiesMessagesForInput") &&
+    browserJs.includes("currentDisplayInputProtocol") &&
+    browserJs.includes("selkiesMessagesForInput") &&
+    browserJs.includes('displaySession.input_protocol === "selkies_v1"') &&
+    browserPlanningSurface.includes("input_protocol=selkies_v1") &&
+    read("docs/BROWSER_CAPSULE.md").includes("input_protocol=selkies_v1"),
+  "Hosted Selkies product sessions must declare selkies_v1 input and Browser UI must translate input events instead of sending ElastOS JSON to the Selkies-native datachannel",
+);
+assert(
+  browserJs.includes("const requiresRuntimeRoute =") &&
+    browserJs.includes('event?.type === "browser_command"') &&
+    browserJs.includes('event?.type === "resize"') &&
+    browserJs.includes("!requiresRuntimeRoute") &&
+    browserJs.includes("navigateAddress") &&
+    browserJs.includes('command: "navigate"') &&
+    browserSelkiesControlService.includes("validateBrowserNavigationUrl") &&
+    browserSelkiesControlService.includes("Page.navigate") &&
+    browserSelkiesControlService.includes("Page.navigateToHistoryEntry") &&
+    browserSelkiesControlService.includes("Page.reload") &&
+    browserSelkiesControlService.includes(
+      "Emulation.setDeviceMetricsOverride",
+    ) &&
+    browserSelkiesControlService.includes('body?.event?.type === "resize"') &&
+    browserSelkiesControlServiceSmoke.includes('"type": "browser_command"') &&
+    browserSelkiesControlServiceSmoke.includes('"command": "navigate"') &&
+    browserSelkiesControlServiceSmoke.includes('"command": "reload"') &&
+    browserPlanningSurface.includes("Runtime/provider navigation") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "commands such as address navigation, back, forward, reload, and",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "viewport resize remain Runtime/provider input calls",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("private CDP"),
+  "Hosted Selkies product navigation and viewport resize commands must stay on the Runtime/provider route and be applied by private CDP instead of disappearing into the Selkies pointer/key datachannel or reopening compositor sessions",
+);
+assert(
+  browserJs.includes("lastPageStatus = status") &&
+    browserJs.includes("syncViewFromResponse(status)") &&
+    browserJs.includes("collectWebrtcStats") &&
+    browserJs.includes("item.kind || item.mediaType") &&
+    browserJs.includes('"framesDecoded" in item') &&
+    browserJs.includes("webkitDecodedFrameCount") &&
+    browserJs.includes("isAddressEditing()") &&
+    browserJs.includes("ADDRESS_EDIT_STALE_MS") &&
+    browserHostedProductWebrtcSmoke.includes("webrtc_stats") &&
+    browserHostedProductWebrtcSmoke.includes("video_frames_decoded") &&
+    browserHostedProductWebrtcSmoke.includes("item.kind || item.mediaType") &&
+    browserHostedProductWebrtcSmoke.includes("video_element_decoded_frames") &&
+    browserHostedProductWebrtcSmoke.includes("assertQualityGate") &&
+    browserHostedProductWebrtcSmoke.includes("assertRemoteViewportResize") &&
+    browserHostedProductWebrtcSmoke.includes("resize_gate") &&
+    browserHostedProductWebrtcSmokeShell.includes("--resize-width") &&
+    browserHostedProductWebrtcSmokeShell.includes("--resize-height") &&
+    browserHostedProviderCandidateSmoke.includes(
+      "resize_gate: media.resize_gate",
+    ) &&
+    browserObjectiveAudit.includes(
+      "resizeGateAccepted(candidate.resize_gate)",
+    ) &&
+    browserObjectiveAudit.includes("resizeGateAccepted(youtube.resize_gate)") &&
+    browserHostedProductWebrtcSmoke.includes("minVideoFps: 24") &&
+    browserHostedProductWebrtcSmoke.includes("minVideoWidth: 1280") &&
+    browserHostedProductWebrtcSmoke.includes("quality_gate") &&
+    browserPlanningSurface.includes("quality floor") &&
+    read("docs/BROWSER_CAPSULE.md").includes("quality floor") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "rendered video-element counters",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "Browser UI pauses page-status polling while the user is actively editing",
+    ),
+  "Hosted Browser product quality must expose engine history state, protect address-bar editing from status polling, and provide measurable WebRTC/video-element stats with enforced media and remote-viewport resize gates instead of stale navigation state, fixed or unproven compositor scale, or subjective quality reports",
+);
+assert(
+  browserSelkiesControlService.includes("readIceServersConfig") &&
+    browserSelkiesControlService.includes(
+      "ice_servers may contain at most 8 entries",
+    ) &&
+    browserSelkiesControlService.includes("display_session") &&
+    browserSelkiesControlService.includes(
+      "ice_servers: this.config.iceServers",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes(
+      "stun:stun.example.invalid:3478",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes(
+      "ICE servers were not propagated",
+    ) &&
+    browserSelkiesTargetPreflight.includes("--ice-server") &&
+    browserSelkiesTargetPreflight.includes("--ice-username") &&
+    browserSelkiesTargetPreflight.includes("--ice-credential") &&
+    browserSelkiesRuntimeExitTarget.includes("--ice-server") &&
+    browserSelkiesRuntimeExitTarget.includes("ice_servers_configured") &&
+    browserPlanningSurface.includes(
+      "Operators that need traversal beyond direct host UDP must pass `--ice-server`",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("display_session.ice_servers"),
+  "Hosted Browser product WebRTC path must propagate explicit operator STUN/TURN/TURNS configuration through the typed display session instead of relying on hidden fallback ICE behavior",
+);
+assert(
+  browserSelkiesRuntimeExitTarget.includes('selkies_encoder="x264enc"') &&
+    browserSelkiesRuntimeExitTarget.includes('selkies_framerate="30"') &&
+    browserSelkiesRuntimeExitTarget.includes('selkies_video_bitrate="16"') &&
+    browserSelkiesRuntimeExitTarget.includes('selkies_width="1920"') &&
+    browserSelkiesRuntimeExitTarget.includes('selkies_height="1080"') &&
+    browserSelkiesRuntimeExitTarget.includes(
+      '\\"--force-device-scale-factor=1.5\\"',
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "ELASTOS_SELKIES_INITIAL_RESOLUTION",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "needle = 'resize_display(' + quote + '1920x1080' + quote + ')'",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes(
+      'selkies_resolution_mode="dynamic"',
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
+    browserSelkiesRuntimeExitTarget.includes(
+      "--is-manual-resolution-mode=false",
+    ) &&
+    browserSelkiesRuntimeExitTarget.includes("--enable-resize=true") &&
+    browserSelkiesRuntimeExitTarget.includes("--selkies-encoder") &&
+    browserSelkiesRuntimeExitTarget.includes("selkies_resolution") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "1920x1080 stream with a stable 1280x720 CSS viewport",
+    ),
+  "Canonical hosted Browser launcher must default to a tunable H.264 profile with explicit normal-browser viewport scale and remote-resize gating instead of the old JPEG proof profile or unproven zoomed-out CSS surface",
+);
+assert(
+  browserEngineAdapter.includes("MAX_SUPERVISOR_TIMEOUT_MS: u64 = 300_000") &&
+    browserEngineAdapter.includes("timeout_ms must be 100-300000") &&
+    browserHostedProductOperatorConfig.includes("timeoutMs > 300000") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "supervisor timeouts up to 300 seconds",
+    ),
+  "Hosted Browser adapter and operator config must agree on the 300-second supervisor timeout needed for heavier per-launch product sessions",
+);
+assert(
+  browserSelkiesSystemService.includes("elastos-browser-selkies.sh") &&
+    browserSelkiesSystemScript.includes(
+      "browser-selkies-runtime-exit-target.sh",
+    ) &&
+    browserSelkiesSystemScript.includes(
+      "ELASTOS_BROWSER_SELKIES_ICE_SERVERS",
+    ) &&
+    browserSelkiesSystemScript.includes(
+      "ELASTOS_BROWSER_SELKIES_TARGET_IMAGE",
+    ) &&
+    browserSelkiesSystemEnv.includes(
+      "ELASTOS_BROWSER_SELKIES_TARGET_IMAGE=elastos/browser-selkies-runtime-target:dev",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "scripts/system/elastos-browser-selkies.service",
+    ) &&
+    browserPlanningSurface.includes("elastos-browser-selkies.service") &&
+    read("ROADMAP.md").includes(
+      "operator-image and durable service wrapper path now exists",
+    ),
+  "Hosted Browser product target must have a durable systemd operator wrapper around the canonical Selkies launcher, not only one-off shell deployment commands",
+);
+assert(
+  !browserPlanningSurface.includes("transient systemd unit") &&
+    !browserPlanningSurface.includes("promoting the transient"),
+  "Browser plans must not keep stale transient-service TODOs after the durable Selkies service promotion",
+);
+assert(
+  browserSelkiesControlService.includes(
+    "Page.addScriptToEvaluateOnNewDocument",
+  ) &&
+    browserSelkiesControlService.includes("runtime_mediated_eip1193") &&
+    browserSelkiesControlService.includes("wallet_switchEthereumChain") &&
+    browserSelkiesControlService.includes('signing: "approval_required"') &&
+    browserSelkiesControlServiceSmoke.includes(
+      "wallet bridge init script was not installed before navigation",
+    ) &&
+    browserHostedProductWalletSmoke.includes("eth_requestAccounts") &&
+    browserHostedProductWalletSmoke.includes("wallet_switchEthereumChain") &&
+    browserHostedProductWalletSmoke.includes("approval_required") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "scripts/browser-hosted-product-wallet-smoke.sh",
+    ) &&
+    browserPlanningSurface.includes("browser-hosted-product-wallet-smoke.sh"),
+  "Hosted Browser product path must prove the remote Chromium page receives the constrained Runtime-mediated EIP-1193 bridge while signing routes through Wallet/Inbox approval",
+);
+assert(
+  browserHostedProductGlideWalletSmoke.includes("https://glidefinance.io/") &&
+    browserHostedProductGlideWalletSmoke.includes("Connect Wallet") &&
+    browserHostedProductGlideWalletSmoke.includes(
+      "metamask|browser wallet|injected",
+    ) &&
+    browserHostedProductGlideWalletSmoke.includes("direct_network") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "scripts/browser-hosted-product-glide-wallet-smoke.sh",
+    ) &&
+    browserPlanningSurface.includes(
+      "browser-hosted-product-glide-wallet-smoke.sh",
+    ),
+  "Hosted Browser product path must prove the real Glide connect-wallet dapp flow, not only a fixture page with window.ethereum",
+);
+assert(
+  browserJs.includes("closeRuntimePage") &&
+    browserJs.includes("/api/apps/browser/pages/") &&
+    browserSelkiesControlService.includes("closeActivePages()") &&
+    browserSelkiesControlService.includes(
+      "elastos.browser.selkies-control.status/v1",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes("replacement-response.json") &&
+    browserSelkiesControlServiceSmoke.includes("stale-page-status.json") &&
+    browserSelkiesControlServiceSmoke.includes("initial-status.json") &&
+    browserPlanningSurface.includes("hosted_browser_session_busy") &&
+    browserPlanningSurface.includes(
+      "elastos.browser.selkies-control.status/v1",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("hosted_browser_session_busy") &&
+    read("docs/BROWSER_CAPSULE.md").includes("recycles any") &&
+    read("docs/BROWSER_CAPSULE.md").includes("GET /status") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "single compositor/browser session",
+    ),
+  "Hosted Browser docs and code must recycle stale singleton hosted pages and expose operator status for the current single-compositor target instead of surfacing busy errors to users",
+);
+assert(
+  browserSelkiesControlService.includes("sessionCooldownMs") &&
+    browserSelkiesControlService.includes(
+      "page.close();\n          markSessionClosed();",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes("failed-open-response.json") &&
+    browserSelkiesControlServiceSmoke.includes(
+      "failed open leaked an active Selkies page",
+    ) &&
+    browserSelkiesControlServiceSmoke.includes(
+      "Selkies control bridge did not close the WebSocket after failed open",
+    ),
+  "Hosted Selkies control service must clean up failed opens and apply a bounded session cooldown instead of leaving orphaned controllers that poison the next launch",
+);
+assert(
+  read("scripts/browser-runtime-proxy-smoke.sh").includes(
+    "BROWSER_SMOKE_URL",
+  ) &&
+    read("scripts/browser-runtime-proxy-smoke.sh").includes(
+      "BROWSER_SMOKE_ALLOWED_HOSTS",
+    ),
+  "Browser runtime proxy smoke must support real target URL proofs such as Glide without duplicating the smoke script",
+);
+assert(
+  read("scripts/browser-runtime-proxy-smoke.sh").includes(
+    "BROWSER_SMOKE_ADDRESS_FAMILY",
+  ) &&
+    read("scripts/browser-youtube-acceptance-smoke.sh").includes(
+      "prefer_ipv4",
+    ) &&
+    read("docs/BROWSER_CAPSULE.md").includes("address_family"),
+  "Browser media smokes and docs must expose explicit Exit address-family policy instead of relying on host resolver order",
+);
+assert(
+  read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+    "request.referer",
+  ) &&
+    read("scripts/browser-runtime-proxy-smoke.sh").includes(
+      "BROWSER_SMOKE_REFERER",
+    ),
+  "Browser media smoke must be able to model embedded YouTube referrer identity without adding fake fallback rendering",
+);
+assert(
+  read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+    "headless: input.headless !== false",
+  ) &&
+    read("scripts/browser-runtime-proxy-smoke.sh").includes(
+      "BROWSER_SMOKE_HEADLESS",
+    ),
+  "Browser media smoke must support headful/Xvfb verification so YouTube failures can be separated from headless proof limitations",
+);
+assert(
+  read("scripts/browser-youtube-acceptance-smoke.sh").includes(
+    "BROWSER_SMOKE_REQUIRE_MEDIA=1",
+  ) && read("scripts/browser-youtube-acceptance-smoke.sh").includes("xvfb-run"),
+  "Browser YouTube acceptance must remain a real media playback gate, not a URL-load proxy signal",
+);
+assert(
+  read("scripts/browser-native-youtube-smoke.sh").includes(
+    "browser-native-proxy-engine",
+  ) &&
+    read("scripts/browser-native-youtube-smoke.sh").includes(
+      "connectOverCDP",
+    ) &&
+    read("scripts/browser-native-youtube-smoke.sh").includes(
+      "audio_decoded_delta",
+    ) &&
+    read("scripts/browser-native-youtube-smoke.sh").includes(
+      "YouTube upstream bot challenge",
+    ),
+  "Native Browser YouTube smoke must launch Chromium through browser-native-proxy-engine/Runtime Exit and require decoded audio/video, not Playwright launch or URL-only success",
+);
+assert(
+  browserSelkiesRuntimeExitTarget.includes('\\"--kiosk\\"') &&
+    browserSelkiesRuntimeExitTarget.includes('\\"--app=about:blank\\"') &&
+    browserSelkiesRuntimeExitTarget.includes('\\"--disable-infobars\\"') &&
+    browserSelkiesRuntimeExitTarget.includes('\\"--window-position=0,0\\"') &&
+    browserSelkiesRuntimeExitTarget.includes(
+      '\\"--window-size=$selkies_width,$selkies_height\\"',
+    ) &&
+    browserSelkiesControlService.includes("/json/list") &&
+    browserSelkiesControlService.includes(
+      'Page.navigate", { url: "about:blank"',
+    ) &&
+    !browserSelkiesControlService.includes("/json/close/") &&
+    browser.includes('data-shell-window-fit="fixed"') &&
+    browserJs.includes(
+      "target.videoWidth || getCurrentView()?.width || rect.width",
+    ) &&
+    browserJs.includes("queueWheelInput") &&
+    browserJs.includes("touchPanState") &&
+    browserJs.includes("suppressSyntheticClickUntil") &&
+    browserJs.includes("bindInputChannel") &&
+    browserJs.includes("scheduleViewportResize({ force: true })") &&
+    browserStyle.includes("object-fit: fill;") &&
+    browserStyle.includes("touch-action: none;"),
+  "Hosted Selkies Browser must stream a content-only app-mode Chromium surface, suppress Chrome-for-Testing infobars, reuse/reset the kiosk target, disable Home iframe auto-fit for the dynamic Browser viewport, map input against the actual remote video coordinate space, support touch/pan input, fill the Home window through the engine-owned viewport, and force the initial compositor resize so users do not see a nested browser or misaligned input",
+);
+assert(
+  shellWindows.includes("function fitLaunchedWindow") &&
+    shellWindows.includes("fitWindowToBrowserAspect") &&
+    shellWindows.includes('SINGLE_SESSION_TARGETS = new Set(["browser"])') &&
+    shellWindows.includes("activateTargetGroup(targetId)") &&
+    shellWindows.includes("restoredSingleSessionTargets") &&
+    shellWindows.includes("height: 804") &&
+    shellWindows.includes(
+      'if (entry.targetId !== "browser") {\n      installFrameAutoFit',
+    ) &&
+    shellWindowGeometry.includes("BROWSER_REMOTE_ASPECT_RATIO = 16 / 9") &&
+    shellWindowGeometry.includes("browserAspectResizeBounds"),
+  "Home Browser windows must lock to the current 16:9 remote compositor aspect, enforce the current single-session Browser backend, and must not install generic iframe auto-fit observers that fight the remote display during resize",
+);
+assert(
+  read("scripts/browser-youtube-acceptance-smoke.sh").includes("dQw4w9WgXcQ") &&
+    read("scripts/browser-native-youtube-smoke.sh").includes("dQw4w9WgXcQ") &&
+    browserPlanningSurface.includes("not product audio acceptance") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "not product audio acceptance by themselves",
+    ),
+  "Browser YouTube media gates must use a fixed fixture while documenting that fixture evidence is not product audio acceptance and arbitrary YouTube URLs may still require an approved Exit/provider route",
+);
+assert(
+  read("scripts/browser-runtime-proxy-smoke.sh").includes(
+    "BROWSER_SMOKE_UPSTREAM_HTTP_PROXY",
+  ) &&
+    read("scripts/browser-youtube-acceptance-smoke.sh").includes(
+      "BROWSER_SMOKE_UPSTREAM_HTTP_PROXY",
+    ) &&
+    read("scripts/browser-native-youtube-smoke.sh").includes(
+      "BROWSER_SMOKE_UPSTREAM_HTTP_PROXY",
+    ),
+  "Browser media smokes must be able to exercise an operator-approved upstream HTTP CONNECT Exit without hand-editing config",
+);
+assert(
+  read("scripts/browser-wallet-bridge-smoke.sh").includes(
+    "eth_requestAccounts",
+  ) &&
+    read("scripts/browser-wallet-bridge-smoke.sh").includes(
+      "wallet_switchEthereumChain",
+    ) &&
+    read("scripts/browser-wallet-bridge-smoke.sh").includes("0x2105") &&
+    read("docs/BROWSER_CAPSULE.md").includes(
+      "scripts/browser-wallet-bridge-smoke.sh",
+    ),
+  "Browser wallet bridge must have an actual Browser-page smoke for account discovery and chain switching",
+);
+assert(
+  !read("elastos/tools/browser-playwright-engine/src/supervisor.mjs").includes(
+    "ElastOS Browser/0.1",
+  ),
+  "Browser engine must not force a non-browser user agent that breaks modern sites such as YouTube or dapps",
+);
+assert(
+  browserJs.includes("const expectsAudio = displaySession.audio === true") &&
+    browserJs.includes("prepareAudio(expectsAudio)") &&
+    browserJs.includes("unlockRemoteAudioFromGesture") &&
+    browserJs.includes('nextPeerConnection.addTransceiver("audio"') &&
+    browserJs.includes("Remote audio enabled.") &&
+    browserJs.includes("arx ${audioBytes}") &&
+    browserJs.includes("hasRenderableFrame") &&
+    browserDisplayModeSmoke.includes("audio_invariants_checked") &&
+    browserDisplayModeSmoke.includes("prepareAudio(expectsAudio)") &&
+    browserDisplayModeSmoke.includes(
+      "Remote display ready. Click the page to enable audio.",
+    ),
+  "Browser UI must require explicit display-session audio=true, keep initial remote display playback muted for autoplay policy, wait for a renderable video frame before claiming readiness, then unlock product WebRTC audio on a user gesture, expose debug audio receive bytes, still receive advertised audio tracks, and keep those invariants in the dedicated Browser display smoke",
+);
+assert(
+  browserEngineAdapter.includes(
+    "webrtc_remote_display audio requires a product compositor backend",
+  ) &&
+    browserEngineAdapter.includes(
+      "webrtc_proof_surface_cannot_advertise_audio",
+    ) &&
+    browserEngineAdapter.includes(
+      "webrtc_product_compositor_can_advertise_audio",
+    ),
+  "Browser Engine Adapter must reject proof-surface audio claims while allowing real product compositor WebRTC sessions to advertise audio",
+);
+assert(
+  gatewayBrowserApi.includes("authority_false_proof_missing") &&
+    gatewayBrowserApi.includes("invalid_provider_summary") &&
+    gatewayBrowserApi.includes("invalid_provider_status") &&
+    gatewayBrowserApi.includes(
+      "Browser Engine Adapter status omitted direct_network=false proof",
+    ) &&
+    gatewayBrowserApi.includes(
+      "Runtime Net provider status omitted direct_network=false proof",
+    ) &&
+    gatewayBrowserApi.includes(
+      "Browser Exit provider status omitted direct_network=false proof",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_app_summary_rejects_missing_authority_status_proofs",
+    ),
+  "Browser summaries must not default missing authority proofs to safe-looking status; net, exit, and browser-engine status must surface invalid_provider_status unless direct_network=false and wallet_injection=false are explicitly proven where applicable",
+);
+assert(
+  gatewayBrowserApi.includes("BrowserProviderResourceCall") &&
+    gatewayBrowserApi.includes("provider_response_data") &&
+    gatewayBrowserApi.includes("provider_response_error_message") &&
+    gatewayBrowserApi.includes("browser_provider_resource_call") &&
+    gatewayBrowserApi.includes("BrowserOpenRequest") &&
+    gatewayBrowserApi.includes("browser_app_open") &&
+    gatewayBrowserApi.includes("create_browser_wallet_transaction_request") &&
+    gatewayBrowserApi.includes("browser_engine_summary") &&
+    gatewayBrowserApi.includes("browser_net_summary") &&
+    gatewayBrowserApi.includes("is_browser_wallet_intent") &&
+    gatewayBrowserApi.includes("browser_chain_namespace_network") &&
+    gatewayBrowserApi.includes("browser_wallet_bridge_payload") &&
+    gatewayBrowserApi.includes("browser_request_origin") &&
+    !gatewayApi.includes("struct BrowserProviderResourceCall") &&
+    !gatewayApi.includes("fn provider_response_data(") &&
+    !gatewayApi.includes("fn browser_app_open(") &&
+    !gatewayApi.includes("fn create_browser_wallet_transaction_request(") &&
+    !gatewayApi.includes("fn browser_engine_summary(") &&
+    !gatewayApi.includes("fn browser_net_summary(") &&
+    !gatewayApi.includes("fn is_browser_wallet_intent(") &&
+    !gatewayApi.includes("fn browser_chain_namespace_network(") &&
+    !gatewayApi.includes("fn browser_wallet_bridge_payload(") &&
+    !gatewayApi.includes("fn browser_request_origin("),
+  "Browser provider-envelope helpers, route handlers, Browser wallet approval flows, summary helpers, wallet bridge helpers, and DTOs must stay in gateway_browser.rs instead of expanding the public gateway module again",
+);
+assert(
+  gatewayBrowserApi.includes("browser_attach_runtime_stream_path") &&
+    gatewayBrowserApi.includes("browser_stream_relay") &&
+    gatewayBrowserApi.includes("elastos.exit.relay-open/v1") &&
+    gatewayBrowserApi.includes("copy_bidirectional") &&
+    gatewayBrowserApi.includes("spawn_browser_runtime_stream_listener") &&
+    gatewayBrowserApi.includes("UnixListener") &&
+    gatewayBrowserApi.includes("BROWSER_RUNTIME_STREAM_TMP_DIR") &&
+    gatewayBrowserApi.includes("validate_browser_stream_receipt") &&
+    gatewayBrowserApi.includes("browser_engine_stream_session") &&
+    gatewayBrowserApi.includes("browser_visible_stream_session") &&
+    gatewayBrowserApi.includes('object.remove("adapter_ipc")') &&
+    gatewayBrowserApi.includes('object.remove("relay_ipc")') &&
+    !gatewayApi.includes("fn browser_attach_runtime_stream_path(") &&
+    !gatewayApi.includes("fn browser_stream_relay(") &&
+    !gatewayApi.includes("fn validate_browser_stream_receipt(") &&
+    !gatewayApi.includes("fn browser_engine_stream_session(") &&
+    !gatewayApi.includes("fn browser_visible_stream_session(") &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_open_runtime_stream_socket_accepts_and_closes_fail_closed",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_open_runtime_stream_relays_to_exit_ipc_without_host_network",
+    ) &&
+    gatewayBrowserRouteTests.includes("runtime_stream_path") &&
+    gatewayBrowserRouteTests.includes(
+      'payload["stream_session"].get("adapter_ipc").is_none()',
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      'payload["stream_session"].get("relay_ipc").is_none()',
+    ),
+  "Browser open route must allocate private Runtime stream socket paths, relay only to private Exit IPC with typed open handshakes, bind fail-closed without relay, and strip adapter_ipc/relay_ipc descriptors from Browser UI responses while keeping stream relay/shaping helpers in gateway_browser.rs",
+);
+assert(
+  browser.includes("https://ela.city/") &&
+    browser.includes('id="browser-back"') &&
+    browser.includes('id="browser-forward"') &&
+    browser.includes('id="browser-refresh"') &&
+    browser.includes('id="browser-url"') &&
+    !browser.includes("Runtime boundary") &&
+    !browser.includes("Last request") &&
+    !browser.includes('id="browser-frame"') &&
+    !browser.includes("Open outside ElastOS"),
+  "Browser capsule must present compact browser chrome without debug/proof panels or host-browser escape hatches",
+);
+assert(
+  browserJs.includes("normalizeUrl") &&
+    browserJs.includes("streamTargetForUrl") &&
+    browserJs.includes("Only http and https addresses") &&
+    browserJs.includes("/api/apps/browser/open") &&
+    browserJs.includes("elastos.browser.open-result/v1") &&
+    browserJs.includes("Browser failed closed") &&
+    browserJs.includes("Blocked by Browser Exit policy") &&
+    browserJs.includes("historyEntries") &&
+    !browserJs.includes("/api/provider/net/stream") &&
+    !browserJs.includes("/api/provider/net/http") &&
+    !browserJs.includes("frame.src") &&
+    !browserJs.includes("window.open") &&
+    !browserJs.includes("window.ethereum") &&
+    !browserJs.includes("eth_requestAccounts") &&
+    !browserJs.includes("personal_sign") &&
+    !browserJs.includes("Remote video path is unavailable") &&
+    !browserJs.includes("Runtime frame preview") &&
+    !browserJs.includes("showing Runtime frame"),
+  "Browser capsule must use the high-level Browser open route without faking EIP-1193 wallet injection, external host browsing, iframe host browsing, or diagnostic frame fallbacks into arbitrary web pages",
+);
+assert(
+  browserStyle.includes(".browser-stage") &&
+    browserStyle.includes("@media (max-width: 640px)") &&
+    browserStyle.includes("--accent: #d46f24") &&
+    !browserStyle.includes(".browser-hero") &&
+    !browserStyle.includes(".browser-card"),
+  "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",
+);
+assert(
+  read("components.json").includes('"browser"') &&
+    read("components.json").includes('"release_path": "browser.tar.gz"'),
+  "Browser capsule must be registered as a platform-independent capsule artifact",
+);
+assert(
+  browserCapsulesApi.includes(
+    "general_browser_capsule_assets_remain_cross_origin_isolated_for_home_embedding",
+  ) &&
+    !browserCapsulesApi.includes(
+      'headers_mut().remove("cross-origin-embedder-policy")',
+    ),
+  "Browser app serving must keep COEP/CORP headers so Home can embed it inside the cross-origin-isolated shell",
+);
+assert(
+  gatewayApi.includes('const BROWSER_CAPSULE_ID: &str = "browser"') &&
+    gatewayApi.includes("fn is_home_visible_target(name: &str)") &&
+    !sourceBlock(
+      gatewayApi,
+      "fn is_home_visible_target(name: &str)",
+      "Home visible target filter",
+    ).includes("BROWSER_CAPSULE_ID") &&
+    gatewayTests.includes('browser["attach_kind"], "iframe"') &&
+    shellWindows.includes('launched.attach_kind !== "iframe"') &&
+    shellWindows.includes("function iframeSandboxForLaunch(launched)") &&
+    shellWindows.includes('launched?.target === "browser"') &&
+    shellWindows.includes("BROWSER_IFRAME_SANDBOX_EXTRAS") &&
+    shellWindows.includes("launched?.target === SYSTEM_APP_ID") &&
+    shellWindows.includes("SYSTEM_IFRAME_SANDBOX_EXTRAS") &&
+    sourceBlock(
+      shellWindows,
+      "function iframeSandboxForLaunch(launched)",
+      "Home iframe sandbox policy",
+    ).includes("COMMON_IFRAME_SANDBOX") &&
+    !shellWindows.includes(
+      'sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-popups',
+    ) &&
+    !shellWindows.includes(
+      'sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-same-origin allow-scripts allow-top-navigation',
+    ) &&
+    !shellWindows.includes("reservedTab") &&
+    !shellWindows.includes('window.open("about:blank"'),
+  "Home must open the Browser capsule as an ElastOS window while Browser networking remains Runtime/Exit mediated, and popup/top-navigation iframe privileges must be scoped to Browser/System instead of granted globally",
+);
+assert(
+  walletMetamask.includes('id="wallet-connect"') &&
+    walletMetamask.includes('id="wallet-state"') &&
+    walletMetamask.includes('id="wallet-accounts"') &&
+    walletMetamask.includes('id="wallet-requests"'),
+  "MetaMask must live in a dedicated connector capsule with connected-account visibility",
+);
+assert(
+  !walletMetamask.includes("<h1>MetaMask</h1>") &&
+    !walletMetamask.includes("Link MetaMask") &&
+    !walletMetamask.includes("Refresh</button>") &&
+    !walletMetamask.includes("Accounts linked through MetaMask") &&
+    !walletMetamask.includes(
+      "Review and sign requests for accounts linked through MetaMask",
+    ),
+  "MetaMask connector UI must avoid redundant wallet copy and manual refresh chrome",
+);
+assert(
+  walletMetamaskJs.includes("selectedMetaMaskProvider") &&
+    walletMetamaskJs.includes("eth_requestAccounts") &&
+    walletMetamaskJs.includes("personal_sign") &&
+    !walletMetamaskJs.includes("wallet-refresh"),
+  "MetaMask connector must own the injected-wallet interaction without stale refresh controls",
+);
+assert(
+  walletMetamaskJs.includes("/api/auth/evm/challenge") &&
+    walletMetamaskJs.includes("/api/auth/evm/verify") &&
+    walletMetamaskJs.includes("/api/apps/wallet-metamask/wallet/accounts") &&
+    walletMetamaskJs.includes("/api/apps/wallet-metamask/wallet/approvals"),
+  "MetaMask connector must use runtime wallet-link, account, and approval routes",
+);
+assert(
+  walletMetamaskJs.includes("navigator.clipboard.writeText") &&
+    walletMetamask.includes("Connected accounts"),
+  "MetaMask connector must show copyable full linked wallet accounts",
+);
+assert(
+  walletMetamaskJs.includes("isManagedWalletRequest") &&
+    walletMetamaskJs.includes("managed_btc_p2wpkh") &&
+    walletMetamaskJs.includes("isMetaMaskSignableRequest") &&
+    walletMetamaskJs.includes('intent !== "bitcoin_bip322_proof"'),
+  "MetaMask connector must not show built-in or Bitcoin BIP-322 requests as MetaMask-signable requests",
+);
+assert(
+  walletUnisat.includes('id="wallet-connect"') &&
+    walletUnisat.includes('id="wallet-state"') &&
+    walletUnisat.includes('id="wallet-accounts"') &&
+    walletUnisat.includes('id="wallet-requests"'),
+  "UniSat must live in a dedicated connector capsule with connected-account visibility",
+);
+assert(
+  walletUnisatJs.includes('CONNECTOR_ID = "wallet-unisat"') &&
+    walletUnisatJs.includes("candidateWindow.unisat") &&
+    walletUnisatJs.includes("openTopLevelConnector") &&
+    walletUnisat.includes('id="wallet-open-popup"') &&
+    walletUnisatJs.includes('signMessage(message, "bip322-simple")') &&
+    walletUnisatJs.includes('signMessage(message, "ecdsa")') &&
+    walletUnisatJs.includes("bitcoinAddressType") &&
+    walletUnisatJs.includes("bitcoin_signed_message") &&
+    walletUnisatJs.includes("/api/auth/btc/challenge") &&
+    walletUnisatJs.includes("/api/auth/btc/verify") &&
+    walletUnisatJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/accounts`) &&
+    walletUnisatJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/approvals`),
+  "UniSat connector must own BIP-322 browser wallet signing while using runtime wallet-link and approval routes only",
+);
+assert(
+  !walletJs.includes("/api/auth/btc/challenge") &&
+    !walletJs.includes("/api/auth/btc/verify") &&
+    walletJs.includes("/api/apps/wallet/wallet/summary") &&
+    walletJs.includes("/api/provider/chain/balance") &&
+    walletJs.includes('"bip122:000000000019d6689c085ae165831e93"'),
+  "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
+);
+assert(
+  wallet.includes("wallet-20260523a") &&
+    wallet.includes('id="wallet-send"') &&
+    wallet.includes('id="wallet-receive"') &&
+    wallet.includes("data-wallet-create-account") &&
+    wallet.includes("data-wallet-import-recovery-key") &&
+    (wallet.match(/data-wallet-create-account/g) || []).length === 2 &&
+    (wallet.match(/data-wallet-import-recovery-key/g) || []).length === 2 &&
+    !walletJs.includes("wallet-empty-stack") &&
+    !walletJs.includes("Create your first account") &&
+    walletJs.includes('"EVM"') &&
+    walletJs.includes('"Bitcoin"') &&
+    walletJs.includes("Chains are provider routes, not separate wallet types.") &&
+    !wallet.includes('id="wallet-create-method"') &&
+    walletJs.includes("openReceiveFlow") &&
+    walletJs.includes("openSendFlow") &&
+    walletJs.includes("balance_key") &&
+    walletJs.includes("wallet-detail-summary") &&
+    walletJs.includes("fundedSendableAccounts"),
+  "Wallet must expose Send/Receive plus canonical Accounts/Settings create-import surfaces with cache-busted assets",
+);
+assert(
+  wallet.includes('id="wallet-currency-settings"') &&
+    wallet.includes('data-wallet-currency="btc"') &&
+    wallet.includes('data-wallet-currency="usd"') &&
+    wallet.includes('data-wallet-currency="ela"') &&
+    !wallet.includes('data-wallet-currency="ela" hidden') &&
+    !wallet.includes('id="wallet-enable-ela-currency"') &&
+    !wallet.includes('id="wallet-currency"') &&
+    walletJs.includes('readStoredValue(DISPLAY_CURRENCY_STORAGE_KEY, "btc"') &&
+    !walletJs.includes("ELA_DISPLAY_ENABLED_STORAGE_KEY") &&
+    !walletJs.includes("enableElaDisplayCurrency") &&
+    !walletJs.includes("elaCurrencyEnabled") &&
+    walletJs.includes("/api/wallet/prices") &&
+    gatewayApi.includes("/api/wallet/prices") &&
+    gatewayApi.includes("ELASTOS_WALLET_PRICE_SOURCE") &&
+    gatewayApi.includes("ELASTOS_WALLET_PRICE_HTTP_APPROVED") &&
+    gatewayApi.includes("WALLET_PRICE_POLICY_SCHEMA") &&
+    gatewayApi.includes("upsert_wallet_price_http_request") &&
+    gatewayTests.includes(
+      "test_wallet_price_http_source_requires_explicit_approval",
+    ) &&
+    gatewayTests.includes("test_wallet_price_source_policy_round_trips"),
+  "Wallet pricing currency must be selected in Settings, default to BTC, expose USD and ELA without an enablement gate, and require explicit provider approval for HTTP prices",
+);
+assert(
+  wallet.includes('id="wallet-activity-open"') &&
+    wallet.includes('id="wallet-settings-open"') &&
+    wallet.includes("wallet-hero-actions") &&
+    !wallet.includes("wallet-topbar") &&
+    !wallet.includes("wallet-sidebar") &&
+    !wallet.includes('id="wallet-pending-ribbon"') &&
+    walletJs.includes("renderRequests(reviewRequests, reviewWalletRequestId)") &&
+    !walletJs.includes("renderPendingRibbon"),
+  "Wallet must keep Activity/Privacy/Settings inside the hero card, route approval requests only through the Requests panel, and avoid separate header/sidebar chrome",
+);
+assert(
+  wallet.includes("wallet-settings-drawer") &&
+    wallet.includes("wallet-settings-main") &&
+    wallet.includes("wallet-settings-side") &&
+    wallet.indexOf('class="wallet-settings-side"') <
+      wallet.indexOf('id="wallet-methods"') &&
+    !wallet.includes("<h2>Wallet settings</h2>") &&
+    !wallet.includes("<h3>Identity</h3>") &&
+    !wallet.includes('id="wallet-theme"') &&
+    !wallet.includes("data-wallet-theme") &&
+    !walletJs.includes("applyStoredTheme") &&
+    !walletJs.includes("setTheme") &&
+    !walletJs.includes("wallet.theme"),
+  "Wallet Settings must only contain wallet-local controls, keep approval methods on the side, and leave global appearance to System",
+);
+assert(
+  !walletJs.includes("native balances ready") &&
+    walletJs.includes("No approved price source configured."),
+  "Wallet must not expose implementation-count balance copy when price providers are not approved",
+);
+assert(
+  !wallet.includes("wallet-brand") &&
+    walletJs.includes("selectedAccountId") &&
+    walletJs.includes("wallet-detail-address") &&
+    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes('account.proof_type === "siwe"') &&
+    walletJs.includes("unavailable: Boolean(payload.unavailable)") &&
+    !walletJs.includes("Balances update through approved Runtime providers.") &&
+    !walletJs.includes('textNode("code", account.address, "wallet-address")'),
+  "Wallet must keep top chrome minimal, map SIWE accounts, preserve price-unavailable state, and reveal one copyable account address without provider jargon or duplicate address text",
+);
+assert(
+  wallet.indexOf('aria-label="Accounts"') <
+    wallet.indexOf("data-wallet-create-account") &&
+    wallet.indexOf('id="wallet-settings-drawer"') <
+    wallet.indexOf('id="wallet-create"') &&
+    walletJs.includes("Choose the account type.") &&
+    walletJs.includes("One passkey-controlled account for ESC, Base, and supported EVM networks.") &&
+    walletJs.includes("evmChainNamespaces.slice(0, 1)") &&
+    walletJs.includes("accountGroupKey") &&
+    walletJs.includes("accountNetworkLabel") &&
+    walletJs.includes("balanceTargetsForAccounts") &&
+    walletJs.includes("accountForAsset") &&
+    walletJs.includes("account_ids") &&
+    walletJs.includes("accountActionsNode.hidden = accounts.length > 0") &&
+    walletJs.includes("onWalletActionClick") &&
+    !walletJs.includes("createAccountTile") &&
+    !walletStyle.includes(".wallet-create-card") &&
+    walletJs.includes("create_new: index === 0") &&
+    walletJs.includes("Create an EVM account usable through supported EVM chain providers.") &&
+    walletJs.includes("dataset.walletAccountMenu") &&
+    walletJs.includes("/api/apps/wallet/wallet/default") &&
+    walletJs.includes("openRenameAccount") &&
+    walletJs.includes('method: "PUT"') &&
+    gatewayApi.includes('"op": "rename_account"') &&
+    gatewayTests.includes("test_wallet_app_can_rename_account") &&
+    walletProvider.includes("RenameAccount") &&
+    walletProvider.includes("rename_account"),
+  "Wallet account creation must be available from the main Wallet surface while rename and card action menus stay provider-backed",
+);
+assert(
+    walletJs.includes("requestFreshPasskeyHomeToken") &&
+    walletJs.includes("/api/auth/passkey/authenticate/begin") &&
+    walletJs.includes("/api/auth/passkey/authenticate/complete") &&
+    walletJs.includes("/recovery-key") &&
+    walletJs.includes('schema: "elastos.wallet.recovery-key/v1"') &&
+    walletJs.includes("JSON.stringify(recoveryKey, null, 2)") &&
+    walletJs.includes("Use the full Wallet recovery key JSON below") &&
+    walletJs.includes("Delete account") &&
+    walletJs.includes('method: "DELETE"'),
+  "Wallet account recovery and deletion must be explicit runtime-backed actions, with passkey-protected importable Wallet recovery key export instead of fake seed phrase copy",
+);
+assert(
+  walletProvider.includes("ExportManagedSecret") &&
+    walletProvider.includes("elastos.wallet.recovery-key/v1") &&
+    gatewayApi.includes(
+      "/api/apps/wallet/wallet/accounts/:account_id/recovery-key",
+    ) &&
+    gatewayApi.includes("require_fresh_passkey_home_token") &&
+    gatewayTests.includes(
+      "test_wallet_recovery_key_requires_fresh_passkey_home_token",
+    ) &&
+    gatewayTests.includes("test_wallet_app_can_delete_managed_account"),
+  "Wallet recovery/delete routes must be provider-backed, passkey-gated, and covered by gateway tests",
+);
+assert(
+  walletProviderManifest.includes("rename_account") &&
+    walletProviderManifest.includes("export_managed_secret") &&
+    walletProviderManifest.includes("wallet.account.renamed") &&
+    walletProviderManifest.includes("wallet.recovery_key.viewed") &&
+    walletProviderManifest.includes("passkey-gated managed recovery export") &&
+    !walletProviderManifest.includes("private keys to app capsules"),
+  "wallet-provider manifest must document rename and managed recovery export without claiming impossible zero key display for the Wallet recovery surface",
+);
+assert(
+  wallet.includes(
+    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>',
+  ) &&
+    wallet.indexOf('class="wallet-hero-balance"') <
+      wallet.indexOf('id="wallet-delta"') &&
+    wallet.indexOf('id="wallet-delta"') <
+      wallet.indexOf('id="wallet-account-detail"') &&
+    wallet.indexOf('id="wallet-total-balance"') <
+      wallet.indexOf('class="wallet-action-row"') &&
+    walletJs.includes("renderHeroAccount(allAccounts)") &&
+    walletJs.includes("selectedOrDefaultAccount") &&
+    walletJs.includes("defaultWalletAccount") &&
+    walletJs.includes("latestDefault") &&
+    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes(
+      'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
+    ) &&
+    walletJs.includes(
+      'getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero"',
+    ) &&
+    walletJs.includes("clearAccountSelection") &&
+    walletJs.includes("is-selected") &&
+    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("/api/wallet/qr") &&
+    !walletJs.includes("visibleAccounts") &&
+    !walletJs.includes("Selected account ·") &&
+    !walletJs.includes("Hide details") &&
+    !walletJs.includes("clearAccountFilter") &&
+    !walletJs.includes("accountDetailNode.scrollIntoView") &&
+    !walletJs.includes("wallet-detail-balance") &&
+    !walletJs.includes("wallet-detail-section") &&
+    !walletJs.includes("No transactions yet") &&
+    !walletJs.includes("closeOverlaySurfaces") &&
+    !walletJs.includes("walletPageNode") &&
+    sourceBlock(
+      walletStyle,
+      ".wallet-hero-row {",
+      "Wallet hero row style",
+    ).includes(
+      "grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px)",
+    ) &&
+    sourceBlock(walletStyle, ".wallet-delta {", "Wallet graph style").includes(
+      "justify-self: center",
+    ) &&
+    sourceBlock(
+      walletStyle,
+      ".wallet-detail {",
+      "Wallet detail style",
+    ).includes("justify-self: end") &&
+    sourceBlock(
+      walletStyle,
+      "@media (max-width: 780px)",
+      "Wallet mobile media",
+    ).includes(".wallet-detail {\n    justify-self: center;") &&
+    !sourceBlock(
+      walletStyle,
+      ".wallet-detail {",
+      "Wallet detail style",
+    ).includes("min-height:") &&
+    !sourceBlock(
+      walletStyle,
+      ".wallet-detail {",
+      "Wallet detail style",
+    ).includes("border:") &&
+    !sourceBlock(
+      walletStyle,
+      ".wallet-detail {",
+      "Wallet detail style",
+    ).includes("background:") &&
+    !sourceBlock(
+      walletStyle,
+      ".wallet-detail {",
+      "Wallet detail style",
+    ).includes("position: fixed") &&
+    walletStyle.includes(".wallet-detail-inline") &&
+    walletStyle.includes("width: 156px;") &&
+    walletStyle.includes("width: 132px;") &&
+    walletStyle.includes(
+      "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
+    ) &&
+    walletStyle.includes("min-height: 118px") &&
+    !walletStyle.includes(".wallet-address") &&
+    !walletStyle.includes(".wallet-detail-close") &&
+    !walletStyle.includes(".wallet-detail-balance") &&
+    !walletStyle.includes(".wallet-detail-section") &&
+    walletStyle.includes(".wallet-account.is-selected"),
+  "Wallet hero must keep balance/actions on the left, graph centered, QR/address on the right, center QR on mobile, and denser account cards without separate containers, side sheets, scroll jumps, transactions placeholders, or duplicate balances",
+);
+assert(
+  gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
+    gatewayApi.includes("fn home_launch_target") &&
+    gatewayApi.includes("fn is_home_visible_target") &&
+    gatewayApi.includes(
+      "WALLET_UNISAT_CAPSULE_ID | WALLET_WALLETCONNECT_CAPSULE_ID",
+    ) &&
+    gatewayTests.includes(
+      "test_wallet_app_can_create_and_summarize_accounts",
+    ) &&
+    gatewayTests.includes("test_wallet_token_can_read_chain_provider_balance"),
+  "Wallet must be the visible product surface while connector capsules remain launchable as approval methods",
+);
+assert(
+  !systemJs.includes("walletConnectorForRequest") &&
+    walletUnisatJs.includes('CONNECTOR_ID = "wallet-unisat"') &&
+    walletJs.includes('actionButton("Open UniSat"') &&
+    !walletJs.includes("Paste Bitcoin wallet signature"),
+  "Wallet must route Bitcoin proof requests to the Bitcoin signer connector, not System manual proof or MetaMask",
+);
+const walletMethodForAccountBlock = sourceBlock(
+  walletJs,
+  "function methodForAccount",
+  "Wallet method mapper",
+);
+assert(
+  walletMethodForAccountBlock.indexOf(
+    'connectorId === "wallet-walletconnect"',
+  ) > 0 &&
+    walletMethodForAccountBlock.indexOf(
+      'connectorId === "wallet-walletconnect"',
+    ) < walletMethodForAccountBlock.indexOf('account.proof_type === "siwe"'),
+  "Wallet method mapper must classify connector id before SIWE proof type so WalletConnect SIWE accounts do not render as MetaMask",
+);
+assert(
+  gatewayTests.includes(
+    "test_wallet_connector_approvals_are_scoped_to_connector",
+  ) &&
+    gatewayApi.includes(
+      "request.connector_id.as_deref() == Some(wallet_connector.as_str())",
+    ),
+  "Connector account/request lists must be scoped to the active connector capsule",
+);
+assert(
+  authWalletSmoke.includes("metamask_connector") &&
+    authWalletSmoke.includes("unisat") &&
+    authWalletSmoke.includes("wallet_token_cannot_link_bip322_account"),
+  "Auth/wallet focus smoke must include MetaMask, UniSat, and the Wallet manual-proof rejection filter",
+);
+assert(
+  !walletMetamask.includes("WalletConnect") &&
+    !walletMetamaskJs.includes("walletconnect"),
+  "WalletConnect must not be visible until a pinned connector exists",
+);
+assert(
+  !system.includes("<dt>Wallet requests</dt>") &&
+    !system.includes("wallet-requests-block") &&
+    !system.includes('id="wallet-accounts"') &&
+    !system.includes('id="wallet-approvals"'),
+  "System wallet approvals must be removed from Advanced after Wallet/Inbox becomes the owner",
+);
+assert(
+  !homeSmoke.includes("Wallet proof") &&
+    !homeSmoke.includes("Wallet requests") &&
+    homeSmoke.includes("walletControlsRemoved"),
+  "Home smoke must track that System no longer owns Wallet/Requests layout",
+);
+assert(
+  !systemSmoke.includes("Wallet proof") &&
+    !systemSmoke.includes("Wallet requests") &&
+    systemSmoke.includes("walletControlsRemoved"),
+  "System smoke must track that Wallet/Requests controls are removed from System",
+);
+assert(
+  homeSmoke.includes("recoveryPasswordPresent") &&
+    homeSmoke.includes("Recovery Kit download") &&
+    homeSmoke.includes("Recovery Kit import"),
+  "Home smoke must cover Recovery Kit controls in the Home-launched System frame",
+);
+assert(
+  systemSmoke.includes("recoveryPasswordPresent") &&
+    systemSmoke.includes("Recovery Kit download") &&
+    systemSmoke.includes("Recovery Kit import"),
+  "System smoke must cover Recovery Kit download/import controls",
+);
+assert(
+  homeSmoke.includes("unsigned-launch-prompts-passkey") &&
+    homeSmoke.includes("HOME_SMOKE_PRESERVE_SESSION"),
+  "Home smoke must treat unsigned app launch as a passkey gate and keep signed journeys explicit",
+);
+assert(
+  homeVirtualAuthSmoke.includes("WebAuthn.addVirtualAuthenticator") &&
+    homeVirtualAuthSmoke.includes("HOME_VIRTUAL_AUTH_ALLOW_REMOTE") &&
+    homeVirtualAuthSmoke.includes("http://localhost:8090") &&
+    homeVirtualAuthSmoke.includes("/api/auth/passkeys") &&
+    homeVirtualAuthSmoke.includes("/api/auth/sessions/sign-out") &&
+    homeVirtualAuthSmoke.includes("/api/apps/home/launch") &&
+    homeVirtualAuthSmoke.includes(
+      "System should not duplicate Wallet controls",
+    ),
+  "Home signed-session smoke must use a real CDP WebAuthn virtual authenticator on localhost, refuse remote mutation by default, exercise sign-out/sign-in, launch app-scoped System without human cookies, and catch System/Wallet layout drift",
+);
+assert(
+  homeVirtualAuthSmoke.includes("/revoke") &&
+    homeVirtualAuthSmoke.includes("CLEANUP_PASSKEY"),
+  "Home virtual passkey smoke must clean up its disposable test credential by default",
+);
+assert(
+  !system.includes('id="wallet-approval-check"') &&
+    !systemJs.includes("/api/apps/system/wallet/approvals/check"),
+  "System must not expose synthetic wallet approval test affordances",
+);
+assert(
+  system.includes("<dt>Network status</dt>"),
+  "System chain reads must be labeled as advanced network status",
+);
+assert(
+  system.includes('id="chain-table"') &&
+    systemJs.includes("renderChainTable") &&
+    systemStyle.includes(".network-row"),
+  "System network status must render a compact provider-backed chain table",
+);
+assert(
+  systemJs.includes('action: "status"') &&
+    systemJs.includes("onChainLifecycleAction") &&
+    systemJs.includes("lifecycle.control_available === true"),
+  "System node lifecycle controls must render only from provider-reported control_available state",
+);
+assert(
+  systemStyle.includes(".network-actions") &&
+    systemStyle.includes(".network-action"),
+  "System node lifecycle controls must use compact network-row actions instead of separate noisy panels",
+);
+assert(
+  chainProvider.includes('"transaction_type": "eip155_legacy"') &&
+    chainProvider.includes("eth_getTransactionCount") &&
+    chainProvider.includes("eth_estimateGas"),
+  "Chain-provider transaction prepare must produce a signable typed EVM intent without raw RPC exposure",
+);
+assert(
+  read("elastos/crates/elastos-server/src/provider_resource.rs").includes(
+    "elastos://chain/{network}/proof/erc1271",
+  ),
+  "ERC-1271 chain proof must have a narrow capability resource",
+);
+assert(
+  !system.includes('data-field="chain-status"') &&
+    !system.includes('data-field="chain-note"') &&
+    !systemJs.includes("Chain reads stay inside chain-provider"),
+  "System network status must not show redundant provider-policy copy",
+);
+assert(
+  !system.includes('id="chain-refresh"') &&
+    systemJs.includes("onChainRowClick") &&
+    !systemJs.includes("row.href = `elastos://chain/"),
+  "System chain rows must not use sandbox-blocked external protocol navigation",
+);
+assert(
+  system.indexOf("<dt>Device identity</dt>") <
+    system.indexOf("<dt>Documents</dt>") &&
+    system.indexOf("<dt>Documents</dt>") < system.indexOf("<dt>Version</dt>") &&
+    system.indexOf("<dt>Version</dt>") <
+      system.indexOf("<dt>Network status</dt>"),
+  "System Advanced must order summary fields first, then Network",
+);
+assert(
+  systemStyle.includes(".system-field-advanced-top") &&
+    systemStyle.includes("grid-column: span 2;") &&
+    systemStyle.includes(".system-field-network") &&
+    systemStyle.includes("grid-column: span 6;") &&
+    !systemStyle.includes(".system-field-wallet"),
+  "System Advanced must use a 3-up summary row with full-width Network after Wallet moves out",
+);
+assert(
+  !systemStyle.includes(".wallet-subsection-title"),
+  "System Wallet Requests label styles must be removed with the Wallet/Requests surface",
+);
+assert(
+  system.includes('class="system-inline-row background-actions"'),
+  "System background image actions must stay in one row",
+);
+assert(
+  system.includes("background-overlay-panel"),
+  "System overlay controls must be integrated into the Background control panel",
+);
+assert(
+  system.indexOf('id="background-preview"') <
+    system.indexOf('id="background-overlay"'),
+  "System background preview and overlay controls must share one field flow",
+);
+assert(
+  systemStyle.includes("body {\n    padding: 0.2rem;") &&
+    systemStyle.includes("padding: 0.48rem;"),
+  "System mobile panel must use compact Home-aligned spacing",
+);
+assert(
+  systemStyle.includes("aspect-ratio: 16 / 9;"),
+  "System background preview must preserve wallpaper proportions",
+);
+assert(
+  systemStyle.includes("min-height: 9rem;") &&
+    !systemStyle.includes("max-height: min(13rem, 18dvh);"),
+  "System background preview must not collapse into a low strip on desktop",
+);
+assert(
+  !systemStyle.includes(".system-advanced summary") &&
+    !system.includes("Runtime, storage, wallets, and networks") &&
+    !systemStyle.includes('background-preview[data-empty="true"]::after'),
+  "System must reduce Advanced clutter without stale disclosure copy or default wallpaper badge",
+);
+assert(
+  systemStyle.includes(".system-panel-advanced") &&
+    systemStyle.includes("grid-column: 1 / -1;"),
+  "System Advanced panel must use the full desktop width",
+);
 
 const principles = read("PRINCIPLES.md");
 const architecture = read("docs/ARCHITECTURE.md");
+const roadmap = read("ROADMAP.md");
+const namespacesDoc = read("docs/NAMESPACES.md");
+const overviewDoc = read("docs/OVERVIEW.md");
 const designSystem = read("docs/DESIGN_SYSTEM.md");
 const commandMatrix = read("docs/COMMAND_MATRIX.md");
-const tasks = read("TASKS.md");
-const shellSmoke = read("scripts/home-camofox-smoke.mjs");
+const shellSmoke = homeSmoke;
 const runtimeChecklist = read("docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md");
 assertMarkdownLocalLinksResolve();
 assertMarkdownScriptReferencesResolve();
-assert(!tasks.includes("- [x]"), "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md");
-assert(!runtimeChecklist.includes("Shared is useful"), "Runtime checklist must not point reviewers at the retired Shared Home app");
-assert(!runtimeChecklist.includes("public-install-update-smoke.sh"), "Runtime checklist must not reference retired public install update proof script");
-assert(!runtimeChecklist.includes("public-linux-runtime-portability-smoke.sh"), "Runtime checklist must not reference retired public Linux portability proof script");
-assert(principles.includes("every visible user action should map to the same capability-scoped operation"), "Principles must define human/agent action equality");
-assert(architecture.includes("Interaction equality is part of the same rule"), "Architecture must define interaction equality");
-assert(designSystem.includes("Every visible action must have the same contract for humans and agents"), "Design system must define human/agent interaction contract");
-assert(commandMatrix.includes("Host-side provider bridge commands are explicit operator tooling, not app-capsule authority."), "Command matrix must distinguish host provider tooling from app-capsule authority");
-assert(!commandMatrix.includes("direct IPFS bridge"), "Command matrix must not normalize direct IPFS bridge language");
-assert(!commandMatrix.includes("IPFS bridge"), "Command matrix must describe ipfs-provider explicitly, not an ambiguous IPFS bridge");
-const commandRules = commandMatrix.match(/## Rules\n([\s\S]*?)\n## Future:/)?.[1] || "";
-const commandRuleNumbers = [...commandRules.matchAll(/^(\d+)\./gm)].map((match) => Number(match[1]));
-assert(commandRuleNumbers.length > 0, "Command matrix must keep a numbered Rules section");
+assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority();
+assert(
+  !tasks.includes("- [x]"),
+  "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md",
+);
+assert(
+  !runtimeChecklist.includes("Shared is useful"),
+  "Runtime checklist must not point reviewers at the retired Shared Home app",
+);
+assert(
+  !runtimeChecklist.includes("public-install-update-smoke.sh"),
+  "Runtime checklist must not reference retired public install update proof script",
+);
+assert(
+  !runtimeChecklist.includes("public-linux-runtime-portability-smoke.sh"),
+  "Runtime checklist must not reference retired public Linux portability proof script",
+);
+assert(
+  principles.includes(
+    "every visible user action should map to the same capability-scoped operation",
+  ),
+  "Principles must define human/agent action equality",
+);
+assert(
+  architecture.includes("Interaction equality is part of the same rule"),
+  "Architecture must define interaction equality",
+);
+assert(
+  ![architecture, roadmap, namespacesDoc, overviewDoc].some((doc) =>
+    doc.includes("localhost://Users/self"),
+  ),
+  "Canonical namespace docs must present principal-root storage, not shared Users/self examples",
+);
+assert(
+  designSystem.includes(
+    "Every visible action must have the same contract for humans and agents",
+  ),
+  "Design system must define human/agent interaction contract",
+);
+assert(
+  commandMatrix.includes(
+    "Host-side provider bridge commands are explicit operator tooling, not app-capsule authority.",
+  ),
+  "Command matrix must distinguish host provider tooling from app-capsule authority",
+);
+assert(
+  !commandMatrix.includes("direct IPFS bridge"),
+  "Command matrix must not normalize direct IPFS bridge language",
+);
+assert(
+  !commandMatrix.includes("IPFS bridge"),
+  "Command matrix must describe ipfs-provider explicitly, not an ambiguous IPFS bridge",
+);
+const commandRules =
+  commandMatrix.match(/## Rules\n([\s\S]*?)\n## Future:/)?.[1] || "";
+const commandRuleNumbers = [...commandRules.matchAll(/^(\d+)\./gm)].map(
+  (match) => Number(match[1]),
+);
+assert(
+  commandRuleNumbers.length > 0,
+  "Command matrix must keep a numbered Rules section",
+);
 for (const [index, number] of commandRuleNumbers.entries()) {
-  assert(number === index + 1, "Command matrix ordered rules must stay sequential", commandRuleNumbers);
+  assert(
+    number === index + 1,
+    "Command matrix ordered rules must stay sequential",
+    commandRuleNumbers,
+  );
 }
 assert(
   !/!\s*doc\.querySelector\([^)]*\)\?\.classList\.contains/.test(shellSmoke),
   "Smoke checks must not treat missing DOM nodes as visible with !optional chaining",
 );
+assertProviderOperationEnumsRejectUnknownFields();
+assertGatewayRequestStructsRejectUnknownFields();
+assertCapabilityRequestStructsRejectUnknownFields();
 
 console.log("PASS home entropy check");

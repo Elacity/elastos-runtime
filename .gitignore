@@ -128,6 +128,10 @@ scripts/show_worker_model_policy.py
 scripts/qmd-freshness.py
 scripts/ops/
 scripts/system/
+!scripts/system/
+!scripts/system/elastos-browser-selkies.env.example
+!scripts/system/elastos-browser-selkies.service
+!scripts/system/elastos-browser-selkies.sh
 scripts/publish-ceremony.sh
 scripts/publish-impact.sh
 scripts/publish-mark-proven.sh

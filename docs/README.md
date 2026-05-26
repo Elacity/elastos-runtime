@@ -26,6 +26,16 @@ Planning and truth surfaces outside `docs/`:
 - [OVERVIEW.md](OVERVIEW.md) — high-level repo/system summary
 - [CAPSULE_MODEL.md](CAPSULE_MODEL.md) — supplemental capsule/runtime terminology note
 - [CARRIER.md](CARRIER.md) — supplemental Carrier framing note
+- [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
+- [PC2_CONVERGENCE.md](PC2_CONVERGENCE.md) — current translation of useful PC2 patterns into Runtime provider/capsule boundaries
+- [CHAIN_PROVIDER.md](CHAIN_PROVIDER.md) — typed chain-provider boundary and current blockchain-quadrant slice
+- [WALLET_PROVIDER.md](WALLET_PROVIDER.md) — wallet proof, account-link, typed-signing, and transaction authority boundary
+- [BROWSER_CAPSULE.md](BROWSER_CAPSULE.md) — Browser/Net/Exit/Engine ABI, product rule, and current proof boundary
+- [BROWSER_PROVIDER_BAKEOFF.md](BROWSER_PROVIDER_BAKEOFF.md) — hosted/native browser-provider comparison and acceptance gates
+- [RIGHTS_PROVIDER.md](RIGHTS_PROVIDER.md) — typed protected-content rights questions and fail-closed policy boundary
+- [KEY_PROVIDER.md](KEY_PROVIDER.md) — protected-content key release and PQ-hybrid envelope boundary
+- [DECRYPT_PROVIDER.md](DECRYPT_PROVIDER.md) — protected-content decrypt/render session boundary
+- [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) — sealed objects, DRM provider boundary, and protected-content sequence
 - [GLOSSARY.md](GLOSSARY.md) — vocabulary only
 
 These should stay narrower than the canonical current docs. If they repeat the same story in different words, they should be merged or shortened rather than expanded.

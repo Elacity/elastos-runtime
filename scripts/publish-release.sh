@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Publish an ElastOS release to IPFS — per-capsule artifacts + signed manifest.
+# Publish an ElastOS release — raw installer CIDs plus content-object sidecars.
 # Prefer `elastos publish-release`; this script remains the low-level implementation.
 #
 # Usage:
@@ -25,7 +25,8 @@
 #   8. ipfs add components.json → components CID
 #   9. Create release.json v1 (binary CID + components CID + shell CID)
 #  10. Sign release.json + create release-head.json
-#  11. ipfs-provider add both, save CIDs for chain continuity
+#  11. Publish raw CIDs for installer compatibility plus release/head objects
+#      with `_elastos_object.json` links for SmartWeb traversal
 #
 
 set -euo pipefail
@@ -38,8 +39,7 @@ DIM='\033[2m'
 NC='\033[0m'
 
 # Default publish scope: runtime core + chat demo (3 modes: native, microVM, WASM).
-# peer-provider removed — built-in Carrier owns the peer contract now.
-# ipfs-provider and tunnel-provider are supported direct command assets.
+# ipfs-provider, availability-provider, wallet-provider, drm-provider, rights-provider, key-provider, decrypt-provider, and tunnel-provider are supported direct command assets.
 # They are not part of the managed user runtime, but fresh installs must
 # provision them for share/open/public-share.
 DEFAULT_CAPSULES=(
@@ -61,8 +61,22 @@ SUPPORT_BINARY_ASSETS=(
     shell
     localhost-provider
     did-provider
+    net-provider
+    exit-provider
+    browser-engine-adapter
+    browser-engine-supervisor
+    browser-native-proxy-engine
+    browser-stream-bridge
+    browser-local-exit
     webspace-provider
+    chain-provider
+    wallet-provider
+    drm-provider
+    rights-provider
+    key-provider
+    decrypt-provider
     ipfs-provider
+    availability-provider
     site-provider
     tunnel-provider
 )
@@ -103,8 +117,8 @@ show_help() {
     echo "  --help             Show this help"
     echo ""
     echo -e "${BOLD}Output:${NC}"
-    echo "  Publishes per-capsule artifacts + runtime binary to IPFS."
-    echo "  Creates signed release.json and release-head.json."
+    echo "  Publishes per-capsule artifacts + runtime binary as raw CIDs."
+    echo "  Creates signed release.json/release-head.json plus content-object sidecars."
     echo "  Installer downloads only: binary + components.json (2 files)."
     echo "  Use --cross aarch64 when publishing from x86_64 for Jetson installs."
     echo ""
@@ -272,6 +286,10 @@ resolve_capsule_dir() {
         echo "elastos/capsules/${capsule}"
         return 0
     fi
+    if [[ -f "elastos/tools/${capsule}/Cargo.toml" ]]; then
+        echo "elastos/tools/${capsule}"
+        return 0
+    fi
     return 1
 }
 
@@ -296,31 +314,6 @@ ipfs_add() {
     echo "$cid"
 }
 
-ipfs_add_directory_file() {
-    local src_file="$1"
-    local entry_name="$2"
-    [[ -f "$src_file" ]] || die "File not found for directory upload: ${src_file}"
-
-    local req response status code message cid
-    req=$(jq -nc \
-        --rawfile payload "$src_file" \
-        --arg name "$entry_name" \
-        '{op:"add_directory", files:[{path:$name, data:($payload|@base64)}], pin:true}')
-
-    response=$(printf '%s\n%s\n' '{"op":"init","config":{}}' "$req" | "$IPFS_PROVIDER_BIN" | tail -n1)
-
-    status=$(echo "$response" | jq -r '.status // empty' 2>/dev/null || true)
-    if [[ "$status" != "ok" ]]; then
-        code=$(echo "$response" | jq -r '.code // "unknown_error"' 2>/dev/null || echo "unknown_error")
-        message=$(echo "$response" | jq -r '.message // "unknown error"' 2>/dev/null || echo "unknown error")
-        die "ipfs-provider add_directory failed for ${src_file} [${code}]: ${message}"
-    fi
-
-    cid=$(echo "$response" | jq -r '.data.cid // empty')
-    [[ -z "$cid" ]] && die "ipfs-provider returned no CID for directory file ${src_file}"
-    echo "$cid"
-}
-
 abs_path() {
     local path="$1"
     if [[ "$path" = /* ]]; then
@@ -331,6 +324,19 @@ abs_path() {
         base=$(basename "$path")
         echo "$(cd "$dir" && pwd)/$base"
     fi
+}
+
+content_publish_object() {
+    local src_file="$1"
+    local kind="$2"
+    local entry_name="$3"
+    shift 3
+    [[ -f "$src_file" ]] || die "File not found for content object publish: ${src_file}"
+
+    "$ELASTOS" content publish-object "$src_file" \
+        --kind "$kind" \
+        --entry-name "$entry_name" \
+        "$@"
 }
 
 find_ipfs_provider_binary() {
@@ -837,6 +843,7 @@ if [[ -z "$IPFS_PROVIDER_BIN" ]]; then
 fi
 [[ -z "$IPFS_PROVIDER_BIN" ]] && die "ipfs-provider binary not found. Build/install it first."
 [[ ! -x "$IPFS_PROVIDER_BIN" ]] && die "ipfs-provider binary is not executable: $IPFS_PROVIDER_BIN"
+export ELASTOS_IPFS_PROVIDER_BIN="$IPFS_PROVIDER_BIN"
 
 # Resolve target dir from .cargo/config.toml (supports custom target-dir for WSL2 ext4 perf)
 CARGO_TARGET_DIR=""
@@ -1665,6 +1672,44 @@ info "Publishing release.json to IPFS..."
 RELEASE_CID=$(ipfs_add "${TMPDIR}/release.json")
 info "Release CID: ${RELEASE_CID}"
 
+RELEASE_LINK_ARGS=()
+while IFS= read -r link; do
+    [[ -n "$link" ]] && RELEASE_LINK_ARGS+=(--link "$link")
+done < <(jq -rn \
+    --argjson platforms "$PLATFORMS_JSON" \
+    --argjson host_capsules "$CAPSULE_ENTRIES" \
+    --argjson cross_capsules "$CROSS_CAPSULE_ENTRIES" \
+    '
+    (
+    $platforms
+        | to_entries[]
+        | "binary.\(.key)=\(.value.binary.cid)",
+          "components.\(.key)=\(.value.components.cid)"
+    ),
+    (
+    $host_capsules
+        | to_entries[]
+        | select(.value.cid)
+        | "capsule.\(.key).\(.value.platforms[0] // "host")=\(.value.cid)"
+    ),
+    (
+    $cross_capsules
+        | to_entries[]
+        | select(.value.cid)
+        | "capsule.\(.key).\(.value.platforms[0] // "cross")=\(.value.cid)"
+    )
+    ')
+if [[ "$PREV_RELEASE_CID" != "null" && -f "${STATE_DIR}/last-release-cid" ]]; then
+    RELEASE_LINK_ARGS+=(--link "previous.$CHANNEL=$(cat "${STATE_DIR}/last-release-cid")")
+fi
+
+info "Publishing release object manifest through content availability..."
+RELEASE_OBJECT_CID=$(content_publish_object "${TMPDIR}/release.json" "release" "release.json" \
+    --object-did "elastos://release/${CHANNEL}/${VERSION}" \
+    --publisher-did "$SIGNER_DID" \
+    "${RELEASE_LINK_ARGS[@]}")
+info "Release object CID: ${RELEASE_OBJECT_CID}"
+
 # ── Step 8: Create + sign release-head.json ──────────────────────────
 
 PREV_HEAD_CID="null"
@@ -1676,6 +1721,7 @@ HEAD_PAYLOAD=$(jq -ncS \
     --arg schema "elastos.release.head/v1" \
     --arg channel "$CHANNEL" \
     --arg latest_release_cid "$RELEASE_CID" \
+    --arg release_object_cid "$RELEASE_OBJECT_CID" \
     --arg version "$VERSION" \
     --argjson updated_at "$(now_unix)" \
     --arg signer_did "$SIGNER_DID" \
@@ -1684,6 +1730,7 @@ HEAD_PAYLOAD=$(jq -ncS \
         schema: $schema,
         channel: $channel,
         latest_release_cid: $latest_release_cid,
+        release_object_cid: $release_object_cid,
         version: $version,
         updated_at: $updated_at,
         signer_did: $signer_did,
@@ -1705,6 +1752,22 @@ echo "$HEAD_JSON" > "${TMPDIR}/release-head.json"
 
 info "Publishing release-head.json to IPFS..."
 HEAD_CID=$(ipfs_add "${TMPDIR}/release-head.json")
+info "Head CID: ${HEAD_CID}"
+
+HEAD_LINK_ARGS=(
+    --link "release=$RELEASE_CID"
+    --link "release.object=$RELEASE_OBJECT_CID"
+)
+if [[ "$PREV_HEAD_CID" != "null" && -f "${STATE_DIR}/last-release-head-cid" ]]; then
+    HEAD_LINK_ARGS+=(--link "previous.$CHANNEL=$(cat "${STATE_DIR}/last-release-head-cid")")
+fi
+
+info "Publishing release-head object manifest through content availability..."
+HEAD_OBJECT_CID=$(content_publish_object "${TMPDIR}/release-head.json" "release" "release-head.json" \
+    --object-did "elastos://release-head/${CHANNEL}" \
+    --publisher-did "$HEAD_SIGNER_DID" \
+    "${HEAD_LINK_ARGS[@]}")
+info "Head object CID: ${HEAD_OBJECT_CID}"
 
 # ── Step 8b: Publish IPNS name ─────────────────────────────────────────
 
@@ -1808,7 +1871,13 @@ if [[ -z "$STAMPED_SOURCE_CONNECT_TICKET" ]] && \
    grep -Fq 'SOURCE_CONNECT_TICKET="${ELASTOS_SOURCE_CONNECT_TICKET:-}"' "$STAMPED_INSTALL"; then
     die "Rendered installer is missing a stamped trusted-source Carrier ticket"
 fi
-INSTALL_SCRIPT_CID=$(ipfs_add_directory_file "$STAMPED_INSTALL" "install.sh")
+INSTALL_SCRIPT_CID=$(content_publish_object "$STAMPED_INSTALL" "release" "install.sh" \
+    --object-did "elastos://installer/${CHANNEL}/${VERSION}" \
+    --publisher-did "$SIGNER_DID" \
+    --link "head=$HEAD_CID" \
+    --link "head.object=$HEAD_OBJECT_CID" \
+    --link "release=$RELEASE_CID" \
+    --link "release.object=$RELEASE_OBJECT_CID")
 # Persist stamped install.sh and metadata so we can re-provide to IPFS network.
 mkdir -p artifacts
 cp "$STAMPED_INSTALL" artifacts/install.sh
@@ -2016,6 +2085,8 @@ fi
 echo -n "$RELEASE_CID" > "${STATE_DIR}/last-release-cid"
 echo -n "$HEAD_CID" > "${STATE_DIR}/last-release-head-cid"
 echo -n "$INSTALL_SCRIPT_CID" > "${STATE_DIR}/last-install-script-cid"
+echo -n "$RELEASE_OBJECT_CID" > "${STATE_DIR}/last-release-object-cid"
+echo -n "$HEAD_OBJECT_CID" > "${STATE_DIR}/last-release-head-object-cid"
 if [[ -n "$PUBLIC_INSTALL_URL" ]]; then
     echo -n "$PUBLIC_INSTALL_URL" > "${STATE_DIR}/last-public-install-url"
 fi
@@ -2044,7 +2115,9 @@ fi
 echo ""
 [[ -n "${SHELL_CID:-}" ]] && echo -e "  Shell:        elastos://${SHELL_CID}"
 echo -e "  Release:      elastos://${RELEASE_CID}"
+echo -e "  Release obj:  elastos://${RELEASE_OBJECT_CID}"
 echo -e "  Head:         elastos://${HEAD_CID}"
+echo -e "  Head obj:     elastos://${HEAD_OBJECT_CID}"
 echo -e "  Installer:    elastos://${INSTALL_SCRIPT_CID}"
 echo -e "  Signer:       ${SIGNER_DID}"
 if [[ -n "$IPNS_NAME" ]]; then

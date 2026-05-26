@@ -10,7 +10,9 @@ use super::capsule_inventory::{
     active_component_names, capsule_dir_candidates, capsule_roots, installed_capsule_is_inactive,
     load_capsule_manifest,
 };
-use super::gateway::{content_type, validate_file_path, GatewayState};
+use super::gateway::{
+    content_type, ensure_wallet_connector_configured, validate_file_path, GatewayState,
+};
 
 const BROWSER_CAPSULE_CACHE_CONTROL: &str = "no-store";
 const BROWSER_CAPSULE_COOP: &str = "same-origin";
@@ -63,6 +65,10 @@ async fn serve_browser_capsule_path(
     app: &str,
     requested_path: Option<&str>,
 ) -> Response {
+    if ensure_wallet_connector_configured(data_dir, app).is_err() {
+        return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
+    }
+
     let capsule = match resolve_browser_capsule(data_dir, app) {
         Ok(capsule) => capsule,
         Err(status) => return (status, "Browser capsule not found").into_response(),
@@ -274,6 +280,7 @@ fn load_browser_capsule(dir: &Path, expected_name: &str) -> Option<BrowserCapsul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::gateway::WALLET_WALLETCONNECT_CAPSULE_ID;
     use std::fs;
 
     fn write_test_browser_capsule(data_dir: &Path, name: &str, description: &str, role: &str) {
@@ -490,6 +497,22 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(BROWSER_CAPSULE_OAC)
         );
+    }
+
+    #[tokio::test]
+    async fn walletconnect_browser_capsule_requires_pinned_runtime_config() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_test_browser_capsule(
+            data_dir.path(),
+            WALLET_WALLETCONNECT_CAPSULE_ID,
+            "WalletConnect",
+            "app",
+        );
+
+        let response =
+            serve_browser_capsule_path(data_dir.path(), WALLET_WALLETCONNECT_CAPSULE_ID, None)
+                .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
