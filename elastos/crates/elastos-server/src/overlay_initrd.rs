@@ -277,6 +277,13 @@ pub fn write_combined_initrd(source: &Path, dest: &Path) -> anyhow::Result<bool>
 
 const CPIO_NEWC_MAGIC: &[u8] = b"070701";
 /// Regular file, mode 0755 (rwxr-xr-x).
+///
+/// Phase 10.7 — currently no entries are emitted as 0755-mode files
+/// (the carrier-bridge agent payload is staged via a separate rootfs
+/// overlay, not in initrd), so this constant is unused. Kept for
+/// completeness alongside the rest of the cpio-newc mode-bit set so
+/// adding executable initrd entries in future remains mechanical.
+#[allow(dead_code)]
 const CPIO_MODE_EXEC_FILE: u32 = 0o100755;
 
 fn write_cpio_entry(buf: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {

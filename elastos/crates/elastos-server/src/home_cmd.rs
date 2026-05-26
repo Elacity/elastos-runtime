@@ -3289,9 +3289,7 @@ mod tests {
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"home"));
     }
 
-    fn full_screen_apps_service<'a>(
-        services: &'a [SystemServiceStatus],
-    ) -> &'a SystemServiceStatus {
+    fn full_screen_apps_service(services: &[SystemServiceStatus]) -> &SystemServiceStatus {
         services
             .iter()
             .find(|service| service.name == "Full-screen Apps")

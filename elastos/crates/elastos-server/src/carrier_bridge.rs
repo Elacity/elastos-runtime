@@ -109,12 +109,11 @@ pub fn parse_carrier_line(bytes: &[u8]) -> Result<Option<serde_json::Value>, Car
 /// [`run_carrier_bridge_loop`] fires *after* the allocation has
 /// already happened, which is too late.
 ///
-/// **Calling convention:** callers pass `CARRIER_MAX_LINE_BYTES
-/// + 1` so the post-read check `n > CARRIER_MAX_LINE_BYTES`
-/// fires without truncating an attacker-supplied payload
-/// mid-byte. This `+1` headroom convention is the contract
-/// between this helper and the bridge loop's oversized-line
-/// handler.
+/// **Calling convention:** callers pass `CARRIER_MAX_LINE_BYTES + 1`
+/// (note the +1 headroom) so the post-read check `n > CARRIER_MAX_LINE_BYTES`
+/// fires without truncating an attacker-supplied payload mid-byte.
+/// This +1 headroom convention is the contract between this helper and
+/// the bridge loop's oversized-line handler.
 ///
 /// **Semantics:**
 /// - On EOF before any byte: returns `Ok(0)`.

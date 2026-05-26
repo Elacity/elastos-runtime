@@ -23,6 +23,10 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::setup::{detect_platform, load_manifest, ComponentsManifest, PlatformInfo};
+// Phase 10.7 — `Supervisor` is consumed only by the Mac-only `print_report`
+// body (to read back the resolved Vz paths). On Linux the import is unused
+// because `print_report` is a stub that prints "not available on this platform".
+#[cfg(target_os = "macos")]
 use crate::supervisor::Supervisor;
 
 /// CLI arguments for `elastos doctor`.
@@ -222,6 +226,12 @@ pub(crate) fn print_report(
 /// component itself declares an `install_path` — both of which are
 /// "rootfs not configured for this platform" cases doctor reports
 /// explicitly so the operator knows to update `components.json`.
+///
+/// Phase 10.7 — consumed only by Mac `print_report`; on Linux the
+/// stub `print_report` returns before any helper would be invoked.
+/// Tests still reference these helpers via the `tests` module, so we
+/// suppress dead_code rather than cfg-gating the function itself.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn resolve_rootfs_install_path<'a>(
     manifest: &'a ComponentsManifest,
     platform: &str,
@@ -236,6 +246,11 @@ fn resolve_rootfs_install_path<'a>(
 /// Parameters for a single substrate-artifact row. Bundled in a struct
 /// to keep [`print_artifact_row`]'s signature readable (clippy
 /// `too_many_arguments`) and to make adding future rows mechanical.
+///
+/// Phase 10.7 — Mac-only (consumed by `print_artifact_row`). Linux
+/// suppresses dead_code without cfg-gating the type itself to keep
+/// the file's tests cross-platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ArtifactRow<'a> {
     label: &'a str,
     path: &'a Path,
@@ -244,6 +259,8 @@ struct ArtifactRow<'a> {
     manifest_component: &'a str,
 }
 
+// Phase 10.7 — Mac-only consumer; Linux suppresses dead_code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn print_artifact_row(
     out: &mut dyn Write,
     row: ArtifactRow<'_>,
@@ -303,6 +320,7 @@ fn print_artifact_row(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn print_dir_row(out: &mut dyn Write, label: &str, path: &Path) -> anyhow::Result<()> {
     writeln!(out, "  {label}:  {}", path.display())?;
     if path.is_dir() {
@@ -321,6 +339,7 @@ fn print_dir_row(out: &mut dyn Write, label: &str, path: &Path) -> anyhow::Resul
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn current_platform_info<'a>(
     manifest: &'a ComponentsManifest,
     component_name: &str,
@@ -329,6 +348,7 @@ fn current_platform_info<'a>(
     component.platforms.get(&detect_platform())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn print_manifest_metadata(out: &mut dyn Write, info: &PlatformInfo) -> anyhow::Result<()> {
     if let Some(url) = &info.url {
         writeln!(out, "              url:         {url}")?;
@@ -349,6 +369,7 @@ fn print_manifest_metadata(out: &mut dyn Write, info: &PlatformInfo) -> anyhow::
 /// is already a project-wide formatter in setup.rs, but it's wired through
 /// a different output column convention. Local copy keeps doctor's output
 /// stable independent of setup's UI churn.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn human_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
