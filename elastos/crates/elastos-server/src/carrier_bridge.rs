@@ -28,6 +28,75 @@ use elastos_runtime::provider::ProviderRegistry;
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
 
+/// Maximum byte length of a single Carrier-bridge framed line. Lines
+/// longer than this are dropped with a `request_too_large` error
+/// envelope written back to the guest. **Phase 10 Day 4-8**: hoisted
+/// from the two inline copies (microVM bridge loop + WASM bridge loop)
+/// into a single public constant so the fuzz harness and the bridge
+/// loops cannot drift.
+pub const CARRIER_MAX_LINE_BYTES: usize = 1_048_576;
+
+/// Typed parser result for the fuzz harness. The production bridge
+/// loops keep using `anyhow::Result` for source-line continuity; this
+/// enum exists so fuzz can distinguish a rejection-class from a true
+/// panic-class finding.
+#[derive(Debug)]
+pub enum CarrierFrameError {
+    /// Raw byte length exceeded `CARRIER_MAX_LINE_BYTES` before any
+    /// JSON parse was attempted. Production bridge writes back
+    /// `{"id":0,"type":"error","error":"request_too_large"}` and
+    /// continues; fuzz treats this as a clean rejection.
+    LineTooLarge { len: usize },
+    /// Raw bytes were not valid UTF-8. Production `read_line` produces
+    /// a `String` so this branch isn't reachable on the live host
+    /// path; surfaced here for fuzz coverage of the conversion.
+    InvalidUtf8(std::str::Utf8Error),
+    /// `serde_json::from_str` rejected the trimmed line.
+    InvalidJson(serde_json::Error),
+}
+
+/// **Phase 10 Day 4-8 — trust-boundary framing parser surface.**
+///
+/// Pure function that mirrors the framing + JSON-parse logic embedded
+/// in [`run_carrier_bridge_loop`] and [`spawn_wasm_carrier_bridge`].
+/// Exists solely so the fuzz harness at `fuzz/fuzz_targets/
+/// carrier_bridge_framing.rs` can exercise the parser with arbitrary
+/// bytes without spinning up an async runtime, a Unix socket, or a
+/// `BridgeContext`.
+///
+/// Semantics, in order:
+/// 1. If `bytes.len() > CARRIER_MAX_LINE_BYTES`: return
+///    `Err(LineTooLarge)` immediately — no JSON parse attempted.
+/// 2. If `bytes` is not valid UTF-8: return `Err(InvalidUtf8)`.
+/// 3. Trim leading/trailing ASCII whitespace per `str::trim`.
+/// 4. If the trimmed line is empty: return `Ok(None)` (production
+///    bridges skip these via `if line.trim().is_empty() { continue; }`).
+/// 5. Otherwise `serde_json::from_str(trimmed)` — on failure return
+///    `Err(InvalidJson)`, on success return `Ok(Some(value))`.
+///
+/// **Invariants the fuzz harness asserts on this function:**
+/// - It never panics.
+/// - For inputs longer than `CARRIER_MAX_LINE_BYTES` the function
+///   short-circuits and returns `Err(LineTooLarge)` without
+///   allocating proportional to input size.
+/// - The function is total: every byte slice produces either `Ok(_)`
+///   or `Err(_)`.
+pub fn parse_carrier_line(
+    bytes: &[u8],
+) -> Result<Option<serde_json::Value>, CarrierFrameError> {
+    if bytes.len() > CARRIER_MAX_LINE_BYTES {
+        return Err(CarrierFrameError::LineTooLarge { len: bytes.len() });
+    }
+    let s = std::str::from_utf8(bytes).map_err(CarrierFrameError::InvalidUtf8)?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(CarrierFrameError::InvalidJson)?;
+    Ok(Some(value))
+}
+
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -148,7 +217,6 @@ async fn run_carrier_bridge_loop(
     let on_terminate = ctx.as_ref().and_then(|c| c.on_terminate.clone());
 
     let (reader, mut writer) = stream.into_split();
-    const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
     let mut reader = BufReader::new(reader);
 
     let mut line = String::new();
@@ -163,7 +231,7 @@ async fn run_carrier_bridge_loop(
             }
         }
 
-        if line.len() > MAX_LINE_BYTES {
+        if line.len() > CARRIER_MAX_LINE_BYTES {
             tracing::warn!(
                 "Carrier bridge: oversized line ({} bytes), dropping",
                 line.len()
@@ -236,8 +304,6 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
             let mut writer = pipes.capsule_stdin;
             let ctx = Some(ctx);
 
-            const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
-
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(l) => l,
@@ -251,7 +317,7 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
                     continue;
                 }
 
-                if line.len() > MAX_LINE_BYTES {
+                if line.len() > CARRIER_MAX_LINE_BYTES {
                     tracing::warn!("WASM bridge: oversized line ({} bytes), dropping", line.len());
                     let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
                     let _ = writeln!(writer, "{}", error);
