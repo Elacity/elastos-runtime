@@ -1334,6 +1334,80 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Phase 10.5 M3 — JSON nesting-depth resilience verification.
+    //
+    // `serde_json` 1.0.149 documents a default 128-deep recursion
+    // limit on `from_str` / `Deserializer`, so deeply-nested input
+    // should `Err(RecursionLimitExceeded)` rather than overflow
+    // the stack. The pre-review packet flagged that this had not
+    // been verified empirically on our actual call path
+    // (`parse_carrier_line` → `serde_json::from_str::<Value>`).
+    //
+    // These tests verify the guarantee in normal CI:
+    //   1. A 200-deep nested array (well past 128) is rejected as
+    //      `Err(CarrierFrameError::InvalidJson(_))`, not a panic.
+    //   2. A 50-deep nested array (well under 128) is accepted as
+    //      `Ok(Some(_))` (proves the cap is not over-eager).
+    //
+    // The fuzz corpus also gets two new seeds — `26-nested-129-deep`
+    // and `27-envelope-nested-200-deep` — so subsequent libfuzzer
+    // runs exercise both the bare-Value path and the typed
+    // RequestEnvelope path.
+    //
+    // If serde_json's default ever changes upstream (or a transitive
+    // feature flag disables the limit), this test fires with a
+    // `STATUS_STACK_BUFFER_OVERRUN` / `SIGSEGV` and we escalate to
+    // an explicit `Deserializer::with_recursion_limit(128)` wrapper.
+    // ---------------------------------------------------------------
+
+    /// 200-deep nested array (`[[[...]]]`) must be rejected as
+    /// invalid JSON, not overflow the stack.
+    #[test]
+    fn parse_carrier_line_rejects_excessively_nested_json() {
+        let depth = 200usize;
+        let mut payload = String::with_capacity(2 * depth);
+        for _ in 0..depth {
+            payload.push('[');
+        }
+        for _ in 0..depth {
+            payload.push(']');
+        }
+        let result = parse_carrier_line(payload.as_bytes());
+        match result {
+            Err(CarrierFrameError::InvalidJson(_)) => { /* expected */ }
+            Err(other) => panic!(
+                "expected InvalidJson rejection, got: {other:?}"
+            ),
+            Ok(value) => panic!(
+                "expected InvalidJson rejection, got Ok: {value:?}"
+            ),
+        }
+    }
+
+    /// 50-deep nested array must be accepted — proves the depth
+    /// cap is not over-eager. Pre-fix: this also passed, but if
+    /// we ever lower the limit aggressively this catches the
+    /// regression.
+    #[test]
+    fn parse_carrier_line_accepts_moderately_nested_json() {
+        let depth = 50usize;
+        let mut payload = String::with_capacity(2 * depth);
+        for _ in 0..depth {
+            payload.push('[');
+        }
+        for _ in 0..depth {
+            payload.push(']');
+        }
+        let result = parse_carrier_line(payload.as_bytes());
+        match result {
+            Ok(Some(serde_json::Value::Array(_))) => { /* expected */ }
+            other => panic!(
+                "expected Ok(Some(Array(...))) for 50-deep input, got: {other:?}"
+            ),
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Phase 10.5 M1 — bounded read regression test.
     //
     // Pre-Phase-10.5 the bridge loop called
