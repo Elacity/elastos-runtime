@@ -489,34 +489,76 @@ async fn run_microvm_standalone(
         );
     }
 
-    loop {
+    // **Phase 10 Day 9** — graceful shutdown on every well-known
+    // terminating signal, not just SIGINT (Ctrl-C). Operators sending
+    // SIGTERM (e.g. via `kill <pid>`, `pkill elastos`, container
+    // orchestrators, supervisor scripts) previously ran the loop's
+    // SIGINT-only branch, fell through with no shutdown trigger, and
+    // had to follow up with SIGKILL — leaving the Apple Vz XPC
+    // (`com.apple.Virtualization.VirtualMachine`) running as an
+    // orphan. We now treat SIGTERM identically to SIGINT and route
+    // both through the same `provider.stop()` path.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow::anyhow!("install SIGTERM handler: {e}"))?;
+
+    let stop_trigger = loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!();
                 eprintln!("[run] Ctrl-C received");
-                break;
+                break "SIGINT";
+            }
+            _ = sigterm.recv() => {
+                eprintln!();
+                eprintln!("[run] SIGTERM received");
+                break "SIGTERM";
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 match provider.status(&handle).await {
                     Ok(elastos_common::CapsuleStatus::Running) => continue,
                     Ok(other) => {
                         eprintln!("[run] guest state transitioned to {other:?}");
-                        break;
+                        break "guest-transition";
                     }
                     Err(e) => {
                         eprintln!("[run] status query failed: {e}");
-                        break;
+                        break "status-error";
                     }
                 }
             }
         }
+    };
+
+    // **Phase 10 Day 9** — bound the provider stop call. Apple's
+    // `VZVirtualMachine.stop` should resolve within a few seconds,
+    // but a stuck XPC could hang us indefinitely otherwise.
+    // `VZ_STOP_TIMEOUT` covers normal shutdown + cleanup; if it
+    // expires we still drop `provider` below, which triggers the
+    // `VzMachineHandle::Drop` teardown path Apple expects.
+    const VZ_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+    eprintln!("[run] stopping VM (trigger={stop_trigger}, timeout={VZ_STOP_TIMEOUT:?})…");
+    match tokio::time::timeout(VZ_STOP_TIMEOUT, provider.stop(&handle)).await {
+        Ok(Ok(())) => {
+            eprintln!("[run] provider.stop completed cleanly");
+        }
+        Ok(Err(e)) => {
+            eprintln!("[run] provider.stop returned: {e}");
+        }
+        Err(_) => {
+            eprintln!(
+                "[run] provider.stop timed out after {:?}; relying on drop teardown",
+                VZ_STOP_TIMEOUT
+            );
+        }
     }
 
-    eprintln!("[run] stopping VM…");
-    if let Err(e) = provider.stop(&handle).await {
-        eprintln!("[run] provider.stop returned: {e}");
-    }
+    // **Phase 10 Day 9** — explicit drop of the provider before
+    // returning, so the `VzMachineHandle::Drop` path runs while we
+    // can still observe + log the teardown, rather than racing the
+    // tokio runtime shutdown the CLI dispatch performs on return.
+    drop(provider);
     eprintln!("[run] done.");
+
     // The TermiosGuard restores the host terminal on drop —
     // explicit drop here documents the lifecycle ordering: the
     // guard must outlive the VM (so guest output keeps reaching
