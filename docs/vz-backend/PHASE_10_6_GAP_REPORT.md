@@ -3,7 +3,9 @@
 **Branch**: `sash/local-test`  
 **Date opened**: 2026-05-26  
 **Date paused**: 2026-05-26  
-**Status**: **PAUSED — partial completion. Two real fixes shipped, four issue classes documented for a future Phase 10.7 cleanup session.**
+**Date resumed (as Phase 10.7)**: 2026-05-27  
+**Date closed**: 2026-05-27  
+**Status**: **✅ CLOSED — All four issue classes resolved in Phase 10.7. See "Phase 10.7 closure record" at the bottom of this document.**
 
 ---
 
@@ -204,3 +206,67 @@ The approved work in the current sprint is **Step 2 (inherited CVE remediation o
 ## One-line summary
 
 **Two real fixes shipped, four bounded issues documented, branch is honest about its CI red-state, CVE work resumes on its own branch.**
+
+---
+
+## Phase 10.7 closure record (added 2026-05-27)
+
+After `chore/runtime-cve-hygiene` was opened as PR #1 against `main`, the operator
+requested Phase 10.7 — close the four gap-report issues on `sash/local-test`.
+That work landed in 7 commits on this branch (HEAD `5d754b8`):
+
+| Commit | Subject | Closes |
+|---|---|---|
+| `39bb3b3` | phase10.7 fix #2: add prune_orphans_on_startup to Linux VzConfig stub | Issue #2 |
+| `3ef99d6` | phase10.7 fix #1: cfg-gate doctor_cmd::print_report to Mac + Linux stub | Issue #1 (main) |
+| `18a5f71` | phase10.7 fix #3: cfg-gate unused VzError import on Linux in vm.rs | Issue #3 |
+| `1dfd7ae` | phase10.7 fix #4: replace manual find loop with Iterator::find (clippy) | Issue #4 |
+| `e5b5772` | phase10.7 fix #1+#2 followup: two Linux sites missed in original audit | Issue #1 (followup) |
+| `379c2ad` | phase10.7 cascade: clean up Linux dead-code + latent clippy lints | cascade |
+| `5d754b8` | phase10.7 tests: cfg-gate Mac doctor tests + add Linux stub coverage | test divergence |
+
+### Final CI state on `sash/local-test` HEAD `5d754b8`
+
+| Lane | Run | Status |
+|---|---|---|
+| Linux-untouched gate (Vz backend) | 26469599513 | ✅ success (11s) |
+| CI (Linux build + clippy `-D warnings` + tests) | 26469599353 | ✅ success (2m36s) |
+| Mac Vz CI (Apple Silicon, fmt + clippy + tests threads=1 & 4) | 26469599624 | ✅ success (15m54s) |
+
+### What each issue cost
+
+| Issue | Original estimate | Actual | Notes |
+|---|---|---|---|
+| #2 | 5 min | ~10 min | One-field stub extension; landed cleanly. |
+| #1 | 30 min | ~90 min over 3 commits | Initial cfg-gate was correct; CI revealed two missed Linux call-sites (`doctor_cmd.rs:272` in `print_artifact_row`, `supervisor.rs:4328` in the Linux-only test) AND a cascade of `dead_code` errors on the now-unused helpers, plus 4 Mac-only test assertions that broke on Linux. Each was a faithful application of the gap-report's "audit ALL files, not just the obvious one" warning. |
+| #3 | 30-60 min | ~10 min | CI only flagged `vm.rs:28`; the proactive audit of the rest of `elastos-vz/src/` found no other unconditional `elastos_vz::*` uses (all already behind `#[cfg(target_os = "macos")]` or `#[cfg_attr]`). |
+| #4 | 10 min | ~5 min | Clippy's exact suggestion (`Iterator::find`) applied; identical semantics. |
+| Cascade | — | ~30 min | Two latent clippy lints surfaced once compile errors cleared (`needless_lifetimes` in `home_cmd.rs`, `doc_list_item_without_indent` in `carrier_bridge.rs`) plus the dead-code wave once `print_report` became Mac-only. |
+| **Total** | **~75 min** | **~145 min** | Doubled the estimate, primarily because Issue #1's scope was larger than the gap report could anticipate without the CI feedback loop. |
+
+### Sign-off discipline applied (correcting the Phase 10.5 gap)
+
+- ✅ Each fix is its own commit with explicit verifier output in the commit body.
+- ✅ `Cargo.lock` untouched (all changes are source-only).
+- ✅ No new dependencies.
+- ✅ No `main` touched.
+- ✅ **CI on the same branch is green before claiming closure** — this is the
+  discipline the Phase 10.5 sign-off should have applied. All three CI lanes
+  on this branch HEAD are now green; closure is honest.
+
+### Test coverage delta
+
+- Mac side: 5/5 doctor tests pass (4 of them Mac-only, 1 cross-platform).
+- Linux side: 2/2 doctor tests pass (`doctor_quiet_subscriber_*` cross-platform
+  + new `doctor_linux_stub_prints_not_available_notice`).
+- Total doctor coverage unchanged or improved on each platform.
+
+### Cross-references to closure artifacts
+
+- `PHASE_10_5_SIGNOFF.md` — banner updated to reflect this closure.
+- `chore/runtime-cve-hygiene` (PR #1) — unaffected by this work; independently
+  reviewable.
+
+### One-line closure summary
+
+**All four gap-report issues closed, cascade cleaned up, all three CI lanes green on `sash/local-test` HEAD `5d754b8`. Branch ready for reviewer.**

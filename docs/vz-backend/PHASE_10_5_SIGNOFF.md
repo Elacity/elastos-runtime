@@ -1,30 +1,36 @@
 # Phase 10.5 — Sign-off
 
-> ## ⚠️ Branch status callout (added 2026-05-26 post-sign-off)
+> ## ✅ Branch status (updated 2026-05-27 post-Phase-10.7)
 >
 > **M1-M4 findings: CLOSED.** Code fixes, regression tests, and operator verifiers
 > for the four medium-severity Phase 10 findings are all on this branch and verified.
-> Nothing in this section retracts that.
 >
-> **Branch `sash/local-test` merge-readiness: NOT YET CLAIMED.** A post-sign-off CI
-> sanity check (the one the original Phase 10.5 sign-off should have included but
-> didn't) revealed this branch's **Linux CI has been continuously red since
-> 2026-05-25T11:46Z** (commit `30cccce`, Phase 6 Day 6) due to pre-existing
-> Phase 4/5/6 cross-OS substrate regressions unrelated to M1-M4. The original
-> sign-off's phrasing implied "branch ready for reviewer" — that was overclaiming.
+> **Phase 10.6 substrate-CI regressions: CLOSED via Phase 10.7.**
+> The four cross-OS substrate regressions catalogued in
+> [`PHASE_10_6_GAP_REPORT.md`](./PHASE_10_6_GAP_REPORT.md) — three
+> hard-error Linux build failures (`supervisor.rs:1019`,
+> `doctor_cmd.rs` field-access cluster, `vm.rs:28` unused-import) and
+> one Mac clippy lint (`concurrent_launch.rs:464` `manual_find`) —
+> are all fixed on this branch. Plus a documented cascade
+> (`carrier_bridge.rs` doc-list false positive, `home_cmd.rs` latent
+> `needless_lifetimes`, `overlay_initrd.rs` latent `CPIO_MODE_EXEC_FILE`,
+> Linux-side dead-code on doctor helpers and 4 Mac-only test
+> assertions) was cleaned up in the same Phase 10.7 sweep.
 >
-> A follow-up Phase 10.6 session closed two of the substrate regressions
-> (`cargo fmt` drift and 5 unconditional `elastos_vz::*` references in
-> `supervisor.rs`) and **explicitly paused** on documenting the four remaining
-> issue classes. See **[`PHASE_10_6_GAP_REPORT.md`](./PHASE_10_6_GAP_REPORT.md)**
-> for the full breakdown.
+> **Branch `sash/local-test` CI status (HEAD `5d754b8`):**
+> | Lane | Status |
+> |---|---|
+> | Linux-untouched gate (Vz backend) | ✅ success |
+> | CI (Linux build + clippy `-D warnings` + tests) | ✅ success |
+> | Mac Vz CI (Apple Silicon, fmt + clippy + tests threads=1 & 4) | ✅ success |
 >
 > **What this means for the operator:**
-> - The Mac substrate security work (M1-M4) is genuinely done and reviewable.
-> - The branch is **NOT** ready to merge to `main` until Phase 10.7 closes the
->   four substrate regressions catalogued in the gap report.
-> - The parallel Step 2 work (inherited CVE remediation) is on its own clean
->   branch (`chore/runtime-cve-hygiene`) and is not affected by this red CI.
+> - Mac substrate security work (M1-M4): done and reviewable.
+> - Cross-OS substrate hygiene: all four gap-report issues closed; both
+>   CI lanes green on the branch HEAD.
+> - The branch is ready for reviewer; merge sequencing relative to the
+>   inherited-CVE branch (`chore/runtime-cve-hygiene`, PR #1) is the
+>   reviewer's call. Both are independently reviewable off `main`.
 >
 > ---
 
@@ -39,9 +45,6 @@
 > dependencies, no `main` touched. Inherited workspace CVEs
 > remain on the parallel `chore/runtime-cve-hygiene` handoff
 > (separate branch off `main`, owned by the broader runtime team).
->
-> ⚠️ See the branch-status callout above for the substrate-CI
-> caveat that this original outcome statement did not cover.
 
 ---
 
