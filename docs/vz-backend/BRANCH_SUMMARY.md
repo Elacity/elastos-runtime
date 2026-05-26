@@ -6,6 +6,27 @@
 > day-by-day detail see `PHASE_*_DAY_*_NOTES.md`; for the formal sign-off see
 > `PHASE_9_SIGNOFF.md`; for product framing see `../ELASTOS_PRD.md`.
 
+## Executive summary (30 seconds)
+
+This branch teaches ElastOS to run its private-computing capsules on macOS using
+**Apple's native Virtualization.framework**, achieving feature parity with the
+Linux experience for developers working from source. The architectural change
+is surgical: we swapped only the lowest layer (the VM engine), leaving the
+supervisor, capsule manifests, gateway, Carrier bridge, and identity stack
+**byte-identical to Linux**. The engineering milestone is **complete and
+validated live on Apple Silicon** — a Linux kernel boots inside Apple's
+hypervisor on a Mac, holds ~400 MB, and serves the same Home shell that
+Linux users see. **It is not yet ready for public release**: a defined
+~3-week security-hardening phase (Phase 10) is required first, covering CVE
+audit, external code review, Carrier-bridge fuzzing, and notarized-build CI.
+
+## What this document is — and is not
+
+| | |
+|---|---|
+| **This is** | The single shareable summary of the `sash/local-test` branch. Read this to understand the *what*, *how*, *why*, and *what's missing*. |
+| **This is not** | A marketing page. A release announcement. A complete security audit. A user manual. |
+
 ## At a glance
 
 | Metric | Value |
@@ -124,9 +145,96 @@ This is the meat of Phase 9 and is what made the user-visible experience reach p
 
 - `cargo test -p elastos-server` — green on Mac, no regressions.
 - `cargo test -p elastos-vz --test concurrent_launch --release` — green; multiple VMs boot in parallel under Vz.
-- `elastos run ubuntu-base` — boots Ubuntu 22.04 LTS to login prompt in ~10s. Verified live with Activity Monitor.
+- `elastos run ubuntu-base` — boots Ubuntu 22.04 LTS to login prompt in ~10s wall clock; VM holds ~400 MB resident; CPU spikes to ~100% during boot then settles to ~2% at idle login. Verified live with Activity Monitor.
 - `elastos capsule system --interactive` (managed Home path) — boots through supervisor with full Carrier wiring. Verified live.
 - Browser-based Home shell at `/apps/home/` — served by `elastos gateway` from the source tree via `DEV_CAPSULES_ROOT`. Verified live; user clicked through Documents / Library / Inbox / System / Chat-Room apps.
+
+### Validate it yourself in 5 minutes (engineer quickstart)
+
+> Prereq: Apple Silicon Mac running macOS 13+, Xcode CLI tools installed, Rust
+> toolchain installed.
+
+```bash
+# 1. Clone and check out the branch (60s)
+git clone https://github.com/Elacity/elastos-runtime.git
+cd elastos-runtime && git checkout sash/local-test
+
+# 2. Bootstrap the Mac dev environment (3-4 min; idempotent)
+./scripts/dev/mac-local-setup.sh
+
+# 3. Boot a real Linux VM under Apple Vz (15s — proves the substrate)
+./elastos/target/debug/elastos run ubuntu-base
+# In another terminal, open Activity Monitor → All Processes →
+# search "Virtual" → you'll see com.apple.Virtualization.VirtualMachine
+# spawned by our Rust code, holding ~400 MB, booting Ubuntu 22.04.
+# Ctrl-C to stop (followed by `pkill -KILL` until graceful-shutdown lands).
+
+# 4. Launch the managed Home shell (proves the full stack)
+./elastos/target/debug/elastos gateway --addr 127.0.0.1:8090 &
+open http://127.0.0.1:8090/apps/home/
+# Click around Documents / Library / Inbox / System / Chat-Room.
+```
+
+For a guided, narrated walkthrough including log inspection, run
+`./scripts/dev/mac-live-demo.sh`.
+
+### FAQ
+
+**Q: Why didn't we just use Docker / Podman / OrbStack?**
+A: Capsules are full Linux VMs with their own kernel, not containers sharing
+the host kernel. The threat model demands hardware-level isolation between
+capsules — containers don't provide that. Apple Vz is the platform-native
+hypervisor for the exact same threat model `crosvm` covers on Linux.
+
+**Q: Does this work on Intel Macs?**
+A: The code paths exist (Vz supports Intel) but we have only validated on
+Apple Silicon. Intel-Mac validation is an explicit gap; would require
+testing access to an Intel Mac.
+
+**Q: Will a Linux-built capsule (`.elastos` artifact) run unchanged on Mac?**
+A: WASM capsules — yes, byte-identical. MicroVM capsules — yes if the rootfs
+is `aarch64`; the substrate is platform-agnostic but the rootfs architecture
+must match the host. Cross-platform rootfs handling is a distribution
+concern, not a substrate concern.
+
+**Q: How does this compare to OrbStack / Lima / Vagrant?**
+A: Those are general-purpose VM management tools. We are an
+*application-specific* substrate: capsules have a fixed lifecycle managed by
+our supervisor, a fixed communication contract (Carrier bridge over
+virtio-console), and a fixed identity model (DID + capability tokens). We
+use Apple's same underlying framework but expose a much smaller, more
+opinionated surface tailored to the ElastOS supervisor's needs.
+
+**Q: What's the performance overhead vs Linux + KVM?**
+A: Baseline measurement is in `PERFORMANCE_BASELINE.md`. Boot-to-login is
+within 2x of crosvm on similar hardware. Steady-state has not shown
+measurable differences in the benchmarks we run today; broader profiling
+is a Phase 10+ follow-up.
+
+**Q: Are we abandoning Linux?**
+A: No. The Linux substrate (`crosvm`) is unchanged on this branch.
+`scripts/check-linux-untouched.sh` enforces that. Both substrates ship.
+
+**Q: What does an attacker who fully compromises a capsule get?**
+A: Code execution inside their own Linux VM, NAT'd network only (no LAN
+visibility, no access to other capsules' VMs), and the ability to send
+messages over the Carrier bridge to the host runtime — where capability
+checks gate every operation. Escaping the VM itself requires defeating
+Apple Vz, which is a hardware-enforced boundary. The Carrier bridge is
+the lowest-level parser on the trust boundary and is currently the
+highest-priority Phase 10 audit target.
+
+**Q: Why is `com.apple.security.cs.allow-jit` granted?**
+A: Wasmtime needs writable + executable memory for JIT-compiled WASM
+capsule code. This weakens the codesign enforcement window slightly. The
+tradeoff is well-known in the wasmtime community and is gated to the
+single binary that hosts the WASM runtime.
+
+**Q: Can I run this on a CI worker?**
+A: GitHub Apple-Silicon runners support Vz. We have a self-hosted M2 lane
+described in `SELF_HOSTED_RUNNER_SPEC.md`. Hosted Mac runners on GitHub
+Actions require explicit Vz entitlement, which the current cert chain
+handles.
 
 ### Entitlements — what we grant and why
 
@@ -235,7 +343,15 @@ This is roughly a three-week phase, the bulk of which (Days 11-15) is wall-clock
 ## TL;DR
 
 - **What we built:** a Mac substrate for ElastOS capsules using Apple's Virtualization.framework, plus a Mac dev-bootstrap that reaches feature parity with the Linux source-checkout developer experience. Net 41,828 LOC across 158 files, 72 commits, 9 phases, all 5 sign-off smoke tests green.
-- **Am I happy it's the engineering milestone I was tasked with?** Yes. Validated live in front of you.
+- **Am I happy it's the engineering milestone I was tasked with?** Yes. Validated live, end-to-end, on a real Mac.
 - **Is it ready for public users?** Not without Phase 10 security hardening. The substrate has never been reviewed by an outside set of eyes and the most attackable parser on the trust boundary has never been fuzzed. The fixes are well-scoped (~3 weeks) and not blockers to the engineering achievement.
 
-Anchors: `PHASE_9_SIGNOFF.md` · `PHASE_6_PLAN.md` (rolling status) · `scripts/dev/mac-local-setup.sh` · `scripts/dev/mac-live-demo.sh` · `elastos/crates/elastos-vz/`
+### One-line verdict (quote me)
+
+> *"The Mac substrate is engineering-complete and validated live; it is ready
+> for internal use and dogfooding today. It is not ready for public release
+> until a ~3-week security-hardening phase runs `cargo audit`, completes
+> external code review of `elastos-vz`, and fuzzes the Carrier-bridge
+> parser."*
+
+Anchors: `PHASE_9_SIGNOFF.md` · `PHASE_6_PLAN.md` (rolling status) · `PHASE_10_PLAN.md` (next, security hardening) · `scripts/dev/mac-local-setup.sh` · `scripts/dev/mac-live-demo.sh` · `elastos/crates/elastos-vz/`
