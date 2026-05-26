@@ -8,6 +8,15 @@
 > or (b) the operator accepts those findings with rationale and
 > ships under a documented "guest-host trust assumption" caveat.
 > Phase 10 does not ship the alpha; it gates it.
+>
+> **Update 2026-05-26 (post-Phase-10.5):** M1, M2, M3, M4 are all
+> **closed on this branch** in a follow-up 4-commit Phase 10.5
+> session — see [`PHASE_10_5_SIGNOFF.md`](./PHASE_10_5_SIGNOFF.md).
+> The "remediated" precondition above is now satisfied for those
+> four findings without an external review round-trip. M5 remains
+> Phase 11 (typed-dispatch fuzz expansion) and the 34 inherited
+> workspace CVEs remain owned by the broader runtime team on a
+> separate `chore/runtime-cve-hygiene` branch off `main`.
 
 ---
 
@@ -239,41 +248,66 @@ deferral target.
 
 ### Gap B — M1/M2 unbounded `read_line` in Carrier-bridge + kernel-console
 
-- **Owner:** this branch (agent fixes once concurrence lands).
-- **Status:** awaiting external reviewer concurrence on the
-  severity classification before fix-now. If reviewer concurs
-  (M1 medium, M2 medium-low), agent applies the bounded-read
-  patch (~15 LOC across both files) as two commits on
-  `sash/local-test` with regression tests.
-- **Decision point:** does the alpha ship before or after these
-  fixes? Agent's recommendation: **before** these fixes is
-  acceptable only if the alpha is gated to a known-cooperative
-  audience (internal team + invited testers, not public).
-  **Public alpha must include the fix.**
-- **Deferral target:** within the Phase 10 review window
-  (Days 11-13 + a fast follow-up); not a Phase 11 deferral.
+- **Owner:** this branch — **CLOSED in Phase 10.5.**
+- **Status:** **FIXED.** M1 in commit
+  [`80ac011`](https://github.com/Elacity/elastos-runtime/commit/80ac011)
+  (`phase10.5 M1: byte-budget carrier-bridge line reader`); M2 in
+  [`42e11d4`](https://github.com/Elacity/elastos-runtime/commit/42e11d4)
+  (`phase10.5 M2: byte-budget kernel-console line reader`).
+  Bounded-read helpers (`read_line_byte_budgeted` async + sync
+  flavours, `drain_to_newline` resync) replace the unbounded
+  `BufReader::read_line` on both paths. Per-line allocation
+  capped at 1 MiB+1 (Carrier-bridge) and 64 KiB+1
+  (kernel-console). Two end-to-end regression tests prove the
+  bound holds + the loop resyncs cleanly + dispatch resumes.
+- **Operator verifiers (both pass on `sash/local-test` HEAD):**
+  ```bash
+  cargo test -p elastos-server --lib carrier_bridge::tests::oversized_line_resyncs_and_continues_dispatch -- --nocapture
+  cargo test -p elastos-vz --lib ffi::console_forwarder::tests::forwarder_caps_oversized_kernel_line_and_resyncs -- --nocapture
+  ```
+- See `PHASE_10_5_SIGNOFF.md` § 2 for the full closeout.
 
 ### Gap C — M3 JSON-depth resilience verification
 
-- **Owner:** this branch (agent verifies once a fuzz seed lands).
-- **Status:** documented `serde_json` 1.0.149 default is
-  128-deep limit; agent did not verify experimentally. Plan: add
-  a deeply-nested seed to the fuzz corpus, re-run 5-minute
-  burst, confirm clean (or surface the panic and pin the limit
-  explicitly).
-- **Decision point:** before alpha or after? Agent's
-  recommendation: before — it's a 30-minute task and the result
-  decides whether M3 is a real finding or a documentation gap.
+- **Owner:** this branch — **CLOSED in Phase 10.5.**
+- **Status:** **VERIFIED (no code change required).** Commit
+  [`4c83a23`](https://github.com/Elacity/elastos-runtime/commit/4c83a23)
+  (`phase10.5 M3: verify JSON nesting-depth resilience`) added
+  two regression tests + two new fuzz corpus seeds
+  (`26-nested-129-deep`, `27-envelope-nested-200-deep`). Cargo
+  test confirms a 200-deep nested array returns
+  `Err(CarrierFrameError::InvalidJson(_))` (not stack overflow);
+  60-second fuzz burst with the augmented corpus completed
+  491,712 iterations clean. If `serde_json`'s default 128-deep
+  recursion limit ever changes upstream, the regression test
+  fires immediately.
+- **Operator verifier:**
+  ```bash
+  cargo test -p elastos-server --lib carrier_bridge::tests::parse_carrier_line_rejects_excessively_nested_json -- --nocapture
+  ```
 
 ### Gap D — M4 manifest resource caps
 
-- **Owner:** Phase 11.
-- **Status:** documented in pre-review (no upper bound on
-  `memory_mb` / `vcpu_count`). Apple's validate catches absurd
-  values at construction time, so the failure mode is
-  "construction fails noisily" not "host hangs". Agent
-  recommends adding configurable upper bounds at `from_manifest`
-  time (~15 LOC + one test); explicitly deferred.
+- **Owner:** this branch — **CLOSED in Phase 10.5** (was
+  previously deferred to Phase 11; operator chose to close now
+  alongside M1–M3).
+- **Status:** **FIXED.** Commit
+  [`45a1ec2`](https://github.com/Elacity/elastos-runtime/commit/45a1ec2)
+  (`phase10.5 M4: cap manifest memory_mb / vcpu_count at config
+  build`) adds `VmConfigLimits` (default 64 GiB / 32 vCPUs),
+  `ConfigError::ResourceLimitExceeded`, and
+  `VmConfig::from_manifest_with_limits(...)`. Production launch
+  paths (`VzProvider::load`, `Supervisor::build_vm_config_for_mac`)
+  wired to the fallible variant. `u32::MAX` MiB manifest now
+  rejected at config-build time *before* Apple's
+  `validateWithError` is asked to commit memory. Legacy
+  infallible `from_manifest` retained as the unvalidated path
+  for tests + future trusted-input call sites.
+- **Operator verifier:**
+  ```bash
+  cargo test -p elastos-vz --lib config::tests::from_manifest_with_limits_rejects_excessive_memory -- --nocapture
+  cargo test -p elastos-vz --lib config::tests::from_manifest_with_limits_rejects_excessive_vcpus -- --nocapture
+  ```
 
 ### Gap E — M5 typed-`RequestEnvelope` fuzz expansion
 

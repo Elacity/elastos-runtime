@@ -3,7 +3,26 @@
 > **Audience:** external security engineer hired/asked to review this branch.
 > **Branch:** `sash/local-test` (head as of 2026-05-26).
 > **Time budget:** ~30 minutes of careful reading; ~1-2 days of deeper poking.
-> **Predecessor docs:** `PHASE_9_SIGNOFF.md`, `MAC_THREAT_MODEL.md`, `PHASE_10_DAY_8_NOTES.md`, `PHASE_10_DAY_9_NOTES.md`, `RUNTIME_CVE_HANDOFF.md`, `BRANCH_SUMMARY.md`.
+> **Predecessor docs:** `PHASE_9_SIGNOFF.md`, `MAC_THREAT_MODEL.md`, `PHASE_10_DAY_8_NOTES.md`, `PHASE_10_DAY_9_NOTES.md`, `RUNTIME_CVE_HANDOFF.md`, `BRANCH_SUMMARY.md`, `PHASE_10_5_SIGNOFF.md`.
+
+> ## ⚠ Status update — 2026-05-26 (post-Phase-10.5)
+>
+> The four medium-severity findings (M1, M2, M3, M4) the agent
+> surfaced in section 4 below were **closed on this branch** in
+> a 4-commit Phase 10.5 session immediately following Phase 10
+> sign-off. Each finding section now carries a `Status: FIXED`
+> or `Status: VERIFIED (no code change)` line with the fix
+> commit SHA and the operator-runnable verifier command.
+>
+> **For an external reviewer arriving today:** the reviewer-focus
+> narrows to (a) M5 (typed-`RequestEnvelope` fuzz coverage —
+> still Phase 11), (b) the 34 inherited workspace CVEs (separate
+> `chore/runtime-cve-hygiene` branch off `main`, owned by the
+> broader runtime team via `RUNTIME_CVE_HANDOFF.md`), and (c)
+> falsifying the Phase 10.5 fixes via the operator verifiers in
+> `PHASE_10_5_SIGNOFF.md` § 3. The 10 reviewer focus points in
+> section 3 below remain useful as a falsifiability checklist
+> for the substrate's defences as they stand post-Phase-10.5.
 
 This is the **Phase 10 Day 11-13 packet**. The agent has done a pre-review
 pass (section 4); the external reviewer's job is to falsify the
@@ -164,6 +183,7 @@ section 3 (unbounded reads, JSON-depth stack overflow).
 ### Mediums
 
 #### M1 — Unbounded `BufReader::read_line` in Carrier-bridge loop
+- **Status: FIXED in Phase 10.5 — commit [`80ac011`](https://github.com/Elacity/elastos-runtime/commit/80ac011).** Verifier: `cargo test -p elastos-server --lib carrier_bridge::tests::oversized_line_resyncs_and_continues_dispatch -- --nocapture`. See `PHASE_10_5_SIGNOFF.md` § 2.
 - **File:line:** `elastos/crates/elastos-server/src/carrier_bridge.rs:225`
 - **Observed:** `reader.read_line(&mut line).await` has no upper bound. A
   guest writing `b"A" * 10_000_000_000` without a `\n` would grow `line`
@@ -184,6 +204,7 @@ section 3 (unbounded reads, JSON-depth stack overflow).
   not-newline-terminated cases.
 
 #### M2 — Same unbounded read in kernel-console forwarder
+- **Status: FIXED in Phase 10.5 — commit [`42e11d4`](https://github.com/Elacity/elastos-runtime/commit/42e11d4).** Verifier: `cargo test -p elastos-vz --lib ffi::console_forwarder::tests::forwarder_caps_oversized_kernel_line_and_resyncs -- --nocapture`. See `PHASE_10_5_SIGNOFF.md` § 2.
 - **File:line:** `elastos/crates/elastos-vz/src/ffi/console_forwarder.rs:94`
 - **Observed:** `reader.read_line(&mut buf)` on the kernel-printk pipe.
   Same shape as M1 but the producer is the guest kernel via Vz, not the
@@ -199,6 +220,7 @@ section 3 (unbounded reads, JSON-depth stack overflow).
   `console_forwarder.rs` cover the happy path.
 
 #### M3 — JSON nesting-depth resilience needs verification
+- **Status: VERIFIED (no code change) in Phase 10.5 — commit [`4c83a23`](https://github.com/Elacity/elastos-runtime/commit/4c83a23).** Verifier: `cargo test -p elastos-server --lib carrier_bridge::tests::parse_carrier_line_rejects_excessively_nested_json -- --nocapture`. `serde_json` 1.0.149's default 128-deep recursion limit holds for the actual call path (200-deep array returns `Err(InvalidJson)`, not stack overflow); 60-second fuzz burst on augmented corpus (491,712 iterations) clean. See `PHASE_10_5_SIGNOFF.md` § 2 + § 7.
 - **File:line:** `elastos/crates/elastos-server/src/carrier_bridge.rs:96`
   (in `parse_carrier_line`) and `:479` (in `handle_request`).
 - **Observed:** `serde_json` 1.0.149 (the workspace version) documents
@@ -225,6 +247,7 @@ section 3 (unbounded reads, JSON-depth stack overflow).
   the limit explicitly pinned; one new fuzz seed.
 
 #### M4 — No upper bound on `mem_size_mib` or `vcpu_count`
+- **Status: FIXED in Phase 10.5 — commit [`45a1ec2`](https://github.com/Elacity/elastos-runtime/commit/45a1ec2).** Verifier: `cargo test -p elastos-vz --lib config::tests::from_manifest_with_limits_rejects_excessive_memory -- --nocapture` (and `_rejects_excessive_vcpus`, `_rejects_u32_max_memory`). New `VmConfigLimits` type (default 64 GiB / 32 vCPUs), `ConfigError::ResourceLimitExceeded` typed error, `VmConfig::from_manifest_with_limits(...)` fallible builder. Production launch paths wired. See `PHASE_10_5_SIGNOFF.md` § 2.
 - **File:line:** `elastos/crates/elastos-vz/src/config.rs:386-387`
   (`from_manifest`).
 - **Observed:** `manifest.resources.memory_mb` is a `u32` and used

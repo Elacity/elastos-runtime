@@ -17,13 +17,21 @@ supervisor, capsule manifests, gateway, Carrier bridge, and identity stack
 validated live on Apple Silicon** — a Linux kernel boots inside Apple's
 hypervisor on a Mac, holds ~400 MB, and serves the same Home shell that
 Linux users see. **It is not yet ready for public release**: Phase 10
-(Mac-substrate security hardening) is now in progress. Day 1 (CVE audit)
-just completed and confirmed that **zero vulnerabilities were introduced by
-this branch** — all 34 findings are pre-existing in `main` and have been
-handed off to the broader runtime team via `RUNTIME_CVE_HANDOFF.md`. This
-branch's Phase 10 calendar is ~14 working days, focused only on
-Mac-substrate-specific work (threat model, Carrier-bridge fuzz, demo bugs,
-external code review, release CI lane).
+(Mac-substrate security hardening) is **complete** — see
+`PHASE_10_SIGNOFF.md`. The CVE audit confirmed that **zero
+vulnerabilities were introduced by this branch** — all 34 findings are
+pre-existing in `main` and have been handed off to the broader runtime
+team via `RUNTIME_CVE_HANDOFF.md`. Phase 10 also produced a Mac threat
+model, a cargo-fuzz harness for the Carrier-bridge framing parser
+(2.4M iterations clean), SIGINT/SIGTERM graceful shutdown, a release
+CI lane, and an internal pre-review pass that surfaced four
+medium-severity findings (M1–M4) in the new code. **Phase 10.5
+(2026-05-26) closed all four** — see `PHASE_10_5_SIGNOFF.md`. The
+substrate now has no known unbounded-resource hazards from its own
+code; what remains is one Phase 11 deferral (M5 typed-dispatch fuzz),
+the parallel `chore/runtime-cve-hygiene` branch off `main` for the
+inherited workspace CVEs, and (recommended for a public ship) an
+actual external code review.
 
 ## What this document is — and is not
 
