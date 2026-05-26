@@ -612,7 +612,11 @@ mod tests {
         // both [present] AND that the validate-FAIL message is rendered,
         // which is the doctor surface that catches a corrupted artifact
         // staged at the right path.
-        std::fs::write(data_dir.join("bin/vmlinux"), b"placeholder-not-a-real-kernel").unwrap();
+        std::fs::write(
+            data_dir.join("bin/vmlinux"),
+            b"placeholder-not-a-real-kernel",
+        )
+        .unwrap();
 
         let manifest = fixture_manifest();
         let out = report(data_dir, &manifest, true);

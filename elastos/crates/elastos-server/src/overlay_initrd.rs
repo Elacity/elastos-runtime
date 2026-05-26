@@ -332,7 +332,11 @@ mod tests {
     #[test]
     fn cpio_starts_with_magic() {
         let bytes = build_overlay_init_cpio();
-        assert_eq!(&bytes[..6], CPIO_NEWC_MAGIC, "first entry must be newc cpio");
+        assert_eq!(
+            &bytes[..6],
+            CPIO_NEWC_MAGIC,
+            "first entry must be newc cpio"
+        );
     }
 
     #[test]
@@ -413,10 +417,7 @@ mod tests {
         // the assertion above on magic/filename/trailer is still
         // a strong invariant — but on a dev box `cpio -t -F` is the
         // gold-standard parser, so use it when available.
-        let cpio = match std::process::Command::new("cpio")
-            .arg("--version")
-            .output()
-        {
+        let cpio = match std::process::Command::new("cpio").arg("--version").output() {
             Ok(o) if o.status.success() => o,
             _ => return, // no cpio on host — skip rather than fail
         };
@@ -472,7 +473,10 @@ mod tests {
         let first = write_combined_initrd(&source, &dest).unwrap();
         let second = write_combined_initrd(&source, &dest).unwrap();
         assert!(first, "first call writes");
-        assert!(!second, "second call must short-circuit when content matches");
+        assert!(
+            !second,
+            "second call must short-circuit when content matches"
+        );
     }
 
     #[test]

@@ -81,9 +81,7 @@ pub enum CarrierFrameError {
 ///   allocating proportional to input size.
 /// - The function is total: every byte slice produces either `Ok(_)`
 ///   or `Err(_)`.
-pub fn parse_carrier_line(
-    bytes: &[u8],
-) -> Result<Option<serde_json::Value>, CarrierFrameError> {
+pub fn parse_carrier_line(bytes: &[u8]) -> Result<Option<serde_json::Value>, CarrierFrameError> {
     if bytes.len() > CARRIER_MAX_LINE_BYTES {
         return Err(CarrierFrameError::LineTooLarge { len: bytes.len() });
     }
@@ -1375,12 +1373,8 @@ mod tests {
         let result = parse_carrier_line(payload.as_bytes());
         match result {
             Err(CarrierFrameError::InvalidJson(_)) => { /* expected */ }
-            Err(other) => panic!(
-                "expected InvalidJson rejection, got: {other:?}"
-            ),
-            Ok(value) => panic!(
-                "expected InvalidJson rejection, got Ok: {value:?}"
-            ),
+            Err(other) => panic!("expected InvalidJson rejection, got: {other:?}"),
+            Ok(value) => panic!("expected InvalidJson rejection, got Ok: {value:?}"),
         }
     }
 
@@ -1401,9 +1395,7 @@ mod tests {
         let result = parse_carrier_line(payload.as_bytes());
         match result {
             Ok(Some(serde_json::Value::Array(_))) => { /* expected */ }
-            other => panic!(
-                "expected Ok(Some(Array(...))) for 50-deep input, got: {other:?}"
-            ),
+            other => panic!("expected Ok(Some(Array(...))) for 50-deep input, got: {other:?}"),
         }
     }
 
@@ -1578,7 +1570,10 @@ mod tests {
         let n = read_line_byte_budgeted(&mut reader, &mut buf, max)
             .await
             .expect("read should succeed");
-        assert_eq!(n, max, "must return exactly max_bytes when no newline found");
+        assert_eq!(
+            n, max,
+            "must return exactly max_bytes when no newline found"
+        );
         assert_eq!(buf.len(), max, "buf must be capped at max_bytes");
     }
 

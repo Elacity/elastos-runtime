@@ -265,10 +265,7 @@ async fn run_wasm_via_operator_runtime(
 /// uses. Bridging is intentionally not configured: the WASM
 /// provider's default (no spawner -> `use_bridge = false`,
 /// inherited stdio) is correct for standalone.
-async fn run_wasm_standalone(
-    capsule_dir: &Path,
-    capsule_args: Vec<String>,
-) -> anyhow::Result<()> {
+async fn run_wasm_standalone(capsule_dir: &Path, capsule_args: Vec<String>) -> anyhow::Result<()> {
     let storage_dir = crate::default_data_dir().join("storage");
     let runtime = crate::create_runtime(&storage_dir).await?;
 

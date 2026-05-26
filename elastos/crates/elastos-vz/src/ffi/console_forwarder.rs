@@ -355,8 +355,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn forwarder_caps_oversized_kernel_line_and_resyncs() {
         let (read, mut write) = pipe_pair();
-        let forwarder =
-            spawn_console_forwarder(read, "phase10.5-m2-oversized".to_string());
+        let forwarder = spawn_console_forwarder(read, "phase10.5-m2-oversized".to_string());
 
         // Spawn the writer on a blocking thread so the pipe's
         // kernel buffer (typically 64 KiB on macOS) cannot
@@ -365,9 +364,7 @@ mod tests {
         // progress in lock-step with the reader.
         std::thread::spawn(move || {
             let oversized = vec![b'A'; 2 * KERNEL_CONSOLE_MAX_LINE_BYTES];
-            write
-                .write_all(&oversized)
-                .expect("write oversized burst");
+            write.write_all(&oversized).expect("write oversized burst");
             // Terminating newline so the forwarder's drain can
             // resync without waiting for the rest of the
             // (never-coming) attacker payload.
@@ -398,12 +395,9 @@ mod tests {
     fn read_line_byte_budgeted_sync_returns_full_line_under_cap() {
         let mut reader = BufReader::new(&b"hello\nworld\n"[..]);
         let mut buf = Vec::new();
-        let n = read_line_byte_budgeted_sync(
-            &mut reader,
-            &mut buf,
-            KERNEL_CONSOLE_MAX_LINE_BYTES + 1,
-        )
-        .expect("read should succeed");
+        let n =
+            read_line_byte_budgeted_sync(&mut reader, &mut buf, KERNEL_CONSOLE_MAX_LINE_BYTES + 1)
+                .expect("read should succeed");
         assert_eq!(n, 6);
         assert_eq!(&buf, b"hello\n");
     }
@@ -417,9 +411,12 @@ mod tests {
         let mut reader = BufReader::new(&payload[..]);
         let mut buf = Vec::new();
         let max = 1024usize;
-        let n = read_line_byte_budgeted_sync(&mut reader, &mut buf, max)
-            .expect("read should succeed");
-        assert_eq!(n, max, "must return exactly max_bytes when no newline found");
+        let n =
+            read_line_byte_budgeted_sync(&mut reader, &mut buf, max).expect("read should succeed");
+        assert_eq!(
+            n, max,
+            "must return exactly max_bytes when no newline found"
+        );
         assert_eq!(buf.len(), max, "buf must be capped at max_bytes");
     }
 
@@ -430,8 +427,8 @@ mod tests {
     fn read_line_byte_budgeted_sync_returns_zero_on_immediate_eof() {
         let mut reader = BufReader::new(&b""[..]);
         let mut buf = Vec::new();
-        let n = read_line_byte_budgeted_sync(&mut reader, &mut buf, 1024)
-            .expect("read should succeed");
+        let n =
+            read_line_byte_budgeted_sync(&mut reader, &mut buf, 1024).expect("read should succeed");
         assert_eq!(n, 0);
         assert!(buf.is_empty());
     }

@@ -1759,9 +1759,9 @@ fn write_decompressed_or_verbatim(
             use std::io::Read;
             let mut decoder = GzDecoder::new(data);
             let mut decoded = Vec::with_capacity(data.len() * 2);
-            decoder.read_to_end(&mut decoded).map_err(|e| {
-                anyhow::anyhow!("gzip decompression of {} failed: {}", name, e)
-            })?;
+            decoder
+                .read_to_end(&mut decoded)
+                .map_err(|e| anyhow::anyhow!("gzip decompression of {} failed: {}", name, e))?;
             atomic_write_file(dest, &decoded)
         }
         other => anyhow::bail!(
@@ -1960,7 +1960,9 @@ mod tests {
         let body = fs::read_to_string(&manifest_path).unwrap();
         let parsed: elastos_common::CapsuleManifest = serde_json::from_str(&body)
             .expect("auto-init capsule.json must parse as CapsuleManifest");
-        parsed.validate().expect("auto-init capsule.json must validate");
+        parsed
+            .validate()
+            .expect("auto-init capsule.json must validate");
         assert_eq!(parsed.name, "ubuntu-base");
         assert_eq!(parsed.entrypoint, "rootfs.ext4");
         assert_eq!(parsed.capsule_type, elastos_common::CapsuleType::MicroVM);

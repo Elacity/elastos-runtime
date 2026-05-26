@@ -933,8 +933,8 @@ impl Supervisor {
             // pristine `bin/initrd` Canonical published —
             // identical behaviour to Days 2-5.
             let bin_dir = data_dir.join("bin");
-            let installed_initrd = crate::overlay_initrd::resolve_initrd_path(&bin_dir)
-                .or_else(|| {
+            let installed_initrd =
+                crate::overlay_initrd::resolve_initrd_path(&bin_dir).or_else(|| {
                     let registry_path = Self::resolve_external_install_path(
                         &registry,
                         &data_dir,

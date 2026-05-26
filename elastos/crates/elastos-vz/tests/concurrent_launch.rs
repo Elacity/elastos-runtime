@@ -459,11 +459,7 @@ fn observed_boot_markers(buf: &LineBuffer) -> Option<&'static str> {
     // accept any one of them as proof of "kernel reached
     // initialisation"; the union covers cases where one or another
     // is filtered by a `quiet` boot arg or a custom printk level.
-    const MARKERS: &[&str] = &[
-        "Linux version",
-        "Booting Linux",
-        "Run /init",
-    ];
+    const MARKERS: &[&str] = &["Linux version", "Booting Linux", "Run /init"];
     let lines = buf.lock().ok()?;
     for marker in MARKERS {
         if lines.iter().any(|l| l.contains(marker)) {

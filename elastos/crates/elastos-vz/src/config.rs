@@ -907,7 +907,13 @@ mod tests {
         )
         .expect_err("u32::MAX MiB ask must be rejected");
         assert!(
-            matches!(err, ConfigError::ResourceLimitExceeded { field: "resources.memory_mb", .. }),
+            matches!(
+                err,
+                ConfigError::ResourceLimitExceeded {
+                    field: "resources.memory_mb",
+                    ..
+                }
+            ),
             "expected memory-field rejection, got: {err:?}"
         );
     }
