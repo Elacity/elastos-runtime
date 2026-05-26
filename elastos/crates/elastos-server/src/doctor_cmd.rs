@@ -269,15 +269,25 @@ fn print_artifact_row(
             // Synthesize a probe `VzConfig` aimed at this exact kernel
             // path so we can leverage the substrate's own validator
             // without bringing the supervisor's launch path online.
-            let probe = elastos_vz::VzConfig::new().with_kernel_path(row.path);
-            match probe.validate() {
-                Ok(()) => writeln!(
-                    out,
-                    "              [validate] passes guest-kernel sanity check"
-                )?,
-                Err(e) => {
-                    writeln!(out, "              [validate FAIL] {e}")?;
-                    writeln!(out, "              → run: {}", row.remediation)?;
+            //
+            // Phase 10.7 — Mac-only: `elastos_vz::VzConfig::with_kernel_path`
+            // and `validate()` are Mac-only types. On Linux the doctor's
+            // Mac-only `print_report` stub never invokes this row, so the
+            // body would type-check as dead code but still references
+            // `elastos_vz::*` at the type system level. cfg-gate the whole
+            // probe block to keep the Linux build clean.
+            #[cfg(target_os = "macos")]
+            {
+                let probe = elastos_vz::VzConfig::new().with_kernel_path(row.path);
+                match probe.validate() {
+                    Ok(()) => writeln!(
+                        out,
+                        "              [validate] passes guest-kernel sanity check"
+                    )?,
+                    Err(e) => {
+                        writeln!(out, "              [validate FAIL] {e}")?;
+                        writeln!(out, "              → run: {}", row.remediation)?;
+                    }
                 }
             }
         }

@@ -64,6 +64,17 @@ mod vz_stubs {
         pub fn new() -> Self {
             Self::default()
         }
+
+        // Phase 10.7 — builder method to match the Mac VzConfig surface
+        // exercised by the Linux-only test
+        // `supervisor_new_is_noop_on_linux_even_with_prune_flag_set`,
+        // which constructs `VzConfig::new().with_prune_orphans_on_startup(true)`
+        // to assert that even with the flag set, the Linux launch path
+        // never touches on-disk artifacts.
+        pub fn with_prune_orphans_on_startup(mut self, value: bool) -> Self {
+            self.prune_orphans_on_startup = value;
+            self
+        }
     }
 }
 
@@ -4325,7 +4336,12 @@ mod tests {
                 capsules: std::collections::HashMap::new(),
                 profiles: std::collections::HashMap::new(),
             },
-            elastos_vz::VzConfig::new().with_prune_orphans_on_startup(true),
+            // Phase 10.7 — use the file-local `VzConfig` alias rather
+            // than the `elastos_vz::` namespace path. On Linux that alias
+            // resolves to `vz_stubs::VzConfig` (defined in this file at
+            // ~line 54); on Mac it resolves to `elastos_vz::VzConfig`.
+            // Either way, `with_prune_orphans_on_startup` is the builder.
+            VzConfig::new().with_prune_orphans_on_startup(true),
         );
 
         assert!(
