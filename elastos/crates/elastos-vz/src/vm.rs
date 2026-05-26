@@ -25,7 +25,15 @@ use std::path::PathBuf;
 use elastos_common::{CapsuleManifest, CapsuleStatus, ElastosError, Result};
 
 use crate::config::VmConfig;
-use crate::error::{VzError, VzExitReason};
+// Phase 10.7 — `VzError` is consumed only inside `#[cfg(target_os = "macos")]`
+// blocks in this file (struct fields, accessors, test-only setters, error
+// classification in `stop`). On Linux the import would sit unused and CI's
+// `-D warnings` flag turns the unused-import lint into a hard error.
+// `VzExitReason` is referenced in the public `last_exit_reason()` signature
+// on both platforms and stays unconditional.
+#[cfg(target_os = "macos")]
+use crate::error::VzError;
+use crate::error::VzExitReason;
 
 /// State of a single capsule's VM as seen by the Vz provider.
 pub struct RunningVm {
