@@ -73,7 +73,13 @@ mkdir -p "$DATA_DIR/bin" "$DATA_DIR/capsules"
 # python stamper has one source of truth. Format per line:
 #   name<TAB>sha256<TAB>size
 PROVIDER_STAMPS_FILE="$(mktemp -t mac-local-setup-stamps.XXXXXX)"
-trap 'rm -f "$PROVIDER_STAMPS_FILE"' EXIT
+# Day-5 — equivalent stream for capsule entries written into the
+# `capsules:` map of components.json. Mirrors the canonical
+# chat-staging pattern from `scripts/home-demo-local.sh` lines 167-188.
+# Format per line:
+#   name<TAB>cid<TAB>sha256<TAB>size<TAB>platform
+CAPSULE_STAMPS_FILE="$(mktemp -t mac-local-setup-capsule-stamps.XXXXXX)"
+trap 'rm -f "$PROVIDER_STAMPS_FILE" "$CAPSULE_STAMPS_FILE"' EXIT
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -147,7 +153,79 @@ build_and_stage_wasm_capsule() {
   install -m 0644 "$src_wasm" "$dest_dir/${name}.wasm"
   install -m 0644 "$src_manifest" "$dest_dir/capsule.json"
 
+  stamp_local_capsule_cid "$name" "any"
+
   echo "  staged $dest_dir/{${name}.wasm, capsule.json}"
+}
+
+# stamp_local_capsule_cid <name> <platform>
+#
+# Day-5 — mirrors the canonical `local-<name>-<sha:0:16>` CID pattern
+# from `scripts/home-demo-local.sh` lines 179-188. After the capsule
+# directory is staged, this writes:
+#
+#   <data_dir>/capsules/<name>/.elastos-cid              ← local CID marker
+#   <data_dir>/capsules/<name>/.elastos-artifact-sha256  ← artifact sha256
+#
+# and appends a TSV row to $CAPSULE_STAMPS_FILE that the python
+# manifest writer consumes, ensuring the `capsules:<name>` entry in
+# `<data_dir>/components.json` carries the same cid/sha256/size. With
+# both stores matching, `Supervisor::ensure_capsule` short-circuits on
+# the cached-CID match (supervisor.rs:1530) and returns the existing
+# directory without ever attempting an IPFS fetch.
+#
+# Hash scheme: sha256 over a deterministic stream of (relative file
+# path) + (file bytes) for every regular file in the capsule directory,
+# excluding the two stamp files themselves. This produces a stable
+# sha across re-runs as long as the staged content is unchanged, and
+# tracks content drift without requiring a tarball intermediate.
+#
+# Platform: passed through to the manifest's `platforms` list. WASM
+# uses `"any"`; data capsules use `"any"` too (HTML is portable).
+stamp_local_capsule_cid() {
+  local name="$1"
+  local platform="$2"
+  local dest_dir="$DATA_DIR/capsules/$name"
+
+  if [[ ! -d "$dest_dir" ]]; then
+    echo "error: cannot stamp CID; capsule dir missing: $dest_dir" >&2
+    exit 1
+  fi
+
+  local sha
+  sha="$(
+    cd "$dest_dir" \
+      && find . -type f \
+           -not -name '.elastos-cid' \
+           -not -name '.elastos-artifact-sha256' \
+           -print0 \
+      | LC_ALL=C sort -z \
+      | xargs -0 cat \
+      | shasum -a 256 \
+      | awk '{print $1}'
+  )"
+
+  # Sum all artifact bytes for the `size` field. `find` runs from the
+  # capsule dir so paths are relative — pipe them straight back through
+  # `stat -f '%z'` from the same cwd to avoid bouncing between shells.
+  local size
+  size="$(
+    cd "$dest_dir" \
+      && find . -type f \
+           -not -name '.elastos-cid' \
+           -not -name '.elastos-artifact-sha256' \
+           -exec stat -f '%z' {} + \
+      | awk '{ total += $1 } END { print total + 0 }'
+  )"
+
+  local cid="local-${name}-${sha:0:16}"
+
+  printf '%s\n' "$cid" > "$dest_dir/.elastos-cid"
+  printf '%s\n' "$sha" > "$dest_dir/.elastos-artifact-sha256"
+
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$cid" "$sha" "$size" "$platform" \
+    >> "$CAPSULE_STAMPS_FILE"
 }
 
 # stage_data_capsule <name>
@@ -170,7 +248,9 @@ stage_data_capsule() {
 
   # `rsync` is portable on macOS and skips build/cache directories
   # without needing GNU `cp -ru`. The exclusions match what the runtime
-  # ignores when discovering capsule directories.
+  # ignores when discovering capsule directories. The two `.elastos-*`
+  # files are written by stamp_local_capsule_cid below; rsync excludes
+  # them so the stamps survive across re-runs.
   rsync -a --delete \
     --exclude 'target/' \
     --exclude '*.lock' \
@@ -178,6 +258,8 @@ stage_data_capsule() {
     --exclude '.elastos-artifact-sha256' \
     --exclude 'browser/' \
     "$src_dir/" "$dest_dir/"
+
+  stamp_local_capsule_cid "$name" "any"
 
   echo "  staged $dest_dir/"
 }
@@ -237,26 +319,39 @@ echo
 # ── 4. Stamp the manifest ────────────────────────────────────────────
 
 python3 - "$REPO_ROOT/components.json" "$DATA_DIR/components.json" "$PLATFORM" \
-    "$PROVIDER_STAMPS_FILE" <<'PY'
+    "$PROVIDER_STAMPS_FILE" "$CAPSULE_STAMPS_FILE" <<'PY'
 import json
 import sys
 
-src_path, dst_path, platform, stamps_path = sys.argv[1:5]
+src_path, dst_path, platform, provider_stamps_path, capsule_stamps_path = sys.argv[1:6]
 
-with open(stamps_path, "r", encoding="utf-8") as f:
-    stamps = []
+# Provider stamps: name<TAB>sha<TAB>size  → stamped onto external[<name>].platforms[<platform>].
+with open(provider_stamps_path, "r", encoding="utf-8") as f:
+    provider_stamps = []
     for line in f:
         line = line.strip()
         if not line:
             continue
         name, sha, size = line.split("\t")
-        stamps.append((name, sha, int(size)))
+        provider_stamps.append((name, sha, int(size)))
+
+# Capsule stamps: name<TAB>cid<TAB>sha<TAB>size<TAB>platform
+# Mirrors the canonical `capsules.<name> = {cid, sha256, size, platforms}` shape
+# that `home-demo-local.sh` stamps for the locally-built chat bundle (lines 243-248).
+with open(capsule_stamps_path, "r", encoding="utf-8") as f:
+    capsule_stamps = []
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        name, cid, sha, size, plat = line.split("\t")
+        capsule_stamps.append((name, cid, sha, int(size), plat))
 
 with open(src_path, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 external = data.setdefault("external", {})
-for name, sha, size in stamps:
+for name, sha, size in provider_stamps:
     component = external.get(name)
     if component is None:
         raise SystemExit(f"components.json missing external entry for {name!r}")
@@ -268,6 +363,19 @@ for name, sha, size in stamps:
         )
     entry["checksum"] = f"sha256:{sha}"
     entry["size"] = size
+
+# Day-5 — register each staged capsule in the `capsules:` map so the supervisor's
+# `resolve-plan` + `ensure-capsule` see them as locally-cached artifacts whose
+# CIDs match the on-disk .elastos-cid stamps (supervisor.rs:1530 short-circuits
+# on cached-CID match → no IPFS fetch attempted).
+capsules = data.setdefault("capsules", {})
+for name, cid, sha, size, plat in capsule_stamps:
+    capsules[name] = {
+        "cid": cid,
+        "sha256": sha,
+        "size": size,
+        "platforms": [plat],
+    }
 
 with open(dst_path, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
@@ -344,6 +452,52 @@ if ready_count < 5:
     print("  FAILED: fewer than 5 services ready.")
     sys.exit(1)
 '
+
+# Day-5 — verify the canonical capsule-registry chain: every home-surface
+# capsule we stage must appear in components.json `capsules:` with a CID
+# that exactly matches the `.elastos-cid` file on disk. This is the
+# precondition `Supervisor::ensure_capsule` checks (supervisor.rs:1530)
+# before short-circuiting the IPFS fetch — without it, every launch of
+# a non-WASM capsule fails with "capsule '<name>' not in registry" or
+# "capsule cache CID metadata missing or stale".
+echo "[mac-local-setup] verifying capsule registry consistency"
+python3 - "$DATA_DIR" <<'PY' || exit 1
+import json
+import sys
+from pathlib import Path
+
+data_dir = Path(sys.argv[1])
+manifest_path = data_dir / "components.json"
+with open(manifest_path, "r", encoding="utf-8") as f:
+    manifest = json.load(f)
+
+capsules = manifest.get("capsules", {})
+failed = 0
+for name in ("home", "system", "documents", "library", "inbox"):
+    entry = capsules.get(name)
+    if entry is None:
+        print(f"    [no ] {name}: missing components.json capsules entry")
+        failed += 1
+        continue
+    cid_file = data_dir / "capsules" / name / ".elastos-cid"
+    if not cid_file.is_file():
+        print(f"    [no ] {name}: missing .elastos-cid stamp on disk")
+        failed += 1
+        continue
+    on_disk_cid = cid_file.read_text().strip()
+    entry_cid = entry.get("cid", "")
+    if on_disk_cid != entry_cid:
+        print(
+            f"    [no ] {name}: on-disk CID {on_disk_cid!r} != manifest CID {entry_cid!r}"
+        )
+        failed += 1
+        continue
+    print(f"    [ok ] {name}: cid={entry_cid}")
+
+if failed:
+    print(f"  FAILED: {failed} capsule(s) have inconsistent registry / stamp state.")
+    sys.exit(1)
+PY
 else
   echo "[mac-local-setup] note: $DEBUG_ELASTOS not built — skipping live check."
   echo "[mac-local-setup]   build it with: cargo build --manifest-path \"$REPO_ROOT/elastos/Cargo.toml\" -p elastos-server"

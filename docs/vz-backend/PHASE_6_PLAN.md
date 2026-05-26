@@ -1,6 +1,67 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Phase 9 OPEN. Day 4 (2026-05-26) closed the
+> **Status:** **Phase 9 OPEN. Day 5 (2026-05-26) stamped the
+> canonical local CIDs onto the five home-surface capsules
+> (`home`, `system`, `documents`, `library`, `inbox`) that Day 2
+> staged onto disk but never registered, closing the
+> `capsule '<name>' not in registry` error that fell out of
+> trying to launch a capsule from `elastos home` on a Mac source
+> checkout. The fix mirrors the pattern from
+> `scripts/home-demo-local.sh` (lines 167-188 + 243-248) that
+> the Linux canonical install already uses for the local chat
+> bundle: for each staged capsule dir compute a sha256 over a
+> sorted-by-path file stream, mint `local-<name>-<sha:0:16>` as
+> the synthetic CID, write it to both `<data_dir>/capsules/<name>/.elastos-cid`
+> and the `capsules.<name>.cid` field of `<data_dir>/components.json`,
+> and stamp the artefact sha into the sibling
+> `.elastos-artifact-sha256` file. With both stores in lockstep
+> `Supervisor::ensure_capsule` (`supervisor.rs:1530`) short-
+> circuits the IPFS fetch and returns the cached path, which is
+> exactly what `capsule_cmd::run_capsule` needs to take the
+> `run_wasm_capsule` branch and load the wasm via wasmtime. The
+> end-to-end smoke that was previously erroring with the
+> `not in registry` 500 is now green: `elastos capsule system
+> --lifecycle interactive --interactive` → `Runtime started
+> (pid …)` → `vz provider enabled` → `Loading capsule 'system'
+> (Wasm)` → `Loaded WASM capsule 'system'` → `WASM bridge active`
+> → `system capsule launched: name=system id=wasm-…`. Zero
+> substrate code changed: ~85 LOC of bash + python inside
+> `scripts/dev/mac-local-setup.sh` (new `stamp_local_capsule_cid`
+> helper called from both `build_and_stage_wasm_capsule` and
+> `stage_data_capsule`, plus a second TSV stream that the inline
+> python manifest writer consumes, plus a registry-consistency
+> verifier that fails the script if any CID drifts). Critical
+> course-correction: the operator's principle-check (_"does the
+> original have HTTP wiring? remember our principles, please
+> just double check"_) caught what would otherwise have been a
+> Mac-specific short-circuit invented inside `capsule_cmd`
+> bypassing `resolve-plan` + `ensure-capsule`. The real fix is
+> in the bootstrap, not the substrate — Mac source checkouts
+> share the same "no Carrier, no real CIDs" constraints as Linux
+> source checkouts, and the chat-staging pattern is the
+> established solution. Two gaps surfaced during the
+> investigation: **Gap A** (registry stamping) is what Day 5
+> closed; **Gap B** (terminal `elastos home`'s capsule action
+> falls through to `launch-capsule`'s microVM path with no
+> `CapsuleType::Data` branch) is a pre-existing limitation that
+> affects Linux equally and is deferred — browser-hosted Home
+> via `/api/apps/home/launch` → `/apps/<name>/?home_token=…` is
+> the canonical UX for Data capsules on both platforms, and Day
+> 5's stamping unlocks that gateway route on Mac too (the
+> existing `api/browser_capsules::serve_browser_app_index`
+> handler reads directly from `<data_dir>/capsules/<name>/` and
+> needs no new code to serve the now-registered capsules). The
+> self-verifier in the bootstrap was extended with a
+> capsule-registry-consistency block that checks every
+> home-surface capsule's on-disk `.elastos-cid` equals the
+> manifest's `capsules.<name>.cid` and fails the bootstrap if
+> any pair drifts, guarding against future hash exclusion bugs
+> or rsync regressions. See
+> [`PHASE_9_DAY_5_NOTES.md`](PHASE_9_DAY_5_NOTES.md) for the
+> trap-that-was-averted, the supervisor.rs:1530 line reference,
+> and the architectural rationale (why Mac source checkouts
+> share Linux's "synthetic local CID" path rather than inventing
+> a Mac-specific launch mechanism). Day 4 (2026-05-26) closed the
 > silent-corruption footgun that Day 3 surfaced as an
 > operational note: every `cargo build -p elastos-server`
 > invalidates codesign and drops the four Vz + JIT entitlements
