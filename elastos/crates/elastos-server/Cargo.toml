@@ -22,7 +22,7 @@ elastos-crosvm = { path = "../elastos-crosvm" }
 # HTTP server
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # TLS (ring crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -32,8 +32,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 # CLI
 clap = { version = "4.0", features = ["derive"] }
-crossterm = "0.28"
-ratatui = "0.29"
+# NOTE: `crossterm` and `ratatui` were removed on 2026-05-27 (Step 2 Day 10) —
+# they were declared but never imported anywhere in source. Removing them
+# closes RUSTSEC-2026-0002 (lru 0.12 unsoundness) and RUSTSEC-2024-0436
+# (paste 1.0 unmaintained); both were dragged in only via ratatui's tree.
+# If a TUI is ever reintroduced, re-add with current maintained versions.
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }

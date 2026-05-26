@@ -7,9 +7,13 @@ description = "TLS certificate management for ElastOS"
 
 [dependencies]
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.0"
+# PEM parsing is via the re-exported `rustls_pki_types::pem::PemObject`
+# (in-tree under `tokio_rustls::rustls::pki_types::pem`). The previously-direct
+# `rustls-pemfile = "2.0"` dep was removed on 2026-05-27 (Step 2 Day 10) to
+# close RUSTSEC-2025-0134. axum-server 0.8 also dropped it, so the warning is
+# fully eliminated from our dependency tree.
 time = "0.3"
 tokio = { version = "1.0", features = ["net", "io-util", "rt", "macros", "time"] }
 tracing = "0.1"
