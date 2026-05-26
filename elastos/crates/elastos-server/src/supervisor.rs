@@ -24,6 +24,42 @@ use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::{SessionRegistry, SessionType};
 
+// Phase 10.6 — cross-OS aliases for Vz-backend types referenced in
+// public type signatures and struct fields. On macOS they resolve to
+// the real types from the `elastos-vz` crate; on Linux they resolve
+// to zero-data stubs that are never constructed at runtime (every
+// Vz code path is gated behind `#[cfg(target_os = "macos")]`).
+//
+// Without this shim, struct fields like `EnsureCapsuleResponse::vz_error`
+// and `Supervisor::vz_config` would reference `elastos_vz::*` on
+// Linux too, where the crate is not built (it's `target.'cfg(target_os
+// = "macos")'.dependencies` in `Cargo.toml`). That broke the Linux
+// workspace build from 2026-05-22 onward; Phase 10.6 closes the leak.
+#[cfg(target_os = "macos")]
+use elastos_vz::{VzConfig, VzErrorReport};
+#[cfg(not(target_os = "macos"))]
+use vz_stubs::{VzConfig, VzErrorReport};
+
+#[cfg(not(target_os = "macos"))]
+mod vz_stubs {
+    //! Linux-side stubs for Vz-backend types so cross-OS type
+    //! signatures compile. Never constructed at runtime — every
+    //! consumer is gated behind `#[cfg(target_os = "macos")]`.
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+    pub struct VzErrorReport;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct VzConfig;
+
+    impl VzConfig {
+        pub fn new() -> Self {
+            Self
+        }
+    }
+}
+
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.
 const VM_PROVIDER_PORT: u16 = 7000;
@@ -303,7 +339,7 @@ fn vz_last_exit_reason(backend: &CapsuleBackend) -> Option<String> {
 /// for Mac Vz capsules with no cached error, and on every
 /// platform that isn't macOS. Mac Vz capsules with a cached
 /// [`elastos_vz::VzError`] surface the typed report.
-fn vz_last_error_report(backend: &CapsuleBackend) -> Option<elastos_vz::VzErrorReport> {
+fn vz_last_error_report(backend: &CapsuleBackend) -> Option<VzErrorReport> {
     #[cfg(target_os = "macos")]
     {
         match backend {
@@ -329,7 +365,7 @@ fn vz_last_error_report(backend: &CapsuleBackend) -> Option<elastos_vz::VzErrorR
 /// - `NotFound` → `status: "not_found"`.
 #[derive(Debug)]
 enum CapsuleVzErrorOutcome {
-    Found(Option<elastos_vz::VzErrorReport>),
+    Found(Option<VzErrorReport>),
     NotFound,
 }
 
@@ -428,7 +464,7 @@ pub struct SupervisorResponse {
     /// stop-timeout cases. See
     /// `docs/vz-backend/PHASE_4_DAY_8_NOTES.md`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vz_error: Option<elastos_vz::VzErrorReport>,
+    pub vz_error: Option<VzErrorReport>,
 
     /// One-shot orphan-prune report (macOS only). **Phase 5
     /// Day 4.** Populated by the FIRST
@@ -490,7 +526,7 @@ impl SupervisorResponse {
     /// optional [`elastos_vz::VzErrorReport`] — `None` means
     /// "no cached error" (success path, pre-stop, or non-Vz
     /// backend).
-    fn ok_with_vz_error(report: Option<elastos_vz::VzErrorReport>) -> Self {
+    fn ok_with_vz_error(report: Option<VzErrorReport>) -> Self {
         Self {
             vz_error: report,
             ..Self::ok()
@@ -641,7 +677,7 @@ pub struct Supervisor {
     /// `prune_orphans_on_startup: true`). Held independently
     /// from `crosvm_config` because the Linux launch path
     /// must remain byte-identical (it never reads this field).
-    vz_config: elastos_vz::VzConfig,
+    vz_config: VzConfig,
     /// Phase 5 Day 4 — cached one-shot orphan-prune report
     /// surfaced via [`SupervisorResponse::orphans_pruned`] on
     /// the FIRST [`SupervisorRequest::EnsureCapsule`] response
@@ -846,7 +882,7 @@ impl Supervisor {
     }
 
     pub fn new(data_dir: PathBuf, registry: ComponentsManifest) -> Self {
-        Self::new_with_vz_config(data_dir, registry, elastos_vz::VzConfig::new())
+        Self::new_with_vz_config(data_dir, registry, VzConfig::new())
     }
 
     /// Phase 5 Day 4 — construct a `Supervisor` with an
@@ -865,7 +901,7 @@ impl Supervisor {
     pub fn new_with_vz_config(
         data_dir: PathBuf,
         registry: ComponentsManifest,
-        vz_config: elastos_vz::VzConfig,
+        vz_config: VzConfig,
     ) -> Self {
         let capsules_dir = data_dir.join("capsules");
         let crosvm_bin =
@@ -1006,7 +1042,7 @@ impl Supervisor {
     /// Phase 5 Day 4 — read-only accessor on the Vz config the
     /// supervisor was constructed with. Used by tests to assert
     /// the `prune_orphans_on_startup` flag was honoured.
-    pub fn vz_config(&self) -> &elastos_vz::VzConfig {
+    pub fn vz_config(&self) -> &VzConfig {
         &self.vz_config
     }
 
