@@ -1,6 +1,75 @@
 # Phase 6 — Ship: Truthful darwin-arm64 + signed Mac binary + tagged release
 
-> **Status:** **Phase 9 OPEN. Day 5 (2026-05-26) stamped the
+> **Status:** **Phase 9 SIGNED OFF (2026-05-26). All five sign-off
+> smokes green on Mac against the `sash/local-test` branch: (1)
+> `mac-local-setup.sh` exits 0 with 6 / 8 services ready and 5 / 5
+> capsules registered with matching `.elastos-cid` ↔
+> `components.json` stamps; (2) `cargo test -p elastos-server` is
+> 517 passed / 0 failed / 2 ignored (byte-identical to the Day-3
+> baseline — zero regressions); (3) `elastos run capsules/home`
+> launches the WASM standalone, prints the home capsule banner,
+> and exits 0 (Hardened Runtime + JIT entitlements + wasmtime
+> in-process all healthy); (4) `cargo test -p elastos-vz --test
+> concurrent_launch --release` is 3 / 3 (`single_vm_boots_to_userspace`,
+> `concurrent_load_with_real_kernel`,
+> `concurrent_load_rejections_isolate_per_vm`) once the test
+> binary carries the same Vz entitlements as `target/debug/elastos`
+> — Day-6 candidate to extend the bootstrap's auto-resign to test
+> binaries (~10 LOC); (5) `elastos capsule system --lifecycle
+> interactive --interactive` runs the full canonical chain
+> end-to-end on Mac (`Runtime started … vz provider enabled …
+> Loading capsule 'system' (Wasm) … Loaded WASM capsule 'system'
+> … WASM bridge active … system capsule launched`), which proves
+> Layers 1 + 2 + 3 all wire together correctly through the
+> managed-home runtime. The three-layer audit confirms what the
+> trait abstraction was designed for: Layer 1 (VM substrate) took
+> **zero LOC** in Phase 9 — the `ComputeProvider` trait selects
+> `elastos-vz` on Mac and `crosvm`/`qemu` on Linux at startup, and
+> the substrate work from Phases 1-8 holds without modification.
+> Layer 2 (supervisor, capsules, gateway, providers, run_cmd,
+> capsule_cmd, viewer_gateway, browser_capsules, carrier_bridge)
+> also took **zero LOC** — the runtime is the same Rust binary on
+> both platforms. Layer 2½ (the `home_cmd::SystemServiceSpec`
+> dashboard) took **83 LOC in one file** under
+> `#[cfg(target_os = "macos")]` for Day 3's `FULL_SCREEN_APPS_BACKING`
+> constant; pure platform-conditional, no logic change. Layer 3
+> (install / bootstrap) absorbed **502 LOC in one bash script**
+> (`scripts/dev/mac-local-setup.sh`) — the Mac-equivalent of
+> `install.sh + elastos setup --profile demo` that fills the
+> install-pipeline hole left by the absent Mac release channel.
+> Mac developers can now run `mac-local-setup.sh && elastos home`
+> and get the same operator UX a Linux developer gets from
+> `home-demo-local.sh`. Three operator principle-checks shaped
+> the phase outcome: Day 3 caught the `crosvm` Linux-only
+> assumption baked into the dashboard backings list; Day 4
+> caught the silent codesign-strip footgun that every
+> `cargo build` triggers; Day 5 caught the design pull to invent
+> a Mac-specific `capsule_cmd::run_capsule` short-circuit that
+> would have bypassed `resolve-plan` + `ensure-capsule` — the
+> real fix lived in mirroring the chat-staging local-CID pattern
+> from `home-demo-local.sh`, not in the substrate. Each
+> intervention saved net LOC and preserved Linux ↔ Mac parity.
+> Known gaps that are explicitly **not** part of sign-off (and
+> belong to other phases or are pre-existing non-Mac-specific):
+> camofox-browser-Home-on-Mac (gateway routes + launch tokens
+> already wired; only the Mac browser client is missing — future
+> phase), `brew install elastos` / signed `.dmg` (release
+> engineering phase, far future), terminal `elastos home` →
+> Data-capsule launch Gap B (pre-existing Linux limitation
+> affecting both platforms equally — browser-hosted Home is the
+> canonical UX for Data capsules), `Content Exchange` /
+> `Public Edge` services (third-party `kubo` + `cloudflared`
+> dependencies; same gap on a Linux source checkout — flips green
+> with `brew install kubo cloudflared`), and Mac test-binary
+> signing for `cargo test -p elastos-vz` (Day-6 candidate, ~10
+> LOC bootstrap extension; the error message itself prints the
+> one-liner operator recipe so the failure mode is instructive
+> rather than silent). See
+> [`PHASE_9_SIGNOFF.md`](PHASE_9_SIGNOFF.md) for the full sign-off
+> note (three-layer audit, smoke matrix, principle-checks log,
+> honest gap list, closing position). Main untouched —
+> all work on the `sash/local-test` branch. Day 5 (2026-05-26)
+> stamped the
 > canonical local CIDs onto the five home-surface capsules
 > (`home`, `system`, `documents`, `library`, `inbox`) that Day 2
 > staged onto disk but never registered, closing the
