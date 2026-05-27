@@ -20,15 +20,36 @@ were reading the older copy.
 | **Phase 10.5 — pre-review medium-severity findings (M1-M4)** | n/a (didn't exist) | ✅ **CLOSED.** Four medium-severity findings from the Phase 10 internal pre-review (unbounded `BufRead::read_line` × 2, fuzz seeds, manifest-driven memory/vCPU bounds) all fixed with regression tests + operator verifiers. See `PHASE_10_5_SIGNOFF.md`. |
 | **Phase 10.6 — substrate-CI cleanup (paused)** | n/a | ✅ **CLOSED** (via Phase 10.7). Initial session shipped 2 fixes (cargo-fmt drift, 5 cross-OS leaks in `supervisor.rs`) and explicitly paused on documenting the remaining 4 issue classes. See `PHASE_10_6_GAP_REPORT.md` (now headed "CLOSED"). |
 | **Phase 10.7 — gap-report closure** | n/a | ✅ **CLOSED.** All 4 gap-report issues fixed across 7 commits + 1 docs commit (HEAD `2766a5a`). Cascade dead-code + 2 latent clippy lints also cleaned up. See the "Phase 10.7 closure record" section at the bottom of `PHASE_10_6_GAP_REPORT.md`. |
-| **Parallel: inherited-CVE remediation (off `main`, branch `chore/runtime-cve-hygiene`)** | Handoff doc written; not yet started | ✅ **READY FOR REVIEW.** 11 working days delivered 32 of 34 inherited CVEs closed (94%) and 2 of 6 unmaintained-crate warnings closed. Wasmtime 17 → 36 (closed 18 CVEs across 2 minor-bumps with a new FIFO carrier-bridge transport in between). 207-line net-negative Cargo.lock churn. Zero new direct deps, zero `[patch.crates-io]`. **PR #1 open:** <https://github.com/Elacity/elastos-runtime/pull/1>. See `docs/vz-backend/cve-hygiene/RUNTIME_CVE_HYGIENE_SIGNOFF.md` and `MERGE_PLAN.md`. |
+| **Parallel: inherited-CVE remediation (off `main`, branch `chore/runtime-cve-hygiene`)** | Handoff doc written; not yet started | ✅ **READY FOR REVIEW — PR #1 CLEAN.** 11 working days delivered 32 of 34 inherited CVEs closed (94%) and 2 of 6 unmaintained-crate warnings closed. Wasmtime 17 → 36 (closed 18 CVEs across 2 minor-bumps with a new FIFO carrier-bridge transport in between). 207-line net-negative Cargo.lock churn. Zero new direct deps, zero `[patch.crates-io]`. **PR #1 open and CI-CLEAN** (HEAD `d32cc3a`, all 3 checks SUCCESS, mergeStateStatus `CLEAN`): <https://github.com/Elacity/elastos-runtime/pull/1>. Two follow-up commits landed on the PR after opening to fix issues that local `cargo test` missed but PR CI caught (`cargo fmt`, `clippy -D warnings`, `cargo build --release`); details in the [PR-CI fix-up](#pr-1-ci-fixup-2026-05-27) appendix below. See `docs/vz-backend/cve-hygiene/RUNTIME_CVE_HYGIENE_SIGNOFF.md` and `MERGE_PLAN.md`. |
 | **CI status on this branch HEAD `2766a5a`** | Linux CI red since 2026-05-25T11:46Z | ✅ **All 3 lanes green.** Linux-untouched gate ✅ (11s), Linux CI ✅ (2m36s), Mac Vz CI ✅ (15m54s). Run IDs: 26469599513, 26469599353, 26469599624. |
 | **Reviewer readiness** | Engineering reviewable; security audit pending | ✅ **Reviewable.** No PR opened yet for `sash/local-test` (operator's call when to open one). PR #1 (`chore/runtime-cve-hygiene` → `main`) is open and independently reviewable. |
 
 > **One-line update to share with the team:** "Phase 10 security hardening and
 > all four cross-OS substrate-CI regressions are closed. All three CI lanes
 > are green on `sash/local-test`. In parallel, 32 of 34 inherited workspace
-> CVEs are closed on `chore/runtime-cve-hygiene` (PR #1). Both branches are
-> ready for review."
+> CVEs are closed on `chore/runtime-cve-hygiene` and PR #1 is now CI-CLEAN.
+> Both branches are ready for review."
+
+### <a name="pr-1-ci-fixup-2026-05-27"></a>PR #1 CI fix-up (2026-05-27)
+
+PR #1 opened with red CI because the Step 2 verifier matrix used local
+`cargo test` only, and the Linux CI gate runs `cargo fmt --check`,
+`cargo clippy -- -D warnings`, and `cargo build --release` on top. Four
+classes of issue surfaced and were all fixed in-place; HEAD is now
+`d32cc3a` and all 3 checks pass.
+
+| Issue | Cause | Fix | Commit |
+|---|---|---|---|
+| `cargo fmt --check` drift | Day 7 FIFO carrier-bridge work + Day 10 PEM migration left 5 minor formatting drift sites | `cargo fmt --all` | `46e3edd` |
+| 6 `generic-array 0.14.9` deprecation warnings → hard errors under `-D warnings` | Step 2 Day 1 cargo-update cascade pulled in `generic-array 0.14.9`, which marks `GenericArray::as_slice` / `from_slice` deprecated as a forward-looking signal for the eventual 1.x migration | 3 SHA2 sites in `elastos-namespace` use `&digest[..]` (`Deref<Target=[u8; 32]>`, forward-compatible with 1.x). 4 AES-GCM `Nonce::from_slice` sites in `elastos-identity` + `localhost-provider` use `#[allow(deprecated)]` with a comment deferring proper migration to a future `aes_gcm` upstream bump | `46e3edd` |
+| 1 `clippy::type_complexity` in `WasmProvider::build_wasi_context` (4-tuple return) | Day 7 carrier-bridge work returned `Result<(WasiP1Ctx, Option<PathBuf>, Option<BridgePipes>, Option<PathBuf>)>` inline | Factored into a `WasiContextWithBridge` type alias near the `BridgePipes` definition | `46e3edd` |
+| 5 E0308 / E0599 type-mismatch errors in `elastos-server` from two coexisting iroh versions | `distributed-topic-tracker 0.2.8` (released 2026-03-18, pulled in by Step 2 D1) silently bumped its iroh dep from `^0.96` to `^0.97`, clashing with our direct `iroh = "0.96"` pin | Pinned `distributed-topic-tracker = "=0.2.7"` (the last 0.2.x on iroh `^0.96`). `Cargo.toml` comment documents the constraint so a future `cargo update --aggressive` cannot silently re-introduce the conflict; migrating `elastos-server` to iroh 0.97 is tracked as out-of-scope follow-up | `d32cc3a` |
+
+**Sign-off discipline lesson learned:** the original Step 2 verifier matrix
+will be amended to run the exact Linux CI gate (`fmt --check` +
+`clippy -D warnings` + `build --release` + `test`) before any "ready for
+review" claim. The same gap killed Phase 10.6 in its first session; the
+mistake should not happen a third time.
 
 ## Executive summary (30 seconds)
 
