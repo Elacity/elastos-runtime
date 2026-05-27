@@ -439,67 +439,6 @@ fn parse_home_realtime_cursor(cursor: &str) -> BTreeMap<String, String> {
     parsed
 }
 
-#[cfg(test)]
-mod home_realtime_tests {
-    use super::*;
-
-    #[test]
-    fn room_realtime_signature_ignores_session_last_seen_heartbeat() {
-        let mut room = HomeRoomSummary::default();
-        room.active_session_count = 1;
-        room.active_sessions.push(HomeActiveSessionSummary {
-            display_name: "Alice".to_string(),
-            device_label: "Laptop".to_string(),
-            approved_at: 10,
-            last_seen_at: 20,
-        });
-        let before = home_room_realtime_signature(&room);
-
-        room.active_sessions[0].last_seen_at = 30;
-        let after = home_room_realtime_signature(&room);
-
-        assert_eq!(
-            before, after,
-            "presence heartbeat metadata must not emit chat-room.changed events"
-        );
-    }
-
-    #[test]
-    fn scoped_realtime_change_does_not_emit_home_summary_event() {
-        let snapshot = HomeRealtimeSnapshot {
-            principal_id: "person:local:test".to_string(),
-            notification_signature: Vec::new(),
-            wallet_request_signature: Vec::new(),
-            capability_request_count: 0,
-            room_signature: String::new(),
-            browser_sessions: serde_json::json!({
-                "schema": "elastos.browser.session-capacity/v1",
-                "total_sessions": 0
-            }),
-        };
-        let cursor = home_realtime_cursor(&snapshot);
-        let changed = HomeRealtimeSnapshot {
-            wallet_request_signature: vec!["request:pending:sign:999".to_string()],
-            ..snapshot
-        };
-
-        let events = home_realtime_events(&cursor, &changed);
-
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == "wallet.requests.changed" && event.scope == "wallet"),
-            "wallet changes should still emit wallet scoped events"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.kind == "home.summary.changed"),
-            "scoped provider changes must not force full Home summary refreshes"
-        );
-    }
-}
-
 pub(super) async fn home_browser_state_get(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -1419,5 +1358,68 @@ pub(super) async fn home_background_image(
             response
         }
         Err(err) => home_error_response(anyhow::anyhow!(err)),
+    }
+}
+
+#[cfg(test)]
+mod home_realtime_tests {
+    use super::*;
+
+    #[test]
+    fn room_realtime_signature_ignores_session_last_seen_heartbeat() {
+        let mut room = HomeRoomSummary {
+            active_session_count: 1,
+            ..HomeRoomSummary::default()
+        };
+        room.active_sessions.push(HomeActiveSessionSummary {
+            display_name: "Alice".to_string(),
+            device_label: "Laptop".to_string(),
+            approved_at: 10,
+            last_seen_at: 20,
+        });
+        let before = home_room_realtime_signature(&room);
+
+        room.active_sessions[0].last_seen_at = 30;
+        let after = home_room_realtime_signature(&room);
+
+        assert_eq!(
+            before, after,
+            "presence heartbeat metadata must not emit chat-room.changed events"
+        );
+    }
+
+    #[test]
+    fn scoped_realtime_change_does_not_emit_home_summary_event() {
+        let snapshot = HomeRealtimeSnapshot {
+            principal_id: "person:local:test".to_string(),
+            notification_signature: Vec::new(),
+            wallet_request_signature: Vec::new(),
+            capability_request_count: 0,
+            room_signature: String::new(),
+            browser_sessions: serde_json::json!({
+                "schema": "elastos.browser.session-capacity/v1",
+                "total_sessions": 0
+            }),
+        };
+        let cursor = home_realtime_cursor(&snapshot);
+        let changed = HomeRealtimeSnapshot {
+            wallet_request_signature: vec!["request:pending:sign:999".to_string()],
+            ..snapshot
+        };
+
+        let events = home_realtime_events(&cursor, &changed);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "wallet.requests.changed" && event.scope == "wallet"),
+            "wallet changes should still emit wallet scoped events"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "home.summary.changed"),
+            "scoped provider changes must not force full Home summary refreshes"
+        );
     }
 }
