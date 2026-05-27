@@ -310,9 +310,7 @@ pub async fn start_tls_proxy(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::rustls::pki_types::{
-        pem::PemObject, CertificateDer, PrivatePkcs8KeyDer,
-    };
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivatePkcs8KeyDer};
     use tokio_rustls::TlsAcceptor;
 
     // PEM parsing migrated from the unmaintained `rustls-pemfile` crate

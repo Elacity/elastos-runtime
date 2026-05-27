@@ -297,7 +297,12 @@ fn verify_cid_content(cid_str: &str, content: &[u8]) -> CidVerification {
 
     let expected = mh.digest();
     let actual = Sha256::digest(content);
-    if actual.as_slice() == expected {
+    // Phase 10.7+ — `as_slice()` on the `GenericArray<u8, _>` returned by
+    // `Sha256::digest` was deprecated in `generic-array 0.14.9` (pulled in by
+    // the Step 2 Day 1 cargo-update cascade). The fix is `&actual[..]`, which
+    // uses the `Deref<Target = [u8; 32]>` impl on `GenericArray` — works on
+    // both 0.14 and 1.x without an `as_slice` call.
+    if &actual[..] == expected {
         CidVerification::Verified
     } else {
         CidVerification::Mismatch(format!(
@@ -706,7 +711,11 @@ mod tests {
         // Build a CIDv1 raw-codec SHA2-256 from known content
         let content = b"hello elastos";
         let digest = Sha256::digest(content);
-        let mh = multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).expect("wrap multihash");
+        // Phase 10.7+ — `as_slice()` on the `GenericArray<u8, U32>` returned by
+        // `Sha256::digest` was deprecated in `generic-array 0.14.9`. `&digest[..]`
+        // uses the `Deref<Target = [u8; 32]>` impl and is forward-compatible
+        // with the generic-array 1.x API.
+        let mh = multihash::Multihash::<64>::wrap(0x12, &digest[..]).expect("wrap multihash");
         let cid = cid::Cid::new_v1(0x55, mh);
         let cid_str = cid.to_string();
 
@@ -724,7 +733,9 @@ mod tests {
         // Build a valid CID for "hello" but verify against "world"
         let content = b"hello";
         let digest = Sha256::digest(content);
-        let mh = multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).expect("wrap multihash");
+        // See test_verify_cid_raw_sha256 above for the generic-array 0.14.9
+        // deprecation context.
+        let mh = multihash::Multihash::<64>::wrap(0x12, &digest[..]).expect("wrap multihash");
         let cid = cid::Cid::new_v1(0x55, mh);
         let cid_str = cid.to_string();
 

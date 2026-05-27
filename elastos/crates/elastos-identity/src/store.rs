@@ -200,6 +200,13 @@ fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("AES key init: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    // Phase 10.7+ — `Nonce::from_slice` was deprecated in `aes_gcm`'s
+    // `generic-array 0.14.9` bump (pulled in by the Step 2 Day 1 cargo-update
+    // cascade) as a forward-looking signal for the eventual generic-array 1.x
+    // migration. The function is still functionally correct; the proper fix is
+    // an `aes_gcm` upstream bump to a version that exports the 1.x API, which
+    // is tracked separately and not in scope for the CVE-hygiene branch.
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -226,6 +233,8 @@ fn decrypt_data(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("AES key init: {}", e))?;
+    // See encrypt_data above for the aes_gcm/generic-array deprecation context.
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     cipher

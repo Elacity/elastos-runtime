@@ -68,6 +68,18 @@ pub struct BridgePipes {
 /// The callback should spawn a bridge thread/task and return immediately.
 pub type BridgeSpawner = Arc<dyn Fn(BridgePipes) + Send + Sync>;
 
+/// Return type of [`WasmProvider::build_wasi_context`]: the configured WASI
+/// context plus optional host-side handles for the data-dir preopen, the
+/// carrier-bridge pipes, and the carrier-dir path (for cleanup on exit).
+///
+/// Factored out of an inline 4-tuple to satisfy `clippy::type_complexity`.
+type WasiContextWithBridge = (
+    WasiP1Ctx,
+    Option<PathBuf>,
+    Option<BridgePipes>,
+    Option<PathBuf>,
+);
+
 /// Transport used to wire the carrier bridge between the runtime and a WASM
 /// capsule.
 ///
@@ -277,12 +289,7 @@ impl WasmProvider {
         capsule_id: &str,
         args: &[String],
         use_bridge: bool,
-    ) -> Result<(
-        WasiP1Ctx,
-        Option<PathBuf>,
-        Option<BridgePipes>,
-        Option<PathBuf>,
-    )> {
+    ) -> Result<WasiContextWithBridge> {
         let mut builder = WasiCtxBuilder::new();
 
         // Always inherit stdio for user I/O and debug output.
@@ -707,8 +714,8 @@ mod tests {
         // Both FIFOs created with mode 0o600 (owner read/write only).
         for filename in &["request", "response"] {
             let path = dir.join(filename);
-            let meta = std::fs::metadata(&path)
-                .unwrap_or_else(|_| panic!("{} fifo must exist", filename));
+            let meta =
+                std::fs::metadata(&path).unwrap_or_else(|_| panic!("{} fifo must exist", filename));
             assert!(meta.file_type().is_fifo(), "{} must be a fifo", filename);
             assert_eq!(
                 meta.permissions().mode() & 0o777,
@@ -724,8 +731,8 @@ mod tests {
     #[test]
     fn test_cleanup_carrier_dir_is_idempotent() {
         let cid = unique_test_capsule_id("cleanup-idempotent");
-        let (dir, _pipes) = WasmProvider::setup_carrier_fifos(&cid)
-            .expect("setup_carrier_fifos must succeed");
+        let (dir, _pipes) =
+            WasmProvider::setup_carrier_fifos(&cid).expect("setup_carrier_fifos must succeed");
         assert!(dir.exists(), "dir must exist after setup");
 
         WasmProvider::cleanup_carrier_dir(&dir);
@@ -741,8 +748,8 @@ mod tests {
         use std::io::{Read, Write};
 
         let cid = unique_test_capsule_id("round-trip");
-        let (dir, mut pipes) = WasmProvider::setup_carrier_fifos(&cid)
-            .expect("setup_carrier_fifos must succeed");
+        let (dir, mut pipes) =
+            WasmProvider::setup_carrier_fifos(&cid).expect("setup_carrier_fifos must succeed");
 
         // Simulate a capsule by opening the FIFOs by their *host* paths. Inside
         // a real WASM sandbox these would be /_carrier/request and

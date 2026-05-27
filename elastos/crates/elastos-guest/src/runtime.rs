@@ -611,15 +611,11 @@ impl RuntimeClient {
         let reader = std::fs::OpenOptions::new()
             .read(true)
             .open(reader_path)
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("open {reader_path} (read): {e}"))
-            })?;
+            .map_err(|e| io::Error::new(e.kind(), format!("open {reader_path} (read): {e}")))?;
         let writer = std::fs::OpenOptions::new()
             .write(true)
             .open(writer_path)
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("open {writer_path} (write): {e}"))
-            })?;
+            .map_err(|e| io::Error::new(e.kind(), format!("open {writer_path} (write): {e}")))?;
 
         Ok(CarrierChannel::FilePair {
             reader: io::BufReader::new(reader),
@@ -1459,10 +1455,7 @@ mod tests {
         // Send a request through the channel and read it via the host's
         // RDWR anchor on the request FIFO. Tests that the writer side of
         // the channel is wired to the right FIFO.
-        if let CarrierChannel::FilePair {
-            ref mut writer, ..
-        } = channel
-        {
+        if let CarrierChannel::FilePair { ref mut writer, .. } = channel {
             writeln!(writer, "{{\"id\":1,\"request\":{{\"type\":\"ping\"}}}}").unwrap();
             writer.flush().unwrap();
         } else {
@@ -1484,13 +1477,14 @@ mod tests {
         assert_eq!(buf, "{\"id\":1,\"request\":{\"type\":\"ping\"}}\n");
 
         // Host writes a response; channel reader on the SDK side must see it.
-        writeln!(host_resp_rw, "{{\"id\":1,\"response\":{{\"type\":\"pong\"}}}}").unwrap();
+        writeln!(
+            host_resp_rw,
+            "{{\"id\":1,\"response\":{{\"type\":\"pong\"}}}}"
+        )
+        .unwrap();
         host_resp_rw.flush().unwrap();
 
-        if let CarrierChannel::FilePair {
-            ref mut reader, ..
-        } = channel
-        {
+        if let CarrierChannel::FilePair { ref mut reader, .. } = channel {
             let mut resp_buf = String::new();
             reader
                 .read_line(&mut resp_buf)
