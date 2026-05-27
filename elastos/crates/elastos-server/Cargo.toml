@@ -93,9 +93,14 @@ tar = "0.4"
 libc = "0.2"
 
 # Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery)
+# distributed-topic-tracker is pinned to ~0.2.7 (the last 0.2.x that depends on
+# iroh ^0.96). The 0.2.8 release silently bumped to iroh ^0.97, which clashes
+# with our direct iroh 0.96 dep and produces hard type errors at compile time
+# (two `iroh_gossip::Gossip` types in the same dep tree). The proper fix is
+# migrating to iroh 0.97 across elastos-server, tracked separately.
 iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 iroh-gossip = "0.96"
-distributed-topic-tracker = "0.2"
+distributed-topic-tracker = "=0.2.7"
 futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"
