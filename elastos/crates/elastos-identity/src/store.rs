@@ -201,6 +201,9 @@ fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("AES key init: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    // Keep the current aes-gcm API until the upstream generic-array 1.x
+    // migration is available through a compatible aes-gcm release.
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher
@@ -227,6 +230,8 @@ fn decrypt_data(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("AES key init: {}", e))?;
+    // See encrypt_data above for the aes-gcm/generic-array migration context.
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     cipher

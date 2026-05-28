@@ -7,7 +7,7 @@ description = "Identity management (WebAuthn/Passkey) for ElastOS"
 
 [dependencies]
 p256 = { version = "0.13", features = ["ecdsa"] }
-rsa = "0.9"
+aws-lc-rs = "1"
 ciborium = "0.2"
 sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"

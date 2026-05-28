@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use aws_lc_rs::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use rsa::{BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -653,7 +653,7 @@ fn require_user_present_and_verified(flags: u8) -> anyhow::Result<()> {
 
 enum CosePublicKey {
     Es256(VerifyingKey),
-    Rs256(RsaPublicKey),
+    Rs256(Vec<u8>),
 }
 
 impl CosePublicKey {
@@ -666,12 +666,10 @@ impl CosePublicKey {
                     .verify(signed_data, &signature)
                     .map_err(|e| anyhow::anyhow!("ES256 verification failed: {}", e))
             }
-            CosePublicKey::Rs256(public_key) => {
-                let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(public_key.clone());
-                let signature = rsa::pkcs1v15::Signature::try_from(sig_bytes)
-                    .map_err(|e| anyhow::anyhow!("Invalid RS256 signature format: {}", e))?;
-                rsa::signature::Verifier::verify(&verifying_key, signed_data, &signature)
-                    .map_err(|e| anyhow::anyhow!("RS256 verification failed: {}", e))
+            CosePublicKey::Rs256(public_key_spki) => {
+                UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_spki)
+                    .verify(signed_data, sig_bytes)
+                    .map_err(|e| anyhow::anyhow!("RS256 verification failed: {:?}", e))
             }
         }
     }
@@ -731,9 +729,7 @@ fn parse_cose_es256_key_map(
         .map_err(|e| anyhow::anyhow!("Invalid EC public key: {}", e))
 }
 
-fn parse_cose_rs256_key_map(
-    map: &[(ciborium::Value, ciborium::Value)],
-) -> anyhow::Result<RsaPublicKey> {
+fn parse_cose_rs256_key_map(map: &[(ciborium::Value, ciborium::Value)]) -> anyhow::Result<Vec<u8>> {
     // kty (1) must be RSA (3)
     let kty = find_cbor_int(map, 1)?;
     if kty != 3 {
@@ -746,9 +742,88 @@ fn parse_cose_rs256_key_map(
         anyhow::bail!("Unsupported algorithm: {} (expected RS256=-257)", alg);
     }
 
-    let n = BigUint::from_bytes_be(&find_cbor_bytes(map, -1)?);
-    let e = BigUint::from_bytes_be(&find_cbor_bytes(map, -2)?);
-    RsaPublicKey::new(n, e).map_err(|e| anyhow::anyhow!("Invalid RSA public key: {}", e))
+    let n = find_cbor_bytes(map, -1)?;
+    let e = find_cbor_bytes(map, -2)?;
+    rsa_spki_der(&n, &e)
+}
+
+fn rsa_spki_der(modulus: &[u8], exponent: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let modulus = der_positive_integer_bytes(modulus, "RSA modulus")?;
+    let exponent = der_positive_integer_bytes(exponent, "RSA exponent")?;
+
+    let rsa_public_key = der_sequence(&[der_tlv(0x02, &modulus), der_tlv(0x02, &exponent)]);
+    let algorithm = der_sequence(&[
+        vec![
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+        ],
+        vec![0x05, 0x00],
+    ]);
+    let mut subject_public_key = Vec::with_capacity(rsa_public_key.len() + 1);
+    subject_public_key.push(0);
+    subject_public_key.extend_from_slice(&rsa_public_key);
+
+    Ok(der_sequence(&[
+        algorithm,
+        der_tlv(0x03, &subject_public_key),
+    ]))
+}
+
+fn der_positive_integer_bytes(bytes: &[u8], label: &str) -> anyhow::Result<Vec<u8>> {
+    let first_non_zero = bytes.iter().position(|byte| *byte != 0);
+    let Some(offset) = first_non_zero else {
+        anyhow::bail!("{} must be non-zero", label);
+    };
+    let bytes = &bytes[offset..];
+
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    if bytes[0] & 0x80 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn der_sequence(parts: &[Vec<u8>]) -> Vec<u8> {
+    let len = parts.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(1 + der_len_size(len) + len);
+    out.push(0x30);
+    der_push_len(&mut out, len);
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + der_len_size(value.len()) + value.len());
+    out.push(tag);
+    der_push_len(&mut out, value.len());
+    out.extend_from_slice(value);
+    out
+}
+
+fn der_len_size(len: usize) -> usize {
+    if len < 128 {
+        1
+    } else {
+        1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize
+    }
+}
+
+fn der_push_len(out: &mut Vec<u8>, len: usize) {
+    if len < 128 {
+        out.push(len as u8);
+        return;
+    }
+
+    let bytes = len.to_be_bytes();
+    let offset = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let significant = &bytes[offset..];
+    out.push(0x80 | significant.len() as u8);
+    out.extend_from_slice(significant);
 }
 
 /// Find an integer value in a CBOR map by integer key
@@ -842,6 +917,58 @@ mod tests {
         assert!(json["publicKey"]["authenticatorSelection"]
             .get("authenticatorAttachment")
             .is_none());
+    }
+
+    #[test]
+    fn rs256_cose_key_is_encoded_as_positive_spki_der() {
+        let spki = rsa_spki_der(&[0x00, 0x80, 0x01], &[0x01, 0x00, 0x01]).unwrap();
+
+        assert_eq!(spki[0], 0x30);
+        assert!(spki
+            .windows(11)
+            .any(|window| window
+                == [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]));
+        assert!(spki
+            .windows(5)
+            .any(|window| window == [0x02, 0x03, 0x00, 0x80, 0x01]));
+    }
+
+    #[test]
+    fn rs256_cose_key_rejects_zero_integers() {
+        assert!(rsa_spki_der(&[0], &[0x01, 0x00, 0x01]).is_err());
+        assert!(rsa_spki_der(&[0x01], &[0]).is_err());
+    }
+
+    #[test]
+    fn rs256_verification_accepts_pkcs1_sha256_vector() {
+        let modulus = hex::decode(concat!(
+            "00b46062899be0b9f25018e81494c3889573c1acdd27db80f03609ebd92f",
+            "95419036edc31052283ae0367602e40e710621b02e4dbf1d44954966eb86",
+            "208c114f2cd885629cbe2a89598469e12ded100969065156e2de32ea3f72",
+            "041c6e36a8e7b9b77d58ec7ff7ad5d4e9dff37d3c0ef976ab358ee64f1b3",
+            "1af35d65a01362bc64c8b6aec7e4959f192c3263a38f4f6c012797d6041f",
+            "870ffed7ab8a4653b89d75b3997a7cb13cc08775ba779652c9c4316cb03a",
+            "797244d257b4571b8bf928eb6d735b15f7a8d20239867844891664500a2c",
+            "0d8b416c402d931f2664701a8d024a7f9d2911283f1ee487e8e43798a394",
+            "dc2165e448003c8fb61aad773e109ceed3"
+        ))
+        .unwrap();
+        let signature = hex::decode(concat!(
+            "631411a560c6e1fa0277775ed0d44e4a3450a47c668f361cad2e925036d92445",
+            "f18d9ecf4f2219d37315db11656e0794c76c5205420b6def7beb18cf75a2a88",
+            "11889a8b9d1af52e11a0599852fe5ef3ab23182f7068215acd967a568e6f",
+            "3dc9c3ca4284185b595ad3401937c96a1de0373c12eed680c9f4c7576ba47",
+            "8aff03ba520460383103dcf0d6d66e0b65897bcbb8896d3f75c73561607",
+            "8bbc3d8a623f31521a4c2f887a1595ede72728d6443b1b72bc07a3843ba",
+            "200aa6701900d1eb296ed4dfdbc6cd2522519aabef7db0ff777e88b4ecd",
+            "57a8b49237c37f05a8f4b3448d60f6e01847a67e38163b53f1b67cf109",
+            "b6ccbb852569bb0e7bd780a7951df"
+        ))
+        .unwrap();
+        let key = CosePublicKey::Rs256(rsa_spki_der(&modulus, &[0x01, 0x00, 0x01]).unwrap());
+
+        key.verify(b"elastos-rs256-test", &signature).unwrap();
+        assert!(key.verify(b"elastos-rs256-tampered", &signature).is_err());
     }
 
     #[test]
