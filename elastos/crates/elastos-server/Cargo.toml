@@ -22,7 +22,7 @@ elastos-crosvm = { path = "../elastos-crosvm" }
 # HTTP server
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # TLS (ring crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

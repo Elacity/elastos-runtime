@@ -308,27 +308,27 @@ pub async fn start_tls_proxy(
     cert_path: &Path,
     key_path: &Path,
 ) -> anyhow::Result<()> {
-    use rustls_pemfile::{certs, pkcs8_private_keys};
-    use std::io::BufReader;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivatePkcs8KeyDer};
     use tokio_rustls::TlsAcceptor;
 
-    let cert_file = fs::File::open(cert_path)?;
-    let key_file = fs::File::open(key_path)?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
-    let keys: Vec<_> =
-        pkcs8_private_keys(&mut BufReader::new(key_file)).collect::<Result<Vec<_>, _>>()?;
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+    // PEM parsing migrated from the unmaintained `rustls-pemfile` crate
+    // (RUSTSEC-2025-0134) to the in-tree `rustls-pki-types::pem::PemObject`
+    // API. Wire format is identical PEM; the returned types
+    // (`CertificateDer`, `PrivatePkcs8KeyDer`) are the same ones we were
+    // already constructing manually one line below.
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to read cert PEM {}: {e}", cert_path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse cert PEM: {e}"))?;
+    let key: PrivatePkcs8KeyDer<'static> = PrivatePkcs8KeyDer::from_pem_file(key_path)
+        .map_err(|e| anyhow::anyhow!("failed to read/parse key PEM {}: {e}", key_path.display()))?;
 
     let config = tokio_rustls::rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
-            certs.into_iter().collect(),
+            certs,
             tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key),
         )?;
 
