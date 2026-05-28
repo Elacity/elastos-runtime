@@ -32,8 +32,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 # CLI
 clap = { version = "4.0", features = ["derive"] }
-crossterm = "0.28"
-ratatui = "0.29"
+# crossterm + ratatui were declared here historically but never used in
+# elastos-server src. They pulled in unmaintained transitives (lru 0.12.5 etc.)
+# that surfaced in `cargo audit`. The chat capsule declares its own optional
+# ratatui/crossterm under the `tui` feature, unaffected by this removal.
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -93,10 +95,36 @@ flate2 = "1.0"
 tar = "0.4"
 libc = "0.2"
 
-# Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery)
+# Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery).
+#
+# Four load-bearing pins all serve the same root cause: distributed-topic-tracker
+# (DTT) was published against pre-release versions of three RustCrypto crates,
+# and each of those crates has since released its final 1.0/3.0 with breaking
+# API changes. Any cargo update that touches the chain rolls forward into the
+# released versions and breaks DTT's transitive ed25519-dalek 3.0.0-pre.1.
+#
+# 1. distributed-topic-tracker = "=0.2.7"
+#    0.2.8 (2026-03-18) silently bumped its iroh dep from ^0.96 to ^0.97,
+#    clashing with our direct iroh 0.96 pin (two `iroh_gossip::Gossip` types
+#    in the dep tree → hard E0308/E0599). 0.2.7 is the last 0.2.x on iroh ^0.96.
+#    Migrating elastos-server to iroh 0.97 is tracked separately.
+#
+# 2/3/4. ed25519 / pkcs8 / signature pre-release chain
+#    DTT → ed25519-dalek 3.0.0-pre.1 was built against:
+#      - ed25519  ^3.0.0-rc.X
+#      - pkcs8    ^0.11.0-rc.X
+#      - signature ^3.0.0-rc.X
+#    The released ed25519 3.0.0 / pkcs8 0.11.0 / signature 3.0.0 are
+#    API-incompatible with those pre-releases (pkcs8::Error variants moved,
+#    etc.), causing compile errors inside cargo's own registry source. Holding
+#    all three at the rc versions v0.3.0 shipped keeps the graph buildable
+#    until ed25519-dalek itself releases a 3.x-stable.
 iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 iroh-gossip = "0.96"
-distributed-topic-tracker = "0.2"
+distributed-topic-tracker = "=0.2.7"
+ed25519 = "=3.0.0-rc.4"
+pkcs8 = "=0.11.0-rc.11"
+signature = "=3.0.0-rc.10"
 futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"
