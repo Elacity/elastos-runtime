@@ -76,6 +76,13 @@ pub struct PlatformInfo {
     pub note: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    /// Optional whole-file compression applied to the downloaded bytes.
+    /// When set, the fetcher verifies the checksum against the *compressed*
+    /// bytes (matching what the publisher signed) and then decompresses to
+    /// `install_path`. Currently supports: "gzip". Does not apply to
+    /// tarball artifacts — those still use `extract_path` for unpacking.
+    #[serde(default)]
+    pub compression: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -308,6 +315,31 @@ pub async fn run(
 
     let stamped = write_installed_manifest(&data_dir, &manifest, &platform)?;
 
+    // Phase 8 Day 5 — auto-init capsule metadata for known
+    // standalone microVM capsules (e.g. `ubuntu-base`) so that
+    // `elastos run <name>` finds a valid `capsule.json` adjacent
+    // to the rootfs.ext4 the install loop just wrote. Idempotent:
+    // skips when the file is already present, never overwrites
+    // operator edits. See `ensure_standalone_capsule_metadata`.
+    if let Err(e) = ensure_standalone_capsule_metadata(&data_dir) {
+        // Non-fatal: the rootfs is installed and the user can
+        // still hand-write a capsule.json. We just lose the
+        // one-command-demo path for this run.
+        eprintln!("[warn] capsule metadata init failed: {e}");
+    }
+
+    // Phase 8 Day 6 — build the overlay-aware second-stage
+    // initramfs so Ubuntu userspace gets a writable root via
+    // tmpfs overlay on top of the read-only squashfs. Skipped
+    // when `bin/initrd` isn't present (kernel-only boot paths)
+    // or when the combined output is already up-to-date.
+    // Non-fatal on error: consumers fall back to plain
+    // `bin/initrd`, which still boots — userspace just keeps
+    // crashing on EROFS the way Day 5 captured.
+    if let Err(e) = ensure_overlay_initrd(&data_dir) {
+        eprintln!("[warn] overlay-initrd build failed: {e}");
+    }
+
     println!();
     if !stamped.is_empty() {
         println!(
@@ -323,9 +355,95 @@ pub async fn run(
     Ok(())
 }
 
+/// Write a default `capsule.json` for any known standalone microVM
+/// capsule (today: `ubuntu-base`) when the rootfs is installed but
+/// the operator has not yet written their own manifest. Idempotent:
+/// if `capsule.json` already exists at the target path we leave it
+/// untouched, so operator customisations survive `elastos setup`
+/// re-runs.
+///
+/// The auto-init list is intentionally hard-coded for Phase 8 Day 5.
+/// A future general mechanism (`PlatformInfo.capsule_manifest` or a
+/// new `external.<name>.capsule_template` field) is the obvious
+/// next step, but premature generalisation would lock the schema
+/// before we have a second standalone capsule to drive it.
+pub(crate) fn ensure_standalone_capsule_metadata(data_dir: &Path) -> anyhow::Result<()> {
+    const UBUNTU_BASE_CAPSULE_JSON: &str = r#"{
+  "schema": "elastos.capsule/v1",
+  "version": "0.1.0",
+  "name": "ubuntu-base",
+  "description": "Ubuntu 22.04 LTS arm64 base rootfs — first real Linux guest on Mac (Phase 8 v0.1 demo). Boot path: kernel → initramfs → pivot to /dev/vda (the rootfs.ext4 squashfs from Canonical's cloud images). The squashfs is read-only; v0.1 boots through to userspace handover and exposes the demo behaviour. A writable overlay (tmpfs or copy-on-write file) is a Day-6+ task once we measure what userspace actually wants to write to.",
+  "role": "app",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "resources": {
+    "memory_mb": 256,
+    "cpu_shares": 100
+  },
+  "microvm": {
+    "boot_args": "console=hvc0 reboot=k panic=1 root=/dev/vda rootfstype=squashfs ro init=/sbin/init",
+    "vcpu_count": 1
+  }
+}
+"#;
+
+    let ubuntu_base_dir = data_dir.join("capsules/ubuntu-base");
+    let capsule_json_path = ubuntu_base_dir.join("capsule.json");
+    let rootfs_path = ubuntu_base_dir.join("rootfs.ext4");
+
+    // Only write metadata when the rootfs is actually present —
+    // otherwise we'd advertise a runnable capsule that fails at
+    // boot time with "rootfs not found", which is worse UX than
+    // the missing-rootfs error the rootfs check itself returns.
+    if !rootfs_path.is_file() {
+        return Ok(());
+    }
+
+    if capsule_json_path.is_file() {
+        return Ok(());
+    }
+
+    fs::write(&capsule_json_path, UBUNTU_BASE_CAPSULE_JSON)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", capsule_json_path.display()))?;
+    println!(
+        "[init] wrote default capsule metadata: {}",
+        capsule_json_path.display()
+    );
+    Ok(())
+}
+
+/// Phase 8 Day 6 — build `bin/initrd-overlay` by appending our
+/// overlay-init CPIO to Ubuntu's pristine `bin/initrd`. The combined
+/// file is what consumers (supervisor, `elastos run` standalone lane,
+/// integration test discovery) prefer when present, so userspace gets
+/// a writable tmpfs overlay on top of the read-only squashfs without
+/// any per-consumer plumbing.
+///
+/// Idempotent: skips the write when the destination already contains
+/// exactly the bytes we'd produce (see `write_combined_initrd` for the
+/// byte-compare semantics). Safe to call on every `elastos setup`
+/// invocation. No-ops when `bin/initrd` isn't present — kernel-only
+/// boots and pre-Day-2 installs stay untouched.
+pub(crate) fn ensure_overlay_initrd(data_dir: &Path) -> anyhow::Result<()> {
+    let source = data_dir.join("bin/initrd");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let dest = data_dir.join("bin/initrd-overlay");
+    let wrote = crate::overlay_initrd::write_combined_initrd(&source, &dest)?;
+    if wrote {
+        println!(
+            "[init] built overlay initrd: {} ({} bytes)",
+            dest.display(),
+            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
 // ── Manifest loading ────────────────────────────────────────────────
 
-fn load_manifest() -> anyhow::Result<ComponentsManifest> {
+pub(crate) fn load_manifest() -> anyhow::Result<ComponentsManifest> {
     let exe_path = std::env::current_exe().ok();
     let manifest_paths = [
         // Source checkout layout: <repo>/elastos/target/{debug,release}/elastos.
@@ -335,8 +453,8 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
         exe_path
             .as_deref()
             .and_then(|p| p.parent().map(|d| d.join("components.json"))),
-        // Installed layout
-        dirs::data_dir().map(|d| d.join("elastos/components.json")),
+        // Installed layout (honors $ELASTOS_DATA_DIR override)
+        Some(crate::sources::default_data_dir().join("components.json")),
     ];
 
     for path in manifest_paths.iter().flatten() {
@@ -352,13 +470,7 @@ fn load_manifest() -> anyhow::Result<ComponentsManifest> {
 }
 
 fn data_dir() -> anyhow::Result<PathBuf> {
-    let dir = dirs::data_dir()
-        .map(|d| d.join("elastos"))
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/share/elastos")
-        });
-    Ok(dir)
+    Ok(crate::sources::default_data_dir())
 }
 
 fn source_checkout_manifest_path(exe_path: &Path) -> Option<PathBuf> {
@@ -419,8 +531,13 @@ fn set_local_copy_permissions(source: &Path, dest: &Path) {
 // ── Platform detection ──────────────────────────────────────────────
 
 pub fn detect_platform() -> String {
+    // `darwin` is the canonical OS token in Rust/llvm target triples (e.g.
+    // aarch64-apple-darwin); the runtime uses it across the
+    // setup/components/release surfaces.
     let os = if cfg!(target_os = "linux") {
         "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
     } else {
         "unknown"
     };
@@ -485,6 +602,16 @@ pub fn verify_installed_component_binary(
             platform
         )
     })?;
+    // Compression-bearing artifacts cannot be checksum-verified post-install:
+    // the on-disk file is the decompressed form, whose hash by design differs
+    // from `platform_info.checksum` (which captures the as-downloaded,
+    // publisher-signed bytes). The download-time verifier already validated
+    // those compressed bytes when this file was first written, so we treat
+    // the artifact as verified here, consistent with how tarballs already skip
+    // per-file checksums.
+    if platform_info.compression.is_some() {
+        return Ok(String::new());
+    }
     let checksum = platform_info
         .checksum
         .as_deref()
@@ -741,33 +868,46 @@ fn component_install_state(
                 }
             }
 
-            if let Some(expected_size) = platform_info.size.filter(|size| *size > 0) {
-                match fs::metadata(&candidate) {
-                    Ok(meta) if meta.len() == expected_size => {}
-                    Ok(meta) => {
-                        return InstallState::Stale(format!(
-                            "size mismatch (have {} bytes, expected {})",
-                            meta.len(),
-                            expected_size
-                        ));
-                    }
-                    Err(err) => {
-                        return InstallState::Stale(format!("metadata read failed: {}", err));
+            // For compression-bearing artifacts, the on-disk file is the
+            // *decompressed* form — its size and hash do NOT match the
+            // `size`/`checksum` fields in components.json (those describe
+            // the as-downloaded, publisher-signed bytes). Skip the on-disk
+            // byte-level checks here, consistent with how tarball-extracted
+            // bundles skip per-file checksums (see lines above). Download-time
+            // `verify_checksum` has already validated the compressed bytes.
+            let skip_on_disk_byte_check = platform_info.compression.is_some();
+
+            if !skip_on_disk_byte_check {
+                if let Some(expected_size) = platform_info.size.filter(|size| *size > 0) {
+                    match fs::metadata(&candidate) {
+                        Ok(meta) if meta.len() == expected_size => {}
+                        Ok(meta) => {
+                            return InstallState::Stale(format!(
+                                "size mismatch (have {} bytes, expected {})",
+                                meta.len(),
+                                expected_size
+                            ));
+                        }
+                        Err(err) => {
+                            return InstallState::Stale(format!("metadata read failed: {}", err));
+                        }
                     }
                 }
-            }
 
-            if let Some(expected) = platform_info
-                .checksum
-                .as_deref()
-                .filter(|checksum| !checksum.is_empty())
-            {
-                match file_matches_checksum(&candidate, expected) {
-                    Ok(true) => InstallState::Installed,
-                    Ok(false) => InstallState::Stale("checksum mismatch".to_string()),
-                    Err(err) => {
-                        InstallState::Stale(format!("checksum verification failed: {}", err))
+                if let Some(expected) = platform_info
+                    .checksum
+                    .as_deref()
+                    .filter(|checksum| !checksum.is_empty())
+                {
+                    match file_matches_checksum(&candidate, expected) {
+                        Ok(true) => InstallState::Installed,
+                        Ok(false) => InstallState::Stale("checksum mismatch".to_string()),
+                        Err(err) => {
+                            InstallState::Stale(format!("checksum verification failed: {}", err))
+                        }
                     }
+                } else {
+                    InstallState::Installed
                 }
             } else {
                 InstallState::Installed
@@ -852,6 +992,10 @@ fn platform_aliases(platform: &str) -> impl Iterator<Item = &'static str> {
         "aarch64-linux" => &["linux-arm64"],
         "linux-amd64" => &["x86_64-linux"],
         "linux-arm64" => &["aarch64-linux"],
+        "x86_64-darwin" => &["darwin-amd64"],
+        "aarch64-darwin" => &["darwin-arm64"],
+        "darwin-amd64" => &["x86_64-darwin"],
+        "darwin-arm64" => &["aarch64-darwin"],
         _ => &[],
     };
     aliases.iter().copied()
@@ -1319,7 +1463,7 @@ pub(crate) async fn install_first_party_component_via_carrier(
     if is_tarball {
         extract_from_tarball(&bytes, dest, platform_info)?;
     } else {
-        atomic_write_file(dest, &bytes)?;
+        write_decompressed_or_verbatim(name, &bytes, dest, platform_info)?;
     }
 
     #[cfg(unix)]
@@ -1442,7 +1586,7 @@ async fn download_component(
         if is_tarball {
             extract_from_tarball(&bytes, dest, platform_info)?;
         } else {
-            atomic_write_file(dest, &bytes)?;
+            write_decompressed_or_verbatim(name, &bytes, dest, platform_info)?;
         }
     }
 
@@ -1595,6 +1739,49 @@ fn verify_checksum(name: &str, data: &[u8], platform_info: &PlatformInfo) -> any
     Ok(())
 }
 
+/// Write the verified download bytes to `dest`, applying whole-file
+/// decompression first if `platform_info.compression` is set.
+///
+/// This is the single-file analogue of `extract_from_tarball`. The
+/// checksum has already been verified against the *as-downloaded*
+/// bytes upstream — that ordering is intentional, so the field in
+/// `components.json` matches what the publisher signs (e.g. Canonical's
+/// `SHA256SUMS` for `cloud-images.ubuntu.com` lists the compressed
+/// `vmlinuz-*-generic` bytes, not the decompressed Image).
+fn write_decompressed_or_verbatim(
+    name: &str,
+    data: &[u8],
+    dest: &Path,
+    platform_info: &PlatformInfo,
+) -> anyhow::Result<()> {
+    let Some(scheme) = platform_info
+        .compression
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return atomic_write_file(dest, data);
+    };
+
+    match scheme {
+        "gzip" => {
+            use flate2::read::GzDecoder;
+            use std::io::Read;
+            let mut decoder = GzDecoder::new(data);
+            let mut decoded = Vec::with_capacity(data.len() * 2);
+            decoder
+                .read_to_end(&mut decoded)
+                .map_err(|e| anyhow::anyhow!("gzip decompression of {} failed: {}", name, e))?;
+            atomic_write_file(dest, &decoded)
+        }
+        other => anyhow::bail!(
+            "unsupported compression scheme '{}' for component '{}' (supported: gzip)",
+            other,
+            name,
+        ),
+    }
+}
+
 fn extract_from_tarball(
     data: &[u8],
     dest: &Path,
@@ -1738,11 +1925,87 @@ mod tests {
     use super::*;
     use crate::sources::{save_trusted_sources, TrustedSource, TrustedSourcesConfig};
 
+    /// Phase 8 Day 5 — the post-install hook writes a default
+    /// `capsule.json` next to the installed rootfs so
+    /// `elastos run ubuntu-base` finds a valid manifest. We
+    /// assert (a) it's a no-op when the rootfs isn't there
+    /// (no advertising a broken capsule), (b) it's a no-op when
+    /// the file already exists (operator edits survive setup
+    /// re-runs), and (c) when it does write, the result parses
+    /// as a valid `CapsuleManifest` so the install path doesn't
+    /// emit JSON we can't read back.
+    #[test]
+    fn ensure_capsule_metadata_skips_when_rootfs_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        // No rootfs was installed → the hook should leave the
+        // capsules dir alone (no spurious capsule.json that
+        // would advertise a runnable capsule with no payload).
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        assert!(
+            !data_dir.join("capsules/ubuntu-base/capsule.json").exists(),
+            "metadata hook must not write a manifest when the rootfs is missing"
+        );
+    }
+
+    #[test]
+    fn ensure_capsule_metadata_writes_when_rootfs_present_and_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let capsule_dir = data_dir.join("capsules/ubuntu-base");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(capsule_dir.join("rootfs.ext4"), b"sentinel").unwrap();
+
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        let manifest_path = capsule_dir.join("capsule.json");
+        assert!(
+            manifest_path.is_file(),
+            "metadata hook should write capsule.json when rootfs is present"
+        );
+
+        // Round-trip through the same parser `elastos run` uses
+        // — guards against future edits to the hard-coded JSON
+        // breaking the schema (typo in field name, missing
+        // schema version, etc.).
+        let body = fs::read_to_string(&manifest_path).unwrap();
+        let parsed: elastos_common::CapsuleManifest = serde_json::from_str(&body)
+            .expect("auto-init capsule.json must parse as CapsuleManifest");
+        parsed
+            .validate()
+            .expect("auto-init capsule.json must validate");
+        assert_eq!(parsed.name, "ubuntu-base");
+        assert_eq!(parsed.entrypoint, "rootfs.ext4");
+        assert_eq!(parsed.capsule_type, elastos_common::CapsuleType::MicroVM);
+    }
+
+    #[test]
+    fn ensure_capsule_metadata_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let capsule_dir = data_dir.join("capsules/ubuntu-base");
+        fs::create_dir_all(&capsule_dir).unwrap();
+        fs::write(capsule_dir.join("rootfs.ext4"), b"sentinel").unwrap();
+
+        // Operator-edited content the hook must NOT overwrite —
+        // even though it doesn't parse as a real manifest, we
+        // promise not to clobber whatever's already there.
+        let manifest_path = capsule_dir.join("capsule.json");
+        let user_content = b"operator edited this -- do not overwrite";
+        fs::write(&manifest_path, user_content).unwrap();
+
+        ensure_standalone_capsule_metadata(data_dir).unwrap();
+        let after = fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            after, user_content,
+            "metadata hook must not overwrite an existing capsule.json"
+        );
+    }
+
     #[test]
     fn test_detect_platform() {
         let p = detect_platform();
         assert!(
-            p.contains("linux") || p.contains("unknown"),
+            p.contains("linux") || p.contains("darwin") || p.contains("unknown"),
             "Platform should contain os: {}",
             p
         );
@@ -1947,6 +2210,7 @@ mod tests {
                 source: None,
                 note: None,
                 size: Some(10),
+                compression: None,
             },
         );
         let comp = Component {
@@ -1992,6 +2256,7 @@ mod tests {
                 source: None,
                 note: None,
                 size: Some(1234),
+                compression: None,
             },
         );
         let component = Component {
@@ -2141,6 +2406,14 @@ mod tests {
 
     #[test]
     fn test_verify_installed_component_binary_requires_checksum() {
+        // Fixture must carry an entry for the platform the test
+        // actually runs on; otherwise `verify_installed_component_binary`
+        // surfaces "no platform entry for <host>" before it gets a
+        // chance to notice the missing checksum — and the assertion
+        // on "missing checksum" never fires. Using `detect_platform()`
+        // keeps the test exercising the SAME property on every host
+        // (Linux CI + local Mac).
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2149,21 +2422,23 @@ mod tests {
         fs::write(&install_path, b"shell-binary").unwrap();
         fs::write(
             data_dir.join("components.json"),
-            r#"{
-  "external": {
-    "shell": {
+            format!(
+                r#"{{
+  "external": {{
+    "shell": {{
       "install_path": "bin/shell",
-      "platforms": {
-        "linux-amd64": {
+      "platforms": {{
+        "{platform}": {{
           "checksum": "",
           "url": "https://example.invalid/shell"
-        }
-      }
-    }
-  },
-  "capsules": {},
-  "profiles": {}
-}"#,
+        }}
+      }}
+    }}
+  }},
+  "capsules": {{}},
+  "profiles": {{}}
+}}"#,
+            ),
         )
         .unwrap();
 
@@ -2175,6 +2450,10 @@ mod tests {
 
     #[test]
     fn test_verify_installed_component_binary_verifies_checksum() {
+        // See the comment on the sibling `requires_checksum` test
+        // for why the fixture key is the current host platform
+        // instead of a hard-coded "linux-amd64".
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2191,8 +2470,8 @@ mod tests {
     "shell": {{
       "install_path": "bin/shell",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/shell"
         }}
       }}
@@ -2201,7 +2480,6 @@ mod tests {
   "capsules": {{}},
   "profiles": {{}}
 }}"#,
-                checksum
             ),
         )
         .unwrap();
@@ -2212,6 +2490,13 @@ mod tests {
 
     #[test]
     fn test_write_installed_manifest_stamps_local_copy_checksum() {
+        // Two coupled platform strings here: the JSON fixture key
+        // AND the `write_installed_manifest(.., platform)` argument
+        // MUST agree so the function finds a matching entry to stamp.
+        // Hard-coding either to "linux-amd64" makes the test
+        // host-specific; using `detect_platform()` keeps it
+        // exercising the same property on every host.
+        let platform = super::detect_platform();
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
         let bin_dir = data_dir.join("bin");
@@ -2227,7 +2512,7 @@ mod tests {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
                     "platforms": {
-                        "linux-amd64": {
+                        platform.as_str(): {
                             "strategy": "local-copy",
                             "source": source_path.to_string_lossy(),
                             "install_path": "bin/vmlinux"
@@ -2240,7 +2525,7 @@ mod tests {
         }))
         .unwrap();
 
-        let stamped = write_installed_manifest(data_dir, &manifest, "linux-amd64").unwrap();
+        let stamped = write_installed_manifest(data_dir, &manifest, &platform).unwrap();
         assert_eq!(stamped, vec!["vmlinux".to_string()]);
 
         let result = verify_installed_component_binary(data_dir, "vmlinux", &install_path).unwrap();
@@ -2292,6 +2577,7 @@ mod tests {
                 source: Some(source_path.to_string_lossy().to_string()),
                 note: None,
                 size: Some(b"same-size-data".len() as u64),
+                compression: None,
             },
         );
         let comp = Component {
@@ -2321,6 +2607,7 @@ mod tests {
             source: None,
             note: None,
             size: None,
+            compression: None,
         };
 
         assert_eq!(

@@ -1,0 +1,758 @@
+//! `elastos doctor` — substrate path resolution inspector.
+//!
+//! Read-only triage command that constructs the same [`Supervisor`] the
+//! runtime daemon would (against the current `data_dir` + `components.json`)
+//! and prints the resolved Vz substrate paths it intends to load — kernel,
+//! initrd, state_dir, rootfs_cache_dir. Each row reports presence and, where
+//! applicable, runs [`elastos_vz::VzConfig::validate`] for a guest-kernel
+//! sanity check. Absent artifacts come with a one-line remediation hint
+//! (`elastos setup --profile minimal`).
+//!
+//! Motivation: Phase 7 Day 3 closed a latent data-dir mismatch between
+//! `elastos-vz` (Unix-style `~/.local/share/elastos`) and the
+//! `elastos-server` installer (macOS `~/Library/Application Support/elastos`).
+//! That class of "the file is staged but the substrate is looking at the
+//! other directory" bug is precisely what doctor is designed to surface
+//! before users hit a `KernelNotFound` at launch time.
+//!
+//! The command is pure (no on-disk mutations). Output is rendered through
+//! a `&mut dyn Write` so unit tests can capture it into a `Vec<u8>` and
+//! assert on substrings without spawning a subprocess.
+
+use std::io::Write;
+use std::path::Path;
+
+use crate::setup::{detect_platform, load_manifest, ComponentsManifest, PlatformInfo};
+// Phase 10.7 — `Supervisor` is consumed only by the Mac-only `print_report`
+// body (to read back the resolved Vz paths). On Linux the import is unused
+// because `print_report` is a stub that prints "not available on this platform".
+#[cfg(target_os = "macos")]
+use crate::supervisor::Supervisor;
+
+/// CLI arguments for `elastos doctor`.
+#[derive(Debug, Clone, Default)]
+pub struct DoctorArgs {
+    /// When true, augment each substrate row with the manifest entry's
+    /// URL / checksum / size / compression. Off by default to keep the
+    /// summary triage-friendly.
+    pub verbose: bool,
+}
+
+/// Top-level entry point. Resolves the live `data_dir` + manifest from disk
+/// and writes the report to stdout.
+///
+/// Phase 7 Day 6 — the body runs inside `tracing::subscriber::with_default`
+/// with a WARN-and-above subscriber, so the supervisor's INFO logs
+/// (e.g. `vz: startup orphan-prune complete`) do not bleed into the
+/// inspector output. `doctor` is a one-shot triage CLI; the global
+/// `elastos=info` subscriber installed in `main` is appropriate for
+/// long-running `serve`/`setup` paths but distracting here. The
+/// `with_default` swap is thread-local and ends when this function
+/// returns — other subcommands keep the operator's `RUST_LOG`
+/// configuration intact. Safe because the body of `run` is purely
+/// synchronous (no `.await`), so no task migration can leak the
+/// override across worker threads.
+pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
+    tracing::subscriber::with_default(build_quiet_subscriber(), || -> anyhow::Result<()> {
+        let data_dir = crate::sources::default_data_dir();
+        let manifest = load_manifest()?;
+        let platform = detect_platform();
+
+        print_report(
+            &mut std::io::stdout(),
+            &data_dir,
+            &manifest,
+            &platform,
+            args.verbose,
+        )
+    })
+}
+
+/// Build the WARN-and-above fmt subscriber installed by [`run`].
+/// Extracted as a free function so the unit test can install the
+/// same subscriber against a capture-buffer `MakeWriter` and assert
+/// the suppression behaviour directly.
+fn build_quiet_subscriber() -> impl tracing::Subscriber + Send + Sync {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .finish()
+}
+
+/// Write the substrate report to `out`. Extracted from [`run`] so unit
+/// tests can drive it with a synthetic `data_dir` + manifest and capture
+/// the output into a buffer.
+///
+/// Phase 10.7 — the body is Mac-only because it reads four absolute paths
+/// off `elastos_vz::VzConfig` and calls `elastos_vz::VzConfig::validate()`.
+/// `elastos-vz` is a `target.'cfg(target_os = "macos")'.dependencies`
+/// entry, so on Linux the doctor inspector has no Vz substrate to report
+/// on. The Linux stub below prints a one-line "not available on this
+/// platform" notice so the command still exits cleanly and CI builds.
+#[cfg(target_os = "macos")]
+pub(crate) fn print_report(
+    out: &mut dyn Write,
+    data_dir: &Path,
+    manifest: &ComponentsManifest,
+    platform: &str,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    writeln!(out, "ElastOS doctor — substrate path resolution check")?;
+    writeln!(out, "  platform:   {platform}")?;
+    writeln!(out, "  data_dir:   {}", data_dir.display())?;
+    writeln!(out)?;
+
+    // Construct the same supervisor `serve_cmd` would, then read back the
+    // resolved Vz paths. This is the entire point of doctor: ground-truth
+    // the paths the substrate will actually try to load, not the paths a
+    // human guesses from the manifest.
+    let supervisor = Supervisor::new(data_dir.to_path_buf(), manifest.clone());
+    let vz_config = supervisor.vz_config();
+
+    print_artifact_row(
+        out,
+        ArtifactRow {
+            label: "vmlinux",
+            path: &vz_config.kernel_path,
+            validate_as_kernel: true,
+            remediation: "elastos setup --profile minimal",
+            manifest_component: "vmlinux",
+        },
+        manifest,
+        verbose,
+    )?;
+
+    match vz_config.initramfs_path.as_deref() {
+        Some(path) => {
+            print_artifact_row(
+                out,
+                ArtifactRow {
+                    label: "initrd",
+                    path,
+                    validate_as_kernel: false,
+                    remediation: "elastos setup --profile minimal",
+                    manifest_component: "initrd",
+                },
+                manifest,
+                verbose,
+            )?;
+        }
+        None => {
+            writeln!(out, "  initrd:     not configured")?;
+            writeln!(
+                out,
+                "              kernel-only boot path (only valid if vmlinux has built-in virtio drivers)"
+            )?;
+            writeln!(out)?;
+        }
+    }
+
+    // Phase 8 Day 3 — surface the base rootfs the supervisor's capsule
+    // launch path will consume. Unlike kernel/initrd (resolved via
+    // `VzConfig` because the substrate owns the absolute paths), the
+    // rootfs lives at a per-capsule path that the supervisor computes
+    // on demand from `capsules_dir`. Doctor reads the install path
+    // straight from the registry so the row is meaningful even before
+    // any capsule has been instantiated.
+    match resolve_rootfs_install_path(manifest, platform) {
+        Some(install_path) => {
+            let rootfs_path = data_dir.join(install_path);
+            print_artifact_row(
+                out,
+                ArtifactRow {
+                    label: "rootfs",
+                    path: &rootfs_path,
+                    validate_as_kernel: false,
+                    remediation: "elastos setup --profile minimal",
+                    manifest_component: "rootfs",
+                },
+                manifest,
+                verbose,
+            )?;
+        }
+        None => {
+            writeln!(out, "  rootfs:     not configured")?;
+            writeln!(
+                out,
+                "              no `external.rootfs` entry for {platform} in components.json"
+            )?;
+            writeln!(out)?;
+        }
+    }
+
+    print_dir_row(out, "state_dir", &vz_config.state_dir)?;
+    print_dir_row(out, "rootfs_cache_dir", &vz_config.rootfs_cache_dir)?;
+
+    Ok(())
+}
+
+/// Phase 10.7 — Linux stub for `print_report`. On Linux the `elastos-vz`
+/// crate is not built (target-gated in `Cargo.toml`), so there is no
+/// substrate to inspect. The stub emits a single notice and returns Ok
+/// so `elastos doctor` exits 0 on Linux without misleading the operator
+/// into thinking artifacts are missing — they are absent by design.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn print_report(
+    out: &mut dyn Write,
+    data_dir: &Path,
+    _manifest: &ComponentsManifest,
+    platform: &str,
+    _verbose: bool,
+) -> anyhow::Result<()> {
+    writeln!(out, "ElastOS doctor — substrate path resolution check")?;
+    writeln!(out, "  platform:   {platform}")?;
+    writeln!(out, "  data_dir:   {}", data_dir.display())?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  vz substrate: not available on this platform (Mac-only)"
+    )?;
+    writeln!(
+        out,
+        "                doctor inspects elastos-vz artifacts (kernel, initrd,"
+    )?;
+    writeln!(
+        out,
+        "                state_dir, rootfs_cache_dir); nothing to report on Linux."
+    )?;
+    Ok(())
+}
+
+/// Resolve the on-disk install path for the base rootfs, honouring the
+/// same platform-override-then-component-default fallback the install
+/// loop uses in [`crate::setup`]. Returns `None` when the manifest has
+/// no `external.rootfs` entry, or when neither the platform row nor the
+/// component itself declares an `install_path` — both of which are
+/// "rootfs not configured for this platform" cases doctor reports
+/// explicitly so the operator knows to update `components.json`.
+///
+/// Phase 10.7 — consumed only by Mac `print_report`; on Linux the
+/// stub `print_report` returns before any helper would be invoked.
+/// Tests still reference these helpers via the `tests` module, so we
+/// suppress dead_code rather than cfg-gating the function itself.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn resolve_rootfs_install_path<'a>(
+    manifest: &'a ComponentsManifest,
+    platform: &str,
+) -> Option<&'a str> {
+    let component = manifest.external.get("rootfs")?;
+    let platform_info = component.platforms.get(platform);
+    platform_info
+        .and_then(|p| p.install_path.as_deref())
+        .or(component.install_path.as_deref())
+}
+
+/// Parameters for a single substrate-artifact row. Bundled in a struct
+/// to keep [`print_artifact_row`]'s signature readable (clippy
+/// `too_many_arguments`) and to make adding future rows mechanical.
+///
+/// Phase 10.7 — Mac-only (consumed by `print_artifact_row`). Linux
+/// suppresses dead_code without cfg-gating the type itself to keep
+/// the file's tests cross-platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ArtifactRow<'a> {
+    label: &'a str,
+    path: &'a Path,
+    validate_as_kernel: bool,
+    remediation: &'a str,
+    manifest_component: &'a str,
+}
+
+// Phase 10.7 — Mac-only consumer; Linux suppresses dead_code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn print_artifact_row(
+    out: &mut dyn Write,
+    row: ArtifactRow<'_>,
+    manifest: &ComponentsManifest,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    writeln!(out, "  {}:     {}", row.label, row.path.display())?;
+
+    if !row.path.exists() {
+        writeln!(out, "              [absent]")?;
+        writeln!(out, "              → run: {}", row.remediation)?;
+    } else if !row.path.is_file() {
+        writeln!(
+            out,
+            "              [present but not a regular file] expected a file at this path"
+        )?;
+        writeln!(out, "              → run: {}", row.remediation)?;
+    } else {
+        let size = std::fs::metadata(row.path).map(|m| m.len()).unwrap_or(0);
+        writeln!(out, "              [present] size {}", human_bytes(size))?;
+
+        if row.validate_as_kernel {
+            // Synthesize a probe `VzConfig` aimed at this exact kernel
+            // path so we can leverage the substrate's own validator
+            // without bringing the supervisor's launch path online.
+            //
+            // Phase 10.7 — Mac-only: `elastos_vz::VzConfig::with_kernel_path`
+            // and `validate()` are Mac-only types. On Linux the doctor's
+            // Mac-only `print_report` stub never invokes this row, so the
+            // body would type-check as dead code but still references
+            // `elastos_vz::*` at the type system level. cfg-gate the whole
+            // probe block to keep the Linux build clean.
+            #[cfg(target_os = "macos")]
+            {
+                let probe = elastos_vz::VzConfig::new().with_kernel_path(row.path);
+                match probe.validate() {
+                    Ok(()) => writeln!(
+                        out,
+                        "              [validate] passes guest-kernel sanity check"
+                    )?,
+                    Err(e) => {
+                        writeln!(out, "              [validate FAIL] {e}")?;
+                        writeln!(out, "              → run: {}", row.remediation)?;
+                    }
+                }
+            }
+        }
+    }
+
+    if verbose {
+        if let Some(info) = current_platform_info(manifest, row.manifest_component) {
+            print_manifest_metadata(out, info)?;
+        }
+    }
+
+    writeln!(out)?;
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn print_dir_row(out: &mut dyn Write, label: &str, path: &Path) -> anyhow::Result<()> {
+    writeln!(out, "  {label}:  {}", path.display())?;
+    if path.is_dir() {
+        writeln!(out, "              [present]")?;
+    } else if path.exists() {
+        writeln!(out, "              [exists but not a directory]")?;
+    } else {
+        // Directories are lazily created at first launch by the substrate,
+        // so absence is informational, not an error.
+        writeln!(
+            out,
+            "              [absent — will be created on first launch]"
+        )?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn current_platform_info<'a>(
+    manifest: &'a ComponentsManifest,
+    component_name: &str,
+) -> Option<&'a PlatformInfo> {
+    let component = manifest.external.get(component_name)?;
+    component.platforms.get(&detect_platform())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn print_manifest_metadata(out: &mut dyn Write, info: &PlatformInfo) -> anyhow::Result<()> {
+    if let Some(url) = &info.url {
+        writeln!(out, "              url:         {url}")?;
+    }
+    if let Some(cs) = &info.checksum {
+        writeln!(out, "              checksum:    {cs}")?;
+    }
+    if let Some(c) = &info.compression {
+        writeln!(out, "              compression: {c}")?;
+    }
+    if let Some(s) = info.size {
+        writeln!(out, "              manifest-size: {s} bytes")?;
+    }
+    Ok(())
+}
+
+/// Human-readable byte formatter used in row output. Kept private — there
+/// is already a project-wide formatter in setup.rs, but it's wired through
+/// a different output column convention. Local copy keeps doctor's output
+/// stable independent of setup's UI churn.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} bytes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup::Component;
+    use std::collections::HashMap;
+
+    fn fixture_manifest() -> ComponentsManifest {
+        // Build a minimal manifest that matches what `Supervisor::new`
+        // expects: an `external.vmlinux` entry with a platform row for
+        // the test runner's platform that resolves to `bin/vmlinux`,
+        // plus an `external.rootfs` entry resolving to the canonical
+        // capsule path so the Phase-8-Day-3 rootfs row is exercised
+        // alongside the kernel row.
+        let mut vmlinux_platforms = HashMap::new();
+        vmlinux_platforms.insert(
+            detect_platform(),
+            PlatformInfo {
+                url: Some("https://example.test/vmlinux".to_string()),
+                cid: None,
+                release_path: None,
+                checksum: Some("sha256:0123456789abcdef".to_string()),
+                extract_path: None,
+                install_path: Some("bin/vmlinux".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: Some(1234),
+                compression: Some("gzip".to_string()),
+            },
+        );
+        let mut rootfs_platforms = HashMap::new();
+        rootfs_platforms.insert(
+            detect_platform(),
+            PlatformInfo {
+                url: Some("https://example.test/rootfs.squashfs".to_string()),
+                cid: None,
+                release_path: None,
+                checksum: Some("sha256:fedcba9876543210".to_string()),
+                extract_path: None,
+                install_path: Some("capsules/ubuntu-base/rootfs.ext4".to_string()),
+                strategy: None,
+                source: None,
+                note: None,
+                size: Some(430985216),
+                compression: None,
+            },
+        );
+        let mut external = HashMap::new();
+        external.insert(
+            "vmlinux".to_string(),
+            Component {
+                version: None,
+                install_path: Some("bin/vmlinux".to_string()),
+                size_mb: None,
+                description: None,
+                platforms: vmlinux_platforms,
+            },
+        );
+        external.insert(
+            "rootfs".to_string(),
+            Component {
+                version: None,
+                install_path: Some("capsules/ubuntu-base/rootfs.ext4".to_string()),
+                size_mb: None,
+                description: None,
+                platforms: rootfs_platforms,
+            },
+        );
+
+        ComponentsManifest {
+            external,
+            capsules: HashMap::new(),
+            profiles: HashMap::new(),
+        }
+    }
+
+    fn report(data_dir: &Path, manifest: &ComponentsManifest, verbose: bool) -> String {
+        let mut buf = Vec::new();
+        print_report(&mut buf, data_dir, manifest, "test-platform", verbose).unwrap();
+        String::from_utf8(buf).expect("report output is utf-8")
+    }
+
+    // Phase 10.7 — Mac-only tests below assert on substrings produced by
+    // the full Vz-substrate-aware print_report (kernel rows, [absent]
+    // tags, install-path remediation hints). On Linux print_report is a
+    // stub that prints "vz substrate: not available on this platform";
+    // those assertions don't apply. A Linux-specific test below covers
+    // the stub output instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doctor_reports_absent_artifact_with_remediation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest = fixture_manifest();
+
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("vmlinux:"),
+            "expected a vmlinux row, got:\n{out}"
+        );
+        assert!(
+            out.contains("[absent]"),
+            "expected [absent] tag, got:\n{out}"
+        );
+        assert!(
+            out.contains("elastos setup --profile minimal"),
+            "expected remediation hint, got:\n{out}"
+        );
+        // state_dir / rootfs_cache_dir rows are still rendered even with
+        // no on-disk artifacts.
+        assert!(
+            out.contains("state_dir:"),
+            "expected state_dir row, got:\n{out}"
+        );
+        assert!(
+            out.contains("rootfs_cache_dir:"),
+            "expected rootfs_cache_dir row, got:\n{out}"
+        );
+    }
+
+    /// Phase 7 Day 6 — verify the quiet-subscriber pattern actually
+    /// suppresses INFO-level tracing events while letting WARN/ERROR
+    /// through. We re-build the same subscriber [`run`] installs, but
+    /// point its writer at an `Arc<Mutex<Vec<u8>>>` capture buffer so
+    /// the assertion is over what an operator would have seen on
+    /// stderr — not over implementation details like `max_level_hint`.
+    #[test]
+    fn doctor_quiet_subscriber_suppresses_info_logs_but_passes_warn() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        /// Minimal `MakeWriter` adapter over a shared byte buffer so
+        /// the test can assert on the formatted log lines the
+        /// subscriber would have emitted.
+        #[derive(Clone)]
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+        struct CaptureHandle(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CaptureHandle {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureHandle;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureHandle(self.0.clone())
+            }
+        }
+
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = CaptureWriter(buffer.clone());
+
+        // Mirror exactly what `build_quiet_subscriber` does, but with
+        // the capture writer instead of stderr. Any divergence in the
+        // shape of this subscriber from `build_quiet_subscriber` would
+        // be a test-only false negative, so this construction stays
+        // intentionally tight.
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(capture)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Mimic the supervisor's startup INFO line that bleeds
+            // into pre-Day-6 doctor output.
+            tracing::info!("vz: startup orphan-prune complete");
+            // A real warning that operators should still see.
+            tracing::warn!("doctor: substrate kernel checksum mismatch");
+        });
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone())
+            .expect("capture buffer should be valid utf-8");
+
+        assert!(
+            !captured.contains("startup orphan-prune"),
+            "Phase 7 Day 6: WARN subscriber should suppress INFO events, \
+             but the captured output contained the supervisor's startup \
+             INFO marker. Captured:\n{captured}"
+        );
+        assert!(
+            captured.contains("substrate kernel checksum mismatch"),
+            "Phase 7 Day 6: WARN-and-above events must still pass through \
+             — otherwise doctor would silently hide real problems. \
+             Captured:\n{captured}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doctor_reports_rootfs_with_remediation_when_absent() {
+        // Phase 8 Day 3 — the rootfs row is doctor's "are you ready
+        // to boot a Linux userspace inside Vz?" surface. When no
+        // capsule has been staged, doctor must say so clearly and
+        // point at `elastos setup --profile minimal` (same remediation
+        // string vmlinux/initrd use, since they all install under one
+        // command). This is the empty-data-dir state a fresh checkout
+        // would see.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest = fixture_manifest();
+
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("rootfs:"),
+            "expected a rootfs row, got:\n{out}"
+        );
+        // Path should be data_dir-relative (resolved through the
+        // manifest, not hard-coded), so the tmpdir prefix must be in
+        // the row to prove we're not falling back to a global path.
+        assert!(
+            out.contains("capsules/ubuntu-base/rootfs.ext4"),
+            "expected canonical rootfs install path, got:\n{out}"
+        );
+        // The first [absent] tag belongs to the vmlinux row; we want
+        // to make sure the rootfs row ALSO reports absent, not that
+        // any single absent marker exists. Easiest check: count two
+        // distinct absent markers across the report.
+        assert!(
+            out.matches("[absent]").count() >= 2,
+            "expected at least two [absent] rows (vmlinux + rootfs), got:\n{out}"
+        );
+        // Remediation hint must mention `elastos setup` so the
+        // operator has a single, actionable next step.
+        assert!(
+            out.contains("elastos setup --profile minimal"),
+            "expected remediation hint, got:\n{out}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doctor_reports_rootfs_present_with_size() {
+        // Phase 8 Day 3 — when the install loop has landed the
+        // squashfs at the canonical path, doctor reports it as
+        // present and shows the on-disk size. We don't run the
+        // kernel validator on rootfs (it's not a kernel), so
+        // `validate_as_kernel: false` means the row terminates
+        // after the size line — no validate stanza.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        std::fs::create_dir_all(data_dir.join("capsules/ubuntu-base")).unwrap();
+        // 2 KiB sentinel — large enough to test the human-bytes path
+        // ("2.0 KB") but small enough to keep the test fast.
+        std::fs::write(
+            data_dir.join("capsules/ubuntu-base/rootfs.ext4"),
+            vec![0u8; 2048],
+        )
+        .unwrap();
+
+        let manifest = fixture_manifest();
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("rootfs:"),
+            "expected a rootfs row, got:\n{out}"
+        );
+        // The rootfs-row's `[present]` marker must follow the
+        // `rootfs:` label. Locate the rootfs section explicitly
+        // because the report contains a `[present]` from vmlinux
+        // too on present runs.
+        let rootfs_section = out
+            .split_once("rootfs:")
+            .map(|(_, rest)| rest)
+            .expect("report should contain a rootfs section");
+        let next_section = rootfs_section
+            .find("state_dir:")
+            .expect("state_dir row should follow rootfs row");
+        let rootfs_section = &rootfs_section[..next_section];
+        assert!(
+            rootfs_section.contains("[present]"),
+            "expected [present] in rootfs section, got rootfs section:\n{rootfs_section}"
+        );
+        assert!(
+            rootfs_section.contains("2.0 KB"),
+            "expected human-bytes size in rootfs section, got rootfs section:\n{rootfs_section}"
+        );
+        // Rootfs row must NOT run the kernel validator — it's not a
+        // kernel. The validator output would be either
+        // `[validate] passes …` or `[validate FAIL] …`. Absence of
+        // the substring is the assertion.
+        assert!(
+            !rootfs_section.contains("[validate"),
+            "rootfs row must not invoke the kernel validator, got rootfs section:\n{rootfs_section}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn doctor_reports_present_artifact_with_size_and_verbose_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        std::fs::create_dir_all(data_dir.join("bin")).unwrap();
+        // Any non-empty placeholder is enough for the [present] branch.
+        // The kernel-signature validator will fail on this — we assert
+        // both [present] AND that the validate-FAIL message is rendered,
+        // which is the doctor surface that catches a corrupted artifact
+        // staged at the right path.
+        std::fs::write(
+            data_dir.join("bin/vmlinux"),
+            b"placeholder-not-a-real-kernel",
+        )
+        .unwrap();
+
+        let manifest = fixture_manifest();
+        let out = report(data_dir, &manifest, true);
+
+        assert!(
+            out.contains("[present]"),
+            "expected [present] tag, got:\n{out}"
+        );
+        assert!(
+            out.contains("[validate FAIL]"),
+            "expected guest-kernel validator to reject placeholder bytes, got:\n{out}"
+        );
+        // Verbose mode should echo the manifest URL/checksum/compression.
+        assert!(
+            out.contains("https://example.test/vmlinux"),
+            "expected verbose URL line, got:\n{out}"
+        );
+        assert!(
+            out.contains("compression: gzip"),
+            "expected verbose compression line, got:\n{out}"
+        );
+    }
+
+    // Phase 10.7 — Linux-side coverage for the print_report stub that
+    // replaces the Vz-substrate-aware report when this crate is built
+    // for Linux (where `elastos-vz` is target-gated out). Asserts that
+    // doctor exits 0, prints the header (platform + data_dir), and
+    // explains why no substrate rows follow.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn doctor_linux_stub_prints_not_available_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let manifest = fixture_manifest();
+        let out = report(data_dir, &manifest, false);
+
+        assert!(
+            out.contains("ElastOS doctor"),
+            "expected report header, got:\n{out}"
+        );
+        assert!(
+            out.contains("platform:"),
+            "expected platform line in header, got:\n{out}"
+        );
+        assert!(
+            out.contains("data_dir:"),
+            "expected data_dir line in header, got:\n{out}"
+        );
+        assert!(
+            out.contains("not available on this platform"),
+            "expected Mac-only notice line, got:\n{out}"
+        );
+        assert!(
+            out.contains("Mac-only"),
+            "expected Mac-only marker, got:\n{out}"
+        );
+    }
+}

@@ -100,6 +100,12 @@ impl Runtime {
                     capsule_id: pipes.capsule_id.clone(),
                     principal_id: pipes.principal_id.clone(),
                     data_dir: Some(data_dir.clone()),
+                    // WASM-stdio bridges do not currently use the
+                    // Phase 4 Day 6 termination observer (no
+                    // supervisor-driven `stop_capsule` waits on
+                    // them — they end with their child host
+                    // process). See `BridgeContext.on_terminate`.
+                    on_terminate: None,
                 };
                 crate::carrier_bridge::spawn_wasm_carrier_bridge(pipes, ctx);
             }));

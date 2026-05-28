@@ -22,6 +22,7 @@ mod share_cmd;
 mod shares_cmd;
 mod site_cmd;
 mod trust_cmd;
+mod vm_debug_cmd;
 mod webspace_cmd;
 
 use clap::{Parser, Subcommand};
@@ -436,6 +437,19 @@ enum Commands {
         list: bool,
     },
 
+    /// Inspect the substrate paths the runtime would launch with
+    ///
+    /// Read-only triage command. Reports the resolved kernel, initrd,
+    /// state_dir, and rootfs_cache_dir against the current data_dir +
+    /// components.json, flagging absent artifacts with the exact
+    /// remediation command to install them.
+    Doctor {
+        /// Include manifest metadata (URL, checksum, compression, size)
+        /// for each substrate artifact row.
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Manage trusted release sources
     #[command(subcommand)]
     Source(sources::SourceCommand),
@@ -496,6 +510,12 @@ enum Commands {
         #[arg(long)]
         rollback_to: Option<String>,
     },
+
+    /// Developer entry point: drive the Apple Silicon Vz backend
+    /// directly. macOS only — see `docs/MAC.md` and
+    /// `docs/vz-backend/PLAN.md` (Phase 2 Day 4).
+    #[command(name = "vm-debug", subcommand)]
+    VmDebug(vm_debug_cmd::VmDebugCommand),
 }
 
 #[derive(Subcommand)]
@@ -1030,11 +1050,19 @@ async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Initialize logging — uses ConditionalStderr so interactive VMs can suppress output.
+    //
+    // The extra `vm_console=info` directive opts the guest-kernel
+    // console target into the default filter so both the Linux
+    // (crosvm) and macOS (Vz) backends' `tracing::info!(target =
+    // "vm_console", …)` events are visible without forcing
+    // operators to set `RUST_LOG` by hand. `EnvFilter::from_default_env`
+    // still wins, so a user-provided `RUST_LOG` can override.
     tracing_subscriber::fmt()
         .with_writer(ConditionalStderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("elastos=info".parse().expect("valid tracing directive")),
+                .add_directive("elastos=info".parse().expect("valid tracing directive"))
+                .add_directive("vm_console=info".parse().expect("valid tracing directive")),
         )
         .init();
 
@@ -1081,6 +1109,14 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Publish { path } => {
             return capsule_publish_cmd::run_publish(path).await;
+        }
+
+        Commands::VmDebug(vm_debug) => {
+            // Phase 2 Day 4 (docs/vz-backend/PLAN.md). The
+            // subcommand itself decides whether the host is
+            // capable; here we just hand off so the typed error
+            // surface lives in one place.
+            return vm_debug_cmd::run(vm_debug).await;
         }
 
         Commands::Share {
@@ -1240,6 +1276,11 @@ async fn main() -> anyhow::Result<()> {
             list,
         } => {
             setup::run(profile, with, without, list).await?;
+        }
+
+        Commands::Doctor { verbose } => {
+            elastos_server::doctor_cmd::run(elastos_server::doctor_cmd::DoctorArgs { verbose })
+                .await?;
         }
 
         Commands::Source(cmd) => {
@@ -1645,16 +1686,16 @@ fn parse_tunnel_status_response(resp: serde_json::Value, op: &str) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("Invalid tunnel-provider {} response: {}", op, e))
 }
 
+fn tunnel_public_share_url(base_url: &str, cid: &str) -> String {
+    format!("{}/ipfs/{}/", base_url.trim_end_matches('/'), cid)
+}
+
 fn tunnel_status_detail(status: &TunnelStatus) -> String {
     status
         .last_log
         .as_deref()
         .map(|log| format!(" Last status: {}", log))
         .unwrap_or_default()
-}
-
-fn tunnel_public_share_url(base_url: &str, cid: &str) -> String {
-    format!("{}/ipfs/{}/", base_url.trim_end_matches('/'), cid)
 }
 
 async fn start_public_preview_tunnel(
@@ -1921,6 +1962,34 @@ pub(crate) async fn create_runtime(
         }
     }
 
+    // Add Apple Virtualization.framework provider on macOS. This is a
+    // SIBLING block to the crosvm registration above — it never
+    // executes on Linux (compiled out by `cfg(target_os = "macos")`)
+    // and the crosvm block above is byte-identical to the
+    // pre-Vz-backend commit. Per `docs/vz-backend/PLAN.md` Phase 1
+    // ("Linux-untouched gate"). Phase 1 wires the provider as a stub
+    // — every `load`/`start` call fails closed with the message in
+    // `elastos_vz::PHASE_1_STUB_MESSAGE`.
+    #[cfg(target_os = "macos")]
+    if elastos_vz::is_supported() {
+        match elastos_vz::VzProvider::new(elastos_vz::VzConfig::default()) {
+            Ok(provider) => {
+                if let Err(e) = provider.init().await {
+                    tracing::warn!("Failed to initialize vz provider: {}", e);
+                } else {
+                    tracing::info!(
+                        "vz provider enabled (Apple Virtualization.framework available; \
+                         Phase 1 stub — microVM launch fails closed)"
+                    );
+                    compute_providers.push(Arc::new(provider));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("vz provider not available: {}", e);
+            }
+        }
+    }
+
     Ok(Runtime::with_providers(
         storage,
         compute_providers,
@@ -1951,6 +2020,14 @@ mod tests {
 
     #[test]
     fn verify_component_binary_with_data_dir_verifies_installed_agent_binary() {
+        // Sibling to setup::tests::test_verify_installed_component_binary_*:
+        // the fixture's platforms-map key must match the host the
+        // test actually runs on, otherwise the production code's
+        // platform lookup returns "no platform entry for <host>"
+        // before it ever validates the checksum. Using
+        // `setup::detect_platform()` keeps the test exercising the
+        // SAME property on every host (Linux CI + local Mac).
+        let platform = elastos_server::setup::detect_platform();
         let data_dir = tempfile::tempdir().unwrap();
         let bin_dir = data_dir.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -1970,8 +2047,8 @@ mod tests {
     "agent": {{
       "install_path": "bin/agent",
       "platforms": {{
-        "linux-amd64": {{
-          "checksum": "{}",
+        "{platform}": {{
+          "checksum": "{checksum}",
           "url": "https://example.invalid/agent"
         }}
       }}
@@ -1979,7 +2056,6 @@ mod tests {
   }},
   "profiles": {{}}
 }}"#,
-                checksum
             )
         })
         .unwrap();

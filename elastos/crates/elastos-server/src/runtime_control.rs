@@ -322,6 +322,41 @@ fn home_runtime_coord_path(data_dir: &Path) -> PathBuf {
     data_dir.join("home-runtime-coords.json")
 }
 
+/// Portable PID liveness check.
+///
+/// Previously the codebase used `PathBuf::from(format!("/proc/{}", pid)).exists()`,
+/// which works on Linux but silently always returns `false` on macOS (no /proc).
+/// That caused `read_runtime_coords` to delete the coords file every time it was
+/// invoked on Darwin, which in turn made `elastos home` / `elastos chat` /
+/// gateway-launch paths time out waiting for a runtime that was actually alive.
+///
+/// `kill(pid, 0)` is the portable POSIX way: it returns 0 when the target exists
+/// and the caller can signal it, sets `ESRCH` when no such process exists, and
+/// sets `EPERM` when the process exists but the caller may not signal it (still
+/// alive from our perspective). Anything other than `ESRCH` means alive.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let pid_i32: libc::pid_t = match pid.try_into() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let ret = unsafe { libc::kill(pid_i32, 0) };
+        if ret == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative fallback: assume alive so we don't tear down a live
+        // runtime's coords. Implement a Win32 OpenProcess-based check when
+        // Windows support lands.
+        let _ = pid;
+        true
+    }
+}
+
 pub fn write_runtime_coords(path: &Path, coords: &RuntimeCoords) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -348,7 +383,7 @@ pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
         }
     };
 
-    if !PathBuf::from(format!("/proc/{}", coords.pid)).exists() {
+    if !pid_is_alive(coords.pid) {
         let _ = std::fs::remove_file(path);
         return None;
     }
@@ -432,19 +467,18 @@ async fn terminate_managed_chat_runtime(coords: &RuntimeCoords, coords_path: &Pa
         libc::kill(coords.pid as i32, libc::SIGTERM);
     }
 
-    let proc_path = PathBuf::from(format!("/proc/{}", coords.pid));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while proc_path.exists() && std::time::Instant::now() < deadline {
+    while pid_is_alive(coords.pid) && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[cfg(unix)]
-    if proc_path.exists() {
+    if pid_is_alive(coords.pid) {
         unsafe {
             libc::kill(coords.pid as i32, libc::SIGKILL);
         }
         let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while proc_path.exists() && std::time::Instant::now() < kill_deadline {
+        while pid_is_alive(coords.pid) && std::time::Instant::now() < kill_deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }

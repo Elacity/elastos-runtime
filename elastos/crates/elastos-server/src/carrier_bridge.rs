@@ -17,12 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::local_http::LoopbackHttpBaseUrl;
-use crate::provider_resource::build_capability_resource;
 use anyhow::{Context, Result};
-use elastos_common::localhost::{
-    is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
-    rooted_localhost_uri,
-};
+use elastos_common::localhost::rooted_localhost_uri;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use elastos_compute::providers::BridgePipes;
@@ -32,6 +28,175 @@ use elastos_runtime::provider::ProviderRegistry;
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
 
+/// Maximum byte length of a single Carrier-bridge framed line. Lines
+/// longer than this are dropped with a `request_too_large` error
+/// envelope written back to the guest. **Phase 10 Day 4-8**: hoisted
+/// from the two inline copies (microVM bridge loop + WASM bridge loop)
+/// into a single public constant so the fuzz harness and the bridge
+/// loops cannot drift.
+pub const CARRIER_MAX_LINE_BYTES: usize = 1_048_576;
+
+/// Typed parser result for the fuzz harness. The production bridge
+/// loops keep using `anyhow::Result` for source-line continuity; this
+/// enum exists so fuzz can distinguish a rejection-class from a true
+/// panic-class finding.
+#[derive(Debug)]
+pub enum CarrierFrameError {
+    /// Raw byte length exceeded `CARRIER_MAX_LINE_BYTES` before any
+    /// JSON parse was attempted. Production bridge writes back
+    /// `{"id":0,"type":"error","error":"request_too_large"}` and
+    /// continues; fuzz treats this as a clean rejection.
+    LineTooLarge { len: usize },
+    /// Raw bytes were not valid UTF-8. Production `read_line` produces
+    /// a `String` so this branch isn't reachable on the live host
+    /// path; surfaced here for fuzz coverage of the conversion.
+    InvalidUtf8(std::str::Utf8Error),
+    /// `serde_json::from_str` rejected the trimmed line.
+    InvalidJson(serde_json::Error),
+}
+
+/// **Phase 10 Day 4-8 — trust-boundary framing parser surface.**
+///
+/// Pure function that mirrors the framing + JSON-parse logic embedded
+/// in [`run_carrier_bridge_loop`] and [`spawn_wasm_carrier_bridge`].
+/// Exists solely so the fuzz harness at `fuzz/fuzz_targets/
+/// carrier_bridge_framing.rs` can exercise the parser with arbitrary
+/// bytes without spinning up an async runtime, a Unix socket, or a
+/// `BridgeContext`.
+///
+/// Semantics, in order:
+/// 1. If `bytes.len() > CARRIER_MAX_LINE_BYTES`: return
+///    `Err(LineTooLarge)` immediately — no JSON parse attempted.
+/// 2. If `bytes` is not valid UTF-8: return `Err(InvalidUtf8)`.
+/// 3. Trim leading/trailing ASCII whitespace per `str::trim`.
+/// 4. If the trimmed line is empty: return `Ok(None)` (production
+///    bridges skip these via `if line.trim().is_empty() { continue; }`).
+/// 5. Otherwise `serde_json::from_str(trimmed)` — on failure return
+///    `Err(InvalidJson)`, on success return `Ok(Some(value))`.
+///
+/// **Invariants the fuzz harness asserts on this function:**
+/// - It never panics.
+/// - For inputs longer than `CARRIER_MAX_LINE_BYTES` the function
+///   short-circuits and returns `Err(LineTooLarge)` without
+///   allocating proportional to input size.
+/// - The function is total: every byte slice produces either `Ok(_)`
+///   or `Err(_)`.
+pub fn parse_carrier_line(bytes: &[u8]) -> Result<Option<serde_json::Value>, CarrierFrameError> {
+    if bytes.len() > CARRIER_MAX_LINE_BYTES {
+        return Err(CarrierFrameError::LineTooLarge { len: bytes.len() });
+    }
+    let s = std::str::from_utf8(bytes).map_err(CarrierFrameError::InvalidUtf8)?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(CarrierFrameError::InvalidJson)?;
+    Ok(Some(value))
+}
+
+/// **Phase 10.5 M1 — byte-budgeted line reader.**
+///
+/// Reads bytes from `reader` into `buf` until either a newline
+/// is consumed (inclusive, matching [`tokio::io::AsyncBufReadExt::read_line`]
+/// shape) or `max_bytes` bytes have been buffered, whichever
+/// comes first. Returns the number of bytes pushed onto `buf`.
+///
+/// **Why it exists:** `BufReader::read_line` is unbounded. A
+/// guest writing `b"A" * 10_000_000_000` without a `\n` would
+/// grow the receiving `String` until the host runs out of
+/// memory — the post-read length check in
+/// [`run_carrier_bridge_loop`] fires *after* the allocation has
+/// already happened, which is too late.
+///
+/// **Calling convention:** callers pass `CARRIER_MAX_LINE_BYTES + 1`
+/// (note the +1 headroom) so the post-read check `n > CARRIER_MAX_LINE_BYTES`
+/// fires without truncating an attacker-supplied payload mid-byte.
+/// This +1 headroom convention is the contract between this helper and
+/// the bridge loop's oversized-line handler.
+///
+/// **Semantics:**
+/// - On EOF before any byte: returns `Ok(0)`.
+/// - On newline within `max_bytes`: returns `Ok(n)` with the
+///   newline included in `buf`.
+/// - On reaching `max_bytes` without a newline: returns
+///   `Ok(max_bytes)`; the caller must call [`drain_to_newline`]
+///   to resync the stream to the start of the next line.
+///
+/// Memory footprint: bounded by `max_bytes` (size of `buf` on
+/// successful return) plus the inner `BufReader`'s 8 KiB
+/// internal scratch — constant in the size of attacker input.
+async fn read_line_byte_budgeted<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<usize>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut total = 0usize;
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(total);
+            }
+            let remaining = max_bytes.saturating_sub(total);
+            let take = chunk.len().min(remaining);
+            let scan = &chunk[..take];
+            if let Some(pos) = scan.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&scan[..=pos]);
+                (pos + 1, true)
+            } else {
+                buf.extend_from_slice(scan);
+                (take, false)
+            }
+        };
+        reader.consume(consumed);
+        total += consumed;
+        if found_newline {
+            return Ok(total);
+        }
+        if total >= max_bytes {
+            return Ok(total);
+        }
+    }
+}
+
+/// **Phase 10.5 M1 — resync helper.**
+///
+/// Discard bytes from `reader` until the next `\n` is consumed
+/// or EOF. Memory footprint is O(internal `BufReader` buffer
+/// size) — bytes are scanned then consumed, never accumulated.
+///
+/// Called by [`run_carrier_bridge_loop`] after an oversized
+/// line is detected, so the next iteration starts on a clean
+/// line boundary. If the producer never sends a newline, the
+/// function loops until the underlying stream closes (EOF);
+/// memory remains O(1) the entire time.
+async fn drain_to_newline<R>(reader: &mut R) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let (consumed, found_newline) = {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                (pos + 1, true)
+            } else {
+                (chunk.len(), false)
+            }
+        };
+        reader.consume(consumed);
+        if found_newline {
+            return Ok(());
+        }
+    }
+}
+
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
 pub struct BridgeContext {
@@ -40,18 +205,43 @@ pub struct BridgeContext {
     pub pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     /// Capsule identity for token minting (session ID or capsule name)
     pub capsule_id: String,
-    /// Runtime principal used to resolve capsule-facing `Users/self` aliases.
+    /// Principal granting the launch (when shell-mediated). When set, the
+    /// bridge scopes localhost-fs `current-user` aliases to the principal's
+    /// rooted home (Phase 8 Day 6 — principal-aware localhost paths).
     pub principal_id: Option<String>,
-    /// Runtime data directory used by protected principal-root storage helpers.
+    /// Data dir for resolving principal-rooted localhost FS paths. When
+    /// `None`, principal-scoped reads/writes fall back to the legacy
+    /// flat-rooted layout (Phase 8 Day 6).
     pub data_dir: Option<PathBuf>,
+    /// Optional bridge-termination observer. **Phase 4 Day 6.**
+    ///
+    /// When set, [`run_carrier_bridge_loop`] calls
+    /// `notify.notify_waiters()` on EVERY exit path (EOF, read
+    /// error, write error, oversized-line teardown) before
+    /// returning. Lets the supervisor's `stop_capsule` await
+    /// the bridge's natural termination after `vm.stop()`
+    /// resolves, rather than relying on send-and-pray
+    /// observability.
+    ///
+    /// `None` for legacy callers (Linux crosvm bridges,
+    /// WASM-stdio bridges) where lifecycle observation is not
+    /// wired today.
+    pub on_terminate: Option<Arc<tokio::sync::Notify>>,
 }
 
-/// Spawn a Carrier bridge handler for a microVM capsule.
+/// Spawn a Carrier bridge handler for a microVM capsule on a
+/// **path** (Linux / crosvm flow).
 ///
-/// Listens on a Unix socket that crosvm serial port 2 connects to.
-/// Must be called BEFORE starting the VM so the socket exists when crosvm launches.
-/// Reads `RequestEnvelope` JSON lines, dispatches to providers,
-/// writes `ResponseEnvelope` JSON lines back.
+/// Binds a Unix listener that crosvm's `--serial type=unix-stream`
+/// connects to at VM start, then hands the accepted stream into
+/// the shared bridge loop. Must be called BEFORE starting the
+/// VM so the socket exists when crosvm launches.
+///
+/// macOS / Vz capsules use [`spawn_carrier_bridge_on_stream`]
+/// instead, because the host endpoint comes directly from a
+/// `socketpair(AF_UNIX, SOCK_STREAM)` carrier-console attachment
+/// — there is no listener to bind. The shared bridge loop is
+/// the same.
 pub async fn spawn_carrier_bridge(
     socket_path: &Path,
     _provider_registry: Arc<ProviderRegistry>,
@@ -65,7 +255,6 @@ pub async fn spawn_carrier_bridge(
         .context("Failed to bind microVM Carrier bridge socket")?;
 
     let socket_display = socket_path.display().to_string();
-    let ctx = bridge_ctx;
 
     // Accept one bidirectional connection in background — crosvm connects when
     // the VM boots. The supported contract is a single `unix-stream` socket
@@ -82,66 +271,163 @@ pub async fn spawn_carrier_bridge(
             "Carrier microVM bridge: bidirectional connection accepted for {}",
             socket_display
         );
-        let (reader, mut writer) = stream.into_split();
-        const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB — prevent OOM from malicious guest
-        let mut reader = BufReader::new(reader);
-
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF — guest shut down
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Carrier bridge read error: {}", e);
-                    break;
-                }
-            }
-
-            if line.len() > MAX_LINE_BYTES {
-                tracing::warn!(
-                    "Carrier bridge: oversized line ({} bytes), dropping",
-                    line.len()
-                );
-                let error = serde_json::json!({
-                    "id": 0,
-                    "type": "error",
-                    "error": "request_too_large"
-                });
-                let _ = writer.write_all(error.to_string().as_bytes()).await;
-                let _ = writer.write_all(b"\n").await;
-                let _ = writer.flush().await;
-                continue;
-            }
-
-            tracing::debug!("[serial-bridge] → {}", line.trim());
-            let response = match handle_request(&line, &ctx).await {
-                Ok(resp) => {
-                    tracing::debug!("[serial-bridge] ← {}", resp);
-                    resp
-                }
-                Err(e) => {
-                    tracing::warn!("[serial-bridge] error: {}", e);
-                    serde_json::json!({
-                        "id": 0,
-                        "response": {"type": "error", "code": "bridge_error", "message": e.to_string()}
-                    })
-                }
-            };
-
-            let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
-            bytes.push(b'\n');
-            if writer.write_all(&bytes).await.is_err() {
-                break;
-            }
-            if writer.flush().await.is_err() {
-                break;
-            }
-        }
-        tracing::info!("Carrier bridge closed for {}", socket_display);
+        run_carrier_bridge_loop(stream, bridge_ctx, socket_display).await;
     });
 
     Ok(())
+}
+
+/// Spawn a Carrier bridge handler on an **already-connected**
+/// `tokio::net::UnixStream` — **Phase 3 Day 4** entry point for
+/// the macOS / Vz flow.
+///
+/// On Mac, the host endpoint of the Carrier console is the
+/// host-side fd of a `socketpair(AF_UNIX, SOCK_STREAM)` set up
+/// by `elastos-vz::ffi::console::build_carrier_console_slot`.
+/// The supervisor takes that fd via `RunningVm::take_carrier_host_fd`,
+/// converts it to a `tokio::net::UnixStream`, and hands it to
+/// this function — no listener / bind / accept needed.
+///
+/// The bridge dispatch loop is byte-identical to
+/// [`spawn_carrier_bridge`]; only the connection-acquisition
+/// half differs.
+pub fn spawn_carrier_bridge_on_stream(
+    stream: tokio::net::UnixStream,
+    _provider_registry: Arc<ProviderRegistry>,
+    _session_token: String,
+    bridge_ctx: Option<BridgeContext>,
+    label: String,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            "Carrier microVM bridge: pre-connected stream attached for {}",
+            label
+        );
+        run_carrier_bridge_loop(stream, bridge_ctx, label).await;
+    });
+}
+
+/// Shared per-connection bridge dispatch loop. Reads newline
+/// delimited JSON `RequestEnvelope`s off the supplied stream,
+/// dispatches them through `bridge_ctx` providers, and writes
+/// `ResponseEnvelope`s back on the same stream.
+///
+/// `label` is a human-readable identifier used in trace log
+/// lines (socket path on Linux, capsule handle on Mac).
+async fn run_carrier_bridge_loop(
+    stream: tokio::net::UnixStream,
+    ctx: Option<BridgeContext>,
+    label: String,
+) {
+    // Phase 4 Day 6: stash the termination observer up front
+    // so every exit path can fire it without re-matching on
+    // `ctx`.
+    let on_terminate = ctx.as_ref().and_then(|c| c.on_terminate.clone());
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    // Phase 10.5 M1: the framed-line read is byte-budgeted at
+    // `CARRIER_MAX_LINE_BYTES + 1`. Pre-Phase-10.5 this was
+    // `read_line(&mut line)`, which is unbounded — a guest could
+    // grow the host's `String` to multi-GiB before the post-read
+    // length check fired (which was too late by then). The new
+    // helper allocates at most `CARRIER_MAX_LINE_BYTES + 1`
+    // bytes; the `+1` headroom lets the post-read check below
+    // distinguish "exactly at limit" from "over limit" without
+    // truncating attacker-supplied payloads mid-byte.
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut line = String::new();
+    loop {
+        buf.clear();
+        line.clear();
+        let n = match read_line_byte_budgeted(&mut reader, &mut buf, CARRIER_MAX_LINE_BYTES + 1)
+            .await
+        {
+            Ok(0) => break, // EOF — guest shut down
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!("Carrier bridge read error: {}", e);
+                break;
+            }
+        };
+
+        if n > CARRIER_MAX_LINE_BYTES {
+            tracing::warn!(
+                "Carrier bridge: oversized line ({} bytes, cap {}), dropping and resyncing",
+                n,
+                CARRIER_MAX_LINE_BYTES
+            );
+            // Resync the stream to the next line boundary so a
+            // subsequent well-formed request is dispatched
+            // cleanly. `drain_to_newline` is O(1) memory.
+            if let Err(e) = drain_to_newline(&mut reader).await {
+                tracing::debug!("Carrier bridge drain-after-overflow error: {}", e);
+                break;
+            }
+            let error = serde_json::json!({
+                "id": 0,
+                "type": "error",
+                "error": "request_too_large"
+            });
+            let _ = writer.write_all(error.to_string().as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+            continue;
+        }
+
+        // Convert to UTF-8. `read_line` previously enforced this
+        // implicitly via its `&mut String` signature; we replicate
+        // the behaviour explicitly so a non-UTF-8 framed line
+        // does not break the loop — log and continue, matching
+        // the pre-Phase-10.5 read-error path semantics.
+        match std::str::from_utf8(&buf) {
+            Ok(s) => line.push_str(s),
+            Err(e) => {
+                tracing::warn!(
+                    "Carrier bridge: framed line is not valid UTF-8: {} (dropping)",
+                    e
+                );
+                continue;
+            }
+        }
+
+        tracing::debug!("[serial-bridge] → {}", line.trim());
+        let response = match handle_request(&line, &ctx).await {
+            Ok(resp) => {
+                tracing::debug!("[serial-bridge] ← {}", resp);
+                resp
+            }
+            Err(e) => {
+                tracing::warn!("[serial-bridge] error: {}", e);
+                serde_json::json!({
+                    "id": 0,
+                    "response": {"type": "error", "code": "bridge_error", "message": e.to_string()}
+                })
+            }
+        };
+
+        let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
+        bytes.push(b'\n');
+        if writer.write_all(&bytes).await.is_err() {
+            break;
+        }
+        if writer.flush().await.is_err() {
+            break;
+        }
+    }
+    tracing::info!("Carrier bridge closed for {}", label);
+
+    // Phase 4 Day 6: fire the termination observer (if wired)
+    // on EVERY loop exit so the supervisor's `stop_capsule`
+    // can await natural bridge teardown deterministically.
+    // `notify_waiters()` is fire-and-forget — if no one is
+    // listening, the signal is dropped (the post-stop poll
+    // uses a bounded `tokio::time::timeout` either way, so a
+    // missed signal degrades to a best-effort warn).
+    if let Some(notify) = on_terminate {
+        notify.notify_waiters();
+    }
 }
 
 /// Spawn a Carrier bridge for a WASM capsule.
@@ -163,8 +449,6 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
             let mut writer = pipes.capsule_stdin;
             let ctx = Some(ctx);
 
-            const MAX_LINE_BYTES: usize = 1_048_576; // 1 MB
-
             for line_result in reader.lines() {
                 let line = match line_result {
                     Ok(l) => l,
@@ -178,7 +462,7 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
                     continue;
                 }
 
-                if line.len() > MAX_LINE_BYTES {
+                if line.len() > CARRIER_MAX_LINE_BYTES {
                     tracing::warn!("WASM bridge: oversized line ({} bytes), dropping", line.len());
                     let error = serde_json::json!({"id":0,"type":"error","error":"request_too_large"});
                     let _ = writeln!(writer, "{}", error);
@@ -226,7 +510,6 @@ pub fn spawn_wasm_carrier_bridge(pipes: BridgePipes, ctx: BridgeContext) {
 /// host-side bridge performs the HTTP calls.
 pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: String) {
     let tokio_handle = tokio::runtime::Handle::current();
-    let principal_id = pipes.principal_id.clone();
 
     if let Err(e) = std::thread::Builder::new()
         .name("wasm-api-bridge".into())
@@ -250,7 +533,7 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
                 }
 
                 let response = tokio_handle.block_on(async {
-                    match handle_remote_request(&line, &api_url, &client_token, principal_id.as_deref()).await {
+                    match handle_remote_request(&line, &api_url, &client_token).await {
                         Ok(resp) => {
                             tracing::debug!("[wasm-api-bridge] → {}", line.trim());
                             tracing::debug!("[wasm-api-bridge] ← {}", resp);
@@ -282,6 +565,45 @@ pub fn spawn_wasm_api_bridge(pipes: BridgePipes, api_url: String, client_token: 
     }
 }
 
+/// Build the capability resource string from scheme, op, and request body.
+///
+/// For `localhost`: uses `body.path` which may be a full URI or a rooted local
+/// path like `Users/self/.AppData/LocalHost/Chat/channels.json`.
+/// Rootless bare paths are rejected by returning an invalid localhost resource,
+/// which makes capability validation fail closed.
+/// For `did`/`peer`: uses `elastos://scheme/*` (wildcard, matching how tokens are granted).
+/// For `ai`: uses backend-specific path matching the HTTP handler's logic.
+fn build_capability_resource(scheme: &str, op: &str, body: &serde_json::Value) -> String {
+    match scheme {
+        "localhost" => {
+            match body
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.is_empty())
+            {
+                Some(p) => {
+                    rooted_localhost_uri(p).unwrap_or_else(|| "localhost://INVALID".to_string())
+                }
+                None => "localhost://INVALID".to_string(),
+            }
+        }
+        "ai" => {
+            let backend = body.get("backend").and_then(|v| v.as_str());
+            match backend {
+                Some(b)
+                    if b.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+                {
+                    format!("elastos://ai/{}/{}", b, op)
+                }
+                _ => format!("elastos://ai/meta/{}", op),
+            }
+        }
+        "did" | "peer" => format!("elastos://{}/*", scheme),
+        _ => format!("{}://*", scheme),
+    }
+}
+
 /// Parse an action string into a capability Action.
 /// Returns None for unrecognized actions instead of silently defaulting.
 fn parse_action(s: &str) -> Option<elastos_runtime::capability::Action> {
@@ -297,352 +619,6 @@ fn parse_action(s: &str) -> Option<elastos_runtime::capability::Action> {
     })
 }
 
-fn is_runtime_control_request(request_type: &str) -> bool {
-    matches!(
-        request_type,
-        "list_capsules"
-            | "launch_capsule"
-            | "stop_capsule"
-            | "grant_capability"
-            | "revoke_capability"
-            | "send_message"
-            | "receive_messages"
-            | "fetch_content"
-            | "storage_read"
-            | "storage_write"
-            | "provider_call"
-    )
-}
-
-struct CarrierInvokeDispatch {
-    scheme: String,
-    operation: String,
-    request: serde_json::Value,
-    resource: String,
-}
-
-fn carrier_invoke_dispatch(
-    request: &serde_json::Value,
-    principal_id: Option<&str>,
-) -> Result<CarrierInvokeDispatch, String> {
-    let uri = request["uri"]
-        .as_str()
-        .ok_or_else(|| "carrier_invoke missing uri".to_string())?;
-    if !is_supported_resource_scheme(uri) {
-        return Err("carrier URI must use elastos:// or localhost://".to_string());
-    }
-    if is_system_only_backend_resource(uri) {
-        return Err("system backends are not app capabilities; use elastos://content".to_string());
-    }
-    let uri = scope_current_user_alias(uri, principal_id)?;
-
-    let operation = request["operation"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "carrier_invoke missing operation".to_string())?
-        .to_string();
-
-    let scheme = provider_scheme_for_carrier_uri(&uri)?;
-    let mut body = request
-        .get("body")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    if scheme == "localhost" {
-        let path = match body.get("path").and_then(|value| value.as_str()) {
-            Some(path) => scope_current_user_alias(path, principal_id)?,
-            None => uri.to_string(),
-        };
-        body["path"] = serde_json::Value::String(path);
-    }
-    if scheme == "chain" && body.get("network").is_none() {
-        if let Some(network) = uri
-            .strip_prefix("elastos://chain/")
-            .and_then(|rest| rest.split('/').next())
-            .filter(|network| !network.is_empty() && *network != "meta")
-        {
-            body["network"] = serde_json::Value::String(network.to_string());
-        }
-    }
-    if scheme == "wallet" && operation == "request_signature" {
-        if let Some((chain_namespace, intent)) = wallet_signature_parts_from_uri(&uri) {
-            if body.get("chain_namespace").is_none() {
-                body["chain_namespace"] = serde_json::Value::String(chain_namespace);
-            }
-            if body.get("intent").is_none() {
-                body["intent"] = serde_json::Value::String(intent);
-            }
-        }
-    }
-
-    let resource = build_capability_resource(&scheme, &operation, &body)?;
-    body["op"] = serde_json::Value::String(operation.clone());
-
-    Ok(CarrierInvokeDispatch {
-        scheme,
-        operation,
-        request: body,
-        resource,
-    })
-}
-
-fn protected_principal_root_carrier_response(
-    bridge_ctx: &BridgeContext,
-    operation: &str,
-    request: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let rooted = principal_root_read_write_uri(operation, request)?;
-
-    let Some(principal_id) = bridge_ctx.principal_id.as_deref() else {
-        return Some(carrier_error_response(
-            "principal_context_required",
-            "localhost://Users requires a principal-scoped launch context",
-        ));
-    };
-    let localhost_root = crate::auth::principal_localhost_root(principal_id);
-    if rooted != localhost_root && !rooted.starts_with(&format!("{localhost_root}/")) {
-        return Some(carrier_error_response(
-            "principal_context_required",
-            "localhost://Users roots must use Users/self or the active principal root",
-        ));
-    }
-    let Some(data_dir) = bridge_ctx.data_dir.as_deref() else {
-        return Some(carrier_error_response(
-            "principal_context_required",
-            "principal-root storage requires a local runtime data directory",
-        ));
-    };
-
-    match crate::auth::load_principal_root_protection(data_dir, principal_id, &localhost_root) {
-        Ok(Some(_)) => {}
-        Ok(None) => return None,
-        Err(err) => {
-            return Some(carrier_error_response(
-                "principal_root_protection_invalid",
-                &err.to_string(),
-            ));
-        }
-    }
-
-    let Some(path) = rooted_localhost_fs_path(data_dir, &rooted) else {
-        return Some(carrier_error_response(
-            "invalid_localhost_path",
-            "invalid principal-root object path",
-        ));
-    };
-
-    match operation {
-        "read" => {
-            let bytes = match crate::auth::read_principal_root_object(
-                data_dir,
-                principal_id,
-                &localhost_root,
-                &rooted,
-                &path,
-            ) {
-                Ok(bytes) => bytes,
-                Err(err) => return Some(provider_error_result("read_failed", &err.to_string())),
-            };
-            let bytes = apply_read_window(
-                bytes,
-                request.get("offset").and_then(|value| value.as_u64()),
-                request.get("length").and_then(|value| value.as_u64()),
-            );
-            Some(provider_ok_result(serde_json::json!({
-                "content": bytes,
-                "size": bytes.len(),
-            })))
-        }
-        "write" => {
-            let content = match request_content_bytes(request) {
-                Ok(content) => content,
-                Err(message) => return Some(carrier_error_response("invalid_content", &message)),
-            };
-            let append = request
-                .get("append")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            let bytes = if append && path.is_file() {
-                match crate::auth::read_principal_root_object(
-                    data_dir,
-                    principal_id,
-                    &localhost_root,
-                    &rooted,
-                    &path,
-                ) {
-                    Ok(mut existing) => {
-                        existing.extend_from_slice(&content);
-                        existing
-                    }
-                    Err(err) => {
-                        return Some(provider_error_result("read_failed", &err.to_string()))
-                    }
-                }
-            } else {
-                content.clone()
-            };
-            match crate::auth::write_principal_root_object(
-                data_dir,
-                principal_id,
-                &localhost_root,
-                &rooted,
-                &path,
-                &bytes,
-            ) {
-                Ok(()) => Some(provider_ok_result(serde_json::json!({
-                    "bytes_written": content.len(),
-                }))),
-                Err(err) => Some(provider_error_result("write_failed", &err.to_string())),
-            }
-        }
-        _ => None,
-    }
-}
-
-fn principal_root_read_write_uri(operation: &str, request: &serde_json::Value) -> Option<String> {
-    if !matches!(operation, "read" | "write") {
-        return None;
-    }
-    let object_uri = request
-        .get("path")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let rooted = rooted_localhost_uri(object_uri)?;
-    rooted.starts_with("localhost://Users/").then_some(rooted)
-}
-
-fn request_content_bytes(request: &serde_json::Value) -> Result<Vec<u8>, String> {
-    let Some(value) = request.get("content") else {
-        return Err("write request missing content".to_string());
-    };
-    if let Some(text) = value.as_str() {
-        return Ok(text.as_bytes().to_vec());
-    }
-    serde_json::from_value::<Vec<u8>>(value.clone())
-        .map_err(|err| format!("write content must be bytes or string: {err}"))
-}
-
-fn apply_read_window(bytes: Vec<u8>, offset: Option<u64>, length: Option<u64>) -> Vec<u8> {
-    let start = offset.unwrap_or(0) as usize;
-    if start >= bytes.len() {
-        return Vec::new();
-    }
-    let end = match length {
-        Some(length) => start.saturating_add(length as usize).min(bytes.len()),
-        None => bytes.len(),
-    };
-    bytes[start..end].to_vec()
-}
-
-fn provider_ok_result(data: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "type": "carrier_result",
-        "result": {
-            "status": "ok",
-            "data": data,
-        },
-    })
-}
-
-fn provider_error_result(code: &str, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "carrier_result",
-        "result": {
-            "status": "error",
-            "code": code,
-            "message": message,
-        },
-    })
-}
-
-fn carrier_error_response(code: &str, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "error",
-        "code": code,
-        "message": message,
-    })
-}
-
-fn scope_current_user_alias(
-    uri_or_resource: &str,
-    principal_id: Option<&str>,
-) -> Result<String, String> {
-    let Some(rooted) = rooted_localhost_uri(uri_or_resource) else {
-        return Ok(uri_or_resource.to_string());
-    };
-
-    if is_unscoped_current_user_alias(&rooted) {
-        let Some(principal_id) = principal_id else {
-            return Err(
-                "localhost://Users/self requires a principal-scoped launch context".to_string(),
-            );
-        };
-        let principal_root = crate::auth::principal_localhost_root(principal_id);
-        if rooted == "localhost://Users/self" {
-            return Ok(principal_root);
-        }
-        let rest = rooted
-            .strip_prefix("localhost://Users/self/")
-            .ok_or_else(|| format!("Invalid current-user alias: {uri_or_resource}"))?;
-        return Ok(format!("{principal_root}/{rest}"));
-    }
-
-    if rooted.starts_with("localhost://Users/") {
-        let Some(principal_id) = principal_id else {
-            return Err("localhost://Users requires a principal-scoped launch context".to_string());
-        };
-        let principal_root = crate::auth::principal_localhost_root(principal_id);
-        if rooted == principal_root || rooted.starts_with(&format!("{principal_root}/")) {
-            return Ok(rooted);
-        }
-        return Err(
-            "localhost://Users roots must use Users/self or the active principal root".to_string(),
-        );
-    }
-
-    Ok(rooted)
-}
-
-fn is_unscoped_current_user_alias(uri_or_resource: &str) -> bool {
-    let Some(rooted) = rooted_localhost_uri(uri_or_resource) else {
-        return false;
-    };
-    rooted == "localhost://Users/self" || rooted.starts_with("localhost://Users/self/")
-}
-
-fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
-    if uri.starts_with("localhost://") {
-        if rooted_localhost_uri(uri).is_none() {
-            return Err(format!("Invalid rooted localhost URI: {}", uri));
-        }
-        return Ok("localhost".to_string());
-    }
-
-    let rest = uri
-        .strip_prefix("elastos://")
-        .ok_or_else(|| "carrier URI must use elastos:// or localhost://".to_string())?;
-    let scheme = rest
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "elastos URI missing provider".to_string())?;
-    Ok(scheme.to_string())
-}
-
-fn wallet_signature_parts_from_uri(uri: &str) -> Option<(String, String)> {
-    let mut segments = uri.strip_prefix("elastos://wallet/")?.split('/');
-    let chain_namespace = segments.next()?.trim();
-    let sign_segment = segments.next()?.trim();
-    let intent = segments.next()?.trim();
-    if chain_namespace.is_empty()
-        || sign_segment != "sign"
-        || intent.is_empty()
-        || segments.next().is_some()
-    {
-        return None;
-    }
-    Some((chain_namespace.to_string(), intent.to_string()))
-}
-
 /// Handle a single request from the guest capsule.
 async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde_json::Value> {
     let envelope: serde_json::Value =
@@ -653,34 +629,28 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
     let request_type = request["type"].as_str().unwrap_or("");
 
     let response = match request_type {
-        "carrier_invoke" => {
+        "provider_call" => {
             let bridge_ctx = ctx
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no bridge context"))?;
 
+            let scheme = request["scheme"].as_str().unwrap_or("");
+            let op = request["op"].as_str().unwrap_or("");
             let token_b64 = request["token"].as_str().unwrap_or("");
-            let dispatch =
-                match carrier_invoke_dispatch(request, bridge_ctx.principal_id.as_deref()) {
-                    Ok(dispatch) => dispatch,
-                    Err(message) => {
-                        return Ok(serde_json::json!({
-                            "id": id,
-                            "response": {
-                                "type": "error",
-                                "code": "invalid_carrier_invoke",
-                                "message": message,
-                            }
-                        }));
-                    }
-                };
 
             // Validate capability token before dispatching to provider.
             // The guest SDK sends the token it received from request_capability.
+            // Resource is built from scheme+op matching the HTTP handler's logic.
             if !token_b64.is_empty() {
                 use elastos_runtime::capability::token::{CapabilityToken, ResourceId};
                 match CapabilityToken::from_base64(token_b64) {
                     Ok(token) => {
-                        let resource_id = ResourceId::new(&dispatch.resource);
+                        let body = request
+                            .get("body")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
+                        let resource = build_capability_resource(scheme, op, &body);
+                        let resource_id = ResourceId::new(&resource);
                         if bridge_ctx
                             .capability_manager
                             .validate(
@@ -721,38 +691,25 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                     "response": {
                         "type": "error",
                         "code": "missing_token",
-                        "message": "carrier_invoke requires a capability token",
+                        "message": "provider_call requires a capability token",
                     }
                 }));
             }
 
-            if let Some(response) = protected_principal_root_carrier_response(
-                bridge_ctx,
-                &dispatch.operation,
-                &dispatch.request,
-            ) {
-                return Ok(serde_json::json!({
-                    "id": id,
-                    "response": response,
-                }));
-            }
+            let body = request
+                .get("body")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let mut req = body;
+            req["op"] = serde_json::Value::String(op.to_string());
 
-            match bridge_ctx
-                .provider_registry
-                .send_raw(&dispatch.scheme, &dispatch.request)
-                .await
-            {
+            match bridge_ctx.provider_registry.send_raw(scheme, &req).await {
                 Ok(result) => serde_json::json!({
-                    "type": "carrier_result",
+                    "type": "provider_result",
                     "result": result,
                 }),
                 Err(e) => {
-                    tracing::warn!(
-                        "Bridge carrier_invoke failed for {}/{}: {}",
-                        dispatch.scheme,
-                        dispatch.operation,
-                        e
-                    );
+                    tracing::warn!("Bridge provider_call failed for {}/{}: {}", scheme, op, e);
                     serde_json::json!({
                         "type": "error",
                         "code": "provider_error",
@@ -767,41 +724,6 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
             let action_str = request["action"].as_str().unwrap_or("execute");
 
             if let Some(ctx) = ctx {
-                if !is_supported_resource_scheme(resource) {
-                    return Ok(serde_json::json!({
-                        "id": id,
-                        "response": {
-                            "type": "error",
-                            "code": "unsupported_resource",
-                            "message": "capability resources must use elastos:// or localhost://",
-                        },
-                    }));
-                }
-                if is_system_only_backend_resource(resource) {
-                    return Ok(serde_json::json!({
-                        "id": id,
-                        "response": {
-                            "type": "error",
-                            "code": "system_backend_denied",
-                            "message": "system backends are not app capabilities; use elastos://content",
-                        },
-                    }));
-                }
-                let scoped_resource =
-                    match scope_current_user_alias(resource, ctx.principal_id.as_deref()) {
-                        Ok(resource) => resource,
-                        Err(message) => {
-                            return Ok(serde_json::json!({
-                                "id": id,
-                                "response": {
-                                    "type": "error",
-                                    "code": "principal_context_required",
-                                    "message": message,
-                                },
-                            }));
-                        }
-                    };
-                let resource = scoped_resource.as_str();
                 let action = match parse_action(action_str) {
                     Some(a) => a,
                     None => {
@@ -944,12 +866,6 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
             "capsule_count": 0,
         }),
 
-        request_type if is_runtime_control_request(request_type) => serde_json::json!({
-            "type": "error",
-            "code": "not_capsule_kernel_abi",
-            "message": format!("{} is not exposed through the capsule kernel ABI", request_type),
-        }),
-
         _ => serde_json::json!({
             "type": "error",
             "code": "unknown_request",
@@ -973,7 +889,6 @@ async fn handle_remote_request(
     line: &str,
     api_url: &str,
     client_token: &str,
-    principal_id: Option<&str>,
 ) -> Result<serde_json::Value> {
     let api_base = LoopbackHttpBaseUrl::parse(api_url).map_err(|e| {
         anyhow::anyhow!(
@@ -991,52 +906,27 @@ async fn handle_remote_request(
     let client = reqwest::Client::new();
 
     let response = match request_type {
-        "carrier_invoke" => {
-            let dispatch = match carrier_invoke_dispatch(request, principal_id) {
-                Ok(dispatch) => dispatch,
-                Err(message) => {
-                    return Ok(serde_json::json!({
-                        "id": id,
-                        "response": {
-                            "type": "error",
-                            "code": "invalid_carrier_invoke",
-                            "message": message,
-                        }
-                    }));
-                }
-            };
+        "provider_call" => {
+            let scheme = request["scheme"].as_str().unwrap_or("");
+            let op = request["op"].as_str().unwrap_or("");
+            let body = request
+                .get("body")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
             let cap_token = request["token"].as_str().unwrap_or("");
 
-            if principal_root_read_write_uri(&dispatch.operation, &dispatch.request).is_some() {
-                return Ok(serde_json::json!({
-                    "id": id,
-                    "response": carrier_error_response(
-                        "principal_context_required",
-                        "principal-root storage requires an in-runtime protected storage bridge",
-                    ),
-                }));
-            }
-
             tracing::debug!(
-                "[wasm-api-bridge] carrier_invoke {}/{} token={} body={}",
-                dispatch.scheme,
-                dispatch.operation,
+                "[wasm-api-bridge] provider_call {}/{} token={} body={}",
+                scheme,
+                op,
                 !cap_token.is_empty(),
-                &dispatch
-                    .request
-                    .to_string()
-                    .chars()
-                    .take(150)
-                    .collect::<String>()
+                &body.to_string().chars().take(150).collect::<String>()
             );
 
             let mut req = client
-                .post(api_base.join(&format!(
-                    "/api/provider/{}/{}",
-                    dispatch.scheme, dispatch.operation
-                ))?)
+                .post(api_base.join(&format!("/api/provider/{}/{}", scheme, op))?)
                 .header("Authorization", format!("Bearer {}", client_token))
-                .json(&dispatch.request);
+                .json(&body);
 
             if !cap_token.is_empty() {
                 req = req.header("X-Capability-Token", cap_token);
@@ -1047,34 +937,19 @@ async fn handle_remote_request(
             let body: serde_json::Value = resp.json().await?;
             tracing::debug!(
                 "[wasm-api-bridge] {}/{} → {} {}",
-                dispatch.scheme,
-                dispatch.operation,
+                scheme,
+                op,
                 status,
                 &body.to_string().chars().take(200).collect::<String>()
             );
             serde_json::json!({
-                "type": "carrier_result",
+                "type": "provider_result",
                 "result": body,
             })
         }
         "request_capability" => {
             let resource = request["resource"].as_str().unwrap_or("");
             let action = request["action"].as_str().unwrap_or("execute");
-
-            let scoped_resource = match scope_current_user_alias(resource, principal_id) {
-                Ok(resource) => resource,
-                Err(message) => {
-                    return Ok(serde_json::json!({
-                        "id": id,
-                        "response": {
-                            "type": "error",
-                            "code": "principal_context_required",
-                            "message": message,
-                        }
-                    }));
-                }
-            };
-            let resource = scoped_resource.as_str();
 
             let resp = client
                 .post(api_base.join("/api/capability/request")?)
@@ -1093,19 +968,6 @@ async fn handle_remote_request(
                     "token": token,
                 })
             } else {
-                match body.get("status").and_then(|s| s.as_str()) {
-                    Some("denied") | Some("auto_denied") | Some("expired") => {
-                        return Ok(serde_json::json!({
-                            "id": id,
-                            "response": {
-                                "type": "error",
-                                "code": body.get("status").and_then(|s| s.as_str()).unwrap_or("denied"),
-                                "message": body.get("reason").and_then(|r| r.as_str()).unwrap_or("capability request denied"),
-                            }
-                        }));
-                    }
-                    _ => {}
-                }
                 let request_id = body
                     .get("request_id")
                     .and_then(|r| r.as_str())
@@ -1156,13 +1018,6 @@ async fn handle_remote_request(
             "version": env!("CARGO_PKG_VERSION"),
             "capsule_count": 0,
         }),
-
-        request_type if is_runtime_control_request(request_type) => serde_json::json!({
-            "type": "error",
-            "code": "not_capsule_kernel_abi",
-            "message": format!("{} is not exposed through the capsule kernel ABI", request_type),
-        }),
-
         _ => serde_json::json!({
             "type": "error",
             "code": "unknown_request",
@@ -1184,39 +1039,646 @@ mod tests {
         capability::token::{Action, CapabilityToken, ResourceId, TokenConstraints},
         primitives::time::SecureTimestamp,
     };
-    use std::sync::Arc;
 
-    fn bridge_context() -> BridgeContext {
-        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
-        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
-        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
-        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
-            store,
-            audit_log.clone(),
-            metrics,
-        ));
+    /// Phase 3 Day 4: prove the bridge dispatch loop can be
+    /// driven by a pre-connected `tokio::net::UnixStream` (the
+    /// Mac flow), not just an `accept()`-derived one (the Linux
+    /// flow). Sends a `ping` request through one half of a
+    /// socketpair, expects a `pong` response on the other.
+    ///
+    /// `ctx = None` is the worst-case bridge state (no provider
+    /// registry, no capability manager) — only the built-in
+    /// handlers (ping / get_runtime_info) work in that mode,
+    /// which is exactly what this test exercises. A pong proves
+    /// the per-stream dispatch loop is wired correctly.
+    #[tokio::test]
+    async fn spawn_carrier_bridge_on_stream_handles_ping_pong_over_socketpair() {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        BridgeContext {
-            provider_registry: Arc::new(elastos_runtime::provider::ProviderRegistry::new()),
-            capability_manager,
-            pending_store: Arc::new(
-                elastos_runtime::capability::pending::PendingRequestStore::new(audit_log),
-            ),
-            capsule_id: "test-capsule".to_string(),
-            principal_id: None,
-            data_dir: None,
+        // Build a connected pair of fds — same shape as the Vz
+        // carrier console socketpair.
+        let mut sv = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair must succeed for the test fixture");
+
+        // Set both ends non-blocking so tokio is happy.
+        for fd in sv {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0);
+        }
+
+        let host_fd = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let test_fd = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        // Convert each end to a `tokio::net::UnixStream`.
+        let host_stream = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(host_fd.into_raw_fd())
+        })
+        .expect("host-side tokio UnixStream from_std");
+        let mut test_stream = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(test_fd.into_raw_fd())
+        })
+        .expect("test-side tokio UnixStream from_std");
+
+        // We need a non-empty `ProviderRegistry` clone for the
+        // signature, but `ctx: None` means the dispatch loop
+        // never touches it. Use `Arc::new(ProviderRegistry::new())`.
+        let registry = Arc::new(ProviderRegistry::new());
+
+        spawn_carrier_bridge_on_stream(
+            host_stream,
+            registry,
+            String::new(),
+            None,
+            "test:phase3-day4-pingpong".to_string(),
+        );
+
+        // Send a ping line on the test side.
+        let ping = b"{\"id\":42,\"request\":{\"type\":\"ping\"}}\n";
+        test_stream
+            .write_all(ping)
+            .await
+            .expect("write ping to socketpair");
+        test_stream.flush().await.expect("flush ping to socketpair");
+
+        // Read the pong response back.
+        let (reader, _writer) = test_stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut response_line = String::new();
+        // Allow a generous timeout — the bridge dispatch loop
+        // runs in a separate task and the kernel may briefly
+        // buffer.
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut response_line),
+        )
+        .await;
+        assert!(
+            read_result.is_ok(),
+            "bridge must respond within 2s; got timeout"
+        );
+        assert!(
+            read_result.unwrap().is_ok(),
+            "read_line must succeed; got error"
+        );
+
+        // The bridge wraps the inner response in `{"id":42,"response":{...}}`.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&response_line).expect("response is JSON");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(
+            parsed["response"]["type"], "pong",
+            "expected a pong response from the ping request, got: {response_line}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 4 Day 2 — Carrier-bridge multiplex audit.
+    //
+    // Production reality: every microVM gets its own carrier
+    // socketpair and the bridge dispatch loop is detached via
+    // `tokio::spawn` — the `JoinHandle` is intentionally
+    // discarded. Bridge termination is socket-driven: dropping
+    // the guest endpoint (which the supervisor does by dropping
+    // the `RunningCapsule`'s `carrier_host_fd`) causes the next
+    // `read_line` to return `Ok(0)` (EOF) and the loop to break
+    // cleanly.
+    //
+    // The audit question is: can N bridges run side-by-side
+    // sharing the same `Arc<ProviderRegistry>` without
+    // cross-talk? The tests below build three independent
+    // socketpairs, attach three bridges to one registry, and
+    // assert per-bridge isolation in both the steady-state
+    // (ping/pong round-tripping on each) and shutdown
+    // (dropping one guest endpoint terminates only that
+    // bridge) cases.
+    // ---------------------------------------------------------------
+
+    /// Helper: build a non-blocking socketpair and return both
+    /// halves as `tokio::net::UnixStream`s.
+    #[cfg(target_os = "macos")]
+    fn build_socketpair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+        let mut sv = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair must succeed");
+
+        for fd in sv {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert_eq!(rc, 0);
+        }
+
+        let a = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let b = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+
+        let host = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(a.into_raw_fd())
+        })
+        .expect("host-side UnixStream::from_std");
+        let test = tokio::net::UnixStream::from_std(unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(b.into_raw_fd())
+        })
+        .expect("test-side UnixStream::from_std");
+        (host, test)
+    }
+
+    /// Helper: drive a ping/pong round-trip on a test-side
+    /// stream and parse the JSON response. Returns `None` if
+    /// the bridge does not respond within 2s — surface the
+    /// timeout as a `None` so callers can distinguish "bridge
+    /// alive but slow" (rare) from "bridge dead" (expected
+    /// after shutdown).
+    #[cfg(target_os = "macos")]
+    async fn ping_bridge(
+        stream: &mut tokio::net::UnixStream,
+        request_id: u64,
+    ) -> Option<serde_json::Value> {
+        let req = format!("{{\"id\":{request_id},\"request\":{{\"type\":\"ping\"}}}}\n");
+        stream.write_all(req.as_bytes()).await.expect("write ping");
+        stream.flush().await.expect("flush ping");
+
+        let mut buf = [0u8; 4096];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(stream, &mut buf),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if read == 0 {
+            return None;
+        }
+        // The bridge writes one line per response; the kernel
+        // may briefly buffer but `read` returns when any bytes
+        // are available. We trust the bridge wrote a complete
+        // line (the implementation does `write_all` + `flush`).
+        let line = std::str::from_utf8(&buf[..read]).ok()?;
+        let trimmed = line.trim_end();
+        serde_json::from_str(trimmed).ok()
+    }
+
+    /// Three concurrent bridges sharing ONE `ProviderRegistry`
+    /// must each respond to its own ping with a pong, without
+    /// any cross-VM message contamination. Proves the detached-
+    /// spawn model has per-bridge isolation under N>1.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_concurrent_carrier_bridges_isolate_per_capsule() {
+        let registry = Arc::new(ProviderRegistry::new());
+
+        let mut clients: Vec<tokio::net::UnixStream> = Vec::with_capacity(3);
+        let labels = ["alpha", "bravo", "charlie"];
+        for label in labels.iter() {
+            let (host, test) = build_socketpair();
+            spawn_carrier_bridge_on_stream(
+                host,
+                registry.clone(),
+                String::new(),
+                None,
+                format!("test:phase4-day2-multiplex-{label}"),
+            );
+            clients.push(test);
+        }
+
+        // Issue one ping per bridge, identified by a distinct
+        // request id. Each bridge must echo back its OWN id —
+        // never another bridge's.
+        for (idx, stream) in clients.iter_mut().enumerate() {
+            let request_id = 1000 + idx as u64;
+            let response = ping_bridge(stream, request_id)
+                .await
+                .unwrap_or_else(|| panic!("bridge {idx} ({}) failed to respond", labels[idx]));
+            assert_eq!(
+                response["id"],
+                serde_json::Value::from(request_id),
+                "bridge {idx} ({}) must echo its OWN request id; got: {response}",
+                labels[idx]
+            );
+            assert_eq!(
+                response["response"]["type"], "pong",
+                "bridge {idx} ({}) must respond with pong; got: {response}",
+                labels[idx]
+            );
         }
     }
 
-    fn bridge_token(ctx: &BridgeContext, resource: &str, action: Action) -> String {
-        let token = ctx.capability_manager.grant(
-            &ctx.capsule_id,
-            ResourceId::new(resource),
-            action,
-            TokenConstraints::default(),
+    /// Dropping ONE bridge's guest endpoint must terminate
+    /// ONLY that bridge's dispatch loop (the next read EOFs,
+    /// the loop breaks). The other two bridges keep serving
+    /// requests on the same shared `ProviderRegistry`. Proves
+    /// the "supervisor drops `RunningCapsule.carrier_host_fd`,
+    /// bridge dies" contract holds under N>1.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_one_carrier_endpoint_terminates_only_that_bridge() {
+        let registry = Arc::new(ProviderRegistry::new());
+
+        let (host_a, mut client_a) = build_socketpair();
+        let (host_b, client_b) = build_socketpair();
+        let (host_c, mut client_c) = build_socketpair();
+
+        spawn_carrier_bridge_on_stream(
+            host_a,
+            registry.clone(),
+            String::new(),
             None,
+            "test:phase4-day2-shutdown-alpha".into(),
         );
-        encode_bridge_capability_token(&token)
+        spawn_carrier_bridge_on_stream(
+            host_b,
+            registry.clone(),
+            String::new(),
+            None,
+            "test:phase4-day2-shutdown-bravo".into(),
+        );
+        spawn_carrier_bridge_on_stream(
+            host_c,
+            registry.clone(),
+            String::new(),
+            None,
+            "test:phase4-day2-shutdown-charlie".into(),
+        );
+
+        // Sanity: alpha + charlie alive and responding.
+        let resp = ping_bridge(&mut client_a, 2001)
+            .await
+            .expect("alpha pre-shutdown ping");
+        assert_eq!(resp["id"], serde_json::Value::from(2001u64));
+        let resp = ping_bridge(&mut client_c, 2003)
+            .await
+            .expect("charlie pre-shutdown ping");
+        assert_eq!(resp["id"], serde_json::Value::from(2003u64));
+
+        // Drop bravo's guest endpoint — its bridge's next
+        // read_line returns Ok(0) (EOF) and the loop breaks.
+        drop(client_b);
+
+        // Give Tokio one yield to let the EOF propagate
+        // through the (idle) bravo bridge. The other two are
+        // unaffected.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Alpha + charlie must still serve a fresh ping.
+        let resp = ping_bridge(&mut client_a, 2101)
+            .await
+            .expect("alpha post-bravo-shutdown ping must succeed");
+        assert_eq!(resp["id"], serde_json::Value::from(2101u64));
+        assert_eq!(resp["response"]["type"], "pong");
+
+        let resp = ping_bridge(&mut client_c, 2103)
+            .await
+            .expect("charlie post-bravo-shutdown ping must succeed");
+        assert_eq!(resp["id"], serde_json::Value::from(2103u64));
+        assert_eq!(resp["response"]["type"], "pong");
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M3 — JSON nesting-depth resilience verification.
+    //
+    // `serde_json` 1.0.149 documents a default 128-deep recursion
+    // limit on `from_str` / `Deserializer`, so deeply-nested input
+    // should `Err(RecursionLimitExceeded)` rather than overflow
+    // the stack. The pre-review packet flagged that this had not
+    // been verified empirically on our actual call path
+    // (`parse_carrier_line` → `serde_json::from_str::<Value>`).
+    //
+    // These tests verify the guarantee in normal CI:
+    //   1. A 200-deep nested array (well past 128) is rejected as
+    //      `Err(CarrierFrameError::InvalidJson(_))`, not a panic.
+    //   2. A 50-deep nested array (well under 128) is accepted as
+    //      `Ok(Some(_))` (proves the cap is not over-eager).
+    //
+    // The fuzz corpus also gets two new seeds — `26-nested-129-deep`
+    // and `27-envelope-nested-200-deep` — so subsequent libfuzzer
+    // runs exercise both the bare-Value path and the typed
+    // RequestEnvelope path.
+    //
+    // If serde_json's default ever changes upstream (or a transitive
+    // feature flag disables the limit), this test fires with a
+    // `STATUS_STACK_BUFFER_OVERRUN` / `SIGSEGV` and we escalate to
+    // an explicit `Deserializer::with_recursion_limit(128)` wrapper.
+    // ---------------------------------------------------------------
+
+    /// 200-deep nested array (`[[[...]]]`) must be rejected as
+    /// invalid JSON, not overflow the stack.
+    #[test]
+    fn parse_carrier_line_rejects_excessively_nested_json() {
+        let depth = 200usize;
+        let mut payload = String::with_capacity(2 * depth);
+        for _ in 0..depth {
+            payload.push('[');
+        }
+        for _ in 0..depth {
+            payload.push(']');
+        }
+        let result = parse_carrier_line(payload.as_bytes());
+        match result {
+            Err(CarrierFrameError::InvalidJson(_)) => { /* expected */ }
+            Err(other) => panic!("expected InvalidJson rejection, got: {other:?}"),
+            Ok(value) => panic!("expected InvalidJson rejection, got Ok: {value:?}"),
+        }
+    }
+
+    /// 50-deep nested array must be accepted — proves the depth
+    /// cap is not over-eager. Pre-fix: this also passed, but if
+    /// we ever lower the limit aggressively this catches the
+    /// regression.
+    #[test]
+    fn parse_carrier_line_accepts_moderately_nested_json() {
+        let depth = 50usize;
+        let mut payload = String::with_capacity(2 * depth);
+        for _ in 0..depth {
+            payload.push('[');
+        }
+        for _ in 0..depth {
+            payload.push(']');
+        }
+        let result = parse_carrier_line(payload.as_bytes());
+        match result {
+            Ok(Some(serde_json::Value::Array(_))) => { /* expected */ }
+            other => panic!("expected Ok(Some(Array(...))) for 50-deep input, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M1 — bounded read regression test.
+    //
+    // Pre-Phase-10.5 the bridge loop called
+    // `reader.read_line(&mut line).await` with no upper bound, so a
+    // guest writing N bytes without a `\n` would grow the host's
+    // `String` to N bytes before the post-read length check fired.
+    // The fix replaces `read_line` with `read_line_byte_budgeted`
+    // which caps the allocation at `CARRIER_MAX_LINE_BYTES + 1`.
+    //
+    // This test exercises the path end-to-end:
+    //   1. Send 2 × CARRIER_MAX_LINE_BYTES bytes of 'A' with no
+    //      newline. Pre-fix, this would either OOM the test
+    //      process or, with the post-read check, block waiting for
+    //      a newline that never came.
+    //   2. Append a trailing `\n` + a well-formed `ping` request +
+    //      another `\n`.
+    //   3. Assert: the bridge writes back a `request_too_large`
+    //      envelope (proves the cap fired) followed by a `pong`
+    //      response (proves the loop drained to the next newline
+    //      and resumed normal dispatch — no bridge teardown).
+    //
+    // If the unbounded-read regression ever returns, this test
+    // will either time out (bridge stuck in `read_line` waiting
+    // for `\n`) or trigger an OOM kill in CI.
+    // ---------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_line_resyncs_and_continues_dispatch() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let (host, mut client) = build_socketpair();
+
+        spawn_carrier_bridge_on_stream(
+            host,
+            registry,
+            String::new(),
+            None,
+            "test:phase10.5-m1-oversized".into(),
+        );
+
+        // 2 MiB of 'A' with no newline — pre-fix this would grow
+        // the host `String` to 2 MiB before the length check
+        // tripped (the cap is 1 MiB).
+        let oversized = vec![b'A'; 2 * CARRIER_MAX_LINE_BYTES];
+        client
+            .write_all(&oversized)
+            .await
+            .expect("write oversized burst to bridge");
+        // Newline to close out the oversized framed line so the
+        // drain can resync without waiting for the rest of the
+        // (never-coming) attacker payload.
+        client.write_all(b"\n").await.expect("write closing \\n");
+        // Then a clean ping to prove the bridge is still alive
+        // and dispatching after the overflow event.
+        let ping = b"{\"id\":91005,\"request\":{\"type\":\"ping\"}}\n";
+        client
+            .write_all(ping)
+            .await
+            .expect("write follow-up ping after overflow");
+        client.flush().await.expect("flush after overflow + ping");
+
+        // The bridge writes two responses back-to-back:
+        //   1. `request_too_large` (for the oversized line)
+        //   2. `pong` envelope echoing id=91005 (for the follow-up)
+        //
+        // Read them as raw bytes and split on `\n` — they may
+        // arrive in one or two `read` chunks depending on kernel
+        // buffering.
+        let mut buf = [0u8; 8192];
+        let mut accumulated = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "bridge did not produce both responses within deadline; got: {}",
+                    String::from_utf8_lossy(&accumulated)
+                );
+            }
+            let read = tokio::time::timeout(
+                remaining,
+                tokio::io::AsyncReadExt::read(&mut client, &mut buf),
+            )
+            .await;
+            match read {
+                Ok(Ok(0)) => panic!(
+                    "bridge closed early; partial accumulator: {}",
+                    String::from_utf8_lossy(&accumulated)
+                ),
+                Ok(Ok(n)) => {
+                    accumulated.extend_from_slice(&buf[..n]);
+                    // Two `\n`-terminated frames means both
+                    // responses have arrived.
+                    if accumulated.iter().filter(|&&b| b == b'\n').count() >= 2 {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => panic!("read from bridge failed: {e}"),
+                Err(_) => panic!(
+                    "deadline hit waiting for second response; accumulator: {}",
+                    String::from_utf8_lossy(&accumulated)
+                ),
+            }
+        }
+
+        let text = String::from_utf8(accumulated).expect("bridge responses are UTF-8");
+        let mut lines = text.lines();
+
+        let first = lines.next().expect("first response line present");
+        let first_json: serde_json::Value =
+            serde_json::from_str(first).expect("first response is JSON");
+        assert_eq!(
+            first_json["type"], "error",
+            "first response must be the error envelope; got: {first}"
+        );
+        assert_eq!(
+            first_json["error"], "request_too_large",
+            "first response must be `request_too_large`; got: {first}"
+        );
+
+        let second = lines.next().expect("second response line present");
+        let second_json: serde_json::Value =
+            serde_json::from_str(second).expect("second response is JSON");
+        assert_eq!(
+            second_json["id"],
+            serde_json::Value::from(91005u64),
+            "second response must echo the follow-up ping's id (proves resync \
+             worked and dispatch resumed); got: {second}"
+        );
+        assert_eq!(
+            second_json["response"]["type"], "pong",
+            "second response must be a pong (proves the bridge is still \
+             servicing the same connection after the overflow event); got: {second}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 10.5 M1 — direct helper unit tests.
+    //
+    // These exercise `read_line_byte_budgeted` in isolation so a
+    // regression in the byte-budget arithmetic (off-by-one on the
+    // `+1` headroom, premature return, etc.) is caught without
+    // standing up a full bridge.
+    // ---------------------------------------------------------------
+
+    /// Happy path: a small newline-terminated line under the cap
+    /// is read in full with the newline included (matching
+    /// `read_line`'s shape).
+    #[tokio::test]
+    async fn read_line_byte_budgeted_returns_full_line_under_cap() {
+        let mut reader = tokio::io::BufReader::new(&b"hello\nworld\n"[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, CARRIER_MAX_LINE_BYTES + 1)
+            .await
+            .expect("read should succeed");
+        assert_eq!(n, 6);
+        assert_eq!(&buf, b"hello\n");
+    }
+
+    /// Overflow path: a payload longer than `max_bytes` with no
+    /// embedded newline returns exactly `max_bytes` bytes, so the
+    /// caller's `> CARRIER_MAX_LINE_BYTES` check fires.
+    #[tokio::test]
+    async fn read_line_byte_budgeted_caps_at_max_bytes_when_no_newline() {
+        let payload = vec![b'A'; 4096];
+        let mut reader = tokio::io::BufReader::new(&payload[..]);
+        let mut buf = Vec::new();
+        let max = 1024usize;
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, max)
+            .await
+            .expect("read should succeed");
+        assert_eq!(
+            n, max,
+            "must return exactly max_bytes when no newline found"
+        );
+        assert_eq!(buf.len(), max, "buf must be capped at max_bytes");
+    }
+
+    /// EOF path: stream that closes before any byte is read
+    /// returns `Ok(0)`, matching `read_line`'s EOF shape so the
+    /// caller's `match Ok(0) => break` arm works unchanged.
+    #[tokio::test]
+    async fn read_line_byte_budgeted_returns_zero_on_immediate_eof() {
+        let mut reader = tokio::io::BufReader::new(&b""[..]);
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, 1024)
+            .await
+            .expect("read should succeed");
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    /// `drain_to_newline` consumes everything up to and including
+    /// the next `\n` — and only that — so the next read picks up
+    /// from the start of the following line.
+    #[tokio::test]
+    async fn drain_to_newline_resyncs_to_next_line_start() {
+        let mut reader = tokio::io::BufReader::new(&b"AAAAAAAA\nBBBB\n"[..]);
+        drain_to_newline(&mut reader)
+            .await
+            .expect("drain should succeed");
+        let mut buf = Vec::new();
+        let n = read_line_byte_budgeted(&mut reader, &mut buf, 1024)
+            .await
+            .expect("post-drain read should succeed");
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"BBBB\n");
+    }
+
+    #[test]
+    fn test_build_capability_resource_localhost_full_uri() {
+        let body = serde_json::json!({"path": "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"});
+        let resource = build_capability_resource("localhost", "read", &body);
+        assert_eq!(
+            resource,
+            "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"
+        );
+    }
+
+    #[test]
+    fn test_build_capability_resource_localhost_bare_path() {
+        let body = serde_json::json!({"path": "Users/self/.AppData/LocalHost/Chat/channels.json"});
+        let resource = build_capability_resource("localhost", "read", &body);
+        assert_eq!(
+            resource,
+            "localhost://Users/self/.AppData/LocalHost/Chat/channels.json"
+        );
+    }
+
+    #[test]
+    fn test_build_capability_resource_localhost_bare_history() {
+        let body =
+            serde_json::json!({"path": "Users/self/.AppData/LocalHost/Chat/history/general.json"});
+        let resource = build_capability_resource("localhost", "write", &body);
+        assert_eq!(
+            resource,
+            "localhost://Users/self/.AppData/LocalHost/Chat/history/general.json"
+        );
+    }
+
+    #[test]
+    fn test_build_capability_resource_localhost_no_path() {
+        let body = serde_json::json!({});
+        let resource = build_capability_resource("localhost", "read", &body);
+        assert_eq!(resource, "localhost://INVALID");
+    }
+
+    #[test]
+    fn test_build_capability_resource_peer() {
+        let body = serde_json::json!({});
+        let resource = build_capability_resource("peer", "gossip_join", &body);
+        assert_eq!(resource, "elastos://peer/*");
+    }
+
+    #[test]
+    fn test_build_capability_resource_did() {
+        let body = serde_json::json!({});
+        let resource = build_capability_resource("did", "get_did", &body);
+        assert_eq!(resource, "elastos://did/*");
+    }
+
+    #[test]
+    fn test_build_capability_resource_ai_with_backend() {
+        let body = serde_json::json!({"backend": "local"});
+        let resource = build_capability_resource("ai", "chat_completions", &body);
+        assert_eq!(resource, "elastos://ai/local/chat_completions");
+    }
+
+    #[test]
+    fn test_build_capability_resource_ai_no_backend() {
+        let body = serde_json::json!({});
+        let resource = build_capability_resource("ai", "chat_completions", &body);
+        assert_eq!(resource, "elastos://ai/meta/chat_completions");
     }
 
     #[test]
@@ -1241,198 +1703,6 @@ mod tests {
         assert!(parse_action("READ").is_some());
         assert!(parse_action("Write").is_some());
         assert!(parse_action("EXECUTE").is_some());
-    }
-
-    #[test]
-    fn test_runtime_control_request_classification() {
-        assert!(is_runtime_control_request("launch_capsule"));
-        assert!(is_runtime_control_request("storage_read"));
-        assert!(is_runtime_control_request("provider_call"));
-        assert!(!is_runtime_control_request("carrier_invoke"));
-        assert!(!is_runtime_control_request("request_capability"));
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_uses_uri_resource_contract() {
-        let dispatch = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": "localhost://Local/SharedByLocalUsersAndBots/Home/a.md",
-                "operation": "read",
-                "body": {}
-            }),
-            None,
-        )
-        .expect("localhost carrier invoke should dispatch");
-
-        assert_eq!(dispatch.scheme, "localhost");
-        assert_eq!(dispatch.operation, "read");
-        assert_eq!(
-            dispatch.resource,
-            "localhost://Local/SharedByLocalUsersAndBots/Home/a.md"
-        );
-        assert_eq!(
-            dispatch
-                .request
-                .get("path")
-                .and_then(|value| value.as_str()),
-            Some("localhost://Local/SharedByLocalUsersAndBots/Home/a.md")
-        );
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_rejects_unscoped_current_user_alias() {
-        let result = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": "localhost://Users/self/Documents/a.md",
-                "operation": "read",
-                "body": {}
-            }),
-            None,
-        );
-        assert!(
-            result.is_err(),
-            "capsule-kernel Users/self requires a principal context"
-        );
-        let error = result.err().unwrap();
-
-        assert_eq!(
-            error,
-            "localhost://Users/self requires a principal-scoped launch context"
-        );
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_scopes_current_user_alias_with_principal() {
-        let principal_id = "person:local:test-principal";
-        let expected_root = crate::auth::principal_localhost_root(principal_id);
-        let dispatch = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": "localhost://Users/self/Documents/a.md",
-                "operation": "read",
-                "body": {}
-            }),
-            Some(principal_id),
-        )
-        .expect("principal-scoped current-user alias should dispatch");
-
-        let expected_path = format!("{expected_root}/Documents/a.md");
-        assert_eq!(dispatch.resource, expected_path);
-        assert_eq!(
-            dispatch
-                .request
-                .get("path")
-                .and_then(|value| value.as_str()),
-            Some(expected_path.as_str())
-        );
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_allows_active_explicit_principal_root() {
-        let principal_id = "person:local:test-principal";
-        let principal_root = crate::auth::principal_localhost_root(principal_id);
-        let path = format!("{principal_root}/Documents/a.md");
-        let dispatch = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": path,
-                "operation": "read",
-                "body": {}
-            }),
-            Some(principal_id),
-        )
-        .expect("active explicit principal root should dispatch");
-
-        assert_eq!(dispatch.resource, path);
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_rejects_foreign_principal_root() {
-        let active_principal_id = "person:local:active";
-        let foreign_root = crate::auth::principal_localhost_root("person:local:foreign");
-        let result = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": format!("{foreign_root}/Documents/a.md"),
-                "operation": "read",
-                "body": {}
-            }),
-            Some(active_principal_id),
-        );
-
-        assert_eq!(
-            result.err().as_deref(),
-            Some("localhost://Users roots must use Users/self or the active principal root")
-        );
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_derives_chain_network() {
-        let dispatch = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": "elastos://chain/esc-mainnet/block_number",
-                "operation": "block_number",
-                "body": {}
-            }),
-            None,
-        )
-        .expect("chain carrier invoke should dispatch");
-
-        assert_eq!(dispatch.scheme, "chain");
-        assert_eq!(
-            dispatch
-                .request
-                .get("network")
-                .and_then(|value| value.as_str()),
-            Some("esc-mainnet")
-        );
-        assert_eq!(
-            dispatch.resource,
-            "elastos://chain/esc-mainnet/block_number"
-        );
-    }
-
-    #[test]
-    fn carrier_invoke_dispatch_derives_wallet_chain_and_intent() {
-        let dispatch = carrier_invoke_dispatch(
-            &serde_json::json!({
-                "type": "carrier_invoke",
-                "uri": "elastos://wallet/eip155:20/sign/transaction_intent",
-                "operation": "request_signature",
-                "body": {
-                    "capsule_id": "market",
-                    "resource": "elastos://wallet/eip155:20/sign/transaction_intent",
-                    "reason": "Approve transaction",
-                    "payload": {"schema": "elastos.wallet.test/v1"}
-                }
-            }),
-            None,
-        )
-        .expect("wallet carrier invoke should dispatch");
-
-        assert_eq!(dispatch.scheme, "wallet");
-        assert_eq!(dispatch.operation, "request_signature");
-        assert_eq!(
-            dispatch
-                .request
-                .get("chain_namespace")
-                .and_then(|value| value.as_str()),
-            Some("eip155:20")
-        );
-        assert_eq!(
-            dispatch
-                .request
-                .get("intent")
-                .and_then(|value| value.as_str()),
-            Some("transaction_intent")
-        );
-        assert_eq!(
-            dispatch.resource,
-            "elastos://wallet/eip155:20/sign/transaction_intent"
-        );
     }
 
     #[test]
@@ -1467,7 +1737,6 @@ mod tests {
             r#"{"id":1,"request":{"type":"ping"}}"#,
             "https://example.com",
             "client-token",
-            None,
         )
         .await
         .unwrap_err();
@@ -1475,274 +1744,5 @@ mod tests {
         assert!(err
             .to_string()
             .contains("attached WASM bridge requires a local runtime API URL"));
-    }
-
-    #[tokio::test]
-    async fn handle_remote_request_rejects_raw_runtime_control_api() {
-        let response = handle_remote_request(
-            r#"{"id":8,"request":{"type":"launch_capsule","cid":"QmExample","config":{}}}"#,
-            "http://127.0.0.1:12345",
-            "client-token",
-            None,
-        )
-        .await
-        .expect("browser host adapter should reject runtime control before HTTP dispatch");
-
-        assert_eq!(response["id"], 8);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
-    }
-
-    #[tokio::test]
-    async fn handle_remote_request_denies_users_self_before_runtime_prompt() {
-        let response = handle_remote_request(
-            r#"{"id":12,"request":{"type":"request_capability","resource":"localhost://Users/self/Documents/*","action":"read"}}"#,
-            "http://127.0.0.1:12345",
-            "client-token",
-            None,
-        )
-        .await
-        .expect("attached WASM bridge should reject before runtime dispatch");
-
-        assert_eq!(response["id"], 12);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "principal_context_required");
-    }
-
-    #[tokio::test]
-    async fn handle_remote_request_rejects_users_root_storage_without_protected_bridge() {
-        let principal_id = "person:local:active";
-        let response = handle_remote_request(
-            r#"{"id":13,"request":{"type":"carrier_invoke","uri":"localhost://Users/self/Documents/a.md","operation":"read","token":"tok","body":{}}}"#,
-            "http://127.0.0.1:12345",
-            "client-token",
-            Some(principal_id),
-        )
-        .await
-        .expect("attached bridge should reject before provider dispatch");
-
-        assert_eq!(response["id"], 13);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "principal_context_required");
-        assert!(response["response"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("protected storage bridge"));
-    }
-
-    #[tokio::test]
-    async fn handle_request_rejects_raw_runtime_control_api() {
-        let response = handle_request(
-            r#"{"id":7,"request":{"type":"launch_capsule","cid":"QmExample","config":{}}}"#,
-            &None,
-        )
-        .await
-        .expect("bridge should produce a fail-closed response");
-
-        assert_eq!(response["id"], 7);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
-    }
-
-    #[tokio::test]
-    async fn handle_request_rejects_old_provider_call_shape() {
-        let response = handle_request(
-            r#"{"id":10,"request":{"type":"provider_call","scheme":"did","op":"get_did","body":{},"token":"tok"}}"#,
-            &None,
-        )
-        .await
-        .expect("bridge should reject old provider-call ABI");
-
-        assert_eq!(response["id"], 10);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "not_capsule_kernel_abi");
-    }
-
-    #[tokio::test]
-    async fn handle_request_denies_system_backend_capability_before_pending() {
-        let ctx = bridge_context();
-        let pending_store = ctx.pending_store.clone();
-        let response = handle_request(
-            r#"{"id":8,"request":{"type":"request_capability","resource":"elastos://ipfs-provider/add","action":"write"}}"#,
-            &Some(ctx),
-        )
-        .await
-        .expect("bridge should fail closed before creating a pending request");
-
-        assert_eq!(response["id"], 8);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "system_backend_denied");
-        assert!(
-            pending_store.list_pending().await.is_empty(),
-            "system backend denials must not create approval prompts"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_request_denies_unsupported_capability_scheme_before_pending() {
-        let ctx = bridge_context();
-        let pending_store = ctx.pending_store.clone();
-        let response = handle_request(
-            r#"{"id":9,"request":{"type":"request_capability","resource":"https://example.com/raw","action":"read"}}"#,
-            &Some(ctx),
-        )
-        .await
-        .expect("bridge should fail closed before creating a pending request");
-
-        assert_eq!(response["id"], 9);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "unsupported_resource");
-        assert!(
-            pending_store.list_pending().await.is_empty(),
-            "unsupported resource denials must not create approval prompts"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_request_denies_users_self_without_principal_before_pending() {
-        let ctx = bridge_context();
-        let pending_store = ctx.pending_store.clone();
-        let response = handle_request(
-            r#"{"id":11,"request":{"type":"request_capability","resource":"localhost://Users/self/Documents/*","action":"read"}}"#,
-            &Some(ctx),
-        )
-        .await
-        .expect("bridge should require principal context before creating a pending request");
-
-        assert_eq!(response["id"], 11);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "principal_context_required");
-        assert!(
-            pending_store.list_pending().await.is_empty(),
-            "principal-context denials must not create approval prompts"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_request_denies_foreign_user_root_before_pending() {
-        let mut ctx = bridge_context();
-        ctx.principal_id = Some("person:local:active".to_string());
-        let pending_store = ctx.pending_store.clone();
-        let foreign_root = crate::auth::principal_localhost_root("person:local:foreign");
-        let response = handle_request(
-            &format!(
-                r#"{{"id":12,"request":{{"type":"request_capability","resource":"{foreign_root}/Documents/*","action":"read"}}}}"#
-            ),
-            &Some(ctx),
-        )
-        .await
-        .expect("bridge should reject foreign principal roots before creating a pending request");
-
-        assert_eq!(response["id"], 12);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "principal_context_required");
-        assert_eq!(
-            response["response"]["message"],
-            "localhost://Users roots must use Users/self or the active principal root"
-        );
-        assert!(
-            pending_store.list_pending().await.is_empty(),
-            "foreign-root denials must not create approval prompts"
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_request_uses_protected_principal_root_object_for_users_self_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let principal_id = "person:local:active";
-        let protection =
-            crate::auth::store_test_principal_root_protection(temp.path(), principal_id);
-        let mut ctx = bridge_context();
-        ctx.principal_id = Some(principal_id.to_string());
-        ctx.data_dir = Some(temp.path().to_path_buf());
-
-        let object_uri = format!(
-            "{}/.AppData/LocalHost/Chat/state.json",
-            protection.localhost_root
-        );
-        let write_token = bridge_token(&ctx, &object_uri, Action::Write);
-        let write_line = serde_json::json!({
-            "id": 21,
-            "request": {
-                "type": "carrier_invoke",
-                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
-                "operation": "write",
-                "token": write_token,
-                "body": {
-                    "content": b"secret-chat-state".to_vec(),
-                    "append": false
-                }
-            }
-        })
-        .to_string();
-        let ctx_opt = Some(ctx.clone());
-        let write_response = handle_request(&write_line, &ctx_opt)
-            .await
-            .expect("protected write should produce a bridge response");
-
-        assert_eq!(write_response["id"], 21);
-        assert_eq!(write_response["response"]["type"], "carrier_result");
-        assert_eq!(write_response["response"]["result"]["status"], "ok");
-
-        let path = rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
-        let stored = std::fs::read_to_string(path).unwrap();
-        assert!(stored.contains("elastos.principal-root.object/v1"));
-        assert!(stored.contains(&protection.data_key_id));
-        assert!(!stored.contains("secret-chat-state"));
-
-        let read_token = bridge_token(&ctx, &object_uri, Action::Read);
-        let read_line = serde_json::json!({
-            "id": 22,
-            "request": {
-                "type": "carrier_invoke",
-                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
-                "operation": "read",
-                "token": read_token,
-                "body": {}
-            }
-        })
-        .to_string();
-        let read_response = handle_request(&read_line, &ctx_opt)
-            .await
-            .expect("protected read should produce a bridge response");
-        let content: Vec<u8> =
-            serde_json::from_value(read_response["response"]["result"]["data"]["content"].clone())
-                .unwrap();
-        assert_eq!(content, b"secret-chat-state");
-    }
-
-    #[tokio::test]
-    async fn handle_request_rejects_users_root_carrier_invoke_without_data_dir() {
-        let principal_id = "person:local:active";
-        let mut ctx = bridge_context();
-        ctx.principal_id = Some(principal_id.to_string());
-        let object_uri = format!(
-            "{}/Documents/a.md",
-            crate::auth::principal_localhost_root(principal_id)
-        );
-        let read_token = bridge_token(&ctx, &object_uri, Action::Read);
-        let line = serde_json::json!({
-            "id": 23,
-            "request": {
-                "type": "carrier_invoke",
-                "uri": "localhost://Users/self/Documents/a.md",
-                "operation": "read",
-                "token": read_token,
-                "body": {}
-            }
-        })
-        .to_string();
-
-        let response = handle_request(&line, &Some(ctx))
-            .await
-            .expect("missing data dir should produce a fail-closed response");
-
-        assert_eq!(response["id"], 23);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "principal_context_required");
-        assert!(response["response"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("local runtime data directory"));
     }
 }
