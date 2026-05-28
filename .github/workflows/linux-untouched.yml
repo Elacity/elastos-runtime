@@ -37,11 +37,21 @@ jobs:
 
       - name: Run protected-paths gate
         env:
-          # Phase 0 baseline commit — last commit on sash/local-test
-          # before Vz-backend Phase 1 work started. Update this only
-          # if the project decides to re-baseline (e.g., after rebase
-          # onto a newer upstream main). See docs/vz-backend/PLAN.md.
-          VZ_BACKEND_BASELINE: a65dad3
+          # Re-baselined 2026-05-28 onto Day-2-of-the-v0.3.0-rebase
+          # HEAD (`ded1333`). Until that point this gate compared
+          # against the original Phase 0 sash/local-test baseline
+          # `a65dad3`, which is unreachable from the rebased branch
+          # (the new branch is rooted on PR #2 / v0.3.0 main, not on
+          # sash/local-test). `ded1333` is the first Mac-VZ-rebase
+          # commit, after which the elastos-crosvm cfg-gating and the
+          # new elastos-vz crate are in place — i.e. the legitimate
+          # "Phase 0" of the rebased Mac VZ branch. Day 3+ commits
+          # only touch elastos-server (NOT protected), so this gate
+          # continues to enforce "no Mac-VZ-rebase work modifies
+          # elastos-crosvm / elastos-runtime / elastos-common /
+          # elastos-compute beyond what Day 2 already shipped."
+          # See docs/mac-vz/v030-rebase/DAY_2.md.
+          VZ_BACKEND_BASELINE: ded1333
         run: |
           set -euo pipefail
           # Make sure the baseline commit is reachable in the checkout.
