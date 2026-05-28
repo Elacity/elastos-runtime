@@ -207,6 +207,7 @@ section if a higher section is incoherent, unverified, or too large to review.
 ### Operator and audit hardening
 - [ ] Keep `verify`, `command-smoke`, `installed-command-audit`, and related gates honest and fail-closed.
 - [ ] Continue the systematic crate audit through the remaining runtime crates.
+- [ ] Track the security/platform work intentionally left out of the 0.3.1 CVE candidate as explicit follow-up, not hidden release debt: migrate `bincode 1.3.x` to `bincode 2.x` with versioned serialization compatibility tests; coordinate the `iroh`/Hickory fix as a Carrier-generation upgrade with Rust/MSRV/toolchain proof instead of force-overriding transitive DNS crates; review Sash's macOS VZ / `elastos-crosvm` Darwin substrate branch as a separate platform decision; and keep any temporary Hickory audit ignores documented until the Carrier upgrade closes them.
 
 ### Dead code cleanup
 - [ ] Re-audit `provider/registry.rs` from current source, not from the stale dead-code list that existed before the 2026-03-31 cleanup. Only remove API surface that is now proven unused on the installed path.
