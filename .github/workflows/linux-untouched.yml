@@ -37,21 +37,26 @@ jobs:
 
       - name: Run protected-paths gate
         env:
-          # Re-baselined 2026-05-28 onto Day-2-of-the-v0.3.0-rebase
-          # HEAD (`ded1333`). Until that point this gate compared
-          # against the original Phase 0 sash/local-test baseline
-          # `a65dad3`, which is unreachable from the rebased branch
-          # (the new branch is rooted on PR #2 / v0.3.0 main, not on
-          # sash/local-test). `ded1333` is the first Mac-VZ-rebase
-          # commit, after which the elastos-crosvm cfg-gating and the
-          # new elastos-vz crate are in place — i.e. the legitimate
-          # "Phase 0" of the rebased Mac VZ branch. Day 3+ commits
-          # only touch elastos-server (NOT protected), so this gate
-          # continues to enforce "no Mac-VZ-rebase work modifies
-          # elastos-crosvm / elastos-runtime / elastos-common /
-          # elastos-compute beyond what Day 2 already shipped."
-          # See docs/mac-vz/v030-rebase/DAY_2.md.
-          VZ_BACKEND_BASELINE: ded1333
+          # Re-baselined 2026-05-28 onto Day-4-of-the-v0.3.0-rebase HEAD
+          # (`65f5f05`), the rebase's final-state commit. Earlier
+          # baselines:
+          #   - Phase 0 (`a65dad3`): pre-Vz baseline on the original
+          #     sash/local-test branch, unreachable from the rebased
+          #     branch (rooted on PR #2 / v0.3.0 main).
+          #   - Day 2 (`ded1333`): first Mac-VZ-rebase commit on
+          #     sash/local-test-v030; protected-crate cfg-gating and
+          #     the new elastos-vz crate land here.
+          #   - Day 4 (`65f5f05`, this baseline): rebase complete.
+          #     The carrier-bridge fuzz harness is restored, the v0.3.0
+          #     `carrier_invoke` ABI is in carrier_bridge.rs, the
+          #     principal-aware localhost-fs scoping is wired through.
+          #     Day 3+4 commits only touch elastos-server (NOT
+          #     protected), so the gate keeps enforcing "no future
+          #     commit modifies elastos-crosvm / elastos-runtime /
+          #     elastos-common / elastos-compute beyond what the
+          #     rebase already shipped." See
+          #     docs/mac-vz/v030-rebase/DAY_4.md.
+          VZ_BACKEND_BASELINE: 65f5f05
         run: |
           set -euo pipefail
           # Make sure the baseline commit is reachable in the checkout.
