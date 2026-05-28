@@ -1,0 +1,16 @@
+# cargo-fuzz build artifacts
+target/
+
+# libfuzzer-generated corpus entries (40-char hex hash names).
+# Operator-runnable seeds with descriptive names (e.g. 01-ping.json) are
+# tracked. Runtime-grown corpus regenerates on each `cargo fuzz run`.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+
+# Crash artifacts — these ARE valuable when present (each is a finding),
+# but on a clean run the directory is empty and shouldn't be committed.
+# When a crash is found, the operator commits the specific crash-* file
+# alongside the regression-test commit that fixes it.
+artifacts/*/crash-*
+artifacts/*/leak-*
+artifacts/*/oom-*
+artifacts/*/timeout-*

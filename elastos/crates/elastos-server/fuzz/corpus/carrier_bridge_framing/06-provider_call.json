@@ -1,0 +1,1 @@
+{"id":6,"request":{"type":"provider_call","scheme":"localhost","op":"read","body":{"path":"Users/self/.AppData/X/y.json"},"token":"tok-123"}}

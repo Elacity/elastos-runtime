@@ -1,0 +1,27 @@
+[package]
+name = "elastos-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Isolate from the parent workspace. The parent pins stable Rust via
+# rust-toolchain.toml; the fuzz crate needs nightly for libfuzzer-sys
+# instrumentation. Keeping the fuzz crate in its own workspace lets
+# `cargo +nightly fuzz run` work without disturbing the main build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.elastos-server]
+path = ".."
+
+[[bin]]
+name = "carrier_bridge_framing"
+path = "fuzz_targets/carrier_bridge_framing.rs"
+test = false
+doc = false
+bench = false
