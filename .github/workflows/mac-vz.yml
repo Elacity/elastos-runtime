@@ -1,0 +1,222 @@
+name: Mac Vz CI (Phase 5+ Apple Silicon)
+
+# Phase 5 Day 5 — macOS Apple-Silicon CI substrate for the Vz
+# backend. Three GitHub-hosted jobs run in parallel:
+#   1. mac-rust-tests      — fmt + clippy + tests (single & multi-threaded)
+#   2. mac-shell-helpers   — bash 3.2 helper-library unit tests
+#   3. mac-smokes-dry-run  — three shell smokes in their CI fast-lane
+#
+# Phase 5 Day 6 — adds a fourth, OPTIONAL job:
+#   4. mac-vz-full-boot    — full Vz microVM boot, self-hosted lane.
+#
+# The Day-6 job is gated behind two independent switches that
+# both must be on for the job to even attempt to schedule:
+#   a. Repository variable `MAC_VZ_FULL_BOOT_ENABLED == 'true'`
+#      — owner flips this once a self-hosted runner is online.
+#      Default-off keeps the workflow green for public forks
+#      and contributors who don't have access to the runner.
+#   b. Runner labels `[self-hosted, macOS, ARM64, vz-capable]`
+#      — labels MUST be applied by the runner's owner per
+#      docs/vz-backend/SELF_HOSTED_RUNNER_SPEC.md.
+#
+# Real Vz microVM smoke runs (kernel + rootfs boot) only run
+# on the Day-6 lane. GitHub-hosted macOS runners don't
+# reliably support `Virtualization.framework` (no nested virt),
+# so Jobs 1-3 stay dry-run / build-only.
+#
+# Anchors:
+#   - docs/vz-backend/PHASE_5_PLAN.md § Day 5, § Day 6
+#   - docs/vz-backend/PHASE_5_DAY_5_NOTES.md
+#   - docs/vz-backend/PHASE_5_DAY_6_NOTES.md
+#   - docs/vz-backend/CI_RUNBOOK.md
+#   - docs/vz-backend/SELF_HOSTED_RUNNER_SPEC.md
+
+on:
+  push:
+    branches: [main, "sash/**", "vz/**"]
+  pull_request:
+    branches: [main]
+  # Manual one-shot trigger from the Actions UI. Useful when
+  # debugging a failure without re-pushing the branch.
+  workflow_dispatch: {}
+
+# Auto-cancel older runs on the same ref so a rapid-fire push
+# sequence doesn't queue N redundant macOS-runner minutes.
+concurrency:
+  group: mac-vz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Mirror ci.yml so any new clippy warning fails fast — keeps
+  # the Mac substrate's quality gate aligned with Linux's.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  mac-rust-tests:
+    name: Rust (fmt + clippy + tests, threads=1 & 4)
+    runs-on: macos-latest
+    # GitHub's macOS runners are billed at 10× Linux minutes.
+    # 30-minute hard cap protects against runaway builds; local
+    # wall-clock for the full suite is ~30 s so the headroom is
+    # massive — the cap is the "something is wrong" tripwire.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          # Distinct prefix so the Mac cache doesn't collide
+          # with the Linux ci.yml cache (different toolchain,
+          # different target triple, different intermediates).
+          prefix-key: mac-vz
+
+      - name: cargo fmt --check
+        working-directory: elastos
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: elastos
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Phase 5 Days 1-4 land Vz-only tests + Phase-4 typed-error
+      # tests; scope to the two Mac-relevant crates so the Mac
+      # runner isn't paying to re-run every Linux-only test as
+      # well. The Linux ci.yml stays the source of truth for
+      # full-workspace coverage.
+      - name: cargo test (threads=1)
+        working-directory: elastos
+        run: cargo test -p elastos-server -p elastos-vz --tests -- --test-threads=1
+
+      - name: cargo test (threads=4)
+        working-directory: elastos
+        run: cargo test -p elastos-server -p elastos-vz --tests -- --test-threads=4
+
+  mac-shell-helpers:
+    name: Shell helpers (cross-platform.sh + runtime-cleanup.sh)
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cross-platform.sh unit tests (44 assertions)
+        run: bash scripts/lib/cross-platform-test.sh
+
+      - name: runtime-cleanup.sh unit tests (5 assertions)
+        run: bash scripts/lib/runtime-cleanup-test.sh
+
+  mac-smokes-dry-run:
+    name: Smokes (dry-run lane)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The three Phase-5 smokes all source
+      # `scripts/lib/cross-platform.sh`'s new
+      # `cross_platform_in_ci` predicate (Day 5) and auto-enable
+      # `ELASTOS_VZ_SMOKE_DRY_RUN=1` because `GITHUB_ACTIONS` is
+      # set on every job. We keep the explicit env-var here as
+      # the operator-visible "this IS the dry-run lane" signal
+      # — `unset`ing it would still produce the same result via
+      # the auto-detect, but the explicit setting documents
+      # intent in the Actions UI.
+      - name: local-carrier-setup-smoke.sh (dry-run)
+        env:
+          ELASTOS_VZ_SMOKE_DRY_RUN: "1"
+        run: bash scripts/local-carrier-setup-smoke.sh
+
+      - name: home-frontdoor-smoke.sh (dry-run)
+        env:
+          ELASTOS_VZ_SMOKE_DRY_RUN: "1"
+        run: bash scripts/home-frontdoor-smoke.sh
+
+      - name: chat-wasm-native-interop-smoke.sh (dry-run)
+        env:
+          ELASTOS_VZ_SMOKE_DRY_RUN: "1"
+        run: bash scripts/chat-wasm-native-interop-smoke.sh
+
+  # ─────────────────────────────────────────────────────────────
+  # Phase 5 Day 6 — Self-hosted Mac, full Vz microVM boot.
+  #
+  # Doubly gated:
+  #   - `if:` repo-var opt-in (default OFF for public forks).
+  #   - `runs-on:` labels — needs an actively-registered runner
+  #     with EVERY label below, otherwise the job stays queued
+  #     until GitHub's per-job timeout (1 day) hits.
+  #
+  # Operator surface:
+  #   - To enable: set repository variable
+  #     `MAC_VZ_FULL_BOOT_ENABLED=true` AND register at least
+  #     one runner matching all four labels.
+  #   - To disable: set variable back to `false` or delete it.
+  #   - Heartbeat: `_self-hosted-probe.yml` reports whether a
+  #     matching runner is online (Day 6 deliverable).
+  #
+  # Runs the three Phase-5 smokes with the Day-6 `FORCE_FULL=1`
+  # override, which (a) beats the CI auto-detect Day-5 wired in,
+  # and (b) leaves the existing `DRY_RUN` operator override
+  # available as an escape hatch for emergency turn-off.
+  # ─────────────────────────────────────────────────────────────
+  mac-vz-full-boot:
+    name: Vz full boot (self-hosted)
+    # Two-stage gate: opt-in var first, then runner labels.
+    if: ${{ vars.MAC_VZ_FULL_BOOT_ENABLED == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64, vz-capable]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: mac-vz-self-hosted
+
+      # Self-hosted runners persist `~/.local/share/elastos`
+      # across runs (see SELF_HOSTED_RUNNER_SPEC.md for the
+      # provisioning script). The full smokes need a real
+      # kernel + rootfs cache; the spec doc covers warming it.
+
+      - name: Mac substrate probe
+        run: |
+          sw_vers
+          uname -a
+          # `Virtualization.framework` is present on every
+          # supported macOS; the smoke does its own runtime
+          # check via `cross_platform_vz_substrate_check`.
+          if ! [ -d /System/Library/Frameworks/Virtualization.framework ]; then
+            echo "::error::Virtualization.framework not found"
+            exit 1
+          fi
+
+      - name: cargo build (release artefacts)
+        working-directory: elastos
+        run: cargo build -p elastos-server -p elastos-vz --release
+
+      - name: local-carrier-setup-smoke.sh (FULL)
+        env:
+          ELASTOS_VZ_SMOKE_FORCE_FULL: "1"
+        run: bash scripts/local-carrier-setup-smoke.sh
+
+      - name: home-frontdoor-smoke.sh (FULL)
+        env:
+          ELASTOS_VZ_SMOKE_FORCE_FULL: "1"
+        run: bash scripts/home-frontdoor-smoke.sh
+
+      - name: chat-wasm-native-interop-smoke.sh (FULL)
+        env:
+          ELASTOS_VZ_SMOKE_FORCE_FULL: "1"
+        run: bash scripts/chat-wasm-native-interop-smoke.sh

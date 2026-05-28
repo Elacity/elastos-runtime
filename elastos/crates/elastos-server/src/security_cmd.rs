@@ -22,9 +22,7 @@ pub enum EmergencyCommand {
 }
 
 pub fn run_tls(tls_cmd: TlsCommand) -> anyhow::Result<()> {
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/elastos"))
-        .join("elastos");
+    let data_dir = crate::sources::default_data_dir();
     match tls_cmd {
         TlsCommand::Trust => {
             elastos_tls::print_trust_instructions(&data_dir);

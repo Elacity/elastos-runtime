@@ -1,0 +1,28 @@
+[package]
+name = "mac-vz-feature-check"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Standalone macOS probe that reports which Apple Virtualization.framework features are available on the running host. Phase 2 Day 1 deliverable: comprehensive per-device construct + VZVirtualMachineConfiguration::validateWithError probe, anchored in docs/vz-backend/PHASE_0_SCOPE.md §B / §D."
+
+[[bin]]
+name = "mac-vz-feature-check"
+path = "src/main.rs"
+
+# Intentionally NOT a workspace member — this is a developer-side
+# diagnostic tool, not part of the runtime build. It is invoked
+# manually before / during Phase 2 work to confirm the host's Vz
+# capability matches the docs/vz-backend/PHASE_0_SCOPE.md research.
+[workspace]
+
+# Pin versions to match elastos-vz's Cargo.toml exactly. No drift —
+# the binary's whole job is to verify the elastos-vz dependency set
+# behaves as expected on a real Mac before we lift those patterns
+# into the runtime crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-virtualization = "0.3"
+objc2-foundation = "0.3"
+dispatch2 = "0.3"
+tempfile = "3.10"
+libc = "0.2"

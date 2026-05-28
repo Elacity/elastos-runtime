@@ -1,9 +1,18 @@
 //! ElastOS crosvm Compute Provider
 //!
-//! Runs capsules in crosvm VMs with hardware-level isolation.
-//! crosvm is the sole VM backend — no fallback, no feature gating.
+//! Runs capsules in crosvm VMs with hardware-level isolation on Linux/KVM.
+//! crosvm is the sole microVM backend; capsule launch fails closed on hosts
+//! without `/dev/kvm` rather than silently downgrading.
 //!
-//! # Requirements
+//! On non-Linux hosts (macOS, Windows) the crate still compiles so the rest
+//! of the runtime — browser-hosted Home, WASM capsules, data capsules — stays
+//! in scope. Per `state.md`: *"The default Home path must remain a
+//! KVM-independent browser-hosted adapter so macOS and Windows stay in scope
+//! without pretending to offer Linux parity."* The guest-network module is
+//! replaced by a stub that mirrors the public surface and returns explicit
+//! errors if any microVM path is invoked.
+//!
+//! # Linux requirements
 //!
 //! - Linux with KVM support (`/dev/kvm`)
 //! - crosvm binary
@@ -22,6 +31,10 @@
 //! ```
 
 mod config;
+#[cfg(target_os = "linux")]
+mod network;
+#[cfg(not(target_os = "linux"))]
+#[path = "network_stub.rs"]
 mod network;
 mod provider;
 mod proxy;

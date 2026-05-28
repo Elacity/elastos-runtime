@@ -3,6 +3,10 @@
 **/*.rs.bk
 # Main Cargo.lock committed for reproducible builds; negate the ignore
 !elastos/Cargo.lock
+# Developer-side probe (Phase 2 Day 1) is a throwaway dev binary; its
+# Cargo.toml already pins versions to match elastos-vz, so the lockfile
+# churn is noise.
+scripts/dev/mac-vz-feature-check/Cargo.lock
 
 # Node.js
 node_modules/
@@ -41,6 +45,10 @@ elastos/storage/
 # Build artifacts (release tarballs, platform binaries)
 artifacts/
 artifacts-aarch64/
+
+# Linux kernel source tree (downloaded by scripts/build-vmlinux-arm64.sh,
+# ~600 MB extracted; never committed)
+/build/
 
 # Secrets and credentials
 .env
@@ -128,10 +136,6 @@ scripts/show_worker_model_policy.py
 scripts/qmd-freshness.py
 scripts/ops/
 scripts/system/
-!scripts/system/
-!scripts/system/elastos-browser-selkies.env.example
-!scripts/system/elastos-browser-selkies.service
-!scripts/system/elastos-browser-selkies.sh
 scripts/publish-ceremony.sh
 scripts/publish-impact.sh
 scripts/publish-mark-proven.sh

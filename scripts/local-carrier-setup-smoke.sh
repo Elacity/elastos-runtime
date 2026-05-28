@@ -5,23 +5,39 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ELASTOS_ROOT="${REPO_ROOT}/elastos"
 ELASTOS_BIN="${ELASTOS_ROOT}/target/debug/elastos"
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "local-carrier-setup-smoke currently supports Linux only." >&2
-    exit 1
-fi
+# Phase 5 Day 1 — cross-platform helpers (bash 3.2 clean,
+# Linux + macOS BSD-util compatible). See
+# `scripts/lib/cross-platform.sh` for the full rationale.
+# shellcheck source=lib/cross-platform.sh
+. "${REPO_ROOT}/scripts/lib/cross-platform.sh"
+
+case "$(uname -s)" in
+    Linux)  OS_TOKEN="linux"  ;;
+    Darwin) OS_TOKEN="darwin" ;;
+    *)
+        echo "Unsupported OS for local-carrier-setup-smoke: $(uname -s)" >&2
+        exit 1
+        ;;
+esac
 
 case "$(uname -m)" in
-    x86_64) SETUP_PLATFORM="linux-amd64" ;;
-    aarch64|arm64) SETUP_PLATFORM="linux-arm64" ;;
+    x86_64)         ARCH_TOKEN="amd64" ;;
+    aarch64|arm64)  ARCH_TOKEN="arm64" ;;
     *)
         echo "Unsupported machine architecture: $(uname -m)" >&2
         exit 1
         ;;
 esac
 
+SETUP_PLATFORM="${OS_TOKEN}-${ARCH_TOKEN}"
+
 TEST_ROOT="${ELASTOS_LOCAL_TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/elastos-local-carrier-setup.XXXXXX")}"
 XDG_DATA_HOME="${TEST_ROOT}/xdg-data"
 DATA_DIR="${XDG_DATA_HOME}/elastos"
+# `dirs::data_dir()` is platform-specific (Library/Application Support on
+# macOS, $XDG_DATA_HOME on Linux). Use ELASTOS_DATA_DIR for cross-platform
+# isolation so the smoke test never leaks into the user's real runtime.
+export ELASTOS_DATA_DIR="${DATA_DIR}"
 PUBLISHER_ROOT="${DATA_DIR}/ElastOS/SystemServices/Publisher"
 ARTIFACTS_DIR="${PUBLISHER_ROOT}/artifacts"
 LOG_PATH="${TEST_ROOT}/serve.log"
@@ -64,7 +80,15 @@ stop_source_runtime() {
 kill_temp_processes() {
     local root="$1"
     local skip_pid="${2:-}"
-    mapfile -t pids < <(pgrep -f "$root" || true)
+    # bash 3.2 (macOS default) has no mapfile/readarray. Read line-by-line and
+    # guard against empty arrays under `set -u` with the `${arr[@]+...}` form.
+    local pids=()
+    while IFS= read -r _pid; do
+        pids+=("$_pid")
+    done < <(pgrep -f "$root" || true)
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        return 0
+    fi
     for pid in "${pids[@]}"; do
         [[ "$pid" == "$$" ]] && continue
         [[ -n "${skip_pid}" && "$pid" == "${skip_pid}" ]] && continue
@@ -89,6 +113,73 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[local-carrier-setup] test root: ${TEST_ROOT}"
+
+# Phase 5 Day 8 — Day-5 + Day-6 inline precedence blocks
+# consolidated into `scripts/lib/cross-platform.sh`'s
+# `cross_platform_smoke_should_dry_run` predicate + the
+# companion `cross_platform_smoke_log_dry_run_reason` echo
+# helper. The wire format of the operator-visible echo lines
+# is preserved byte-for-byte from the Day-5/Day-6 inline
+# blocks; CI log parsers + dashboards keep working unchanged.
+#
+# Precedence (top wins, encoded by the helper):
+#   1. ELASTOS_VZ_SMOKE_FORCE_FULL=1   → full run.
+#   2. ELASTOS_VZ_SMOKE_DRY_RUN=0      → full run.
+#   3. ELASTOS_VZ_SMOKE_DRY_RUN=1      → dry run.
+#   4. CI auto-detect (GITHUB_ACTIONS / CI env set) → dry run.
+#   5. Default                          → full run.
+if [[ "${ELASTOS_VZ_SMOKE_FORCE_FULL:-0}" == "1" ]]; then
+    echo "[local-carrier-setup] FORCE_FULL=1 — forcing full smoke run (overrides CI auto-detect)"
+fi
+
+if cross_platform_smoke_should_dry_run; then
+    cross_platform_smoke_log_dry_run_reason "[local-carrier-setup]"
+    echo "[local-carrier-setup] dry-run mode: parse OK, helper sourced OK; exiting before cargo build"
+    if [[ "${OS_TOKEN}" == "darwin" ]]; then
+        if vz_host_is_capable; then
+            echo "[local-carrier-setup] dry-run: Vz host capability check passed (macOS 12+)"
+        else
+            echo "[local-carrier-setup] dry-run: Vz host capability check skipped (not macOS 12+ or sw_vers unavailable)"
+        fi
+    fi
+    exit 0
+fi
+
+# Phase 5 Day 1 — Mac pre-flight: detect whether components.json
+# has the darwin-arm64 release metadata required for the
+# Carrier install half of this smoke.
+#
+# Phase 5 Day 2 — the inline Python check was hoisted into
+# `cross_platform_assert_native_binary_release_metadata`
+# (`scripts/lib/cross-platform.sh`) so Day 1 / Day 2 / Day 3
+# / future Phase-6 install smokes share one source of truth
+# for the platform-key + names check.
+#
+# Pre-Work removed the dishonest darwin entries; Phase 6
+# restores truthful ones (per `docs/vz-backend/PLAN.md` L321).
+# Between those, on Mac, this smoke cannot exercise the
+# native-binary install path end-to-end. We exit 0 with a
+# clear operator-facing message + skip telemetry. The
+# substrate probe at the tail is unaffected — it visibly-skips
+# for the same reason.
+#
+# We run this BEFORE the "building current binary…" echo so the
+# operator-facing skip output isn't preceded by a misleading
+# "we're building things" header.
+if [[ "${OS_TOKEN}" == "darwin" ]] \
+        && [[ "${ELASTOS_VZ_SMOKE_FORCE_PROCEED:-0}" != "1" ]]; then
+    if ! cross_platform_assert_native_binary_release_metadata \
+            "${REPO_ROOT}/components.json" \
+            shell localhost-provider did-provider webspace-provider 2>/dev/null
+    then
+        cross_platform_print_phase6_skip_message
+        echo "[local-carrier-setup] Mac pre-flight: SKIP (Phase 6 prerequisite not met)"
+        # Exit 0 — this is a clean skip, not a smoke failure. CI dashboards
+        # alert on the skip telemetry separately.
+        exit 0
+    fi
+fi
+
 echo "[local-carrier-setup] building current binary and first-party Home core assets"
 
 (cd "${ELASTOS_ROOT}" && cargo build -p elastos-server)
@@ -99,6 +190,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/home" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/system" && cargo build --target wasm32-wasip1 --release)
+(cd "${REPO_ROOT}/capsules/chat-room" && cargo build --target wasm32-wasip1 --release)
 
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
@@ -122,9 +214,12 @@ WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/we
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
+CHAT_ROOM_CAPSULE_DIR="${REPO_ROOT}/capsules/chat-room" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
+GBA_EMULATOR_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-emulator" \
+GBA_UCITY_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-ucity" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -186,9 +281,13 @@ home_cli_data = home_cli_archive.read_bytes()
 home_cli_manifest["checksum"] = "sha256:" + hashlib.sha256(home_cli_data).hexdigest()
 home_cli_manifest["size"] = len(home_cli_data)
 
+# Browser WASM capsules: capsule.json + {name}.wasm + browser/ assets.
+# chat-room follows the same shape (Cargo crate that builds chat-room.wasm
+# under target/wasm32-wasip1/release and a sibling browser/ dir).
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+    "chat-room": pathlib.Path(os.environ["CHAT_ROOM_CAPSULE_DIR"]),
 }
 for name, capsule_dir in browser_capsules.items():
     info = platform_info(name)
@@ -207,10 +306,17 @@ for name, capsule_dir in browser_capsules.items():
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
 
+# Data capsules: tar every source-side file so multi-file viewers (e.g.
+# gba-emulator with its mgba.wasm + emulator.js + style.css) and content
+# capsules with non-`index.html` entrypoints (e.g. gba-ucity → ucity.gba)
+# both install correctly. Build artifacts and VCS metadata are excluded.
+_DATA_EXCLUDE_NAMES = {"target", "Cargo.lock", ".git", "node_modules", ".DS_Store"}
 data_capsules = {
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+    "gba-emulator": pathlib.Path(os.environ["GBA_EMULATOR_CAPSULE_DIR"]),
+    "gba-ucity": pathlib.Path(os.environ["GBA_UCITY_CAPSULE_DIR"]),
 }
 for name, capsule_dir in data_capsules.items():
     info = platform_info(name)
@@ -219,8 +325,10 @@ for name, capsule_dir in data_capsules.items():
         raise SystemExit(f"{name} missing release_path for {platform}")
     archive = artifacts_dir / release_path
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+        for child in sorted(capsule_dir.iterdir()):
+            if child.name in _DATA_EXCLUDE_NAMES:
+                continue
+            tar.add(child, arcname=f"{name}/{child.name}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -329,7 +437,11 @@ if [[ ! -f "${SOURCE_BOOTSTRAP_FILE}" ]]; then
     exit 1
 fi
 
-readarray -t SOURCE_BOOTSTRAP < "${SOURCE_BOOTSTRAP_FILE}"
+# bash 3.2 (macOS default) has no readarray; read line-by-line.
+SOURCE_BOOTSTRAP=()
+while IFS= read -r _line; do
+    SOURCE_BOOTSTRAP+=("$_line")
+done < "${SOURCE_BOOTSTRAP_FILE}"
 CONNECT_TICKET="${SOURCE_BOOTSTRAP[0]:-}"
 NODE_ID="${SOURCE_BOOTSTRAP[1]:-}"
 
@@ -379,6 +491,20 @@ echo "[local-carrier-setup] running Carrier-only setup smoke"
     "${ELASTOS_BIN}" setup
 )
 
+# Layer the universal-platform browser/data capsules on top of the home profile
+# install. These are platform-agnostic (`platforms: ["*"]`) and run anywhere
+# the gateway runs, so they're the first natural extension beyond the home
+# profile on macOS.
+echo "[local-carrier-setup] installing universal demo capsules (chat-room, gba-emulator, gba-ucity)"
+(
+    cd "${ELASTOS_ROOT}"
+    XDG_DATA_HOME="${XDG_DATA_HOME}" \
+    "${ELASTOS_BIN}" setup \
+        --with chat-room \
+        --with gba-emulator \
+        --with gba-ucity
+)
+
 stop_source_runtime
 
 for installed in \
@@ -394,7 +520,13 @@ for installed in \
     "${DATA_DIR}/capsules/system/browser/index.html" \
     "${DATA_DIR}/capsules/documents/index.html" \
     "${DATA_DIR}/capsules/library/index.html" \
-    "${DATA_DIR}/capsules/inbox/index.html"
+    "${DATA_DIR}/capsules/inbox/index.html" \
+    "${DATA_DIR}/capsules/chat-room/chat-room.wasm" \
+    "${DATA_DIR}/capsules/chat-room/capsule.json" \
+    "${DATA_DIR}/capsules/gba-emulator/index.html" \
+    "${DATA_DIR}/capsules/gba-emulator/mgba.wasm" \
+    "${DATA_DIR}/capsules/gba-ucity/ucity.gba" \
+    "${DATA_DIR}/capsules/gba-ucity/capsule.json"
 do
     if [[ ! -f "${installed}" ]]; then
         echo "expected installed file missing: ${installed}" >&2
@@ -425,6 +557,39 @@ grep -q "ElastOS Home" "${HOME_OUT}" || {
 }
 
 echo "[local-carrier-setup] OK"
+
+# Phase 5 Day 1 — Vz-substrate readiness probe. The smoke
+# itself validates the Carrier install pipeline; this tail step
+# additionally documents whether the host can launch a real
+# microVM via Vz (Mac) or crosvm (Linux) end-to-end.
+#
+# The probe deliberately does NOT fail the smoke. The smoke's
+# contract is "install pipeline works"; substrate readiness is
+# diagnostic. Operators / CI dashboards alert on the "skip"
+# signal separately.
+#
+# The probe visibly-skips if no installed MicroVM-typed
+# capsule with a rootfs.ext4 is present. The Day-1 smoke does
+# NOT install a rootfs (none of the published microVM-typed
+# capsules ship one in the trusted-source pipeline yet — that
+# lands as part of Phase 6's `components.json` restoration),
+# so the skip is the expected outcome on a fresh host. The
+# probe still validates the helper logic.
+if [[ "${ELASTOS_VZ_SMOKE_SKIP_PROBE:-0}" != "1" ]]; then
+    if [[ "${OS_TOKEN}" == "darwin" ]]; then
+        if vz_host_is_capable; then
+            echo "[local-carrier-setup] Vz substrate probe: host capable (macOS 12+, sw_vers reachable)"
+        else
+            echo "[local-carrier-setup] Vz substrate probe: host NOT capable (sw_vers unavailable or pre-macOS-12)" >&2
+        fi
+    fi
+    if probe_capsule="$(vz_discover_launchable_capsule "${DATA_DIR}" 2>/dev/null)"; then
+        echo "[local-carrier-setup] Vz substrate probe: discovered launchable capsule '${probe_capsule}' under ${DATA_DIR}/capsules/"
+    else
+        echo "[local-carrier-setup] Vz substrate probe: no launchable capsule found under ${DATA_DIR}/capsules/ (no rootfs.ext4 installed — expected on a fresh host pre-Phase-6)"
+    fi
+fi
+
 echo "[local-carrier-setup] temp data dir: ${DATA_DIR}"
 echo "[local-carrier-setup] runtime log:   ${LOG_PATH}"
 echo "[local-carrier-setup] inspect with:"

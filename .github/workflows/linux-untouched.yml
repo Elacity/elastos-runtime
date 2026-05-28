@@ -1,0 +1,54 @@
+name: Linux-untouched gate (Vz backend)
+
+# Enforces the Linux-untouched guarantee from docs/vz-backend/PLAN.md:
+# Phase 1+ Vz-backend commits must not modify the four protected crates
+# (elastos-crosvm, elastos-runtime, elastos-common, elastos-compute).
+#
+# Runs `scripts/check-linux-untouched.sh` against the Phase 0 baseline
+# (commit a65dad3 — the last commit before Vz work began). The script
+# itself documents how to adjust the base ref locally.
+#
+# Anchors:
+#   - docs/vz-backend/PLAN.md → "Linux-untouched: explicit guarantees"
+#   - PRINCIPLES.md #10 "One Canonical Path"
+#   - scripts/check-linux-untouched.sh
+
+on:
+  push:
+    branches: ["sash/**", "vz/**"]
+  pull_request:
+    branches: [main]
+  # Phase 5 Day 5 — allow manual one-shot triggers from the
+  # Actions UI so operators can re-run the gate after rebasing
+  # without pushing a new commit. Matches the trigger surface
+  # of the new mac-vz.yml workflow.
+  workflow_dispatch: {}
+
+jobs:
+  linux-untouched:
+    name: Protected crates not modified vs Vz baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed for `git merge-base` to find the
+          # divergence point against the baseline commit.
+          fetch-depth: 0
+
+      - name: Run protected-paths gate
+        env:
+          # Phase 0 baseline commit — last commit on sash/local-test
+          # before Vz-backend Phase 1 work started. Update this only
+          # if the project decides to re-baseline (e.g., after rebase
+          # onto a newer upstream main). See docs/vz-backend/PLAN.md.
+          VZ_BACKEND_BASELINE: a65dad3
+        run: |
+          set -euo pipefail
+          # Make sure the baseline commit is reachable in the checkout.
+          # Shallow clones don't always have it; `fetch-depth: 0` above
+          # asks for the full history but defend against any quirks.
+          if ! git cat-file -e "${VZ_BACKEND_BASELINE}^{commit}" 2>/dev/null; then
+            git fetch origin "${VZ_BACKEND_BASELINE}" || true
+          fi
+          chmod +x scripts/check-linux-untouched.sh
+          scripts/check-linux-untouched.sh "${VZ_BACKEND_BASELINE}"

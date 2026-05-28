@@ -1,0 +1,50 @@
+[package]
+name = "elastos-vz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ElastOS Apple Virtualization.framework Compute Provider — Run capsules in real microVMs on macOS (Phase 1: scaffold; no Vz API calls yet)"
+
+[dependencies]
+elastos-common = { path = "../elastos-common" }
+elastos-compute = { path = "../elastos-compute" }
+
+tokio = { version = "1.0", features = ["full", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+async-trait = "0.1"
+tracing = "0.1"
+thiserror = "1.0"
+libc = "0.2"
+
+# Apple Virtualization.framework bindings — fetched and linked ONLY on macOS.
+# On Linux the crate compiles as a stub (`is_supported()` returns false,
+# every entry point fails closed) so the workspace build stays green and
+# nothing is silently downgraded. The choice is anchored in
+# docs/vz-backend/PHASE_0_SCOPE.md §A. Phase 1 declares the dependency but
+# does not `use` it in any function body — actual Vz calls land in Phase 2.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-virtualization = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }
+tempfile = "3.10"
+# Phase 6 Day 7: substrate boot tests capture the kernel-console
+# tracing stream (`target = "vm_console"`) via a custom Layer. We
+# don't need the formatting / filter / env machinery — just `Layer`
+# trait + `Registry` — so `tracing-subscriber` is minimal here.
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+# Phase 8 Day 4: platform-aware data-dir resolution for the
+# discover_kernel/initrd/rootfs helpers in tests/concurrent_launch.rs.
+# Linux: $XDG_DATA_HOME (default ~/.local/share) — byte-identical to
+# the old hard-coded Linux path, so existing Linux test workflows
+# stay green. macOS: ~/Library/Application Support — matches the
+# install paths `elastos setup` writes to on this platform (see
+# elastos-server/src/sources.rs::default_data_dir). Pinned to 5.0
+# to match elastos-server / elastos-storage / elastos-compute.
+dirs = "5.0"

@@ -1,0 +1,219 @@
+name: Release (Apple Silicon)
+
+# Phase 10 Day 14 — Mac release lane.
+#
+# Fires when a release is **published** on GitHub (not on every
+# push to a release branch, not on tag creation alone). The
+# operator's workflow is:
+#
+#   1. git tag -a vX.Y.Z -m "release X.Y.Z" && git push origin vX.Y.Z
+#   2. On the GitHub web UI, create a Draft Release for that tag
+#      with whatever changelog notes you want, then click Publish.
+#   3. This workflow fires, builds + signs + smoke-checks the
+#      tarball on a fresh macos-14 runner, and uploads it +
+#      the .sha256 to the release as assets.
+#   4. **Manual step (operator-only):** download the uploaded
+#      tarball, run `xcrun notarytool submit` + `xcrun stapler
+#      staple` on a machine with your Apple Developer
+#      credentials configured, then re-upload the stapled
+#      tarball as a release asset, replacing the
+#      pre-notarisation copy.
+#
+# Why notarisation is NOT automated here:
+#   Apple's notary credentials grant the ability to ship code
+#   that the entire Mac ecosystem trusts. Storing them in
+#   GitHub Actions secrets — even encrypted — moves that risk
+#   off the operator's machine and onto GitHub's infra.
+#   For Phase 10 (alpha) we hold the credentials on the
+#   operator's machine and treat notarisation as a deliberate
+#   human step. Phase 11+ may revisit using `notarytool` with
+#   App Store Connect API key secrets if the operator chooses
+#   to opt in.
+#
+# Why macos-14 (NOT macos-latest):
+#   `aarch64-apple-darwin` is the only target this script
+#   produces. macos-14 is GitHub's first Apple Silicon
+#   image and the only one where the host architecture matches
+#   the target. macos-latest currently aliases to macos-15
+#   (also arm64) but pinning a specific runner avoids surprise
+#   migrations on a security-sensitive workflow.
+#
+# Anchors:
+#   - docs/vz-backend/PHASE_10_PLAN.md § Day 14
+#   - docs/vz-backend/PHASE_10_DAY_14_NOTES.md
+#   - scripts/release/release-mac.sh
+
+on:
+  release:
+    types: [published]
+  # Manual trigger so the operator can re-run the build for an
+  # existing release tag (e.g. after a workflow bug fix) without
+  # having to unpublish/republish. The `inputs.tag` selects
+  # which tag to build; the resulting tarball goes to the
+  # workflow artifacts only (NOT auto-attached to the release)
+  # because attaching might overwrite the operator's hand-stapled
+  # copy.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.2.0)"
+        required: true
+
+# One release at a time per tag — guards against the (rare)
+# case where the operator publishes a release twice in quick
+# succession (e.g. while editing changelog notes).
+concurrency:
+  group: release-mac-${{ github.event.release.tag_name || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-package:
+    name: Build, sign, smoke-check, package
+    runs-on: macos-14
+    timeout-minutes: 45
+    permissions:
+      # `contents: write` is required for softprops/action-gh-release
+      # to upload the tarball + .sha256 as release assets. The
+      # default GITHUB_TOKEN scope is read-only on releases.
+      contents: write
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          # For `release.published` events the default checkout
+          # already lands on the tag commit. For
+          # `workflow_dispatch` we explicitly check out the
+          # operator-supplied tag.
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          # Full history so the script's `git rev-parse refs/tags/<tag>`
+          # check sees the tag. Without `fetch-depth: 0` the
+          # default shallow clone may omit it.
+          fetch-depth: 0
+
+      - name: Resolve tag for downstream steps
+        id: tag
+        # Single source of truth for the tag name — both event
+        # paths funnel into TAG. The release-mac.sh script
+        # takes the tag as its only positional arg.
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          if [[ -z "$TAG" ]]; then
+            echo "::error::tag is empty (neither release.tag_name nor workflow_dispatch.tag set)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $TAG"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          # Distinct prefix so the release cache doesn't mix
+          # with the mac-vz.yml CI cache — different intent
+          # (release artefacts vs. test iteration), different
+          # eviction profile.
+          prefix-key: release-mac
+
+      - name: Confirm host is Apple Silicon
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -a
+          arch="$(uname -m)"
+          if [[ "$arch" != "arm64" ]]; then
+            echo "::error::release-mac.sh requires arm64; runner reports $arch"
+            exit 1
+          fi
+          # Surface the Xcode + codesign versions in the log so a
+          # future build divergence is diff-able from this point.
+          xcodebuild -version || true
+          codesign --version
+
+      - name: Build, sign, smoke-check, package
+        run: |
+          bash scripts/release/release-mac.sh "${{ steps.tag.outputs.tag }}"
+
+      - name: Locate produced artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          RELEASE_DIR="elastos/target/release-mac/$TAG"
+          TARBALL="$RELEASE_DIR/elastos-${TAG}-aarch64-apple-darwin.tar.gz"
+          SHA256="$TARBALL.sha256"
+          if [[ ! -f "$TARBALL" ]]; then
+            echo "::error::expected tarball not found: $TARBALL"
+            exit 1
+          fi
+          if [[ ! -f "$SHA256" ]]; then
+            echo "::error::expected checksum not found: $SHA256"
+            exit 1
+          fi
+          {
+            echo "tarball=$TARBALL"
+            echo "sha256=$SHA256"
+            echo "tarball_basename=$(basename "$TARBALL")"
+            echo "sha256_basename=$(basename "$SHA256")"
+          } >> "$GITHUB_OUTPUT"
+          echo "Artifacts ready:"
+          ls -lh "$TARBALL" "$SHA256"
+          echo "Contents:"
+          cat "$SHA256"
+
+      - name: Upload as workflow artifacts (always)
+        # Workflow artifacts are kept for 90 days by default and
+        # are available even if the release-asset attach step
+        # below fails. Operator can always pull from here.
+        uses: actions/upload-artifact@v4
+        with:
+          name: elastos-${{ steps.tag.outputs.tag }}-aarch64-apple-darwin
+          path: |
+            ${{ steps.artifacts.outputs.tarball }}
+            ${{ steps.artifacts.outputs.sha256 }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub release (release.published only)
+        # On `workflow_dispatch` re-runs we skip the release
+        # attach — the operator's existing stapled artifact must
+        # not get overwritten. Workflow-artifact upload above
+        # still happens so the re-build is recoverable.
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            ${{ steps.artifacts.outputs.tarball }}
+            ${{ steps.artifacts.outputs.sha256 }}
+          # Don't recreate the release if it already exists;
+          # this workflow only ever runs on already-published
+          # releases.
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+
+      - name: Operator follow-up reminder
+        # Prints the manual notarise/staple steps in the log so
+        # the operator sees them without having to re-read this
+        # workflow YAML or the script's stdout.
+        run: |
+          cat <<'EOF'
+
+          ──────────────────────────────────────────────────────────
+          The pre-notarisation tarball has been attached to the release.
+          Gatekeeper on user machines will warn until you notarise it.
+
+          Manual steps on your local Mac (NOT in CI):
+            xcrun notarytool submit <tarball> --keychain-profile <profile> --wait
+            # then staple + repackage + re-upload per:
+            #   scripts/release/release-mac.sh (printed in the build step's stdout)
+          ──────────────────────────────────────────────────────────
+
+          EOF
