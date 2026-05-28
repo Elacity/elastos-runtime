@@ -965,12 +965,15 @@ mod tests {
             let mut slave_fd = -1;
             let mut name = [0i8; 128];
 
+            // null_mut() (not null()) matches macOS' `openpty` signature, which
+            // takes `*mut termios` / `*mut winsize` for the optional args. Linux
+            // libc bindings accept either; null_mut is valid on both.
             let rc = libc::openpty(
                 &mut master_fd,
                 &mut slave_fd,
                 name.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
             assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
             assert!(master_fd >= 0);
