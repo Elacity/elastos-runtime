@@ -163,7 +163,12 @@ is green." Documented as it lands:
 - `git diff origin/main..sash/local-test-v030 --stat`: matches PR #2's
   diff exactly (CVE work only, zero Mac VZ work)
 - Draft PR #3 opened: ✓
-- Linux CI on PR #3: pending — outcome will be appended once it lands
+- Linux CI on PR #3: **3/3 green** on commit `0b4385e` (after DAY_1.md was added)
+  - `Check + Clippy + Format` — pass (4m57s)
+  - `Test` — pass (9m22s)
+  - `Build Release (x86_64)` — pass (9m43s)
+  - GitHub Actions run: [26562616261](https://github.com/Elacity/elastos-runtime/actions/runs/26562616261)
+- Mac VZ CI: not triggered yet (no Mac VZ source on the branch). Will run from Day 2 onward.
 
 ---
 
