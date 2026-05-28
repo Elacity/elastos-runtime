@@ -7,9 +7,10 @@ description = "TLS certificate management for ElastOS"
 
 [dependencies]
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2.0"
+# PEM parsing uses `rustls_pki_types::pem::PemObject` from the active Rustls
+# stack; keep `rustls-pemfile` out of the direct dependency tree.
 time = "0.3"
 tokio = { version = "1.0", features = ["net", "io-util", "rt", "macros", "time"] }
 tracing = "0.1"

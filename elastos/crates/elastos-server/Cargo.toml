@@ -22,7 +22,7 @@ elastos-crosvm = { path = "../elastos-crosvm" }
 # HTTP server
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "fs"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 
 # TLS (ring crypto provider)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -32,8 +32,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 
 # CLI
 clap = { version = "4.0", features = ["derive"] }
-crossterm = "0.28"
-ratatui = "0.29"
+# `crossterm` and `ratatui` were declared but unused. If a TUI is reintroduced,
+# add current maintained versions at that point.
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -94,9 +94,12 @@ tar = "0.4"
 libc = "0.2"
 
 # Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery)
+# distributed-topic-tracker 0.2.8 pulls iroh 0.97 while elastos-server still
+# uses iroh 0.96 directly. Keep one iroh generation in the tree until the whole
+# server can migrate together.
 iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 iroh-gossip = "0.96"
-distributed-topic-tracker = "0.2"
+distributed-topic-tracker = "=0.2.7"
 futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"

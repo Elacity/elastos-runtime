@@ -297,7 +297,7 @@ fn verify_cid_content(cid_str: &str, content: &[u8]) -> CidVerification {
 
     let expected = mh.digest();
     let actual = Sha256::digest(content);
-    if actual.as_slice() == expected {
+    if &actual[..] == expected {
         CidVerification::Verified
     } else {
         CidVerification::Mismatch(format!(
@@ -706,7 +706,7 @@ mod tests {
         // Build a CIDv1 raw-codec SHA2-256 from known content
         let content = b"hello elastos";
         let digest = Sha256::digest(content);
-        let mh = multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).expect("wrap multihash");
+        let mh = multihash::Multihash::<64>::wrap(0x12, &digest[..]).expect("wrap multihash");
         let cid = cid::Cid::new_v1(0x55, mh);
         let cid_str = cid.to_string();
 
@@ -724,7 +724,7 @@ mod tests {
         // Build a valid CID for "hello" but verify against "world"
         let content = b"hello";
         let digest = Sha256::digest(content);
-        let mh = multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).expect("wrap multihash");
+        let mh = multihash::Multihash::<64>::wrap(0x12, &digest[..]).expect("wrap multihash");
         let cid = cid::Cid::new_v1(0x55, mh);
         let cid_str = cid.to_string();
 

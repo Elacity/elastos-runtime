@@ -1,0 +1,9 @@
+[advisories]
+# Blocked on a coordinated Carrier upgrade. `iroh` 0.96/0.97/0.98 still pins
+# vulnerable Hickory versions, while the available `iroh` generation that moves
+# further requires a Rust toolchain bump beyond the current 1.89 runtime floor.
+# Keep this explicit and revisit under `chore/runtime-cve-residuals-iroh`.
+ignore = [
+  "RUSTSEC-2026-0118",
+  "RUSTSEC-2026-0119",
+]
