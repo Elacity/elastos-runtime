@@ -100,6 +100,23 @@ copy was the older v0.2.0 vision draft and is intentionally superseded).
    alongside the Day 2 finding for a project-level decision (cfg-gate to
    Linux / fix Mac compatibility / accept Mac CI as informational).
 
+   **Concrete root cause (captured Day 3):** all 6 failing tests panic
+   on `assert_eq!(response.status(), StatusCode::OK)` because the
+   `/api/apps/browser/open` handler returns `500 Internal Server Error`
+   with body `path must be shorter than SUN_LEN`. Origin: v0.3.0's
+   `gateway_browser_stream::browser_runtime_stream_socket_path` builds
+   the runtime stream socket under `std::env::temp_dir().join(
+   "elastos-browser-streams")`, which on macOS resolves under the
+   per-user `/var/folders/<XX>/<YY>/T/...` private temp tree. Combined
+   with the test's `tempfile::tempdir()` cache dir (also under
+   `/var/folders/...`) and the SHA256-prefixed socket file name, the
+   resulting absolute path exceeds the 104-byte SUN_LEN limit on
+   Darwin (Linux's `sun_path` is 108 bytes and the path stays under
+   that). Net: this is a v0.3.0-on-Mac platform incompatibility in
+   the test path, not a Day 3 regression. Fix would be to shorten the
+   socket path on Darwin (e.g. `tmpfs`/CARGO_TARGET_TMPDIR-style short
+   prefix or hashed filename truncation). Out of scope for the rebase.
+
 ## Local validation
 
 ```text
