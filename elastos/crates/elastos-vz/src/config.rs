@@ -639,6 +639,9 @@ mod tests {
                 gpu: false,
             },
             permissions: Default::default(),
+            // v0.3.0 added the principal-binding `authority` field; None
+            // here = "no authority constraint" for in-module unit tests.
+            authority: None,
             microvm: Some(MicroVmConfig {
                 kernel: None,
                 boot_args: boot_args.to_string(),

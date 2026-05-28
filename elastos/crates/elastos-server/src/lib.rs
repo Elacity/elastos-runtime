@@ -22,6 +22,7 @@ pub mod ipfs;
 pub mod local_http;
 pub mod notifications;
 pub mod operator_control;
+pub mod overlay_initrd;
 pub mod ownership;
 pub mod provider_resource;
 pub mod room_service;

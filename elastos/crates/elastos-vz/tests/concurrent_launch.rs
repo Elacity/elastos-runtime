@@ -59,6 +59,10 @@ fn microvm_manifest(name: &str) -> CapsuleManifest {
             gpu: false,
         },
         permissions: Default::default(),
+        // v0.3.0 added the principal-binding `authority` field; None
+        // here = "no authority constraint" for the synthetic
+        // concurrent-launch fixture.
+        authority: None,
         microvm: Some(MicroVmConfig {
             kernel: None,
             boot_args: "console=ttyS0".into(),

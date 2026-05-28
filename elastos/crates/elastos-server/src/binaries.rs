@@ -34,15 +34,21 @@ pub fn find_installed_provider_binary(name: &str) -> Option<PathBuf> {
         return Some(installed_capsule);
     }
 
-    if let Some(global_data_dir) = dirs::data_dir().map(|dir| dir.join("elastos")) {
-        let global_component = global_data_dir.join("bin").join(name);
-        if global_component.is_file() {
-            return Some(global_component);
-        }
+    // Platform-native global fallback (e.g. ~/Library/Application Support/elastos
+    // on macOS) — only when there is no explicit ELASTOS_DATA_DIR override.
+    // Otherwise an isolated test/smoke run would silently leak into the user's
+    // real install.
+    if std::env::var_os("ELASTOS_DATA_DIR").is_none() {
+        if let Some(global_data_dir) = dirs::data_dir().map(|dir| dir.join("elastos")) {
+            let global_component = global_data_dir.join("bin").join(name);
+            if global_component.is_file() {
+                return Some(global_component);
+            }
 
-        let global_capsule = global_data_dir.join("capsules").join(name).join(name);
-        if global_capsule.is_file() {
-            return Some(global_capsule);
+            let global_capsule = global_data_dir.join("capsules").join(name).join(name);
+            if global_capsule.is_file() {
+                return Some(global_capsule);
+            }
         }
     }
 

@@ -129,6 +129,13 @@ futures-lite = "2.6"
 getrandom = "0.2"
 data-encoding = "2.6"
 
+# Apple Virtualization.framework substrate — only compiled into the
+# server on macOS hosts. On Linux/Windows the server keeps its
+# Linux/crosvm-only behaviour byte-for-byte. Anchored in
+# docs/vz-backend/PLAN.md (Linux-untouched gate).
+[target.'cfg(target_os = "macos")'.dependencies]
+elastos-vz = { path = "../elastos-vz" }
+
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.10"
