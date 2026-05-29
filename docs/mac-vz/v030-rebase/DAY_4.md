@@ -235,3 +235,14 @@ The Day 1–3 deferred lists are now empty:
   (Linux green, Mac CI 6 SUN_LEN failures).
 - PR #3 stays draft until Anders confirms the rebase landing strategy
   for v0.3.1.
+
+## Update — Anders review reply (2026-05-29)
+
+Anders has replied with seven binding decisions. Recorded verbatim in
+[`DECISIONS.md`](DECISIONS.md). Headline: macOS stays browser-hosted;
+native Mac VZ parity is gated behind real Apple Silicon hardware proof;
+**PR #3 is held as a parked v0.3.2+ branch**, not a v0.3.1 merge
+candidate. A post-rebase day plan executes against those decisions
+(SUN_LEN socket-path fix, principal-scoping parity test, components.json
+hygiene, `provider_call` audit, codesigning doc). See `DECISIONS.md` for
+the per-decision follow-up mapping.

@@ -75,6 +75,11 @@ so you can reply per-question at your own pace.
 
 > Send this as a separate message after the status note above, or
 > together as a second block. Numbered so Anders can reply per item.
+>
+> **UPDATE 2026-05-29:** Anders has replied — all seven answered. Decisions
+> recorded verbatim in `docs/mac-vz/v030-rebase/DECISIONS.md`; the
+> post-rebase day plan executes against them. Headline: macOS stays
+> browser-hosted, PR #3 parked as a v0.3.2+ branch.
 
 **Subject:** Mac VZ rebase — open v0.3.1-shape decisions
 
