@@ -103,9 +103,34 @@ const roots = [
   { schema: "elastos.library.root/v1", id: "videos", label: "Videos", uri: videosUri, kind: "directory" },
   { schema: "elastos.library.root/v1", id: "downloads", label: "Downloads", uri: downloadsUri, kind: "directory" },
   { schema: "elastos.library.root/v1", id: "public", label: "Public", uri: publicUri, kind: "directory" },
+  {
+    schema: "elastos.library.root/v1",
+    id: "trash",
+    label: "Trash",
+    uri: `${principalRoot}/.Trash`,
+    kind: "directory",
+    metadata: { schema: "elastos.library.trash-root/v1", empty: false, item_count: 2 },
+  },
   { schema: "elastos.library.root/v1", id: "webspaces", label: "Spaces", uri: webspacesUri, kind: "webspace-root" },
 ];
 
+const localhostSpace = object(principalRoot, "Localhost", "directory", [
+  "open",
+  "list",
+  "properties",
+], {
+  availability: "local-principal",
+  metadata: {
+    schema: "elastos.library.space-pointer/v1",
+    space: "localhost",
+    label: "Localhost",
+    target_uri: principalRoot,
+    provider: "object-provider",
+    authority: "signed-principal-root",
+    writable: true,
+    note: "This opens the signed principal's mutable localhost object space. It is not a broad host filesystem grant.",
+  },
+});
 const folder = object(`${documentsUri}/Projects`, "Projects", "directory", [
   "download",
   "compress_archive",
@@ -216,6 +241,18 @@ const zipArchiveFile = object(`${documentsUri}/Portable.zip`, "Portable.zip", "f
     archive_support: archiveSupport("zip"),
   },
 });
+const looseZipFile = object(`${documentsUri}/Loose.zip`, "Loose.zip", "file", [
+  "download",
+  "compress_archive",
+  "rename",
+  "move",
+  "copy",
+  "trash",
+  "properties",
+], {
+  mime: "application/zip",
+  size: 384,
+});
 const policyGatedArchiveFile = object(`${documentsUri}/Legacy.7z`, "Legacy.7z", "file", [
   "download",
   "compress_archive",
@@ -251,12 +288,46 @@ const trashFile = object(`${principalRoot}/.Trash/Deleted.txt`, "Deleted.txt", "
   "restore",
   "delete_permanently",
   "properties",
-]);
+], {
+  metadata: {
+    schema: "elastos.library.object-metadata/v1",
+    visibility: {
+      schema: "elastos.library.visibility/v1",
+      placement: "trash",
+      placement_label: "Trash",
+      effective_access: "principal_private",
+    },
+    trash: {
+      schema: "elastos.library.trash-record/v1",
+      trash_uri: `${principalRoot}/.Trash/Deleted.txt`,
+      original_uri: `${documentsUri}/Deleted.txt`,
+      original_name: "Deleted.txt",
+      trashed_at: 1_780_000_000,
+    },
+  },
+});
 const purgeFile = object(`${principalRoot}/.Trash/Purge.txt`, "Purge.txt", "file", [
   "restore",
   "delete_permanently",
   "properties",
-]);
+], {
+  metadata: {
+    schema: "elastos.library.object-metadata/v1",
+    visibility: {
+      schema: "elastos.library.visibility/v1",
+      placement: "trash",
+      placement_label: "Trash",
+      effective_access: "principal_private",
+    },
+    trash: {
+      schema: "elastos.library.trash-record/v1",
+      trash_uri: `${principalRoot}/.Trash/Purge.txt`,
+      original_uri: `${documentsUri}/Purge.txt`,
+      original_name: "Purge.txt",
+      trashed_at: 1_780_000_001,
+    },
+  },
+});
 const webspaceElastos = object(`${webspacesUri}/Elastos`, "Elastos", "directory", [
   "open",
   "list",
@@ -375,13 +446,13 @@ const webspaceMutable = createWebspaceFolderObject(webspaceMutableUri, "Mutable"
 const folders = new Map([
   [principalRoot, []],
   [desktopUri, []],
-  [documentsUri, [folder, file, viewerFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, policyGatedArchiveFile, blockedFile, hiddenFile, trashFile, purgeFile]],
+  [documentsUri, [folder, file, viewerFile, publishedFile, archiveFile, tarArchiveFile, zipArchiveFile, looseZipFile, policyGatedArchiveFile, blockedFile, hiddenFile]],
   [picturesUri, []],
   [videosUri, []],
   [downloadsUri, []],
   [publicUri, [publicDraftFile]],
-  [`${principalRoot}/.Trash`, []],
-  [webspacesUri, [webspaceElastos, webspaceCloud, webspaceMutable]],
+  [`${principalRoot}/.Trash`, [trashFile, purgeFile]],
+  [webspacesUri, [localhostSpace, webspaceElastos, webspaceCloud, webspaceMutable]],
   [`${webspacesUri}/Elastos`, [webspaceContent]],
   [`${webspacesUri}/Elastos/content`, [webspaceFile]],
   [`${webspacesUri}/Cloud`, [webspaceCloudDrive]],
@@ -437,6 +508,20 @@ function touch(item) {
 function objectsFor(parent) {
   if (!folders.has(parent)) folders.set(parent, []);
   return folders.get(parent);
+}
+
+function rootsWithTrashState() {
+  const trashObjects = objectsFor(`${principalRoot}/.Trash`);
+  return roots.map((root) => root.id === "trash"
+    ? {
+      ...root,
+      metadata: {
+        ...(root.metadata || {}),
+        empty: trashObjects.length === 0,
+        item_count: trashObjects.length,
+      },
+    }
+    : root);
 }
 
 function findObject(uri) {
@@ -579,7 +664,7 @@ async function serveStatic(req, res) {
 
 function handleProvider(op, payload, res) {
   ops.push({ op, payload });
-  if (op === "roots") return sendJson(res, 200, ok({ roots }));
+  if (op === "roots") return sendJson(res, 200, ok({ roots: rootsWithTrashState() }));
   if (op === "list") return sendJson(res, 200, ok({
     objects: folders.get(payload.uri) || [],
     object: findObject(payload.uri) || null,
@@ -648,18 +733,37 @@ function handleProvider(op, payload, res) {
   if (op === "trash") {
     const { object: source } = removeObject(payload.uri);
     if (!source) return sendJson(res, 404, JSON.stringify({ status: "error", message: "not found" }));
+    const originalUri = payload.uri;
     source.uri = childUri(`${principalRoot}/.Trash`, source.name || baseName(source.uri));
     source.capabilities = ["restore", "delete_permanently", "properties"];
+    source.metadata = {
+      ...(source.metadata || {}),
+      visibility: {
+        schema: "elastos.library.visibility/v1",
+        placement: "trash",
+        placement_label: "Trash",
+        effective_access: "principal_private",
+      },
+      trash: {
+        schema: "elastos.library.trash-record/v1",
+        trash_uri: source.uri,
+        original_uri: originalUri,
+        original_name: baseName(originalUri),
+        trashed_at: 1_780_000_100,
+      },
+    };
     touch(source);
     putObject(parentUri(source.uri), source);
-    return sendJson(res, 200, ok({ object: source, original_uri: payload.uri }));
+    return sendJson(res, 200, ok({ object: source, original_uri: originalUri }));
   }
   if (op === "restore") {
     const { object: source } = removeObject(payload.uri);
     if (!source) return sendJson(res, 404, JSON.stringify({ status: "error", message: "not found" }));
-    source.uri = payload.target_uri;
-    source.name = baseName(payload.target_uri);
+    const targetUri = payload.target_uri || source.metadata?.trash?.original_uri || childUri(documentsUri, source.name || baseName(source.uri));
+    source.uri = targetUri;
+    source.name = baseName(targetUri);
     source.capabilities = fileCapabilities();
+    if (source.metadata?.trash) delete source.metadata.trash;
     touch(source);
     putObject(parentUri(source.uri), source);
     return sendJson(res, 200, ok({ object: source }));
@@ -667,6 +771,12 @@ function handleProvider(op, payload, res) {
   if (op === "delete_permanently") {
     removeObject(payload.uri);
     return sendJson(res, 200, ok({ deleted: true }));
+  }
+  if (op === "empty_trash") {
+    const trashObjects = objectsFor(`${principalRoot}/.Trash`);
+    const deletedCount = trashObjects.length;
+    folders.set(`${principalRoot}/.Trash`, []);
+    return sendJson(res, 200, ok({ deleted_count: deletedCount }));
   }
   if (op === "publish") {
     const found = findObject(payload.uri);
@@ -1555,7 +1665,7 @@ async function run() {
     await page.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}`);
     await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
 
-    for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Spaces"]) {
+    for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
       await page.locator(".place").filter({ hasText: label }).first().click();
       await page.locator(".crumb-current").filter({ hasText: label }).first().waitFor();
       await assertOnlyActivePlace(page, label);
@@ -1882,6 +1992,11 @@ async function run() {
     includesAll(blockedRows, ["Properties"], "blocked file menu");
     excludesAll(blockedRows, ["Open", "Delete", "Rename"], "blocked file menu");
 
+    await page.locator(".place").filter({ hasText: "Trash" }).first().click();
+    await page.locator(".item").filter({ hasText: "Deleted.txt" }).first().waitFor();
+    includesAll(await openPlaceMenu(page, "Trash"), ["Open", "Open in New Window", "Empty Trash"], "Trash sidebar place menu");
+    await page.keyboard.press("Escape");
+
     includesAll(await openItemMenu(page, "Deleted.txt"), [
       "Restore",
       "Delete Permanently",
@@ -1907,7 +2022,14 @@ async function run() {
 
     await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
     await assertOnlyActivePlace(page, "Spaces");
-    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("3 objects"));
+    await page.waitForFunction(() => document.querySelector("#footer-left")?.textContent?.includes("4 objects"));
+    await page.locator(".item").filter({ hasText: "Localhost" }).first().waitFor();
+    includesAll(await openItemMenu(page, "Localhost"), ["Open", "Open in New Window", "Properties"], "Localhost Spaces pointer menu");
+    excludesAll(await openItemMenu(page, "Localhost"), ["Download", "Compress to ZIP", "Publish", "Delete", "Rename"], "Localhost Spaces pointer menu");
+    await page.locator(".item").filter({ hasText: "Localhost" }).first().dblclick();
+    await page.locator(".crumb-current").filter({ hasText: "Home" }).first().waitFor();
+    await page.locator(".place").filter({ hasText: "Spaces" }).first().click();
+    await assertOnlyActivePlace(page, "Spaces");
     const webspaceRows = await openBackgroundMenu(page);
     excludesAll(webspaceRows, ["New", "Paste", "Upload Here"], "Spaces background menu");
     includesAll(webspaceRows, ["Sort By", "Refresh", "Properties"], "Spaces background menu");
@@ -2224,6 +2346,15 @@ async function run() {
       ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Legacy.7z")).length === readsBeforeArchiveViewerOpen,
       "Double-click with Archive must not fall back to preview/read or unsafe extraction",
     );
+    const looseZipItem = libraryFrame.locator(".item").filter({ hasText: "Loose.zip" }).first();
+    await looseZipItem.click();
+    await looseZipItem.locator(".item-name").dblclick();
+    await page.waitForFunction(() =>
+      window.__shellMessages?.some((message) =>
+        message?.type === "home:open-target" &&
+        message?.target === "archive-manager" &&
+        message?.query?.objectUri?.endsWith("/Loose.zip")),
+    );
     const viewerItem = libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first();
     await viewerItem.click();
     await viewerItem.locator(".item-name").dblclick();
@@ -2237,6 +2368,22 @@ async function run() {
     assert(
       ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Viewer.md")).length === readsBeforeViewerOpen,
       "Double-click with an installed viewer must not fall back to preview/read",
+    );
+    await page.evaluate(() => {
+      window.__shellMessages = [];
+    });
+    await libraryFrame.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}&mode=archive-open&returnTarget=archive-manager`);
+    await libraryFrame.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
+    await libraryFrame.waitForFunction(() => document.querySelector("#status-text")?.classList.contains("hidden"));
+    const pickerZipItem = libraryFrame.locator(".item").filter({ hasText: "Loose.zip" }).first();
+    await pickerZipItem.click();
+    await pickerZipItem.locator(".item-name").dblclick();
+    await page.waitForFunction(() =>
+      window.__shellMessages?.some((message) =>
+        message?.type === "home:deliver-to-target" &&
+        message?.target === "archive-manager" &&
+        message?.payload?.type === "archive:open-library-object" &&
+        message?.payload?.object?.uri?.endsWith("/Loose.zip")),
     );
 
     const archivePage = await context.newPage();
@@ -2260,6 +2407,44 @@ async function run() {
     await archivePage.locator("#extract-selected").click();
     await archivePage.locator("#extract-status").filter({ hasText: "1 written" }).first().waitFor();
     await archivePage.close();
+    const archiveBlankPage = await context.newPage();
+    await archiveBlankPage.goto(
+      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+    );
+    await archiveBlankPage.locator("#open-existing-archive").click();
+    await archiveBlankPage.waitForURL((url) =>
+      url.pathname === "/apps/library/" &&
+        url.searchParams.get("mode") === "archive-open" &&
+        url.searchParams.get("returnTarget") === "archive-manager",
+    );
+    await archiveBlankPage.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
+    await archiveBlankPage.goto(
+      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+    );
+    await archiveBlankPage.locator("#make-new-archive").click();
+    await archiveBlankPage.waitForURL((url) =>
+      url.pathname === "/apps/library/" &&
+        url.searchParams.get("mode") === "archive-create" &&
+        url.searchParams.get("returnTarget") === "archive-manager",
+    );
+    await archiveBlankPage.locator("#picker-action-button").filter({ hasText: "Create ZIP" }).first().waitFor();
+    await archiveBlankPage.close();
+    const archiveMessagePage = await context.newPage();
+    await archiveMessagePage.goto(
+      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+    );
+    await archiveMessagePage.evaluate((uri) => {
+      window.postMessage({
+        type: "archive:open-library-object",
+        object: {
+          uri,
+          name: "Portable.zip",
+          mime: "application/zip",
+        },
+      }, window.location.origin);
+    }, `${documentsUri}/Portable.zip`);
+    await archiveMessagePage.locator("#entry-list").filter({ hasText: "Nested/deep.txt" }).first().waitFor();
+    await archiveMessagePage.close();
     assert(
       ops.some((entry) => entry.op === "roots"),
       "Archive destination picker must load roots through the Runtime viewer route",

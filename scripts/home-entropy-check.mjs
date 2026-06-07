@@ -1185,8 +1185,12 @@ assert(
   "Home open-target messages must stay source-gated",
 );
 assert(
+  shellJs.includes('"archive-manager": new Set(["library"])'),
+  "Home must allow Archive to route users into Library for open/create archive journeys",
+);
+assert(
   shellJs.includes('library: new Set(["archive-manager", "documents", "library"])'),
-  "Home must allow Library sidebar Open in New Window while keeping the source-gated policy explicit",
+  "Home must allow Library to open Archive for archive files while keeping the source-gated policy explicit",
 );
 assert(
   shellIndex.includes(`shell.js?v=${homeAssetVersion}`),
@@ -1215,6 +1219,17 @@ assert(
 assert(
   shellSurface.includes(`shell-windows.js?v=${homeAssetVersion}`),
   "Home shell-surface must import the same shell-windows module instance as shell.js",
+);
+assert(
+    shellCore.includes('"archive-manager": "Archive"') &&
+    !shellCore.includes('"Archive Manager"') &&
+    shellCore.includes("export function canonicalTargetTitle") &&
+    shellCore.includes("title: canonicalTargetTitle(target?.target, target?.title)") &&
+    shellCore.includes("return override || normalizedTitle || targetId") &&
+    shellCore.includes("if (TARGET_TITLE_OVERRIDES[targetId])") &&
+    !shellCore.includes("STALE_TARGET_TITLES") &&
+    shellWindows.includes("canonicalTargetTitle(launched.target, launched.title)"),
+  "Home must canonicalize Archive labels and window titles without stale generated aliases",
 );
 assert(
   !shellWindows.includes("allowfullscreen") &&
@@ -1330,7 +1345,7 @@ assert(
 );
 assert(
   shellJs.includes('library: new Set(["archive-manager", "chat-room"])'),
-  "Home must allow Library picker results to return only to authorized capsules",
+  "Home must allow Library picker results to return only to Archive and Chat Room",
 );
 assert(
   shellJs.includes('"home:close-self"'),
@@ -2273,12 +2288,24 @@ assert(
 );
 assert(
   libraryApp.includes('desktop: "icons/sidebar-folder-desktop.svg"') &&
-    !libraryApp.includes('trash: "icons/trash.svg"'),
-  "Library sidebar must expose Desktop and keep Trash as a hidden operation, not a visible root",
+    libraryApp.includes('"icons/trash.svg"') &&
+    libraryApp.includes('"icons/trash-full.svg"'),
+  "Library sidebar must expose Desktop and visible provider-backed Trash with empty/full icons",
 );
 assert(
   libraryDesktopIcon.includes('width="12px"') && libraryDesktopIcon.includes('height="12px"'),
   "Library Desktop sidebar icon must use compact sidebar sizing",
+);
+assert(
+  gatewayApi.includes("HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA") &&
+    gatewayApi.includes("home_trash_desktop_object") &&
+    gatewayApi.includes('"system_kind": "trash"') &&
+    shellCore.includes('targetId === "trash-full"') &&
+    shellSurface.includes("function isTrashDesktopObject") &&
+    shellSurface.includes("Open Trash") &&
+    shellSurface.includes('action: "empty-trash"') &&
+    libraryApp.includes('state.initialAction === "empty-trash"'),
+  "Home desktop must expose provider-backed Trash as a system desktop object",
 );
 assert(
     objectProviderManifest.includes('"role": "provider"') &&
@@ -2304,8 +2331,11 @@ assert(
 );
 assert(
   objectProviderImpl.includes('("desktop", "Desktop", format!("{root}/Desktop"), "directory")') &&
-    !objectProviderImpl.includes('("trash", "Trash", format!("{root}/.Trash"), "directory")'),
-  "Object provider roots must expose Desktop and omit visible Trash",
+    objectProviderImpl.includes('id: "trash"') &&
+    objectProviderImpl.includes('label: "Trash"') &&
+    objectProviderImpl.includes('format!("{root}/.Trash")') &&
+    objectProviderImpl.includes('"elastos.library.trash-root/v1"'),
+  "Object provider roots must expose Desktop and visible provider-backed Trash",
 );
 assert(
   gatewayApi.includes('"/api/provider/object/upload"') &&
@@ -2373,15 +2403,29 @@ assert(
     archiveManager.includes("/api/viewers/archive-manager/library-roots") &&
     archiveManager.includes('url.searchParams.set("preview_entry", path)') &&
     archiveManager.includes('aria-label="Archive contents"') &&
+    archiveManager.includes("<strong>Open archive</strong>") &&
+    archiveManager.includes("<strong>New ZIP</strong>") &&
+    archiveManager.includes('id="open-archive-button"') &&
+    archiveManager.includes('id="new-archive-button"') &&
+    !archiveManager.includes('class="archive-mark"') &&
+    !archiveManager.includes("Work with archives from Library.") &&
+    !archiveManager.includes("Archive never edits storage directly") &&
+    !archiveManager.includes("Safety details") &&
+    !archiveManager.includes("Technical details") &&
+    !archiveManager.includes("Runtime and Library services") &&
+    !archiveManager.includes("Entry listing unavailable") &&
+    !archiveManager.includes("Choose a Library destination") &&
+    !archiveManager.includes("viewers:") &&
+    archiveManager.includes('mode: intent === "create" ? "archive-create" : "archive-open"') &&
+    archiveManager.includes('returnTarget: "archive-manager"') &&
+    archiveManager.includes('archive:open-library-object') &&
+    archiveManager.includes("async function openLibraryObject(object)") &&
+    archiveManager.includes('new URL("/apps/library/", window.location.origin)') &&
     archiveManager.includes("Extract selected") &&
     archiveManager.includes("Extract all") &&
     archiveManager.includes("Select visible") &&
-    archiveManager.includes("Open archive") &&
-    archiveManager.includes("New ZIP") &&
     archiveManager.includes("Archive files load when this format is supported.") &&
     archiveManager.includes("Select files to extract.") &&
-    !archiveManager.includes("Safety details") &&
-    !archiveManager.includes("Technical details") &&
     !archiveManager.includes("Cancel pending") &&
     !archiveManager.includes("Runtime Boundary") &&
     archiveManager.includes("handleEntryKeyboard") &&
@@ -2413,6 +2457,7 @@ assert(
     objectProviderImpl.includes("fn normalized_archive_entry_path(") &&
     objectProviderImpl.includes('vec!["archive-manager"]') &&
     objectProviderImpl.includes('"archive-manager" => "Archive"') &&
+    gatewayApi.includes('name == "archive-manager"') &&
     viewerGatewayApi.includes("stat_only") &&
     viewerGatewayApi.includes("entries: bool") &&
     viewerGatewayApi.includes("preview_entry: Option<String>") &&
@@ -2427,20 +2472,46 @@ assert(
     viewerGatewayApi.includes("viewer does not support Library object writes") &&
     libraryActions.includes("query.archiveSupport = JSON.stringify") &&
     libraryActions.includes("contentCid(object)") &&
-    libraryApp.includes('viewer?.id === "archive-manager"') &&
+    libraryActions.includes("function deliverArchiveObject(object)") &&
+    libraryActions.includes('isArchiveObject(object) && openWithViewer(object, "archive-manager")') &&
+    libraryActions.includes('type: "archive:open-library-object"') &&
+    !libraryActions.includes("function archiveLibraryObjectPayload(") &&
+    libraryModel.includes("export function isArchiveObject(object)") &&
+    libraryModel.includes("export function archiveLibraryObjectPayload(object)") &&
+    libraryModel.includes("metadata?.archive_support") &&
+    libraryModel.includes("isArchiveName(name)") &&
+    libraryState.includes('"archive-open"') &&
+    libraryState.includes('"archive-create"') &&
+    !libraryState.includes("archiveMode") &&
+    libraryApp.includes("function completeArchivePicker()") &&
+    !libraryApp.includes("function archiveLibraryObjectPayload(") &&
+    !libraryApp.includes("function pickerInstruction()") &&
+    !libraryApp.includes("Choose an archive, then double-click it or press Open in Archive.") &&
+    !libraryApp.includes("Select one item, or several same-folder items, then press Create ZIP.") &&
+    libraryApp.includes('type: "archive:open-library-object"') &&
     libraryMenuSmoke.includes("Legacy.7z") &&
+    libraryMenuSmoke.includes("Loose.zip") &&
+    libraryMenuSmoke.includes('message?.type === "home:deliver-to-target"') &&
     libraryMenuSmoke.includes("archive_entries") &&
     libraryMenuSmoke.includes("archive_preview_entry") &&
     libraryMenuSmoke.includes("archive_extract_entries") &&
     libraryMenuSmoke.includes("Nested/deep.txt") &&
     libraryMenuSmoke.includes("#destination-roots") &&
+    archiveManager.includes("function isWritableDestinationRoot(root)") &&
+    archiveManager.includes('root.kind === "webspace-root") return false') &&
     libraryMenuSmoke.includes("#entry-preview") &&
     libraryMenuSmoke.includes("#select-all-safe") &&
     libraryMenuSmoke.includes("#extract-all") &&
+    libraryMenuSmoke.includes("#open-existing-archive") &&
+    libraryMenuSmoke.includes("#make-new-archive") &&
+    libraryMenuSmoke.includes('get("mode") === "archive-open"') &&
+    libraryMenuSmoke.includes('get("mode") === "archive-create"') &&
+    libraryMenuSmoke.includes('get("returnTarget") === "archive-manager"') &&
     !libraryMenuSmoke.includes("#cancel-extract") &&
     libraryMenuSmoke.includes("#extract-status") &&
     libraryMenuSmoke.includes("policy_gated_unsupported_archive_family") &&
     libraryMenuSmoke.includes('message?.target === "archive-manager"') &&
+    shellJs.includes('library: new Set(["archive-manager", "chat-room"])') &&
     libraryGatewayTests.includes("/api/viewers/archive-manager/library-object?uri=") &&
     libraryGatewayTests.includes("test_library_provider_lists_supported_archive_entries_through_viewer_route") &&
     libraryGatewayTests.includes("test_library_provider_lists_unsafe_archive_entries_as_blocked") &&
@@ -2467,6 +2538,9 @@ assert(
   gatewayApi.includes("HOME_DESKTOP_OBJECTS_SCHEMA") &&
     gatewayApi.includes("home_desktop_objects_summary") &&
     gatewayApi.includes("home_desktop_events_signature") &&
+    gatewayApi.includes("is_home_desktop_object_layout_entry") &&
+    gatewayApi.includes('entry.strip_prefix("object:")') &&
+    gatewayApi.includes('format!("{root}/.Trash")') &&
     gatewayApi.includes('registry.send_raw("object", &request).await') &&
     gatewayApi.includes('"op": "list"') &&
     gatewayApi.includes('"op": "events"') &&
@@ -2668,7 +2742,7 @@ assert(
   "Library Published/blocked/trash badges must be layout participants and remain visible in list view instead of overlaying icons or disappearing",
 );
 assert(
-  libraryRender.includes('elements.content.dataset.empty = "true"') &&
+    libraryRender.includes('elements.content.dataset.empty = "true"') &&
     libraryRender.includes('class="empty-inner"') &&
     libraryCss.includes('.content[data-empty="true"]') &&
     libraryRender.includes("No objects in this space") &&
@@ -3083,7 +3157,8 @@ assert(
     libraryMenuSmoke.includes("Alt-drag/drop copy must call copy") &&
     libraryMenuSmoke.includes("Publish must call publish") &&
     libraryMenuSmoke.includes("Delete Permanently must use in-app confirmation, not window.confirm") &&
-    libraryMenuSmoke.includes("Delete must move the object to Trash"),
+    libraryMenuSmoke.includes("Delete must move the object to Trash") &&
+    libraryMenuSmoke.includes("Trash sidebar place menu"),
   "Library must have an operator smoke for context-menu reliability, WebSpaces read-only behavior, and core object journeys",
 );
 assert(
@@ -6231,6 +6306,14 @@ assert(
   homeSmoke.includes("unsigned-launch-prompts-passkey") &&
     homeSmoke.includes("HOME_SMOKE_PRESERVE_SESSION"),
   "Home smoke must treat unsigned app launch as a passkey gate and keep signed journeys explicit",
+);
+assert(
+  homeSmoke.includes("archive-launch-routes-to-library") &&
+    homeSmoke.includes("#open-existing-archive") &&
+    homeSmoke.includes('archiveWindow.title !== "Archive"') &&
+    homeSmoke.includes('archive.title === "Archive - ElastOS"') &&
+    homeSmoke.includes('window.target === "library" && window.title === "Library"'),
+  "Home smoke must cover Archive's authorized open-target handoff to Library and visible Archive labeling",
 );
 assert(
   homeVirtualAuthSmoke.includes("WebAuthn.addVirtualAuthenticator") &&
