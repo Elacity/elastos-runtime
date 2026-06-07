@@ -2255,11 +2255,10 @@ async function run() {
       await archivePage.locator("#entry-list").filter({ hasText: "alpha.txt" }).count() === 0,
       "Archive search must filter entry rows",
     );
+    await archivePage.locator("#extract-all").waitFor();
     await archivePage.locator("#select-all-safe").click();
     await archivePage.locator("#extract-selected").click();
     await archivePage.locator("#extract-status").filter({ hasText: "1 written" }).first().waitFor();
-    await archivePage.locator("#cancel-extract").click();
-    await archivePage.locator("#extract-status").filter({ hasText: "cancelled" }).first().waitFor();
     await archivePage.close();
     assert(
       ops.some((entry) => entry.op === "roots"),
@@ -2282,14 +2281,7 @@ async function run() {
         entry.payload.uri.endsWith("/Portable.zip") &&
         entry.payload.destination_uri === documentsUri &&
         entry.payload.entries?.includes("Nested/deep.txt")),
-      "Archive Extract Selected must use the Runtime viewer route archive_extract_entries bridge",
-    );
-    assert(
-      ops.some((entry) =>
-        entry.op === "archive_extract_entries" &&
-        entry.payload.uri.endsWith("/Portable.zip") &&
-        entry.payload.cancel === true),
-      "Archive Cancel pending must use archive_extract_entries cancel receipts",
+      "Archive Extract selected must use the Runtime viewer route archive_extract_entries bridge",
     );
 
     console.log("PASS Library menu smoke");

@@ -574,6 +574,7 @@ fn app_shell_title(name: &str) -> String {
         SYSTEM_CAPSULE_ID => "System".to_string(),
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
+        "archive-manager" => "Archive".to_string(),
         "gba-emulator" => "GBA Emulator".to_string(),
         _ if is_wallet_connector_capsule_id(name) => wallet_connector_label(name).to_string(),
         _ => title_case_capsule_name(name),
@@ -597,6 +598,7 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         WALLET_CAPSULE_ID => {
             "View accounts, balances, approvals, and approval methods.".to_string()
         }
+        "archive-manager" => "Open archives selected from Library.".to_string(),
         _ if is_wallet_connector_capsule_id(name) => format!(
             "Add {} as an approval method.",
             wallet_connector_label(name)

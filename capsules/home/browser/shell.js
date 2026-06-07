@@ -84,6 +84,7 @@ const HOME_EVENTS_HIDDEN_RETRY_MS = 30_000;
 const HOME_EVENTS_STREAM_URL = "/api/apps/home/events/stream";
 const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
+  "archive-manager": new Set(["library"]),
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
   library: new Set(["documents", "library"]),
