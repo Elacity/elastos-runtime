@@ -1,4 +1,5 @@
 import {
+  inTrash,
   isDirectory,
 } from "./model.js";
 
@@ -28,6 +29,7 @@ export function bindLibraryEvents({
   selectOnly,
   setSort,
   setView,
+  deleteSelectedObjects,
   showBackgroundMenu,
   showError,
   showMenuForObject,
@@ -36,6 +38,7 @@ export function bindLibraryEvents({
   state,
   stopLibraryEventStream,
   toggleSelected,
+  trashSelectedObjects,
   uploadFiles,
 }) {
   let draggingPlaceId = "";
@@ -79,6 +82,11 @@ export function bindLibraryEvents({
       markPlaceDropTarget(elements, button, event);
       return;
     }
+    if (button?.dataset.rootId === "trash" && selectedObjects().some((object) => !inTrash(object))) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      return;
+    }
     if (button?.dataset.uri && selectedObjects().length) {
       event.preventDefault();
       event.dataTransfer.dropEffect = event.altKey ? "copy" : "move";
@@ -98,6 +106,11 @@ export function bindLibraryEvents({
       reorderPlace(sourceRootId, button.dataset.rootId, placeDropPosition(button, event));
       clearPlaceDropTargets(elements);
       draggingPlaceId = "";
+      return;
+    }
+    if (button?.dataset.rootId === "trash" && selectedObjects().some((object) => !inTrash(object))) {
+      event.preventDefault();
+      trashSelectedObjects().catch(showError);
       return;
     }
     if (!button?.dataset.uri || !selectedObjects().length) return;
@@ -229,6 +242,15 @@ export function bindLibraryEvents({
       if (objects.length) {
         event.preventDefault();
         openSelectedObjects(objects, openObject, showError);
+      }
+    }
+    if (event.key === "Delete" && !editable && !isDialogOpen(elements) && !isMenuOpen(elements)) {
+      const objects = selectedObjects();
+      if (objects.length) {
+        event.preventDefault();
+        const hasTrash = objects.some(inTrash);
+        const action = event.shiftKey || hasTrash ? deleteSelectedObjects : trashSelectedObjects;
+        action().catch(showError);
       }
     }
     if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) && !editable && !isDialogOpen(elements)) {
