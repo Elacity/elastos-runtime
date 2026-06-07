@@ -19,6 +19,7 @@ pub mod gateway_cmd;
 pub mod host_lock;
 pub mod init;
 pub mod ipfs;
+pub mod library;
 pub mod local_http;
 pub mod notifications;
 pub mod operator_control;

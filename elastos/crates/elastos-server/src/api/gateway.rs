@@ -12,16 +12,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::documents::DocumentsClient;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, State};
 use axum::http::{
-    header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, SET_COOKIE},
+    header::{
+        ACCEPT_RANGES, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+        CONTENT_TYPE, COOKIE, RANGE, SET_COOKIE,
+    },
     HeaderMap, HeaderValue, StatusCode,
 };
 use axum::response::{
     sse::{Event as SseEvent, KeepAlive, Sse},
     Html, IntoResponse, Redirect, Response,
 };
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Json;
 use axum::Router;
 use base64::Engine as _;
@@ -92,6 +95,7 @@ use gateway_wallet::*;
 
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
+const LIBRARY_UPLOAD_CHUNK_MAX_BYTES: usize = 768 * 1024;
 const GATEWAY_VERSION: &str = env!("ELASTOS_VERSION");
 const MANAGED_WALLET_CHAIN_NAMESPACES: &[&str] = &[
     "eip155:20",
@@ -325,6 +329,35 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route(
             "/api/browser/session/request/:request_id",
             get(super::browser_sessions::browser_session_request_status),
+        )
+        .route(
+            "/api/provider/object/events/stream",
+            get(gateway_library_events_stream),
+        )
+        .route(
+            "/api/provider/object/download/raw",
+            get(gateway_library_download),
+        )
+        .route(
+            "/api/provider/object/upload",
+            put(gateway_library_upload).layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
+        )
+        .route(
+            "/api/provider/object/upload/start",
+            post(gateway_library_upload_start),
+        )
+        .route(
+            "/api/provider/object/upload/:upload_id/chunk",
+            put(gateway_library_upload_chunk)
+                .layer(DefaultBodyLimit::max(LIBRARY_UPLOAD_CHUNK_MAX_BYTES)),
+        )
+        .route(
+            "/api/provider/object/upload/:upload_id/finish",
+            post(gateway_library_upload_finish),
+        )
+        .route(
+            "/api/provider/object/upload/:upload_id",
+            delete(gateway_library_upload_cancel),
         )
         .route("/api/provider/:scheme/:op", post(gateway_provider_proxy))
         .route("/release.json", get(serve_release_manifest))
@@ -585,6 +618,16 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route(
             "/api/viewers/:viewer/content/:capsule",
             get(super::viewer_gateway::viewer_content),
+        )
+        .route(
+            "/api/viewers/:viewer/library-object",
+            get(super::viewer_gateway::viewer_library_object_get)
+                .post(super::viewer_gateway::viewer_library_object_post)
+                .put(super::viewer_gateway::viewer_library_object_put),
+        )
+        .route(
+            "/api/viewers/:viewer/library-roots",
+            get(super::viewer_gateway::viewer_library_roots_get),
         )
         .route(
             "/api/viewers/:viewer/storage/:capsule/:scope/:name",

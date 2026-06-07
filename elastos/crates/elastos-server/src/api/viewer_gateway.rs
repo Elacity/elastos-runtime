@@ -1,16 +1,20 @@
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use elastos_common::localhost::rooted_localhost_fs_path;
-use serde::Serialize;
+use elastos_runtime::auth::RuntimeAuditEventV1;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use super::gateway::{
-    content_type, require_home_launch_token_for_any, viewer_object_shell_description,
-    viewer_object_shell_title, GatewayState, HomeLaunchTokenContext,
+    content_type, require_home_launch_token_for_any, require_home_launch_token_for_any_context,
+    viewer_object_shell_description, viewer_object_shell_title, GatewayState,
+    HomeLaunchTokenContext,
 };
 
 #[derive(Debug, Serialize)]
@@ -24,6 +28,46 @@ struct ViewerLibraryItem {
     title: String,
     description: String,
     entrypoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewerLibraryObjectQuery {
+    uri: String,
+    #[serde(default)]
+    stat_only: bool,
+    #[serde(default)]
+    entries: bool,
+    #[serde(default)]
+    preview_entry: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewerLibraryObjectWrite {
+    data: String,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    if_revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ViewerLibraryArchiveExtractEntries {
+    destination_uri: String,
+    entries: Vec<String>,
+    #[serde(default)]
+    conflict_policy: Option<String>,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    cancel: bool,
+}
+
+struct ViewerLibraryObjectRequest {
+    uri: String,
+    stat_only: bool,
+    entries: bool,
+    preview_entry: Option<String>,
+    write: Option<ViewerLibraryObjectWrite>,
 }
 
 pub async fn viewer_library_summary(
@@ -110,6 +154,128 @@ pub async fn viewer_content(
         .into_response()
 }
 
+pub async fn viewer_library_object_get(
+    State(state): State<GatewayState>,
+    Path(viewer): Path<String>,
+    Query(query): Query<ViewerLibraryObjectQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let viewer = match clean_capsule_ref(&viewer, "viewer") {
+        Ok(viewer) => viewer,
+        Err(err) => return viewer_error_response(err),
+    };
+    let context = match require_library_object_viewer_context(&state.data_dir, &headers, &viewer) {
+        Ok(context) => context,
+        Err(err) => return viewer_error_response(err),
+    };
+    match viewer_library_object(
+        &state,
+        &context,
+        &viewer,
+        ViewerLibraryObjectRequest {
+            uri: query.uri,
+            stat_only: query.stat_only,
+            entries: query.entries,
+            preview_entry: query.preview_entry,
+            write: None,
+        },
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => viewer_error_response(err),
+    }
+}
+
+pub async fn viewer_library_object_put(
+    State(state): State<GatewayState>,
+    Path(viewer): Path<String>,
+    Query(query): Query<ViewerLibraryObjectQuery>,
+    headers: HeaderMap,
+    Json(input): Json<ViewerLibraryObjectWrite>,
+) -> Response {
+    let viewer = match clean_capsule_ref(&viewer, "viewer") {
+        Ok(viewer) => viewer,
+        Err(err) => return viewer_error_response(err),
+    };
+    if viewer != "documents" {
+        return (
+            StatusCode::FORBIDDEN,
+            "viewer does not support Library object writes",
+        )
+            .into_response();
+    }
+    let context = match require_documents_viewer_context(&state.data_dir, &headers, &viewer) {
+        Ok(context) => context,
+        Err(err) => return viewer_error_response(err),
+    };
+    match viewer_library_object(
+        &state,
+        &context,
+        &viewer,
+        ViewerLibraryObjectRequest {
+            uri: query.uri,
+            stat_only: false,
+            entries: false,
+            preview_entry: None,
+            write: Some(input),
+        },
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => viewer_error_response(err),
+    }
+}
+
+pub async fn viewer_library_object_post(
+    State(state): State<GatewayState>,
+    Path(viewer): Path<String>,
+    Query(query): Query<ViewerLibraryObjectQuery>,
+    headers: HeaderMap,
+    Json(input): Json<ViewerLibraryArchiveExtractEntries>,
+) -> Response {
+    let viewer = match clean_capsule_ref(&viewer, "viewer") {
+        Ok(viewer) => viewer,
+        Err(err) => return viewer_error_response(err),
+    };
+    let context = match require_library_object_viewer_context(&state.data_dir, &headers, &viewer) {
+        Ok(context) => context,
+        Err(err) => return viewer_error_response(err),
+    };
+    match viewer_library_archive_extract_entries(&state, &context, &viewer, &query.uri, input).await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => viewer_error_response(err),
+    }
+}
+
+pub async fn viewer_library_roots_get(
+    State(state): State<GatewayState>,
+    Path(viewer): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let viewer = match clean_capsule_ref(&viewer, "viewer") {
+        Ok(viewer) => viewer,
+        Err(err) => return viewer_error_response(err),
+    };
+    if viewer != "archive-manager" {
+        return (
+            StatusCode::FORBIDDEN,
+            "viewer does not support Library destination roots",
+        )
+            .into_response();
+    }
+    let context = match require_library_object_viewer_context(&state.data_dir, &headers, &viewer) {
+        Ok(context) => context,
+        Err(err) => return viewer_error_response(err),
+    };
+    match viewer_object_provider_request(&state, &context, "roots", json!({})).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => viewer_error_response(err),
+    }
+}
+
 pub async fn viewer_storage_get(
     State(state): State<GatewayState>,
     Path((viewer, capsule, scope, name)): Path<(String, String, String, String)>,
@@ -165,6 +331,215 @@ pub async fn viewer_storage_put(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => viewer_error_response(err),
     }
+}
+
+async fn viewer_library_object(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    viewer: &str,
+    request: ViewerLibraryObjectRequest,
+) -> anyhow::Result<Value> {
+    let stat =
+        viewer_object_provider_request(state, context, "stat", json!({ "uri": &request.uri }))
+            .await?;
+    ensure_viewer_can_view_library_object(&stat, viewer)?;
+    if request.stat_only {
+        return Ok(stat);
+    }
+    if request.entries {
+        if viewer != "archive-manager" {
+            anyhow::bail!("viewer does not support Library archive entry listing");
+        }
+        return viewer_object_provider_request(
+            state,
+            context,
+            "archive_entries",
+            json!({ "uri": &request.uri }),
+        )
+        .await;
+    }
+    if let Some(entry) = request.preview_entry {
+        if viewer != "archive-manager" {
+            anyhow::bail!("viewer does not support Library archive entry preview");
+        }
+        return viewer_object_provider_request(
+            state,
+            context,
+            "archive_preview_entry",
+            json!({ "uri": &request.uri, "entry": entry }),
+        )
+        .await;
+    }
+    if viewer != "documents" {
+        anyhow::bail!("viewer supports Library object metadata only");
+    }
+    let payload = match request.write {
+        Some(write) => json!({
+            "uri": &request.uri,
+            "data": write.data,
+            "mime": write.mime,
+            "if_revision": write.if_revision,
+        }),
+        None => json!({ "uri": &request.uri }),
+    };
+    let op = if payload.get("data").is_some() {
+        "write"
+    } else {
+        "read"
+    };
+    viewer_object_provider_request(state, context, op, payload).await
+}
+
+async fn viewer_object_provider_request(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    op: &str,
+    mut request: Value,
+) -> anyhow::Result<Value> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("object provider unavailable"))?;
+    request["op"] = Value::String(op.to_string());
+    request["principal_id"] = Value::String(context.principal_id.clone());
+    let request_id = format!("viewer-library:{op}:{}", crate::auth::now_ts());
+    append_viewer_library_audit(
+        &state.data_dir,
+        context,
+        &request_id,
+        "library.viewer.requested",
+        "requested",
+        &format!("Viewer requested Library object operation {op}"),
+    )?;
+    let response = crate::library::handle_object_provider_runtime_request(
+        &state.data_dir,
+        Arc::clone(registry),
+        &request,
+    )
+    .await;
+    let completed = response.get("status").and_then(Value::as_str) == Some("ok");
+    if completed && op == "write" {
+        crate::library::library_event_notifier().notify_waiters();
+    }
+    append_viewer_library_audit(
+        &state.data_dir,
+        context,
+        &request_id,
+        if completed {
+            "library.viewer.completed"
+        } else {
+            "library.viewer.failed"
+        },
+        if completed { "completed" } else { "failed" },
+        &format!(
+            "Viewer {} Library object operation {op}",
+            if completed { "completed" } else { "failed" }
+        ),
+    )?;
+    Ok(response)
+}
+
+async fn viewer_library_archive_extract_entries(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    viewer: &str,
+    uri: &str,
+    input: ViewerLibraryArchiveExtractEntries,
+) -> anyhow::Result<Value> {
+    if viewer != "archive-manager" {
+        anyhow::bail!("viewer does not support Library archive extraction");
+    }
+    let stat =
+        viewer_object_provider_request(state, context, "stat", json!({ "uri": uri })).await?;
+    ensure_viewer_can_view_library_object(&stat, viewer)?;
+    let response = viewer_object_provider_request(
+        state,
+        context,
+        "archive_extract_entries",
+        json!({
+            "uri": uri,
+            "destination_uri": input.destination_uri,
+            "entries": input.entries,
+            "conflict_policy": input.conflict_policy,
+            "if_revision": input.if_revision,
+            "cancel": input.cancel,
+        }),
+    )
+    .await?;
+    if response.get("status").and_then(Value::as_str) == Some("ok") {
+        crate::library::library_event_notifier().notify_waiters();
+    }
+    Ok(response)
+}
+
+fn ensure_viewer_can_view_library_object(response: &Value, viewer_id: &str) -> anyhow::Result<()> {
+    let object = response
+        .get("data")
+        .and_then(|data| data.get("object"))
+        .ok_or_else(|| anyhow::anyhow!("library object not found"))?;
+    let can_view = object
+        .get("viewers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|viewer| viewer.get("id").and_then(Value::as_str) == Some(viewer_id));
+    if !can_view {
+        anyhow::bail!("Library object is not viewable by {viewer_id}");
+    }
+    Ok(())
+}
+
+fn require_library_object_viewer_context(
+    data_dir: &FsPath,
+    headers: &HeaderMap,
+    viewer: &str,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let viewer = clean_capsule_ref(viewer, "viewer")?;
+    if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
+        anyhow::bail!("viewer capsule not found");
+    }
+    require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
+}
+
+fn require_documents_viewer_context(
+    data_dir: &FsPath,
+    headers: &HeaderMap,
+    viewer: &str,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let viewer = clean_capsule_ref(viewer, "viewer")?;
+    if viewer != "documents" || !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
+        anyhow::bail!("viewer capsule not found");
+    }
+    require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
+}
+
+fn append_viewer_library_audit(
+    data_dir: &FsPath,
+    context: &HomeLaunchTokenContext,
+    request_id: &str,
+    event_type: &str,
+    result: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let now = crate::auth::now_ts();
+    crate::auth::append_audit_event(
+        data_dir,
+        RuntimeAuditEventV1 {
+            schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+            event_id: format!("audit:{event_type}:{request_id}:{now}"),
+            event_type: event_type.to_string(),
+            principal_id: Some(context.principal_id.clone()),
+            proof_binding_id: context.proof_binding_id.clone(),
+            session_id: Some(context.session_id.clone()),
+            challenge_id: Some(request_id.to_string()),
+            capsule_id: Some("documents".to_string()),
+            result: result.to_string(),
+            reason: reason.to_string(),
+            occurred_at: now,
+            signer_did: None,
+            signature: None,
+        },
+    )
 }
 
 struct ViewerStorageTarget {
@@ -303,6 +678,11 @@ fn viewer_error_response(err: anyhow::Error) -> Response {
         StatusCode::NOT_FOUND
     } else if text.contains("home launch token") {
         StatusCode::UNAUTHORIZED
+    } else if text.contains("does not support")
+        || text.contains("not viewable")
+        || text.contains("metadata only")
+    {
+        StatusCode::FORBIDDEN
     } else if text.contains("invalid")
         || text.contains("must not be empty")
         || text.contains("no storage grant")
