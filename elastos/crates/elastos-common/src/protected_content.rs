@@ -12,6 +12,7 @@ pub const KEY_RELEASE_REQUEST_SCHEMA: &str = "elastos.key_release.request/v1";
 pub const DECRYPT_SESSION_REQUEST_SCHEMA: &str = "elastos.decrypt.session.request/v1";
 pub const DECRYPT_SESSION_SCHEMA: &str = "elastos.decrypt.session/v1";
 pub const RELEASE_RECEIPT_SCHEMA: &str = "elastos.release.receipt/v1";
+pub const RIGHTS_DECISION_RECEIPT_SCHEMA: &str = "elastos.rights.decision.receipt/v1";
 pub const PROTECTED_CONTENT_ACTIONS: &[&str] = &["view", "stream", "download", "execute"];
 pub const PROTECTED_CONTENT_OUTPUTS: &[&str] = &["rendered", "stream", "working_copy"];
 pub const DEFAULT_PROTECTED_CONTENT_CIPHER: &str = "aes-256-gcm";
@@ -174,6 +175,7 @@ pub struct KeyReleaseRequestV1 {
     pub session_id: String,
     pub object_cid: String,
     pub action: String,
+    pub rights_receipt: RightsDecisionReceiptV1,
     pub key_envelope: KeyEnvelopeV1,
     pub reason: String,
     pub expires_at: u64,
@@ -189,7 +191,7 @@ pub struct DecryptSessionRequestV1 {
     pub object_cid: String,
     pub action: String,
     pub viewer_interface: String,
-    pub release_receipt_id: String,
+    pub release_receipt: ReleaseReceiptV1,
     pub output_kind: String,
     pub reason: String,
     pub expires_at: u64,
@@ -213,8 +215,25 @@ pub struct ReleaseReceiptV1 {
     pub request_id: String,
     pub object_cid: String,
     pub principal_id: String,
+    pub session_id: String,
+    pub action: String,
     pub provider: String,
     pub status: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RightsDecisionReceiptV1 {
+    pub schema: String,
+    pub request_id: String,
+    pub content_id: String,
+    pub principal_id: String,
+    pub session_id: String,
+    pub right: String,
+    pub provider: String,
+    pub allowed: bool,
     pub issued_at: u64,
     pub expires_at: u64,
 }
@@ -271,7 +290,18 @@ mod tests {
             object_cid: "bafybeigprotectedcontent".to_string(),
             action: PROTECTED_CONTENT_ACTIONS[0].to_string(),
             viewer_interface: "elastos.viewer/document@1".to_string(),
-            release_receipt_id: "release:test".to_string(),
+            release_receipt: ReleaseReceiptV1 {
+                schema: RELEASE_RECEIPT_SCHEMA.to_string(),
+                request_id: "key-release:test".to_string(),
+                object_cid: "bafybeigprotectedcontent".to_string(),
+                principal_id: "person:local:test".to_string(),
+                session_id: "session:test".to_string(),
+                action: PROTECTED_CONTENT_ACTIONS[0].to_string(),
+                provider: "key-provider".to_string(),
+                status: "released".to_string(),
+                issued_at: 1_800_000_000,
+                expires_at: 1_900_000_000,
+            },
             output_kind: PROTECTED_CONTENT_OUTPUTS[0].to_string(),
             reason: "open protected document".to_string(),
             expires_at: 1_900_000_000,
@@ -399,6 +429,18 @@ mod tests {
             "session_id": "session:test",
             "object_cid": "bafybeigprotectedcontent",
             "action": "view",
+            "rights_receipt": {
+                "schema": RIGHTS_DECISION_RECEIPT_SCHEMA,
+                "request_id": "rights:test",
+                "content_id": "bafybeigprotectedcontent",
+                "principal_id": "person:local:test",
+                "session_id": "session:test",
+                "right": "view",
+                "provider": "rights-provider",
+                "allowed": true,
+                "issued_at": 1_800_000_000u64,
+                "expires_at": 1_900_000_000u64
+            },
             "key_envelope": {
                 "scheme": "elastos-pq-hybrid-threshold-v0",
                 "kid": "kid:test",
@@ -432,7 +474,18 @@ mod tests {
             "object_cid": "bafybeigprotectedcontent",
             "action": "view",
             "viewer_interface": "elastos.viewer/document@1",
-            "release_receipt_id": "release:test",
+            "release_receipt": {
+                "schema": RELEASE_RECEIPT_SCHEMA,
+                "request_id": "key-release:test",
+                "object_cid": "bafybeigprotectedcontent",
+                "principal_id": "person:local:test",
+                "session_id": "session:test",
+                "action": "view",
+                "provider": "key-provider",
+                "status": "released",
+                "issued_at": 1_800_000_000u64,
+                "expires_at": 1_900_000_000u64
+            },
             "output_kind": "rendered",
             "reason": "open protected document",
             "expires_at": 1_900_000_000u64,

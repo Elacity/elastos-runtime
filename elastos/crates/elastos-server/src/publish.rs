@@ -679,6 +679,7 @@ fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Resu
             "drm-provider".to_string(),
             "ipfs-provider".to_string(),
             "key-provider".to_string(),
+            "object-provider".to_string(),
             "localhost-provider".to_string(),
             "rights-provider".to_string(),
             "tunnel-provider".to_string(),
@@ -1584,6 +1585,7 @@ mod tests {
 
         assert!(selected.contains(&"chain-provider".to_string()));
         assert!(selected.contains(&"wallet-provider".to_string()));
+        assert!(selected.contains(&"object-provider".to_string()));
         assert!(selected.contains(&"drm-provider".to_string()));
         assert!(selected.contains(&"rights-provider".to_string()));
         assert!(selected.contains(&"key-provider".to_string()));

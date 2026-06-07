@@ -157,6 +157,40 @@ impl RightsProvider {
                 "key-provider",
                 "decrypt-provider"
             ],
+            "contract": {
+                "schema": "elastos.protected-content.rights-provider/v1",
+                "authority_boundary": "typed rights decisions only",
+                "denied_to_apps": [
+                    "contract_sdk",
+                    "chain_rpc",
+                    "wallet_rpc",
+                    "key_backend_sdk",
+                    "raw_cek",
+                    "provider_credentials"
+                ],
+                "operations": {
+                    "has_access_by_content_id": {
+                        "input": [
+                            "principal_id",
+                            "session_id",
+                            "content_id",
+                            "right",
+                            "reason",
+                            "policy_ref?"
+                        ],
+                        "output": "allow/deny receipt when a dDRM policy backend is configured"
+                    },
+                    "can_stream": {
+                        "input": ["principal_id", "session_id", "content_id", "reason", "policy_ref?"],
+                        "output": "allow/deny stream receipt"
+                    },
+                    "can_download": {
+                        "input": ["principal_id", "session_id", "content_id", "reason", "policy_ref?"],
+                        "output": "allow/deny download receipt"
+                    }
+                },
+                "status": "fail_closed_until_policy_backend_configured"
+            },
         }))
     }
 
@@ -368,6 +402,14 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("contract_sdk")));
+        assert_eq!(
+            data["contract"]["schema"],
+            "elastos.protected-content.rights-provider/v1"
+        );
+        assert_eq!(
+            data["contract"]["status"],
+            "fail_closed_until_policy_backend_configured"
+        );
     }
 
     #[test]
