@@ -1,0 +1,964 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archive Manager - ElastOS</title>
+  <style>
+    :root {
+      --bg: #f4efe5;
+      --panel: #fffdf7;
+      --panel-strong: #fff8e8;
+      --ink: #262118;
+      --muted: #746a5d;
+      --line: rgba(80, 61, 31, 0.16);
+      --accent: #b85f19;
+      --accent-soft: #f8dfbd;
+      --safe: #2f7651;
+      --warn: #a45516;
+      --shadow: 0 24px 60px rgba(84, 59, 24, 0.14);
+      color-scheme: light;
+      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 20% 10%, rgba(184, 95, 25, 0.16), transparent 28%),
+        radial-gradient(circle at 82% 18%, rgba(93, 125, 92, 0.13), transparent 30%),
+        linear-gradient(135deg, #fbf7ec 0%, var(--bg) 100%);
+    }
+
+    main {
+      width: min(980px, calc(100vw - 28px));
+      min-height: calc(100vh - 28px);
+      min-height: calc(100dvh - 28px);
+      margin: 14px auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 290px;
+      gap: 14px;
+    }
+
+    .panel,
+    .side {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 24px;
+      background:
+        linear-gradient(135deg, rgba(184, 95, 25, 0.13), transparent 42%),
+        var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent);
+      font-size: 0.74rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 4vw, 3.3rem);
+      line-height: 0.95;
+      letter-spacing: -0.055em;
+    }
+
+    .subtitle {
+      max-width: 660px;
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .content {
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .card {
+      padding: 16px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .card h2,
+    .side h2 {
+      margin: 0 0 12px;
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .section-heading h2 {
+      margin: 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .field {
+      min-width: 0;
+      padding: 10px 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 0.74rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .value {
+      overflow-wrap: anywhere;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 0.88rem;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #5a310f;
+      font-weight: 800;
+      font-size: 0.82rem;
+    }
+
+    .pill.safe {
+      background: #d9efdf;
+      color: var(--safe);
+    }
+
+    .pill.blocked {
+      background: #f5d8c0;
+      color: var(--warn);
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .toolbar input,
+    .toolbar select {
+      width: 100%;
+      padding: 10px 12px;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      font: inherit;
+    }
+
+    .toolbar select {
+      width: min(190px, 100%);
+    }
+
+    .toolbar button {
+      padding: 10px 14px;
+      color: #fff;
+      background: var(--accent);
+      border: 0;
+      border-radius: 12px;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .toolbar button.secondary {
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line);
+    }
+
+    .toolbar button.warn {
+      color: #6d2d0f;
+      background: #ffe2cc;
+      border: 1px solid rgba(164, 85, 22, 0.24);
+    }
+
+    .toolbar button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .destination-input {
+      flex: 1 1 360px;
+    }
+
+    .search-input {
+      flex: 1 1 220px;
+    }
+
+    .entry-list {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .entry-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      padding: 11px 12px;
+      border-top: 1px solid var(--line);
+    }
+
+    .entry-row input {
+      margin-top: 3px;
+    }
+
+    .entry-row:first-child {
+      border-top: 0;
+    }
+
+    .entry-row.blocked {
+      background: #fff6ed;
+    }
+
+    .entry-row:focus {
+      outline: 3px solid rgba(184, 95, 25, 0.28);
+      outline-offset: -3px;
+    }
+
+    .entry-row.selected {
+      background: #fff1dc;
+    }
+
+    .root-picker {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 8px 0 12px;
+    }
+
+    .root-picker button {
+      padding: 7px 10px;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .preview {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      min-height: 120px;
+    }
+
+    .preview pre {
+      max-height: 220px;
+      margin: 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .entry-path {
+      overflow-wrap: anywhere;
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 0.88rem;
+    }
+
+    .entry-meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .entry-empty {
+      margin: 0;
+      padding: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 1.2rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .side {
+      padding: 18px;
+      align-self: start;
+      display: grid;
+      gap: 14px;
+      background: #fffaf0;
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+
+    .status strong {
+      color: var(--ink);
+    }
+
+    @media (max-width: 760px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <header class="hero">
+        <p class="eyebrow">ElastOS Archive Manager</p>
+        <h1 id="title">Archive policy</h1>
+        <p class="subtitle">
+          This viewer inspects archive object identity and release policy. It does
+          not extract unsupported archive families or touch raw host storage.
+        </p>
+      </header>
+      <section class="content">
+        <article class="card">
+          <h2>Object</h2>
+          <div class="grid">
+            <div class="field">
+              <span class="label">Object URI</span>
+              <span id="object-uri" class="value">-</span>
+            </div>
+            <div class="field">
+              <span class="label">Content CID</span>
+              <span id="content-cid" class="value">-</span>
+            </div>
+            <div class="field">
+              <span class="label">MIME</span>
+              <span id="mime" class="value">-</span>
+            </div>
+            <div class="field">
+              <span class="label">Provider</span>
+              <span class="value">Runtime-mediated object metadata</span>
+            </div>
+          </div>
+        </article>
+        <article class="card">
+          <h2>Archive Policy</h2>
+          <p id="policy-pill" class="pill">Policy loading</p>
+          <div class="grid" style="margin-top: 12px;">
+            <div class="field">
+              <span class="label">Family</span>
+              <span id="family" class="value">-</span>
+            </div>
+            <div class="field">
+              <span class="label">Status</span>
+              <span id="policy-status" class="value">-</span>
+            </div>
+          </div>
+        </article>
+        <article class="card">
+          <div class="section-heading">
+            <h2>Archive Contents</h2>
+            <span id="entries-pill" class="pill">Not loaded</span>
+          </div>
+          <div class="toolbar">
+            <input id="entry-search" class="search-input" type="search" placeholder="Search entries" autocomplete="off">
+            <button id="select-all-safe" class="secondary" type="button" disabled>Select all safe</button>
+            <button id="invert-selection" class="secondary" type="button" disabled>Invert</button>
+            <button id="clear-selection" class="secondary" type="button" disabled>Clear</button>
+            <input id="destination-uri" class="destination-input" type="text" placeholder="Destination Library URI">
+            <select id="conflict-policy" aria-label="Conflict policy">
+              <option value="keep_both">Keep both</option>
+              <option value="replace">Replace</option>
+              <option value="skip">Skip</option>
+            </select>
+            <button id="extract-selected" type="button" disabled>Extract Selected</button>
+            <button id="cancel-extract" class="warn" type="button" disabled>Cancel pending</button>
+          </div>
+          <div id="destination-roots" class="root-picker" aria-label="Destination roots"></div>
+          <p id="extract-status" class="status">Select safe entries to import them into Library.</p>
+          <div id="entry-list" class="entry-list">
+            <p class="entry-empty">Archive entries are loaded through the Runtime viewer route when this archive family is supported.</p>
+          </div>
+        </article>
+        <article class="card">
+          <h2>Implemented Safely</h2>
+          <ul id="implemented"></ul>
+        </article>
+        <article class="card">
+          <h2>Blocked Until Review</h2>
+          <ul id="blocked"></ul>
+        </article>
+      </section>
+    </section>
+    <aside class="side">
+      <h2>Runtime Boundary</h2>
+      <p class="status">
+        <strong>Viewer authority:</strong> metadata inspection only. Extraction,
+        import, write, and content publication remain provider-owned operations.
+      </p>
+      <section class="preview" aria-live="polite">
+        <h2>Entry Preview</h2>
+        <div id="entry-preview" class="status">Select a safe file entry to preview bounded archive metadata or text.</div>
+      </section>
+      <p id="live-status" class="status">Waiting for launch context.</p>
+    </aside>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const objectUri = params.get("objectUri") || params.get("uri") || "";
+    const objectName = params.get("name") || objectUri.split("/").pop() || "Archive";
+    const launchPolicy = parseArchiveSupport(params.get("archiveSupport"));
+    const state = {
+      name: objectName,
+      uri: objectUri,
+      mime: params.get("mime") || "",
+      contentCid: params.get("contentCid") || "",
+      policy: launchPolicy,
+      entries: [],
+      roots: [],
+      entryStatus: "Not loaded",
+      entryQuery: "",
+      selectedEntries: new Set(),
+      focusedEntry: "",
+      preview: null,
+      previewStatus: "Select a safe file entry to preview bounded archive metadata or text.",
+      extractStatus: "Select safe entries to import them into Library.",
+      extracting: false,
+    };
+
+    render(state);
+    document.querySelector("#entry-search").addEventListener("input", (event) => {
+      state.entryQuery = event.target.value || "";
+      renderEntries();
+    });
+    document.querySelector("#destination-uri").value = parentUri(objectUri);
+    document.querySelector("#select-all-safe").addEventListener("click", () => {
+      for (const entry of safeVisibleEntries()) state.selectedEntries.add(entry.path);
+      renderEntries();
+    });
+    document.querySelector("#invert-selection").addEventListener("click", () => {
+      for (const entry of safeVisibleEntries()) {
+        if (state.selectedEntries.has(entry.path)) {
+          state.selectedEntries.delete(entry.path);
+        } else {
+          state.selectedEntries.add(entry.path);
+        }
+      }
+      renderEntries();
+    });
+    document.querySelector("#clear-selection").addEventListener("click", () => {
+      state.selectedEntries.clear();
+      renderEntries();
+    });
+    document.querySelector("#cancel-extract").addEventListener("click", () => {
+      cancelPendingExtract().catch((error) => {
+        state.extractStatus = "Cancel failed: " + error.message;
+        renderExtractControls();
+      });
+    });
+    document.querySelector("#destination-roots").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-destination-uri]");
+      if (!button) return;
+      document.querySelector("#destination-uri").value = button.dataset.destinationUri || "";
+    });
+    document.querySelector("#entry-list").addEventListener("click", (event) => {
+      const row = event.target.closest(".entry-row");
+      if (!row || event.target.matches(".entry-check")) return;
+      const path = row.dataset.path || "";
+      if (path) selectPreviewEntry(path);
+    });
+    document.querySelector("#entry-list").addEventListener("keydown", (event) => {
+      handleEntryKeyboard(event);
+    });
+    document.querySelector("#entry-list").addEventListener("change", (event) => {
+      if (!event.target.matches(".entry-check")) return;
+      if (event.target.checked) {
+        state.selectedEntries.add(event.target.value);
+      } else {
+        state.selectedEntries.delete(event.target.value);
+      }
+      renderExtractControls();
+    });
+    document.querySelector("#extract-selected").addEventListener("click", () => {
+      extractSelectedEntries().catch((error) => {
+        state.extractStatus = "Extract failed: " + error.message;
+        renderExtractControls();
+      });
+    });
+    hydrateDestinationRoots().catch((error) => {
+      setLiveStatus("Destination roots unavailable: " + error.message);
+    });
+    hydrateStatOnly().then(() => hydrateArchiveEntries()).catch((error) => {
+      setLiveStatus("Provider metadata unavailable: " + error.message);
+    });
+
+    async function hydrateStatOnly() {
+      const token = params.get("home_token") || "";
+      if (!token || !objectUri) {
+        setLiveStatus("Opened with launch metadata only.");
+        return;
+      }
+      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
+      url.searchParams.set("uri", objectUri);
+      url.searchParams.set("stat_only", "true");
+      const response = await fetch(url.pathname + url.search, {
+        headers: { "x-elastos-home-token": token },
+      });
+      const envelope = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(envelope.message || envelope.error || "viewer stat failed");
+      }
+      const object = envelope?.data?.object || {};
+      Object.assign(state, {
+        name: object.name || state.name,
+        uri: object.uri || state.uri,
+        mime: object.mime || state.mime,
+        contentCid: object.content_cid || state.contentCid,
+        policy: object.metadata?.archive_support || state.policy,
+      });
+      render(state);
+      setLiveStatus("Provider metadata loaded through the viewer object route.");
+    }
+
+    async function hydrateArchiveEntries() {
+      const token = params.get("home_token") || "";
+      if (!token || !objectUri) {
+        state.entryStatus = "Opened with launch metadata only.";
+        renderEntries();
+        return;
+      }
+      if (state.policy?.status && state.policy.status !== "extractable") {
+        state.entryStatus = "Entry browsing is policy-gated for this archive family.";
+        renderEntries();
+        return;
+      }
+      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
+      url.searchParams.set("uri", objectUri);
+      url.searchParams.set("entries", "true");
+      const response = await fetch(url.pathname + url.search, {
+        headers: { "x-elastos-home-token": token },
+      });
+      const envelope = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        state.entryStatus = envelope.message || envelope.error || "Entry listing unavailable.";
+        state.entries = [];
+        renderEntries();
+        return;
+      }
+      const data = envelope?.data || {};
+      state.entries = Array.isArray(data.entries) ? data.entries : [];
+      state.selectedEntries = new Set([...state.selectedEntries].filter((path) =>
+        state.entries.some((entry) => entry.path === path && entry?.safety?.status !== "blocked")
+      ));
+      const returned = data.limits?.returned_entries ?? state.entries.length;
+      const truncated = data.limits?.truncated ? " truncated" : "";
+      state.entryStatus = `${returned} entries${truncated}`;
+      if (data.object) {
+        state.name = data.object.name || state.name;
+        state.uri = data.object.uri || state.uri;
+        state.mime = data.object.mime || state.mime;
+        state.contentCid = data.object.content_cid || state.contentCid;
+        state.policy = data.object.metadata?.archive_support || state.policy;
+      }
+      render(state);
+      setLiveStatus("Archive entries loaded through the Runtime viewer route.");
+    }
+
+    async function hydrateDestinationRoots() {
+      const token = params.get("home_token") || "";
+      if (!token) return;
+      const response = await fetch("/api/viewers/archive-manager/library-roots", {
+        headers: { "x-elastos-home-token": token },
+      });
+      const envelope = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(envelope.message || envelope.error || "viewer roots failed");
+      }
+      state.roots = Array.isArray(envelope?.data?.roots) ? envelope.data.roots : [];
+      renderDestinationRoots();
+    }
+
+    async function extractSelectedEntries() {
+      const token = params.get("home_token") || "";
+      const destinationUri = document.querySelector("#destination-uri").value.trim();
+      const entries = [...state.selectedEntries];
+      if (!token || !objectUri) throw new Error("launch token missing");
+      if (!destinationUri) throw new Error("destination URI is required");
+      if (!entries.length) throw new Error("select at least one safe entry");
+      state.extracting = true;
+      state.extractStatus = "Extracting selected entries through Runtime...";
+      renderExtractControls();
+      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
+      url.searchParams.set("uri", objectUri);
+      try {
+        const response = await fetch(url.pathname + url.search, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-elastos-home-token": token,
+          },
+          body: JSON.stringify({
+            destination_uri: destinationUri,
+            entries,
+            conflict_policy: document.querySelector("#conflict-policy").value,
+          }),
+        });
+        const envelope = await response.json().catch(() => ({}));
+        if (!response.ok || envelope.status === "error") {
+          throw new Error(envelope.message || envelope.error || "archive extract failed");
+        }
+        const receipt = envelope?.data?.receipt || {};
+        const progress = receipt.progress || {};
+        state.extractStatus = `Extract ${receipt.status || "completed"}: ${progress.written_entries || 0} written, ${progress.skipped_entries || 0} skipped, ${progress.blocked_entries || 0} blocked.`;
+      } finally {
+        state.extracting = false;
+        renderExtractControls();
+      }
+    }
+
+    async function cancelPendingExtract() {
+      const token = params.get("home_token") || "";
+      const destinationUri = document.querySelector("#destination-uri").value.trim();
+      const entries = [...state.selectedEntries];
+      if (!token || !objectUri) throw new Error("launch token missing");
+      if (!destinationUri) throw new Error("destination URI is required");
+      if (!entries.length) throw new Error("select at least one safe entry");
+      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
+      url.searchParams.set("uri", objectUri);
+      const response = await fetch(url.pathname + url.search, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-elastos-home-token": token,
+        },
+        body: JSON.stringify({
+          destination_uri: destinationUri,
+          entries,
+          conflict_policy: document.querySelector("#conflict-policy").value,
+          cancel: true,
+        }),
+      });
+      const envelope = await response.json().catch(() => ({}));
+      if (!response.ok || envelope.status === "error") {
+        throw new Error(envelope.message || envelope.error || "archive cancel failed");
+      }
+      const receipt = envelope?.data?.receipt || {};
+      state.extractStatus = `Extract ${receipt.status || "cancelled"} before write.`;
+      renderExtractControls();
+    }
+
+    async function selectPreviewEntry(path) {
+      const entry = (state.entries || []).find((row) => row.path === path);
+      if (!entry || entry?.safety?.status === "blocked" || entry.kind !== "file") {
+        state.focusedEntry = path;
+        state.preview = null;
+        state.previewStatus = "Preview is available only for safe file entries.";
+        renderEntries();
+        renderEntryPreview();
+        return;
+      }
+      state.focusedEntry = path;
+      state.preview = null;
+      state.previewStatus = "Loading bounded archive preview...";
+      renderEntries();
+      renderEntryPreview();
+      const token = params.get("home_token") || "";
+      if (!token || !objectUri) {
+        state.previewStatus = "Launch token missing; archive preview unavailable.";
+        renderEntryPreview();
+        return;
+      }
+      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
+      url.searchParams.set("uri", objectUri);
+      url.searchParams.set("preview_entry", path);
+      const response = await fetch(url.pathname + url.search, {
+        headers: { "x-elastos-home-token": token },
+      });
+      const envelope = await response.json().catch(() => ({}));
+      if (!response.ok || envelope.status === "error") {
+        state.previewStatus = envelope.message || envelope.error || "Preview unavailable.";
+        state.preview = null;
+      } else {
+        state.preview = envelope?.data || null;
+        state.previewStatus = "Provider preview loaded.";
+      }
+      renderEntryPreview();
+    }
+
+    function parseArchiveSupport(value) {
+      if (!value) return null;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+
+    function render(next) {
+      document.querySelector("#title").textContent = next.name || "Archive policy";
+      document.querySelector("#object-uri").textContent = next.uri || "-";
+      document.querySelector("#content-cid").textContent = next.contentCid || "-";
+      document.querySelector("#mime").textContent = next.mime || "-";
+      const policy = next.policy || {};
+      const status = policy.status || "metadata_only";
+      document.querySelector("#family").textContent = policy.family || familyFromName(next.name);
+      document.querySelector("#policy-status").textContent = status;
+      const pill = document.querySelector("#policy-pill");
+      pill.textContent = status === "extractable" ? "Safe extraction is provider-enabled" : "Extraction is policy-gated";
+      pill.classList.toggle("safe", status === "extractable");
+      renderList("#implemented", implementedRows(policy));
+      renderList("#blocked", blockedRows(policy));
+      renderDestinationRoots();
+      renderEntries();
+      renderEntryPreview();
+    }
+
+    function renderEntries() {
+      const pill = document.querySelector("#entries-pill");
+      const rows = filteredEntries();
+      const hasBlocked = rows.some((entry) => entry?.safety?.status === "blocked");
+      pill.textContent = state.entryStatus || "Not loaded";
+      pill.classList.toggle("safe", rows.length > 0 && !hasBlocked);
+      pill.classList.toggle("blocked", hasBlocked || /blocked|gated|unsupported|unavailable/i.test(pill.textContent));
+      const list = document.querySelector("#entry-list");
+      if (!rows.length) {
+        list.innerHTML = `<p class="entry-empty">${escapeHtml(state.entryStatus || "No archive entries loaded.")}</p>`;
+        renderExtractControls();
+        return;
+      }
+      list.innerHTML = rows.map((entry) => {
+        const blocked = entry?.safety?.status === "blocked";
+        const selectable = !blocked && entry.kind !== "blocked";
+        const checked = state.selectedEntries.has(entry.path || "");
+        const meta = [
+          entry.kind || "entry",
+          formatBytes(entry.size),
+          entry.compressed_size == null ? "" : `compressed ${formatBytes(entry.compressed_size)}`,
+          entry.modified_at ? `modified ${new Date(entry.modified_at * 1000).toLocaleString()}` : "",
+          blocked ? (entry.safety?.reason || "blocked by provider safety policy") : "safe",
+        ].filter(Boolean).join(" · ");
+        const selected = state.focusedEntry === (entry.path || "");
+        return `<div class="entry-row${blocked ? " blocked" : ""}${selected ? " selected" : ""}" role="button" tabindex="${selectable ? "0" : "-1"}" data-path="${escapeHtml(entry.path || "")}" aria-selected="${selected ? "true" : "false"}">
+          <input class="entry-check" type="checkbox" value="${escapeHtml(entry.path || "")}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="Select ${escapeHtml(entry.path || entry.name || "entry")}">
+          <div>
+            <div class="entry-path">${escapeHtml(entry.path || entry.name || "entry")}</div>
+            <div class="entry-meta">${escapeHtml(meta)}</div>
+          </div>
+          <span class="pill${blocked ? " blocked" : " safe"}">${blocked ? "Blocked" : "Safe"}</span>
+        </div>`;
+      }).join("");
+      renderExtractControls();
+    }
+
+    function renderDestinationRoots() {
+      const container = document.querySelector("#destination-roots");
+      const roots = (state.roots || []).filter((root) =>
+        root.kind === "directory" || root.kind === "principal-root" || root.kind === "webspace-root"
+      );
+      if (!roots.length) {
+        container.innerHTML = `<span class="status">Destination roots load through the Runtime viewer route.</span>`;
+        return;
+      }
+      container.innerHTML = roots.map((root) =>
+        `<button type="button" data-destination-uri="${escapeHtml(root.uri)}" title="${escapeHtml(root.uri)}">${escapeHtml(root.label || root.id || "Root")}</button>`
+      ).join("");
+    }
+
+    function renderEntryPreview() {
+      const preview = document.querySelector("#entry-preview");
+      const data = state.preview || {};
+      const entry = data.entry || null;
+      const previewData = data.preview || null;
+      if (!entry || !previewData) {
+        preview.innerHTML = escapeHtml(state.previewStatus || "Select a safe file entry to preview bounded archive metadata or text.");
+        return;
+      }
+      const viewerLabels = Array.isArray(entry.viewers) && entry.viewers.length
+        ? entry.viewers.map((viewer) => viewer.label || viewer.id).join(", ")
+        : "none installed";
+      const text = typeof previewData.text === "string" ? previewData.text : "";
+      const body = text
+        ? `<pre>${escapeHtml(text)}</pre>`
+        : `<p class="status">Binary preview is bounded to ${formatBytes(previewData.max_bytes)} and available for extraction/opening through Library actions.</p>`;
+      preview.innerHTML = `
+        <div><strong>${escapeHtml(entry.path || "entry")}</strong></div>
+        <div class="status">${escapeHtml(entry.mime || "application/octet-stream")} · ${formatBytes(entry.size)} · viewers: ${escapeHtml(viewerLabels)}${previewData.truncated ? " · truncated" : ""}</div>
+        ${body}
+      `;
+    }
+
+    function filteredEntries() {
+      const query = String(state.entryQuery || "").trim().toLowerCase();
+      if (!query) return state.entries || [];
+      return (state.entries || []).filter((entry) =>
+        String(entry.path || entry.name || "").toLowerCase().includes(query)
+      );
+    }
+
+    function safeVisibleEntries() {
+      return filteredEntries().filter((entry) =>
+        entry.path && entry.kind !== "blocked" && entry?.safety?.status !== "blocked"
+      );
+    }
+
+    function toggleEntrySelection(path) {
+      const entry = (state.entries || []).find((row) => row.path === path);
+      if (!entry || entry.kind === "blocked" || entry?.safety?.status === "blocked") return;
+      if (state.selectedEntries.has(path)) {
+        state.selectedEntries.delete(path);
+      } else {
+        state.selectedEntries.add(path);
+      }
+      renderEntries();
+    }
+
+    function handleEntryKeyboard(event) {
+      const row = event.target.closest(".entry-row");
+      if (!row) return;
+      const rows = Array.from(document.querySelectorAll(".entry-row[tabindex='0']"));
+      const index = rows.indexOf(row);
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        const next = rows[index + delta] || rows[index];
+        next?.focus();
+        if (next?.dataset?.path) selectPreviewEntry(next.dataset.path);
+      } else if (event.key === " " || event.key === "Enter") {
+        event.preventDefault();
+        const path = row.dataset.path || "";
+        if (event.key === " ") {
+          toggleEntrySelection(path);
+        } else if (path) {
+          selectPreviewEntry(path);
+        }
+      }
+    }
+
+    function implementedRows(policy) {
+      const implemented = policy.implemented || {};
+      return [
+        "Download formats: " + listValue(implemented.download_formats, "zip, tar.gz"),
+        "Compress to Library: " + listValue(implemented.compress_to_library, "zip"),
+        "Extract formats: " + listValue(implemented.extract_formats, "zip, tar, tar.gz, tgz"),
+        "Safety: " + (implemented.safety || "relative UTF-8 file paths only; non-file entries rejected"),
+      ];
+    }
+
+    function blockedRows(policy) {
+      const gate = policy.policy_gate || {};
+      if (gate.required === false || policy.status === "extractable") {
+        return ["No release-policy gate for this archive family."];
+      }
+      return [
+        gate.reason || "Generic archive support needs dependency and release-policy review before enabling.",
+        "Blocked formats: " + listValue(gate.blocked_formats, "7z, rar, tar.xz, tar.bz2, tar.zst, xz, bz2, zst, lz4, gzip"),
+      ];
+    }
+
+    function renderList(selector, rows) {
+      document.querySelector(selector).innerHTML = rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("");
+    }
+
+    function listValue(value, fallback) {
+      return Array.isArray(value) && value.length ? value.join(", ") : fallback;
+    }
+
+    function renderExtractControls() {
+      const selectableCount = safeVisibleEntries().length;
+      const enabled = state.selectedEntries.size > 0 && state.policy?.status !== "policy_gated_unsupported_archive_family";
+      document.querySelector("#select-all-safe").disabled = selectableCount === 0;
+      document.querySelector("#invert-selection").disabled = selectableCount === 0;
+      document.querySelector("#clear-selection").disabled = state.selectedEntries.size === 0;
+      document.querySelector("#extract-selected").disabled = !enabled || state.extracting;
+      document.querySelector("#cancel-extract").disabled = !enabled || state.extracting;
+      document.querySelector("#extract-status").textContent = state.extractStatus || "Select safe entries to import them into Library.";
+    }
+
+    function parentUri(uri) {
+      const clean = String(uri || "").replace(/\/+$/, "");
+      const index = clean.lastIndexOf("/");
+      return index > "localhost://".length ? clean.slice(0, index) : clean;
+    }
+
+    function formatBytes(value) {
+      if (value == null || Number.isNaN(Number(value))) return "size unknown";
+      const bytes = Number(value);
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    }
+
+    function familyFromName(name) {
+      const lower = String(name || "").toLowerCase();
+      for (const ext of [".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tzst", ".zip", ".tar", ".7z", ".rar", ".xz", ".bz2", ".zst", ".lz4", ".gz"]) {
+        if (lower.endsWith(ext)) return ext.replace(/^\./, "");
+      }
+      return "archive";
+    }
+
+    function setLiveStatus(value) {
+      document.querySelector("#live-status").textContent = value;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+  </script>
+</body>
+</html>

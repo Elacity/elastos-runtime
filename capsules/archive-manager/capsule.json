@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "archive-manager",
+  "version": "0.1.0",
+  "description": "Inspect archive objects and ElastOS archive policy without unsafe extraction",
+  "role": "viewer",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 24,
+    "gpu": false
+  }
+}
