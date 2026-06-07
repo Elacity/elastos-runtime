@@ -159,6 +159,33 @@ Runtime principals, scoped capabilities, provider-owned effects, and signed
 audit. The current translation is tracked in
 [docs/PC2_CONVERGENCE.md](docs/PC2_CONVERGENCE.md).
 
+The first PC2 migration slices should stay product-useful and boundary-small:
+
+1. **Explorer / Library / WebSpace**: browse, upload, download, open,
+   publish, share, and inspect files/objects through Home/Library,
+   principal-root storage, persisted WebSpace mount/object-head metadata,
+   WebSpace lifecycle/health receipts,
+   `elastos://content/*`, recipient share-grant records, recipient-scoped
+   shared-access checks, and availability receipts with honest
+   peer-selection/quota/repair-worker metadata.
+   Preserve PC2's file-manager UX where it helps users, but translate every
+   operation onto typed Runtime object/provider contracts instead of PC2's older
+   filesystem, Puter, or direct IPFS assumptions. The implementation gate is
+   [docs/FILE_MANAGER_MIGRATION.md](docs/FILE_MANAGER_MIGRATION.md).
+2. **AI Chat**: bring the chat UX over as a provider-backed app capsule where
+   inference, hosted-model credentials, embeddings, and document context
+   expansion stay inside `ai-provider`, `llama-provider`, or an operator-pinned
+   hosted provider.
+3. **dDRM + Elacity Marketplace foundation**: wire protected-content provider
+   contracts before Marketplace/Creator/Player/Viewer UX. The sequence is
+   content status/fetch, rights check, key release, decrypt/render session,
+   receipt, Wallet/Inbox approval where needed, and audit.
+
+Those slices are intentionally ordered so the user can first manage and publish
+ordinary objects, then use provider-backed AI over those objects, then add
+protected-content economics without giving apps raw keys, wallets, chain RPC,
+Kubo/IPFS, Elacity SDKs, or provider credentials.
+
 COMO is a separate runtime-framework research input, not a planned dependency.
 Its C++ component model, runtime reflection, MetaClass packaging idea, Android
 aarch64 history, and safety/redundancy lessons may inform the capsule-kernel ABI
@@ -220,6 +247,9 @@ The first implementation should be deliberately layered:
 - expose `elastos://content/*` as the capsule-facing product contract
 - keep `elastos://ipfs/*` only as the current low-level system/provider backend around Kubo, then retire it from the normal capsule-facing namespace once `elastos://content/*` exists
 - model published objects, signed heads, provenance, and availability receipts with IPLD-compatible JSON/CBOR shapes
+- keep local-only availability receipts honest by carrying explicit
+  peer-selection/quota/repair-worker metadata instead of implying live
+  multi-peer replication
 - use Elacity/supernodes as the first remote availability target
 - add volunteer replication and repair loops behind provider policy
 - add payment/storage incentives only after receipts, quotas, health checks, and abuse controls exist

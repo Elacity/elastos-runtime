@@ -190,4 +190,13 @@ and not an access-control or rights system.
 
 ## WebSpace
 
-In the WCI-aligned model, a WebSpace is a special AppCapsule class that interprets the named data after `://` dynamically. It is not just a folder on disk. The resolver owns the raw moniker first and may then return either a file endpoint or a traversable `folder/` handle. `localhost://WebSpaces/...` is therefore not ordinary local storage; it is the future local handle into named, daemon-resolved spaces such as `Elastos`, `SimpleX.chat`, or `WeChat.com`.
+In the WCI-aligned model, a WebSpace is a mounted resolver surface for named
+data and provider-backed resources. It is not just a folder on disk. The
+resolver owns `localhost://WebSpaces/<mount>/...` first and returns typed
+handles instead of letting an app walk raw storage. A mount can project native
+ElastOS resources such as `elastos://content/*` or, in the future, external
+provider targets such as `google://drive/...`; those provider targets remain
+resolver-private authority, while Library/Home show the local mounted WebSpace
+view. Mutable WebSpace mounts/forks can also materialize local provider-owned
+objects with explicit access-policy metadata; that local materialization is
+provider state, not a raw app-visible filesystem alias.

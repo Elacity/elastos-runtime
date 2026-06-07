@@ -294,6 +294,9 @@ This implies:
 - providers should implement URI semantics
 - the Capsule Runtime should make execution portable
 - Carrier should stay below app semantics
+- `localhost://WebSpaces/<mount>/...` is the local mounted view; raw provider
+  targets such as `google://drive/...` or backing `elastos://content/...`
+  handles remain provider-resolved authority, not ordinary app storage
 
 ## Current Repo Mapping
 

@@ -27,6 +27,7 @@ Planning and truth surfaces outside `docs/`:
 - [CAPSULE_MODEL.md](CAPSULE_MODEL.md) — supplemental capsule/runtime terminology note
 - [CARRIER.md](CARRIER.md) — supplemental Carrier framing note
 - [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
+- [ARCHIVE_POLICY.md](ARCHIVE_POLICY.md) — Archive Manager dependency, release, and generic-family enablement policy
 - [PC2_CONVERGENCE.md](PC2_CONVERGENCE.md) — current translation of useful PC2 patterns into Runtime provider/capsule boundaries
 - [CHAIN_PROVIDER.md](CHAIN_PROVIDER.md) — typed chain-provider boundary and current blockchain-quadrant slice
 - [WALLET_PROVIDER.md](WALLET_PROVIDER.md) — wallet proof, account-link, typed-signing, and transaction authority boundary
@@ -44,3 +45,7 @@ These should stay narrower than the canonical current docs. If they repeat the s
 
 - [VERSIONING.md](VERSIONING.md) — runtime release versioning policy
 - [SHARE_VERSIONING.md](SHARE_VERSIONING.md) — share lifecycle and versioning model
+
+## Reports
+
+- [WCI_EXEC_WEEKLY_REPORT_2026-06-05.md](WCI_EXEC_WEEKLY_REPORT_2026-06-05.md) — WCI executive weekly status for the Library/Explorer release slice

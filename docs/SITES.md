@@ -91,6 +91,15 @@ Examples:
 - nginx / Caddy / reverse proxy in front
 - public domain such as `runtime.ela.city`
 
+Reverse-proxy requirements for the public gateway:
+
+- TLS/front-door only; object/site authority stays in `elastos gateway`
+- body-size limits must allow bounded Library upload chunks through
+  `/api/provider/object/upload/:upload_id/chunk`; large files use Runtime
+  upload sessions instead of a single giant `PUT /api/provider/object/upload`
+- realtime routes such as provider event streams must not be buffered
+- stale static aliases must not serve old `/apps/library/src/*.js` modules
+
 This is the boring, durable operator path.
 
 The public `https://elastos.elacitylabs.com/` root now follows this pattern:
