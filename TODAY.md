@@ -29,10 +29,14 @@ operator through route/provider/UI checks.
   surface over object/content spaces, not the principal-root object graph; mutable
   mounts/forks may also materialize local WebSpace objects in provider-owned
   object/head tables until external resolver sync workers take over.
-- `localhost://WebSpaces/<mount>/...` is the local mounted view, shown to users
-  as **Spaces** in Library. Provider targets such as `google://drive/...` are
-  resolver-private, and `elastos://content/*` is the provider-independent
-  published/shared content identity after import, publish, or fork.
+- Library **Spaces** is a user-facing index, not a new storage authority.
+  `Localhost` opens the signed principal root under `localhost://Users/<id>`;
+  `Elastos` opens the built-in resolver view under
+  `localhost://WebSpaces/Elastos`; connected mounts continue under
+  `localhost://WebSpaces/<mount>/...`. Provider targets such as
+  `google://drive/...` are resolver-private, and `elastos://content/*` is the
+  provider-independent published/shared content identity after import, publish,
+  or fork.
 - Runtime injects the signed principal and mediates Library operations.
 - Library must not call raw host filesystem, Kubo/IPFS, Elacity APIs, wallet,
   chain, network, Carrier peer, provider SDK, or broad `localhost://Users/*`.
@@ -111,7 +115,8 @@ area and authority boundary, not by numbered release buckets.
 - Archive support is complete for enabled families in this branch. ZIP, tar,
   tar.gz, and tgz download/list/preview/selective extract are provider-owned;
   generic non-tar/non-zip families are detected and policy-gated; Archive
-  Manager exposes safe browse/import/extract UX and WebSpace archive policy
+  exposes safe browse/import/extract UX, direct Library journeys for opening
+  existing archives or creating new ZIP archives, and WebSpace archive policy
   without viewer-side extraction or raw provider access.
 
 ### Remaining Product Tracks
@@ -137,7 +142,7 @@ area and authority boundary, not by numbered release buckets.
   scope: Library Explorer UX, the object-provider capsule/API boundary,
   provider invocation and streaming, recipient-scoped sharing proof,
   Spaces/WebSpace foundation,
-  archive manager for enabled families, and branch-local multi-peer
+  Archive for enabled families, and branch-local multi-peer
   availability proof/status surfaces.
 - Remaining work before publishing is release validation: human Chrome-profile
   testing, live signed Home/Library smoke with a real session, release notes,
@@ -185,6 +190,20 @@ area and authority boundary, not by numbered release buckets.
 - No more local-only status schema should be added to close that gap. Resume it
   only when real external production infrastructure is available for testable
   execution.
+
+### Archive UX Audit 2026-06-07
+
+- Archive is a viewer/assembly capsule, not a storage authority. Library remains
+  the object selector and object-operation surface; Home mediates explicit
+  capsule-to-capsule handoff; Runtime and `object-provider` keep byte access,
+  compression, extraction, and destination writes provider-owned.
+- The user-facing Archive app now starts from two journeys: open an existing
+  archive from Library, or create a new ZIP from Library selection. Opened
+  archives use a Library-like file list, preview, destination picker, and
+  extract actions without exposing raw provider diagnostics.
+- Removed noisy Archive copy and technical panels from the default
+  Archive UI. Safety, support status, and provider errors remain enforced by the
+  provider/runtime path and tests, but are not presented as primary user tasks.
 
 ## Current State
 
@@ -768,7 +787,7 @@ release branch scope is fixed.
   this release because they require real external production infrastructure.
   The release ships Library Explorer UX, the object-provider capsule/API
   boundary, provider invocation and streaming, recipient-scoped sharing proof,
-  Spaces/WebSpace foundation, archive manager for enabled families, and
+  Spaces/WebSpace foundation, Archive for enabled families, and
   branch-local availability proof/status surfaces. Production dDRM/dKMS remains
   a Trusted content/access-rights follow-up track.
 - AI Chat, dDRM, Elacity Marketplace, Mac VZ, and new Browser provider work.
@@ -868,7 +887,7 @@ release branch scope is fixed.
   elastos/Cargo.toml -p elastos-server`, and `cargo clippy --manifest-path
   elastos/Cargo.toml -p elastos-server --tests -- -D warnings`. The
   performance smoke was corrected to use the canonical `/api/provider/object/*`
-  fixture route with no legacy fallback, and Archive copy was made
+  fixture route with no legacy fallback, and Archive UI copy was made
   provider-neutral for WCI alignment.
 - Post object-provider no-fallback gate passed on 2026-06-05 15:17 UTC in this
   worktree after freeing disk space: `cargo fmt --manifest-path
@@ -1123,7 +1142,9 @@ release branch scope is fixed.
   safe `.tar`/`.zip` extraction remain deferred. Archive now presents a
   simplified Archive flow: browse/search entries, preview safe files,
   extract selected/all files into Library, and keep release-policy/dDRM details
-  collapsed behind secondary safety copy. WebSpace mutable resolver sync is now
+  collapsed behind secondary safety copy. Direct Archive launch routes users to
+  Library for the two real journeys: open an existing archive or create a new
+  ZIP archive from Library objects. WebSpace mutable resolver sync is now
   fixture-proven with adapter
   write-back, no-adapter fail-closed receipts, conflict receipts, and
   resolver-scope availability hints. The fixture contract is now also promoted
@@ -1181,11 +1202,18 @@ release branch scope is fixed.
   no `library-provider`.
 - Signed Home live smoke passes with a current Home session: live Home shell,
   module graph, cleanup service worker, and signed summary verified. Latest
-  Home asset version: `home-20260603c`.
+  Home asset version: `home-20260607c`.
 - Signed live Library smoke passes with a current Home session: Home launch
   minted a Library token, then roots, Public write/upload, provider-owned plain
   `.tar` extraction, publish, status, share, and cleanup all succeeded. Latest
   smoke CID: `QmW8h4rLgBvCMwxMGuVrEUagjJRkiny98h9Rk7YK6cbGCT`.
+- Archive now uses a real Library selector handoff instead of duplicate
+  generic "open Library" buttons. Archive opens Library in `archive-open` or
+  `archive-create` mode, Library performs the authorized object-provider
+  select/compress operation, and Home allows Library to deliver only the
+  selected/created archive object back to Archive or published attachments back
+  to Chat Room. Archive remains a viewer capsule and does not claim direct
+  storage authority.
 - Still needs final human proof before release: normal Chrome profile retest and
   perceived Library speed/native-feel pass on
   `https://elastos.elacitylabs.com/apps/home/`. This is intentionally left for
@@ -1221,6 +1249,12 @@ release branch scope is fixed.
   `.tar`/`.tar.gz`/`.zip` extraction,
   rename, move, copy, drag/drop, create text document, move to Trash, restore,
   and permanent delete from the appropriate roots.
+- Open Archive from Home with no object selected. Verify "Open archive from
+  Library" opens Library with an `Open in Archive` picker action, and
+  double-clicking a supported archive returns the same Archive window to the
+  archive file list. Verify "Create ZIP from Library" opens Library with a
+  `Create ZIP` picker action, creates the ZIP through object-provider, and
+  returns the new archive to Archive.
 - Upload a large video-sized file. Library must use Runtime chunked upload
   sessions and commit through object-provider at `finish`; it must not send the
   whole file as one public `PUT`. If the operator keeps the public gateway chunk
