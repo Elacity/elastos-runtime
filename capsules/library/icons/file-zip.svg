@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" height="48" width="48" viewBox="0 0 48 48">
+    <title>zipped file</title>
+    <g class="nc-icon-wrapper">
+        <path fill="#E6E6E6"
+            d="M41,47H7c-1.105,0-2-0.895-2-2V3c0-1.105,0.895-2,2-2l34,0c1.105,0,2,0.895,2,2v42 C43,46.105,42.105,47,41,47z">
+        </path>
+        <rect x="19" y="1" fill="#444444" width="10" height="22"></rect>
+        <rect x="24" y="1" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="21" y="3" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="24" y="5" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="21" y="7" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="24" y="9" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="21" y="11" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="24" y="13" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="21" y="15" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="24" y="17" fill="#E6E6E6" width="3" height="2"></rect>
+        <rect x="21" y="19" fill="#E6E6E6" width="3" height="2"></rect>
+        <path fill="#B3B3B3" d="M21,23v5c0,1.657,1.343,3,3,3s3-1.343,3-3v-5H21z M25,28h-2v-2h2V28z"></path>
+    </g>
+</svg>

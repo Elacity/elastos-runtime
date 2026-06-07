@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" height="48"
+    width="48" viewBox="0 0 48 48">
+    <title>file 2</title>
+    <g class="nc-icon-wrapper">
+        <path fill="#E6E6E6"
+            d="M43,3v32L31,47L7,47c-1.105,0-2-0.895-2-2V3c0-1.105,0.895-2,2-2h34C42.105,1,43,1.895,43,3z"></path>
+        <path fill="#B3B3B3" d="M31,47V37c0-1.105,0.895-2,2-2h10L31,47z"></path>
+    </g>
+</svg>
