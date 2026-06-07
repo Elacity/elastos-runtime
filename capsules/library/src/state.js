@@ -7,6 +7,7 @@ export const MUTATING_PROVIDER_OPS = new Set([
   "trash",
   "restore",
   "delete_permanently",
+  "empty_trash",
   "extract_archive",
   "compress_archive",
   "publish",
@@ -16,9 +17,10 @@ export const MUTATING_PROVIDER_OPS = new Set([
 ]);
 
 export function createLibraryState({ queryParams, storage, perfTarget }) {
+  const rawMode = queryParams.get("mode") || "";
   const state = {
     homeToken: queryParams.get("home_token") || "",
-    mode: queryParams.get("mode") === "attach" ? "attach" : "browse",
+    mode: ["attach", "archive-open", "archive-create"].includes(rawMode) ? rawMode : "browse",
     returnTarget: queryParams.get("returnTarget") || "",
     initialUri: queryParams.get("uri") || "",
     initialObjectUri: queryParams.get("objectUri") || "",
