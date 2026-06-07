@@ -21,7 +21,7 @@
       --warn: #b57918;
       --danger: #b14c5a;
       --mono: "SFMono-Regular", "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
-      --archive-list-columns: 30px minmax(280px, 1fr) 92px 150px 82px;
+      --archive-list-columns: 30px minmax(280px, 1fr) 92px 150px;
       font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
     }
 
@@ -68,39 +68,56 @@
     }
 
     .empty-card {
-      width: min(460px, 100%);
+      width: min(380px, 100%);
       display: grid;
       justify-items: center;
-      gap: 14px;
-      padding: 28px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
+      gap: 9px;
+      padding: 18px;
+      border: 0;
+      border-radius: 0;
       background: #fff;
-      text-align: center;
-    }
-
-    .archive-mark {
-      width: 52px;
-      height: 52px;
-      display: grid;
-      place-items: center;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: linear-gradient(180deg, #fff, #edf0f4);
-      color: var(--brand);
-      font-size: 1.45rem;
-      font-weight: 800;
-    }
-
-    .empty-card h1 {
-      font-size: 1.55rem;
-      letter-spacing: -0.04em;
     }
 
     .empty-card p,
     .muted {
       color: var(--muted);
       line-height: 1.45;
+    }
+
+    .empty-actions {
+      width: 100%;
+      display: grid;
+      gap: 9px;
+      margin-top: 4px;
+    }
+
+    .journey-button {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #fff;
+      padding: 12px 14px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .journey-button strong {
+      font-size: 0.94rem;
+    }
+
+    .journey-button span {
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1;
+    }
+
+    .journey-button:hover {
+      border-color: rgba(0, 122, 255, 0.42);
+      background: var(--accent-soft);
     }
 
     .shell {
@@ -138,28 +155,6 @@
     .top-actions {
       justify-content: flex-end;
       flex: 0 1 auto;
-    }
-
-    .small-mark {
-      width: 31px;
-      height: 31px;
-      display: grid;
-      place-items: center;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: linear-gradient(180deg, #fff, #edf0f4);
-      color: var(--brand);
-      font-weight: 800;
-      user-select: none;
-    }
-
-    .eyebrow {
-      color: var(--muted);
-      font-size: 0.68rem;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      line-height: 1.1;
-      text-transform: uppercase;
     }
 
     h1 {
@@ -428,10 +423,21 @@
     .entry-empty {
       margin: 0;
       min-width: 760px;
-      padding: 34px 24px;
+      padding: 52px 24px;
+    }
+
+    .archive-empty-list {
+      display: grid;
+      justify-items: center;
+      gap: 8px;
       color: var(--muted);
       line-height: 1.45;
       text-align: center;
+    }
+
+    .archive-empty-list strong {
+      color: var(--ink);
+      font-size: 0.96rem;
     }
 
     .side-panel {
@@ -452,8 +458,7 @@
       overflow: auto;
     }
 
-    .card,
-    details {
+    .card {
       border: 1px solid var(--line);
       border-radius: 7px;
       background: #fff;
@@ -549,20 +554,6 @@
       font-size: 0.8rem;
     }
 
-    summary {
-      cursor: pointer;
-      font-size: 0.9rem;
-      font-weight: 700;
-    }
-
-    ul {
-      margin: 0;
-      padding-left: 1.1rem;
-      color: var(--muted);
-      font-size: 0.82rem;
-      line-height: 1.45;
-    }
-
     @media (max-width: 980px) {
       .shell {
         overflow: auto;
@@ -602,25 +593,27 @@
 <body>
   <section id="empty-state" class="empty-state" hidden>
     <div class="empty-card">
-      <div class="archive-mark" aria-hidden="true">A</div>
-      <h1>Archive</h1>
-      <p>Archive opens files selected from Library. Choose a supported .zip, .tar, .tar.gz, or .tgz archive to browse and extract it.</p>
-      <button id="open-library" class="btn btn-primary" type="button">Open Library</button>
-      <p class="muted">In Library, double-click an archive or right-click it and choose Open.</p>
+      <div class="empty-actions" aria-label="Archive actions">
+        <button id="open-existing-archive" class="journey-button" type="button">
+          <strong>Open archive</strong>
+          <span aria-hidden="true">-></span>
+        </button>
+        <button id="make-new-archive" class="journey-button" type="button">
+          <strong>New ZIP</strong>
+          <span aria-hidden="true">-></span>
+        </button>
+      </div>
     </div>
   </section>
 
   <main id="archive-workspace" class="shell" hidden>
     <header class="topbar">
       <div class="title-group">
-        <div class="small-mark" aria-hidden="true">A</div>
-        <div>
-          <p class="eyebrow">Archive</p>
-          <h1 id="title">Archive</h1>
-        </div>
+        <h1 id="title">Archive</h1>
       </div>
       <div class="top-actions">
-        <span id="policy-pill" class="status-chip">Loading</span>
+        <button id="open-archive-button" class="btn" type="button">Open</button>
+        <button id="new-archive-button" class="btn btn-primary" type="button">New ZIP</button>
         <input id="entry-search" class="search" type="search" placeholder="Search files" autocomplete="off">
       </div>
     </header>
@@ -630,7 +623,6 @@
         <div class="list-toolbar">
           <div class="list-title">
             <strong>Files</strong>
-            <span class="muted">Check files to extract. Click a row to preview.</span>
           </div>
           <div class="list-actions">
             <button id="select-all-safe" class="btn" type="button" disabled>Select visible</button>
@@ -644,7 +636,6 @@
             <span>Name</span>
             <span>Size</span>
             <span>Modified</span>
-            <span>State</span>
           </div>
           <div id="entry-list" class="entry-list">
             <p class="entry-empty">Archive files load when this format is supported.</p>
@@ -658,51 +649,11 @@
             <h2>Preview</h2>
             <div id="entry-preview" class="preview-body">
               <div class="preview-empty">
-                <strong>No file selected</strong>
-                <span>Click a safe file to preview text or metadata before extraction.</span>
+                <strong>Select a file</strong>
+                <span>Preview appears here.</span>
               </div>
             </div>
           </section>
-
-          <details>
-            <summary>Safety details</summary>
-            <h3>Enabled</h3>
-            <ul id="implemented"></ul>
-            <h3>Needs review</h3>
-            <ul id="blocked"></ul>
-          </details>
-
-          <details>
-            <summary>Technical details</summary>
-            <div class="details-grid">
-              <div>
-                <span class="label">Format</span>
-                <span id="family" class="value">-</span>
-              </div>
-              <div>
-                <span class="label">Status</span>
-                <span id="policy-status" class="value">-</span>
-              </div>
-              <div>
-                <span class="label">Content ID</span>
-                <span id="content-cid" class="value">-</span>
-              </div>
-              <div>
-                <span class="label">Object URI</span>
-                <span id="object-uri" class="value">-</span>
-              </div>
-              <div>
-                <span class="label">MIME</span>
-                <span id="mime" class="value">-</span>
-              </div>
-              <div>
-                <span class="label">Authority</span>
-                <span class="value">Runtime and Library services</span>
-              </div>
-            </div>
-          </details>
-
-          <p id="live-status" class="preview-body">Waiting for launch context.</p>
         </div>
 
         <section class="extract-card">
@@ -720,7 +671,7 @@
               <button id="extract-all" class="btn btn-primary" type="button" disabled>Extract all</button>
             </div>
           </div>
-          <p id="extract-status" class="muted">Select files to extract, or extract all safe files.</p>
+          <p id="extract-status" class="muted">Select files to extract.</p>
         </section>
       </aside>
     </section>
@@ -728,7 +679,7 @@
 
   <script>
     const params = new URLSearchParams(window.location.search);
-    const objectUri = params.get("objectUri") || params.get("uri") || "";
+    let objectUri = params.get("objectUri") || params.get("uri") || "";
     const objectName = params.get("name") || objectUri.split("/").pop() || "Archive";
     const launchPolicy = parseArchiveSupport(params.get("archiveSupport"));
     const state = {
@@ -744,12 +695,26 @@
       selectedEntries: new Set(),
       focusedEntry: "",
       preview: null,
-      previewStatus: "No file selected",
-      extractStatus: "Select files to extract, or extract all safe files.",
+      previewStatus: "Select a file",
+      extractStatus: "Select files to extract.",
       extracting: false,
     };
 
-    document.querySelector("#open-library").addEventListener("click", openLibrary);
+    document.querySelector("#open-existing-archive").addEventListener("click", () => openLibraryPicker("open"));
+    document.querySelector("#make-new-archive").addEventListener("click", () => openLibraryPicker("create"));
+    document.querySelector("#open-archive-button").addEventListener("click", () => openLibraryPicker("open"));
+    document.querySelector("#new-archive-button").addEventListener("click", () => openLibraryPicker("create"));
+    window.addEventListener("message", (event) => {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data || {};
+      if (data.type !== "archive:open-library-object") return;
+      openLibraryObject(data.object).catch((error) => {
+        showWorkspace();
+        state.entryStatus = "Could not open this Library archive: " + error.message;
+        state.entries = [];
+        renderEntries();
+      });
+    });
     document.querySelector("#entry-search").addEventListener("input", (event) => {
       state.entryQuery = event.target.value || "";
       renderEntries();
@@ -802,11 +767,11 @@
       showEmptyState();
     } else {
       showWorkspace();
-      hydrateDestinationRoots().catch((error) => {
-        setLiveStatus("Destination roots unavailable: " + error.message);
-      });
+      hydrateDestinationRoots().catch(() => {});
       hydrateStatOnly().then(() => hydrateArchiveEntries()).catch((error) => {
-        setLiveStatus("Metadata unavailable: " + error.message);
+        state.entryStatus = "Could not load this archive: " + error.message;
+        state.entries = [];
+        renderEntries();
       });
     }
 
@@ -820,21 +785,59 @@
       document.querySelector("#archive-workspace").hidden = false;
     }
 
-    function openLibrary() {
+    function openLibraryPicker(intent) {
       const homeToken = params.get("home_token") || "";
-      if (!homeToken || !window.parent || window.parent === window) return;
-      window.parent.postMessage({
-        type: "home:open-target",
-        target: "library",
-        query: {},
-        homeToken,
-      }, window.location.origin);
+      const query = {
+        mode: intent === "create" ? "archive-create" : "archive-open",
+        returnTarget: "archive-manager",
+      };
+      if (homeToken && window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          type: "home:open-target",
+          target: "library",
+          query,
+          homeToken,
+        }, window.location.origin);
+        return;
+      }
+      const url = new URL("/apps/library/", window.location.origin);
+      if (homeToken) url.searchParams.set("home_token", homeToken);
+      for (const [key, value] of Object.entries(query)) {
+        if (value) url.searchParams.set(key, value);
+      }
+      window.location.assign(url.pathname + url.search);
+    }
+
+    async function openLibraryObject(object) {
+      if (!object?.uri) {
+        throw new Error("Library did not return an archive object.");
+      }
+      objectUri = object.uri;
+      state.name = object.name || object.uri.split("/").pop() || "Archive";
+      state.uri = object.uri;
+      state.mime = object.mime || "";
+      state.contentCid = object.contentCid || object.content_cid || "";
+      state.policy = parseArchiveSupport(object.archiveSupport || object.archive_support);
+      state.entries = [];
+      state.entryStatus = "Loading archive files...";
+      state.entryQuery = "";
+      state.selectedEntries = new Set();
+      state.focusedEntry = "";
+      state.preview = null;
+      state.previewStatus = "Select a file";
+      state.extractStatus = "Select files to extract.";
+      document.querySelector("#entry-search").value = "";
+      document.querySelector("#destination-uri").value = parentUri(objectUri);
+      showWorkspace();
+      render(state);
+      await hydrateDestinationRoots().catch(() => {});
+      await hydrateStatOnly();
+      await hydrateArchiveEntries();
     }
 
     async function hydrateStatOnly() {
       const token = params.get("home_token") || "";
       if (!token || !objectUri) {
-        setLiveStatus("Opened with launch metadata only.");
         return;
       }
       const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
@@ -856,7 +859,6 @@
         policy: object.metadata?.archive_support || state.policy,
       });
       render(state);
-      setLiveStatus("Metadata loaded through Runtime.");
     }
 
     async function hydrateArchiveEntries() {
@@ -879,7 +881,7 @@
       });
       const envelope = await response.json().catch(() => ({}));
       if (!response.ok) {
-        state.entryStatus = envelope.message || envelope.error || "Entry listing unavailable.";
+        state.entryStatus = envelope.message || envelope.error || "Could not read this archive.";
         state.entries = [];
         renderEntries();
         return;
@@ -900,7 +902,6 @@
         state.policy = data.object.metadata?.archive_support || state.policy;
       }
       render(state);
-      setLiveStatus("Contents loaded through Runtime.");
     }
 
     async function hydrateDestinationRoots() {
@@ -1005,6 +1006,7 @@
 
     function parseArchiveSupport(value) {
       if (!value) return null;
+      if (typeof value === "object") return value;
       try {
         return JSON.parse(value);
       } catch {
@@ -1014,19 +1016,6 @@
 
     function render(next) {
       document.querySelector("#title").textContent = next.name || "Archive";
-      document.querySelector("#object-uri").textContent = next.uri || "-";
-      document.querySelector("#content-cid").textContent = next.contentCid || "-";
-      document.querySelector("#mime").textContent = next.mime || "-";
-      const policy = next.policy || {};
-      const status = policy.status || "metadata_only";
-      document.querySelector("#family").textContent = policy.family || familyFromName(next.name);
-      document.querySelector("#policy-status").textContent = humanStatus(status);
-      const pill = document.querySelector("#policy-pill");
-      pill.textContent = status === "extractable" ? "Ready" : "Format needs review";
-      pill.classList.toggle("safe", status === "extractable");
-      pill.classList.toggle("blocked", status !== "extractable" && status !== "metadata_only");
-      renderList("#implemented", implementedRows(policy));
-      renderList("#blocked", blockedRows(policy));
       renderDestinationRoots();
       renderEntries();
       renderEntryPreview();
@@ -1037,11 +1026,12 @@
       const rows = filteredEntries();
       const hasBlocked = rows.some((entry) => entry?.safety?.status === "blocked");
       pill.textContent = selectionSummary(rows);
+      pill.hidden = rows.length === 0;
       pill.classList.toggle("safe", rows.length > 0 && !hasBlocked);
       pill.classList.toggle("blocked", hasBlocked || /blocked|gated|unsupported|unavailable|review/i.test(state.entryStatus));
       const list = document.querySelector("#entry-list");
       if (!rows.length) {
-        list.innerHTML = `<p class="entry-empty">${escapeHtml(state.entryStatus || "No archive files loaded.")}</p>`;
+        list.innerHTML = `<div class="entry-empty"><div class="archive-empty-list"><strong>No files shown</strong><span>${escapeHtml(emptyEntryMessage())}</span></div></div>`;
         renderExtractControls();
         return;
       }
@@ -1050,7 +1040,6 @@
         const selectable = !blocked && entry.kind !== "blocked";
         const checked = state.selectedEntries.has(entry.path || "");
         const selected = state.focusedEntry === (entry.path || "");
-        const stateLabel = blocked ? "Blocked" : "Safe";
         const modified = entry.modified_at ? new Date(entry.modified_at * 1000).toLocaleString() : "-";
         return `<div class="entry-row${blocked ? " blocked" : ""}${selected ? " selected" : ""}" role="button" tabindex="${selectable ? "0" : "-1"}" data-path="${escapeHtml(entry.path || "")}" aria-selected="${selected ? "true" : "false"}">
           <div><input class="entry-check" type="checkbox" value="${escapeHtml(entry.path || "")}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="Select ${escapeHtml(entry.path || entry.name || "entry")}"></div>
@@ -1060,7 +1049,6 @@
           </div>
           <span class="entry-cell">${escapeHtml(formatBytes(entry.size))}</span>
           <span class="entry-cell">${escapeHtml(modified)}</span>
-          <span class="status-chip${blocked ? " blocked" : " safe"}" title="${escapeHtml(blocked ? (entry.safety?.reason || "blocked by safety policy") : "safe")}">${stateLabel}</span>
         </div>`;
       }).join("");
       renderExtractControls();
@@ -1068,11 +1056,9 @@
 
     function renderDestinationRoots() {
       const container = document.querySelector("#destination-roots");
-      const roots = (state.roots || []).filter((root) =>
-        root.kind === "directory" || root.kind === "principal-root" || root.kind === "webspace-root"
-      );
+      const roots = (state.roots || []).filter(isWritableDestinationRoot);
       if (!roots.length) {
-        container.innerHTML = `<span class="muted">Choose a Library destination.</span>`;
+        container.innerHTML = "";
         return;
       }
       container.innerHTML = roots.map((root) =>
@@ -1086,21 +1072,26 @@
       const entry = data.entry || null;
       const previewData = data.preview || null;
       if (!entry || !previewData) {
-        preview.innerHTML = `<div class="preview-empty"><strong>${escapeHtml(state.previewStatus || "No file selected")}</strong><span>Click a safe file to preview text or metadata before extraction.</span></div>`;
+        preview.innerHTML = `<div class="preview-empty"><strong>${escapeHtml(state.previewStatus || "Select a file")}</strong><span>Preview appears here.</span></div>`;
         return;
       }
-      const viewerLabels = Array.isArray(entry.viewers) && entry.viewers.length
-        ? entry.viewers.map((viewer) => viewer.label || viewer.id).join(", ")
-        : "none installed";
       const text = typeof previewData.text === "string" ? previewData.text : "";
       const body = text
         ? `<pre>${escapeHtml(text)}</pre>`
-        : `<p>Binary preview is bounded to ${formatBytes(previewData.max_bytes)}. Extract or open it from Library after import.</p>`;
+        : `<p>Binary preview is not shown. Extract the file to open it from Library.</p>`;
       preview.innerHTML = `
         <div><strong>${escapeHtml(entry.path || "entry")}</strong></div>
-        <div>${escapeHtml(entry.mime || "application/octet-stream")} · ${formatBytes(entry.size)} · viewers: ${escapeHtml(viewerLabels)}${previewData.truncated ? " · truncated" : ""}</div>
+        <div>${escapeHtml(entry.mime || "application/octet-stream")} · ${formatBytes(entry.size)}${previewData.truncated ? " · truncated" : ""}</div>
         ${body}
       `;
+    }
+
+    function isWritableDestinationRoot(root) {
+      if (!root?.uri) return false;
+      if (root.id === "trash" || root.uri.includes("/.Trash")) return false;
+      if (root.kind === "webspace-root") return false;
+      if (root.metadata?.readonly === true) return false;
+      return root.kind === "directory" || root.kind === "principal-root";
     }
 
     function filteredEntries() {
@@ -1156,32 +1147,14 @@
       }
     }
 
-    function implementedRows(policy) {
-      const implemented = policy.implemented || {};
-      return [
-        "Open and inspect supported ZIP/tar/tar.gz/tgz archives.",
-        "Extract selected or all safe files into Library.",
-        "Safety: " + (implemented.safety || "relative UTF-8 file paths only; non-file entries rejected"),
-      ];
-    }
-
-    function blockedRows(policy) {
-      const gate = policy.policy_gate || {};
-      if (gate.required === false || policy.status === "extractable") {
-        return ["No release-policy gate for this archive format."];
+    function emptyEntryMessage() {
+      const status = String(state.entryStatus || "").trim();
+      if (!objectUri) return "Open an archive or create a new ZIP.";
+      if (!status || status === "Not loaded" || status === "Loading archive files...") return "Files will appear here.";
+      if (/could not read|entry listing unavailable|archive_entries|viewer|unavailable/i.test(status)) {
+        return "Could not read this archive yet. Try recreating it or opening another archive.";
       }
-      return [
-        gate.reason || "This archive format needs dependency and release-policy review before extraction.",
-        "Examples: " + listValue(gate.blocked_formats, "7z, rar, tar.xz, tar.bz2, tar.zst, xz, bz2, zst, lz4, gzip"),
-      ];
-    }
-
-    function renderList(selector, rows) {
-      document.querySelector(selector).innerHTML = rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("");
-    }
-
-    function listValue(value, fallback) {
-      return Array.isArray(value) && value.length ? value.join(", ") : fallback;
+      return status;
     }
 
     function renderExtractControls() {
@@ -1190,10 +1163,12 @@
       const policyBlocked = state.policy?.status === "policy_gated_unsupported_archive_family";
       const selectedEnabled = state.selectedEntries.size > 0 && !policyBlocked;
       document.querySelector("#select-all-safe").disabled = selectableCount === 0 || state.extracting;
+      document.querySelector("#select-all-safe").hidden = selectableCount === 0;
       document.querySelector("#clear-selection").disabled = state.selectedEntries.size === 0 || state.extracting;
+      document.querySelector("#clear-selection").hidden = selectableCount === 0 && state.selectedEntries.size === 0;
       document.querySelector("#extract-selected").disabled = !selectedEnabled || state.extracting;
       document.querySelector("#extract-all").disabled = allSafeCount === 0 || policyBlocked || state.extracting;
-      document.querySelector("#extract-status").textContent = state.extractStatus || "Select files to extract, or extract all safe files.";
+      document.querySelector("#extract-status").textContent = state.extractStatus || "Select files to extract.";
     }
 
     function selectionSummary(rows) {
@@ -1211,12 +1186,6 @@
       return "F";
     }
 
-    function humanStatus(status) {
-      if (status === "extractable") return "Ready to extract";
-      if (status === "policy_gated_unsupported_archive_family") return "Format needs review";
-      return "Metadata only";
-    }
-
     function parentUri(uri) {
       const clean = String(uri || "").replace(/\/+$/, "");
       const index = clean.lastIndexOf("/");
@@ -1229,18 +1198,6 @@
       if (bytes < 1024) return `${bytes} B`;
       if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
       return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-    }
-
-    function familyFromName(name) {
-      const lower = String(name || "").toLowerCase();
-      for (const ext of [".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tar.zst", ".tzst", ".zip", ".tar", ".7z", ".rar", ".xz", ".bz2", ".zst", ".lz4", ".gz"]) {
-        if (lower.endsWith(ext)) return ext.replace(/^\./, "");
-      }
-      return "archive";
-    }
-
-    function setLiveStatus(value) {
-      document.querySelector("#live-status").textContent = value;
     }
 
     function escapeHtml(value) {
