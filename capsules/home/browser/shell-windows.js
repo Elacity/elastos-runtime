@@ -6,6 +6,7 @@ import {
   shellState,
   fetchJson,
   targetTitle,
+  canonicalTargetTitle,
   escapeHtml,
   shouldOpenMaximizedByDefault,
   mountGlyph,
@@ -18,7 +19,7 @@ import {
   clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260603c";
+} from "./shell-core.js?v=home-20260607d";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -28,7 +29,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260603c";
+} from "./shell-window-geometry.js?v=home-20260607d";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -676,6 +677,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
       query: normalizedLaunchQuery(options.query),
     }),
   });
+  launched.title = canonicalTargetTitle(launched.target, launched.title);
   if (launched.attach_kind !== "iframe") {
     throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
   }

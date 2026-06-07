@@ -1,4 +1,4 @@
-import { clockNode } from "./shell-core.js?v=home-20260603c";
+import { clockNode } from "./shell-core.js?v=home-20260607d";
 
 export function syncIdentity(_summary) {}
 

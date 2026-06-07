@@ -40,7 +40,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260603c";
+} from "./shell-core.js?v=home-20260607d";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -54,7 +54,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260603c";
+} from "./shell-windows.js?v=home-20260607d";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -93,10 +93,7 @@ export function renderDesktop(summary) {
     button.style.top = `${position.y}px`;
     button.setAttribute("aria-label", desktopShortcutAriaLabel(label));
     button.title = `${label}\nDouble-click or press Enter to open`;
-    mountGlyph(
-      button.querySelector(".desktop-shortcut-icon"),
-      object.kind === "directory" ? "file-folder" : "documents",
-    );
+    mountGlyph(button.querySelector(".desktop-shortcut-icon"), desktopObjectGlyphId(object));
     button.querySelector(".desktop-shortcut-title").textContent = label;
     attachDesktopObjectInteractions(button, entryId);
     desktopShortcuts.appendChild(button);
@@ -107,6 +104,17 @@ export function renderDesktop(summary) {
 
 function desktopShortcutIdForEntry(entryId) {
   return `desktop-shortcut-${encodeURIComponent(entryId).replaceAll("%", "_")}`;
+}
+
+function isTrashDesktopObject(object) {
+  return object?.metadata?.system_kind === "trash" || object?.uri?.endsWith("/.Trash");
+}
+
+function desktopObjectGlyphId(object) {
+  if (isTrashDesktopObject(object)) {
+    return object?.metadata?.empty === false ? "trash-full" : "trash";
+  }
+  return object.kind === "directory" ? "file-folder" : "documents";
 }
 
 function syncDesktopIconsVisibility() {
@@ -876,7 +884,7 @@ function dragEntryDescriptor(entryId) {
   const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
   if (object) {
     return {
-      glyphId: object.kind === "directory" ? "file-folder" : "documents",
+      glyphId: desktopObjectGlyphId(object),
       title: object.name,
     };
   }
@@ -1134,6 +1142,18 @@ function desktopObjectContextMenuItems(target) {
   if (!object) {
     return [];
   }
+  if (isTrashDesktopObject(object)) {
+    const items = [
+      { action: "open-desktop-object", label: "Open Trash" },
+      { action: "open-desktop-object-new-window", label: "Open in New Window" },
+    ];
+    if (object.metadata?.empty === false) {
+      items.push({ action: "empty-trash", label: "Empty Trash" });
+    }
+    items.push({ kind: "divider" });
+    items.push({ action: "properties-desktop-object", label: "Properties" });
+    return items;
+  }
   const items = [
     {
       action: "open-desktop-object",
@@ -1204,6 +1224,16 @@ export function handleContextAction(action) {
           object,
           action === "download-desktop-object" ? "download" : "properties",
         );
+      }
+      return;
+    }
+    if (action === "empty-trash") {
+      const object = desktopObjectByEntryId(
+        shellState.currentSummary,
+        shellState.contextMenuTarget.entryId,
+      );
+      if (object && isTrashDesktopObject(object)) {
+        libraryActionForObject(object, "empty-trash");
       }
       return;
     }
