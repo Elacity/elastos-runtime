@@ -91,6 +91,7 @@ tempfile = "3.10"
 # Archive extraction (for capsule artifacts)
 flate2 = "1.0"
 tar = "0.4"
+zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
 libc = "0.2"
 
 # Built-in Carrier transport (P2P for updates, gossip messaging, DHT discovery)

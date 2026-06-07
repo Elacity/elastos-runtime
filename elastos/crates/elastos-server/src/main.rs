@@ -778,6 +778,140 @@ pub(crate) enum SiteCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum WebspaceCommand {
+    /// Show the persistent WebSpace mount table and built-in mounts
+    Mounts {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show registered external WebSpace resolver adapters
+    Adapters {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register or update an external WebSpace resolver adapter
+    RegisterAdapter {
+        /// Resolver/provider identifier used by mounted WebSpaces
+        resolver: String,
+        /// Human label for operator UX
+        #[arg(long)]
+        label: Option<String>,
+        /// Endpoint URI or provider-qualified route; credentials are redacted in status output
+        #[arg(long)]
+        endpoint_uri: Option<String>,
+        /// Provider id that owns this adapter, when available
+        #[arg(long)]
+        provider: Option<String>,
+        /// Adapter state: configured, connected, unavailable, or disabled
+        #[arg(long)]
+        state: Option<String>,
+        /// Adapter capability label, repeatable; defaults to metadata_index
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// Mark new mounts through this adapter mutable by default
+        #[arg(long)]
+        mutable_default: bool,
+        /// Operator-facing description
+        #[arg(long)]
+        description: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an external WebSpace resolver adapter registration
+    UnregisterAdapter {
+        /// Resolver/provider identifier to remove
+        resolver: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a safe external WebSpace resolver adapter health check
+    CheckAdapter {
+        /// Resolver/provider identifier to check
+        resolver: String,
+        /// Health result: ok, failed, skipped, or unknown
+        #[arg(long)]
+        result: Option<String>,
+        /// Optional adapter state override: configured, connected, unavailable, or disabled
+        #[arg(long)]
+        state: Option<String>,
+        /// Short opaque failure code; credentials/messages are rejected
+        #[arg(long)]
+        error_code: Option<String>,
+        /// Adapter capability label, repeatable; updates capabilities when supplied
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show WebSpace resolver metadata health without exposing provider credentials
+    Health {
+        /// Optional WebSpace moniker to inspect
+        moniker: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Persistently mount an external namespace under localhost://WebSpaces/<moniker>
+    Mount {
+        /// Local WebSpace moniker, for example Cloud
+        moniker: String,
+        /// External target URI, for example cloud://drive or https://example.com
+        target_uri: String,
+        /// Optional namespace URI override, for example cloud://
+        #[arg(long)]
+        namespace_uri: Option<String>,
+        /// Resolver/provider identifier required for live access
+        #[arg(long)]
+        resolver: Option<String>,
+        /// Operator-facing description
+        #[arg(long)]
+        description: Option<String>,
+        /// Mark the mount mutable. Content writes still require provider-to-provider support.
+        #[arg(long)]
+        mutable: bool,
+        /// Cache policy label, for example metadata-only
+        #[arg(long)]
+        cache_policy: Option<String>,
+        /// Sync policy label, for example manual
+        #[arg(long)]
+        sync_policy: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a persistent WebSpace mount
+    Unmount {
+        /// Local WebSpace moniker to remove
+        moniker: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace resolver-discovered child metadata for a mounted WebSpace
+    Index {
+        /// Local WebSpace moniker to index
+        moniker: String,
+        /// JSON file containing an array of { path, kind, target_uri?, resolver_state?, readonly?, description? }
+        entries_json: PathBuf,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh resolver metadata for a WebSpace handle, optionally replacing its resolver index
+    Refresh {
+        /// Moniker or handle path to refresh, for example: Cloud
+        target: String,
+        /// Optional JSON file containing a replacement resolver index
+        #[arg(long)]
+        entries_json: Option<PathBuf>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List the currently known WebSpace monikers or the typed children under a mounted handle
     List {
         /// Optional moniker or handle path (for example: Elastos or Elastos/peer)
@@ -790,6 +924,74 @@ pub(crate) enum WebspaceCommand {
     Resolve {
         /// Moniker or handle path, for example: Elastos or Elastos/content/<cid>
         target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Persist or inspect the current provider-owned object head for a WebSpace handle
+    Head {
+        /// Moniker or handle path, for example: Elastos/content/<cid>
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show metadata-cache status for a WebSpace handle
+    CacheStatus {
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh provider-owned metadata cache state for a WebSpace handle
+    Cache {
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show sync/dirty status for a WebSpace handle
+    SyncStatus {
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark provider-owned WebSpace metadata/fork head as synced
+    Sync {
+        /// Moniker or handle path, for example: ProjectFork
+        target: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a mutable metadata fork of a WebSpace handle under a new moniker
+    Fork {
+        /// Source moniker or handle path to fork
+        source: String,
+        /// New local WebSpace moniker
+        moniker: String,
+        /// Optional target URI override for the fork
+        #[arg(long)]
+        target_uri: Option<String>,
+        /// Optional resolver/provider override
+        #[arg(long)]
+        resolver: Option<String>,
+        /// Operator-facing description
+        #[arg(long)]
+        description: Option<String>,
+        /// Keep the fork readonly instead of mutable
+        #[arg(long)]
+        readonly: bool,
+        /// Cache policy label, for example metadata-only
+        #[arg(long)]
+        cache_policy: Option<String>,
+        /// Sync policy label, for example manual
+        #[arg(long)]
+        sync_policy: Option<String>,
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
