@@ -208,18 +208,26 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         payload["desktop_objects"]["schema"],
         "elastos.home.desktop-objects/v1"
     );
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
     assert_eq!(
         payload["desktop_objects"]["uri"],
-        format!(
-            "{}/Desktop",
-            crate::auth::principal_localhost_root(&authority.principal_id)
-        )
+        format!("{localhost_root}/Desktop")
     );
     assert!(payload["desktop_objects"]["objects"]
         .as_array()
         .unwrap()
         .iter()
         .any(|object| object["name"] == "Test Folder" && object["kind"] == "directory"));
+    assert!(payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| {
+            object["name"] == "Trash"
+                && object["kind"] == "directory"
+                && object["uri"] == format!("{localhost_root}/.Trash")
+                && object["metadata"]["system_kind"] == "trash"
+        }));
     let targets = payload["targets"].as_array().unwrap();
     let system = targets
         .iter()
@@ -1512,6 +1520,29 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
 async fn test_home_browser_state_drops_unknown_targets() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let desktop_object_entry = format!("object:{localhost_root}/Desktop/Test Folder");
+    let trash_entry = format!("object:{localhost_root}/.Trash");
+    let foreign_object_entry = "object:localhost://Users/foreign/Desktop/Bad".to_string();
+    let mut layout = json!({
+        "desktop": {
+            "system": { "x": 12, "y": 12 },
+            "obsolete-wallet": { "x": 24, "y": 24 }
+        },
+        "desktopHidden": ["system", "obsolete-wallet"],
+        "desktopLabels": {
+            "system": "System",
+            "obsolete-wallet": "Old Wallet"
+        },
+        "taskbar": ["system", "obsolete-wallet"],
+        "desktopIconsVisible": true
+    });
+    {
+        let desktop = layout["desktop"].as_object_mut().unwrap();
+        desktop.insert(desktop_object_entry.clone(), json!({ "x": 36, "y": 36 }));
+        desktop.insert(trash_entry.clone(), json!({ "x": 48, "y": 48 }));
+        desktop.insert(foreign_object_entry.clone(), json!({ "x": 60, "y": 60 }));
+    }
     let app = gateway_router(test_state(dir.path()));
 
     let updated = app
@@ -1524,19 +1555,7 @@ async fn test_home_browser_state_drops_unknown_targets() {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
-                        "layout": {
-                            "desktop": {
-                                "system": { "x": 12, "y": 12 },
-                                "obsolete-wallet": { "x": 24, "y": 24 }
-                            },
-                            "desktopHidden": ["system", "obsolete-wallet"],
-                            "desktopLabels": {
-                                "system": "System",
-                                "obsolete-wallet": "Old Wallet"
-                            },
-                            "taskbar": ["system", "obsolete-wallet"],
-                            "desktopIconsVisible": true
-                        },
+                        "layout": layout,
                         "session": {
                             "browser_context_id": "browser:test",
                             "windows": [
@@ -1558,6 +1577,15 @@ async fn test_home_browser_state_drops_unknown_targets() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["layout"]["desktop"].get("obsolete-wallet").is_none());
+    assert!(json["layout"]["desktop"]
+        .get(desktop_object_entry.as_str())
+        .is_some());
+    assert!(json["layout"]["desktop"]
+        .get(trash_entry.as_str())
+        .is_some());
+    assert!(json["layout"]["desktop"]
+        .get(foreign_object_entry.as_str())
+        .is_none());
     assert!(json["layout"]["desktopLabels"]
         .get("obsolete-wallet")
         .is_none());

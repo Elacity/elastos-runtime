@@ -610,6 +610,9 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
 }
 
 pub(crate) fn viewer_object_shell_title(name: &str, description: Option<&str>) -> String {
+    if name == "archive-manager" {
+        return "Archive".to_string();
+    }
     let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) else {
         return title_case_capsule_name(name);
     };
