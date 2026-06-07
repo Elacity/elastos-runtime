@@ -754,11 +754,16 @@ async fn test_library_provider_object_lifecycle() {
                 && root["label"] == "Spaces"
                 && root["uri"] == "localhost://WebSpaces"
         }));
-    assert!(!roots["data"]["roots"]
+    assert!(roots["data"]["roots"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|root| root["id"] == "trash"));
+        .any(|entry| {
+            entry["id"] == "trash"
+                && entry["label"] == "Trash"
+                && entry["uri"] == format!("{root}/.Trash")
+                && entry["metadata"]["empty"] == true
+        }));
 
     let (mkdir_status, mkdir) = post_library(
         app.clone(),
@@ -853,34 +858,36 @@ async fn test_library_provider_object_lifecycle() {
     assert_eq!(trash_status, StatusCode::OK);
     let trash_uri = trash["data"]["object"]["uri"].as_str().unwrap().to_string();
     assert!(trash_uri.contains("/.Trash/"));
+    assert_eq!(
+        trash["data"]["object"]["metadata"]["trash"]["original_uri"],
+        renamed_uri
+    );
 
-    let restored_uri = format!("{documents_uri}/restored.txt");
     let (restore_status, restore) = post_library(
         app.clone(),
         &token,
         "restore",
         json!({
             "uri": trash_uri,
-            "target_uri": restored_uri,
         }),
     )
     .await;
     assert_eq!(restore_status, StatusCode::OK);
-    assert_eq!(restore["data"]["object"]["uri"], restored_uri);
+    assert_eq!(restore["data"]["object"]["uri"], renamed_uri);
 
     let (trash_again_status, trash_again) = post_library(
         app.clone(),
         &token,
         "trash",
         json!({
-            "uri": restored_uri,
+            "uri": renamed_uri,
         }),
     )
     .await;
     assert_eq!(trash_again_status, StatusCode::OK);
     let deleted_uri = trash_again["data"]["object"]["uri"].as_str().unwrap();
     let (delete_status, deleted) = post_library(
-        app,
+        app.clone(),
         &token,
         "delete_permanently",
         json!({
@@ -890,6 +897,33 @@ async fn test_library_provider_object_lifecycle() {
     .await;
     assert_eq!(delete_status, StatusCode::OK);
     assert_eq!(deleted["data"]["deleted_uri"], deleted_uri);
+
+    let cleanup_uri = format!("{documents_uri}/cleanup.txt");
+    let (cleanup_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": cleanup_uri,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"cleanup"),
+        }),
+    )
+    .await;
+    assert_eq!(cleanup_status, StatusCode::OK);
+    let (trash_cleanup_status, _) = post_library(
+        app.clone(),
+        &token,
+        "trash",
+        json!({
+            "uri": cleanup_uri,
+        }),
+    )
+    .await;
+    assert_eq!(trash_cleanup_status, StatusCode::OK);
+    let (empty_status, empty) = post_library(app, &token, "empty_trash", json!({})).await;
+    assert_eq!(empty_status, StatusCode::OK);
+    assert_eq!(empty["data"]["deleted_count"], 1);
 }
 
 #[tokio::test]
@@ -2089,6 +2123,24 @@ async fn test_library_gateway_lists_webspaces_through_runtime_provider() {
     assert_eq!(root["status"], "ok");
     assert_eq!(root["data"]["uri"], "localhost://WebSpaces");
     let root_objects = root["data"]["objects"].as_array().unwrap();
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    assert!(root_objects.iter().any(|object| {
+        object["uri"] == localhost_root
+            && object["name"] == "Localhost"
+            && object["kind"] == "directory"
+            && object["availability"] == "local-principal"
+            && object["metadata"]["schema"] == "elastos.library.space-pointer/v1"
+            && object["metadata"]["space"] == "localhost"
+            && object["metadata"]["target_uri"] == localhost_root
+            && object["metadata"]["provider"] == "object-provider"
+            && object["metadata"]["authority"] == "signed-principal-root"
+            && object["metadata"]["writable"] == true
+            && object["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "list")
+    }));
     assert!(root_objects.iter().any(|object| {
         object["uri"] == "localhost://WebSpaces/Elastos"
             && object["kind"] == "directory"

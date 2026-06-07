@@ -2064,6 +2064,8 @@ async function main() {
       assert(desktopTargets.includes("inbox"), "Inbox should be exposed as a Home desktop shortcut", desktopTargets);
       assert(launcherTargets.includes("library"), "Library should be exposed in the Home launcher", launcherTargets);
       assert(desktopTargets.includes("library"), "Library should be exposed as a Home desktop shortcut", desktopTargets);
+      assert(launcherTargets.includes("archive-manager"), "Archive should be exposed in the Home launcher", launcherTargets);
+      assert(desktopTargets.includes("archive-manager"), "Archive should be exposed as a Home desktop shortcut", desktopTargets);
       assert(state.launcherHeading === "Open", "Home launcher heading should use plain product wording", state);
       assert(state.launcherSearchPlaceholder === "Search Home", "Home launcher search should use plain product wording", state);
       assert(!state.launcherGroupHeadings.includes("All Apps"), "Home launcher should not describe mixed targets as apps", state);
@@ -2085,6 +2087,11 @@ async function main() {
         state,
       );
       assert(
+        state.launcherCards.some((card) => card.target === "archive-manager" && card.title === "Archive"),
+        "Home launcher did not label Archive as Archive",
+        state,
+      );
+      assert(
         state.launcherCards.some((card) => card.target === "inbox" && card.title === "Inbox"),
         "Home launcher did not label inbox as Inbox",
         state,
@@ -2100,9 +2107,52 @@ async function main() {
         state,
       );
       assert(
+        state.desktopShortcuts.some((shortcut) => shortcut.target === "archive-manager" && shortcut.label === "Archive"),
+        "Home desktop did not label Archive as Archive",
+        state,
+      );
+      assert(
         state.desktopShortcuts.some((shortcut) => shortcut.target === "inbox" && shortcut.label === "Inbox"),
         "Home desktop did not label inbox as Inbox",
         state,
+      );
+    });
+
+    await runCase("archive-launch-routes-to-library", async (tabId) => {
+      await openShellTarget(tabId, "archive-manager");
+      const archiveReady = await waitFor(async () => {
+        const state = await shellState(tabId);
+        const archiveWindow = state.windows.find((window) => window.target === "archive-manager");
+        if (!archiveWindow || archiveWindow.title !== "Archive") {
+          return false;
+        }
+        const archive = await frameState(tabId, "archive-manager", `({
+          ok: true,
+          title: doc.title,
+          openButton: !!doc.querySelector("#open-existing-archive"),
+        })`);
+        return archive.ok && archive.title === "Archive - ElastOS" && archive.openButton;
+      }, 12000, 500);
+      assert(archiveReady, "Archive launcher did not open the Archive window", await shellState(tabId));
+
+      const clicked = await clickInFrame(tabId, "archive-manager", "#open-existing-archive");
+      assert(clicked.ok, "Archive open-existing action was not clickable", clicked);
+      const openedLibrary = await waitFor(async () => {
+        const state = await shellState(tabId);
+        return state.windows.some((window) => window.target === "library" && window.title === "Library");
+      }, 12000, 500);
+      assert(openedLibrary, "Home rejected Archive open-target handoff to Library", await shellState(tabId));
+      const pickerMode = await frameState(tabId, "library", `({
+        mode: new URL(win.location.href).searchParams.get("mode") || "",
+        returnTarget: new URL(win.location.href).searchParams.get("returnTarget") || "",
+        pickerButton: doc.querySelector("#picker-action-button")?.textContent?.trim() || "",
+      })`);
+      assert(
+        pickerMode.mode === "archive-open" &&
+          pickerMode.returnTarget === "archive-manager" &&
+          pickerMode.pickerButton === "Open in Archive",
+        "Archive handoff must open Library as an Archive picker, not as a generic Library window",
+        pickerMode,
       );
     });
 

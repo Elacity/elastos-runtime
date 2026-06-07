@@ -44,7 +44,7 @@ const roots = [
   { schema: "elastos.library.root/v1", id: "home", label: "Home", uri: principalRoot, kind: "principal-root" },
   { schema: "elastos.library.root/v1", id: "desktop", label: "Desktop", uri: desktopUri, kind: "directory" },
   { schema: "elastos.library.root/v1", id: "documents", label: "Documents", uri: documentsUri, kind: "directory" },
-  { schema: "elastos.library.root/v1", id: "webspaces", label: "WebSpaces", uri: "localhost://WebSpaces", kind: "webspace-root" },
+  { schema: "elastos.library.root/v1", id: "webspaces", label: "Spaces", uri: "localhost://WebSpaces", kind: "webspace-root" },
 ];
 
 const documents = Array.from({ length: 1000 }, (_, index) => {
