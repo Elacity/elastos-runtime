@@ -20,12 +20,12 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260603c";
+} from "./shell-core.js?v=home-20260607d";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260603c";
+} from "./shell-chrome.js?v=home-20260607d";
 import {
   renderDesktop,
   renderTaskbar,
@@ -45,7 +45,7 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260603c";
+} from "./shell-surface.js?v=home-20260607d";
 import {
   configureWindowHooks,
   renderBootError,
@@ -56,7 +56,7 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260603c";
+} from "./shell-windows.js?v=home-20260607d";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -64,7 +64,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260603c";
+} from "./shell-auth.js?v=home-20260607d";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -87,13 +87,13 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
-  library: new Set(["documents", "library"]),
+  library: new Set(["archive-manager", "documents", "library"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
-  library: new Set(["chat-room"]),
+  library: new Set(["archive-manager", "chat-room"]),
 });
 
 function fullscreenElement() {

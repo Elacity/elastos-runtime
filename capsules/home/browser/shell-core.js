@@ -25,6 +25,9 @@ export const taskbarItemTemplate = document.querySelector("#taskbar-item-templat
 
 export const SHELL_APP_ID = "home";
 export const SYSTEM_APP_ID = "system";
+const TARGET_TITLE_OVERRIDES = Object.freeze({
+  "archive-manager": "Archive",
+});
 const MAX_RECENT_TARGETS = 10;
 export const ICON_DRAG_THRESHOLD = 6;
 const DESKTOP_ICON_WIDTH = 92;
@@ -126,7 +129,12 @@ export async function fetchJson(url, init) {
 }
 
 export function allVisibleTargets(summary) {
-  return (summary && Array.isArray(summary.targets)) ? summary.targets : [];
+  return (summary && Array.isArray(summary.targets))
+    ? summary.targets.map((target) => ({
+      ...target,
+      title: canonicalTargetTitle(target?.target, target?.title),
+    }))
+    : [];
 }
 
 export function desktopObjects(summary) {
@@ -216,7 +224,13 @@ export function shellAppId(summary) {
 
 export function targetTitle(summary, targetId) {
   const target = targetById(summary, targetId);
-  return target ? target.title : targetId;
+  return canonicalTargetTitle(targetId, target?.title);
+}
+
+export function canonicalTargetTitle(targetId, title) {
+  const normalizedTitle = normalizeText(title);
+  const override = TARGET_TITLE_OVERRIDES[targetId];
+  return override || normalizedTitle || targetId;
 }
 
 export function desktopLabelForTarget(summary, targetId) {
@@ -408,6 +422,9 @@ function normalizeDesktopLabels(labels, summary) {
   for (const [targetId, label] of Object.entries(labels)) {
     const nextLabel = normalizeText(label);
     if (!knownTargets.has(targetId) || nextLabel === "") {
+      continue;
+    }
+    if (TARGET_TITLE_OVERRIDES[targetId]) {
       continue;
     }
     normalized[targetId] = nextLabel;
@@ -618,6 +635,9 @@ export function mountGlyph(container, targetId, forcedTone) {
 }
 
 export function glyphTone(targetId) {
+  if (targetId === "trash" || targetId === "trash-full") {
+    return "system";
+  }
   if (targetId === SYSTEM_APP_ID) {
     return "system";
   }
@@ -646,6 +666,17 @@ export function glyphTone(targetId) {
 }
 
 function glyphSvg(targetId) {
+  if (targetId === "trash" || targetId === "trash-full") {
+    const full = targetId === "trash-full";
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 7.25h8" />
+        <path d="M10 7.25V5.5h4v1.75" />
+        <path d="M6.75 9.25h10.5l-.75 9.25a2 2 0 0 1-2 1.82h-5a2 2 0 0 1-2-1.82Z" />
+        ${full ? '<path d="M9.25 12.25h5.5" /><path d="M9.75 15.25h4.5" />' : '<path d="M10 12.25v4.5" /><path d="M14 12.25v4.5" />'}
+      </svg>
+    `;
+  }
   if (targetId === SYSTEM_APP_ID) {
     return `
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

@@ -1027,7 +1027,7 @@ const gatewayBrowserRouteTests = read(
 );
 const debugPolicy = read("DEBUG.md");
 const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260603c";
+const homeAssetVersion = "home-20260607d";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1185,7 +1185,7 @@ assert(
   "Home open-target messages must stay source-gated",
 );
 assert(
-  shellJs.includes('library: new Set(["documents", "library"])'),
+  shellJs.includes('library: new Set(["archive-manager", "documents", "library"])'),
   "Home must allow Library sidebar Open in New Window while keeping the source-gated policy explicit",
 );
 assert(
@@ -1329,8 +1329,8 @@ assert(
   "Home must source-gate capsule-to-capsule picker returns",
 );
 assert(
-  shellJs.includes('library: new Set(["chat-room"])'),
-  "Home must allow Library picker results to return to Chat Room only",
+  shellJs.includes('library: new Set(["archive-manager", "chat-room"])'),
+  "Home must allow Library picker results to return only to authorized capsules",
 );
 assert(
   shellJs.includes('"home:close-self"'),
