@@ -20,12 +20,12 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260526d";
+} from "./shell-core.js?v=home-20260603c";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260526d";
+} from "./shell-chrome.js?v=home-20260603c";
 import {
   renderDesktop,
   renderTaskbar,
@@ -38,13 +38,14 @@ import {
   filterLauncherItems,
   moveLauncherSelection,
   openSelectedLauncherTarget,
+  openSelectedDesktopEntry,
   clearDesktopSelection,
   continueTargetDrag,
   finishTargetDrag,
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260526d";
+} from "./shell-surface.js?v=home-20260603c";
 import {
   configureWindowHooks,
   renderBootError,
@@ -55,7 +56,7 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260526d";
+} from "./shell-windows.js?v=home-20260603c";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -63,7 +64,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260526d";
+} from "./shell-auth.js?v=home-20260603c";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -85,7 +86,7 @@ const SESSION_REFRESH_MS = 10 * 60 * 1000;
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
-  library: new Set(["documents"]),
+  library: new Set(["documents", "library"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
@@ -130,14 +131,9 @@ function toggleShellFullscreen() {
 }
 
 function registerHomeServiceWorker() {
-  if (!("serviceWorker" in navigator)) {
-    return;
-  }
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./service-worker.js", { scope: "./" }).catch((error) => {
-      console.warn("ElastOS Home service worker registration failed", error);
-    });
-  }, { once: true });
+  // Home is network-first during active Runtime development. A stale service
+  // worker can strand the shell on an old module graph while provider APIs are
+  // live, so service-worker registration is intentionally disabled for now.
 }
 
 function trackPointerDown(event) {
@@ -247,7 +243,7 @@ desktopShortcuts.addEventListener("keydown", (event) => {
   if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
     event.preventDefault();
     event.stopPropagation();
-    openTarget(shellState.selectedDesktopTargetId);
+    openSelectedDesktopEntry();
   }
 });
 
@@ -311,7 +307,7 @@ document.addEventListener("keydown", (event) => {
   }
   if ((event.key === "Enter" || event.key === " ") && shellState.selectedDesktopTargetId) {
     event.preventDefault();
-    openTarget(shellState.selectedDesktopTargetId);
+    openSelectedDesktopEntry();
   }
 });
 
@@ -566,9 +562,11 @@ async function boot() {
       console.error("home runtime ensure failed", error);
       return null;
     });
-  await restoreShellSession();
   document.body.dataset.homeStatus = "ready";
   hideHomeUnlock();
+  restoreShellSession().catch((error) => {
+    console.error("home session restore failed", error);
+  });
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
   });
@@ -673,7 +671,12 @@ async function refreshShellSummary({ initialize = false } = {}) {
     stopHomeEventChannel();
   }
 
-  if (initialize || principalChanged || targetsChanged(previous, summary)) {
+  if (
+    initialize ||
+    principalChanged ||
+    targetsChanged(previous, summary) ||
+    desktopObjectsChanged(previous, summary)
+  ) {
     renderDesktop(summary);
     renderTaskbar(summary);
     renderLauncher(summary);
@@ -805,7 +808,8 @@ function homeEventsRequireShellSummary(events) {
       scope === "wallet" ||
       kind === "home.summary.changed" ||
       kind === "inbox.changed" ||
-      kind === "wallet.requests.changed"
+      kind === "wallet.requests.changed" ||
+      kind === "home.desktop.changed"
     );
   });
 }
@@ -868,4 +872,24 @@ function targetsChanged(previous, next) {
     ? next.targets.map((target) => `${target.target}:${target.title}:${target.description}`).join("|")
     : "";
   return previousTargets !== nextTargets;
+}
+
+function desktopObjectsChanged(previous, next) {
+  return desktopObjectsSignature(previous) !== desktopObjectsSignature(next);
+}
+
+function desktopObjectsSignature(summary) {
+  const objects = summary &&
+    summary.desktop_objects &&
+    Array.isArray(summary.desktop_objects.objects)
+    ? summary.desktop_objects.objects
+    : [];
+  return objects
+    .map((object) => [
+      object && object.uri,
+      object && object.revision,
+      object && object.kind,
+      object && object.name,
+    ].join(":"))
+    .join("|");
 }

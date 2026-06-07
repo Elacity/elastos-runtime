@@ -36,7 +36,11 @@ import {
   clamp,
   pointInRect,
   CONTEXT_MENU_IGNORE_OUTSIDE_MS,
-} from "./shell-core.js?v=home-20260526d";
+  desktopObjects,
+  desktopObjectEntryId,
+  desktopObjectByEntryId,
+  desktopEntryExists,
+} from "./shell-core.js?v=home-20260603c";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -50,7 +54,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260526d";
+} from "./shell-windows.js?v=home-20260603c";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -65,6 +69,7 @@ export function renderDesktop(summary) {
     const position = desktopPositionForTarget(app.target, index);
     const label = desktopLabelForTarget(summary, app.target);
     button.dataset.target = app.target;
+    button.dataset.desktopEntryId = app.target;
     button.id = `desktop-shortcut-${app.target}`;
     button.style.left = `${position.x}px`;
     button.style.top = `${position.y}px`;
@@ -75,8 +80,33 @@ export function renderDesktop(summary) {
     attachTargetIconInteractions(button, app.target, "desktop");
     desktopShortcuts.appendChild(button);
   }
+  const desktopObjectOffset = allVisibleTargets(summary).length;
+  for (const [index, object] of desktopObjects(summary).entries()) {
+    const entryId = desktopObjectEntryId(object);
+    const button = shortcutTemplate.content.firstElementChild.cloneNode(true);
+    const position = desktopPositionForTarget(entryId, desktopObjectOffset + index);
+    const label = object.name;
+    button.dataset.desktopEntryId = entryId;
+    button.dataset.objectUri = object.uri;
+    button.id = desktopShortcutIdForEntry(entryId);
+    button.style.left = `${position.x}px`;
+    button.style.top = `${position.y}px`;
+    button.setAttribute("aria-label", desktopShortcutAriaLabel(label));
+    button.title = `${label}\nDouble-click or press Enter to open`;
+    mountGlyph(
+      button.querySelector(".desktop-shortcut-icon"),
+      object.kind === "directory" ? "file-folder" : "documents",
+    );
+    button.querySelector(".desktop-shortcut-title").textContent = label;
+    attachDesktopObjectInteractions(button, entryId);
+    desktopShortcuts.appendChild(button);
+  }
   syncDesktopIconsVisibility();
   updateDesktopSelectionState();
+}
+
+function desktopShortcutIdForEntry(entryId) {
+  return `desktop-shortcut-${encodeURIComponent(entryId).replaceAll("%", "_")}`;
 }
 
 function syncDesktopIconsVisibility() {
@@ -85,12 +115,12 @@ function syncDesktopIconsVisibility() {
   desktopShortcuts.setAttribute("aria-hidden", visible ? "false" : "true");
 }
 
-function selectDesktopTarget(targetId) {
-  if (shellState.selectedDesktopTargetId === targetId) {
+function selectDesktopTarget(entryId) {
+  if (shellState.selectedDesktopTargetId === entryId) {
     focusDesktopSelectionSurface();
     return;
   }
-  shellState.selectedDesktopTargetId = targetId;
+  shellState.selectedDesktopTargetId = entryId;
   updateDesktopSelectionState();
   focusDesktopSelectionSurface();
 }
@@ -115,15 +145,13 @@ function updateDesktopSelectionState() {
   if (
     shellState.selectedDesktopTargetId &&
     shellState.currentSummary &&
-    (
-      !targetById(shellState.currentSummary, shellState.selectedDesktopTargetId) ||
-      !isTargetOnDesktop(shellState.selectedDesktopTargetId)
-    )
+    !desktopEntryExists(shellState.currentSummary, shellState.selectedDesktopTargetId)
   ) {
     shellState.selectedDesktopTargetId = null;
   }
-  for (const shortcut of desktopShortcuts.querySelectorAll(".desktop-shortcut[data-target]")) {
-    const selected = shortcut.dataset.target === shellState.selectedDesktopTargetId;
+  for (const shortcut of desktopShortcuts.querySelectorAll(".desktop-shortcut")) {
+    const entryId = shortcut.dataset.desktopEntryId || shortcut.dataset.target || "";
+    const selected = entryId === shellState.selectedDesktopTargetId;
     shortcut.classList.toggle("selected", selected);
     shortcut.setAttribute("aria-selected", selected ? "true" : "false");
     if (selected) {
@@ -523,6 +551,125 @@ function attachTargetIconInteractions(node, targetId, source) {
   });
 }
 
+function attachDesktopObjectInteractions(node, entryId) {
+  node.addEventListener("click", (event) => {
+    if (shouldOpenDesktopShortcutFromClick(node, event)) {
+      openDesktopObject(entryId);
+      return;
+    }
+    selectDesktopTarget(entryId);
+  });
+  node.addEventListener("dblclick", () => {
+    selectDesktopTarget(entryId);
+    openDesktopObject(entryId);
+  });
+  node.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    selectDesktopTarget(entryId);
+    openDesktopObject(entryId);
+  });
+  node.addEventListener("focus", () => {
+    selectDesktopTarget(entryId);
+  });
+  node.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    node.dataset.lastPointerType = event.pointerType || "";
+    maybeStartLongPressGesture(event, entryId, "desktop-object", node);
+    beginTargetDrag(event, entryId, "desktop-object", node);
+    if (!isTouchLikePointer(event)) {
+      selectDesktopTarget(entryId);
+    }
+  });
+  node.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    selectDesktopTarget(entryId);
+    openDesktopContextMenu(event.clientX, event.clientY, {
+      kind: "desktop-object",
+      entryId,
+      source: "desktop",
+    });
+  });
+}
+
+function openDesktopObject(entryId) {
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (!object) {
+    return;
+  }
+  if (object.kind === "directory") {
+    openTarget("library", { query: { uri: object.uri } });
+    return;
+  }
+  const viewer = desktopObjectViewer(object);
+  openTarget(viewer, {
+    query: {
+      objectUri: object.uri,
+      uri: object.uri,
+      name: object.name || "",
+      mime: object.mime || "application/octet-stream",
+    },
+  });
+}
+
+export function openSelectedDesktopEntry() {
+  const entryId = shellState.selectedDesktopTargetId;
+  if (!entryId) {
+    return false;
+  }
+  if (entryId.startsWith("object:")) {
+    openDesktopObject(entryId);
+    return true;
+  }
+  openTarget(entryId);
+  return true;
+}
+
+function desktopObjectViewer(object) {
+  const viewers = Array.isArray(object.viewers) ? object.viewers : [];
+  const preferred = viewers.find((viewer) => viewer && viewer.default) || viewers[0];
+  return preferred && typeof preferred.id === "string" && preferred.id.trim() !== ""
+    ? preferred.id
+    : "documents";
+}
+
+function parentUri(uri) {
+  const clean = String(uri || "").replace(/\/+$/, "");
+  const index = clean.lastIndexOf("/");
+  return index > "localhost://".length ? clean.slice(0, index) : clean;
+}
+
+function hasObjectCapability(object, capability) {
+  const capabilities = object && object.capabilities;
+  return !Array.isArray(capabilities) || capabilities.includes(capability);
+}
+
+function revealDesktopObject(entryId) {
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (!object) {
+    return;
+  }
+  const uri = object.kind === "directory" ? object.uri : parentUri(object.uri);
+  openTarget("library", { query: { uri } });
+}
+
+function libraryActionForObject(object, action) {
+  const uri = object.kind === "directory" ? object.uri : parentUri(object.uri);
+  openTarget("library", {
+    query: {
+      uri,
+      objectUri: object.uri,
+      action,
+    },
+  });
+}
+
 function shouldOpenDesktopShortcutFromClick(node, event) {
   const pointerType = node.dataset.lastPointerType || "";
   delete node.dataset.lastPointerType;
@@ -551,7 +698,7 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
     clearDragSelection();
   }
   hideDesktopContextMenu();
-  if (source === "desktop" && !isTouchLikePointer(event)) {
+  if ((source === "desktop" || source === "desktop-object") && !isTouchLikePointer(event)) {
     selectDesktopTarget(targetId);
   }
   const rect = sourceElement.getBoundingClientRect();
@@ -574,7 +721,7 @@ function beginTargetDrag(event, targetId, source, sourceElement) {
 }
 
 function maybeStartLongPressGesture(event, targetId, source, sourceElement) {
-  if (source !== "desktop" || !isTouchLikePointer(event)) {
+  if ((source !== "desktop" && source !== "desktop-object") || !isTouchLikePointer(event)) {
     clearLongPressGesture();
     return;
   }
@@ -599,8 +746,9 @@ function maybeStartLongPressGesture(event, targetId, source, sourceElement) {
     shellState.longPressState = null;
     selectDesktopTarget(targetId);
     openDesktopContextMenu(gesture.clientX, gesture.clientY, {
-      kind: "target",
-      targetId,
+      kind: source === "desktop-object" ? "desktop-object" : "target",
+      targetId: source === "desktop-object" ? undefined : targetId,
+      entryId: source === "desktop-object" ? targetId : undefined,
       source,
     });
   }, DESKTOP_LONG_PRESS_MS);
@@ -636,7 +784,8 @@ function updateLongPressGesture(event) {
   ) {
     if (
       shellState.dragState &&
-      shellState.dragState.source === "desktop" &&
+      (shellState.dragState.source === "desktop" ||
+        shellState.dragState.source === "desktop-object") &&
       isTouchLikeDragState(shellState.dragState) &&
       !shellState.dragState.longPressReady &&
       !shellState.dragState.started
@@ -657,7 +806,8 @@ export function continueTargetDrag(event) {
     return;
   }
   if (
-    shellState.dragState.source === "desktop" &&
+    (shellState.dragState.source === "desktop" ||
+      shellState.dragState.source === "desktop-object") &&
     isTouchLikeDragState(shellState.dragState) &&
     !shellState.dragState.longPressReady
   ) {
@@ -704,18 +854,33 @@ function startTargetDrag() {
   } catch (_error) {
     // Pointer capture can fail on browsers that do not support it here.
   }
-  const target = targetById(shellState.currentSummary, shellState.dragState.targetId);
-  if (!target) {
+  const dragEntry = dragEntryDescriptor(shellState.dragState.targetId);
+  if (!dragEntry) {
     return;
   }
   document.body.classList.add("dragging-target");
   clearDragSelection();
   const ghost = shortcutTemplate.content.firstElementChild.cloneNode(true);
   ghost.classList.add("desktop-shortcut-ghost");
-  mountGlyph(ghost.querySelector(".desktop-shortcut-icon"), target.target);
-  ghost.querySelector(".desktop-shortcut-title").textContent = target.title;
+  mountGlyph(ghost.querySelector(".desktop-shortcut-icon"), dragEntry.glyphId);
+  ghost.querySelector(".desktop-shortcut-title").textContent = dragEntry.title;
   document.body.appendChild(ghost);
   shellState.dragState.ghost = ghost;
+}
+
+function dragEntryDescriptor(entryId) {
+  const target = targetById(shellState.currentSummary, entryId);
+  if (target) {
+    return { glyphId: target.target, title: target.title };
+  }
+  const object = desktopObjectByEntryId(shellState.currentSummary, entryId);
+  if (object) {
+    return {
+      glyphId: object.kind === "directory" ? "file-folder" : "documents",
+      title: object.name,
+    };
+  }
+  return null;
 }
 
 function updateDragGhost(clientX, clientY) {
@@ -731,11 +896,13 @@ function updateDragTarget(clientX, clientY) {
     return;
   }
   taskbarTargets.classList.remove("drop-active");
-  const taskbarTarget = taskbarDropTarget(clientX, clientY);
-  if (taskbarTarget) {
-    taskbarTargets.classList.add("drop-active");
-    shellState.dragState.dropTarget = taskbarTarget;
-    return;
+  if (shellState.dragState.source !== "desktop-object") {
+    const taskbarTarget = taskbarDropTarget(clientX, clientY);
+    if (taskbarTarget) {
+      taskbarTargets.classList.add("drop-active");
+      shellState.dragState.dropTarget = taskbarTarget;
+      return;
+    }
   }
   shellState.dragState.dropTarget = desktopDropTarget(clientX, clientY);
 }
@@ -814,7 +981,11 @@ export function finishTargetDrag(event) {
 
   state.sourceElement.classList.remove("drag-source");
   let changed = false;
-  if (state.dropTarget && state.dropTarget.kind === "taskbar") {
+  if (
+    state.dropTarget &&
+    state.dropTarget.kind === "taskbar" &&
+    state.source !== "desktop-object"
+  ) {
     changed = pinTargetToTaskbar(state.targetId, state.dropTarget.index) || changed;
   } else if (state.dropTarget && state.dropTarget.kind === "desktop") {
     changed = setDesktopPosition(state.targetId, state.dropTarget.position) || changed;
@@ -942,6 +1113,9 @@ function contextMenuItems(target) {
   if (target.kind === "target") {
     return targetContextMenuItems(target);
   }
+  if (target.kind === "desktop-object") {
+    return desktopObjectContextMenuItems(target);
+  }
   const iconsVisible = shellState.shellLayoutState.desktopIconsVisible !== false;
   const items = [
     {
@@ -952,6 +1126,29 @@ function contextMenuItems(target) {
   if (iconsVisible) {
     items.push({ action: "auto-arrange", label: "Auto-arrange Icons" });
   }
+  return items;
+}
+
+function desktopObjectContextMenuItems(target) {
+  const object = desktopObjectByEntryId(shellState.currentSummary, target.entryId);
+  if (!object) {
+    return [];
+  }
+  const items = [
+    {
+      action: "open-desktop-object",
+      label: object.kind === "directory" ? `Open ${object.name}` : "Open",
+    },
+  ];
+  if (object.kind === "directory") {
+    items.push({ action: "open-desktop-object-new-window", label: "Open in New Window" });
+  }
+  items.push({ action: "reveal-desktop-object", label: "Show in Library" });
+  items.push({ kind: "divider" });
+  if (hasObjectCapability(object, "download")) {
+    items.push({ action: "download-desktop-object", label: "Download" });
+  }
+  items.push({ action: "properties-desktop-object", label: "Properties" });
   return items;
 }
 
@@ -988,6 +1185,29 @@ function desktopPinMenuItem(targetId) {
 }
 
 export function handleContextAction(action) {
+  if (shellState.contextMenuTarget.kind === "desktop-object") {
+    if (action === "open-desktop-object" || action === "open-desktop-object-new-window") {
+      openDesktopObject(shellState.contextMenuTarget.entryId);
+      return;
+    }
+    if (action === "reveal-desktop-object") {
+      revealDesktopObject(shellState.contextMenuTarget.entryId);
+      return;
+    }
+    if (action === "download-desktop-object" || action === "properties-desktop-object") {
+      const object = desktopObjectByEntryId(
+        shellState.currentSummary,
+        shellState.contextMenuTarget.entryId,
+      );
+      if (object) {
+        libraryActionForObject(
+          object,
+          action === "download-desktop-object" ? "download" : "properties",
+        );
+      }
+      return;
+    }
+  }
   if (action.startsWith("focus-window:")) {
     focusWindow(action.slice("focus-window:".length));
     return;

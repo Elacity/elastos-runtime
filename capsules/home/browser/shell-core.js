@@ -129,6 +129,57 @@ export function allVisibleTargets(summary) {
   return (summary && Array.isArray(summary.targets)) ? summary.targets : [];
 }
 
+export function desktopObjects(summary) {
+  const objects = summary &&
+    summary.desktop_objects &&
+    Array.isArray(summary.desktop_objects.objects)
+    ? summary.desktop_objects.objects
+    : [];
+  return objects.filter((object) => (
+    object &&
+    typeof object.uri === "string" &&
+    object.uri.trim() !== "" &&
+    typeof object.name === "string" &&
+    object.name.trim() !== ""
+  ));
+}
+
+export function desktopObjectEntryId(object) {
+  return `object:${object.uri}`;
+}
+
+export function desktopObjectByEntryId(summary, entryId) {
+  if (typeof entryId !== "string" || !entryId.startsWith("object:")) {
+    return null;
+  }
+  const uri = entryId.slice("object:".length);
+  return desktopObjects(summary).find((object) => object.uri === uri) || null;
+}
+
+export function desktopEntryExists(summary, entryId) {
+  if (!summary || typeof entryId !== "string" || entryId.trim() === "") {
+    return false;
+  }
+  if (entryId.startsWith("object:")) {
+    return Boolean(desktopObjectByEntryId(summary, entryId));
+  }
+  return Boolean(targetById(summary, entryId) && isTargetOnDesktop(entryId));
+}
+
+export function desktopLayoutEntries(summary) {
+  const appEntries = allVisibleTargets(summary).map((target) => ({
+    id: target.target,
+    kind: "target",
+    target,
+  }));
+  const objectEntries = desktopObjects(summary).map((object) => ({
+    id: desktopObjectEntryId(object),
+    kind: "object",
+    object,
+  }));
+  return [...appEntries, ...objectEntries];
+}
+
 function syncHomeBrowserState(summary) {
   const state = summary && summary.browser_state && typeof summary.browser_state === "object"
     ? summary.browser_state
@@ -213,11 +264,11 @@ export function initializeShellLayout(summary) {
       normalizedDesktopHidden,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
-  for (const [index, app] of allVisibleTargets(summary).entries()) {
+  for (const [index, entry] of desktopLayoutEntries(summary).entries()) {
     const defaultPosition = defaultDesktopPosition(index);
-    const storedPosition = stored && stored.desktop ? stored.desktop[app.target] : null;
+    const storedPosition = stored && stored.desktop ? stored.desktop[entry.id] : null;
     const position = clampDesktopPosition(normalizeDesktopPosition(storedPosition, defaultPosition));
-    shellState.shellLayoutState.desktop[app.target] = position;
+    shellState.shellLayoutState.desktop[entry.id] = position;
     if (!storedPosition || !positionsEqual(storedPosition, position)) {
       changed = true;
     }
@@ -502,9 +553,13 @@ export function autoArrangeDesktopIcons(summary = shellState.currentSummary) {
   }
   let changed = false;
   const desktopTargets = sortedDesktopTargets(summary)
-    .filter((target) => isTargetOnDesktop(target.target));
-  for (const [index, target] of desktopTargets.entries()) {
-    changed = setDesktopPosition(target.target, defaultDesktopPosition(index)) || changed;
+    .filter((target) => isTargetOnDesktop(target.target))
+    .map((target) => ({ id: target.target }));
+  const desktopObjectEntries = desktopObjects(summary).map((object) => ({
+    id: desktopObjectEntryId(object),
+  }));
+  for (const [index, entry] of [...desktopTargets, ...desktopObjectEntries].entries()) {
+    changed = setDesktopPosition(entry.id, defaultDesktopPosition(index)) || changed;
   }
   if (!changed) {
     return false;
@@ -546,10 +601,10 @@ export function clampDesktopLayoutToViewport() {
     return false;
   }
   let changed = false;
-  for (const [index, app] of allVisibleTargets(shellState.currentSummary).entries()) {
-    const next = clampDesktopPosition(desktopPositionForTarget(app.target, index));
-    if (!positionsEqual(shellState.shellLayoutState.desktop[app.target], next)) {
-      shellState.shellLayoutState.desktop[app.target] = next;
+  for (const [index, entry] of desktopLayoutEntries(shellState.currentSummary).entries()) {
+    const next = clampDesktopPosition(desktopPositionForTarget(entry.id, index));
+    if (!positionsEqual(shellState.shellLayoutState.desktop[entry.id], next)) {
+      shellState.shellLayoutState.desktop[entry.id] = next;
       changed = true;
     }
   }
