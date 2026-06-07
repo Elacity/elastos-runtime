@@ -33,6 +33,7 @@ const LIBRARY_ARCHIVE_ENTRIES_SCHEMA: &str = "elastos.library.archive-entries/v1
 const LIBRARY_ARCHIVE_EXTRACT_ENTRIES_SCHEMA: &str = "elastos.library.archive-extract-entries/v1";
 const LIBRARY_ARCHIVE_PREVIEW_ENTRY_SCHEMA: &str = "elastos.library.archive-preview-entry/v1";
 const LIBRARY_VISIBILITY_SCHEMA: &str = "elastos.library.visibility/v1";
+const LIBRARY_TRASH_RECORD_SCHEMA: &str = "elastos.library.trash-record/v1";
 const MAX_LIBRARY_EVENTS: usize = 256;
 const MAX_ARCHIVE_LIST_ENTRIES: usize = 512;
 const MAX_ARCHIVE_PREVIEW_BYTES: usize = 64 * 1024;
@@ -90,6 +91,8 @@ struct LibraryRoot {
     label: &'static str,
     uri: String,
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +126,15 @@ struct LibraryShareGrant {
     #[serde(default = "default_share_key_release")]
     key_release: Value,
     created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LibraryTrashRecord {
+    schema: String,
+    trash_uri: String,
+    original_uri: String,
+    original_name: String,
+    trashed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,7 +254,8 @@ enum ObjectProviderRequest {
     Restore {
         principal_id: String,
         uri: String,
-        target_uri: String,
+        #[serde(default)]
+        target_uri: Option<String>,
         #[serde(default)]
         if_revision: Option<String>,
     },
@@ -251,6 +264,9 @@ enum ObjectProviderRequest {
         uri: String,
         #[serde(default)]
         if_revision: Option<String>,
+    },
+    EmptyTrash {
+        principal_id: String,
     },
     Status {
         principal_id: String,
@@ -927,7 +943,7 @@ async fn handle_library_webspace_request(
     request: ObjectProviderRequest,
 ) -> anyhow::Result<Value> {
     match request {
-        ObjectProviderRequest::List { uri, .. } => {
+        ObjectProviderRequest::List { principal_id, uri } => {
             let uri = clean_webspace_uri(uri.as_deref().unwrap_or("localhost://WebSpaces"))?;
             webspace_try_refresh_index_from_adapter(data_dir, registry, &uri).await?;
             let data = webspace_provider_data(
@@ -942,10 +958,14 @@ async fn handle_library_webspace_request(
             .await?;
             let entries: Vec<WebSpaceDirEntry> = serde_json::from_value(data)
                 .context("webspace-provider list response has invalid entries")?;
-            let objects = entries
+            let mut objects = entries
                 .into_iter()
                 .map(|entry| webspace_entry_object(data_dir, &uri, entry))
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            if uri == "localhost://WebSpaces" {
+                objects.push(localhost_space_pointer_object(data_dir, &principal_id)?);
+                sort_spaces_root_objects(&mut objects);
+            }
             let object = webspace_stat_object(data_dir, registry, &uri).await?;
             Ok(json!({
                 "uri": uri,
@@ -1104,7 +1124,7 @@ fn handle_library_request(
 ) -> anyhow::Result<Value> {
     match request {
         ObjectProviderRequest::Roots { principal_id } => {
-            Ok(json!({ "roots": library_roots(&principal_id) }))
+            Ok(json!({ "roots": library_roots(data_dir, &principal_id) }))
         }
         ObjectProviderRequest::List { principal_id, uri } => {
             let root = crate::auth::principal_localhost_root(&principal_id);
@@ -1122,6 +1142,9 @@ fn handle_library_request(
             {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().to_string();
+                if target.uri == root && (name == ".AppData" || name == ".Trash") {
+                    continue;
+                }
                 let child_uri = format!("{}/{}", target.uri.trim_end_matches('/'), name);
                 objects.push(library_object(data_dir, &principal_id, &child_uri)?);
             }
@@ -1245,10 +1268,14 @@ fn handle_library_request(
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data.trim())
                 .context("library write data must be base64")?;
+            let target = library_target(data_dir, &principal_id, &uri)?;
+            if is_trash_uri(&target.localhost_root, &target.uri) {
+                bail!("library Trash accepts objects only through delete");
+            }
             let object = write_library_file_bytes(
                 data_dir,
                 &principal_id,
-                &uri,
+                &target.uri,
                 mime.as_deref(),
                 if_revision.as_deref(),
                 &bytes,
@@ -1263,6 +1290,9 @@ fn handle_library_request(
             let parent = library_target(data_dir, &principal_id, &parent_uri)?;
             if parent.path.exists() && !parent.path.is_dir() {
                 bail!("library mkdir parent must be a directory");
+            }
+            if is_trash_uri(&parent.localhost_root, &parent.uri) {
+                bail!("library Trash accepts objects only through delete");
             }
             let child_uri = child_uri(&parent.uri, &name)?;
             let child = library_target(data_dir, &principal_id, &child_uri)?;
@@ -1287,6 +1317,9 @@ fn handle_library_request(
         } => {
             let target = library_target(data_dir, &principal_id, &uri)?;
             check_revision(data_dir, &principal_id, &target.uri, if_revision.as_deref())?;
+            if is_trash_uri(&target.localhost_root, &target.uri) {
+                bail!("library Trash objects can be restored or deleted permanently");
+            }
             let parent_uri = target
                 .uri
                 .rsplit_once('/')
@@ -1318,6 +1351,11 @@ fn handle_library_request(
             let parent = library_target(data_dir, &principal_id, &target_parent_uri)?;
             if parent.path.exists() && !parent.path.is_dir() {
                 bail!("library move target parent must be a directory");
+            }
+            if is_trash_uri(&target.localhost_root, &target.uri)
+                || is_trash_uri(&parent.localhost_root, &parent.uri)
+            {
+                bail!("library Trash objects can be moved only through trash or restore");
             }
             if parent.uri == target.uri || parent.uri.starts_with(&(target.uri.clone() + "/")) {
                 bail!("library object cannot be moved inside itself");
@@ -1356,6 +1394,11 @@ fn handle_library_request(
             if parent.path.exists() && !parent.path.is_dir() {
                 bail!("library copy target parent must be a directory");
             }
+            if is_trash_uri(&target.localhost_root, &target.uri)
+                || is_trash_uri(&parent.localhost_root, &parent.uri)
+            {
+                bail!("library Trash objects cannot be copied directly");
+            }
             if parent.uri == target.uri || parent.uri.starts_with(&(target.uri.clone() + "/")) {
                 bail!("library object cannot be copied inside itself");
             }
@@ -1391,6 +1434,9 @@ fn handle_library_request(
             if is_trash_uri(&target.localhost_root, &target.uri) {
                 bail!("library object is already in Trash");
             }
+            if is_runtime_private_uri(&target.localhost_root, &target.uri) {
+                bail!("runtime-private Library objects cannot be moved to Trash");
+            }
             let name = target
                 .uri
                 .rsplit('/')
@@ -1400,6 +1446,17 @@ fn handle_library_request(
             let trash_root = format!("{}/.Trash", target.localhost_root);
             let trash_uri = unique_child_uri(data_dir, &principal_id, &trash_root, name)?;
             move_library_object(data_dir, &principal_id, &target.uri, &trash_uri)?;
+            write_trash_record(
+                data_dir,
+                &principal_id,
+                &LibraryTrashRecord {
+                    schema: LIBRARY_TRASH_RECORD_SCHEMA.to_string(),
+                    trash_uri: trash_uri.clone(),
+                    original_uri: target.uri.clone(),
+                    original_name: name.to_string(),
+                    trashed_at: now_ts(),
+                },
+            )?;
             let object = library_object(data_dir, &principal_id, &trash_uri)?;
             append_library_event(
                 data_dir,
@@ -1423,12 +1480,31 @@ fn handle_library_request(
             if_revision,
         } => {
             let target = library_target(data_dir, &principal_id, &uri)?;
-            if !is_trash_uri(&target.localhost_root, &target.uri) {
+            if !is_trash_child_uri(&target.localhost_root, &target.uri) {
                 bail!("library restore target must be in Trash");
             }
             check_revision(data_dir, &principal_id, &target.uri, if_revision.as_deref())?;
-            let restore_target = library_target(data_dir, &principal_id, &target_uri)?;
+            let trash_record = read_trash_record(data_dir, &principal_id, &target.uri).ok();
+            let restore_uri = target_uri
+                .as_deref()
+                .filter(|uri| !uri.trim().is_empty())
+                .map(|uri| clean_library_uri(&target.localhost_root, uri))
+                .transpose()?
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    restore_uri_from_trash_record(
+                        data_dir,
+                        &principal_id,
+                        &target,
+                        trash_record.as_ref(),
+                    )
+                })?;
+            let restore_target = library_target(data_dir, &principal_id, &restore_uri)?;
+            if is_trash_uri(&restore_target.localhost_root, &restore_target.uri) {
+                bail!("library restore target cannot be inside Trash");
+            }
             move_library_object(data_dir, &principal_id, &target.uri, &restore_target.uri)?;
+            remove_trash_record(data_dir, &principal_id, &target.uri)?;
             let object = library_object(data_dir, &principal_id, &restore_target.uri)?;
             append_library_event(
                 data_dir,
@@ -1437,6 +1513,7 @@ fn handle_library_request(
                 &restore_target.uri,
                 json!({
                     "trash_uri": target.uri,
+                    "original_uri": trash_record.as_ref().map(|record| record.original_uri.clone()),
                     "object": object.clone(),
                 }),
             )?;
@@ -1448,7 +1525,7 @@ fn handle_library_request(
             if_revision,
         } => {
             let target = library_target(data_dir, &principal_id, &uri)?;
-            if !is_trash_uri(&target.localhost_root, &target.uri) {
+            if !is_trash_child_uri(&target.localhost_root, &target.uri) {
                 bail!("library delete_permanently target must be in Trash");
             }
             check_revision(data_dir, &principal_id, &target.uri, if_revision.as_deref())?;
@@ -1457,6 +1534,7 @@ fn handle_library_request(
             } else {
                 fs::remove_file(&target.path)?;
             }
+            remove_trash_record(data_dir, &principal_id, &target.uri)?;
             append_library_event(
                 data_dir,
                 &principal_id,
@@ -1465,6 +1543,44 @@ fn handle_library_request(
                 json!({}),
             )?;
             Ok(json!({ "deleted_uri": target.uri }))
+        }
+        ObjectProviderRequest::EmptyTrash { principal_id } => {
+            let root = crate::auth::principal_localhost_root(&principal_id);
+            let trash_root = format!("{root}/.Trash");
+            let target = library_target(data_dir, &principal_id, &trash_root)?;
+            let mut deleted_uris = Vec::new();
+            if target.path.exists() {
+                if !target.path.is_dir() {
+                    bail!("library Trash root must be a directory");
+                }
+                for entry in fs::read_dir(&target.path)
+                    .with_context(|| format!("failed to list {:?}", target.path))?
+                {
+                    let entry = entry?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let child_uri = format!("{}/{}", target.uri, name);
+                    let child = library_target(data_dir, &principal_id, &child_uri)?;
+                    if child.path.is_dir() {
+                        fs::remove_dir_all(&child.path)?;
+                    } else {
+                        fs::remove_file(&child.path)?;
+                    }
+                    remove_trash_record(data_dir, &principal_id, &child.uri)?;
+                    deleted_uris.push(child.uri);
+                }
+            }
+            let deleted_count = deleted_uris.len();
+            append_library_event(
+                data_dir,
+                &principal_id,
+                "empty_trash",
+                &target.uri,
+                json!({
+                    "deleted_count": deleted_uris.len(),
+                    "deleted_uris": deleted_uris,
+                }),
+            )?;
+            Ok(json!({ "deleted_count": deleted_count }))
         }
         ObjectProviderRequest::Status { principal_id, uri } => {
             let object = library_object(data_dir, &principal_id, &uri)?;
@@ -2684,6 +2800,70 @@ fn webspace_stat_to_object(
     })
 }
 
+fn localhost_space_pointer_object(
+    data_dir: &Path,
+    principal_id: &str,
+) -> anyhow::Result<LibraryObject> {
+    let uri = crate::auth::principal_localhost_root(principal_id);
+    let target = library_target(data_dir, principal_id, &uri)?;
+    let metadata = fs::metadata(&target.path).ok();
+    let modified_at = metadata
+        .as_ref()
+        .and_then(|metadata| system_time_secs(metadata.modified().ok()))
+        .unwrap_or_else(now_ts);
+    let created_at = metadata
+        .as_ref()
+        .and_then(|metadata| system_time_secs(metadata.created().ok()))
+        .unwrap_or(modified_at);
+    Ok(LibraryObject {
+        schema: LIBRARY_OBJECT_SCHEMA,
+        uri: uri.clone(),
+        name: "Localhost".to_string(),
+        kind: "directory",
+        mime: "inode/directory".to_string(),
+        size: 0,
+        created_at,
+        modified_at,
+        revision: format!("rev:space:{}", hex::encode(Sha256::digest(uri.as_bytes()))),
+        viewer: None,
+        viewers: Vec::new(),
+        thumbnail_uri: None,
+        availability: "local-principal".to_string(),
+        blocked_reason: None,
+        content_cid: None,
+        published_cid: None,
+        metadata: Some(json!({
+            "schema": "elastos.library.space-pointer/v1",
+            "space": "localhost",
+            "label": "Localhost",
+            "target_uri": uri,
+            "provider": "object-provider",
+            "authority": "signed-principal-root",
+            "writable": true,
+            "note": "This opens the signed principal's mutable localhost object space. It is not a broad host filesystem grant."
+        })),
+        published: false,
+        shared: false,
+        capabilities: vec!["open", "list", "properties"],
+    })
+}
+
+fn sort_spaces_root_objects(objects: &mut [LibraryObject]) {
+    objects.sort_by(|left, right| {
+        spaces_root_rank(left)
+            .cmp(&spaces_root_rank(right))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+}
+
+fn spaces_root_rank(object: &LibraryObject) -> u8 {
+    match object.name.as_str() {
+        "Localhost" => 0,
+        "Elastos" => 1,
+        _ => 2,
+    }
+}
+
 fn webspace_content_cid_from_metadata(metadata: &Value) -> Option<String> {
     metadata
         .get("target_uri")
@@ -2903,9 +3083,13 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         } => any_webspace(&[uri, target_parent_uri]),
         ObjectProviderRequest::Restore {
             uri, target_uri, ..
-        } => any_webspace(&[uri, target_uri]),
+        } => target_uri
+            .as_deref()
+            .map(|target_uri| any_webspace(&[uri, target_uri]))
+            .unwrap_or_else(|| any_webspace(&[uri])),
         ObjectProviderRequest::Roots { .. }
         | ObjectProviderRequest::List { uri: None, .. }
+        | ObjectProviderRequest::EmptyTrash { .. }
         | ObjectProviderRequest::Events { .. } => false,
     }
 }
@@ -2955,6 +3139,7 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     let record = read_publish_record(data_dir, principal_id, &target.uri).ok();
     let active_record = record.as_ref().filter(|record| record_is_published(record));
     let published_cid = active_record.map(|record| record.cid.clone());
+    let is_trash_root = is_trash_root_uri(&target.localhost_root, &target.uri);
     let in_trash = is_trash_uri(&target.localhost_root, &target.uri);
     let visibility = library_visibility_metadata(
         &target.localhost_root,
@@ -3005,17 +3190,19 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         }
         capabilities
     };
-    if in_trash {
+    if is_trash_root {
+        capabilities = vec!["open", "list", "empty_trash", "properties"];
+    } else if in_trash {
         capabilities = vec!["restore", "delete_permanently", "properties"];
     }
     if blocked_reason.is_some() {
         capabilities = vec!["properties"];
     }
-    let local_metadata = if is_dir {
-        Some(json!({
+    let mut local_metadata = if is_dir {
+        json!({
             "schema": "elastos.library.object-metadata/v1",
             "visibility": visibility,
-        }))
+        })
     } else {
         let mut metadata = json!({
             "schema": "elastos.library.object-metadata/v1",
@@ -3031,8 +3218,20 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         if let Some(archive_support) = archive_support_for_name(&name) {
             metadata["archive_support"] = archive_support;
         }
-        Some(metadata)
+        metadata
     };
+    if in_trash && !is_trash_root {
+        if let Ok(record) = read_trash_record(data_dir, principal_id, &target.uri) {
+            local_metadata["trash"] = json!({
+                "schema": LIBRARY_TRASH_RECORD_SCHEMA,
+                "trash_uri": record.trash_uri,
+                "original_uri": record.original_uri,
+                "original_name": record.original_name,
+                "trashed_at": record.trashed_at,
+            });
+        }
+    }
+    let local_metadata = Some(local_metadata);
     let viewers = viewer_options_for_name(data_dir, uri);
     let viewer = viewers.first().map(|viewer| viewer.id.clone());
     let availability = if blocked_reason.is_some() {
@@ -3171,6 +3370,9 @@ fn write_library_file_bytes(
     bytes: &[u8],
 ) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
+    if is_trash_uri(&target.localhost_root, &target.uri) {
+        bail!("library Trash accepts objects only through delete");
+    }
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(parent) = target.path.parent() {
         fs::create_dir_all(parent)?;
@@ -5946,9 +6148,9 @@ fn shared_access_open_contract(
     })
 }
 
-fn library_roots(principal_id: &str) -> Vec<LibraryRoot> {
+fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
     let root = crate::auth::principal_localhost_root(principal_id);
-    [
+    let mut roots: Vec<_> = [
         ("home", "Home", root.clone(), "principal-root"),
         ("desktop", "Desktop", format!("{root}/Desktop"), "directory"),
         (
@@ -5985,8 +6187,35 @@ fn library_roots(principal_id: &str) -> Vec<LibraryRoot> {
         label,
         uri,
         kind,
+        metadata: None,
     })
-    .collect()
+    .collect();
+    let trash_uri = format!("{root}/.Trash");
+    let (empty, item_count) = trash_root_state(data_dir, principal_id, &trash_uri);
+    roots.push(LibraryRoot {
+        schema: LIBRARY_ROOT_SCHEMA,
+        id: "trash",
+        label: "Trash",
+        uri: trash_uri,
+        kind: "directory",
+        metadata: Some(json!({
+            "schema": "elastos.library.trash-root/v1",
+            "empty": empty,
+            "item_count": item_count,
+        })),
+    });
+    roots
+}
+
+fn trash_root_state(data_dir: &Path, principal_id: &str, trash_uri: &str) -> (bool, usize) {
+    let Ok(target) = library_target(data_dir, principal_id, trash_uri) else {
+        return (true, 0);
+    };
+    let Ok(entries) = fs::read_dir(&target.path) else {
+        return (true, 0);
+    };
+    let count = entries.filter_map(Result::ok).count();
+    (count == 0, count)
 }
 
 fn move_library_object(
@@ -6195,11 +6424,101 @@ fn clean_object_name(name: &str) -> anyhow::Result<&str> {
     Ok(name)
 }
 
+fn library_uri_parent(uri: &str) -> anyhow::Result<&str> {
+    uri.rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+        .ok_or_else(|| anyhow!("library object URI has no parent"))
+}
+
 fn is_trash_uri(localhost_root: &str, uri: &str) -> bool {
+    is_trash_root_uri(localhost_root, uri) || is_trash_child_uri(localhost_root, uri)
+}
+
+fn is_trash_root_uri(localhost_root: &str, uri: &str) -> bool {
     uri == format!("{localhost_root}/.Trash")
-        || uri
-            .strip_prefix(&format!("{localhost_root}/.Trash/"))
-            .is_some()
+}
+
+fn is_trash_child_uri(localhost_root: &str, uri: &str) -> bool {
+    uri.strip_prefix(&format!("{localhost_root}/.Trash/"))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+fn restore_uri_from_trash_record(
+    data_dir: &Path,
+    principal_id: &str,
+    trash_target: &LibraryTarget,
+    trash_record: Option<&LibraryTrashRecord>,
+) -> anyhow::Result<String> {
+    let record =
+        trash_record.ok_or_else(|| anyhow!("library Trash restore metadata is missing"))?;
+    let original_uri = clean_library_uri(&trash_target.localhost_root, &record.original_uri)?;
+    let parent_uri = library_uri_parent(&original_uri)?;
+    let name = original_uri
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(record.original_name.as_str());
+    unique_child_uri(data_dir, principal_id, parent_uri, name)
+}
+
+fn trash_record_uri(localhost_root: &str, trash_uri: &str) -> String {
+    let digest = hex::encode(Sha256::digest(trash_uri.as_bytes()));
+    format!("{localhost_root}/.AppData/LocalHost/.Runtime/Library/Trash/{digest}.json")
+}
+
+fn read_trash_record(
+    data_dir: &Path,
+    principal_id: &str,
+    trash_uri: &str,
+) -> anyhow::Result<LibraryTrashRecord> {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let record_uri = trash_record_uri(&root, trash_uri);
+    let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
+        .ok_or_else(|| anyhow!("invalid library Trash record path"))?;
+    let bytes = crate::auth::read_principal_root_object(
+        data_dir,
+        principal_id,
+        &root,
+        &record_uri,
+        &record_path,
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_trash_record(
+    data_dir: &Path,
+    principal_id: &str,
+    record: &LibraryTrashRecord,
+) -> anyhow::Result<()> {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let record_uri = trash_record_uri(&root, &record.trash_uri);
+    let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
+        .ok_or_else(|| anyhow!("invalid library Trash record path"))?;
+    if let Some(parent) = record_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(record)?;
+    crate::auth::write_principal_root_object(
+        data_dir,
+        principal_id,
+        &root,
+        &record_uri,
+        &record_path,
+        &bytes,
+    )
+}
+
+fn remove_trash_record(data_dir: &Path, principal_id: &str, trash_uri: &str) -> anyhow::Result<()> {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let record_uri = trash_record_uri(&root, trash_uri);
+    let record_path = rooted_localhost_fs_path(data_dir, &record_uri)
+        .ok_or_else(|| anyhow!("invalid library Trash record path"))?;
+    match fs::remove_file(record_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn publish_record_uri(localhost_root: &str, object_uri: &str) -> String {
