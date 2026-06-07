@@ -644,6 +644,9 @@ export function glyphTone(targetId) {
   if (targetId === "inbox") {
     return "docs";
   }
+  if (targetId === "marketplace") {
+    return "market";
+  }
   if (targetId.includes("wallet")) {
     return "wallet";
   }
@@ -698,6 +701,17 @@ function glyphSvg(targetId) {
         <path d="M4 6.75A2.25 2.25 0 0 1 6.25 4.5h11.5A2.25 2.25 0 0 1 20 6.75v10.5a2.25 2.25 0 0 1-2.25 2.25H6.25A2.25 2.25 0 0 1 4 17.25Z" />
         <path d="m5.25 7.25 5.48 4.12a2.1 2.1 0 0 0 2.54 0l5.48-4.12" />
         <path d="M8 15.5h8" />
+      </svg>
+    `;
+  }
+  if (targetId === "marketplace") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 9.25 6.3 4.5h11.4L19 9.25" />
+        <path d="M5 9.25h14" />
+        <path d="M6 9.25V18a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 18V9.25" />
+        <path d="M9 13.25h6" />
+        <path d="M9 16.25h4" />
       </svg>
     `;
   }

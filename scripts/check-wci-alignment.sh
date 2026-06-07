@@ -889,7 +889,7 @@ for platform in ("linux-amd64", "linux-arm64"):
     if not info.get("release_path"):
         print(f"[alignment] home-cli capsule missing {platform} release_path")
         sys.exit(1)
-for name in ("home", "system", "documents", "library", "inbox"):
+for name in ("home", "system", "documents", "library", "marketplace", "inbox"):
     component = components["external"].get(name)
     if not component:
         print(f"[alignment] {name} capsule is missing from external components")

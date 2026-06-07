@@ -88,6 +88,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "library"]),
+  marketplace: "visible-target",
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });

@@ -1566,6 +1566,8 @@ mod tests {
                 cid: "bafy-provider-test".to_string(),
                 sha256: String::new(),
                 size: 0,
+                repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -1757,6 +1759,8 @@ mod tests {
         Component {
             version: None,
             install_path: Some(install_path.to_string()),
+            repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -1965,6 +1969,8 @@ mod tests {
                 cid: "bafy-test-cid".to_string(),
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
+                repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -2008,6 +2014,8 @@ mod tests {
                 cid: "bafy-test-cid".to_string(),
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
+                repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );

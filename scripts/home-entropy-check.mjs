@@ -602,6 +602,9 @@ const activeUiFiles = [
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
   "capsules/library/index.html",
+  "capsules/library/library.css",
+  "capsules/library/src/actions.js",
+  "capsules/library/src/api.js",
   "capsules/chat-room/browser/index.html",
   "capsules/chat-room/browser/style.css",
   "capsules/gba-emulator/index.html",
@@ -681,6 +684,21 @@ for (const file of lightTokenFiles) {
   for (const [token, value] of lightTokens) {
     assertToken(source, file, token, value);
   }
+}
+
+const libraryStyle = read("capsules/library/library.css");
+for (const [token, value] of new Map([
+  ["--bg", "#f6f7f9"],
+  ["--sidebar-bg", "#f0f1f4"],
+  ["--panel", "#ffffff"],
+  ["--panel-soft", "#f3f4f6"],
+  ["--line", "rgba(60, 60, 67, 0.14)"],
+  ["--ink", "#1d1d1f"],
+  ["--muted", "#6b6b6b"],
+  ["--brand", "#f6921a"],
+  ["--accent", "#007aff"],
+])) {
+  assertToken(libraryStyle, "capsules/library/library.css", token, value);
 }
 
 const shellStyle = read("capsules/home/browser/style.css");
@@ -1907,6 +1925,7 @@ for (const component of [
   "browser-native-proxy-engine",
   "browser-stream-bridge",
   "browser-local-exit",
+  "object-provider",
 ]) {
   assert(homeProfile.has(component), `Home profile must install ${component}`);
   assert(
@@ -1927,7 +1946,14 @@ for (const component of [
     );
   }
 }
-for (const component of ["home", "system", "documents", "library", "inbox"]) {
+for (const component of [
+  "home",
+  "system",
+  "documents",
+  "library",
+  "marketplace",
+  "inbox",
+]) {
   assert(
     homeProfile.has(component),
     `Home profile must install first-party ${component} assets`,
@@ -1946,6 +1972,33 @@ for (const component of ["home", "system", "documents", "library", "inbox"]) {
     );
   }
 }
+assert(
+  read("capsules/marketplace/marketplace.js").includes(
+    'fetch("/api/capsules/catalog"',
+  ),
+  "Marketplace must read the canonical capsule catalog, not an app-scoped marketplace catalog",
+);
+const marketplaceUi = read("capsules/marketplace/marketplace.js");
+assert(
+  marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
+    marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("App identity:") &&
+    !marketplaceUi.includes("CID-backed") &&
+    !marketplaceUi.includes("Content ID") &&
+    !marketplaceUi.includes("Signed package") &&
+    !marketplaceUi.includes("Package identity:") &&
+    !marketplaceUi.includes('price-tag">${app.cid ? "CID"') &&
+    !marketplaceUi.includes("signed CID manifests") &&
+    !marketplaceUi.includes("capsule catalog route missing") &&
+    !marketplaceUi.includes("`CID:"),
+  "Marketplace must describe app trust in user-facing language instead of raw CID/package jargon",
+);
+assert(
+  read("elastos/crates/elastos-server/src/api/gateway_marketplace.rs").includes(
+    "capsule_catalog_summary",
+  ),
+  "Marketplace route must delegate to the canonical capsule catalog",
+);
 
 const documents = read("capsules/documents/index.html");
 const archiveManager = read("capsules/archive-manager/index.html");

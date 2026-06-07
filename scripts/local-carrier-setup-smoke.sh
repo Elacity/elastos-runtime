@@ -96,6 +96,7 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/elastos/capsules/localhost-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/did-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
+(cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/home" && cargo build --target wasm32-wasip1 --release)
 (cd "${REPO_ROOT}/capsules/system" && cargo build --target wasm32-wasip1 --release)
@@ -119,11 +120,13 @@ SHELL_BIN="${REPO_ROOT}/elastos/target/release/shell" \
 LOCALHOST_PROVIDER_BIN="${REPO_ROOT}/elastos/target/release/localhost-provider" \
 DID_PROVIDER_BIN="${REPO_ROOT}/capsules/did-provider/target/release/did-provider" \
 WEBSPACE_PROVIDER_BIN="${REPO_ROOT}/capsules/webspace-provider/target/release/webspace-provider" \
+OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object-provider" \
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
+MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
 python3 - <<'PY'
 import hashlib
@@ -155,6 +158,7 @@ mapping = {
     "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
     "did-provider": pathlib.Path(os.environ["DID_PROVIDER_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
+    "object-provider": pathlib.Path(os.environ["OBJECT_PROVIDER_BIN"]),
 }
 
 for name, src in mapping.items():
@@ -210,6 +214,7 @@ for name, capsule_dir in browser_capsules.items():
 data_capsules = {
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
 }
 for name, capsule_dir in data_capsules.items():
@@ -220,7 +225,10 @@ for name, capsule_dir in data_capsules.items():
     archive = artifacts_dir / release_path
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+        for asset in sorted(capsule_dir.rglob("*")):
+            if not asset.is_file() or asset.name == "capsule.json":
+                continue
+            tar.add(asset, arcname=f"{name}/{asset.relative_to(capsule_dir)}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -386,6 +394,7 @@ for installed in \
     "${DATA_DIR}/bin/localhost-provider" \
     "${DATA_DIR}/bin/did-provider" \
     "${DATA_DIR}/bin/webspace-provider" \
+    "${DATA_DIR}/bin/object-provider" \
     "${DATA_DIR}/capsules/home-cli/home-cli.wasm" \
     "${DATA_DIR}/capsules/home-cli/capsule.json" \
     "${DATA_DIR}/capsules/home/home.wasm" \
@@ -394,6 +403,12 @@ for installed in \
     "${DATA_DIR}/capsules/system/browser/index.html" \
     "${DATA_DIR}/capsules/documents/index.html" \
     "${DATA_DIR}/capsules/library/index.html" \
+    "${DATA_DIR}/capsules/library/library.css" \
+    "${DATA_DIR}/capsules/library/src/app.js" \
+    "${DATA_DIR}/capsules/library/icons/folder.svg" \
+    "${DATA_DIR}/capsules/marketplace/index.html" \
+    "${DATA_DIR}/capsules/marketplace/marketplace.css" \
+    "${DATA_DIR}/capsules/marketplace/marketplace.js" \
     "${DATA_DIR}/capsules/inbox/index.html"
 do
     if [[ ! -f "${installed}" ]]; then

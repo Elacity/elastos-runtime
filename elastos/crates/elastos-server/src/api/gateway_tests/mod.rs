@@ -378,6 +378,7 @@ mod documents;
 mod gateway_browser_route_tests;
 mod home_system;
 mod library;
+mod marketplace;
 mod recovery;
 mod room;
 mod site_publication;

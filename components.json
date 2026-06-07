@@ -843,6 +843,20 @@
         }
       }
     },
+    "marketplace": {
+      "install_path": "capsules/marketplace",
+      "description": "Marketplace for browsing installed apps, viewers, providers, and content",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "marketplace.tar.gz",
+          "extract_path": "marketplace",
+          "install_path": "capsules/marketplace"
+        }
+      }
+    },
     "inbox": {
       "install_path": "capsules/inbox",
       "description": "Inbox capsule for reviewing Home requests",
@@ -1045,6 +1059,7 @@
         "browser",
         "documents",
         "library",
+        "marketplace",
         "inbox"
       ]
     },
@@ -1083,6 +1098,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox"
       ]
     },
@@ -1146,6 +1162,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "llama-server",
         "model-qwen3.5-0.8b"
@@ -1183,6 +1200,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "cloudflared"
       ]
@@ -1227,6 +1245,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "crosvm",
         "vmlinux",

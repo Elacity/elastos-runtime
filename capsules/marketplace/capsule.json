@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "marketplace",
+  "version": "0.1.0",
+  "description": "Marketplace for browsing apps, viewers, providers, and content installed on this Runtime",
+  "role": "app",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 16,
+    "gpu": false
+  }
+}

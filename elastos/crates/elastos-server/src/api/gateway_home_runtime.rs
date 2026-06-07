@@ -570,6 +570,7 @@ fn app_shell_title(name: &str) -> String {
         DOCUMENTS_CAPSULE_ID => "Documents".to_string(),
         CHAT_ROOM_CAPSULE_ID => "Chat Room".to_string(),
         LIBRARY_CAPSULE_ID => "Library".to_string(),
+        MARKETPLACE_CAPSULE_ID => "Marketplace".to_string(),
         INBOX_CAPSULE_ID => "Inbox".to_string(),
         SYSTEM_CAPSULE_ID => "System".to_string(),
         BROWSER_CAPSULE_ID => "Browser".to_string(),
@@ -590,6 +591,9 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
             "Open the local sovereign room from this runtime inside ElastOS.".to_string()
         }
         LIBRARY_CAPSULE_ID => "Browse documents and open them in Documents.".to_string(),
+        MARKETPLACE_CAPSULE_ID => {
+            "Browse installed capsules, providers, viewers, and content.".to_string()
+        }
         INBOX_CAPSULE_ID => "Review requests and approvals for this Home.".to_string(),
         SYSTEM_CAPSULE_ID => {
             "Manage passkeys, appearance, and runtime settings for this Home.".to_string()
