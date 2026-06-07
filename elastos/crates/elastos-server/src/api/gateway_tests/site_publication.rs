@@ -265,6 +265,35 @@ async fn test_cid_file_fetches_through_content_provider() {
 }
 
 #[tokio::test]
+async fn test_content_cid_root_fetches_raw_file_through_content_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = content_test_state(dir.path()).await;
+    let app = gateway_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/content/{}", TEST_CIDV1))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(ct, "application/octet-stream");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"raw-content-provider-bytes");
+}
+
+#[tokio::test]
 async fn test_ipfs_cid_root_without_provider_registry_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let state = test_state(dir.path());

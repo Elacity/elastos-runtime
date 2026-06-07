@@ -348,6 +348,86 @@ impl Provider for MockContentProvider {
                     }
                 }
             })),
+            (Some("fetch"), Some(TEST_CIDV1), None) => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "cid": TEST_CIDV1,
+                    "path": "",
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"raw-content-provider-bytes"),
+                    "availability": {
+                        "status": "local_pinned",
+                        "provider": "mock-content-provider",
+                        "replicas": 1
+                    }
+                }
+            })),
+            (Some("publish"), _, _) => {
+                if request.get("object_kind").and_then(|value| value.as_str()) == Some("sealed") {
+                    validate_mock_sealed_publish_request(request)?;
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": TEST_CIDV1,
+                        "uri": format!("elastos://{}", TEST_CIDV1),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": "mock-content-provider",
+                            "replicas": 1
+                        },
+                        "receipt": {
+                            "schema": "elastos.content.availability.receipt/v1",
+                            "cid": TEST_CIDV1
+                        }
+                    }
+                }))
+            }
+            (Some("unpublish"), _, _) => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "cid": TEST_CIDV1,
+                    "uri": format!("elastos://{}", TEST_CIDV1),
+                    "availability": {
+                        "status": "local_unpinned",
+                        "provider": "mock-content-provider",
+                        "replicas": 0
+                    },
+                    "receipt": {
+                        "schema": "elastos.content.availability.receipt/v1",
+                        "cid": TEST_CIDV1,
+                        "status": "local_unpinned"
+                    }
+                }
+            })),
+            (Some("repair"), _, _) => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "cid": TEST_CIDV1,
+                    "uri": format!("elastos://{}", TEST_CIDV1),
+                    "availability": {
+                        "status": "local_pinned",
+                        "provider": "mock-content-provider",
+                        "replicas": 1
+                    },
+                    "receipt": {
+                        "schema": "elastos.content.availability.receipt/v1",
+                        "cid": TEST_CIDV1,
+                        "status": "local_pinned"
+                    }
+                }
+            })),
+            (Some("status"), _, _) => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "cid": TEST_CIDV1,
+                    "uri": format!("elastos://{}", TEST_CIDV1),
+                    "availability": {
+                        "status": "local_pinned",
+                        "provider": "mock-content-provider",
+                        "replicas": 1
+                    }
+                }
+            })),
             _ => Ok(json!({
                 "status": "error",
                 "code": "not_found",
@@ -355,6 +435,1225 @@ impl Provider for MockContentProvider {
             })),
         }
     }
+}
+
+fn validate_mock_sealed_publish_request(request: &serde_json::Value) -> Result<(), ProviderError> {
+    let files = request
+        .get("files")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ProviderError::Provider("sealed publish files are required".into()))?;
+    let sealed_entry = files
+        .iter()
+        .find(|entry| entry.get("path").and_then(|value| value.as_str()) == Some("sealed.json"))
+        .ok_or_else(|| ProviderError::Provider("sealed publish requires sealed.json".into()))?;
+    let sealed_data = sealed_entry
+        .get("data")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ProviderError::Provider("sealed.json data is required".into()))?;
+    let sealed_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sealed_data)
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let sealed_object: elastos_common::protected_content::SealedObjectV1 =
+        serde_json::from_slice(&sealed_bytes)
+            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let links = request
+        .get("links")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| ProviderError::Provider("sealed publish links are required".into()))?;
+    for (rel, cid) in [
+        ("availability.receipt", sealed_object.availability_receipt_cid.as_str()),
+        ("payload", sealed_object.payload_cid.as_str()),
+        ("rights.policy", sealed_object.rights_policy_cid.as_str()),
+    ] {
+        if !links.iter().any(|link| {
+            link.get("rel").and_then(|value| value.as_str()) == Some(rel)
+                && link.get("cid").and_then(|value| value.as_str()) == Some(cid)
+        }) {
+            return Err(ProviderError::Provider(format!(
+                "sealed publish missing {rel} link"
+            )));
+        }
+    }
+    if !links
+        .iter()
+        .any(|link| link.get("rel").and_then(|value| value.as_str()) == Some("provenance"))
+    {
+        return Err(ProviderError::Provider(
+            "sealed publish missing provenance link".into(),
+        ));
+    }
+    if serde_json::to_string(&sealed_object)
+        .map_err(|err| ProviderError::Provider(err.to_string()))?
+        .contains("raw_cek")
+    {
+        return Err(ProviderError::Provider(
+            "sealed publish must not expose raw CEK".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct MockDrmProvider;
+struct MockRightsProvider;
+struct MockKeyProvider;
+struct MockDecryptProvider;
+
+#[async_trait::async_trait]
+impl Provider for MockDrmProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock drm provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["drm"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-drm-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("status") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "provider": "drm",
+                    "configured": true,
+                    "supported_operations": ["status", "open"],
+                    "blocked_authority": ["raw_cek", "chain_rpc", "wallet_rpc"],
+                    "contract": {
+                        "schema": "elastos.protected-content.drm-provider/v1",
+                        "fixture": true
+                    }
+                }
+            })),
+            Some("open") => {
+                let request = request
+                    .get("request")
+                    .ok_or_else(|| ProviderError::Provider("drm request is required".into()))?;
+                let object = request
+                    .get("object")
+                    .ok_or_else(|| ProviderError::Provider("sealed object is required".into()))?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.drm.open.receipt/v1",
+                        "provider": "drm-provider",
+                        "status": "accepted",
+                        "payload_cid": object
+                            .get("payload_cid")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(TEST_CIDV1),
+                        "principal_id": required_test_str(request, "principal_id")?,
+                        "session_id": required_test_str(request, "session_id")?,
+                        "action": required_test_str(request, "action")?,
+                        "fixture": true
+                    }
+                }))
+            }
+            _ => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": "unsupported mock drm op"
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockRightsProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock rights provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["rights"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-rights-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("status") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "provider": "rights",
+                    "configured": true,
+                    "supported_operations": ["status", "has_access_by_content_id"],
+                    "blocked_authority": ["chain_rpc", "wallet_rpc", "raw_cek"],
+                    "contract": {
+                        "schema": "elastos.protected-content.rights-provider/v1",
+                        "fixture": true
+                    }
+                }
+            })),
+            Some("has_access_by_content_id") => {
+                let request = request
+                    .get("request")
+                    .ok_or_else(|| ProviderError::Provider("rights request is required".into()))?;
+                let content_id = required_test_str(request, "content_id")?;
+                let principal_id = required_test_str(request, "principal_id")?;
+                let session_id = required_test_str(request, "session_id")?;
+                let right = required_test_str(request, "right")?;
+                let allowed = right == "view" && !principal_id.contains("blocked");
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.rights.decision.receipt/v1",
+                        "request_id": "rights:fixture",
+                        "content_id": content_id,
+                        "principal_id": principal_id,
+                        "session_id": session_id,
+                        "right": right,
+                        "provider": "rights-provider",
+                        "allowed": allowed,
+                        "issued_at": 1_800_000_000u64,
+                        "expires_at": 1_900_000_000u64
+                    }
+                }))
+            }
+            _ => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": "unsupported mock rights op"
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockKeyProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock key provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["key"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-key-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("status") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "provider": "key",
+                    "configured": true,
+                    "supported_operations": ["status", "release"],
+                    "blocked_authority": ["raw_cek", "kms_node_credentials"],
+                    "contract": {
+                        "schema": "elastos.protected-content.key-provider/v1",
+                        "fixture": true
+                    }
+                }
+            })),
+            Some("release") => {
+                let request = request
+                    .get("request")
+                    .ok_or_else(|| ProviderError::Provider("key request is required".into()))?;
+                if request
+                    .get("rights_receipt")
+                    .and_then(|receipt| receipt.get("allowed"))
+                    .and_then(|value| value.as_bool())
+                    != Some(true)
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "denied",
+                        "message": "rights receipt denied key release"
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.release.receipt/v1",
+                        "request_id": required_test_str(request, "request_id")?,
+                        "object_cid": required_test_str(request, "object_cid")?,
+                        "principal_id": required_test_str(request, "principal_id")?,
+                        "session_id": required_test_str(request, "session_id")?,
+                        "action": required_test_str(request, "action")?,
+                        "provider": "key-provider",
+                        "status": "released",
+                        "issued_at": 1_800_000_000u64,
+                        "expires_at": request
+                            .get("expires_at")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(1_900_000_000u64)
+                    }
+                }))
+            }
+            _ => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": "unsupported mock key op"
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockDecryptProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock decrypt provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["decrypt"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-decrypt-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("status") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "provider": "decrypt",
+                    "configured": true,
+                    "supported_operations": ["status", "open_session"],
+                    "blocked_authority": ["raw_cek", "raw_plaintext", "filesystem"],
+                    "contract": {
+                        "schema": "elastos.protected-content.decrypt-provider/v1",
+                        "fixture": true
+                    }
+                }
+            })),
+            Some("open_session") => {
+                let request = request
+                    .get("request")
+                    .ok_or_else(|| ProviderError::Provider("decrypt request is required".into()))?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.decrypt.session/v1",
+                        "session_id": "decrypt-session:fixture",
+                        "object_cid": required_test_str(request, "object_cid")?,
+                        "viewer_interface": required_test_str(request, "viewer_interface")?,
+                        "output": "viewer_capsule_session:fixture",
+                        "expires_at": request
+                            .get("expires_at")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(1_900_000_000u64)
+                    }
+                }))
+            }
+            _ => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": "unsupported mock decrypt op"
+            })),
+        }
+    }
+}
+
+struct MockExternalObjectProvider {
+    data_dir: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Provider for MockExternalObjectProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock external object provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["object"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-external-object-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        Ok(crate::library::handle_object_provider_raw_request(
+            &self.data_dir,
+            request,
+        ))
+    }
+}
+
+#[derive(Clone)]
+struct MockCachedWebSpaceObject {
+    bytes: Vec<u8>,
+    sync_state: &'static str,
+}
+
+#[derive(Default)]
+struct MockWebSpaceProvider {
+    cached: std::sync::Mutex<BTreeMap<String, MockCachedWebSpaceObject>>,
+}
+
+struct MockWebSpaceAdapterProvider;
+struct MockOperatorWebSpaceAdapterProvider;
+
+fn mock_operator_archive_zip_bytes() -> Vec<u8> {
+    use std::io::Write as _;
+
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("alpha.txt", options).unwrap();
+    writer.write_all(b"zip alpha").unwrap();
+    writer.add_directory("Nested/", options).unwrap();
+    writer.start_file("Nested/deep.txt", options).unwrap();
+    writer.write_all(b"zip nested").unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+impl MockWebSpaceProvider {
+    fn cached_object(&self, path: &str) -> Option<MockCachedWebSpaceObject> {
+        self.cached.lock().ok()?.get(path).cloned()
+    }
+
+    fn store_cached_object(
+        &self,
+        path: &str,
+        request: &serde_json::Value,
+    ) -> Result<MockCachedWebSpaceObject, ProviderError> {
+        let bytes = request
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ProviderError::Provider("mock cache missing content".into()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|byte| *byte <= u8::MAX as u64)
+                    .map(|byte| byte as u8)
+                    .ok_or_else(|| ProviderError::Provider("mock cache byte out of range".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cached = MockCachedWebSpaceObject {
+            bytes,
+            sync_state: "manual_idle",
+        };
+        self.cached
+            .lock()
+            .map_err(|_| ProviderError::Provider("mock cache lock poisoned".into()))?
+            .insert(path.to_string(), cached.clone());
+        Ok(cached)
+    }
+
+    fn store_written_object(
+        &self,
+        path: &str,
+        request: &serde_json::Value,
+    ) -> Result<MockCachedWebSpaceObject, ProviderError> {
+        let bytes = request
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ProviderError::Provider("mock write missing content".into()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|byte| *byte <= u8::MAX as u64)
+                    .map(|byte| byte as u8)
+                    .ok_or_else(|| ProviderError::Provider("mock write byte out of range".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let cached = MockCachedWebSpaceObject {
+            bytes,
+            sync_state: "manual_pending",
+        };
+        self.cached
+            .lock()
+            .map_err(|_| ProviderError::Provider("mock cache lock poisoned".into()))?
+            .insert(path.to_string(), cached.clone());
+        Ok(cached)
+    }
+
+    fn mark_synced(&self, path: &str) -> Result<Option<MockCachedWebSpaceObject>, ProviderError> {
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|_| ProviderError::Provider("mock cache lock poisoned".into()))?;
+        let Some(object) = cached.get_mut(path) else {
+            return Ok(None);
+        };
+        object.sync_state = "manual_synced";
+        Ok(Some(object.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockWebSpaceProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock WebSpace provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["webspace"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-webspace-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let path = request
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("localhost://WebSpaces");
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("list") if path == "localhost://WebSpaces" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    {
+                        "name": "Elastos",
+                        "is_file": false,
+                        "is_dir": true,
+                        "size": 0,
+                        "provider": "mock-webspace-provider",
+                        "resolver_state": "resolved",
+                        "resolver": "builtin",
+                        "cache_policy": "metadata-only",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:elastos",
+                        "head_id": "head:webspace:elastos",
+                        "cache_state": "metadata_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "dynamic-webspace",
+                        "readonly": true
+                    },
+                    {
+                        "name": "Google",
+                        "is_file": false,
+                        "is_dir": true,
+                        "size": 0,
+                        "target_uri": "google://drive",
+                        "provider": "mock-webspace-provider",
+                        "resolver_state": "mounted-readonly",
+                        "resolver": "google-drive",
+                        "cache_policy": "metadata-and-thumbnails",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:google",
+                        "head_id": "head:webspace:google",
+                        "cache_state": "metadata_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "mounted-webspace",
+                        "readonly": true
+                    },
+                    {
+                        "name": "Operator",
+                        "is_file": false,
+                        "is_dir": true,
+                        "size": 0,
+                        "target_uri": "operator://drive",
+                        "provider": "mock-webspace-provider",
+                        "resolver_state": "mounted-readonly",
+                        "resolver": "operator-drive",
+                        "cache_policy": "metadata-and-bytes",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:operator",
+                        "head_id": "head:webspace:operator",
+                        "cache_state": "metadata_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "mounted-webspace",
+                        "readonly": true
+                    },
+                    {
+                        "name": "OperatorMutable",
+                        "is_file": false,
+                        "is_dir": true,
+                        "size": 0,
+                        "target_uri": "operator://drive/Writable",
+                        "provider": "mock-webspace-provider",
+                        "resolver_state": "mounted-mutable",
+                        "resolver": "operator-drive",
+                        "cache_policy": "metadata-and-bytes",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:operator-mutable",
+                        "head_id": "head:webspace:operator-mutable",
+                        "cache_state": "content_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "mounted-webspace",
+                        "readonly": false,
+                        "access_policy": "owner-writable"
+                    },
+                    {
+                        "name": "Mutable",
+                        "is_file": false,
+                        "is_dir": true,
+                        "size": 0,
+                        "target_uri": "local://mutable",
+                        "provider": "mock-webspace-provider",
+                        "resolver_state": "mounted-mutable",
+                        "resolver": "local-materialized",
+                        "cache_policy": "metadata-and-bytes",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:mutable",
+                        "head_id": "head:webspace:mutable",
+                        "cache_state": "content_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "mounted-webspace",
+                        "readonly": false,
+                        "access_policy": "owner-writable"
+                    }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Elastos" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "builtin", "cache_policy": "metadata-only", "sync_policy": "manual", "object_id": "object:webspace:elastos-meta", "head_id": "head:webspace:elastos-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "content", "is_file": false, "is_dir": true, "size": 0, "target_uri": "elastos://<cid>", "resolver": "builtin", "cache_policy": "metadata-only", "sync_policy": "manual", "object_id": "object:webspace:content", "head_id": "head:webspace:content", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "folder-handle" },
+                    { "name": "peer", "is_file": false, "is_dir": true, "size": 0, "target_uri": "elastos://peer/", "resolver": "builtin", "cache_policy": "metadata-only", "sync_policy": "manual", "object_id": "object:webspace:peer", "head_id": "head:webspace:peer", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "folder-handle" },
+                    { "name": "did", "is_file": false, "is_dir": true, "size": 0, "target_uri": "elastos://did/", "resolver": "builtin", "cache_policy": "metadata-only", "sync_policy": "manual", "object_id": "object:webspace:did", "head_id": "head:webspace:did", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "folder-handle" },
+                    { "name": "ai", "is_file": false, "is_dir": true, "size": 0, "target_uri": "elastos://ai/", "resolver": "builtin", "cache_policy": "metadata-only", "sync_policy": "manual", "object_id": "object:webspace:ai", "head_id": "head:webspace:ai", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "folder-handle" }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Google" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "google-drive", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-meta", "head_id": "head:webspace:google-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "Drive", "is_file": false, "is_dir": true, "size": 0, "target_uri": "google://drive/Drive", "resolver": "google-drive", "resolver_state": "indexed", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-drive", "head_id": "head:webspace:google-drive", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-directory", "readonly": true },
+                    { "name": "Shared", "is_file": false, "is_dir": true, "size": 0, "target_uri": "google://drive/shared", "resolver": "google-drive", "resolver_state": "indexed-virtual", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-shared", "head_id": "head:webspace:google-shared", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-directory", "readonly": true }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Google/Drive" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "google-drive", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-drive-meta", "head_id": "head:webspace:google-drive-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "Project X", "is_file": false, "is_dir": true, "size": 0, "target_uri": "google://drive/Drive/Project X", "resolver": "google-drive", "resolver_state": "indexed-virtual", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-project", "head_id": "head:webspace:google-project", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-directory", "readonly": true }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Google/Drive/Project X" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "google-drive", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-project-meta", "head_id": "head:webspace:google-project-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "file.pdf", "is_file": true, "is_dir": false, "size": 256, "target_uri": "google://drive/Drive/Project X/file.pdf", "resolver": "google-drive", "resolver_state": "indexed", "cache_policy": "metadata-and-thumbnails", "sync_policy": "manual", "object_id": "object:webspace:google-project-file", "head_id": "head:webspace:google-project-file", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-file", "readonly": true }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Operator" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "operator-drive", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-meta", "head_id": "head:webspace:operator-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "Projects", "is_file": false, "is_dir": true, "size": 0, "target_uri": "operator://drive/Projects", "resolver": "operator-drive", "resolver_state": "indexed", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-projects", "head_id": "head:webspace:operator-projects", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-directory", "readonly": true }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Operator/Projects" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "operator-drive", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-projects-meta", "head_id": "head:webspace:operator-projects-meta", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "metadata" },
+                    { "name": "Brief.md", "is_file": true, "is_dir": false, "size": 512, "target_uri": "operator://drive/Projects/Brief.md", "resolver": "operator-drive", "resolver_state": "indexed", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-brief", "head_id": "head:webspace:operator-brief", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-file", "readonly": true },
+                    { "name": "Bundle.zip", "is_file": true, "is_dir": false, "size": mock_operator_archive_zip_bytes().len(), "target_uri": "operator://drive/Projects/Bundle.zip", "resolver": "operator-drive", "resolver_state": "indexed", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-bundle", "head_id": "head:webspace:operator-bundle", "cache_state": "metadata_cached", "sync_state": "manual_idle", "kind": "indexed-file", "readonly": true }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/OperatorMutable" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "operator-drive", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-mutable-meta", "head_id": "head:webspace:operator-mutable-meta", "cache_state": "content_cached", "sync_state": "manual_idle", "kind": "metadata", "readonly": true, "access_policy": "resolver-readonly" },
+                    { "name": "Folder", "is_file": false, "is_dir": true, "size": 0, "target_uri": "operator://drive/Writable/Folder", "resolver": "operator-drive", "resolver_state": "materialized-local", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:operator-mutable-folder", "head_id": "head:webspace:operator-mutable-folder", "cache_state": "content_cached", "sync_state": "manual_idle", "kind": "materialized-directory", "readonly": false, "access_policy": "owner-writable" }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Mutable" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "local-materialized", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:mutable-meta", "head_id": "head:webspace:mutable-meta", "cache_state": "content_cached", "sync_state": "manual_idle", "kind": "metadata", "readonly": true, "access_policy": "resolver-readonly" },
+                    { "name": "Folder", "is_file": false, "is_dir": true, "size": 0, "target_uri": "local://mutable/Folder", "resolver": "local-materialized", "resolver_state": "materialized-local", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:mutable-folder", "head_id": "head:webspace:mutable-folder", "cache_state": "content_cached", "sync_state": "manual_pending", "kind": "materialized-directory", "readonly": false, "access_policy": "owner-writable" }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Mutable/Folder" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    { "name": "_meta.json", "is_file": true, "is_dir": false, "size": 96, "resolver": "local-materialized", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:mutable-folder-meta", "head_id": "head:webspace:mutable-folder-meta", "cache_state": "content_cached", "sync_state": "manual_idle", "kind": "metadata", "readonly": true, "access_policy": "resolver-readonly" },
+                    { "name": "note.txt", "is_file": true, "is_dir": false, "size": 13, "target_uri": "local://mutable/Folder/note.txt", "resolver": "local-materialized", "resolver_state": "materialized-local", "cache_policy": "metadata-and-bytes", "sync_policy": "manual", "object_id": "object:webspace:mutable-note", "head_id": "head:webspace:mutable-note", "cache_state": "content_cached", "sync_state": "manual_pending", "kind": "materialized-file", "readonly": false, "access_policy": "owner-writable" }
+                ]
+            })),
+            Some("list") if path == "localhost://WebSpaces/Elastos/content" => Ok(json!({
+                "status": "ok",
+                "data": [
+                    {
+                        "name": TEST_CIDV1,
+                        "is_file": true,
+                        "is_dir": false,
+                        "size": 128,
+                        "target_uri": format!("elastos://{TEST_CIDV1}"),
+                        "provider": "content-provider",
+                        "resolver_state": "resolved",
+                        "resolver": "builtin",
+                        "cache_policy": "metadata-only",
+                        "sync_policy": "manual",
+                        "object_id": "object:webspace:content-test-cid",
+                        "head_id": "head:webspace:content-test-cid",
+                        "cache_state": "metadata_cached",
+                        "sync_state": "manual_idle",
+                        "kind": "file-endpoint",
+                        "readonly": true
+                    }
+                ]
+            })),
+            Some("stat") => {
+                let stat = self
+                    .cached_object(path)
+                    .map(|cached| mock_cached_webspace_stat(path, &cached))
+                    .unwrap_or_else(|| mock_webspace_stat(path));
+                Ok(json!({
+                    "status": "ok",
+                    "data": stat
+                }))
+            },
+            Some("health") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.health/v1",
+                    "state": "metadata_ready",
+                    "mounts": [
+                        {
+                            "moniker": "Google",
+                            "resolver": "google-drive",
+                            "live_adapter": true,
+                            "adapter_state": "connected",
+                            "adapter": {
+                                "schema": "elastos.webspace.adapter/v1",
+                                "resolver": "google-drive",
+                                "provider": "google-drive-adapter",
+                                "state": "connected",
+                                "live": true,
+                                "capabilities": ["metadata_index", "read_bytes"]
+                            }
+                        },
+                        {
+                            "moniker": "Operator",
+                            "resolver": "operator-drive",
+                            "live_adapter": true,
+                            "adapter_state": "connected",
+                            "adapter": {
+                                "schema": "elastos.webspace.adapter/v1",
+                                "resolver": "operator-drive",
+                                "provider": "operator-drive-adapter",
+                                "state": "connected",
+                                "live": true,
+                                "capabilities": ["metadata_index", "read_bytes", "write_bytes"]
+                            }
+                        },
+                        {
+                            "moniker": "OperatorMutable",
+                            "resolver": "operator-drive",
+                            "live_adapter": true,
+                            "adapter_state": "connected",
+                            "adapter": {
+                                "schema": "elastos.webspace.adapter/v1",
+                                "resolver": "operator-drive",
+                                "provider": "operator-drive-adapter",
+                                "state": "connected",
+                                "live": true,
+                                "capabilities": ["metadata_index", "read_bytes", "write_bytes"]
+                            }
+                        }
+                    ]
+                }
+            })),
+            Some("refresh") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.refresh-receipt/v1",
+                    "action": "refreshed",
+                    "handle_uri": path,
+                    "byte_materialized": false
+                }
+            })),
+            Some("cache") => {
+                let cached = self.store_cached_object(path, request)?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.cache-receipt/v1",
+                        "action": "content_cached",
+                        "handle_uri": path,
+                        "content_cached": true,
+                        "dirty": false,
+                        "size": cached.bytes.len()
+                    }
+                }))
+            },
+            Some("write")
+                if path.starts_with("localhost://WebSpaces/Mutable/")
+                    || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
+            {
+                let cached = self.store_written_object(path, request)?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.write-receipt/v1",
+                        "action": "written",
+                        "handle_uri": path,
+                        "byte_materialized": true,
+                        "size": cached.bytes.len()
+                    }
+                }))
+            }
+            Some("mkdir")
+                if path.starts_with("localhost://WebSpaces/Mutable/")
+                    || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
+            {
+                Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.mkdir-receipt/v1",
+                    "action": "created",
+                    "handle_uri": path
+                }
+            }))
+            }
+            Some("delete")
+                if path.starts_with("localhost://WebSpaces/Mutable/")
+                    || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
+            {
+                Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.delete-receipt/v1",
+                    "action": "deleted",
+                    "handle_uri": path,
+                    "removed_count": 1
+                }
+            }))
+            }
+            Some("sync")
+                if path.starts_with("localhost://WebSpaces/Mutable/")
+                    || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
+            {
+                let synced = self.mark_synced(path)?.ok_or_else(|| {
+                    ProviderError::Provider("mock sync target was not materialized".into())
+                })?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.sync-receipt/v1",
+                        "action": "resolver_synced",
+                        "handle_uri": path,
+                        "content_synced": true,
+                        "dirty": false,
+                        "size": synced.bytes.len()
+                    }
+                }))
+            }
+            Some("write" | "mkdir" | "delete") => Ok(json!({
+                "status": "error",
+                "code": "readonly",
+                "message": "built-in or readonly WebSpace is resolver-owned and read-only"
+            })),
+            Some("read") if self.cached_object(path).is_some() => {
+                let bytes = self.cached_object(path).unwrap().bytes;
+                let size = bytes.len();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "content": bytes,
+                        "size": size
+                    }
+                }))
+            },
+            Some("read") if path.ends_with("_meta.json") || path.contains("/content/") => {
+                let bytes = serde_json::to_vec_pretty(&json!({
+                    "handle_uri": path.trim_end_matches("/_meta.json"),
+                    "target_uri": if path.contains("/content/") {
+                        Some(format!(
+                            "elastos://{}",
+                            path.rsplit('/').next().unwrap_or_default()
+                        ))
+                    } else {
+                        None
+                    },
+                    "resolver_state": "resolved",
+                    "resolver": "builtin",
+                    "cache_policy": "metadata-only",
+                    "sync_policy": "manual",
+                    "object_id": "object:webspace:read",
+                    "head_id": "head:webspace:read",
+                    "cache_state": "metadata_cached",
+                    "sync_state": "manual_idle"
+                }))
+                .unwrap();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "content": bytes,
+                        "size": bytes.len()
+                    }
+                }))
+            }
+            Some("read") if path.starts_with("localhost://WebSpaces/Mutable/") => {
+                let bytes = b"mutable bytes".to_vec();
+                let size = bytes.len();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "content": bytes,
+                        "size": size
+                    }
+                }))
+            }
+            Some(op) => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": format!("unsupported mock WebSpace op: {op}")
+            })),
+            None => Ok(json!({
+                "status": "error",
+                "code": "invalid_request",
+                "message": "missing mock WebSpace op"
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockWebSpaceAdapterProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock WebSpace adapter provider only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["google-drive-adapter"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-webspace-adapter-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("_runtime_invocation").is_none() {
+            return Ok(json!({
+                "status": "error",
+                "code": "missing_runtime_invocation",
+                "message": "WebSpace adapter requires Runtime provider invocation"
+            }));
+        }
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("metadata_index") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.adapter.metadata-index/v1",
+                    "entries": [
+                        {
+                            "path": "Drive/Project X/file.pdf",
+                            "kind": "file",
+                            "target_uri": "google://drive/Drive/Project X/file.pdf",
+                            "resolver_state": "indexed",
+                            "readonly": true,
+                            "description": "Adapter indexed Google Drive file."
+                        }
+                    ],
+                    "receipt": {
+                        "schema": "elastos.webspace.adapter.metadata-index-receipt/v1",
+                        "resolver": "google-drive"
+                    }
+                }
+            })),
+            Some("read_bytes") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.adapter.read-bytes/v1",
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"google adapter bytes"),
+                    "mime": "application/pdf",
+                    "receipt": {
+                        "schema": "elastos.webspace.adapter.read-bytes-receipt/v1",
+                        "resolver": "google-drive",
+                        "target_uri": request.get("target_uri").cloned()
+                    }
+                }
+            })),
+            Some(op) => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": format!("unsupported mock WebSpace adapter op: {op}")
+            })),
+            None => Ok(json!({
+                "status": "error",
+                "code": "invalid_request",
+                "message": "missing mock WebSpace adapter op"
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockOperatorWebSpaceAdapterProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock operator WebSpace adapter only supports raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["operator-drive-adapter"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-operator-webspace-adapter"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("_runtime_invocation").is_none() {
+            return Ok(json!({
+                "status": "error",
+                "code": "missing_runtime_invocation",
+                "message": "Operator WebSpace adapter requires Runtime provider invocation"
+            }));
+        }
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("metadata_index") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.webspace.adapter.metadata-index/v1",
+                    "entries": [
+                        {
+                            "path": "Projects/Brief.md",
+                            "kind": "file",
+                            "target_uri": "operator://drive/Projects/Brief.md",
+                            "resolver_state": "indexed",
+                            "readonly": true,
+                            "description": "Operator fixture indexed markdown brief."
+                        },
+                        {
+                            "path": "Projects/Bundle.zip",
+                            "kind": "file",
+                            "target_uri": "operator://drive/Projects/Bundle.zip",
+                            "resolver_state": "indexed",
+                            "readonly": true,
+                            "description": "Operator fixture indexed archive bundle."
+                        }
+                    ],
+                    "receipt": {
+                        "schema": "elastos.webspace.adapter.metadata-index-receipt/v1",
+                        "resolver": "operator-drive",
+                        "operator_fixture": true
+                    }
+                }
+            })),
+            Some("read_bytes") => {
+                let target_uri = request
+                    .get("target_uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let (bytes, mime) = if target_uri.ends_with("/Bundle.zip") {
+                    (mock_operator_archive_zip_bytes(), "application/zip")
+                } else {
+                    (
+                        b"# Operator Brief\n\nAdapter-backed bytes.\n".to_vec(),
+                        "text/plain",
+                    )
+                };
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.adapter.read-bytes/v1",
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        "mime": mime,
+                        "receipt": {
+                            "schema": "elastos.webspace.adapter.read-bytes-receipt/v1",
+                            "resolver": "operator-drive",
+                            "operator_fixture": true,
+                            "target_uri": request.get("target_uri").cloned()
+                        }
+                    }
+                }))
+            }
+            Some("write_bytes") => {
+                let target_uri = request
+                    .get("target_uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if target_uri.contains("Conflict") {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "conflict",
+                        "message": "operator fixture rejected stale mutable fork write",
+                        "data": {
+                            "schema": "elastos.webspace.adapter.write-conflict/v1",
+                            "resolver": "operator-drive",
+                            "target_uri": target_uri,
+                            "reason": "head_mismatch"
+                        }
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.adapter.write-bytes/v1",
+                        "receipt": {
+                            "schema": "elastos.webspace.adapter.write-bytes-receipt/v1",
+                            "resolver": "operator-drive",
+                            "operator_fixture": true,
+                            "target_uri": target_uri,
+                            "bytes_accepted": request
+                                .get("data")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok())
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0)
+                        }
+                    }
+                }))
+            }
+            Some(op) => Ok(json!({
+                "status": "error",
+                "code": "unsupported",
+                "message": format!("unsupported mock operator WebSpace adapter op: {op}")
+            })),
+            None => Ok(json!({
+                "status": "error",
+                "code": "invalid_request",
+                "message": "missing mock operator WebSpace adapter op"
+            })),
+        }
+    }
+}
+
+fn mock_webspace_stat(path: &str) -> serde_json::Value {
+    let is_google_file = path == "localhost://WebSpaces/Google/Drive/Project X/file.pdf";
+    let is_operator_mutable = path.starts_with("localhost://WebSpaces/OperatorMutable");
+    let is_operator = path.starts_with("localhost://WebSpaces/Operator") && !is_operator_mutable;
+    let is_operator_file = path == "localhost://WebSpaces/Operator/Projects/Brief.md";
+    let is_operator_archive_file = path == "localhost://WebSpaces/Operator/Projects/Bundle.zip";
+    let is_operator_projects_dir = path == "localhost://WebSpaces/Operator/Projects";
+    let is_mutable = path.starts_with("localhost://WebSpaces/Mutable");
+    let is_mutable_file = is_mutable && path.ends_with(".txt");
+    let is_operator_mutable_file =
+        is_operator_mutable && (path.ends_with(".txt") || path.ends_with(".md"));
+    let is_file = path.ends_with("_meta.json")
+        || path.contains("/content/")
+        || is_google_file
+        || is_operator_file
+        || is_operator_archive_file
+        || is_operator_mutable_file
+        || is_mutable_file;
+    let is_google = path.starts_with("localhost://WebSpaces/Google");
+    json!({
+        "path": path,
+        "is_file": is_file,
+        "is_dir": !is_file,
+        "size": if is_mutable_file { 13 } else if is_operator_mutable_file { 0 } else if is_file { 128 } else { 0 },
+        "readonly": !(is_mutable || is_operator_mutable),
+        "access_policy": if is_mutable || is_operator_mutable { "owner-writable" } else { "resolver-readonly" },
+        "target_uri": if is_google_file {
+            Some("google://drive/Drive/Project X/file.pdf".to_string())
+        } else if is_operator_archive_file {
+            Some("operator://drive/Projects/Bundle.zip".to_string())
+        } else if is_google {
+            Some(path.replacen("localhost://WebSpaces/Google", "google://drive", 1))
+        } else if is_operator_mutable {
+            Some(path.replacen("localhost://WebSpaces/OperatorMutable", "operator://drive/Writable", 1))
+        } else if is_operator {
+            Some(path.replacen("localhost://WebSpaces/Operator", "operator://drive", 1))
+        } else if is_mutable {
+            Some(path.replacen("localhost://WebSpaces/Mutable", "local://mutable", 1))
+        } else if path.contains("/content/") {
+            Some(format!(
+                "elastos://{}",
+                path.rsplit('/').next().unwrap_or_default()
+            ))
+        } else {
+            None
+        },
+        "provider": if path.contains("/content/") { "content-provider" } else { "mock-webspace-provider" },
+        "resolver_state": if is_mutable || is_operator_mutable {
+            if path == "localhost://WebSpaces/Mutable" || path == "localhost://WebSpaces/OperatorMutable" { "mounted-mutable" } else { "materialized-local" }
+        } else if is_operator_file || is_operator_archive_file || is_operator_projects_dir {
+            "indexed"
+        } else if is_operator {
+            "indexed-virtual"
+        } else if is_google_file { "indexed" } else if is_google { "indexed-virtual" } else { "resolved" },
+        "resolver": if is_mutable { "local-materialized" } else if is_operator || is_operator_mutable { "operator-drive" } else if is_google { "google-drive" } else { "builtin" },
+        "cache_policy": if is_mutable || is_operator || is_operator_mutable { "metadata-and-bytes" } else if is_google { "metadata-and-thumbnails" } else { "metadata-only" },
+        "sync_policy": "manual",
+        "object_id": format!("object:webspace:{}", path.replace('/', ":")),
+        "head_id": format!("head:webspace:{}", path.replace('/', ":")),
+        "cache_state": if is_mutable || is_operator_mutable { "content_cached" } else { "metadata_cached" },
+        "sync_state": if is_mutable || is_operator_mutable { "manual_pending" } else { "manual_idle" },
+        "kind": if path.ends_with("_meta.json") {
+            "metadata"
+        } else if is_mutable_file || is_operator_mutable_file {
+            "materialized-file"
+        } else if is_operator_mutable && path == "localhost://WebSpaces/OperatorMutable" {
+            "mounted-webspace"
+        } else if is_operator_mutable {
+            "materialized-directory"
+        } else if is_mutable && path == "localhost://WebSpaces/Mutable" {
+            "mounted-webspace"
+        } else if is_mutable {
+            "materialized-directory"
+        } else if is_operator_file || is_operator_archive_file {
+            "indexed-file"
+        } else if is_operator && path == "localhost://WebSpaces/Operator" {
+            "mounted-webspace"
+        } else if is_operator {
+            "indexed-directory"
+        } else if is_google_file {
+            "indexed-file"
+        } else if is_google {
+            "indexed-directory"
+        } else if path.contains("/content/") {
+            "file-endpoint"
+        } else if path == "localhost://WebSpaces" {
+            "webspace-root"
+        } else {
+            "folder-handle"
+        },
+        "modified": 1,
+        "created": 1
+    })
+}
+
+fn mock_cached_webspace_stat(
+    path: &str,
+    cached: &MockCachedWebSpaceObject,
+) -> serde_json::Value {
+    let mut stat = mock_webspace_stat(path);
+    stat["size"] = json!(cached.bytes.len());
+    stat["resolver_state"] = json!("materialized-local");
+    stat["cache_state"] = json!("content_cached");
+    stat["sync_state"] = json!(cached.sync_state);
+    stat["kind"] = json!("materialized-file");
+    stat
 }
 
 struct MockNetProvider;
@@ -1595,9 +2894,7 @@ impl Provider for MockWalletProvider {
                         "message": "recovery_key is required"
                     }));
                 };
-                if recovery_key
-                    .get("schema")
-                    .and_then(|value| value.as_str())
+                if recovery_key.get("schema").and_then(|value| value.as_str())
                     != Some("elastos.wallet.recovery-key/v1")
                 {
                     return Ok(json!({
@@ -1609,9 +2906,7 @@ impl Provider for MockWalletProvider {
                 let account_id = required_test_str(recovery_key, "account_id")?;
                 let chain_namespace = required_test_str(recovery_key, "chain_namespace")?;
                 let address = required_test_str(recovery_key, "address")?;
-                let proof_type = if chain_namespace
-                    == "bip122:000000000019d6689c085ae165831e93"
-                {
+                let proof_type = if chain_namespace == "bip122:000000000019d6689c085ae165831e93" {
                     "managed_btc_p2wpkh"
                 } else {
                     "managed_evm"
@@ -2011,8 +3306,10 @@ impl Provider for MockWalletProvider {
                         "message": "wallet approval request is not a transaction"
                     }));
                 }
-                let mut signed_result =
-                    approval.get("signed_result").cloned().unwrap_or_else(|| json!({}));
+                let mut signed_result = approval
+                    .get("signed_result")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 signed_result["transaction_hash"] = json!(transaction_hash);
                 signed_result["broadcast_recorded_at"] = json!(crate::auth::now_ts());
                 approval["signed_result"] = signed_result;
