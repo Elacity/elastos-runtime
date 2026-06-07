@@ -2376,8 +2376,12 @@ assert(
     archiveManager.includes("Extract selected") &&
     archiveManager.includes("Extract all") &&
     archiveManager.includes("Select visible") &&
-    archiveManager.includes("Safety details") &&
-    archiveManager.includes("Runtime and Library services") &&
+    archiveManager.includes("Open archive") &&
+    archiveManager.includes("New ZIP") &&
+    archiveManager.includes("Archive files load when this format is supported.") &&
+    archiveManager.includes("Select files to extract.") &&
+    !archiveManager.includes("Safety details") &&
+    !archiveManager.includes("Technical details") &&
     !archiveManager.includes("Cancel pending") &&
     !archiveManager.includes("Runtime Boundary") &&
     archiveManager.includes("handleEntryKeyboard") &&
@@ -2386,7 +2390,7 @@ assert(
     archiveManager.includes("async function extractAllEntries()") &&
     archiveManager.includes("async function selectPreviewEntry(path)") &&
     archiveManager.includes("renderEntries()") &&
-    archiveManager.includes("Format needs review") &&
+    archiveManager.includes("This archive format needs review before extraction.") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_ENTRIES_SCHEMA") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_EXTRACT_ENTRIES_SCHEMA") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_PREVIEW_ENTRY_SCHEMA") &&

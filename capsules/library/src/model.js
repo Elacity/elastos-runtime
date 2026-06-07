@@ -43,7 +43,16 @@ export function isDirectory(object) {
 }
 
 export function inTrash(object) {
-  return object && object.uri.includes("/.Trash");
+  return isTrashUri(object?.uri);
+}
+
+export function isTrashUri(uri) {
+  const value = String(uri || "");
+  return value.includes("/.Trash/");
+}
+
+export function isTrashRootUri(uri) {
+  return String(uri || "").endsWith("/.Trash");
 }
 
 export function isBlockedObject(object) {
@@ -62,6 +71,31 @@ export function isWebSpaceUri(uri) {
 
 export function viewerOptions(object) {
   return Array.isArray(object && object.viewers) ? object.viewers : [];
+}
+
+export function isArchiveObject(object) {
+  if (!object || isDirectory(object)) return false;
+  const capabilities = Array.isArray(object.capabilities) ? object.capabilities : [];
+  const archiveSupport = object.metadata?.archive_support;
+  const name = String(object.name || object.uri || "").toLowerCase();
+  const mime = String(object.mime || "").toLowerCase();
+  return viewerOptions(object).some((viewer) => viewer?.id === "archive-manager") ||
+    !!archiveSupport ||
+    capabilities.includes("extract_archive") ||
+    isArchiveName(name) ||
+    ["application/zip", "application/x-tar", "application/gzip", "application/x-7z-compressed"].includes(mime);
+}
+
+export function archiveLibraryObjectPayload(object) {
+  const payload = {
+    uri: object?.uri || "",
+    name: object?.name || "",
+    mime: object?.mime || "application/octet-stream",
+  };
+  const localCid = contentCid(object);
+  if (localCid) payload.contentCid = localCid;
+  if (object?.metadata?.archive_support) payload.archiveSupport = object.metadata.archive_support;
+  return payload;
 }
 
 export function contentCid(object) {

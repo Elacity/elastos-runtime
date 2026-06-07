@@ -1,12 +1,16 @@
 import {
+  archiveLibraryObjectPayload,
   baseName,
   canPreviewObject,
   childUri,
   contentCid,
   hasCapability,
   inTrash,
+  isArchiveObject,
   isBlockedObject,
   isDirectory,
+  isTrashRootUri,
+  isTrashUri,
   isWebSpaceUri,
   parentUri,
   publishedCid,
@@ -21,6 +25,7 @@ export function createLibraryActions({
   deliverToTarget,
   downloadObjectRaw,
   loadCurrentFolder,
+  loadRoots,
   navigate,
   openPublishedUri,
   openTarget,
@@ -53,6 +58,13 @@ export function createLibraryActions({
     }
     if (isAttachMode()) {
       await attachObject(object);
+      return;
+    }
+    if (isArchiveOpenMode()) {
+      deliverArchiveObject(object);
+      return;
+    }
+    if (isArchiveObject(object) && openWithViewer(object, "archive-manager")) {
       return;
     }
     const viewer = viewerOptions(object)[0];
@@ -106,6 +118,27 @@ export function createLibraryActions({
       return;
     }
     setStatus("Open Chat Room from Home.");
+  }
+
+  function deliverArchiveObject(object) {
+    if (!isArchiveObject(object)) {
+      setStatus("Select a ZIP, tar, tar.gz, or tgz archive.");
+      return false;
+    }
+    const payload = {
+      type: "archive:open-library-object",
+      object: archiveLibraryObjectPayload(object),
+    };
+    if (deliverToTarget("archive-manager", payload)) {
+      setStatus("Opening in Archive.");
+      window.setTimeout(closeSelf, 80);
+      return true;
+    }
+    if (openWithViewer(object, "archive-manager")) {
+      return true;
+    }
+    setStatus("Open Archive from Home, then choose this archive again.");
+    return false;
   }
 
   async function createFolder() {
@@ -320,14 +353,15 @@ export function createLibraryActions({
   async function trashObject(object) {
     await providerApi("trash", { uri: object.uri, if_revision: object.revision });
     setStatus(`Moved ${object.name} to Trash.`);
+    await loadRoots?.();
     await loadCurrentFolder();
   }
 
   async function restoreObject(object) {
     const name = object.name || baseName(object.uri);
-    const target = childUri(parentUri(parentUri(object.uri)), name);
-    await providerApi("restore", { uri: object.uri, target_uri: target, if_revision: object.revision });
+    await providerApi("restore", { uri: object.uri, if_revision: object.revision });
     setStatus(`Restored ${name}.`);
+    await loadRoots?.();
     await loadCurrentFolder();
   }
 
@@ -343,6 +377,7 @@ export function createLibraryActions({
     if (!confirmed) return;
     await providerApi("delete_permanently", { uri: object.uri, if_revision: object.revision });
     setStatus(`Deleted ${object.name}.`);
+    await loadRoots?.();
     await loadCurrentFolder();
   }
 
@@ -380,6 +415,7 @@ export function createLibraryActions({
       uri: object.uri,
       if_revision: object.revision,
     }));
+    await loadRoots?.();
   }
 
   function setClipboard(op, objects) {
@@ -398,6 +434,8 @@ export function createLibraryActions({
       targetParentUri &&
       !isWebSpaceUri(targetParentUri) &&
       state.clipboard.uris.length &&
+      !isTrashRootUri(targetParentUri) &&
+      !isTrashUri(targetParentUri) &&
       (state.clipboard.op === "copy" || state.clipboard.op === "move")
     );
   }
@@ -423,7 +461,7 @@ export function createLibraryActions({
   }
 
   async function transferSelectedObjectsTo(targetParentUri, op) {
-    if (!targetParentUri || isWebSpaceUri(targetParentUri)) return;
+    if (!targetParentUri || isWebSpaceUri(targetParentUri) || isTrashRootUri(targetParentUri) || isTrashUri(targetParentUri)) return;
     const capability = op === "move" ? "move" : "copy";
     const objects = selectedObjects().filter((object) => (
       object &&
@@ -470,14 +508,11 @@ export function createLibraryActions({
 
   async function restoreSelectedObjects() {
     const objects = selectedObjects().filter(inTrash);
-    await runBatchAction("Restored", objects, (object) => {
-      const name = object.name || baseName(object.uri);
-      return providerApi("restore", {
-        uri: object.uri,
-        target_uri: childUri(parentUri(parentUri(object.uri)), name),
-        if_revision: object.revision,
-      });
-    });
+    await runBatchAction("Restored", objects, (object) => providerApi("restore", {
+      uri: object.uri,
+      if_revision: object.revision,
+    }));
+    await loadRoots?.();
   }
 
   async function deleteSelectedObjects() {
@@ -498,6 +533,21 @@ export function createLibraryActions({
       uri: object.uri,
       if_revision: object.revision,
     }));
+    await loadRoots?.();
+  }
+
+  async function emptyTrash() {
+    const confirmed = await confirmDestructive({
+      title: "Empty Trash?",
+      message: "Every object in Trash will be permanently deleted. This cannot be restored.",
+      confirmLabel: "Empty Trash",
+    });
+    if (!confirmed) return;
+    const result = await providerApi("empty_trash", {});
+    const count = Number(result?.deleted_count || 0);
+    setStatus(`Emptied Trash${count ? ` (${count} object${count === 1 ? "" : "s"})` : ""}.`);
+    await loadRoots?.();
+    await loadCurrentFolder();
   }
 
   async function copyText(value, label) {
@@ -507,6 +557,10 @@ export function createLibraryActions({
 
   function isAttachMode() {
     return state.mode === "attach" && state.returnTarget === "chat-room";
+  }
+
+  function isArchiveOpenMode() {
+    return state.mode === "archive-open" && state.returnTarget === "archive-manager";
   }
 
   function principalIdFromHomeToken(token) {
@@ -541,6 +595,7 @@ export function createLibraryActions({
     downloadObjectAsZip,
     downloadSelectedObjects,
     downloadSelectedObjectsAsZip,
+    emptyTrash,
     extractArchiveObject,
     moveSelectedObjectsTo,
     openObject,
