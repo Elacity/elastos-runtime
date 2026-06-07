@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" height="48" width="48" viewBox="0 0 48 48">
+    <title>file text</title>
+    <g class="nc-icon-wrapper">
+        <path d="M41,47H7a2,2,0,0,1-2-2V3A2,2,0,0,1,7,1H31L43,13V45A2,2,0,0,1,41,47Z" fill="#f3f3f3"></path>
+        <path d="M31,1V11a2,2,0,0,0,2,2H43Z" fill="#aeaeae"></path>
+        <path d="M34,35H14a1,1,0,0,0,0,2H34a1,1,0,0,0,0-2Z" fill="#aeaeae"></path>
+        <path d="M34,25H14a1,1,0,0,0,0,2H34a1,1,0,0,0,0-2Z" fill="#aeaeae"></path>
+        <path d="M22,15H14a1,1,0,0,0,0,2h8a1,1,0,0,0,0-2Z" fill="#aeaeae"></path>
+    </g>
+</svg>

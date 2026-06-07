@@ -2,11 +2,14 @@
   "schema": "elastos.capsule/v1",
   "name": "library",
   "version": "0.1.0",
-  "description": "Browse documents",
+  "description": "File manager for local files, folders, and published objects through the Runtime object provider",
   "role": "app",
   "type": "data",
   "author": "elastos",
   "entrypoint": "index.html",
+  "requires": [
+    { "name": "object-provider", "kind": "capsule" }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

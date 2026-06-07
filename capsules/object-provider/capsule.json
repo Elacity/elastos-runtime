@@ -1,0 +1,28 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "object-provider",
+  "version": "0.1.0",
+  "description": "Principal-root object authority for Library",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://object/*",
+  "authority": {
+    "reason": "Owns principal-root object reads, writes, moves, metadata, and events without exposing raw host filesystem access to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://object/*",
+        "actions": ["read", "write", "delete"],
+        "operations": ["roots", "list", "stat", "read", "download", "write", "mkdir", "rename", "move", "copy", "trash", "restore", "delete_permanently", "status", "events", "publish", "unpublish", "repair", "share"]
+      }
+    ],
+    "audit_events": ["object.provider.requested", "object.provider.completed", "object.provider.failed"]
+  },
+  "capabilities": ["localhost://Users/*"],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}
