@@ -69,6 +69,7 @@ SUPPORT_BINARY_ASSETS=(
     browser-stream-bridge
     browser-local-exit
     webspace-provider
+    object-provider
     chain-provider
     wallet-provider
     drm-provider
@@ -505,7 +506,7 @@ build_packaged_capsule_archive() {
     [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
 
     case "$capsule_name" in
-        documents|library|inbox)
+        documents|library|marketplace|inbox)
             required_files=(capsule.json index.html)
             ;;
         chat-wasm)
@@ -713,7 +714,7 @@ build_platform_independent_direct_assets() {
     mkdir -p "$stage_dir"
     updates_json='{}'
 
-    for capsule in documents library inbox chat-wasm gba-emulator gba-ucity; do
+    for capsule in documents library marketplace inbox chat-wasm gba-emulator gba-ucity; do
         archive=$(build_packaged_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"

@@ -11,6 +11,7 @@ SOURCE_HOME_DIR="$ROOT/capsules/home"
 SOURCE_SYSTEM_DIR="$ROOT/capsules/system"
 SOURCE_DOCUMENTS_DIR="$ROOT/capsules/documents"
 SOURCE_LIBRARY_DIR="$ROOT/capsules/library"
+SOURCE_MARKETPLACE_DIR="$ROOT/capsules/marketplace"
 SOURCE_INBOX_DIR="$ROOT/capsules/inbox"
 SOURCE_COMPONENTS_MANIFEST="$ROOT/components.json"
 SOURCE_RUNTIME_HOME="${HOME_DIR}/source-runtime"
@@ -115,6 +116,7 @@ cargo build --manifest-path "$ROOT/elastos/capsules/shell/Cargo.toml" --release 
 cargo build --manifest-path "$ROOT/elastos/capsules/localhost-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/did-provider/Cargo.toml" --release >/dev/null
 cargo build --manifest-path "$ROOT/capsules/webspace-provider/Cargo.toml" --release >/dev/null
+cargo build --manifest-path "$ROOT/capsules/object-provider/Cargo.toml" --release >/dev/null
 
 echo "[home-frontdoor] build Home CLI wasm"
 cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
@@ -130,7 +132,7 @@ SETUP_PLATFORM="$(host_platform)"
 mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
 install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
 
-COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" python3 - <<'PY2'
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" python3 - <<'PY2'
 import hashlib
 import json
 import os
@@ -159,6 +161,7 @@ mapping = {
     "localhost-provider": pathlib.Path(os.environ["LOCALHOST_PROVIDER_BIN"]),
     "did-provider": pathlib.Path(os.environ["DID_PROVIDER_BIN"]),
     "webspace-provider": pathlib.Path(os.environ["WEBSPACE_PROVIDER_BIN"]),
+    "object-provider": pathlib.Path(os.environ["OBJECT_PROVIDER_BIN"]),
 }
 
 for name, src in mapping.items():
@@ -214,6 +217,7 @@ for name, capsule_dir in browser_capsules.items():
 data_capsules = {
     "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
     "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
     "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
 }
 for name, capsule_dir in data_capsules.items():
@@ -224,7 +228,10 @@ for name, capsule_dir in data_capsules.items():
     archive = artifacts_dir / release_path
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        tar.add(capsule_dir / "index.html", arcname=f"{name}/index.html")
+        for asset in sorted(capsule_dir.rglob("*")):
+            if not asset.is_file() or asset.name == "capsule.json":
+                continue
+            tar.add(asset, arcname=f"{name}/{asset.relative_to(capsule_dir)}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -285,8 +292,15 @@ for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/system.wasm" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/bin/object-provider" \
     "$HOME_DIR/xdg-data/elastos/capsules/documents/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/library/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/library.css" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/src/app.js" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/icons/folder.svg" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/marketplace.css" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/marketplace.js" \
     "$HOME_DIR/xdg-data/elastos/capsules/inbox/index.html"
 do
     if [[ ! -f "$installed" ]]; then

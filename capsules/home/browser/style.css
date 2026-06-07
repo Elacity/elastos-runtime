@@ -592,6 +592,12 @@ body[data-home-authority="signed"] .sign-out-btn {
   background: linear-gradient(180deg, #edf5ff 0%, #74c3ff 52%, #0e76c6 100%);
 }
 
+.app-glyph[data-tone="market"],
+.taskbar-item-icon[data-tone="market"],
+.window-head-icon[data-tone="market"] {
+  background: linear-gradient(180deg, #e8fff5 0%, #60d8a4 55%, #0b8a62 100%);
+}
+
 .app-glyph[data-tone="games"],
 .taskbar-item-icon[data-tone="games"],
 .window-head-icon[data-tone="games"] {

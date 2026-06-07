@@ -40,6 +40,10 @@ pub struct Component {
     pub version: Option<String>,
     #[serde(default)]
     pub install_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default)]
     pub size_mb: Option<u64>,
     #[serde(default)]
@@ -55,6 +59,10 @@ pub struct CapsuleEntry {
     pub sha256: String,
     #[serde(default)]
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default)]
     pub platforms: Vec<String>,
 }
@@ -1903,6 +1911,8 @@ mod tests {
         let comp = Component {
             version: None,
             install_path: Some("bin/test".to_string()),
+            repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms: HashMap::new(),
@@ -1952,6 +1962,8 @@ mod tests {
         let comp = Component {
             version: Some("0.20.0-rc30".to_string()),
             install_path: Some("bin/site-provider".to_string()),
+            repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -1997,6 +2009,8 @@ mod tests {
         let component = Component {
             version: Some("0.1.0".to_string()),
             install_path: Some("capsules/home-cli".to_string()),
+            repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -2297,6 +2311,8 @@ mod tests {
         let comp = Component {
             version: None,
             install_path: Some("bin/vmlinux".to_string()),
+            repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,

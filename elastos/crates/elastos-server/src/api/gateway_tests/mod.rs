@@ -273,6 +273,7 @@ mod documents;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod home_system;
+mod marketplace;
 mod recovery;
 mod room;
 mod site_publication;

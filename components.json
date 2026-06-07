@@ -523,6 +523,27 @@
         }
       }
     },
+    "object-provider": {
+      "install_path": "bin/object-provider",
+      "source_path": "capsules/object-provider",
+      "description": "Principal-root object provider binary required for Library file and folder authority",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "object-provider-linux-amd64",
+          "install_path": "bin/object-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "object-provider-linux-arm64",
+          "install_path": "bin/object-provider"
+        }
+      }
+    },
     "home-cli": {
       "install_path": "capsules/home-cli",
       "description": "First-party Home CLI capsule required for the default elastos surface",
@@ -765,6 +786,20 @@
         }
       }
     },
+    "marketplace": {
+      "install_path": "capsules/marketplace",
+      "description": "Marketplace for browsing installed apps, viewers, providers, and content",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "marketplace.tar.gz",
+          "extract_path": "marketplace",
+          "install_path": "capsules/marketplace"
+        }
+      }
+    },
     "inbox": {
       "install_path": "capsules/inbox",
       "description": "Inbox capsule for reviewing Home requests",
@@ -956,6 +991,7 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
+        "object-provider",
         "home-cli",
         "home",
         "system",
@@ -965,6 +1001,7 @@
         "browser",
         "documents",
         "library",
+        "marketplace",
         "inbox"
       ]
     },
@@ -982,6 +1019,7 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
+        "object-provider",
         "home-cli",
         "home",
         "system",
@@ -1001,6 +1039,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox"
       ]
     },
@@ -1051,6 +1090,7 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "webspace-provider",
+        "object-provider",
         "home-cli",
         "home",
         "system",
@@ -1062,6 +1102,7 @@
         "ipfs-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "llama-server",
         "model-qwen3.5-0.8b"
@@ -1083,6 +1124,7 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
+        "object-provider",
         "home-cli",
         "home",
         "system",
@@ -1097,6 +1139,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "cloudflared"
       ]
@@ -1121,6 +1164,7 @@
         "rights-provider",
         "key-provider",
         "decrypt-provider",
+        "object-provider",
         "home-cli",
         "home",
         "system",
@@ -1139,6 +1183,7 @@
         "tunnel-provider",
         "documents",
         "library",
+        "marketplace",
         "inbox",
         "crosvm",
         "vmlinux",

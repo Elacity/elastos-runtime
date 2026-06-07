@@ -43,6 +43,8 @@ use url::form_urlencoded;
 
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
+#[path = "gateway_capsule_catalog.rs"]
+mod gateway_capsule_catalog;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -51,6 +53,8 @@ mod gateway_home_system;
 mod gateway_home_token;
 #[path = "gateway_inbox.rs"]
 mod gateway_inbox;
+#[path = "gateway_marketplace.rs"]
+mod gateway_marketplace;
 #[path = "gateway_provider_proxy.rs"]
 mod gateway_provider_proxy;
 #[path = "gateway_room.rs"]
@@ -63,6 +67,7 @@ mod gateway_site;
 mod gateway_wallet;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
+use gateway_capsule_catalog::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
@@ -81,6 +86,7 @@ use gateway_home_token::{
     issue_home_launch_token, local_home_launch_token_context, uuid_like_token,
 };
 use gateway_inbox::*;
+use gateway_marketplace::*;
 use gateway_provider_proxy::*;
 use gateway_room::*;
 pub(crate) use gateway_room::{
@@ -129,6 +135,7 @@ const HOME_BROWSER_STATE_SCHEMA: &str = "elastos.home.browser-state/v1";
 const HOME_BROWSER_STATE_MAX_BYTES: usize = 64 * 1024;
 const DOCUMENTS_CAPSULE_ID: &str = "documents";
 const LIBRARY_CAPSULE_ID: &str = "library";
+const MARKETPLACE_CAPSULE_ID: &str = "marketplace";
 const INBOX_CAPSULE_ID: &str = "inbox";
 const BROWSER_CAPSULE_ID: &str = "browser";
 pub(crate) const SYSTEM_CAPSULE_ID: &str = "system";
@@ -551,6 +558,8 @@ pub fn gateway_router(state: GatewayState) -> Router {
         )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
+        .route("/api/capsules/catalog", get(capsule_catalog))
+        .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
         .route("/api/apps/chat-room/summary", get(chat_room_summary))

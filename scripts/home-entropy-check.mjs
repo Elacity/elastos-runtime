@@ -602,6 +602,9 @@ const activeUiFiles = [
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
   "capsules/library/index.html",
+  "capsules/library/library.css",
+  "capsules/library/src/actions.js",
+  "capsules/library/src/api.js",
   "capsules/chat-room/browser/index.html",
   "capsules/chat-room/browser/style.css",
   "capsules/gba-emulator/index.html",
@@ -656,7 +659,6 @@ const lightTokenFiles = [
   "capsules/system/browser/style.css",
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
-  "capsules/library/index.html",
 ];
 
 const lightTokens = new Map([
@@ -682,6 +684,21 @@ for (const file of lightTokenFiles) {
   for (const [token, value] of lightTokens) {
     assertToken(source, file, token, value);
   }
+}
+
+const libraryStyle = read("capsules/library/library.css");
+for (const [token, value] of new Map([
+  ["--bg", "#f6f7f9"],
+  ["--sidebar-bg", "#f0f1f4"],
+  ["--panel", "#ffffff"],
+  ["--panel-soft", "#f3f4f6"],
+  ["--line", "rgba(60, 60, 67, 0.14)"],
+  ["--ink", "#1d1d1f"],
+  ["--muted", "#6b6b6b"],
+  ["--brand", "#f6921a"],
+  ["--accent", "#007aff"],
+])) {
+  assertToken(libraryStyle, "capsules/library/library.css", token, value);
 }
 
 const shellStyle = read("capsules/home/browser/style.css");
@@ -1886,6 +1903,7 @@ for (const component of [
   "browser-native-proxy-engine",
   "browser-stream-bridge",
   "browser-local-exit",
+  "object-provider",
 ]) {
   assert(homeProfile.has(component), `Home profile must install ${component}`);
   assert(
@@ -1906,7 +1924,14 @@ for (const component of [
     );
   }
 }
-for (const component of ["home", "system", "documents", "library", "inbox"]) {
+for (const component of [
+  "home",
+  "system",
+  "documents",
+  "library",
+  "marketplace",
+  "inbox",
+]) {
   assert(
     homeProfile.has(component),
     `Home profile must install first-party ${component} assets`,
@@ -1925,10 +1950,29 @@ for (const component of ["home", "system", "documents", "library", "inbox"]) {
     );
   }
 }
+assert(
+  read("capsules/marketplace/marketplace.js").includes(
+    'fetch("/api/capsules/catalog"',
+  ),
+  "Marketplace must read the canonical capsule catalog, not an app-scoped marketplace catalog",
+);
+assert(
+  read("elastos/crates/elastos-server/src/api/gateway_marketplace.rs").includes(
+    "capsule_catalog_summary",
+  ),
+  "Marketplace route must delegate to the canonical capsule catalog",
+);
 
 const documents = read("capsules/documents/index.html");
 const inbox = read("capsules/inbox/index.html");
-const library = read("capsules/library/index.html");
+const library = readAll([
+  "capsules/library/index.html",
+  "capsules/library/library.css",
+  "capsules/library/src/actions.js",
+  "capsules/library/src/api.js",
+  "capsules/library/src/selection.js",
+  "capsules/library/src/state.js",
+]);
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/index.html");
 const gbaStyle = read("capsules/gba-emulator/style.css");
@@ -2185,12 +2229,13 @@ assert(
   "Library must return selected documents using the Chat Room attach contract",
 );
 assert(
-  library.includes("Publish the document before attaching it."),
+  library.includes("Publish this object before attaching it."),
   "Library must fail clearly when a draft is selected for Chat Room attachment",
 );
 assert(
-  library.includes("data-attach-uri"),
-  "Library attach mode must expose published URI selection state",
+  library.includes('queryParams.get("mode") === "attach"') &&
+    library.includes("selectedUris"),
+  "Library attach mode must track selection state explicitly",
 );
 assert(
   !library.includes("entry-details"),
