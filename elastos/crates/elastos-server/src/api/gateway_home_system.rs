@@ -11,6 +11,7 @@ const HOME_EVENTS_POLL_MS: u64 = 1_000;
 const HOME_EVENTS_RETRY_MS: u64 = 250;
 const HOME_EVENTS_STREAM_KEEPALIVE_SECS: u64 = 15;
 const HOME_DESKTOP_OBJECTS_SCHEMA: &str = "elastos.home.desktop-objects/v1";
+const HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA: &str = "elastos.home.system-desktop-object/v1";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -588,11 +589,14 @@ async fn home_desktop_objects_summary(
         };
     }
     let data = response.get("data").and_then(serde_json::Value::as_object);
-    let objects = data
+    let mut objects = data
         .and_then(|data| data.get("objects"))
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if let Some(trash) = home_trash_desktop_object(state, context).await {
+        objects.push(trash);
+    }
     let uri = data
         .and_then(|data| data.get("uri"))
         .and_then(serde_json::Value::as_str)
@@ -612,6 +616,58 @@ async fn home_desktop_objects_summary(
     }
 }
 
+async fn home_trash_desktop_object(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+) -> Option<serde_json::Value> {
+    let registry = state.provider_registry.as_ref()?;
+    let request = serde_json::json!({
+        "op": "roots",
+        "principal_id": &context.principal_id,
+    });
+    let response = registry.send_raw("object", &request).await.ok()?;
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return None;
+    }
+    let roots = response
+        .get("data")
+        .and_then(|data| data.get("roots"))
+        .and_then(serde_json::Value::as_array)?;
+    let trash = roots
+        .iter()
+        .find(|root| root.get("id").and_then(serde_json::Value::as_str) == Some("trash"))?;
+    let uri = trash
+        .get("uri")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())?;
+    let metadata = trash.get("metadata").and_then(serde_json::Value::as_object);
+    let empty = metadata
+        .and_then(|metadata| metadata.get("empty"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let item_count = metadata
+        .and_then(|metadata| metadata.get("item_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(serde_json::json!({
+        "uri": uri,
+        "name": "Trash",
+        "kind": "directory",
+        "mime": "inode/directory",
+        "capabilities": trash
+            .get("capabilities")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(["open", "list", "properties"])),
+        "metadata": {
+            "schema": HOME_SYSTEM_DESKTOP_OBJECT_SCHEMA,
+            "system_kind": "trash",
+            "empty": empty,
+            "item_count": item_count,
+            "provider_root": trash,
+        },
+    }))
+}
+
 async fn home_desktop_events_signature(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
@@ -619,42 +675,45 @@ async fn home_desktop_events_signature(
     let Some(registry) = state.provider_registry.as_ref() else {
         return Vec::new();
     };
-    let request = serde_json::json!({
-        "op": "events",
-        "principal_id": &context.principal_id,
-        "uri": home_desktop_uri(context),
-        "limit": 32,
-    });
-    let Ok(response) = registry.send_raw("object", &request).await else {
-        return Vec::new();
-    };
-    let mut signature = response
-        .get("data")
-        .and_then(|data| data.get("events"))
-        .and_then(serde_json::Value::as_array)
-        .map(|events| {
-            events
-                .iter()
-                .map(|event| {
-                    format!(
-                        "{}:{}:{}",
-                        event
-                            .get("event_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default(),
-                        event
-                            .get("op")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default(),
-                        event
-                            .get("at")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut signature = Vec::new();
+    for uri in [
+        home_desktop_uri(context),
+        format!("{}/.Trash", home_browser_localhost_root(context)),
+    ] {
+        let request = serde_json::json!({
+            "op": "events",
+            "principal_id": &context.principal_id,
+            "uri": uri,
+            "limit": 32,
+        });
+        let Ok(response) = registry.send_raw("object", &request).await else {
+            continue;
+        };
+        let Some(events) = response
+            .get("data")
+            .and_then(|data| data.get("events"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        signature.extend(events.iter().map(|event| {
+            format!(
+                "{}:{}:{}",
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                event
+                    .get("op")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                event
+                    .get("at")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default()
+            )
+        }));
+    }
     signature.sort();
     signature
 }
@@ -808,10 +867,11 @@ fn sanitize_home_browser_state_targets(
     state
         .recent_targets
         .retain(|target| known_targets.contains(target));
+    let localhost_root = state.localhost_root.clone();
     state.layout = state
         .layout
         .take()
-        .and_then(|layout| sanitize_home_layout_targets(layout, &known_targets));
+        .and_then(|layout| sanitize_home_layout_targets(layout, &known_targets, &localhost_root));
     state.session = state
         .session
         .take()
@@ -821,13 +881,17 @@ fn sanitize_home_browser_state_targets(
 fn sanitize_home_layout_targets(
     mut layout: serde_json::Value,
     known_targets: &BTreeSet<String>,
+    localhost_root: &str,
 ) -> Option<serde_json::Value> {
     let layout_object = layout.as_object_mut()?;
     if let Some(desktop) = layout_object
         .get_mut("desktop")
         .and_then(|value| value.as_object_mut())
     {
-        desktop.retain(|target, _position| known_targets.contains(target));
+        desktop.retain(|entry, _position| {
+            known_targets.contains(entry)
+                || is_home_desktop_object_layout_entry(localhost_root, entry)
+        });
     }
     if let Some(labels) = layout_object
         .get_mut("desktopLabels")
@@ -842,6 +906,20 @@ fn sanitize_home_layout_targets(
         *taskbar = sanitize_home_target_array(taskbar.take(), known_targets);
     }
     Some(layout)
+}
+
+fn is_home_desktop_object_layout_entry(localhost_root: &str, entry: &str) -> bool {
+    let Some(uri) = entry.strip_prefix("object:") else {
+        return false;
+    };
+    if uri.len() > 2048 || uri.contains('\0') {
+        return false;
+    }
+    let root = localhost_root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    uri == format!("{root}/.Trash") || uri.starts_with(&format!("{root}/Desktop/"))
 }
 
 fn sanitize_home_session_targets(
