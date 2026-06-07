@@ -178,7 +178,7 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 ### Documents and Library
 - [ ] Add import/fork flows for immutable `elastos://<cid>` document revisions through the same provider contract.
-- [ ] Future generic archive dependency approval: only after a format-specific review passes, enable an extra non-tar/non-zip family through the existing provider-owned archive list/preview/selective-extract/WebSpace policy contract. Current branch support for ZIP/tar/tar.gz/tgz browsing, preview, selected import/extract, WebSpace archive policy, and Archive Manager UX is complete; unsupported generic families remain policy-gated by design.
+- [ ] Future generic archive dependency approval: only after a format-specific review passes, enable an extra non-tar/non-zip family through the existing provider-owned archive list/preview/selective-extract/WebSpace policy contract. Current branch support for ZIP/tar/tar.gz/tgz browsing, preview, selected import/extract, WebSpace archive policy, and Archive UX is complete; unsupported generic families remain policy-gated by design.
 - [ ] Unify the markdown packaging model so local documents, viewer/editor content, and `elastos share` do not keep using three different markdown stories.
 - [ ] Decide the first collaborative document core intentionally; prefer a Rust/WASM CRDT evaluation (`Yrs` first, `Automerge` second) over ad hoc editor glue or a direct port of external JS products.
 - [ ] Keep keystroke-level local editing local-first and low-latency; Carrier should carry remote sync/share/collaboration updates, not gate every same-runtime write.

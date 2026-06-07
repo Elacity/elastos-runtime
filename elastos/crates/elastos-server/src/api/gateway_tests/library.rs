@@ -1429,8 +1429,8 @@ async fn test_library_provider_marks_generic_archive_families_policy_gated() {
         dir.path(),
         "archive-manager",
         "viewer",
-        "Test Archive Manager viewer",
-        "<!doctype html><title>Archive Manager</title>",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
     );
     write_test_static_capsule(
         dir.path(),
@@ -2315,8 +2315,8 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
         dir.path(),
         "archive-manager",
         "viewer",
-        "Test Archive Manager viewer",
-        "<!doctype html><title>Archive Manager</title>",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
     );
     write_test_static_capsule(
         dir.path(),
@@ -2758,8 +2758,8 @@ async fn test_library_provider_selectively_extracts_archive_entries_through_view
         dir.path(),
         "archive-manager",
         "viewer",
-        "Test Archive Manager viewer",
-        "<!doctype html><title>Archive Manager</title>",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
     );
 
     let (mkdir_status, _) = post_library(
@@ -3330,8 +3330,8 @@ async fn test_library_gateway_lists_external_webspace_archive_entries_without_re
         dir.path(),
         "archive-manager",
         "viewer",
-        "Test Archive Manager viewer",
-        "<!doctype html><title>Archive Manager</title>",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
     );
 
     let uri = "localhost://WebSpaces/Operator/Projects/Bundle.zip";
@@ -3450,8 +3450,8 @@ async fn test_library_gateway_imports_external_webspace_archive_entries_to_local
         dir.path(),
         "archive-manager",
         "viewer",
-        "Test Archive Manager viewer",
-        "<!doctype html><title>Archive Manager</title>",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
     );
 
     let (mkdir_status, _) = post_library(

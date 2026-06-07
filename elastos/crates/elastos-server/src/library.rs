@@ -6514,7 +6514,7 @@ fn viewer_label(id: &str) -> &str {
         "image-viewer" => "Image Viewer",
         "video-viewer" => "Video Viewer",
         "gba-emulator" => "GBA Emulator",
-        "archive-manager" => "Archive Manager",
+        "archive-manager" => "Archive",
         _ => id,
     }
 }

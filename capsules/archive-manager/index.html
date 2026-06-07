@@ -3,22 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Archive Manager - ElastOS</title>
+  <title>Archive - ElastOS</title>
   <style>
     :root {
-      --bg: #f4efe5;
-      --panel: #fffdf7;
-      --panel-strong: #fff8e8;
-      --ink: #262118;
-      --muted: #746a5d;
-      --line: rgba(80, 61, 31, 0.16);
-      --accent: #b85f19;
-      --accent-soft: #f8dfbd;
-      --safe: #2f7651;
-      --warn: #a45516;
-      --shadow: 0 24px 60px rgba(84, 59, 24, 0.14);
       color-scheme: light;
-      font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f3f4f6;
+      --line: rgba(60, 60, 67, 0.14);
+      --line-strong: rgba(60, 60, 67, 0.26);
+      --ink: #1d1d1f;
+      --muted: #6b6b6b;
+      --accent: #007aff;
+      --accent-soft: rgba(0, 122, 255, 0.11);
+      --brand: #f6921a;
+      --good: #2f8f68;
+      --warn: #b57918;
+      --danger: #b14c5a;
+      --mono: "SFMono-Regular", "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+      --archive-list-columns: 30px minmax(280px, 1fr) 92px 150px 82px;
+      font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
     }
 
     * {
@@ -26,435 +30,702 @@
     }
 
     body {
+      margin: 0;
       min-height: 100vh;
       min-height: 100dvh;
-      margin: 0;
       color: var(--ink);
-      background:
-        radial-gradient(circle at 20% 10%, rgba(184, 95, 25, 0.16), transparent 28%),
-        radial-gradient(circle at 82% 18%, rgba(93, 125, 92, 0.13), transparent 30%),
-        linear-gradient(135deg, #fbf7ec 0%, var(--bg) 100%);
+      background: var(--bg);
     }
 
-    main {
-      width: min(980px, calc(100vw - 28px));
-      min-height: calc(100vh - 28px);
-      min-height: calc(100dvh - 28px);
-      margin: 14px auto;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 290px;
-      gap: 14px;
+    button,
+    input,
+    select {
+      font: inherit;
     }
 
-    .panel,
-    .side {
-      background: color-mix(in srgb, var(--panel) 92%, transparent);
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
+    button {
+      color: inherit;
     }
 
-    .hero {
-      padding: 24px;
-      background:
-        linear-gradient(135deg, rgba(184, 95, 25, 0.13), transparent 42%),
-        var(--panel);
-      border-bottom: 1px solid var(--line);
-    }
-
-    .eyebrow {
-      margin: 0 0 8px;
-      color: var(--accent);
-      font-size: 0.74rem;
-      font-weight: 800;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }
-
-    h1 {
+    h1,
+    h2,
+    h3,
+    p {
       margin: 0;
-      font-size: clamp(2rem, 4vw, 3.3rem);
-      line-height: 0.95;
-      letter-spacing: -0.055em;
     }
 
-    .subtitle {
-      max-width: 660px;
-      margin: 12px 0 0;
-      color: var(--muted);
-      line-height: 1.55;
+    [hidden] {
+      display: none !important;
     }
 
-    .content {
-      padding: 18px;
+    .empty-state {
+      min-height: 100vh;
+      min-height: 100dvh;
       display: grid;
+      place-items: center;
+      padding: 28px;
+      background: var(--panel);
+    }
+
+    .empty-card {
+      width: min(460px, 100%);
+      display: grid;
+      justify-items: center;
       gap: 14px;
-    }
-
-    .card {
-      padding: 16px;
-      background: var(--panel-strong);
+      padding: 28px;
       border: 1px solid var(--line);
-      border-radius: 18px;
+      border-radius: 10px;
+      background: #fff;
+      text-align: center;
     }
 
-    .card h2,
-    .side h2 {
-      margin: 0 0 12px;
-      font-size: 1rem;
-      letter-spacing: -0.01em;
+    .archive-mark {
+      width: 52px;
+      height: 52px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(180deg, #fff, #edf0f4);
+      color: var(--brand);
+      font-size: 1.45rem;
+      font-weight: 800;
     }
 
-    .section-heading {
+    .empty-card h1 {
+      font-size: 1.55rem;
+      letter-spacing: -0.04em;
+    }
+
+    .empty-card p,
+    .muted {
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .shell {
+      height: 100vh;
+      height: 100dvh;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+      background: var(--panel);
+    }
+
+    .topbar {
+      min-height: 54px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 12px;
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fafafa;
     }
 
-    .section-heading h2 {
-      margin: 0;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
-    }
-
-    .field {
+    .title-group,
+    .top-actions {
       min-width: 0;
-      padding: 10px 12px;
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-    }
-
-    .label {
-      display: block;
-      margin-bottom: 4px;
-      color: var(--muted);
-      font-size: 0.74rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .value {
-      overflow-wrap: anywhere;
-      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
-      font-size: 0.88rem;
-    }
-
-    .pill {
-      display: inline-flex;
+      display: flex;
       align-items: center;
       gap: 8px;
-      width: fit-content;
-      padding: 8px 10px;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      color: #5a310f;
+    }
+
+    .title-group {
+      flex: 1 1 auto;
+    }
+
+    .top-actions {
+      justify-content: flex-end;
+      flex: 0 1 auto;
+    }
+
+    .small-mark {
+      width: 31px;
+      height: 31px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: linear-gradient(180deg, #fff, #edf0f4);
+      color: var(--brand);
       font-weight: 800;
-      font-size: 0.82rem;
+      user-select: none;
     }
 
-    .pill.safe {
-      background: #d9efdf;
-      color: var(--safe);
+    .eyebrow {
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      line-height: 1.1;
+      text-transform: uppercase;
     }
 
-    .pill.blocked {
-      background: #f5d8c0;
+    h1 {
+      max-width: min(55vw, 720px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 1.34rem;
+      letter-spacing: -0.04em;
+      line-height: 1.2;
+    }
+
+    h2 {
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+    }
+
+    h3 {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .search,
+    .destination-input,
+    .select {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      padding: 7px 9px;
+      color: var(--ink);
+      outline: none;
+      font-size: 0.84rem;
+    }
+
+    .search {
+      width: 230px;
+    }
+
+    .search:focus,
+    .destination-input:focus,
+    .select:focus {
+      border-color: rgba(0, 122, 255, 0.45);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.11);
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.88);
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 0.84rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .btn:hover:not(:disabled) {
+      border-color: var(--line-strong);
+      background: #fff;
+    }
+
+    .btn-primary {
+      border-color: transparent;
+      background: var(--ink);
+      color: #f8fbff;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #333438;
+    }
+
+    .btn:disabled {
+      cursor: default;
+      opacity: 0.48;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 25px;
+      max-width: 190px;
+      padding: 3px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status-chip.safe {
+      border-color: rgba(47, 143, 104, 0.22);
+      background: rgba(47, 143, 104, 0.12);
+      color: var(--good);
+    }
+
+    .status-chip.blocked {
+      border-color: rgba(181, 121, 24, 0.24);
+      background: rgba(181, 121, 24, 0.14);
       color: var(--warn);
     }
 
-    .toolbar {
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 340px;
+      overflow: hidden;
+    }
+
+    .list-panel {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      border-right: 0.5px solid #ccc;
+    }
+
+    .list-toolbar {
+      min-height: 44px;
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 10px;
-    }
-
-    .toolbar input,
-    .toolbar select {
-      width: 100%;
-      padding: 10px 12px;
-      color: var(--ink);
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
       background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      font: inherit;
     }
 
-    .toolbar select {
-      width: min(190px, 100%);
+    .list-title {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
     }
 
-    .toolbar button {
-      padding: 10px 14px;
-      color: #fff;
-      background: var(--accent);
-      border: 0;
-      border-radius: 12px;
-      font: inherit;
-      font-weight: 800;
-      cursor: pointer;
+    .list-title strong {
+      font-size: 0.92rem;
     }
 
-    .toolbar button.secondary {
-      color: var(--ink);
+    .list-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .content-pane {
+      min-height: 0;
+      overflow: auto;
       background: #fff;
-      border: 1px solid var(--line);
     }
 
-    .toolbar button.warn {
-      color: #6d2d0f;
-      background: #ffe2cc;
-      border: 1px solid rgba(164, 85, 22, 0.24);
+    .entry-head,
+    .entry-row {
+      display: grid;
+      grid-template-columns: var(--archive-list-columns);
+      align-items: center;
+      min-width: 760px;
     }
 
-    .toolbar button:disabled {
-      cursor: not-allowed;
-      opacity: 0.55;
+    .entry-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      height: 30px;
+      border-bottom: 1px solid var(--line);
+      background: #f8f8f9;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
     }
 
-    .destination-input {
-      flex: 1 1 360px;
-    }
-
-    .search-input {
-      flex: 1 1 220px;
+    .entry-head span,
+    .entry-row > * {
+      min-width: 0;
+      padding: 0 9px;
     }
 
     .entry-list {
-      overflow: hidden;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: #fff;
+      min-width: 760px;
     }
 
     .entry-row {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto;
-      gap: 10px;
-      padding: 11px 12px;
-      border-top: 1px solid var(--line);
+      min-height: 39px;
+      border-bottom: 1px solid rgba(60, 60, 67, 0.08);
+      background: transparent;
+      cursor: default;
+      user-select: none;
     }
 
-    .entry-row input {
-      margin-top: 3px;
-    }
-
-    .entry-row:first-child {
-      border-top: 0;
-    }
-
-    .entry-row.blocked {
-      background: #fff6ed;
-    }
-
-    .entry-row:focus {
-      outline: 3px solid rgba(184, 95, 25, 0.28);
-      outline-offset: -3px;
+    .entry-row:hover {
+      background: rgba(0, 0, 0, 0.035);
     }
 
     .entry-row.selected {
-      background: #fff1dc;
+      background: var(--accent-soft);
     }
 
-    .root-picker {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 8px 0 12px;
+    .entry-row.blocked {
+      color: var(--muted);
+      background: rgba(181, 121, 24, 0.08);
     }
 
-    .root-picker button {
-      padding: 7px 10px;
-      color: var(--ink);
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      font: inherit;
-      font-size: 0.82rem;
-      font-weight: 800;
-      cursor: pointer;
+    .entry-row:focus {
+      outline: 2px solid rgba(0, 122, 255, 0.28);
+      outline-offset: -2px;
     }
 
-    .preview {
-      display: grid;
-      gap: 8px;
-      padding: 12px;
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      min-height: 120px;
-    }
-
-    .preview pre {
-      max-height: 220px;
+    .entry-check {
+      width: 15px;
+      height: 15px;
       margin: 0;
-      overflow: auto;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
-      font-size: 0.82rem;
-      line-height: 1.45;
     }
 
-    .entry-path {
-      overflow-wrap: anywhere;
-      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    .entry-name {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      align-items: center;
+      gap: 7px;
+    }
+
+    .entry-icon {
+      width: 16px;
+      height: 16px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      background: linear-gradient(180deg, #fff, #eef1f5);
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-weight: 800;
+    }
+
+    .entry-title,
+    .entry-cell,
+    .value {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .entry-title {
       font-size: 0.88rem;
     }
 
-    .entry-meta {
-      margin-top: 4px;
+    .entry-cell {
       color: var(--muted);
-      font-size: 0.78rem;
+      font-size: 0.8rem;
+    }
+
+    .entry-row .status-chip {
+      justify-self: start;
+      min-height: 23px;
+      padding: 3px 8px;
     }
 
     .entry-empty {
       margin: 0;
-      padding: 12px;
+      min-width: 760px;
+      padding: 34px 24px;
       color: var(--muted);
       line-height: 1.45;
+      text-align: center;
+    }
+
+    .side-panel {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) auto;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .side-scroll {
+      min-height: 0;
+      display: grid;
+      align-content: start;
+      gap: 10px;
+      padding: 10px;
+      overflow: auto;
+    }
+
+    .card,
+    details {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      padding: 10px;
+    }
+
+    .card h2 {
+      margin-bottom: 8px;
+    }
+
+    .preview-empty {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+      border: 1px dashed var(--line-strong);
+      border-radius: 6px;
+      background: #fbfbfc;
+    }
+
+    .preview-body {
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+
+    .preview-body strong {
+      color: var(--ink);
+    }
+
+    .preview-body pre {
+      max-height: 260px;
+      margin: 8px 0 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      line-height: 1.45;
+    }
+
+    .extract-card {
+      display: grid;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      background: #fafafa;
+    }
+
+    .root-picker {
+      min-height: 28px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .root-picker button {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      padding: 4px 9px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .extract-controls {
+      display: grid;
+      gap: 7px;
+    }
+
+    .extract-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+
+    .details-grid {
+      display: grid;
+      gap: 8px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .value {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+
+    summary {
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 700;
     }
 
     ul {
       margin: 0;
-      padding-left: 1.2rem;
+      padding-left: 1.1rem;
       color: var(--muted);
-      line-height: 1.55;
-    }
-
-    .side {
-      padding: 18px;
-      align-self: start;
-      display: grid;
-      gap: 14px;
-      background: #fffaf0;
-    }
-
-    .status {
-      color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 0.82rem;
       line-height: 1.45;
     }
 
-    .status strong {
-      color: var(--ink);
-    }
-
-    @media (max-width: 760px) {
-      main {
-        grid-template-columns: 1fr;
+    @media (max-width: 980px) {
+      .shell {
+        overflow: auto;
       }
 
-      .grid {
+      .topbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .title-group,
+      .top-actions {
+        width: 100%;
+      }
+
+      .search {
+        width: 100%;
+      }
+
+      .workspace {
         grid-template-columns: 1fr;
+        overflow: visible;
+      }
+
+      .list-panel {
+        min-height: 60vh;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .side-panel {
+        min-height: 420px;
       }
     }
   </style>
 </head>
 <body>
-  <main>
-    <section class="panel">
-      <header class="hero">
-        <p class="eyebrow">ElastOS Archive Manager</p>
-        <h1 id="title">Archive policy</h1>
-        <p class="subtitle">
-          This viewer inspects archive object identity and release policy. It does
-          not extract unsupported archive families or touch raw host storage.
-        </p>
-      </header>
-      <section class="content">
-        <article class="card">
-          <h2>Object</h2>
-          <div class="grid">
-            <div class="field">
-              <span class="label">Object URI</span>
-              <span id="object-uri" class="value">-</span>
-            </div>
-            <div class="field">
-              <span class="label">Content CID</span>
-              <span id="content-cid" class="value">-</span>
-            </div>
-            <div class="field">
-              <span class="label">MIME</span>
-              <span id="mime" class="value">-</span>
-            </div>
-            <div class="field">
-              <span class="label">Provider</span>
-              <span class="value">Runtime-mediated object metadata</span>
-            </div>
+  <section id="empty-state" class="empty-state" hidden>
+    <div class="empty-card">
+      <div class="archive-mark" aria-hidden="true">A</div>
+      <h1>Archive</h1>
+      <p>Archive opens files selected from Library. Choose a supported .zip, .tar, .tar.gz, or .tgz archive to browse and extract it.</p>
+      <button id="open-library" class="btn btn-primary" type="button">Open Library</button>
+      <p class="muted">In Library, double-click an archive or right-click it and choose Open.</p>
+    </div>
+  </section>
+
+  <main id="archive-workspace" class="shell" hidden>
+    <header class="topbar">
+      <div class="title-group">
+        <div class="small-mark" aria-hidden="true">A</div>
+        <div>
+          <p class="eyebrow">Archive</p>
+          <h1 id="title">Archive</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="policy-pill" class="status-chip">Loading</span>
+        <input id="entry-search" class="search" type="search" placeholder="Search files" autocomplete="off">
+      </div>
+    </header>
+
+    <section class="workspace">
+      <section class="list-panel">
+        <div class="list-toolbar">
+          <div class="list-title">
+            <strong>Files</strong>
+            <span class="muted">Check files to extract. Click a row to preview.</span>
           </div>
-        </article>
-        <article class="card">
-          <h2>Archive Policy</h2>
-          <p id="policy-pill" class="pill">Policy loading</p>
-          <div class="grid" style="margin-top: 12px;">
-            <div class="field">
-              <span class="label">Family</span>
-              <span id="family" class="value">-</span>
-            </div>
-            <div class="field">
-              <span class="label">Status</span>
-              <span id="policy-status" class="value">-</span>
-            </div>
+          <div class="list-actions">
+            <button id="select-all-safe" class="btn" type="button" disabled>Select visible</button>
+            <button id="clear-selection" class="btn" type="button" disabled>Clear</button>
+            <span id="entries-pill" class="status-chip">Not loaded</span>
           </div>
-        </article>
-        <article class="card">
-          <div class="section-heading">
-            <h2>Archive Contents</h2>
-            <span id="entries-pill" class="pill">Not loaded</span>
+        </div>
+        <section class="content-pane" aria-label="Archive contents">
+          <div class="entry-head" aria-hidden="true">
+            <span></span>
+            <span>Name</span>
+            <span>Size</span>
+            <span>Modified</span>
+            <span>State</span>
           </div>
-          <div class="toolbar">
-            <input id="entry-search" class="search-input" type="search" placeholder="Search entries" autocomplete="off">
-            <button id="select-all-safe" class="secondary" type="button" disabled>Select all safe</button>
-            <button id="invert-selection" class="secondary" type="button" disabled>Invert</button>
-            <button id="clear-selection" class="secondary" type="button" disabled>Clear</button>
-            <input id="destination-uri" class="destination-input" type="text" placeholder="Destination Library URI">
-            <select id="conflict-policy" aria-label="Conflict policy">
-              <option value="keep_both">Keep both</option>
-              <option value="replace">Replace</option>
-              <option value="skip">Skip</option>
-            </select>
-            <button id="extract-selected" type="button" disabled>Extract Selected</button>
-            <button id="cancel-extract" class="warn" type="button" disabled>Cancel pending</button>
-          </div>
-          <div id="destination-roots" class="root-picker" aria-label="Destination roots"></div>
-          <p id="extract-status" class="status">Select safe entries to import them into Library.</p>
           <div id="entry-list" class="entry-list">
-            <p class="entry-empty">Archive entries are loaded through the Runtime viewer route when this archive family is supported.</p>
+            <p class="entry-empty">Archive files load when this format is supported.</p>
           </div>
-        </article>
-        <article class="card">
-          <h2>Implemented Safely</h2>
-          <ul id="implemented"></ul>
-        </article>
-        <article class="card">
-          <h2>Blocked Until Review</h2>
-          <ul id="blocked"></ul>
-        </article>
+        </section>
       </section>
+
+      <aside class="side-panel">
+        <div class="side-scroll">
+          <section class="card" aria-live="polite">
+            <h2>Preview</h2>
+            <div id="entry-preview" class="preview-body">
+              <div class="preview-empty">
+                <strong>No file selected</strong>
+                <span>Click a safe file to preview text or metadata before extraction.</span>
+              </div>
+            </div>
+          </section>
+
+          <details>
+            <summary>Safety details</summary>
+            <h3>Enabled</h3>
+            <ul id="implemented"></ul>
+            <h3>Needs review</h3>
+            <ul id="blocked"></ul>
+          </details>
+
+          <details>
+            <summary>Technical details</summary>
+            <div class="details-grid">
+              <div>
+                <span class="label">Format</span>
+                <span id="family" class="value">-</span>
+              </div>
+              <div>
+                <span class="label">Status</span>
+                <span id="policy-status" class="value">-</span>
+              </div>
+              <div>
+                <span class="label">Content ID</span>
+                <span id="content-cid" class="value">-</span>
+              </div>
+              <div>
+                <span class="label">Object URI</span>
+                <span id="object-uri" class="value">-</span>
+              </div>
+              <div>
+                <span class="label">MIME</span>
+                <span id="mime" class="value">-</span>
+              </div>
+              <div>
+                <span class="label">Authority</span>
+                <span class="value">Runtime and Library services</span>
+              </div>
+            </div>
+          </details>
+
+          <p id="live-status" class="preview-body">Waiting for launch context.</p>
+        </div>
+
+        <section class="extract-card">
+          <h2>Extract</h2>
+          <div id="destination-roots" class="root-picker" aria-label="Destination roots"></div>
+          <div class="extract-controls">
+            <input id="destination-uri" class="destination-input" type="text" placeholder="Extract to Library URI">
+            <select id="conflict-policy" class="select" aria-label="If a file already exists">
+              <option value="keep_both">Keep both if file exists</option>
+              <option value="replace">Replace existing file</option>
+              <option value="skip">Skip existing file</option>
+            </select>
+            <div class="extract-actions">
+              <button id="extract-selected" class="btn btn-primary" type="button" disabled>Extract selected</button>
+              <button id="extract-all" class="btn btn-primary" type="button" disabled>Extract all</button>
+            </div>
+          </div>
+          <p id="extract-status" class="muted">Select files to extract, or extract all safe files.</p>
+        </section>
+      </aside>
     </section>
-    <aside class="side">
-      <h2>Runtime Boundary</h2>
-      <p class="status">
-        <strong>Viewer authority:</strong> metadata inspection only. Extraction,
-        import, write, and content publication remain provider-owned operations.
-      </p>
-      <section class="preview" aria-live="polite">
-        <h2>Entry Preview</h2>
-        <div id="entry-preview" class="status">Select a safe file entry to preview bounded archive metadata or text.</div>
-      </section>
-      <p id="live-status" class="status">Waiting for launch context.</p>
-    </aside>
   </main>
+
   <script>
     const params = new URLSearchParams(window.location.search);
     const objectUri = params.get("objectUri") || params.get("uri") || "";
@@ -473,12 +744,12 @@
       selectedEntries: new Set(),
       focusedEntry: "",
       preview: null,
-      previewStatus: "Select a safe file entry to preview bounded archive metadata or text.",
-      extractStatus: "Select safe entries to import them into Library.",
+      previewStatus: "No file selected",
+      extractStatus: "Select files to extract, or extract all safe files.",
       extracting: false,
     };
 
-    render(state);
+    document.querySelector("#open-library").addEventListener("click", openLibrary);
     document.querySelector("#entry-search").addEventListener("input", (event) => {
       state.entryQuery = event.target.value || "";
       renderEntries();
@@ -488,25 +759,9 @@
       for (const entry of safeVisibleEntries()) state.selectedEntries.add(entry.path);
       renderEntries();
     });
-    document.querySelector("#invert-selection").addEventListener("click", () => {
-      for (const entry of safeVisibleEntries()) {
-        if (state.selectedEntries.has(entry.path)) {
-          state.selectedEntries.delete(entry.path);
-        } else {
-          state.selectedEntries.add(entry.path);
-        }
-      }
-      renderEntries();
-    });
     document.querySelector("#clear-selection").addEventListener("click", () => {
       state.selectedEntries.clear();
       renderEntries();
-    });
-    document.querySelector("#cancel-extract").addEventListener("click", () => {
-      cancelPendingExtract().catch((error) => {
-        state.extractStatus = "Cancel failed: " + error.message;
-        renderExtractControls();
-      });
     });
     document.querySelector("#destination-roots").addEventListener("click", (event) => {
       const button = event.target.closest("[data-destination-uri]");
@@ -519,9 +774,7 @@
       const path = row.dataset.path || "";
       if (path) selectPreviewEntry(path);
     });
-    document.querySelector("#entry-list").addEventListener("keydown", (event) => {
-      handleEntryKeyboard(event);
-    });
+    document.querySelector("#entry-list").addEventListener("keydown", handleEntryKeyboard);
     document.querySelector("#entry-list").addEventListener("change", (event) => {
       if (!event.target.matches(".entry-check")) return;
       if (event.target.checked) {
@@ -537,12 +790,46 @@
         renderExtractControls();
       });
     });
-    hydrateDestinationRoots().catch((error) => {
-      setLiveStatus("Destination roots unavailable: " + error.message);
+    document.querySelector("#extract-all").addEventListener("click", () => {
+      extractAllEntries().catch((error) => {
+        state.extractStatus = "Extract failed: " + error.message;
+        renderExtractControls();
+      });
     });
-    hydrateStatOnly().then(() => hydrateArchiveEntries()).catch((error) => {
-      setLiveStatus("Provider metadata unavailable: " + error.message);
-    });
+
+    render(state);
+    if (!objectUri) {
+      showEmptyState();
+    } else {
+      showWorkspace();
+      hydrateDestinationRoots().catch((error) => {
+        setLiveStatus("Destination roots unavailable: " + error.message);
+      });
+      hydrateStatOnly().then(() => hydrateArchiveEntries()).catch((error) => {
+        setLiveStatus("Metadata unavailable: " + error.message);
+      });
+    }
+
+    function showEmptyState() {
+      document.querySelector("#empty-state").hidden = false;
+      document.querySelector("#archive-workspace").hidden = true;
+    }
+
+    function showWorkspace() {
+      document.querySelector("#empty-state").hidden = true;
+      document.querySelector("#archive-workspace").hidden = false;
+    }
+
+    function openLibrary() {
+      const homeToken = params.get("home_token") || "";
+      if (!homeToken || !window.parent || window.parent === window) return;
+      window.parent.postMessage({
+        type: "home:open-target",
+        target: "library",
+        query: {},
+        homeToken,
+      }, window.location.origin);
+    }
 
     async function hydrateStatOnly() {
       const token = params.get("home_token") || "";
@@ -569,7 +856,7 @@
         policy: object.metadata?.archive_support || state.policy,
       });
       render(state);
-      setLiveStatus("Provider metadata loaded through the viewer object route.");
+      setLiveStatus("Metadata loaded through Runtime.");
     }
 
     async function hydrateArchiveEntries() {
@@ -580,7 +867,7 @@
         return;
       }
       if (state.policy?.status && state.policy.status !== "extractable") {
-        state.entryStatus = "Entry browsing is policy-gated for this archive family.";
+        state.entryStatus = "This archive format needs review before extraction.";
         renderEntries();
         return;
       }
@@ -613,7 +900,7 @@
         state.policy = data.object.metadata?.archive_support || state.policy;
       }
       render(state);
-      setLiveStatus("Archive entries loaded through the Runtime viewer route.");
+      setLiveStatus("Contents loaded through Runtime.");
     }
 
     async function hydrateDestinationRoots() {
@@ -631,14 +918,24 @@
     }
 
     async function extractSelectedEntries() {
+      await extractEntries([...state.selectedEntries], "Extracting selected files through Runtime...");
+    }
+
+    async function extractAllEntries() {
+      const entries = safeEntries().map((entry) => entry.path);
+      state.selectedEntries = new Set(entries);
+      renderEntries();
+      await extractEntries(entries, "Extracting all safe files through Runtime...");
+    }
+
+    async function extractEntries(entries, progressText) {
       const token = params.get("home_token") || "";
       const destinationUri = document.querySelector("#destination-uri").value.trim();
-      const entries = [...state.selectedEntries];
       if (!token || !objectUri) throw new Error("launch token missing");
       if (!destinationUri) throw new Error("destination URI is required");
-      if (!entries.length) throw new Error("select at least one safe entry");
+      if (!entries.length) throw new Error("select at least one safe file");
       state.extracting = true;
-      state.extractStatus = "Extracting selected entries through Runtime...";
+      state.extractStatus = progressText;
       renderExtractControls();
       const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
       url.searchParams.set("uri", objectUri);
@@ -668,37 +965,6 @@
       }
     }
 
-    async function cancelPendingExtract() {
-      const token = params.get("home_token") || "";
-      const destinationUri = document.querySelector("#destination-uri").value.trim();
-      const entries = [...state.selectedEntries];
-      if (!token || !objectUri) throw new Error("launch token missing");
-      if (!destinationUri) throw new Error("destination URI is required");
-      if (!entries.length) throw new Error("select at least one safe entry");
-      const url = new URL("/api/viewers/archive-manager/library-object", window.location.origin);
-      url.searchParams.set("uri", objectUri);
-      const response = await fetch(url.pathname + url.search, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-elastos-home-token": token,
-        },
-        body: JSON.stringify({
-          destination_uri: destinationUri,
-          entries,
-          conflict_policy: document.querySelector("#conflict-policy").value,
-          cancel: true,
-        }),
-      });
-      const envelope = await response.json().catch(() => ({}));
-      if (!response.ok || envelope.status === "error") {
-        throw new Error(envelope.message || envelope.error || "archive cancel failed");
-      }
-      const receipt = envelope?.data?.receipt || {};
-      state.extractStatus = `Extract ${receipt.status || "cancelled"} before write.`;
-      renderExtractControls();
-    }
-
     async function selectPreviewEntry(path) {
       const entry = (state.entries || []).find((row) => row.path === path);
       if (!entry || entry?.safety?.status === "blocked" || entry.kind !== "file") {
@@ -711,12 +977,12 @@
       }
       state.focusedEntry = path;
       state.preview = null;
-      state.previewStatus = "Loading bounded archive preview...";
+      state.previewStatus = "Loading bounded preview...";
       renderEntries();
       renderEntryPreview();
       const token = params.get("home_token") || "";
       if (!token || !objectUri) {
-        state.previewStatus = "Launch token missing; archive preview unavailable.";
+        state.previewStatus = "Launch token missing; preview unavailable.";
         renderEntryPreview();
         return;
       }
@@ -732,7 +998,7 @@
         state.preview = null;
       } else {
         state.preview = envelope?.data || null;
-        state.previewStatus = "Provider preview loaded.";
+        state.previewStatus = "Preview loaded through Runtime.";
       }
       renderEntryPreview();
     }
@@ -747,17 +1013,18 @@
     }
 
     function render(next) {
-      document.querySelector("#title").textContent = next.name || "Archive policy";
+      document.querySelector("#title").textContent = next.name || "Archive";
       document.querySelector("#object-uri").textContent = next.uri || "-";
       document.querySelector("#content-cid").textContent = next.contentCid || "-";
       document.querySelector("#mime").textContent = next.mime || "-";
       const policy = next.policy || {};
       const status = policy.status || "metadata_only";
       document.querySelector("#family").textContent = policy.family || familyFromName(next.name);
-      document.querySelector("#policy-status").textContent = status;
+      document.querySelector("#policy-status").textContent = humanStatus(status);
       const pill = document.querySelector("#policy-pill");
-      pill.textContent = status === "extractable" ? "Safe extraction is provider-enabled" : "Extraction is policy-gated";
+      pill.textContent = status === "extractable" ? "Ready" : "Format needs review";
       pill.classList.toggle("safe", status === "extractable");
+      pill.classList.toggle("blocked", status !== "extractable" && status !== "metadata_only");
       renderList("#implemented", implementedRows(policy));
       renderList("#blocked", blockedRows(policy));
       renderDestinationRoots();
@@ -769,12 +1036,12 @@
       const pill = document.querySelector("#entries-pill");
       const rows = filteredEntries();
       const hasBlocked = rows.some((entry) => entry?.safety?.status === "blocked");
-      pill.textContent = state.entryStatus || "Not loaded";
+      pill.textContent = selectionSummary(rows);
       pill.classList.toggle("safe", rows.length > 0 && !hasBlocked);
-      pill.classList.toggle("blocked", hasBlocked || /blocked|gated|unsupported|unavailable/i.test(pill.textContent));
+      pill.classList.toggle("blocked", hasBlocked || /blocked|gated|unsupported|unavailable|review/i.test(state.entryStatus));
       const list = document.querySelector("#entry-list");
       if (!rows.length) {
-        list.innerHTML = `<p class="entry-empty">${escapeHtml(state.entryStatus || "No archive entries loaded.")}</p>`;
+        list.innerHTML = `<p class="entry-empty">${escapeHtml(state.entryStatus || "No archive files loaded.")}</p>`;
         renderExtractControls();
         return;
       }
@@ -782,21 +1049,18 @@
         const blocked = entry?.safety?.status === "blocked";
         const selectable = !blocked && entry.kind !== "blocked";
         const checked = state.selectedEntries.has(entry.path || "");
-        const meta = [
-          entry.kind || "entry",
-          formatBytes(entry.size),
-          entry.compressed_size == null ? "" : `compressed ${formatBytes(entry.compressed_size)}`,
-          entry.modified_at ? `modified ${new Date(entry.modified_at * 1000).toLocaleString()}` : "",
-          blocked ? (entry.safety?.reason || "blocked by provider safety policy") : "safe",
-        ].filter(Boolean).join(" · ");
         const selected = state.focusedEntry === (entry.path || "");
+        const stateLabel = blocked ? "Blocked" : "Safe";
+        const modified = entry.modified_at ? new Date(entry.modified_at * 1000).toLocaleString() : "-";
         return `<div class="entry-row${blocked ? " blocked" : ""}${selected ? " selected" : ""}" role="button" tabindex="${selectable ? "0" : "-1"}" data-path="${escapeHtml(entry.path || "")}" aria-selected="${selected ? "true" : "false"}">
-          <input class="entry-check" type="checkbox" value="${escapeHtml(entry.path || "")}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="Select ${escapeHtml(entry.path || entry.name || "entry")}">
-          <div>
-            <div class="entry-path">${escapeHtml(entry.path || entry.name || "entry")}</div>
-            <div class="entry-meta">${escapeHtml(meta)}</div>
+          <div><input class="entry-check" type="checkbox" value="${escapeHtml(entry.path || "")}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} aria-label="Select ${escapeHtml(entry.path || entry.name || "entry")}"></div>
+          <div class="entry-name">
+            <span class="entry-icon" aria-hidden="true">${escapeHtml(entryIcon(entry))}</span>
+            <span class="entry-title" title="${escapeHtml(entry.path || entry.name || "entry")}">${escapeHtml(entry.path || entry.name || "entry")}</span>
           </div>
-          <span class="pill${blocked ? " blocked" : " safe"}">${blocked ? "Blocked" : "Safe"}</span>
+          <span class="entry-cell">${escapeHtml(formatBytes(entry.size))}</span>
+          <span class="entry-cell">${escapeHtml(modified)}</span>
+          <span class="status-chip${blocked ? " blocked" : " safe"}" title="${escapeHtml(blocked ? (entry.safety?.reason || "blocked by safety policy") : "safe")}">${stateLabel}</span>
         </div>`;
       }).join("");
       renderExtractControls();
@@ -808,7 +1072,7 @@
         root.kind === "directory" || root.kind === "principal-root" || root.kind === "webspace-root"
       );
       if (!roots.length) {
-        container.innerHTML = `<span class="status">Destination roots load through the Runtime viewer route.</span>`;
+        container.innerHTML = `<span class="muted">Choose a Library destination.</span>`;
         return;
       }
       container.innerHTML = roots.map((root) =>
@@ -822,7 +1086,7 @@
       const entry = data.entry || null;
       const previewData = data.preview || null;
       if (!entry || !previewData) {
-        preview.innerHTML = escapeHtml(state.previewStatus || "Select a safe file entry to preview bounded archive metadata or text.");
+        preview.innerHTML = `<div class="preview-empty"><strong>${escapeHtml(state.previewStatus || "No file selected")}</strong><span>Click a safe file to preview text or metadata before extraction.</span></div>`;
         return;
       }
       const viewerLabels = Array.isArray(entry.viewers) && entry.viewers.length
@@ -831,10 +1095,10 @@
       const text = typeof previewData.text === "string" ? previewData.text : "";
       const body = text
         ? `<pre>${escapeHtml(text)}</pre>`
-        : `<p class="status">Binary preview is bounded to ${formatBytes(previewData.max_bytes)} and available for extraction/opening through Library actions.</p>`;
+        : `<p>Binary preview is bounded to ${formatBytes(previewData.max_bytes)}. Extract or open it from Library after import.</p>`;
       preview.innerHTML = `
         <div><strong>${escapeHtml(entry.path || "entry")}</strong></div>
-        <div class="status">${escapeHtml(entry.mime || "application/octet-stream")} · ${formatBytes(entry.size)} · viewers: ${escapeHtml(viewerLabels)}${previewData.truncated ? " · truncated" : ""}</div>
+        <div>${escapeHtml(entry.mime || "application/octet-stream")} · ${formatBytes(entry.size)} · viewers: ${escapeHtml(viewerLabels)}${previewData.truncated ? " · truncated" : ""}</div>
         ${body}
       `;
     }
@@ -844,6 +1108,12 @@
       if (!query) return state.entries || [];
       return (state.entries || []).filter((entry) =>
         String(entry.path || entry.name || "").toLowerCase().includes(query)
+      );
+    }
+
+    function safeEntries() {
+      return (state.entries || []).filter((entry) =>
+        entry.path && entry.kind !== "blocked" && entry?.safety?.status !== "blocked"
       );
     }
 
@@ -889,9 +1159,8 @@
     function implementedRows(policy) {
       const implemented = policy.implemented || {};
       return [
-        "Download formats: " + listValue(implemented.download_formats, "zip, tar.gz"),
-        "Compress to Library: " + listValue(implemented.compress_to_library, "zip"),
-        "Extract formats: " + listValue(implemented.extract_formats, "zip, tar, tar.gz, tgz"),
+        "Open and inspect supported ZIP/tar/tar.gz/tgz archives.",
+        "Extract selected or all safe files into Library.",
         "Safety: " + (implemented.safety || "relative UTF-8 file paths only; non-file entries rejected"),
       ];
     }
@@ -899,11 +1168,11 @@
     function blockedRows(policy) {
       const gate = policy.policy_gate || {};
       if (gate.required === false || policy.status === "extractable") {
-        return ["No release-policy gate for this archive family."];
+        return ["No release-policy gate for this archive format."];
       }
       return [
-        gate.reason || "Generic archive support needs dependency and release-policy review before enabling.",
-        "Blocked formats: " + listValue(gate.blocked_formats, "7z, rar, tar.xz, tar.bz2, tar.zst, xz, bz2, zst, lz4, gzip"),
+        gate.reason || "This archive format needs dependency and release-policy review before extraction.",
+        "Examples: " + listValue(gate.blocked_formats, "7z, rar, tar.xz, tar.bz2, tar.zst, xz, bz2, zst, lz4, gzip"),
       ];
     }
 
@@ -917,13 +1186,35 @@
 
     function renderExtractControls() {
       const selectableCount = safeVisibleEntries().length;
-      const enabled = state.selectedEntries.size > 0 && state.policy?.status !== "policy_gated_unsupported_archive_family";
-      document.querySelector("#select-all-safe").disabled = selectableCount === 0;
-      document.querySelector("#invert-selection").disabled = selectableCount === 0;
-      document.querySelector("#clear-selection").disabled = state.selectedEntries.size === 0;
-      document.querySelector("#extract-selected").disabled = !enabled || state.extracting;
-      document.querySelector("#cancel-extract").disabled = !enabled || state.extracting;
-      document.querySelector("#extract-status").textContent = state.extractStatus || "Select safe entries to import them into Library.";
+      const allSafeCount = safeEntries().length;
+      const policyBlocked = state.policy?.status === "policy_gated_unsupported_archive_family";
+      const selectedEnabled = state.selectedEntries.size > 0 && !policyBlocked;
+      document.querySelector("#select-all-safe").disabled = selectableCount === 0 || state.extracting;
+      document.querySelector("#clear-selection").disabled = state.selectedEntries.size === 0 || state.extracting;
+      document.querySelector("#extract-selected").disabled = !selectedEnabled || state.extracting;
+      document.querySelector("#extract-all").disabled = allSafeCount === 0 || policyBlocked || state.extracting;
+      document.querySelector("#extract-status").textContent = state.extractStatus || "Select files to extract, or extract all safe files.";
+    }
+
+    function selectionSummary(rows) {
+      const count = rows.length;
+      const selected = [...state.selectedEntries].filter((path) =>
+        rows.some((entry) => entry.path === path)
+      ).length;
+      if (!count) return state.entryStatus || "Not loaded";
+      return selected ? `${selected} selected of ${count}` : state.entryStatus || `${count} entries`;
+    }
+
+    function entryIcon(entry) {
+      if (entry?.safety?.status === "blocked") return "!";
+      if (entry?.kind === "directory") return "/";
+      return "F";
+    }
+
+    function humanStatus(status) {
+      if (status === "extractable") return "Ready to extract";
+      if (status === "policy_gated_unsupported_archive_family") return "Format needs review";
+      return "Metadata only";
     }
 
     function parentUri(uri) {

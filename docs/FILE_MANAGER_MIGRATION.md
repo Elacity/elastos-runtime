@@ -213,7 +213,7 @@ Still pending:
   `.tar.gz`/`.zip` folder and selected-object archive downloads, same-folder ZIP
   object creation, `.tar`/`.tar.gz`/`.tgz`/`.zip` browsing/preview/extraction,
   and WebSpace archive import/write-back policy. Policy-gated generic archive
-  families are recognized and can open Archive Manager, but their entry
+  families are recognized and can open Archive, but their entry
   browsing/importing remains disabled until dependency/release-policy review.
 - Automated live external resolver adapters, external resolver byte traversal,
   byte cache/sync workers, mutable fork byte materialization, and

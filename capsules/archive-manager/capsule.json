@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "archive-manager",
   "version": "0.1.0",
-  "description": "Inspect archive objects and ElastOS archive policy without unsafe extraction",
+  "description": "Browse and extract supported archive contents through Library",
   "role": "viewer",
   "type": "data",
   "author": "elastos",

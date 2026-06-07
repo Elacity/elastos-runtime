@@ -2365,26 +2365,29 @@ assert(
   "Library Compress to ZIP must be provider-owned, capability-gated, cache-invalidating, and available for single objects and same-folder selections",
 );
 assert(
-  archiveManagerManifest.includes('"name": "archive-manager"') &&
+    archiveManagerManifest.includes('"name": "archive-manager"') &&
     archiveManagerManifest.includes('"role": "viewer"') &&
-    archiveManager.includes("ElastOS Archive Manager") &&
+    archiveManager.includes("<title>Archive - ElastOS</title>") &&
     archiveManager.includes("/api/viewers/archive-manager/library-object") &&
     archiveManager.includes('url.searchParams.set("stat_only", "true")') &&
     archiveManager.includes('url.searchParams.set("entries", "true")') &&
     archiveManager.includes("/api/viewers/archive-manager/library-roots") &&
     archiveManager.includes('url.searchParams.set("preview_entry", path)') &&
-    archiveManager.includes("Archive Contents") &&
-    archiveManager.includes("Extract Selected") &&
-    archiveManager.includes("Select all safe") &&
-    archiveManager.includes("Invert") &&
-    archiveManager.includes("Cancel pending") &&
+    archiveManager.includes('aria-label="Archive contents"') &&
+    archiveManager.includes("Extract selected") &&
+    archiveManager.includes("Extract all") &&
+    archiveManager.includes("Select visible") &&
+    archiveManager.includes("Safety details") &&
+    archiveManager.includes("Runtime and Library services") &&
+    !archiveManager.includes("Cancel pending") &&
+    !archiveManager.includes("Runtime Boundary") &&
     archiveManager.includes("handleEntryKeyboard") &&
-    archiveManager.includes("Provider preview loaded.") &&
+    archiveManager.includes("Preview loaded through Runtime.") &&
     archiveManager.includes("async function extractSelectedEntries()") &&
-    archiveManager.includes("async function cancelPendingExtract()") &&
+    archiveManager.includes("async function extractAllEntries()") &&
     archiveManager.includes("async function selectPreviewEntry(path)") &&
     archiveManager.includes("renderEntries()") &&
-    archiveManager.includes("Extraction is policy-gated") &&
+    archiveManager.includes("Format needs review") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_ENTRIES_SCHEMA") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_EXTRACT_ENTRIES_SCHEMA") &&
     objectProviderImpl.includes("LIBRARY_ARCHIVE_PREVIEW_ENTRY_SCHEMA") &&
@@ -2406,7 +2409,7 @@ assert(
     objectProviderImpl.includes("enum ArchiveConflictPolicy") &&
     objectProviderImpl.includes("fn normalized_archive_entry_path(") &&
     objectProviderImpl.includes('vec!["archive-manager"]') &&
-    objectProviderImpl.includes('"archive-manager" => "Archive Manager"') &&
+    objectProviderImpl.includes('"archive-manager" => "Archive"') &&
     viewerGatewayApi.includes("stat_only") &&
     viewerGatewayApi.includes("entries: bool") &&
     viewerGatewayApi.includes("preview_entry: Option<String>") &&
@@ -2430,7 +2433,8 @@ assert(
     libraryMenuSmoke.includes("#destination-roots") &&
     libraryMenuSmoke.includes("#entry-preview") &&
     libraryMenuSmoke.includes("#select-all-safe") &&
-    libraryMenuSmoke.includes("#cancel-extract") &&
+    libraryMenuSmoke.includes("#extract-all") &&
+    !libraryMenuSmoke.includes("#cancel-extract") &&
     libraryMenuSmoke.includes("#extract-status") &&
     libraryMenuSmoke.includes("policy_gated_unsupported_archive_family") &&
     libraryMenuSmoke.includes('message?.target === "archive-manager"') &&
@@ -2454,7 +2458,7 @@ assert(
     archivePolicyDoc.includes(".7z") &&
     archivePolicyDoc.includes(".rar") &&
     archivePolicyDoc.includes("Unsupported families remain visible as policy-gated archives"),
-  "Archive Manager must provide an installed viewer shell, stat-only/archive-entry/preview/root viewer routes, supported-family browsing, preview, selective extraction, policy-gated unsupported archive UX, conflict/cancel receipts, policy documentation, and no direct viewer provider access or unsafe extraction",
+  "Archive must provide an installed viewer shell, stat-only/archive-entry/preview/root viewer routes, supported-family browsing, preview, selected/all extraction, policy-gated unsupported archive UX, conflict receipts, policy documentation, and no direct viewer provider access or unsafe extraction",
 );
 assert(
   gatewayApi.includes("HOME_DESKTOP_OBJECTS_SCHEMA") &&

@@ -841,7 +841,7 @@ release branch scope is fixed.
 - Release worktree exists at
   `/home/wau/elastos-runtime-library-release` on branch
   `review/library-release`, based on local `main` at `6d4c385`.
-- Post Archive Manager closeout gate passed on 2026-06-06 19:48 UTC:
+- Post Archive closeout gate passed on 2026-06-06 19:48 UTC:
   `node scripts/library-menu-smoke.mjs`, `node
   scripts/library-performance-smoke.mjs`, `node
   scripts/home-entropy-check.mjs`, `bash scripts/check-wci-alignment.sh`,
@@ -868,7 +868,7 @@ release branch scope is fixed.
   elastos/Cargo.toml -p elastos-server`, and `cargo clippy --manifest-path
   elastos/Cargo.toml -p elastos-server --tests -- -D warnings`. The
   performance smoke was corrected to use the canonical `/api/provider/object/*`
-  fixture route with no legacy fallback, and Archive Manager copy was made
+  fixture route with no legacy fallback, and Archive copy was made
   provider-neutral for WCI alignment.
 - Post object-provider no-fallback gate passed on 2026-06-05 15:17 UTC in this
   worktree after freeing disk space: `cargo fmt --manifest-path
@@ -1119,9 +1119,12 @@ release branch scope is fixed.
   extraction, provider-owned `.zip` extraction, and archive MIME classification.
   ZIP extraction dependency review is scoped to stable non-yanked `zip 2.4.2`
   with default features disabled and only the flate2-backed deflate path.
-  Generic non-tar/non-zip archive extraction, richer archive-manager UX, and
-  import policy beyond current safe `.tar`/`.zip` extraction remain deferred,
-  and WebSpace mutable resolver sync is now fixture-proven with adapter
+  Generic non-tar/non-zip archive extraction and import policy beyond current
+  safe `.tar`/`.zip` extraction remain deferred. Archive now presents a
+  simplified Archive flow: browse/search entries, preview safe files,
+  extract selected/all files into Library, and keep release-policy/dDRM details
+  collapsed behind secondary safety copy. WebSpace mutable resolver sync is now
+  fixture-proven with adapter
   write-back, no-adapter fail-closed receipts, conflict receipts, and
   resolver-scope availability hints. The fixture contract is now also promoted
   into an installed `operator-drive-adapter` provider package with Runtime

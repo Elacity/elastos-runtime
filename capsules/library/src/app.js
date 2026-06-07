@@ -708,7 +708,7 @@ import { createLibraryUploads } from "./uploads.js";
       const family = support.family || "archive";
       const archiveViewer = viewerOptions(object).find((viewer) => viewer?.id === "archive-manager");
       if (archiveViewer && openWithViewer(object, archiveViewer.id)) {
-        setStatus(`Opening ${object.name || "archive"} in Archive Manager for ${family} policy inspection.`);
+        setStatus(`Opening ${object.name || "archive"} in Archive.`);
         return;
       }
       setStatus(`${object.name || "Archive"} is a ${family} archive. Extraction is disabled pending dependency and release-policy review.`);

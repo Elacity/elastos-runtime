@@ -1,14 +1,14 @@
-# Archive Manager Dependency And Release Policy
+# Archive Dependency And Release Policy
 
 Date: 2026-06-06
 
-This release enables Archive Manager only for archive families that already have
+This release enables Archive only for archive families that already have
 bounded provider-owned support in `object-provider`: `.zip`, `.tar`, `.tar.gz`,
 and `.tgz`.
 
 ## Runtime Boundary
 
-- Archive Manager is a viewer capsule. It does not parse archive bytes in the
+- Archive is a viewer capsule. It does not parse archive bytes in the
   browser and does not call `/api/provider/object/*` directly.
 - Runtime injects the signed principal and mediates viewer routes for archive
   stat, entry listing, safe entry preview, roots, and selected extraction.
@@ -17,7 +17,7 @@ and `.tgz`.
   WebSpace write-back policy.
 - WebSpace archive reads use mounted `localhost://WebSpaces/...` handles. Any
   resolver-private `target_uri`, credentials, endpoint tokens, Kubo/IPFS handles,
-  or host paths must be redacted from Archive Manager receipts.
+  or host paths must be redacted from Archive receipts.
 
 ## Enabled Families
 
@@ -56,5 +56,5 @@ Before enabling a new family, the owner must record:
   `.gz`: policy-gated until dependency and release review is complete.
 
 Unsupported families remain visible as policy-gated archives in Library
-Properties and Archive Manager. They can be inspected for object identity and
+Properties and Archive. They can be inspected for object identity and
 policy status, but entry browsing, preview, and extraction fail closed.

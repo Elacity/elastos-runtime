@@ -174,7 +174,7 @@ const archiveFile = object(`${documentsUri}/Bundle.tar.gz`, "Bundle.tar.gz", "fi
 ], {
   mime: "application/gzip",
   size: 512,
-  viewers: [{ id: "archive-manager", label: "Archive Manager" }],
+  viewers: [{ id: "archive-manager", label: "Archive" }],
   metadata: {
     schema: "elastos.library.object-metadata/v1",
     archive_support: archiveSupport("tar.gz"),
@@ -192,7 +192,7 @@ const tarArchiveFile = object(`${documentsUri}/Plain.tar`, "Plain.tar", "file", 
 ], {
   mime: "application/x-tar",
   size: 512,
-  viewers: [{ id: "archive-manager", label: "Archive Manager" }],
+  viewers: [{ id: "archive-manager", label: "Archive" }],
   metadata: {
     schema: "elastos.library.object-metadata/v1",
     archive_support: archiveSupport("tar"),
@@ -210,7 +210,7 @@ const zipArchiveFile = object(`${documentsUri}/Portable.zip`, "Portable.zip", "f
 ], {
   mime: "application/zip",
   size: 512,
-  viewers: [{ id: "archive-manager", label: "Archive Manager" }],
+  viewers: [{ id: "archive-manager", label: "Archive" }],
   metadata: {
     schema: "elastos.library.object-metadata/v1",
     archive_support: archiveSupport("zip"),
@@ -227,7 +227,7 @@ const policyGatedArchiveFile = object(`${documentsUri}/Legacy.7z`, "Legacy.7z", 
 ], {
   mime: "application/x-7z-compressed",
   size: 768,
-  viewers: [{ id: "archive-manager", label: "Archive Manager" }],
+  viewers: [{ id: "archive-manager", label: "Archive" }],
   metadata: {
     schema: "elastos.library.object-metadata/v1",
     archive_support: archiveSupport("7z", "policy_gated_unsupported_archive_family"),
@@ -1868,7 +1868,7 @@ async function run() {
     const policyGatedArchiveRows = await openItemMenu(page, "Legacy.7z");
     includesAll(policyGatedArchiveRows, ["Open", "Open With", "Archive Support", "Download", "Properties"], "policy-gated archive file menu");
     excludesAll(policyGatedArchiveRows, ["Extract Here"], "policy-gated archive file menu");
-    includesAll(await submenuRows(page, "Open With"), ["Archive Manager"], "policy-gated archive viewer submenu");
+    includesAll(await submenuRows(page, "Open With"), ["Archive"], "policy-gated archive viewer submenu");
     await page.keyboard.press("Escape");
     await openItemMenu(page, "Legacy.7z");
     await clickMenu(page, "Archive Support");
@@ -2222,7 +2222,7 @@ async function run() {
     );
     assert(
       ops.filter((entry) => entry.op === "read" && entry.payload.uri.endsWith("/Legacy.7z")).length === readsBeforeArchiveViewerOpen,
-      "Double-click with Archive Manager must not fall back to preview/read or unsafe extraction",
+      "Double-click with Archive must not fall back to preview/read or unsafe extraction",
     );
     const viewerItem = libraryFrame.locator(".item").filter({ hasText: "Viewer.md" }).first();
     await viewerItem.click();
@@ -2253,28 +2253,27 @@ async function run() {
     await archivePage.locator("#entry-list").filter({ hasText: "Nested/deep.txt" }).first().waitFor();
     assert(
       await archivePage.locator("#entry-list").filter({ hasText: "alpha.txt" }).count() === 0,
-      "Archive Manager search must filter entry rows",
+      "Archive search must filter entry rows",
     );
+    await archivePage.locator("#extract-all").waitFor();
     await archivePage.locator("#select-all-safe").click();
     await archivePage.locator("#extract-selected").click();
     await archivePage.locator("#extract-status").filter({ hasText: "1 written" }).first().waitFor();
-    await archivePage.locator("#cancel-extract").click();
-    await archivePage.locator("#extract-status").filter({ hasText: "cancelled" }).first().waitFor();
     await archivePage.close();
     assert(
       ops.some((entry) => entry.op === "roots"),
-      "Archive Manager destination picker must load roots through the Runtime viewer route",
+      "Archive destination picker must load roots through the Runtime viewer route",
     );
     assert(
       ops.some((entry) => entry.op === "archive_entries" && entry.payload.uri.endsWith("/Portable.zip")),
-      "Archive Manager must load entries through the Runtime viewer route archive_entries bridge",
+      "Archive must load entries through the Runtime viewer route archive_entries bridge",
     );
     assert(
       ops.some((entry) =>
         entry.op === "archive_preview_entry" &&
         entry.payload.uri.endsWith("/Portable.zip") &&
         entry.payload.entry === "Nested/deep.txt"),
-      "Archive Manager must preview entries through the Runtime viewer route archive_preview_entry bridge",
+      "Archive must preview entries through the Runtime viewer route archive_preview_entry bridge",
     );
     assert(
       ops.some((entry) =>
@@ -2282,14 +2281,7 @@ async function run() {
         entry.payload.uri.endsWith("/Portable.zip") &&
         entry.payload.destination_uri === documentsUri &&
         entry.payload.entries?.includes("Nested/deep.txt")),
-      "Archive Manager Extract Selected must use the Runtime viewer route archive_extract_entries bridge",
-    );
-    assert(
-      ops.some((entry) =>
-        entry.op === "archive_extract_entries" &&
-        entry.payload.uri.endsWith("/Portable.zip") &&
-        entry.payload.cancel === true),
-      "Archive Manager Cancel pending must use archive_extract_entries cancel receipts",
+      "Archive Extract selected must use the Runtime viewer route archive_extract_entries bridge",
     );
 
     console.log("PASS Library menu smoke");

@@ -27,7 +27,7 @@ Planning and truth surfaces outside `docs/`:
 - [CAPSULE_MODEL.md](CAPSULE_MODEL.md) — supplemental capsule/runtime terminology note
 - [CARRIER.md](CARRIER.md) — supplemental Carrier framing note
 - [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
-- [ARCHIVE_POLICY.md](ARCHIVE_POLICY.md) — Archive Manager dependency, release, and generic-family enablement policy
+- [ARCHIVE_POLICY.md](ARCHIVE_POLICY.md) — Archive dependency, release, and generic-family enablement policy
 - [PC2_CONVERGENCE.md](PC2_CONVERGENCE.md) — current translation of useful PC2 patterns into Runtime provider/capsule boundaries
 - [CHAIN_PROVIDER.md](CHAIN_PROVIDER.md) — typed chain-provider boundary and current blockchain-quadrant slice
 - [WALLET_PROVIDER.md](WALLET_PROVIDER.md) — wallet proof, account-link, typed-signing, and transaction authority boundary
