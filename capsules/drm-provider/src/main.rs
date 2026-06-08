@@ -481,3 +481,119 @@ mod tests {
         assert!(err.contains("unknown field"));
     }
 }
+
+/// Characterization tests for the inter-provider contract seams.
+///
+/// The drm-provider orchestrates `rights -> key -> decrypt`. These tests prove the
+/// receipt each step emits deserializes *exactly* into the next step's request type,
+/// so the contracts compose end-to-end. If a shared contract type drifts, these fail
+/// loudly here rather than silently at runtime.
+#[cfg(test)]
+mod chain_seam_tests {
+    use elastos_common::protected_content::{
+        DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
+        DECRYPT_SESSION_REQUEST_SCHEMA, KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA,
+        RIGHTS_DECISION_RECEIPT_SCHEMA,
+    };
+    use serde_json::json;
+
+    const PRINCIPAL: &str = "person:local:test";
+    const SESSION: &str = "session:test";
+    const OBJECT: &str = "bafybeigprotectedcontent";
+
+    fn key_envelope_json() -> serde_json::Value {
+        json!({
+            "scheme": "elastos-pq-hybrid-threshold-v0",
+            "kid": "kid:test",
+            "wrapped_cek": "wrapped",
+            "policy_hash": "sha256:test",
+            "algorithms": {
+                "cipher": "aes-256-gcm",
+                "signature": ["ed25519", "ml-dsa-65"],
+                "kem": ["x25519", "ml-kem-768"],
+                "share_scheme": "shamir-t-of-n"
+            }
+        })
+    }
+
+    /// rights -> key: a RightsDecisionReceiptV1 deserializes as the `rights_receipt`
+    /// field of the key-provider's request, with binding fields intact.
+    #[test]
+    fn rights_receipt_flows_into_key_release_request() {
+        let rights_receipt = json!({
+            "schema": RIGHTS_DECISION_RECEIPT_SCHEMA,
+            "request_id": "rights:test",
+            "content_id": OBJECT,
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "right": "view",
+            "provider": "rights-provider",
+            "allowed": true,
+            "issued_at": 1_800_000_000u64,
+            "expires_at": 1_900_000_000u64
+        });
+
+        // The shape stands alone as a RightsDecisionReceiptV1 ...
+        serde_json::from_value::<RightsDecisionReceiptV1>(rights_receipt.clone()).unwrap();
+
+        // ... and embeds cleanly into the next step's request.
+        let request: KeyReleaseRequestV1 = serde_json::from_value(json!({
+            "schema": KEY_RELEASE_REQUEST_SCHEMA,
+            "request_id": "key-release:test",
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "object_cid": OBJECT,
+            "action": "view",
+            "rights_receipt": rights_receipt,
+            "key_envelope": key_envelope_json(),
+            "reason": "open protected document",
+            "expires_at": 1_900_000_000u64
+        }))
+        .unwrap();
+
+        assert!(request.rights_receipt.allowed);
+        assert_eq!(request.rights_receipt.content_id, request.object_cid);
+        assert_eq!(request.rights_receipt.principal_id, request.principal_id);
+        assert_eq!(request.rights_receipt.right, request.action);
+    }
+
+    /// key -> decrypt: a ReleaseReceiptV1 deserializes as the `release_receipt` field
+    /// of the decrypt-provider's session request, with binding fields intact.
+    #[test]
+    fn release_receipt_flows_into_decrypt_session_request() {
+        let release_receipt = json!({
+            "schema": RELEASE_RECEIPT_SCHEMA,
+            "request_id": "key-release:test",
+            "object_cid": OBJECT,
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "action": "view",
+            "provider": "key-provider",
+            "status": "released",
+            "issued_at": 1_800_000_000u64,
+            "expires_at": 1_900_000_000u64
+        });
+
+        serde_json::from_value::<ReleaseReceiptV1>(release_receipt.clone()).unwrap();
+
+        let request: DecryptSessionRequestV1 = serde_json::from_value(json!({
+            "schema": DECRYPT_SESSION_REQUEST_SCHEMA,
+            "request_id": "decrypt:test",
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "object_cid": OBJECT,
+            "action": "view",
+            "viewer_interface": "elastos.viewer/document@1",
+            "release_receipt": release_receipt,
+            "output_kind": "rendered",
+            "reason": "open protected document",
+            "expires_at": 1_900_000_000u64
+        }))
+        .unwrap();
+
+        assert_eq!(request.release_receipt.status, "released");
+        assert_eq!(request.release_receipt.object_cid, request.object_cid);
+        assert_eq!(request.release_receipt.principal_id, request.principal_id);
+        assert_eq!(request.release_receipt.action, request.action);
+    }
+}
