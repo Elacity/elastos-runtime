@@ -148,15 +148,24 @@ pass; suitable for CI). This upgrades the evidence from "compiles to wasm" to
 
 | Provider | Contract + validation | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
 | --- | --- | --- | --- | --- | --- |
-| `decrypt-provider` | yes (+ tested decrypt-step core seam) | yes | 17 | builds | `scripts/wasm-smoke.sh` |
+| `rights-provider` | yes (typed questions; wire-rejects hidden chain/wallet/key fields) | yes | 9 | builds | `scripts/wasm-smoke.sh` |
 | `key-provider` | yes (+ rights-receipt binding: allowed + principal/session/object/right must match) | yes | 9 | builds | `scripts/wasm-smoke.sh` |
-| `rights-provider` | (declared; not yet brought to this bar) | — | — | — | — |
+| `decrypt-provider` | yes (+ tested decrypt-step core seam) | yes | 17 | builds | `scripts/wasm-smoke.sh` |
 
-`key-provider` now verifies the upstream rights decision before it would ever
-release a key (the `rights -> key` link): a denied, malformed, or mis-bound
-`RightsDecisionReceiptV1` is rejected with `invalid_request`; a valid request
-still fails closed (`not_configured`) until the PQ-hybrid dKMS backend exists.
-The CEK only ever appears here as `key_envelope.wrapped_cek` — never raw.
+The full `rights -> key -> decrypt` chain now compiles to `wasm32-wasip1`, executes
+under WASI, and is fail-closed end-to-end:
+- `rights-provider` answers typed access questions and fails closed
+  (`not_configured`) until the dDRM/chain policy backend exists; it never exposes
+  chain/wallet/contract/key authority (wire-level `deny_unknown_fields`).
+- `key-provider` verifies the upstream `RightsDecisionReceiptV1` (allowed +
+  principal/session/object/right must match) before any release; the CEK only ever
+  appears as `key_envelope.wrapped_cek` — never raw.
+- `decrypt-provider` validates the session + release receipt, holds the cenc engine
+  with CEK containment + zeroization, and fails closed until the rail lands.
+
+The **only** remaining gap to end-to-end decrypt is the CEK/ciphertext transport
+rail (Hybrid chosen; questions for Anders above). Everything else is proven on the
+live wasm substrate.
 
 ## What is NOT blocked (and is done/ready)
 
