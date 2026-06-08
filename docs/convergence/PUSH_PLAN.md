@@ -52,8 +52,8 @@ git range-diff origin/0.4.0...@{-1} origin/0.4.0...HEAD   # confirm nothing drop
 | Order | Branch | ahead | conflict surface on rebase |
 |---|---|---|---|
 | 1 | `fix/crosvm-darwin-build` | 3 | none expected (platform-gating new files); **build-verified green on macOS Day 42** |
-| 2 | `fix/home-summary-resilience` | 4 | stacked on #1 — rebase #1 first, then this onto it |
-| 3 | `chore/bincode-2x` | 3 | **bincode call-sites** if the base touched serialization; keep `bincode::config::legacy()`, re-run the wire-format golden |
+| 2 | `fix/home-summary-resilience` | 4 | stacked on #1 — rebase #1 first, then this onto it; **build-verified macOS Day 43** (own tests green; 4 microVM-launch tests are no-KVM env failures, pass on Linux CI) |
+| 3 | `chore/bincode-2x` | 3 | **bincode call-sites** if the base touched serialization; keep `bincode::config::legacy()`, re-run the wire-format golden; **build-verified green macOS Day 43 (311 passed, byte-identity golden green)** |
 | 4 | `chore/carrier-iroh-upgrade` | 3 | docs/audit.toml only — none expected |
 | 5 | `feat/decrypt-provider-cenc` | 39 | `capsules/{decrypt,key,drm}-provider/src/main.rs` only — see below |
 
@@ -129,6 +129,21 @@ Notes:
   valid JSON from a non-atomic external writer).
 - **Test plan:** passkey sign-in succeeds with a deliberately corrupted
   `browser-state.json`; warning logged; default state returned.
+- **Verified on macOS (Day 43):** `cargo build -p elastos-server` clean; the
+  branch's own `home_browser_state_*` tests pass (incl.
+  `test_home_browser_state_resets_plaintext_for_protected_principal_root` — the
+  reset-to-default path this fix generalizes). **Caveat:** 4 `home_launch` /
+  `runtime_ensure` tests fail on macOS (`assert running==true`) — they require a
+  live KVM microVM and fail **identically on `fix/crosvm-darwin-build`** (which
+  lacks this fix), so they are an **environmental (no-KVM) limitation, not a
+  regression**; they pass on Linux CI. Follow-up (own branch, not this one):
+  `cfg(target_os="linux")`-gate the microVM-launch home tests so
+  `cargo test -p elastos-server` is green on macOS dev machines too.
+- **Quality note:** the exact *trailing-bytes-after-valid-JSON* parse-reset path
+  (serde error → default) is covered by behavior parity with the tested
+  unencrypted-reset path but has no *dedicated* unit test; deliberately NOT added
+  here to keep this minimal reviewed fix unchanged before push (tracked as a
+  follow-up).
 
 ### #3 `chore/bincode-2x`
 - **What:** bincode 1.3 → 2.x using `bincode::config::legacy()` for capability
@@ -137,6 +152,13 @@ Notes:
   silent wire-format change.
 - **Test plan:** `cargo test -p elastos-runtime` green; golden test asserts the
   1.3-era bytes decode and re-encode identically under 2.x.
+- **Verified green on macOS (Day 43, Darwin 25.4.0 arm64):** full
+  `cargo test -p elastos-runtime` = **311 passed / 0 failed**, including the two
+  safety-critical tests — `token_wire_format_is_bincode_1x_legacy` (byte-for-byte
+  pin to captured 1.3 output) and `token_round_trips_through_bincode_2x`. The
+  capability-token wire format is provably **unchanged** by the 2.x migration —
+  the one branch where silent serialization drift would have broken tokens. No
+  churn risk found; ready to push as-is.
 
 ### #4 `chore/carrier-iroh-upgrade`
 - **What:** decision memo (`CARRIER_IROH_UPGRADE.md`) + corrected `audit.toml`

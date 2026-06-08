@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 42).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `a291becb7` + Day-42 push-plan verify, ~46 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 43).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `142f6339a` + Day-43 push-queue verify, ~48 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -463,6 +463,7 @@ next context can continue cold.
 - **D40** integrity audit: every claim→gate mapped (table in `DDRM_STATUS.md`), no orphan vectors / dead flags, counts re-validated fresh; **WASI smoke wired into `ddrm-verify.sh` as gate 4/4** (skips clean w/o wasmtime) — the last doc-only claim is now gate-backed (`4f0cc653a`).
 - **D41** pre-prove Anders' OTHER Q2 answer: a hybrid ECDSA-P256 + ML-DSA-65 `HybridVerifier` (feature `pq-mldsa-hybrid`=37, BOTH halves must verify, `wasm32-wasip1`-clean) through the same `hybrid_unwrap` path — Q2 is now a pure policy pick, both answers drop-in (`779c74ff6`, lock `a291becb7`).
 - **D42** build-hygiene (sibling branch, off the dDRM critical path): verified `fix/crosvm-darwin-build` is **green on this macOS** — `elastos-crosvm` 18 tests pass + warning-free, `elastos-server` builds clean; recorded in `PUSH_PLAN.md` (#1 now build-verified, not just authored). dDRM gate untouched (still 4/4).
+- **D43** build-verify push queue #3 + #2 on macOS: `chore/bincode-2x` **311 passed / 0 failed** incl. the capability-token byte-identity golden (`token_wire_format_is_bincode_1x_legacy`) — wire format provably unchanged; `fix/home-summary-resilience` builds clean + its `home_browser_state_*` tests pass (4 `home_launch`/`runtime_ensure` failures are **no-KVM env limits, identical on the crosvm branch → not a regression**, pass on Linux CI). Recorded in `PUSH_PLAN.md` with a Linux-test-gating follow-up. dDRM gate still 4/4.
 
 ---
 
