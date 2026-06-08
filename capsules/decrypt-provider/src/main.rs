@@ -25,6 +25,10 @@ mod envelope;
 // CEK in `Zeroizing`. Not wired into dispatch; see DDRM_DECRYPT_RAIL.md §PQ.
 #[cfg(feature = "pq-envelope")]
 mod pq_envelope;
+// Portable golden-vector schema (feature `vectors`): substrate-independent
+// fixtures the engines are replayed against. See src/vector_format.rs.
+#[cfg(feature = "vectors")]
+mod vector_format;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,

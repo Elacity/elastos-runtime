@@ -174,6 +174,36 @@ PQ dDRM data path — sealed CEK in → rendered bytes out, key contained — is
 proven before the rail lands; the remaining work is the transport shim, not the
 crypto or the engines.**
 
+### Engines pinned by portable golden vectors (Day 22)
+
+Both decrypt data paths are now locked by **substrate-independent golden vectors**
+(Feathers' characterization/golden-file pattern) committed under
+`capsules/decrypt-provider/tests/vectors/` — fixed input bytes → expected output,
+captured once and replayed through the engines with **no in-test sealing and no
+RNG** (every consumer step — ECDH/x25519 DH, ML-KEM decapsulate, AES open, CENC
+decrypt — is deterministic given the captured material):
+
+- **`classical_cenc.json`** — P-256 ECDH envelope (v3) → CENC AES-128-CTR. This
+  vector is **byte-compatible with PC2 `ddrm-decrypt`** (same envelope + cenc wire
+  shapes), so it doubles as a cross-implementation conformance fixture that can be
+  replayed against the reference implementation.
+- **`pq_hybrid_cenc.json`** — x25519+ML-KEM-768 hybrid seal → CENC AES-128-CTR
+  (`elastos-pq-hybrid-threshold-v0`). Runtime-specific (PC2 has no PQ), so the
+  vector pins it across refactor/rebase/port. Replaying it also reconstructs the
+  **typed `PqSealedEnvelope` from flat bytes** (ML-KEM dk + ciphertext
+  (de)serialization) — exercising the exact wire-decode the live rail will need.
+
+Each vector has a **replay** test (recover CEK → decrypt → assert plaintext) and a
+**corrupted-input fail-closed** test. The schema lives in `src/vector_format.rs`.
+Feature split keeps the surface clean: `vectors` (default OFF, enables
+`pq-rail-prep`) compiles + runs the four replay tests against the committed
+fixtures; `gen-vectors` regenerates the fixtures (`cargo test --features
+gen-vectors emit_`). The four base suites are **unchanged** (default 25, `rail-prep`
+27, `pq-envelope` 29, `pq-rail-prep` 31); `cargo test --features vectors` = **35
+green** (31 + 4 golden). Builds clean to `wasm32-wasip1`. **The engines are now
+refactor-/rebase-/port-safe and the classical path is conformance-checkable against
+PC2 — independent of any in-test seal helper.**
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

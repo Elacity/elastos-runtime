@@ -28,6 +28,14 @@ pq-envelope = ["dep:ml-kem", "dep:x25519-dalek", "dep:aes-gcm", "dep:sha2"]
 # (Day 19) and the PQ envelope (Day 20) into one cross-engine proof. OFF by
 # default; enables pq-envelope. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
 pq-rail-prep = ["pq-envelope"]
+# vectors: replay the committed portable golden vectors (tests/vectors/) through
+# the engines — substrate-independent proof that survives refactor/rebase/port and
+# is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).
+# Enables pq-rail-prep so both classical and PQ paths compile. OFF by default.
+vectors = ["pq-rail-prep"]
+# gen-vectors: regenerate the committed golden vectors (writes tests/vectors/).
+# Run manually: `cargo test --features gen-vectors emit_`. OFF by default.
+gen-vectors = ["vectors"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }

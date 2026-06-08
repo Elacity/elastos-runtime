@@ -416,4 +416,111 @@ mod tests {
             super::decrypt_pq_sealed_segment(&secret_b, &env, &StubVerifier, &segment, None).is_err()
         );
     }
+
+    // --- portable golden vector (PQ-hybrid envelope + cenc) -------------------
+    //
+    // The PQ path is runtime-specific (PC2 has no PQ profile), so the vector pins
+    // it across refactor/rebase/port. Capturing the sealed bytes also exercises
+    // the ML-KEM key/ciphertext (de)serialization the live rail's wire-decode
+    // needs — proving the typed envelope reconstructs from flat bytes.
+
+    /// Regenerate the committed PQ vector. Run:
+    /// `cargo test --features gen-vectors emit_pq_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_pq_vector() {
+        use base64::Engine as _;
+        use ml_kem::EncodedSizeUser;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = gen_session();
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let plaintext = b"the quick brown fox jumps over!!";
+        let env = seal(&public, &cek, &StubSigner);
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        let v = crate::vector_format::PqVector {
+            description: "x25519+ML-KEM-768 hybrid seal -> CENC AES-128-CTR (elastos-pq-hybrid-threshold-v0)".to_string(),
+            x25519_secret_b64: b64.encode(secret.x25519.to_bytes()),
+            mlkem_dk_b64: b64.encode(&secret.mlkem_dk.as_bytes()[..]),
+            eph_x25519_pub_b64: b64.encode(env.eph_x25519_pub),
+            kem_ct_b64: b64.encode(&env.kem_ct[..]),
+            nonce_b64: b64.encode(env.nonce),
+            wrapped_cek_b64: b64.encode(&env.wrapped_cek),
+            signature_b64: b64.encode(&env.signature),
+            cek_b64: b64.encode(cek),
+            encrypted_segment_b64: b64.encode(&segment),
+            expected_plaintext_b64: b64.encode(plaintext),
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/pq_hybrid_cenc.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Reconstruct the typed session secret + sealed envelope from the committed
+    /// flat bytes and replay the full PQ path — substrate-independent proof.
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    fn load_pq_vector() -> (SessionKemSecret, PqSealedEnvelope, crate::vector_format::PqVector) {
+        use base64::Engine as _;
+        use ml_kem::{Encoded, EncodedSizeUser};
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let v: crate::vector_format::PqVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/pq_hybrid_cenc.json"
+        )))
+        .unwrap();
+
+        let x_bytes: [u8; 32] = b64.decode(&v.x25519_secret_b64).unwrap().try_into().unwrap();
+        let x25519 = XStaticSecret::from(x_bytes);
+        let dk_bytes = b64.decode(&v.mlkem_dk_b64).unwrap();
+        let enc = Encoded::<MlKemDk>::try_from(dk_bytes.as_slice()).expect("ML-KEM dk size");
+        let mlkem_dk = MlKemDk::from_bytes(&enc);
+        let session = SessionKemSecret { x25519, mlkem_dk };
+
+        let ct_bytes = b64.decode(&v.kem_ct_b64).unwrap();
+        let kem_ct = Ciphertext::<MlKem768>::try_from(ct_bytes.as_slice()).expect("ML-KEM ct size");
+        let env = PqSealedEnvelope {
+            eph_x25519_pub: b64.decode(&v.eph_x25519_pub_b64).unwrap().try_into().unwrap(),
+            kem_ct,
+            nonce: b64.decode(&v.nonce_b64).unwrap().try_into().unwrap(),
+            wrapped_cek: b64.decode(&v.wrapped_cek_b64).unwrap(),
+            signature: b64.decode(&v.signature_b64).unwrap(),
+        };
+        (session, env, v)
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn pq_golden_vector_replays() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (session, env, v) = load_pq_vector();
+
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        let (output, meta) =
+            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None).unwrap();
+        let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
+        let mdat_off = segment.len() - expected.len();
+        assert_eq!(&output[mdat_off..], expected.as_slice(), "PQ vector plaintext recovered");
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn pq_golden_vector_corrupted_fails_closed() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (session, mut env, v) = load_pq_vector();
+        env.signature[0] ^= 0xFF; // tamper the signature
+
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        assert!(
+            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None).is_err(),
+            "a corrupted PQ vector must fail closed"
+        );
+    }
 }

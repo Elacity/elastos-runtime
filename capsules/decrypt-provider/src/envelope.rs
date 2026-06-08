@@ -295,4 +295,121 @@ mod tests {
             "raw CEK must not appear in the sealed envelope"
         );
     }
+
+    // --- portable golden vectors (classical envelope + cenc) ------------------
+
+    /// Minimal single-sample encrypted fMP4 segment, matching the decrypt-step
+    /// golden, for emitting a portable vector.
+    #[cfg(feature = "gen-vectors")]
+    fn build_encrypted_segment_for_vector(plaintext: &[u8], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+        fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+            let size = (8 + content.len()) as u32;
+            let mut b = size.to_be_bytes().to_vec();
+            b.extend_from_slice(box_type);
+            b.extend_from_slice(content);
+            b
+        }
+
+        let mut iv16 = [0u8; 16];
+        iv16[..8].copy_from_slice(iv8);
+        let mut ciphertext = plaintext.to_vec();
+        let mut cipher = Aes128Ctr::new(cek.into(), (&iv16).into());
+        cipher.apply_keystream(&mut ciphertext);
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        let trun = make_box(b"trun", &trun_content);
+        let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv8);
+        let senc = make_box(b"senc", &senc_content);
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mdat = make_box(b"mdat", &ciphertext);
+        let mut segment = moof;
+        segment.extend_from_slice(&mdat);
+        segment
+    }
+
+    /// Regenerate the committed classical vector. Run:
+    /// `cargo test --features gen-vectors emit_classical_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_vector() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let sk = SecretKey::random(&mut OsRng);
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let plaintext = b"the quick brown fox jumps over!!";
+        let sealed = make_envelope(&sk, &cek, 0x03);
+        let segment = build_encrypted_segment_for_vector(plaintext, &cek, &iv8);
+
+        let v = crate::vector_format::ClassicalVector {
+            description: "P-256 ECDH envelope (v3) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt".to_string(),
+            session_secret_key_b64: b64.encode(sk.to_bytes()),
+            sealed_envelope_b64: b64.encode(&sealed),
+            cek_b64: b64.encode(cek),
+            encrypted_segment_b64: b64.encode(&segment),
+            expected_plaintext_b64: b64.encode(plaintext),
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/classical_cenc.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Replay the committed classical vector through the engines (no in-test
+    /// sealing): proves the portable bytes still decrypt after any refactor.
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_golden_vector_replays() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let v: crate::vector_format::ClassicalVector = serde_json::from_str(include_str!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/classical_cenc.json")
+        ))
+        .unwrap();
+
+        let sk = SecretKey::from_slice(&b64.decode(&v.session_secret_key_b64).unwrap()).unwrap();
+        let sealed = b64.decode(&v.sealed_envelope_b64).unwrap();
+        let parsed = parse(&sealed).unwrap();
+        let recovered = extract_cek(&ecdh_unwrap(&sk, &parsed).unwrap()).unwrap();
+        assert_eq!(b64.encode(recovered.as_slice()), v.cek_b64, "vector CEK recovered via ECDH");
+
+        let cek_b64 = b64.encode(recovered.as_slice());
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        let (output, meta) = crate::decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
+        let mdat_off = segment.len() - expected.len();
+        assert_eq!(&output[mdat_off..], expected.as_slice(), "vector plaintext recovered via cenc");
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    /// A corrupted vector must fail closed (no plaintext on tampered input).
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_golden_vector_corrupted_fails_closed() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let v: crate::vector_format::ClassicalVector = serde_json::from_str(include_str!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/classical_cenc.json")
+        ))
+        .unwrap();
+        let sk = SecretKey::from_slice(&b64.decode(&v.session_secret_key_b64).unwrap()).unwrap();
+        let mut sealed = b64.decode(&v.sealed_envelope_b64).unwrap();
+        let n = sealed.len();
+        sealed[n - 1] ^= 0xFF; // corrupt the encrypted-CEK tail
+
+        let result = parse(&sealed).and_then(|p| ecdh_unwrap(&sk, &p));
+        assert!(result.is_err(), "a corrupted classical vector must fail closed");
+    }
 }
