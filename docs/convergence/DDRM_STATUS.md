@@ -1,10 +1,14 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **+14 commits**)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
-contract handoffs**. The only thing between here and live decrypt is one
-architecture decision (the CEK/ciphertext rail) — see `DDRM_DECRYPT_RAIL.md`.
+contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
+contract** (ECDH CEK-sealing envelope, `decrypt-provider/src/envelope.rs`) and the
+**downstream consumer contract** (both players receive scoped output, never the
+CEK). A full team-facing **security + threat model** is in
+`DDRM_SECURITY_MODEL.md`. The only thing between here and live decrypt is one
+architecture decision (the CEK transport rail) — see `DDRM_DECRYPT_RAIL.md`.
 
 ## The chain
 
@@ -17,10 +21,10 @@ app/viewer --drm/open--> drm-provider --sequences--> rights -> key -> decrypt --
 
 | Provider | Role | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
 | --- | --- | --- | --- | --- | --- |
-| `drm-provider` | orchestrator (`drm/open`) | yes | 12 | builds | 4/4 |
+| `drm-provider` | orchestrator (`drm/open`) + chain-seam | yes | 12 | builds | 4/4 |
 | `rights-provider` | rights decision | yes | 9 | builds | 4/4 |
-| `key-provider` | key release (PQ-hybrid) | yes | 9 | builds | 4/4 |
-| `decrypt-provider` | decrypt/render (+ cenc engine) | yes | 17 | builds | 4/4 |
+| `key-provider` | key release (rights-bound) | yes | 9 | builds | 4/4 |
+| `decrypt-provider` | decrypt/render (cenc + envelope + consumer contract) | yes | 25 | builds | 4/4 |
 
 ## Security properties proven
 
@@ -40,6 +44,18 @@ app/viewer --drm/open--> drm-provider --sequences--> rights -> key -> decrypt --
 - **Contracts compose.** `drm-provider::chain_seam_tests` prove a
   `RightsDecisionReceiptV1` deserializes into the key request and a
   `ReleaseReceiptV1` into the decrypt request — shared-type drift fails loudly.
+- **Upstream rail contract pinned (executable spec).** The CEK-sealing envelope
+  (vendored from PC2 `ddrm-decrypt`: P-256 ECDH unwrap → AES-256-CBC) is captured
+  as `decrypt-provider/src/envelope.rs` with characterization tests: v2/v3
+  round-trip, fail-closed parsing, `Zeroizing` on recovered material, and a
+  `sealed_envelope_does_not_contain_raw_cek` containment check. This is the
+  concrete shape of the rail's "Option A" decrypt boundary.
+- **Downstream consumer contract pinned (both players).** Tests in
+  `decrypt-provider` prove the scoped, player-facing response carries **metadata
+  only** for both viewer capsules — media (fMP4 segments via opaque handle) and
+  non-media (render-only plaintext via opaque session id) — and that a real
+  decrypted media segment never lets the CEK/IV/plaintext reach the player
+  boundary (`media_segment_decrypt_keeps_cek_and_plaintext_off_the_player_boundary`).
 
 ## How to run it yourself
 
@@ -58,11 +74,44 @@ scripts/ddrm-chain-smoke.sh
 ( cd capsules/decrypt-provider && cargo test )
 ```
 
-## The one open decision (for Anders)
+## PQ-hybrid-in-wasm viability (de-risked, Day 15)
 
-How the CEK (VM-sealed) and ciphertext reach the decrypt boundary. Hybrid chosen
-(decrypt step *receives* sealed material; upstream rights→key is a provider chain).
-Full options, recommendation, and questions in `DDRM_DECRYPT_RAIL.md`.
+The runtime profile requires PQ-hybrid crypto for the inter-stage CEK seal
+(`x25519 + ml-kem-768` KEM, `ml-dsa-65` signature). Before committing the rail to
+that profile, we proved the PQ halves actually build inside the wasm boundary:
+
+| Crate | Algorithm | Resolved version | `wasm32-wasip1` |
+| --- | --- | --- | --- |
+| `ml-kem` (RustCrypto) | ML-KEM-768 (FIPS 203) | 0.2.3 | **builds clean** |
+| `ml-dsa` (RustCrypto) | ML-DSA-65 (FIPS 204) | 0.0.4 | **builds clean** |
+
+Proof: a throwaway crate depending on both, built with `cargo build --target
+wasm32-wasip1` under the pinned `1.89.0` toolchain — green. Their transitive deps
+(`sha3 0.10.9`, `keccak 0.1.6`, `kem`, `signature`, `zeroize`) are all wasm-clean.
+The classical halves (`x25519-dalek`, `aes-gcm`) are already wasm-proven in tree.
+
+**Go/no-go:** GO on PQ-in-wasm. One caveat to flag at rail-design time: `ml-dsa`
+is still `0.0.x` (early, pre-1.0 API churn likely); `ml-kem` is more settled at
+`0.2.x`. Recommend pinning exact versions and keeping the signature scheme behind
+the envelope abstraction so a hybrid (ECDSA + ml-dsa) transition stays cheap.
+
+## The one open decision (for Anders / Irzhy)
+
+How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
+*receives* sealed material; upstream rights→key is a provider chain). Irzhy
+independently converged on the same gap and proposed **two boxes + secured channel
+(ECDH + DSA)** over merging — adopted, upgraded to the runtime PQ-hybrid profile.
+Three sharpened sub-questions remain for Anders:
+
+1. Does the **dKMS seal directly** to the decrypt session key (key-provider as a
+   pure broker that never holds a raw CEK), or is a key-provider **re-seal** ok?
+2. Signature during transition: straight to **ml-dsa-65**, or a **hybrid**
+   (ECDSA + ml-dsa) while PC2's classical path is migrated?
+3. Does the provider-invocation rail expose an in-capsule `carrier_invoke` client
+   a microvm provider may use today, or is that still landing?
+
+Full options, threat model, and the invariant→test table:
+`DDRM_DECRYPT_RAIL.md` + `DDRM_SECURITY_MODEL.md`.
 
 ## Isolation tier
 
@@ -72,13 +121,25 @@ fail-closed contract is tier-independent. Rationale in `DDRM_DECRYPT_RAIL.md`.
 
 ## Commits (on `feat/decrypt-provider-cenc`, not yet pushed — GitHub suspension)
 
-dDRM-related, newest last:
-- vendor PC2 cenc-decrypt engine as fail-closed backend
-- decrypt-provider: tested decrypt-step core seam (Branch-by-Abstraction)
-- decrypt-provider: WASI-sandbox smoke harness
-- key-provider: rights-receipt binding + wasm/WASI bar
-- rights-provider: WASI smoke (chain parity)
-- drm-provider: WASI smoke + cross-provider contract-seam tests
-- unified `scripts/ddrm-chain-smoke.sh` + this status doc
+14 commits ahead of `origin/0.4.0`, newest last:
 
-Plus docs: `DDRM_DECRYPT_RAIL.md`, `CONVERGENCE_PLAYBOOK.md`, `PRODUCT_VISION.md`.
+1. `docs(convergence)` — north-star playbook, product vision PRD, v0.4.0 plan
+2. `feat(decrypt-provider)` — vendor PC2 cenc-decrypt engine as fail-closed backend
+3. `docs(ddrm)` — record decrypt-rail decision (CEK/ciphertext transport)
+4. `feat(decrypt-provider)` — tested decrypt-step core seam (Branch-by-Abstraction)
+5. `docs(ddrm)` — isolation-tier recommendation (wasm now, microVM as hardening)
+6. `docs(ddrm)` — confirm decrypt-provider compiles clean to wasm32-wasip1
+7. `test(decrypt-provider)` — WASI-sandbox smoke harness proves fail-closed execution
+8. `feat(key-provider)` — bind rights receipt + bring to wasm/WASI-proven bar
+9. `test(rights-provider)` — WASI smoke completes rights→key→decrypt chain parity
+10. `test(drm-provider)` — WASI smoke + cross-provider contract-seam tests
+11. `feat(ddrm)` — unified chain smoke runner + review-ready status package
+12. `feat(ddrm)` — vendor ECDH CEK-sealing envelope spec + PC2 player alignment
+13. `test(ddrm)` — pin decrypt→player consumer contract for both viewer capsules
+14. `docs(ddrm)` — security model doc + inter-stage CEK transport decision
+
+Push order & PR mapping when GitHub returns: `PUSH_PLAN.md`.
+
+Supporting docs: `DDRM_DECRYPT_RAIL.md`, `DDRM_SECURITY_MODEL.md`,
+`PC2_PLAYER_ALIGNMENT.md`, `CONVERGENCE_PLAYBOOK.md`, `PRODUCT_VISION.md`,
+`PUSH_PLAN.md`.

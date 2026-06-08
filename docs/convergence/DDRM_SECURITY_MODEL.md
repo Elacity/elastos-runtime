@@ -131,6 +131,14 @@ Post-quantum hybrid by default; weaker is rejected at validation:
 | Key sharing | `shamir-t-of-n` threshold |
 | Envelope scheme | `elastos-pq-hybrid-threshold-v0` |
 
+**Wasm viability (de-risked Day 15):** the PQ halves build inside the wasm
+boundary — `ml-kem 0.2.3` (ML-KEM-768) and `ml-dsa 0.0.4` (ML-DSA-65) both compile
+to `wasm32-wasip1` under the pinned `1.89.0` toolchain (classical `x25519-dalek` /
+`aes-gcm` already wasm-proven in tree). So sealing + unwrap can live in
+decrypt-provider's wasm boundary without surprise. Caveat: `ml-dsa` is `0.0.x`
+(pre-1.0) — pin exact versions and keep the sig behind the envelope abstraction.
+Evidence + go/no-go: `DDRM_STATUS.md` § PQ-hybrid-in-wasm viability.
+
 ## 8. Threat model (what an attacker reaches at each boundary)
 
 | Attacker position | Can reach | Cannot reach (by design) |
