@@ -183,3 +183,31 @@ live wasm substrate.
 - `decrypt-provider` validates the full session+receipt contract and fails closed.
 - Once the rail is chosen, wiring is a small, well-scoped step: validated
   request (+ material) → `cenc::process` → scoped output.
+
+## Inter-stage CEK transport — ECDH + DSA, PQ-hybrid (Irzhy, 2026-06-08)
+
+Irzhy independently flagged this exact gap and proposed: either wrap key-release +
+decrypt into one box, or secure the channel between them with ECDH + DSA. Decision:
+**two boxes, secured channel** (do not merge — merging widens the authority blast
+radius). The CEK travels **sealed to decrypt-provider's per-session public key and
+signed**; it is unwrapped, used, and zeroized **only inside decrypt-provider**, so
+recovery + decrypt are colocated (the "one box" benefit) without collapsing the
+rights → key → decrypt authority separation.
+
+- decrypt-provider mints a per-session keypair + publishes its session pubkey
+  (PC2 precedent: `ddrm-decrypt/session.rs`).
+- the key authority seals the CEK to that pubkey (KEM/ECDH) + signs (DSA).
+- **strongest variant:** the dKMS seals **directly** to the decrypt session key, so
+  key-provider is a pure broker and never holds a raw CEK.
+- **crypto reconciliation:** PC2's vendored envelope is classical P-256 ECDH +
+  ECDSA; the shipped rail must use the runtime PQ-hybrid profile
+  (`x25519 + ml-kem-768`, `ml-dsa-65`, `elastos-pq-hybrid-threshold-v0`) — keep
+  PC2's envelope structure + discipline, upgrade the crypto.
+
+Full write-up + threat model + invariant→test table: `DDRM_SECURITY_MODEL.md`.
+
+### Sharpened questions for Anders
+1. Should the **dKMS seal directly** to the decrypt session key (key-provider as
+   pure broker), or is a key-provider **re-seal** acceptable?
+2. Signature during transition: move straight to **ml-dsa-65**, or keep a
+   **hybrid** (ECDSA + ml-dsa) while PC2's classical path is migrated?
