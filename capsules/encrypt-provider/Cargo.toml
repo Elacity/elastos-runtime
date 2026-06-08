@@ -32,6 +32,13 @@ getrandom = "0.2"
 
 [dev-dependencies]
 
+[features]
+# gen-vectors: emit the encrypt->decrypt round-trip golden produced by THIS
+# provider's real in-boundary engine (mint CEK+KID -> CENC encrypt -> mux), into
+# decrypt-provider/tests/vectors/ for the consumer to replay. OFF by default.
+# Run: `cargo test --features gen-vectors emit_roundtrip`.
+gen-vectors = []
+
 [profile.release]
 opt-level = "s"
 lto = true

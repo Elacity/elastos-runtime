@@ -32,6 +32,24 @@ pub struct ClassicalVector {
     pub expected_plaintext_b64: String,
 }
 
+/// Encrypt→decrypt round-trip golden: an asset sealed by `encrypt-provider`'s real
+/// in-boundary engine (mint CEK+KID → CENC encrypt → mux) that `decrypt-provider`
+/// must decrypt back to the original bytes. Pins the cross-invariant composition
+/// (#1 produce ↔ #2 consume). The CEK is captured as the test stand-in for the
+/// still-blocked transport rail (in production it arrives sealed, never in clear).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RoundTripVector {
+    pub description: String,
+    /// The in-boundary-minted Key ID (hex) the producer surfaced.
+    pub kid_hex: String,
+    /// The 16-byte CEK the producer minted (rail stand-in — see above).
+    pub cek_b64: String,
+    /// The encrypted fMP4 segment the producer emitted.
+    pub encrypted_segment_b64: String,
+    /// The plaintext the producer encrypted (and the consumer must recover).
+    pub expected_plaintext_b64: String,
+}
+
 /// PQ-hybrid CEK-seal path: x25519+ML-KEM-768 unwrap → CENC AES-128-CTR decrypt.
 /// Runtime-specific (the `elastos-pq-hybrid-threshold-v0` profile).
 #[derive(Debug, Serialize, Deserialize)]

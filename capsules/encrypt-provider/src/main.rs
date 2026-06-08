@@ -531,4 +531,80 @@ mod tests {
             assert_eq!(iv.len(), 8, "CENC IVs are 8 bytes, never a 16-byte CEK");
         }
     }
+
+    // --- encrypt -> decrypt round-trip golden (feature `gen-vectors`) ----------
+    //
+    // Emits a fixture PRODUCED BY THIS PROVIDER's real in-boundary engine
+    // (mint CEK+KID -> CENC encrypt) muxed into a minimal fMP4 segment, written
+    // into decrypt-provider/tests/vectors/ for the consumer to replay. This pins
+    // the cross-invariant composition: an asset sealed by encrypt-provider
+    // decrypts in decrypt-provider to the original bytes.
+    //
+    // The CEK is captured into the fixture as the test stand-in for the still-
+    // blocked transport rail (DDRM_DECRYPT_RAIL.md): in production the CEK reaches
+    // decrypt SEALED, never in the clear. The seal/envelope transport is the one
+    // remaining gap; the cipher + keygen composition is proven here.
+    #[cfg(feature = "gen-vectors")]
+    fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (8 + content.len()) as u32;
+        let mut b = size.to_be_bytes().to_vec();
+        b.extend_from_slice(box_type);
+        b.extend_from_slice(content);
+        b
+    }
+
+    /// Mux an encrypted single sample + its 8-byte IV into the minimal
+    /// moof{traf{trun,senc}} + mdat segment the decrypt engine consumes. This is
+    /// the box surgery the producer's muxer will perform (a later, separate
+    /// boundary); done test-side so the round-trip is exercised end to end.
+    #[cfg(feature = "gen-vectors")]
+    fn mux_segment(ciphertext: &[u8], iv8: &[u8; 8]) -> Vec<u8> {
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        let trun = make_box(b"trun", &trun_content);
+        let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv8);
+        let senc = make_box(b"senc", &senc_content);
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mdat = make_box(b"mdat", ciphertext);
+        let mut segment = moof;
+        segment.extend_from_slice(&mdat);
+        segment
+    }
+
+    /// Regenerate the committed encrypt->decrypt round-trip golden. Run:
+    /// `cargo test --features gen-vectors emit_roundtrip_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_roundtrip_vector() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // Produce the asset with the REAL in-boundary engine internals: mint a CEK
+        // + KID with the CSPRNG, then CENC-encrypt one sample. The CEK is captured
+        // here (test stand-in for the sealed rail) so the consumer can decrypt.
+        let minted = mint_cek_and_kid().expect("mint");
+        let plaintext = b"the quick brown fox jumps over!!"; // 32 bytes, full-sample
+        let sizes = [plaintext.len() as u32];
+        let iv_seed = [0x22u8; 8];
+        let (ciphertext, ivs, _subs) =
+            cenc::encrypt_samples(plaintext, &minted.cek, &sizes, &iv_seed, 0).expect("encrypt");
+        let segment = mux_segment(&ciphertext, &ivs[0]);
+
+        let v = json!({
+            "description": "encrypt-provider in-boundary mint+CENC -> decrypt-provider cenc; CEK captured (rail stand-in)",
+            "kid_hex": minted.kid_hex,
+            "cek_b64": b64.encode(&*minted.cek),
+            "encrypted_segment_b64": b64.encode(&segment),
+            "expected_plaintext_b64": b64.encode(plaintext),
+        });
+        // Write into the consumer's vectors dir so decrypt-provider can include_str! it.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../decrypt-provider/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/roundtrip_encrypt_to_decrypt.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
 }

@@ -530,6 +530,50 @@ mod tests {
         assert_eq!(meta["sample_count"], json!(1));
     }
 
+    /// Cross-invariant round-trip: replay the golden PRODUCED BY encrypt-provider's
+    /// real in-boundary engine (mint CEK+KID -> CENC encrypt -> mux) and prove THIS
+    /// provider decrypts it back to the producer's original bytes, with the CEK
+    /// staying off the scoped boundary. Pins #1 (produce) ↔ #2 (consume) on one
+    /// artifact. Regenerate the fixture with:
+    ///   (cd ../encrypt-provider && cargo test --features gen-vectors emit_roundtrip_vector)
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn encrypt_to_decrypt_round_trip_golden() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v: crate::vector_format::RoundTripVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/roundtrip_encrypt_to_decrypt.json"
+        )))
+        .unwrap();
+
+        // The producer surfaced a 16-byte KID; the CEK never appears in the KID.
+        assert_eq!(v.kid_hex.len(), 32, "producer KID is 16 bytes (32 hex)");
+
+        let cek_b64 = v.cek_b64.clone();
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
+
+        let (output, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let mdat_off = segment.len() - expected.len();
+        assert_eq!(
+            &output[mdat_off..],
+            expected.as_slice(),
+            "decrypt-provider must recover the exact bytes encrypt-provider sealed"
+        );
+        assert_eq!(meta["is_protected"], json!(true));
+        assert_eq!(meta["sample_count"], json!(1));
+
+        // Containment at the consumer edge: the scoped response leaks neither the
+        // (rail stand-in) CEK nor the recovered plaintext.
+        let response = scoped_session_response(&decrypt_request(), &meta);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(std::str::from_utf8(&expected).unwrap()),
+            "plaintext must not cross the boundary"
+        );
+    }
+
     #[test]
     fn decrypt_session_segment_fails_closed_on_bad_cek() {
         let short_cek = base64::engine::general_purpose::STANDARD.encode([0u8; 8]);

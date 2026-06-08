@@ -250,6 +250,32 @@ negative. Base suites unchanged (25/27/29/31); chain 68; drift PASS. **The rail
 contract is now guarded on both the happy path and the fail-closed path, across
 both envelope versions, by code that runs the reference implementation.**
 
+### Encrypt→decrypt round-trip golden — both invariants pinned on one artifact (Day 26)
+
+The two ends were proven separately (invariant #1: `encrypt-provider` mints CEK+KID
+in-boundary and CENC-encrypts; invariant #2: `decrypt-provider` unwraps + cenc-
+decrypts). They are now proven to **compose** on a single artifact:
+
+- `encrypt-provider` (feature `gen-vectors`) runs its **real in-boundary engine**
+  (`mint_cek_and_kid` → `cenc::encrypt_samples` → mux) and writes
+  `roundtrip_encrypt_to_decrypt.json` into `decrypt-provider/tests/vectors/`.
+- `decrypt-provider` (feature `vectors`) replays it
+  (`encrypt_to_decrypt_round_trip_golden`) and asserts it **recovers the producer's
+  exact plaintext**, with the CEK leaking onto neither the producer's output type
+  (`SealedSegment` has no CEK field — compile-time) nor the consumer's scoped
+  response.
+
+`cargo test --features vectors` (decrypt) = **37 green** (+1 round-trip); the base
+ladder is unchanged (25/27/29/31) and `encrypt-provider` stays **13** (emit gated
+off by default). Both build clean to `wasm32-wasip1`.
+
+**Recorded gap (the rail, unchanged):** the CEK is captured into the fixture as a
+stand-in for the still-blocked transport rail — in production it reaches decrypt
+**sealed**, never in the clear. So this golden pins the **cipher + keygen
+composition** (an asset sealed here decrypts there); the **seal/envelope transport**
+is exactly what lands when Anders confirms the rail. The byte-identical cipher cores
+(both `apply_keystream` AES-128-CTR with `pad_iv`) make that composition sound.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
