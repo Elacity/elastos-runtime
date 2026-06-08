@@ -111,6 +111,22 @@ Recommendation for `decrypt-provider`:
 - First concrete task on `wasm` confirmation: verify `elastos-common`
   (`protected_content`) compiles clean to `wasm32-wasip1`.
 
+### wasm viability — confirmed (2026-06-08)
+
+`cargo build --target wasm32-wasip1` for `decrypt-provider` succeeds with **zero
+code changes**. The full decrypt path is wasm-clean: the cenc engine (`aes`,
+`ctr`, `base64`), `elastos-common::protected_content` (`serde`, `serde_json`,
+`sha2`, `hex`, `thiserror`), and the provider itself all compile to
+`wasm32-wasip1` (valid WebAssembly MVP module emitted). All 17 host tests remain
+green. This is hard evidence that `decrypt-provider` can ship on the live wasm
+substrate today; microVM remains the later max-isolation upgrade for the same
+Rust source.
+
+Reproduce:
+```
+cd capsules/decrypt-provider && cargo build --target wasm32-wasip1
+```
+
 ## What is NOT blocked (and is done/ready)
 
 - The cenc engine is vendored, characterization-tested, and proven to contain +
