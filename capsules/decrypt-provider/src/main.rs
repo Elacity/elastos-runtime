@@ -7,7 +7,8 @@
 
 use elastos_common::protected_content::{
     DecryptSessionRequestV1, ReleaseReceiptV1, DECRYPT_SESSION_REQUEST_SCHEMA,
-    PROTECTED_CONTENT_ACTIONS, PROTECTED_CONTENT_OUTPUTS, RELEASE_RECEIPT_SCHEMA,
+    DECRYPT_SESSION_SCHEMA, PROTECTED_CONTENT_ACTIONS, PROTECTED_CONTENT_OUTPUTS,
+    RELEASE_RECEIPT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -136,6 +137,57 @@ impl DecryptProvider {
             "rendering requires a configured key release and decrypt/render backend",
         )
     }
+}
+
+/// Decrypt a protected-content segment using session material (the decrypt-step core).
+///
+/// Branch-by-Abstraction seam (see `docs/convergence/DDRM_DECRYPT_RAIL.md`): this is the
+/// decrypt-step backend for the Hybrid rail, where the decrypt boundary *receives* its
+/// material rather than reaching out for it. It is intentionally not yet reachable from
+/// `open_session`/`render` — the CEK + ciphertext transport rail is an open architecture
+/// decision. It is exercised directly by tests to prove the engine is correct at the
+/// provider boundary and that the CEK never escapes this function.
+///
+/// The vendored cenc engine owns the CEK lifetime: it decodes `cek_b64`, uses it, and
+/// zeroizes it on every return path. The returned plaintext is consumed only by the
+/// scoped output sink inside the isolation boundary; it is never placed in a
+/// caller-visible `Response`.
+#[allow(dead_code)]
+fn decrypt_session_segment(
+    cek_b64: &str,
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, Value), String> {
+    let command = json!({ "cek_b64": cek_b64, "iv_size": 8 }).to_string();
+    let (result_json, output) = cenc::process(&command, ciphertext_segment, init_segment);
+    let meta: Value = serde_json::from_str(&result_json).map_err(|err| err.to_string())?;
+    if meta.get("success").and_then(Value::as_bool) != Some(true) {
+        let message = meta
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("decrypt failed");
+        return Err(message.to_string());
+    }
+    let plaintext = output.ok_or_else(|| "decrypt produced no output".to_string())?;
+    Ok((plaintext, meta))
+}
+
+/// Build the scoped, containment-safe decrypt-session response for the caller.
+///
+/// Carries session and output metadata only. The raw CEK and the decrypted plaintext
+/// never cross this boundary to the caller (app/viewer capsule).
+#[allow(dead_code)]
+fn scoped_session_response(request: &DecryptSessionRequestV1, decrypt_meta: &Value) -> Response {
+    Response::ok(json!({
+        "schema": DECRYPT_SESSION_SCHEMA,
+        "session_id": request.session_id,
+        "object_cid": request.object_cid,
+        "viewer_interface": request.viewer_interface,
+        "output_kind": request.output_kind,
+        "is_protected": decrypt_meta.get("is_protected"),
+        "sample_count": decrypt_meta.get("sample_count"),
+        "expires_at": request.expires_at,
+    }))
 }
 
 fn validate_decrypt_session_request(request: &DecryptSessionRequestV1) -> Result<(), String> {
@@ -365,6 +417,94 @@ mod tests {
         assert_eq!(
             error_code(provider.open_session(request)),
             "invalid_request"
+        );
+    }
+
+    // --- decrypt-step core seam (Branch-by-Abstraction; see DDRM_DECRYPT_RAIL.md) ---
+
+    use aes::cipher::{KeyIvInit, StreamCipher};
+    use base64::Engine;
+
+    type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+    fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (8 + content.len()) as u32;
+        let mut b = size.to_be_bytes().to_vec();
+        b.extend_from_slice(box_type);
+        b.extend_from_slice(content);
+        b
+    }
+
+    /// Minimal single-sample encrypted fMP4 segment: moof{traf{trun,senc}} + mdat{ciphertext}.
+    fn build_encrypted_segment(plaintext: &[u8], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+        let mut iv16 = [0u8; 16];
+        iv16[..8].copy_from_slice(iv8);
+        let mut ciphertext = plaintext.to_vec();
+        let mut cipher = Aes128Ctr::new(cek.into(), (&iv16).into());
+        cipher.apply_keystream(&mut ciphertext);
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        let trun = make_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv8);
+        let senc = make_box(b"senc", &senc_content);
+
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mdat = make_box(b"mdat", &ciphertext);
+
+        let mut segment = moof;
+        segment.extend_from_slice(&mdat);
+        segment
+    }
+
+    #[test]
+    fn decrypt_session_segment_recovers_plaintext() {
+        let plaintext = b"the quick brown fox jumps over!!"; // 32 bytes
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+        let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
+
+        let (output, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+
+        let moof_len = segment.len() - (8 + plaintext.len());
+        let mdat_off = moof_len + 8;
+        assert_eq!(&output[mdat_off..mdat_off + plaintext.len()], plaintext);
+        assert_eq!(meta["is_protected"], json!(true));
+        assert_eq!(meta["sample_count"], json!(1));
+    }
+
+    #[test]
+    fn decrypt_session_segment_fails_closed_on_bad_cek() {
+        let short_cek = base64::engine::general_purpose::STANDARD.encode([0u8; 8]);
+        assert!(decrypt_session_segment(&short_cek, &[], None).is_err());
+    }
+
+    #[test]
+    fn scoped_session_response_leaks_neither_cek_nor_plaintext() {
+        let plaintext = b"the quick brown fox jumps over!!";
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+        let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
+
+        let (_plaintext_bytes, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let response = scoped_session_response(&decrypt_request(), &meta);
+        let serialized = serde_json::to_string(&response).unwrap();
+
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must never cross the provider boundary to the caller"
+        );
+        let plaintext_str = std::str::from_utf8(plaintext).unwrap();
+        assert!(
+            !serialized.contains(plaintext_str),
+            "decrypted plaintext must never cross the provider boundary to the caller"
         );
     }
 }
