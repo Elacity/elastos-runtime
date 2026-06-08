@@ -1996,8 +1996,7 @@ const libraryDesktopIcon = read("capsules/library/icons/sidebar-folder-desktop.s
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
 const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
 const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
-const fileManagerMigrationDoc = read("docs/FILE_MANAGER_MIGRATION.md");
-const todayLibraryTracker = read("TODAY.md");
+const namespacesDoc = read("docs/NAMESPACES.md");
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/index.html");
 const gbaStyle = read("capsules/gba-emulator/style.css");
@@ -2582,12 +2581,13 @@ assert(
   "Library object model must separate current file-byte content_cid from published_cid/public elastos:// links",
 );
 assert(
-  fileManagerMigrationDoc.includes("Local mutable storage") &&
-    fileManagerMigrationDoc.includes("CID is content identity, not a storage-location guarantee") &&
-    fileManagerMigrationDoc.includes("Private files are SmartWeb object heads") &&
-    todayLibraryTracker.includes("Library object identity is split deliberately") &&
-    todayLibraryTracker.includes("current immutable raw-byte `content_cid`") &&
-    todayLibraryTracker.includes("public `elastos://` links use `published_cid`"),
+  namespacesDoc.includes("Library's user-facing `Public` place") &&
+    namespacesDoc.includes("placement is separate from published content identity") &&
+    namespacesDoc.includes("`content_cid`") &&
+    namespacesDoc.includes("`published_cid`") &&
+    namespacesDoc.includes("`elastos://<cid>` receipt") &&
+    namespacesDoc.includes("placing an object in `Public`") &&
+    namespacesDoc.includes("silently publish it"),
   "Docs must explain that local files are provider-owned mutable storage with CIDs, while published_cid is the public SmartWeb availability identity",
 );
 assert(
@@ -4018,7 +4018,6 @@ assert(
   "System must not hold browser wallet adapter authority",
 );
 const tasks = read("TASKS.md");
-const today = read("TODAY.md");
 const browserPlanningSurface = [
   tasks,
   read("docs/BROWSER_CAPSULE.md"),
@@ -4330,10 +4329,12 @@ assert(
 assert(
   browserObjectiveAudit.includes("elastos.browser.objective-audit/v1") &&
     browserObjectiveAudit.includes("Browser objective is not complete") &&
-    !browserObjectiveAudit.includes("TODAY.md") &&
     browserObjectiveAudit.includes("hosted_provider_product_accepted") &&
     browserObjectiveAudit.includes("native_product_media_accepted") &&
     browserObjectiveAudit.includes("manual_ux_accepted") &&
+    browserObjectiveAudit.includes("TASKS.md") &&
+    browserObjectiveAudit.includes("ROADMAP.md") &&
+    browserObjectiveAudit.includes("docs/BROWSER_PROVIDER_BAKEOFF.md") &&
     browserObjectiveAudit.includes("provider_decision_next_action_defined") &&
     browserObjectiveAudit.includes("consult_provider_decision_report") &&
     browserObjectiveAudit.indexOf("consult_provider_decision_report") <
@@ -6350,8 +6351,8 @@ assert(
 
 const principles = read("PRINCIPLES.md");
 const architecture = read("docs/ARCHITECTURE.md");
+const contentAvailabilityDoc = read("docs/CONTENT_AVAILABILITY.md");
 const roadmap = read("ROADMAP.md");
-const namespacesDoc = read("docs/NAMESPACES.md");
 const overviewDoc = read("docs/OVERVIEW.md");
 const designSystem = read("docs/DESIGN_SYSTEM.md");
 const commandMatrix = read("docs/COMMAND_MATRIX.md");
@@ -6401,36 +6402,62 @@ assert(
   "TASKS.md must not re-list completed branch-local availability/storage proof slices as open work",
 );
 assert(
-  today.includes(
-    "Branch-local protected-recipient and availability/storage proof work is",
-  ) &&
-    today.includes(
-      "Production multi-peer availability and storage markets are now explicitly",
+  contentAvailabilityDoc.includes("This is") &&
+    contentAvailabilityDoc.includes(
+      "provider-mediated autonomous cross-peer repair for announced Carrier peers",
     ) &&
-    today.includes(
-      "marked as a `TASKS.md` blocker, not branch-local release work",
+    contentAvailabilityDoc.includes(
+      "not yet a complete global storage market",
+    ) &&
+    contentAvailabilityDoc.includes(
+      "External availability providers still own production peer admission across",
+    ) &&
+    contentAvailabilityDoc.includes(
+      "independent provider networks",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "production multi-peer availability/storage markets require real external infrastructure before this can close",
     ),
-  "TODAY.md must distinguish completed branch-local proof work from the open production infrastructure blocker",
+  "Durable docs must distinguish completed branch-local proof work from the open production infrastructure blocker",
 );
 assert(
-  today.includes(
-    "Production multi-peer availability and storage markets require real",
+  contentAvailabilityDoc.includes("production independent provider-network") &&
+    contentAvailabilityDoc.includes(
+      "quota-ledger federation beyond the configured bounded endpoint quorum",
+    ) &&
+    contentAvailabilityDoc.includes(
+      "federated network abuse throttles/banlists/abuse ledgers beyond the configured",
+    ) &&
+    contentAvailabilityDoc.includes("bounded abuse-control endpoint quorum") &&
+    contentAvailabilityDoc.includes(
+      "configured Carrier peer-attestation endpoint quorum",
+    ) &&
+    contentAvailabilityDoc.includes("production storage-market admission/execution") &&
+    contentAvailabilityDoc.includes("current signed") &&
+    contentAvailabilityDoc.includes("admission proof path") &&
+    contentAvailabilityDoc.includes("live") &&
+    contentAvailabilityDoc.includes("settlement/escrow execution"),
+  "Content availability docs must keep a hard production-infrastructure gate so local proof/status shims cannot be mistaken for production completion",
+);
+assert(
+  contentAvailabilityDoc.includes(
+    "Optional federated quota-ledger exchange",
   ) &&
-    today.includes("production infrastructure and remain outside this branch scope") &&
-    today.includes("local endpoint shim, receipt-only schema, policy/status") &&
-    today.includes("storage-market pricing/SLA/settlement/escrow"),
-  "TODAY.md must keep a hard production-infrastructure gate so local proof/status shims cannot be mistaken for production completion",
-);
-assert(
-    today.includes("configured federated quota-ledger endpoint-quorum exchange tests") &&
-    today.includes("configured federated abuse-control endpoint-quorum exchange tests") &&
-    today.includes("configured Carrier peer-attestation endpoint-quorum exchange tests") &&
-    today.includes("configured storage-market endpoint-quorum admission tests") &&
-    today.includes("configured external repair-fleet endpoint-quorum dispatch tests") &&
-    today.includes("node scripts/home-entropy-check.mjs") &&
-    today.includes("bash scripts/check-wci-alignment.sh") &&
-    today.includes("git diff --check"),
-  "TODAY.md completion audit must record quota-ledger, abuse-control, storage-market, and Carrier peer-attestation quorum proofs plus entropy/alignment gates",
+    contentAvailabilityDoc.includes(
+      "Optional federated abuse-control exchange",
+    ) &&
+    contentAvailabilityDoc.includes(
+      "Optional Carrier peer-attestation exchange",
+    ) &&
+    contentAvailabilityDoc.includes(
+      "Optional storage-market endpoint-quorum admission gate",
+    ) &&
+    contentAvailabilityDoc.includes("Optional external repair-fleet dispatch") &&
+    tasks.includes(
+      "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
+    ) &&
+    namespacesDoc.includes("explicit capability keys"),
+  "Durable docs must record quota-ledger, abuse-control, storage-market, Carrier peer-attestation, repair-fleet, and capability-key gates",
 );
 assert(
   !runtimeChecklist.includes("Shared is useful"),

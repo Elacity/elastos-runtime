@@ -586,8 +586,10 @@ assert(
     browserObjectiveAudit.includes("manual UX evidence") &&
     browserObjectiveAudit.includes("audio_product_proven") &&
     browserObjectiveAudit.includes("manual_user_acceptance") &&
-    !browserObjectiveAudit.includes("TODAY.md"),
-  "Browser completion gates must produce durable machine artifacts and must not depend on ignored TODAY.md evidence",
+    browserObjectiveAudit.includes("TASKS.md") &&
+    browserObjectiveAudit.includes("ROADMAP.md") &&
+    browserObjectiveAudit.includes("docs/BROWSER_PROVIDER_BAKEOFF.md"),
+  "Browser completion gates must produce durable machine artifacts and planning evidence",
 );
 
 assert(

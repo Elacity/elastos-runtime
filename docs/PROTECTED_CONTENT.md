@@ -129,8 +129,8 @@ The provider plane should expose typed questions instead:
 ## Remaining Sequence
 
 1. Wire real `elastos://drm/open` orchestration behind the declared sequence:
-   content status/fetch, typed rights checks, key release, decrypt/render
-   sessions, and signed release receipts.
+   content status/fetch, typed rights checks, rights-bound key release,
+   release-receipt-bound decrypt/render sessions, and signed release receipts.
 2. Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend.
 3. Wire `decrypt-provider` to a real decrypt/render backend that keeps CEKs
    inside the provider boundary.

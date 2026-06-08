@@ -59,7 +59,9 @@ The current preview is grounded in code and recorded proof, but not every path h
 - immediate public sharing through `elastos share --public`
 - signed publish, install, and update
 - native chat as the default proving surface, with explicit WASM and microVM chat proving paths
-- initial read-only `webspace-provider` resolution under `localhost://WebSpaces/Elastos`
+- `webspace-provider` resolution under `localhost://WebSpaces`, with read-only
+  resolver mounts plus local materialized writable mounts/forks backed by
+  provider-owned object/head tables
 - content availability manifests and signed local availability receipts above
   the low-level `ipfs-provider`
 
@@ -151,6 +153,8 @@ The current relationship is:
 - `localhost://ElastOS/...` = runtime-owned local system state and services
 - `elastos://...` = decentralized identities, shared content, and provider-routed surfaces between nodes
 - `localhost://WebSpaces/<moniker>/...` = the local mounted/interpreted view of a broader dynamic named space
+- provider-specific targets such as `cloud://drive/...` are resolver-private
+  implementation details until a provider contract intentionally exposes them
 
 For documents specifically:
 
@@ -195,12 +199,15 @@ What is already true in code:
 - file-backed localhost roots are first-class
 - `MyWebSite` and `Public` are distinct
 - `http://` is no longer a first-class capability/manifest resource scheme
-- an initial read-only `webspace-provider` slice exists for mounted moniker listing/resolution and typed handles under `localhost://WebSpaces/Elastos`
+- `webspace-provider` exposes mounted moniker listing/resolution, typed handles,
+  persistent mount/index/head/object tables, and local materialized write/mkdir/delete
+  flows for writable mounts/forks
 - the current depth boundary is explicit: `content/<cid>` resolves to a file endpoint, while `peer/<id>`, `did/<did>`, and `ai/<backend>` stop at one typed folder handle and fail closed on deeper traversal
 
 What remains open:
 
-- deeper `WebSpaces` daemon/object resolution beyond the initial `Elastos` handle and its first typed children
+- live external resolver traversal, remote mutable/fork sync, and provider-to-provider
+  Carrier invocation beyond the local materialized WebSpace object model
 - stronger root-aware substrate cleanup across the remaining internal tests/examples
 - broader system-service mapping
 

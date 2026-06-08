@@ -109,8 +109,15 @@ node -e '
     process.exit(1);
   }
   const plannedItem = audit.prompt_to_artifact_checklist.find((item) => item.id === "planned_and_iterated");
-  if (!plannedItem || !Array.isArray(plannedItem.evidence) || plannedItem.evidence.includes("TODAY.md")) {
-    console.error("planned_and_iterated evidence must use durable docs/scripts, not ignored TODAY.md");
+  if (
+    !plannedItem ||
+    !Array.isArray(plannedItem.evidence) ||
+    !plannedItem.evidence.includes("TASKS.md") ||
+    !plannedItem.evidence.includes("ROADMAP.md") ||
+    !plannedItem.evidence.includes("docs/BROWSER_PROVIDER_BAKEOFF.md") ||
+    !plannedItem.evidence.includes("scripts/browser-objective-audit.mjs")
+  ) {
+    console.error("planned_and_iterated evidence must use durable docs/scripts");
     process.exit(1);
   }
   const nextActionCriterion = audit.criteria.find((item) => item.id === "provider_decision_next_action_defined");

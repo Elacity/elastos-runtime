@@ -27,7 +27,7 @@ work log.
 - Put temporary investigation notes in the active issue, PR, review comment, or
   untracked working note.
 - Put release truth in `state.md` or `elastos/CHANGELOG.md`.
-- Put active branch coordination in `TODAY.md`.
+- Put active branch coordination in the active issue, PR, or review thread.
 - Put durable architecture or operator guidance in the relevant `docs/` file.
 
 ## Provider Bridge Invariant

@@ -477,18 +477,22 @@ localhost://ElastOS/Documents/<doc-did>   → Mutable document object
 localhost://Users/<principal-root>/Documents/report.pdf → Principal-owned local file
 localhost://MyWebSite/index.html            → Local browser-facing site root
 localhost://Public/manual.pdf               → Locally shared public file
-google://drive/vacation-photos              → Third-party provider example (aspirational, not implemented)
+localhost://WebSpaces/Cloud Drive/Project X/file.pdf → Mounted third-party WebSpace view (aspirational)
+cloud://drive/files/<stable-file-id>         → Third-party provider target (aspirational, provider-private)
 elastos://peer/did:key:z6Mk.../shared/music → P2P from a verified peer
 elastos://ai/claude/chat                    → AI provider
 ```
 
-### Provider + Content Separation
+### Mounted WebSpace + Provider + Content Separation
 
 ```
-google://drive/photo.jpg   (aspirational provider example)
-   │          │
-   │          └─► Content path (what to fetch)
-   └─► Provider (how to fetch, credentials)
+localhost://WebSpaces/Cloud Drive/Project X/photo.jpg
+   │
+   └─► Local mounted WebSpace handle shown to Library/Home
+
+cloud://drive/files/<stable-file-id>    (aspirational provider target)
+   │
+   └─► Provider-private target: credentials, API, sync, and rate limits
 
 Once fetched, content becomes:
    elastos://Qm789xyz (local, provider-independent)
@@ -498,6 +502,11 @@ This means:
 - Content survives provider deletion
 - Content can be shared without sharing credentials
 - Provider can be swapped without losing data
+- Apps speak mounted WebSpace/provider intent, not raw cloud API authority
+- Mutable WebSpace mounts/forks may materialize local provider-owned objects
+  and dirty heads, but remote resolver sync, cloud-provider traversal, and
+  Carrier availability remain provider/Carrier responsibilities rather than app
+  filesystem authority
 
 ### Content Availability And IPLD
 
@@ -889,7 +898,7 @@ has validated the Browser stream request. It is the current Browser path's only
 DNS/TCP dialer; Browser UI, Browser Engine Adapter, and stream bridge still have
 no direct host network authority.
 | `elastos://decrypt/` | Protected-content decrypt/render sessions through `decrypt-provider`; no raw CEKs, raw plaintext, filesystem authority, key-backend SDKs, KMS credentials, chain RPC, or wallet RPC |
-| `google://` | OAuth, Google API, caching (aspirational example, not implemented) |
+| `cloud://` | OAuth-style external provider API, caching (aspirational example, not implemented) |
 | `elastos://ai/` | Model routing, API keys, response handling |
 
 New provider families should document their typed contract before becoming a
@@ -936,11 +945,11 @@ capsule still sees object state, not Kubo, gateway, relay, or cluster topology.
 Providers handle network/cache transparently:
 
 ```
-Request: google://drive/doc.pdf  (aspirational provider example)
+Provider-internal target: cloud://drive/doc.pdf  (aspirational example)
 
 Online scenario:
   1. Check cache: miss
-  2. Fetch from Google API
+  2. Fetch from the cloud provider API
   3. Cache locally (encrypted)
   4. Return content + CID
 

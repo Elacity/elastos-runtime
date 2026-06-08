@@ -5,6 +5,208 @@ All notable changes to the public ElastOS Runtime repository.
 ## [Next]
 
 ### Added
+- Added a provider-backed Library release slice: desktop-familiar
+  places, breadcrumbs, grid/list views, inline create/rename, drag/drop,
+  preview/open, upload/download, folder and selected-object archive download,
+  provider-created ZIP objects, safe `.tar`/`.tar.gz`/`.tgz`/`.zip`
+  extraction, publish/share/status/repair, Trash, browser Back/Forward
+  takeover, and desktop-style context menus now run through Runtime-scoped Library
+  provider authority.
+- Added `object-provider` as the mutable principal-root object provider for
+  Library files/folders, Desktop/Documents/Public roots, protected-root object
+  envelopes, object events, legacy plaintext auto-protection, and WebSpace
+  resolver routing. Runtime registers the canonical `object` provider scheme,
+  and browser calls use `/api/provider/object/*`.
+- Added Library-to-Documents viewer handoff and Home Desktop projection so
+  concrete Library objects can open in Documents and Desktop file mutations stay
+  provider-owned while Home only displays and launches them.
+- Added the current Spaces/WebSpace contract for Library:
+  `localhost://WebSpaces/*` is the local mounted resolver view shown as
+  **Spaces**, provider targets such as `cloud://drive/...` remain
+  resolver-private, read-only mounts hide mutable actions, mutable mounts/forks
+  can materialize provider-owned objects, and `elastos://content/*` remains the
+  provider-independent published/shared content surface.
+- Added the first Carrier-backed content availability proof path for Library
+  publish/status/repair: `content-provider` signs availability receipts with
+  peer-selection, quota, repair-worker, accounting, and abuse-control metadata;
+  built-in Carrier availability can invoke remote service providers for
+  `content/ensure`, `content/status`, manifest-backed object import, and
+  exact-CID byte fallback without exposing raw Carrier tickets, Kubo/IPFS, or
+  peer handles to apps.
+- Added Runtime provider-to-provider invocation foundations, including typed
+  invocation envelopes, transfer receipts, range/progress propagation, a
+  validated bounded `ProviderTransfer::Stream` base64-chunk envelope, and
+  service-provider-only Carrier `provider_invoke` transport.
+- Added Runtime-native provider stream sessions on top of
+  `ProviderTransfer::Stream`: providers can be opened as read/cancel sessions
+  with live progress events and read-next backpressure, `content-provider`
+  fetch consumes local IPFS and availability fallback reads through that
+  session path, and Library object downloads now return chunked HTTP body
+  streams with backpressure/cancel transfer receipts.
+- Added the WebSpace federation slice: `operator-drive-adapter` now has an
+  operator-private endpoint backend contract with redacted config/status,
+  provider-to-provider invocation boundaries, durable cache/viewer handoff
+  coverage, mutable fork write-back, and a filesystem-backed endpoint proof for
+  metadata traversal, byte reads, and mutable writes.
+- Added recipient-scoped Library share-grant records, `shared_access` checks,
+  access-decision/shared-open receipts, and fail-closed key-release policy
+  handling as the current local/provider-mediated sharing slice.
+- Added the protected recipient receipt-chain proof: Library can publish a
+  non-production `protected_content_fixture` sealed-object descriptor through
+  `content-provider`, record recipient-scoped key-release grants, bind
+  `shared_access` to Runtime recipient proof plus launch `session_id`, invoke
+  DRM/rights/key/decrypt providers, return a viewer-scoped protected-open
+  contract, and fail closed when protected-content providers are absent without
+  exposing raw CEKs, plaintext, wallet, chain, Kubo, host filesystem, or
+  provider credentials to apps.
+- Added durable storage accounting: `content-provider` projects
+  signed availability receipts into a persistent per-principal ledger, exposes
+  storage-accounting summaries and no-settlement storage-market posture through
+  `content/status`, and preserves original publisher identity when unpublish is
+  called without explicit principal metadata.
+- Added principal storage-quota admission for content publish/import:
+  `availability_requirements.max_storage_bytes_per_principal` is enforced from
+  the durable content accounting ledger before local content-backend writes and
+  recorded as `principal_storage_quota` posture in receipts/status.
+- Added bounded cross-provider content admission preflight: `content-provider`
+  exposes provider-only signed `elastos.content.admission/v1` receipts, and
+  Carrier invokes and verifies remote `content/admission` before
+  `content/ensure`, exact/object import, or block-graph repair transfer so
+  unsigned admission, payload mismatches, and quota rejections fail closed before
+  bytes move.
+- Added an optional storage-market endpoint-quorum admission gate for `content/admission`:
+  `ELASTOS_CONTENT_STORAGE_MARKET_ADMISSION_*` can point content-provider at one
+  operator-owned admission endpoint or a bounded configured endpoint set with an
+  explicit quorum, and accepted/rejected market decisions are normalized into
+  the signed admission receipt before Carrier moves bytes or DAG repair data.
+  Credentials are redacted from status, and endpoint or quorum failure rejects
+  admission fail-closed.
+- Added optional external repair-fleet dispatch for the Runtime-gated
+  `content repair-worker`: `ELASTOS_CONTENT_EXTERNAL_REPAIR_FLEET_*` can point
+  content-provider at one operator-owned dispatch endpoint or a bounded endpoint
+  set with an explicit quorum, due tasks are sent as
+  `elastos.content.external-repair-fleet.dispatch-request/v1`, replies are
+  normalized into dispatch receipts with endpoint receipts plus quorum counters,
+  and credentials are redacted while local provider verification still decides
+  final availability.
+- Added bounded Carrier repair-graph policy receipts: current cross-peer repair
+  explicitly supports object-manifest and exact-byte import fallbacks while
+  refusing arbitrary IPLD DAG fallback unless the Runtime-only block-graph
+  provider ABI is available.
+- Added the block-graph provider path: Runtime reserves
+  `elastos://block-graph/*`, the build/release surfaces include a
+  `content-block-graph-provider` contract capsule, startup registers the
+  verified provider when installed, and Carrier routes arbitrary `ipld_dag`
+  repair through local `export_graph` plus remote `import_graph` provider-plane
+  invocations. The provider uses the `ipfs-provider` Kubo coord file to export
+  and import bounded DAG CAR bytes, pins imported roots, and fails closed when
+  Kubo/provider setup is absent.
+- Added `elastos content status` for operator inspection of provider-wide or
+  per-CID availability, storage-accounting, quota, repair, peer-proof, and
+  no-settlement storage-market status through Runtime provider invocation.
+- Added `elastos.content.repair-fleet/v1` status receipts to content dashboard
+  and repair-worker runs so operators can inspect the current single-runtime
+  provider-owned repair coordinator/worker policy, ledger-based due scheduling,
+  task pressure, and explicit non-production external-fleet/settlement posture.
+- Added `elastos.content.network-abuse-policy/v1` status receipts to content
+  dashboard, per-CID status, and repair-worker runs so operators can inspect
+  provider-owned local guardrails, Carrier candidate caps, admission preflight
+  posture, repair-worker budgets, configured abuse-control endpoint-quorum
+  exchange posture, and explicit non-production network-wide
+  throttles/banlists/abuse-ledger posture.
+- Added `elastos.content.operator-dashboard/v1` to provider-wide content status
+  so operators can inspect provider-local storage pressure, top principals,
+  replica-byte estimates, quota-exceeded records, fleet-history attempts, recent
+  repair rows, live-proof counts, and explicit non-production federation posture.
+- Added `elastos.carrier.peer-reputation/v1` policy/status metadata to Carrier
+  peer selection and content status so local Runtime success/failure scoring is
+  visible while signed cross-runtime reputation remains explicitly not
+  configured.
+- Added `elastos.carrier.peer-attestation-exchange-policy/v1` metadata to
+  Carrier peer selection, redacted remote receipt summaries, content proof
+  summaries, and operator dashboard surfaces so signed availability
+  announcements, verified remote content receipts, remote provider proofs, and
+  local Runtime reputation are distinguished from unconfigured signed
+  cross-runtime reputation receipts, third-party attestations, trust-policy
+  exchange, and revocation.
+- Added opt-in Carrier peer-attestation exchange: when
+  `ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_*` is configured,
+  `carrier-availability` posts a signed
+  `elastos.carrier.peer-attestation.exchange-request/v1` with redacted remote
+  proof summaries to one operator-owned exchange endpoint or a bounded endpoint
+  set with an explicit quorum, requires accepted endpoint responses to include
+  signed `elastos.carrier.peer-attestation.exchange-receipt/v1` receipts,
+  verifies receipts before marking configured quorum accepted, records endpoint
+  receipts plus quorum counters, and keeps connect tickets plus endpoint
+  credentials out of app-visible proof surfaces.
+- Added `elastos.content.storage-settlement-policy/v1` metadata to local,
+  Carrier, ledger, per-CID, and provider-wide storage-market status so pricing,
+  escrow, payment settlement, SLA enforcement, storage-market admission, and
+  cross-provider escrow are explicit non-production policy state.
+- Added `elastos.content.storage-market-admission-policy/v1` metadata to local,
+  Carrier, ledger, per-CID, provider-wide, and operator-dashboard
+  storage-market surfaces so local quota admission and remote
+  `content/admission` preflight are distinguished from unconfigured production
+  provider-admission networks, offer receipts, price discovery, SLA admission,
+  and economic abuse controls.
+- Preserved proof metadata through the standalone `availability-provider`
+  capsule so configured external availability targets can report
+  `storage_market`, `repair_graph`, and `abuse_controls` on the same
+  Runtime-validated contract as built-in Carrier availability, with explicit
+  no-market / target-report-only defaults when a target omits them; configured
+  target fanout can now satisfy min-replica/live-proof requirements without
+  bypassing max-replica quota.
+- Added `elastos.content.federated-quota-ledger-policy/v1` metadata to local,
+  principal storage-quota, Carrier quota, remote receipt, per-CID, provider-wide
+  status, and operator dashboard surfaces so local per-principal ledgers and
+  signed remote admission receipt exchange are distinguished from configured
+  signed federated quota-ledger endpoint-quorum exchange and production
+  quota-receipt exchange.
+- Added opt-in federated quota-ledger exchange for remote admission preflight:
+  `content/admission` can post a signed
+  `elastos.content.federated-quota-ledger.exchange-request/v1` to one
+  operator-configured endpoint or a bounded endpoint set with an explicit
+  quorum, require signed
+  `elastos.content.federated-quota-ledger.exchange-receipt/v1` receipts for
+  accepted endpoints, record endpoint receipts and quorum counters in the signed
+  admission receipt, and reject fail-closed on configured quorum failure,
+  malformed signed receipt, timeout, or transport failure without exposing
+  endpoint credentials.
+- Added opt-in federated abuse-control exchange for remote admission preflight:
+  `content/admission` can post a signed
+  `elastos.content.federated-abuse-control.exchange-request/v1` to one
+  operator-configured endpoint or a bounded endpoint set with an explicit
+  quorum before quota-ledger, storage-market, byte-transfer, or repair-graph
+  movement, require signed
+  `elastos.content.federated-abuse-control.exchange-receipt/v1` receipts for
+  accepted endpoints, record endpoint receipts and quorum counters in the signed
+  admission receipt, and reject fail-closed on configured quorum failure,
+  malformed signed receipt, timeout, transport failure, or receipt verification
+  failure without exposing endpoint credentials.
+- Added `elastos.content.external-repair-fleet-policy/v1` metadata to
+  provider-wide status, repair-worker runs, and operator dashboard surfaces so
+  the local provider-owned repair worker is distinguished from unconfigured
+  external coordinators, volunteer/supernode workers, cross-provider queues,
+  worker attestations, settlement, and repair SLAs.
+- Added `elastos.content.federated-operator-alerting-policy/v1` metadata to
+  provider-wide status and operator dashboard surfaces so provider-local status
+  JSON, storage pressure, repair-task pressure, live-proof counters, and
+  remote-receipt counters plus configured provider-local alert sink and
+  configured federated alert-exchange posture are distinguished from production
+  cross-provider dashboards, peer-health subscriptions, fleet-wide SLA policy,
+  and operator UI.
+- Added opt-in operator alert delivery for content availability: provider-wide
+  `content/status` can emit a durable
+  `elastos.content.operator-alert.receipt/v1` outbox entry, post an
+  `elastos.content.operator-alert/v1` payload to one HTTPS or loopback sink
+  when `ELASTOS_CONTENT_OPERATOR_ALERT_*` is configured, and deliver a typed
+  `elastos.content.federated-operator-alert.exchange-request/v1` to one
+  operator-owned exchange endpoint when
+  `ELASTOS_CONTENT_FEDERATED_OPERATOR_ALERT_EXCHANGE_*` is configured. The
+  normalized
+  `elastos.content.federated-operator-alert.exchange-receipt/v1` is recorded
+  beside the provider-local sink result without exposing operator credentials to
+  apps or status JSON.
 - Added runtime authority primitives for proof-bound authentication: principals, proof bindings, SIWE challenges, session grants, and audit events.
 - Added EVM SIWE challenge, verify, and revoke gateway routes that bind verified wallet proofs to runtime principals and issue scoped Home/System launch grants.
 - Added `chain-provider` as the first blockchain provider capsule: typed `elastos://chain/*` access for Essentials-compatible Elastos networks without exposing raw RPC URLs to app capsules.

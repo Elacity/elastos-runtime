@@ -31,7 +31,8 @@ Unsupported operations fail closed and do not create broad provider wildcards.
 - object CID
 - requested action
 - viewer interface
-- key-release receipt ID
+- typed `elastos.release.receipt/v1` from `key-provider`, bound to the same
+  principal/session/object/action
 - output kind
 - reason
 - expiry

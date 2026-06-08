@@ -15,9 +15,10 @@ or provider credentials.
 - `release`: validate a `KeyReleaseRequestV1` and request scoped key release.
 
 Current implementation is intentionally fail-closed. It validates schema,
-principal/session/object/action fields, supported schemes, and PQ-hybrid
-algorithm metadata, then refuses backend work until an ElastOS dKMS adapter
-exists.
+principal/session/object/action fields, an allowed
+`elastos.rights.decision.receipt/v1` bound to the same
+principal/session/object/action, supported schemes, and PQ-hybrid algorithm
+metadata, then refuses backend work until an ElastOS dKMS adapter exists.
 
 ## Capability Schema
 
