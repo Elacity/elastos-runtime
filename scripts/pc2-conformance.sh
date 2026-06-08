@@ -28,8 +28,11 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 VECTOR_DIR="$REPO_ROOT/capsules/decrypt-provider/tests/vectors"
 # Classical vectors to cross-check (both PC2-supported envelope versions).
 VECTORS=(
-  "$VECTOR_DIR/classical_cenc.json"     # v3 random IV
-  "$VECTOR_DIR/classical_cenc_v2.json"  # v2 fixed IV (derived from eph pubkey)
+  "$VECTOR_DIR/classical_cenc.json"             # v3 random IV (single sample)
+  "$VECTOR_DIR/classical_cenc_v2.json"          # v2 fixed IV (derived from eph pubkey)
+  "$VECTOR_DIR/classical_cenc_multisample.json" # 3 samples, per-sample IV
+  "$VECTOR_DIR/classical_cenc_subsample.json"   # subsample clear+encrypted ranges
+  "$VECTOR_DIR/classical_cenc_initseg.json"     # 16-byte IV via init-segment tenc
 )
 PC2_REPO="${PC2_REPO:-/Users/sash/Documents/Cursor/pc2.net/pc2-node}"
 DDRM="$PC2_REPO/crates/ddrm-decrypt"

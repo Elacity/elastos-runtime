@@ -359,6 +359,34 @@ Base ladder unchanged (25/27/29/31, `vectors` 37); `rail-shim` = **45** (+2 PQ c
 builds clean to `wasm32-wasip1`; `ddrm-verify.sh` PASS. Both rail profiles now have a
 carrier golden replayed through the exact `OpenSession` entrypoint.
 
+### Media (cenc) golden widened toward real playback shapes (Day 31)
+
+The media-contract goldens were all single-sample / single-subsample / default-IV.
+Real fMP4 isn't, so the parts most likely to bite at wire-up are now pinned by
+**executable PC2 parity**:
+
+- `tests/vectors/classical_cenc_multisample.json` — a **3-sample** segment, each with
+  its own per-sample IV and a fresh AES-128-CTR counter (`trun` per-sample sizes;
+  `senc` no-subsample).
+- `tests/vectors/classical_cenc_subsample.json` — a **subsample** sample (clear+encrypted
+  ranges, `senc` flags `0x000002`); the CTR keystream is continuous across encrypted
+  ranges only (clear bytes skipped).
+- `tests/vectors/classical_cenc_initseg.json` — a **16-byte IV** segment whose size is
+  driven by an `init` segment's `tenc.default_per_sample_iv_size` (moov→…→stsd→encv→sinf
+  →schi→tenc), exercising the init-derived IV path.
+
+Each replays through our decrypt engine (`vectors`, +3 → **40**) **and** through PC2's
+real `mp4box::parse_segment` + `cenc::decrypt_samples` **and** PC2's session API
+(`session::unwrap_envelope` → `media::decrypt_segment`, init threaded for the IV-size
+case) in `scripts/pc2-conformance.sh`, asserting byte parity + tamper fail-closed. The
+`ClassicalVector` schema gained optional `init_segment_b64` / `iv_size` (backward
+compatible); the conformance driver now parses `senc` at the vector's IV size and passes
+the init to `decrypt_segment`. Box layouts validated against PC2 `mp4box.rs`/`cenc.rs`
+(byte-identical `parse_init_for_tenc`, incl. the encv 78-byte skip).
+
+Base ladder otherwise unchanged (default 25; `rail-shim` 45); `wasm32-wasip1` clean;
+`ddrm-verify.sh` PASS.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

@@ -356,6 +356,8 @@ mod tests {
             cek_b64: b64.encode(cek),
             encrypted_segment_b64: b64.encode(&segment),
             expected_plaintext_b64: b64.encode(plaintext),
+            init_segment_b64: None,
+            iv_size: None,
         };
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
         std::fs::create_dir_all(dir).unwrap();
@@ -383,6 +385,254 @@ mod tests {
             0x02,
             "classical_cenc_v2.json",
             "P-256 ECDH envelope (v2, IV derived from eph pubkey) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt",
+        );
+    }
+
+    // --- richer cenc shapes (multi-sample, subsample, non-default IV size) -----
+    //
+    // Real fMP4 segments are not single-sample/single-subsample/default-IV. These
+    // builders + vectors pin the shapes most likely to bite at wire-up time, by
+    // executable parity against PC2 (classical). Box layouts validated against
+    // PC2 `mp4box.rs` / `cenc.rs`.
+
+    #[cfg(feature = "gen-vectors")]
+    fn mk_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (8 + content.len()) as u32;
+        let mut b = size.to_be_bytes().to_vec();
+        b.extend_from_slice(box_type);
+        b.extend_from_slice(content);
+        b
+    }
+
+    /// Multi-sample segment: N samples, each with its own 8-byte IV + fresh CTR.
+    /// `trun` carries per-sample sizes; `senc` has no subsamples.
+    #[cfg(feature = "gen-vectors")]
+    fn build_multisample_segment(samples: &[(&[u8], [u8; 8])], cek: &[u8; 16]) -> (Vec<u8>, Vec<u8>) {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00]; // v0, flags=sample-size-present
+        trun_content.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+        for (pt, _) in samples {
+            trun_content.extend_from_slice(&(pt.len() as u32).to_be_bytes());
+        }
+        let trun = mk_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0, 0, 0]; // v0, flags=0 (no subsamples)
+        senc_content.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+        let mut mdat_payload = Vec::new();
+        let mut expected = Vec::new();
+        for (pt, iv8) in samples {
+            senc_content.extend_from_slice(iv8);
+            let mut iv16 = [0u8; 16];
+            iv16[..8].copy_from_slice(iv8);
+            let mut ct = pt.to_vec();
+            Aes128Ctr::new(cek.into(), (&iv16).into()).apply_keystream(&mut ct);
+            mdat_payload.extend_from_slice(&ct);
+            expected.extend_from_slice(pt);
+        }
+        let senc = mk_box(b"senc", &senc_content);
+
+        let mut traf = trun;
+        traf.extend_from_slice(&senc);
+        let traf = mk_box(b"traf", &traf);
+        let moof = mk_box(b"moof", &traf);
+        let mut segment = moof;
+        segment.extend_from_slice(&mk_box(b"mdat", &mdat_payload));
+        (segment, expected)
+    }
+
+    /// Single-sample segment with subsample (clear+encrypted) ranges. The CTR
+    /// keystream is continuous across encrypted ranges only (clear bytes are
+    /// skipped), matching CENC + PC2 `decrypt_subsamples`.
+    #[cfg(feature = "gen-vectors")]
+    fn build_subsample_segment(plaintext: &[u8], subs: &[(u16, u32)], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+        let mut data = plaintext.to_vec();
+        let mut iv16 = [0u8; 16];
+        iv16[..8].copy_from_slice(iv8);
+        let mut cipher = Aes128Ctr::new(cek.into(), (&iv16).into());
+        let mut pos = 0usize;
+        for (clear, enc) in subs {
+            pos += *clear as usize;
+            let e = *enc as usize;
+            cipher.apply_keystream(&mut data[pos..pos + e]);
+            pos += e;
+        }
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        let trun = mk_box(b"trun", &trun_content);
+
+        // senc: v0, flags=0x000002 (subsamples present), count=1, iv8, then
+        // subsample_count(u16) + per-subsample clear(u16)+encrypted(u32).
+        let mut senc_content = vec![0u8, 0x00, 0x00, 0x02, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv8);
+        senc_content.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+        for (clear, enc) in subs {
+            senc_content.extend_from_slice(&clear.to_be_bytes());
+            senc_content.extend_from_slice(&enc.to_be_bytes());
+        }
+        let senc = mk_box(b"senc", &senc_content);
+
+        let mut traf = trun;
+        traf.extend_from_slice(&senc);
+        let traf = mk_box(b"traf", &traf);
+        let moof = mk_box(b"moof", &traf);
+        let mut segment = moof;
+        segment.extend_from_slice(&mk_box(b"mdat", &data));
+        segment
+    }
+
+    /// Single-sample segment using a 16-byte IV (the `senc` carries the full 16).
+    #[cfg(feature = "gen-vectors")]
+    fn build_segment_iv16(plaintext: &[u8], cek: &[u8; 16], iv16: &[u8; 16]) -> Vec<u8> {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+        let mut ct = plaintext.to_vec();
+        Aes128Ctr::new(cek.into(), iv16.into()).apply_keystream(&mut ct);
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        let trun = mk_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv16); // 16-byte IV
+        let senc = mk_box(b"senc", &senc_content);
+
+        let mut traf = trun;
+        traf.extend_from_slice(&senc);
+        let traf = mk_box(b"traf", &traf);
+        let moof = mk_box(b"moof", &traf);
+        let mut segment = moof;
+        segment.extend_from_slice(&mk_box(b"mdat", &ct));
+        segment
+    }
+
+    /// Build an init segment whose `tenc.default_per_sample_iv_size = iv_size`.
+    /// Path: moov→trak→mdia→minf→stbl→stsd→encv→sinf→schi→tenc (matches both our
+    /// and PC2's `parse_init_for_tenc`: encv skips 78 sample-entry bytes).
+    #[cfg(feature = "gen-vectors")]
+    fn build_init_segment(iv_size: u8) -> Vec<u8> {
+        // tenc: v0 flags(3) + reserved(1) + reserved(1) + is_protected(1) +
+        //       iv_size(1) + default_kid(16)
+        let mut tenc_content = vec![0u8, 0, 0, 0, 0, 0, 1, iv_size];
+        tenc_content.extend_from_slice(&[0u8; 16]);
+        let tenc = mk_box(b"tenc", &tenc_content);
+        let schi = mk_box(b"schi", &tenc);
+        let sinf = mk_box(b"sinf", &schi);
+
+        let mut encv_content = vec![0u8; 78]; // SampleEntry + VisualSampleEntry header
+        encv_content.extend_from_slice(&sinf);
+        let encv = mk_box(b"encv", &encv_content);
+
+        let mut stsd_content = vec![0u8, 0, 0, 0]; // version+flags
+        stsd_content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        stsd_content.extend_from_slice(&encv);
+        let stsd = mk_box(b"stsd", &stsd_content);
+
+        let stbl = mk_box(b"stbl", &stsd);
+        let minf = mk_box(b"minf", &stbl);
+        let mdia = mk_box(b"mdia", &minf);
+        let trak = mk_box(b"trak", &mdia);
+        mk_box(b"moov", &trak)
+    }
+
+    /// Write a richer classical vector (shared by the three emit tests below).
+    #[cfg(feature = "gen-vectors")]
+    fn write_rich_vector(
+        file: &str,
+        description: &str,
+        segment: &[u8],
+        expected_plaintext: &[u8],
+        cek: &[u8; 16],
+        init: Option<&[u8]>,
+        iv_size: Option<u8>,
+    ) {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let sk = SecretKey::random(&mut OsRng);
+        let sealed = make_envelope(&sk, cek, 0x03);
+        let v = crate::vector_format::ClassicalVector {
+            description: description.to_string(),
+            session_secret_key_b64: b64.encode(sk.to_bytes()),
+            sealed_envelope_b64: b64.encode(&sealed),
+            cek_b64: b64.encode(cek),
+            encrypted_segment_b64: b64.encode(segment),
+            expected_plaintext_b64: b64.encode(expected_plaintext),
+            init_segment_b64: init.map(|i| b64.encode(i)),
+            iv_size,
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/{file}");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// `cargo test --features gen-vectors emit_classical_multisample_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_multisample_vector() {
+        let cek = [0x11u8; 16];
+        let samples: &[(&[u8], [u8; 8])] = &[
+            (b"first sample plaintext block .01", [0x10; 8]),
+            (b"second sample plaintext block 02", [0x20; 8]),
+            (b"third sample plaintext block .03", [0x30; 8]),
+        ];
+        let (segment, expected) = build_multisample_segment(samples, &cek);
+        write_rich_vector(
+            "classical_cenc_multisample.json",
+            "P-256 ECDH envelope -> CENC AES-128-CTR, 3 samples (per-sample IV); byte-compatible with PC2 ddrm-decrypt",
+            &segment,
+            &expected,
+            &cek,
+            None,
+            None,
+        );
+    }
+
+    /// `cargo test --features gen-vectors emit_classical_subsample_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_subsample_vector() {
+        let cek = [0x11u8; 16];
+        // 5 clear + 11 enc + 3 clear + 13 enc = 32 bytes
+        let plaintext = b"CLEARencrypteddatCLRmorecrypted!!";
+        let subs: &[(u16, u32)] = &[(5, 11), (3, 13)];
+        let segment = build_subsample_segment(plaintext, subs, &cek, &[0x22u8; 8]);
+        write_rich_vector(
+            "classical_cenc_subsample.json",
+            "P-256 ECDH envelope -> CENC AES-128-CTR subsample (clear+encrypted ranges); byte-compatible with PC2 ddrm-decrypt",
+            &segment,
+            plaintext,
+            &cek,
+            None,
+            None,
+        );
+    }
+
+    /// `cargo test --features gen-vectors emit_classical_initseg_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_initseg_vector() {
+        let cek = [0x11u8; 16];
+        let plaintext = b"sixteen-byte IV sample plaintext";
+        let iv16 = [0x33u8; 16];
+        let segment = build_segment_iv16(plaintext, &cek, &iv16);
+        let init = build_init_segment(16);
+        write_rich_vector(
+            "classical_cenc_initseg.json",
+            "P-256 ECDH envelope -> CENC AES-128-CTR, 16-byte IV via init-segment tenc; byte-compatible with PC2 ddrm-decrypt",
+            &segment,
+            plaintext,
+            &cek,
+            Some(&init),
+            Some(16),
         );
     }
 
@@ -437,7 +687,9 @@ mod tests {
 
         let cek_b64 = b64.encode(recovered.as_slice());
         let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
-        let (output, meta) = crate::decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let init = v.init_segment_b64.as_ref().map(|s| b64.decode(s).unwrap());
+        let (output, meta) =
+            crate::decrypt_session_segment(&cek_b64, &segment, init.as_deref()).unwrap();
         let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
         let mdat_off = segment.len() - expected.len();
         assert_eq!(&output[mdat_off..], expected.as_slice(), "vector plaintext recovered via cenc");
@@ -459,6 +711,33 @@ mod tests {
         replay_classical_vector(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/vectors/classical_cenc_v2.json"
+        )));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_multisample_golden_vector_replays() {
+        replay_classical_vector(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc_multisample.json"
+        )));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_subsample_golden_vector_replays() {
+        replay_classical_vector(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc_subsample.json"
+        )));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_initseg_golden_vector_replays() {
+        replay_classical_vector(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc_initseg.json"
         )));
     }
 

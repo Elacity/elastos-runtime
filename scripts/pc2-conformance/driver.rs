@@ -50,6 +50,9 @@ fn check_vector(path: &str) {
     let expected_cek = b64d(&field("cek_b64"));
     let segment = b64d(&field("encrypted_segment_b64"));
     let expected_pt = b64d(&field("expected_plaintext_b64"));
+    // Optional richer-shape fields (default to the single-sample / 8-byte-IV case).
+    let iv_size = v["iv_size"].as_u64().unwrap_or(8) as u8;
+    let init: Option<Vec<u8>> = v["init_segment_b64"].as_str().map(b64d);
 
     let sk = SecretKey::from_slice(&sk_bytes).expect("p256 session secret key");
 
@@ -65,7 +68,7 @@ fn check_vector(path: &str) {
 
     // 2. Decrypt the segment through PC2's real MP4 parser + AES-128-CTR cenc.
     let cek16: [u8; 16] = cek.as_slice().try_into().expect("CEK must be exactly 16 bytes");
-    let seg = mp4box::parse_segment(&segment, 8).expect("PC2 mp4box::parse_segment failed");
+    let seg = mp4box::parse_segment(&segment, iv_size).expect("PC2 mp4box::parse_segment failed");
     let traf = seg.traf.expect("segment has no traf");
     let trun = traf.trun.expect("segment has no trun");
     let senc = traf.senc.expect("segment has no senc");
@@ -126,7 +129,7 @@ fn check_vector(path: &str) {
     let handle = install_session("conformance");
     let req = session::unwrap_envelope(handle, &sealed)
         .expect("PC2 session::unwrap_envelope rejected our carrier");
-    let seg_out = media::decrypt_segment(req, None, &segment, false)
+    let seg_out = media::decrypt_segment(req, init.as_deref(), &segment, false)
         .expect("PC2 media::decrypt_segment failed");
     let off = segment.len() - expected_pt.len();
     if seg_out.len() != segment.len() || seg_out[off..] != expected_pt[..] {

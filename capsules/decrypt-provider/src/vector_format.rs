@@ -28,10 +28,20 @@ pub struct ClassicalVector {
     pub sealed_envelope_b64: String,
     /// The 16-byte AES-128 CEK the envelope seals (for assertion only).
     pub cek_b64: String,
-    /// An encrypted fMP4 segment produced with that CEK.
+    /// An encrypted fMP4 segment produced with that CEK. May be single- or
+    /// multi-sample, and may use subsample (clear+encrypted) ranges.
     pub encrypted_segment_b64: String,
-    /// The plaintext bytes the segment's single sample must decrypt to.
+    /// The plaintext bytes the segment must decrypt to (the full decrypted mdat
+    /// content — concatenated samples for multi-sample vectors).
     pub expected_plaintext_b64: String,
+    /// Optional init segment carrying a `tenc` whose `default_per_sample_iv_size`
+    /// drives the IV size. Present only for the non-default-IV-size vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_segment_b64: Option<String>,
+    /// Per-sample IV size in bytes (8 or 16). Absent ⇒ 8. Used by the PC2
+    /// conformance driver to parse `senc` correctly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iv_size: Option<u8>,
 }
 
 /// Encrypt→decrypt round-trip golden: an asset sealed by `encrypt-provider`'s real
