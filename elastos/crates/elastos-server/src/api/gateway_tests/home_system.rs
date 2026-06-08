@@ -100,8 +100,10 @@ async fn test_home_static_route_serves_browser_surface() {
 async fn test_home_summary_reports_identity_and_launch_targets() {
     let dir = tempfile::tempdir().unwrap();
 
-    let app = gateway_router(test_state(dir.path()));
+    let state = library_test_state(dir.path()).await;
+    let app = gateway_router(state);
     let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let library_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let public = app
         .clone()
         .oneshot(
@@ -125,6 +127,15 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert!(public_payload["identity"]["device_did"].is_null());
     assert_eq!(public_payload["browser_state"]["principal_id"], "");
     assert_eq!(public_payload["browser_state"]["localhost_root"], "");
+    assert_eq!(
+        public_payload["desktop_objects"]["schema"],
+        "elastos.home.desktop-objects/v1"
+    );
+    assert_eq!(public_payload["desktop_objects"]["uri"], "");
+    assert!(public_payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(public_payload["browser_state"]["layout"].is_null());
     assert!(public_payload["browser_state"]["session"].is_null());
     assert!(public_payload["browser_state"]["recent_targets"]
@@ -143,6 +154,27 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .unwrap()
         .iter()
         .any(|target| target["target"] == "system"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/mkdir")
+                .header("x-elastos-home-token", library_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "parent_uri": format!("{}/Desktop", crate::auth::principal_localhost_root(&authority.principal_id)),
+                        "name": "Test Folder",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app
         .oneshot(
@@ -172,6 +204,22 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(payload["site"]["root_uri"], MY_WEBSITE_URI);
     assert_eq!(payload["room"]["pending_count"], 0);
     assert_eq!(payload["notifications"]["unread_count"], 0);
+    assert_eq!(
+        payload["desktop_objects"]["schema"],
+        "elastos.home.desktop-objects/v1"
+    );
+    assert_eq!(
+        payload["desktop_objects"]["uri"],
+        format!(
+            "{}/Desktop",
+            crate::auth::principal_localhost_root(&authority.principal_id)
+        )
+    );
+    assert!(payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["name"] == "Test Folder" && object["kind"] == "directory"));
     let targets = payload["targets"].as_array().unwrap();
     let system = targets
         .iter()
