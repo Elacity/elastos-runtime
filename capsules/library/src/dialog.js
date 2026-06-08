@@ -52,6 +52,9 @@ export function createLibraryDialog({
     if (archive.relevant) {
       generalRows.push(["Archive", archive.status]);
     }
+    if (object.metadata?.trash?.original_uri) {
+      generalRows.push(["Original location", copyableValue(object.metadata.trash.original_uri, "original location")]);
+    }
     const runtimeRows = [
       ["Provider", identity.provider],
       ["Object URI", copyableValue(object.uri || "-", "object URI")],

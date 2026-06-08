@@ -83,8 +83,8 @@ export function createLibraryRenderer({
     }
     if (isWebSpaceUri(state.currentUri)) {
       return {
-        title: "No connected spaces",
-        body: "Provider-backed spaces appear here when a resolver is available. Read-only spaces hide mutable actions; writable spaces use provider-owned storage.",
+        title: "No objects in this space",
+        body: "Localhost is your signed local object space. Elastos and mounted spaces resolve through providers and show only the actions they actually support.",
       };
     }
     return { title: "This folder is empty", body: "Upload a file or create a folder." };

@@ -2671,9 +2671,10 @@ assert(
   libraryRender.includes('elements.content.dataset.empty = "true"') &&
     libraryRender.includes('class="empty-inner"') &&
     libraryCss.includes('.content[data-empty="true"]') &&
-    libraryRender.includes("No connected spaces") &&
-    libraryRender.includes("Provider-backed spaces") &&
-    libraryRender.includes("writable spaces use provider-owned storage") &&
+    libraryRender.includes("No objects in this space") &&
+    libraryRender.includes("Localhost is your signed local object space") &&
+    libraryRender.includes("Elastos and mounted spaces resolve through providers") &&
+    !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
   "Library empty Spaces states must be centered and explicit instead of rendering a cramped generic folder message",

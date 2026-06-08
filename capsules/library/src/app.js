@@ -1,4 +1,5 @@
 import {
+  archiveLibraryObjectPayload,
   baseName,
   contentCid,
   escapeHtml,
@@ -6,6 +7,8 @@ import {
   inTrash,
   isBlockedObject,
   isDirectory,
+  isTrashRootUri,
+  isTrashUri,
   isWebSpaceUri,
   parentUri,
   publishedCid,
@@ -56,6 +59,7 @@ import { createLibraryUploads } from "./uploads.js";
       upButton: document.getElementById("up-button"),
       uploadButton: document.getElementById("upload-button"),
       newFolderButton: document.getElementById("new-folder-button"),
+      pickerActionButton: document.getElementById("picker-action-button"),
       search: document.getElementById("search"),
       currentTitle: document.getElementById("current-title"),
       statusText: document.getElementById("status-text"),
@@ -98,6 +102,7 @@ import { createLibraryUploads } from "./uploads.js";
     let downloadObjectAsZip = async () => {};
     let downloadSelectedObjects = async () => {};
     let downloadSelectedObjectsAsZip = async () => {};
+    let emptyTrash = async () => {};
     let extractArchiveObject = async () => {};
     let moveSelectedObjectsTo = async () => {};
     let openObject = async () => {};
@@ -247,6 +252,7 @@ import { createLibraryUploads } from "./uploads.js";
       downloadObjectAsZip,
       downloadSelectedObjects,
       downloadSelectedObjectsAsZip,
+      emptyTrash,
       extractArchiveObject,
       moveSelectedObjectsTo,
       openObject,
@@ -273,6 +279,7 @@ import { createLibraryUploads } from "./uploads.js";
       deliverToTarget,
       downloadObjectRaw,
       loadCurrentFolder,
+      loadRoots,
       navigate,
       openPublishedUri,
       openTarget,
@@ -295,6 +302,18 @@ import { createLibraryUploads } from "./uploads.js";
 
     function isAttachMode() {
       return state.mode === "attach" && state.returnTarget === "chat-room";
+    }
+
+    function isArchiveOpenMode() {
+      return state.mode === "archive-open" && state.returnTarget === "archive-manager";
+    }
+
+    function isArchiveCreateMode() {
+      return state.mode === "archive-create" && state.returnTarget === "archive-manager";
+    }
+
+    function isArchivePickerMode() {
+      return isArchiveOpenMode() || isArchiveCreateMode();
     }
 
     function setStatus(text) {
@@ -328,17 +347,94 @@ import { createLibraryUploads } from "./uploads.js";
     }
 
     function currentFolderReadOnly() {
+      if (isTrashRootUri(state.currentUri) || isTrashUri(state.currentUri)) return true;
       if (!isWebSpaceUri(state.currentUri)) return false;
-      return state.currentObject?.metadata?.readonly !== false;
+      const folderObject = state.currentObject || objectByUri(state.currentUri);
+      return folderObject?.metadata?.readonly !== false;
+    }
+
+    function setFolderStatus(text) {
+      if (isArchivePickerMode()) {
+        setStatus("");
+        return;
+      }
+      setStatus(text);
     }
 
     function syncModeChrome() {
+      elements.pickerActionButton.classList.toggle("hidden", !isArchivePickerMode());
       if (isAttachMode()) {
         setStatus("Choose a published object for Chat Room.");
         elements.uploadButton.textContent = "Upload";
         return;
       }
+      if (isArchiveOpenMode()) {
+        elements.pickerActionButton.textContent = "Open in Archive";
+        setStatus("");
+        return;
+      }
+      if (isArchiveCreateMode()) {
+        elements.pickerActionButton.textContent = "Create ZIP";
+        setStatus("");
+        return;
+      }
       setStatus("Ready.");
+    }
+
+    async function completeArchivePicker() {
+      if (isArchiveOpenMode()) {
+        const selection = selectedObjects();
+        if (selection.length !== 1) {
+          setStatus("Select one archive to open.");
+          return;
+        }
+        await openObject(selection[0]);
+        return;
+      }
+      if (!isArchiveCreateMode()) return;
+      const objects = archiveCreateSelection();
+      if (!objects.length) {
+        setStatus("Select one compressible item, or several same-folder items.");
+        return;
+      }
+      setStatus(objects.length === 1 ? `Creating ${objects[0].name}.zip...` : `Creating ZIP from ${objects.length} items...`);
+      const response = objects.length === 1
+        ? await providerApi("compress_archive", { uri: objects[0].uri, if_revision: objects[0].revision })
+        : await providerApi("compress_archive", { uris: objects.map((object) => object.uri) });
+      const archiveObject = response?.object;
+      await loadCurrentFolder();
+      if (archiveObject && deliverArchiveToArchive(archiveObject)) {
+        setStatus(`Created ${archiveObject.name || "archive"} and opened it in Archive.`);
+        return;
+      }
+      setStatus("ZIP created. Select it and press Open in Archive.");
+    }
+
+    function deliverArchiveToArchive(object) {
+      const payload = {
+        type: "archive:open-library-object",
+        object: archiveLibraryObjectPayload(object),
+      };
+      if (deliverToTarget("archive-manager", payload) || openWithViewer(object, "archive-manager")) {
+        window.setTimeout(closeSelf, 80);
+        return true;
+      }
+      return false;
+    }
+
+    function archiveCreateSelection() {
+      const objects = selectedObjects();
+      const compressible = objects.filter((object) => (
+        object &&
+        !isBlockedObject(object) &&
+        !inTrash(object) &&
+        !isWebSpaceUri(object.uri) &&
+        hasCapability(object, "compress_archive")
+      ));
+      if (compressible.length !== objects.length || !compressible.length) return [];
+      if (compressible.length === 1) return compressible;
+      const parent = parentUri(compressible[0].uri);
+      return compressible.every((object) => parentUri(object.uri) === parent) ? compressible : [];
     }
 
     async function loadRoots() {
@@ -399,7 +495,7 @@ import { createLibraryUploads } from "./uploads.js";
         state.currentObject = cached.object || null;
         setObjects(cached.objects);
         state.selectedUris.clear();
-        setStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+        setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
         renderAll();
         await runInitialObjectAction();
         renderedCached = true;
@@ -419,12 +515,12 @@ import { createLibraryUploads } from "./uploads.js";
         state.currentObject = currentObject;
         if (renderedCached && cached.signature === nextCache.signature) {
           renderAfterFetch = false;
-          setStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+          setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
           return;
         }
         setObjects(objects);
         state.selectedUris.clear();
-        setStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
+        setFolderStatus(`${state.objects.length} object${state.objects.length === 1 ? "" : "s"}.`);
       } finally {
         if (loadSeq === state.loadSeq && uri === state.currentUri) {
           state.loading = false;
@@ -447,6 +543,10 @@ import { createLibraryUploads } from "./uploads.js";
       selectOnly(object.uri);
       if (state.initialAction === "properties") {
         showProperties(object);
+        return;
+      }
+      if (state.initialAction === "empty-trash" && isTrashRootUri(object.uri)) {
+        await emptyTrash();
         return;
       }
       if (state.initialAction === "download" && hasCapability(object, "download")) {
@@ -508,7 +608,7 @@ import { createLibraryUploads } from "./uploads.js";
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
-          ${iconPlaceholder(placeIcon(root.id), "place-icon window-sidebar-item-icon")}
+          ${iconPlaceholder(placeIcon(root), "place-icon window-sidebar-item-icon")}
           <span class="place-label">${escapeHtml(root.label)}</span>
         `;
         elements.places.appendChild(button);
@@ -564,7 +664,11 @@ import { createLibraryUploads } from "./uploads.js";
       renderFooter();
     }
 
-    function placeIcon(id) {
+    function placeIcon(root) {
+      const id = typeof root === "string" ? root : root?.id;
+      if (id === "trash") {
+        return root?.metadata?.empty === false ? "icons/trash-full.svg" : "icons/trash.svg";
+      }
       return {
         home: "icons/sidebar-folder-home.svg",
         desktop: "icons/sidebar-folder-desktop.svg",
@@ -721,10 +825,15 @@ import { createLibraryUploads } from "./uploads.js";
         hideMenu();
         return;
       }
-      renderMenu([
+      const actions = [
         menuAction("Open", () => navigate(root.uri)),
         menuAction("Open in New Window", () => openTarget("library", { uri: root.uri })),
-      ], x, y);
+      ];
+      if (root.id === "trash" && root.metadata?.empty === false) {
+        actions.push("-");
+        actions.push(menuAction("Empty Trash", emptyTrash));
+      }
+      renderMenu(actions, x, y);
     }
 
     function showMenuForSelection(x, y) {
@@ -848,6 +957,7 @@ import { createLibraryUploads } from "./uploads.js";
     }
 
     function bindEvents() {
+      elements.pickerActionButton.addEventListener("click", () => completeArchivePicker().catch(showError));
       bindLibraryEvents({
         bindDialogEvents,
         clearSelection,
@@ -874,6 +984,7 @@ import { createLibraryUploads } from "./uploads.js";
         selectRangeTo,
         setSort,
         setView,
+        deleteSelectedObjects,
         showBackgroundMenu,
         showError,
         showMenuForObject,
@@ -882,6 +993,7 @@ import { createLibraryUploads } from "./uploads.js";
         state,
         stopLibraryEventStream,
         toggleSelected,
+        trashSelectedObjects,
         uploadFiles,
       });
     }
