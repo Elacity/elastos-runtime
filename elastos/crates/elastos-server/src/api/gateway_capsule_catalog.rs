@@ -563,7 +563,6 @@ fn catalog_capsule_summary(
         install_path: component.and_then(|entry| entry.install_path.clone()),
         release_path: component.and_then(|entry| entry.release_path.clone()),
         repository: component.and_then(|entry| entry.repository.clone()),
-        source_path: component.and_then(|entry| entry.source_path.clone()),
     }
 }
 
@@ -636,7 +635,6 @@ struct CapsuleComponentInfo {
     install_path: Option<String>,
     release_path: Option<String>,
     repository: Option<String>,
-    source_path: Option<String>,
 }
 
 fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, CapsuleComponentInfo> {
@@ -655,7 +653,6 @@ fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, Capsu
                 install_path: None,
                 release_path: None,
                 repository: capsule.repository,
-                source_path: capsule.source_path,
             },
         );
     }
@@ -680,19 +677,9 @@ fn load_capsule_components(data_dir: &std::path::Path) -> BTreeMap<String, Capsu
                 if entry.repository.is_none() {
                     entry.repository = component.repository.clone();
                 }
-                if entry.source_path.is_none() {
-                    entry.source_path = component
-                        .source_path
-                        .clone()
-                        .or_else(|| component.install_path.clone());
-                }
             })
             .or_insert_with(|| CapsuleComponentInfo {
                 cid: platform.and_then(|platform| platform.cid.clone()),
-                source_path: component
-                    .source_path
-                    .clone()
-                    .or_else(|| component.install_path.clone()),
                 repository: component.repository,
                 install_path: component.install_path,
                 release_path: platform.and_then(|platform| platform.release_path.clone()),
@@ -805,8 +792,6 @@ struct CapsuleSummary {
     release_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     repository: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -967,7 +952,6 @@ mod tests {
             .unwrap();
         assert!(!provider.launchable);
         assert!(provider.repository.is_none());
-        assert!(provider.source_path.is_none());
     }
 
     #[test]

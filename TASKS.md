@@ -151,7 +151,7 @@ section if a higher section is incoherent, unverified, or too large to review.
   2. Runtime: signed bundle identity, whole-package verification, interface/version contracts, install receipts, update policy
   3. Carrier: package/update distribution and peer discovery for trusted sources
   4. Blockchain: publisher identity, provenance receipts, and optional license/payment hooks without making token mechanics the core model
-- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. The current Marketplace capsule may browse the catalog, show capsule details, and open installed capsules, but remote package actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed.
+- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
 - [ ] Do not prioritize rich DRM economics, DeFi/BtcFi, Android box specifics, or literal Capsule-NFT mechanics before the package identity, principal, space, and provider contracts are real.
 
 ### Runtime primitives missing for the PC2 world-computer model

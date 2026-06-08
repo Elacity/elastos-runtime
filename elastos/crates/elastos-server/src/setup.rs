@@ -20,7 +20,8 @@ const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ComponentsManifest {
-    /// External tools (kubo, cloudflared, llama-server, models).
+    /// Setup-materialized artifacts: external tools, provider binaries, and
+    /// first-party app bundles installed into the runtime data directory.
     pub external: HashMap<String, Component>,
 
     /// Capsule registry (CID-based entries). Defaults empty when a manifest has no capsules.
@@ -31,7 +32,7 @@ pub struct ComponentsManifest {
     pub profiles: HashMap<String, Profile>,
 }
 
-/// An external tool component.
+/// A setup-materialized component.
 ///
 /// First-party app bundles should resolve through trusted Elastos sources.
 /// Explicit vendor URLs remain allowed only for specific approved external tools.
@@ -42,8 +43,6 @@ pub struct Component {
     pub install_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
     #[serde(default)]
     pub size_mb: Option<u64>,
     #[serde(default)]
@@ -61,8 +60,6 @@ pub struct CapsuleEntry {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
     #[serde(default)]
     pub platforms: Vec<String>,
 }
@@ -2110,7 +2107,6 @@ mod tests {
             version: None,
             install_path: Some("bin/test".to_string()),
             repository: None,
-            source_path: None,
             size_mb: None,
             description: None,
             platforms: HashMap::new(),
@@ -2161,7 +2157,6 @@ mod tests {
             version: Some("0.20.0-rc30".to_string()),
             install_path: Some("bin/site-provider".to_string()),
             repository: None,
-            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -2208,7 +2203,6 @@ mod tests {
             version: Some("0.1.0".to_string()),
             install_path: Some("capsules/home-cli".to_string()),
             repository: None,
-            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -2675,7 +2669,6 @@ mod tests {
             version: None,
             install_path: Some("bin/vmlinux".to_string()),
             repository: None,
-            source_path: None,
             size_mb: None,
             description: None,
             platforms,

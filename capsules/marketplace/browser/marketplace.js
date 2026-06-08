@@ -212,7 +212,6 @@
       installPath: capsule.install_path || "",
       releasePath: capsule.release_path || "",
       repository: capsule.repository || "",
-      sourcePath: capsule.source_path || "",
     };
   }
 

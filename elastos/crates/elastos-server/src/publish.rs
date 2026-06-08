@@ -11,13 +11,53 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
+    "did-provider",
+    "net-provider",
+    "exit-provider",
+    "browser-engine-adapter",
+    "webspace-provider",
+    "object-provider",
+    "home-cli",
+    "home",
+    "system",
+    "wallet-metamask",
+    "wallet-unisat",
+    "wallet-walletconnect",
+    "wallet",
+    "browser",
+    "documents",
+    "library",
+    "marketplace",
+    "inbox",
     "chat",
     "chat-wasm",
-    "did-provider",
+    "gba-emulator",
+    "gba-ucity",
+    "chat-room",
     "tunnel-provider",
 ];
-const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] =
-    &["shell", "localhost-provider", "chat", "did-provider"];
+const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
+    "shell",
+    "localhost-provider",
+    "did-provider",
+    "net-provider",
+    "exit-provider",
+    "browser-engine-adapter",
+    "webspace-provider",
+    "object-provider",
+    "home-cli",
+    "home",
+    "system",
+    "wallet-metamask",
+    "wallet-unisat",
+    "wallet-walletconnect",
+    "wallet",
+    "browser",
+    "documents",
+    "library",
+    "marketplace",
+    "inbox",
+];
 const ALLOWED_RELEASE_CHANNELS: &[&str] = &["stable", "canary", "jetson-test"];
 
 pub(crate) fn source_discovery_uri(publisher_did: &str, channel: &str) -> String {
@@ -1457,7 +1497,7 @@ mod tests {
         discover_available_capsules, load_publish_state, operator_release_notes,
         publish_profile_capsules, release_discovery_topics, save_publish_state, select_capsules,
         source_discovery_uri, validate_publish_inputs, PublishReleaseOptions, PublishState,
-        ReleaseLedgerEntry, ReleaseLedgerPlatform,
+        ReleaseLedgerEntry, ReleaseLedgerPlatform, DEFAULT_PUBLISH_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -1504,26 +1544,18 @@ mod tests {
 
     #[test]
     fn test_select_capsules_defaults_to_public_publish_set() {
-        let manifests = test_manifests(&[
-            ("chat", &["did-provider"]),
-            ("chat-wasm", &[]),
-            ("did-provider", &[]),
-            ("localhost-provider", &[]),
-            ("shell", &[]),
-            ("tunnel-provider", &[]),
-        ]);
+        let entries = DEFAULT_PUBLISH_CAPSULES
+            .iter()
+            .map(|name| (*name, &[][..]))
+            .collect::<Vec<(&str, &[&str])>>();
+        let manifests = test_manifests(&entries);
         let selected = select_capsules("demo", &[], &manifests).unwrap();
-        assert_eq!(
-            selected,
-            vec![
-                "chat".to_string(),
-                "chat-wasm".to_string(),
-                "did-provider".to_string(),
-                "localhost-provider".to_string(),
-                "shell".to_string(),
-                "tunnel-provider".to_string(),
-            ]
-        );
+        let mut expected = DEFAULT_PUBLISH_CAPSULES
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(selected, expected);
     }
 
     #[test]
