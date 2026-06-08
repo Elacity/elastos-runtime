@@ -1139,6 +1139,10 @@ const state = {
   homeToken: new URLSearchParams(window.location.search).get("home_token") || "",
   initialDocDid: new URLSearchParams(window.location.search).get("doc") || "",
   initialCid: new URLSearchParams(window.location.search).get("cid") || "",
+  initialLibraryObjectUri:
+    new URLSearchParams(window.location.search).get("objectUri") ||
+    new URLSearchParams(window.location.search).get("object_uri") ||
+    "",
   initialView: new URLSearchParams(window.location.search).get("view") || "",
   initialIntent: new URLSearchParams(window.location.search).get("intent") || "",
   mode: "share",
@@ -1347,8 +1351,22 @@ function documentUri(docDid) {
   return docDid ? "localhost://ElastOS/Documents/" + docDid : "";
 }
 
+function baseName(uri) {
+  const clean = String(uri || "").replace(/\/+$/, "");
+  const name = clean.split("/").pop() || "Document";
+  try {
+    return decodeURIComponent(name);
+  } catch (_error) {
+    return name;
+  }
+}
+
+function isLibraryFileProjection(document) {
+  return !!document && !!document.library_object_uri;
+}
+
 function isDraftDocument(document) {
-  return !!document && !document.doc_did;
+  return !!document && !document.doc_did && !isLibraryFileProjection(document);
 }
 
 function createDraftDocument() {
@@ -1424,11 +1442,12 @@ function setDirty(dirty) {
   state.dirty = !!dirty;
   const hasCurrent = !!state.current;
   const hasPersistedCurrent = hasCurrent && !isDraftDocument(state.current);
+  const isLibraryFile = isLibraryFileProjection(state.current);
   elements.saveButton.disabled = !hasCurrent || !state.dirty;
-  elements.saveAsButton.disabled = !hasPersistedCurrent;
-  elements.publishButton.disabled = !hasCurrent;
-  elements.unpublishButton.disabled = !hasPersistedCurrent || !state.current.latest_published_cid;
-  elements.deleteButton.disabled = !hasPersistedCurrent;
+  elements.saveAsButton.disabled = !hasPersistedCurrent || isLibraryFile;
+  elements.publishButton.disabled = !hasCurrent || isLibraryFile;
+  elements.unpublishButton.disabled = !hasPersistedCurrent || isLibraryFile || !state.current.latest_published_cid;
+  elements.deleteButton.disabled = !hasPersistedCurrent || isLibraryFile;
   if (hasCurrent && state.dirty) {
     setStatus("Unsaved local changes.", "warning");
   } else if (hasCurrent) {
@@ -1541,7 +1560,7 @@ function renderCurrentDocument() {
     return;
   }
 
-  elements.titleInput.disabled = false;
+  elements.titleInput.disabled = isLibraryFileProjection(state.current);
   elements.editor.disabled = false;
   elements.titleInput.value = state.current.title;
   elements.editor.value = state.current.body;
@@ -1634,6 +1653,43 @@ async function documentsProviderApi(op, payload) {
   return response && typeof response === "object" && "data" in response ? response.data : response;
 }
 
+async function libraryObjectApi(op, payload) {
+  const uri = payload && payload.uri ? String(payload.uri) : "";
+  const endpoint = "/api/viewers/documents/library-object?uri=" + encodeURIComponent(uri);
+  const response = op === "write"
+    ? await documentsApi(endpoint, {
+      method: "PUT",
+      body: JSON.stringify({
+        data: payload.data || "",
+        mime: payload.mime || null,
+        if_revision: payload.if_revision || null,
+      }),
+    })
+    : await documentsApi(endpoint, { method: "GET" });
+  if (response && response.status === "error") {
+    throw new Error(response.message || "Library object request failed");
+  }
+  return response && typeof response === "object" && "data" in response ? response.data : response;
+}
+
+function base64ToUtf8(data) {
+  const binary = atob(data || "");
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function utf8ToBase64(text) {
+  const bytes = new TextEncoder().encode(String(text || ""));
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
 function upsertDocumentListItem(document) {
   const listItem = {
     doc_did: document.doc_did,
@@ -1674,6 +1730,13 @@ async function loadSummary() {
     await createDocument("");
     return;
   }
+  if (state.initialLibraryObjectUri) {
+    const requestedUri = state.initialLibraryObjectUri.trim();
+    state.initialLibraryObjectUri = "";
+    await loadLibraryObject(requestedUri);
+    setWorkspaceView(state.initialView === "write" ? "write" : "read");
+    return;
+  }
   if (state.initialCid) {
     const requestedCid = state.initialCid.trim();
     state.initialCid = "";
@@ -1703,6 +1766,30 @@ async function loadSummary() {
     return;
   }
   startDraftDocument({ focusTitle: true });
+}
+
+async function loadLibraryObject(uri) {
+  const response = await libraryObjectApi("read", { uri });
+  const object = response.object || {};
+  const name = object.name || baseName(object.uri || uri);
+  state.current = {
+    doc_did: "",
+    document_uri: object.uri || uri,
+    library_object_uri: object.uri || uri,
+    revision: object.revision || "",
+    title: name,
+    file_name: name,
+    working_copy_uri: object.uri || uri,
+    body: base64ToUtf8(response.data || ""),
+    mime: object.mime || "text/markdown",
+    created_at: object.created_at || 0,
+    updated_at: object.modified_at || 0,
+    latest_published_cid: null,
+    publish_history: [],
+  };
+  renderDocumentsList();
+  renderCurrentDocument();
+  setStatus("Opened from Library.");
 }
 
 async function selectDocument(docDid, options) {
@@ -1751,6 +1838,30 @@ async function saveCurrent() {
     return;
   }
   setStatus("Saving…");
+  if (isLibraryFileProjection(state.current)) {
+    const response = await libraryObjectApi("write", {
+      uri: state.current.library_object_uri,
+      data: utf8ToBase64(elements.editor.value),
+      mime: state.current.mime || "text/markdown",
+      if_revision: state.current.revision || null,
+    });
+    const object = response.object || {};
+    state.current = {
+      ...state.current,
+      document_uri: object.uri || state.current.document_uri,
+      library_object_uri: object.uri || state.current.library_object_uri,
+      revision: object.revision || state.current.revision,
+      title: object.name || state.current.title,
+      file_name: object.name || state.current.file_name,
+      body: elements.editor.value,
+      mime: object.mime || state.current.mime,
+      updated_at: object.modified_at || state.current.updated_at,
+    };
+    renderCurrentDocument();
+    renderDocumentsList();
+    setStatus("Saved to Library.");
+    return;
+  }
   if (isDraftDocument(state.current)) {
     const created = await documentsProviderApi("create", {
       title: elements.titleInput.value || null,
@@ -1852,6 +1963,10 @@ async function publishCurrent() {
   if (!state.current) {
     return;
   }
+  if (isLibraryFileProjection(state.current)) {
+    setStatus("Publish Library files from Library.", "warning");
+    return;
+  }
   try {
     if (state.dirty || isDraftDocument(state.current)) {
       await saveCurrent();
@@ -1873,7 +1988,12 @@ async function publishCurrent() {
 }
 
 async function unpublishCurrent() {
-  if (!state.current || isDraftDocument(state.current) || !state.current.latest_published_cid) {
+  if (
+    !state.current ||
+    isDraftDocument(state.current) ||
+    isLibraryFileProjection(state.current) ||
+    !state.current.latest_published_cid
+  ) {
     return;
   }
   try {
@@ -1890,7 +2010,7 @@ async function unpublishCurrent() {
 }
 
 async function requestDeleteCurrent() {
-  if (!state.current || isDraftDocument(state.current)) {
+  if (!state.current || isDraftDocument(state.current) || isLibraryFileProjection(state.current)) {
     return;
   }
   const deletedDocDid = state.current.doc_did;

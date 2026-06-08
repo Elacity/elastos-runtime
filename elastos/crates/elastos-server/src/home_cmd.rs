@@ -200,6 +200,7 @@ const PROVIDER_CAPSULE_NAMES: &[&str] = &[
     "did-provider",
     "chain-provider",
     "wallet-provider",
+    "object-provider",
     "drm-provider",
     "rights-provider",
     "key-provider",
@@ -3276,6 +3277,7 @@ mod tests {
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"did-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"chain-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"wallet-provider"));
+        assert!(PROVIDER_CAPSULE_NAMES.contains(&"object-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"drm-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"rights-provider"));
         assert!(PROVIDER_CAPSULE_NAMES.contains(&"key-provider"));

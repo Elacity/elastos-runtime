@@ -10,6 +10,7 @@ struct HomeSummaryResponse {
     site: HomeSiteSummary,
     room: HomeRoomSummary,
     notifications: HomeNotificationsSummary,
+    desktop_objects: HomeDesktopObjectsSummary,
     targets: Vec<HomeTargetSummary>,
 }
 
@@ -57,6 +58,17 @@ struct HomeBrowserStateUpdate {
     session: Option<Option<serde_json::Value>>,
     #[serde(default)]
     recent_targets: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HomeDesktopObjectsSummary {
+    schema: String,
+    uri: String,
+    #[serde(default)]
+    objects: Vec<serde_json::Value>,
+    stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
