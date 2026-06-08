@@ -2,7 +2,36 @@
 
 **Status:** Ready. Execute the moment GitHub push access is restored.
 **Date:** 2026-06-08
-**Base for every branch:** `origin/0.4.0` (all are clean descendants — verified).
+**Base for every branch:** `origin/0.4.0`.
+
+> ## ⚠️ Base moved — rebase before pushing (2026-06-08, Day 17)
+>
+> Anders **force-pushed `origin/0.4.0`** (`42e4d7ffd` → `67b7560a7`), redoing
+> commits as warned, and **more redones are still coming** ("3 latest will be
+> redone soon and the rest to follow; aiming to finish 0.4.0 today"). So **do not
+> rebase yet** — wait until 0.4.0 stops moving, then rebase each branch.
+>
+> **Good news — the contract converged.** `elastos-common/protected_content.rs` is
+> **byte-identical** between `feat/decrypt-provider-cenc` and the redone
+> `origin/0.4.0` (verified: `git diff HEAD..origin/0.4.0 -- …/protected_content.rs`
+> = 0 lines). The redone base independently added the exact types our providers
+> were already built against (`RightsDecisionReceiptV1`, `KeyReleaseRequestV1.
+> rights_receipt`, typed `DecryptSessionRequestV1.release_receipt`,
+> `ReleaseReceiptV1.session_id/action`). **Zero type drift.**
+>
+> **Rebase recipe for `feat/decrypt-provider-cenc`** (when 0.4.0 settles):
+> ```bash
+> git fetch origin 0.4.0
+> scripts/ddrm-drift-check.sh            # must PASS first (guards the contract)
+> git branch -f backup/ddrm-preD<N> feat/decrypt-provider-cenc   # safety
+> git rebase --onto origin/0.4.0 <parent-of-our-first-commit> feat/decrypt-provider-cenc
+> # Conflicts will be ONLY in capsules/{decrypt,key,drm}-provider/src/main.rs,
+> # and ONLY because the base lacks our additions — resolve "keep both": take the
+> # base's structure + re-apply our cenc/envelope/rights-binding/seam/consumer
+> # additions. No type reconciliation needed (contract is identical).
+> ```
+> A safety backup of the pre-rebase tip is kept at
+> `backup/decrypt-provider-cenc-preD17`.
 
 While GitHub access is suspended, all work has been committed to isolated local
 branches, each scoped to one reviewable concern. This is the exact order and

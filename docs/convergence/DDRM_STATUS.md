@@ -134,9 +134,31 @@ Providers ship as **`wasm` now** (proven cross-platform, runs on macOS today);
 **microVM** remains the later max-isolation upgrade from the same Rust source. The
 fail-closed contract is tier-independent. Rationale in `DDRM_DECRYPT_RAIL.md`.
 
+## Base reconciliation (Day 17) — 0.4.0 force-push, zero type drift
+
+Anders force-pushed `origin/0.4.0` (`42e4d7ffd` → `67b7560a7`), redoing commits as
+warned, with more still to come. We did **not** rebase yet (0.4.0 is still moving),
+but verified the impact:
+
+- **`elastos-common/protected_content.rs` is byte-identical** between this branch
+  and the redone `origin/0.4.0` (`git diff` = 0 lines). The redone base
+  independently landed the exact types our providers were built against
+  (`RightsDecisionReceiptV1`, `KeyReleaseRequestV1.rights_receipt`, typed
+  `DecryptSessionRequestV1.release_receipt`, `ReleaseReceiptV1.session_id/action`).
+  **The convergence held — zero type drift.**
+- A drift guard, `scripts/ddrm-drift-check.sh`, asserts every schema constant,
+  struct, and chain-binding field the chain depends on still exists on the current
+  base. Run it before any rebase/PR; it fails loudly if a future 0.4.0 redo moves a
+  type. **Currently: PASS.**
+- All five providers' host tests pass against the current tree:
+  `encrypt 6(+1 ignored)`, `drm 12`, `rights 9`, `key 9`, `decrypt 25` → **61 green**.
+- Rebase recipe + safety backup (`backup/decrypt-provider-cenc-preD17`):
+  `PUSH_PLAN.md` § "Base moved".
+
 ## Commits (on `feat/decrypt-provider-cenc`, not yet pushed — GitHub suspension)
 
-14 commits ahead of `origin/0.4.0`, newest last:
+17 commits ahead of `origin/0.4.0` (the original 14 below, plus Day 15 status/PQ,
+Day 16 encrypt-provider, Day 17 drift guard). Newest last:
 
 1. `docs(convergence)` — north-star playbook, product vision PRD, v0.4.0 plan
 2. `feat(decrypt-provider)` — vendor PC2 cenc-decrypt engine as fail-closed backend
