@@ -20,7 +20,20 @@ pub(super) async fn home_launch(
         ));
     }
 
-    let Some(target_summary) = home_launch_target(&state.data_dir, target) else {
+    let mut target_summary = home_launch_target(&state.data_dir, target);
+    if target_summary.is_none() || state.data_dir.join("capsules").join(target).exists() {
+        ensure_home_target_package(&state.data_dir, target, target_summary.is_none())
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": err })),
+                )
+            })?;
+        target_summary = home_launch_target(&state.data_dir, target);
+    }
+
+    let Some(target_summary) = target_summary else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Home target not found" })),
@@ -207,6 +220,14 @@ pub(super) async fn launch_runtime_backed_home_target(
     target: &str,
     context: &HomeLaunchTokenContext,
 ) -> Option<GatewayRuntimeLaunchOutcome> {
+    if let Err(err) = ensure_home_target_package(data_dir, target, false).await {
+        return Some(GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some(err),
+        });
+    }
+
     let capsule_dir = resolve_capsule_dir(data_dir, target)?;
     let manifest = crate::api::capsule_inventory::load_capsule_manifest(&capsule_dir, target)?;
     if !manifest.role.is_shell_launchable() || manifest.capsule_type == CapsuleType::Data {
@@ -310,6 +331,22 @@ async fn launch_runtime_capsule(
         capsule_id: Some(payload.id),
         detail: None,
     })
+}
+
+async fn ensure_home_target_package(
+    data_dir: &FsPath,
+    target: &str,
+    required: bool,
+) -> Result<(), String> {
+    let installed_dir = data_dir.join("capsules").join(target);
+    if !required && !installed_dir.exists() {
+        return Ok(());
+    }
+
+    crate::setup::ensure_capsule_component_for_home_launch(data_dir, target)
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("Home target package materialization failed: {err}"))
 }
 
 pub(super) async fn system_runtime_log(data_dir: &FsPath) -> SystemRuntimeLogSummary {
