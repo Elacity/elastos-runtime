@@ -32,7 +32,7 @@ app/viewer --drm/open--> drm-provider --sequences--> rights -> key -> decrypt --
 | `drm-provider` | orchestrator (`drm/open`) + chain-seam | yes | 12 | builds | 4/4 |
 | `rights-provider` | rights decision | yes | 9 | builds | 4/4 |
 | `key-provider` | key release (rights-bound) | yes | 9 | builds | 4/4 |
-| `decrypt-provider` | decrypt/render (cenc + envelope + consumer contract) | yes | 25 | builds | 4/4 |
+| `decrypt-provider` | decrypt/render (cenc + envelope + consumer contract) | yes | 25 (+2 `rail-prep`) | builds | 4/4 |
 
 The chain now has **both ends present**: `encrypt-provider` is the producer
 (invariant #1) and `decrypt-provider` the consumer (invariant #2). The encrypt
@@ -71,6 +71,20 @@ pinned by tests; its in-boundary keygen/cipher engine is the one scoped gap
   non-media (render-only plaintext via opaque session id) — and that a real
   decrypted media segment never lets the CEK/IV/plaintext reach the player
   boundary (`media_segment_decrypt_keeps_cek_and_plaintext_off_the_player_boundary`).
+- **Rail-landing composition prepped (Parallel Change, feature `rail-prep`).** The
+  two previously-separate tested islands — the upstream envelope unwrap
+  (`envelope::{parse, ecdh_unwrap, extract_cek}`) and the decrypt-step core
+  (`decrypt_session_segment`) — are now joined by `decrypt_sealed_segment`, the
+  single in-boundary operation the Hybrid rail will invoke once Anders confirms the
+  CEK transport. It mirrors PC2 `ddrm-decrypt::session::unwrap_envelope` → cenc
+  decrypt: the CEK materializes only after a correct ECDH unwrap, is held in
+  `Zeroizing`, is consumed + zeroized by the cenc engine, and never reaches the
+  scoped response. Pinned by characterization tests
+  (`sealed_segment_decrypts_end_to_end_and_keeps_cek_off_the_boundary`,
+  `sealed_segment_fails_closed_on_wrong_session_key`) and proven to build to
+  `wasm32-wasip1`. **The flag is OFF by default — the live dispatch and the 25-test
+  default suite are unchanged** — so the live wiring is a one-step swap into
+  `open_session`/`render` once the rail + session-key provisioning land.
 
 ## How to run it yourself
 

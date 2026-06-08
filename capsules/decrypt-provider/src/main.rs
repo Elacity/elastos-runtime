@@ -173,6 +173,47 @@ fn decrypt_session_segment(
     Ok((plaintext, meta))
 }
 
+/// Rail-landing composition (PREP — gated behind the `rail-prep` feature; not yet
+/// wired into `open_session`/`render`).
+///
+/// This joins the chain's two tested islands into the single in-boundary operation
+/// the Hybrid decrypt rail will invoke once Anders confirms the CEK-transport rail
+/// (`docs/convergence/DDRM_DECRYPT_RAIL.md`): the upstream CEK-sealing envelope
+/// unwrap (`envelope::{parse, ecdh_unwrap, extract_cek}`) immediately followed by
+/// the decrypt-step core (`decrypt_session_segment`). It mirrors PC2
+/// `ddrm-decrypt::session::unwrap_envelope` (recover CEK) → cenc segment decrypt,
+/// so the CEK:
+///   - materializes only after a correct ECDH unwrap against the session secret key;
+///   - is held in `Zeroizing` storage for its whole (short) lifetime;
+///   - is consumed by the cenc engine inside this boundary and zeroized there;
+///   - never appears in the scoped, caller-facing response (see `scoped_session_response`).
+///
+/// Keeping it behind a feature flag means the default build and the 25-test default
+/// suite are unchanged (Parallel Change): the live wiring becomes a one-step swap
+/// into dispatch once the rail and session-key provisioning land.
+#[cfg(feature = "rail-prep")]
+#[allow(dead_code)]
+fn decrypt_sealed_segment(
+    session_secret_key: &p256::SecretKey,
+    sealed_envelope: &[u8],
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, Value), String> {
+    use base64::Engine as _;
+    use zeroize::Zeroizing;
+
+    let parsed = envelope::parse(sealed_envelope).map_err(|err| format!("{err:?}"))?;
+    let plaintext =
+        envelope::ecdh_unwrap(session_secret_key, &parsed).map_err(|err| format!("{err:?}"))?;
+    let cek = envelope::extract_cek(&plaintext).map_err(|err| format!("{err:?}"))?;
+
+    // Bridge the recovered CEK into the cenc engine's command surface. The base64
+    // form is held in `Zeroizing` so it is scrubbed from linear memory on drop,
+    // keeping the CEK contained across this internal hand-off.
+    let cek_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(cek.as_slice()));
+    decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
 /// Build the scoped, containment-safe decrypt-session response for the caller.
 ///
 /// Carries session and output metadata only. The raw CEK and the decrypted plaintext
@@ -609,5 +650,130 @@ mod tests {
             !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
             "decrypted media must not reach the player as plaintext in the scoped response"
         );
+    }
+
+    // --- rail-landing composition (PREP, feature = "rail-prep") ----------------
+    //
+    // Proves the end-to-end in-boundary flow the Hybrid decrypt rail will invoke
+    // once Anders confirms the CEK-transport rail: a session-sealed CEK envelope +
+    // an encrypted media segment go in; scoped metadata comes out; the CEK and the
+    // decrypted bytes never cross the provider boundary. Gated behind the feature so
+    // the default suite stays at 25; run with:  cargo test --features rail-prep
+
+    /// Seal a CEK to `session_pk` exactly as the upstream sealer (Lit/key-provider)
+    /// would — independently constructing the wire format so the round-trip pins the
+    /// rail contract end to end. Mirrors `envelope.rs`'s sealer.
+    #[cfg(feature = "rail-prep")]
+    fn seal_cek_envelope(session_pk: &p256::PublicKey, cek: &[u8], version: u8) -> Vec<u8> {
+        use aes::Aes256;
+        use cbc::Encryptor as CbcEncryptor;
+        use cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        use elliptic_curve::sec1::ToEncodedPoint;
+        use p256::ecdh::EphemeralSecret;
+        use rand_core::OsRng;
+        type Aes256CbcEnc = CbcEncryptor<Aes256>;
+
+        let eph = EphemeralSecret::random(&mut OsRng);
+        let eph_point = eph.public_key().to_encoded_point(true);
+        let eph_bytes = eph_point.as_bytes();
+        let shared = eph.diffie_hellman(session_pk);
+        let key_bytes = shared.raw_secret_bytes();
+
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&0u32.to_be_bytes()); // metaSize
+        inner.extend_from_slice(&1u32.to_be_bytes()); // keyCount
+        inner.extend_from_slice(cek);
+
+        let iv: [u8; 16] = if version == 0x03 {
+            let mut iv = [0u8; 16];
+            getrandom::getrandom(&mut iv).unwrap();
+            iv
+        } else {
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&eph_bytes[..16]);
+            iv
+        };
+
+        let cipher = Aes256CbcEnc::new(key_bytes.as_slice().into(), (&iv).into());
+        let mut buf = vec![0u8; inner.len() + 16];
+        buf[..inner.len()].copy_from_slice(&inner);
+        let ct_len = cipher
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, inner.len())
+            .unwrap()
+            .len();
+        let ciphertext = &buf[..ct_len];
+
+        let mut env = Vec::new();
+        env.extend_from_slice(&[0, 0, 0, version]);
+        env.extend_from_slice(&(eph_bytes.len() as u16).to_be_bytes());
+        env.extend_from_slice(eph_bytes);
+        if version == 0x03 {
+            env.extend_from_slice(&iv);
+        }
+        env.extend_from_slice(&0u16.to_be_bytes()); // empty signature
+        env.extend_from_slice(&[0u8; 33]); // signer pubkey (skipped)
+        env.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        env.extend_from_slice(ciphertext);
+        env
+    }
+
+    #[cfg(feature = "rail-prep")]
+    #[test]
+    fn sealed_segment_decrypts_end_to_end_and_keeps_cek_off_the_boundary() {
+        use p256::SecretKey;
+        use rand_core::OsRng;
+
+        let plaintext = b"the quick brown fox jumps over!!"; // 32 bytes
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+
+        let session_sk = SecretKey::random(&mut OsRng);
+        let sealed = seal_cek_envelope(&session_sk.public_key(), &cek, 0x03);
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        // The whole rail step: sealed CEK envelope + encrypted segment -> plaintext
+        // recovered inside the boundary, CEK recovered only via ECDH unwrap.
+        let (output, meta) = decrypt_sealed_segment(&session_sk, &sealed, &segment, None).unwrap();
+
+        let moof_len = segment.len() - (8 + plaintext.len());
+        let mdat_off = moof_len + 8;
+        assert_eq!(&output[mdat_off..mdat_off + plaintext.len()], plaintext);
+        assert_eq!(meta["is_protected"], json!(true));
+        assert_eq!(meta["sample_count"], json!(1));
+
+        // Containment: neither the CEK nor the plaintext reaches the scoped response,
+        // and the sealed envelope never carried the raw CEK in cleartext.
+        let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
+        let serialized =
+            serde_json::to_string(&scoped_session_response(&decrypt_request(), &meta)).unwrap();
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must never cross the provider boundary to the caller"
+        );
+        assert!(
+            !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
+            "decrypted plaintext must never cross the provider boundary to the caller"
+        );
+        assert!(
+            !sealed.windows(cek.len()).any(|w| w == cek),
+            "sealed envelope must not contain the raw CEK"
+        );
+    }
+
+    #[cfg(feature = "rail-prep")]
+    #[test]
+    fn sealed_segment_fails_closed_on_wrong_session_key() {
+        use p256::SecretKey;
+        use rand_core::OsRng;
+
+        let cek = [0x11u8; 16];
+        let session_sk = SecretKey::random(&mut OsRng);
+        let wrong_sk = SecretKey::random(&mut OsRng);
+        let sealed = seal_cek_envelope(&session_sk.public_key(), &cek, 0x03);
+        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
+
+        // A wrong session key cannot unwrap the envelope -> the whole step fails
+        // closed before any segment decryption is attempted.
+        assert!(decrypt_sealed_segment(&wrong_sk, &sealed, &segment, None).is_err());
     }
 }

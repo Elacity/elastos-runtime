@@ -9,6 +9,14 @@ license = "MIT"
 name = "decrypt-provider"
 path = "src/main.rs"
 
+[features]
+# rail-prep: compile (and test) the in-boundary composition the Hybrid decrypt rail
+# will wire once Anders confirms the CEK-transport rail
+# (docs/convergence/DDRM_DECRYPT_RAIL.md): upstream CEK-sealing envelope unwrap ->
+# decrypt-step cenc engine, colocated in this boundary. OFF by default (Parallel
+# Change) so the live dispatch and the default test surface stay unchanged.
+rail-prep = []
+
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
