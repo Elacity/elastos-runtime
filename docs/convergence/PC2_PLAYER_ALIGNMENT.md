@@ -89,6 +89,31 @@ It is deliberately **not yet wired** into the live `OpenSession`/`Render`
 dispatch — that one-step wiring lands once Anders confirms (a) Option A and (b)
 the session-key provisioning path. Contract-first, by design.
 
+## Consumer contract — what each player receives (and never receives)
+
+The downstream boundary (decrypt-provider → player) is fully rail-independent and
+is now pinned by characterization tests in `decrypt-provider`. PC2's
+`ddrm-decrypt/media.rs` states the rule verbatim: *"Public functions never accept
+or return a CEK; only `request_handle: u32`."*
+
+| Player | Receives | Addressed by | Never receives |
+|---|---|---|---|
+| **Media** (`elacity-player`) | decrypted fMP4 segments (init + media) for MSE `appendBuffer`, streamed per segment | opaque session/request handle | CEK, IV, raw key bytes |
+| **Non-media** (`ddrm-viewer`) | `render_only` plaintext / rendered pixels (pixel-lock) or sanitized XHTML + watermark (html-lock) | opaque session id | CEK, IV, raw key bytes |
+
+Runtime enforcement (tests in `capsules/decrypt-provider/src/main.rs`):
+- the scoped response carries **metadata only** — an allow-list of
+  `schema, session_id, object_cid, viewer_interface, output_kind, is_protected,
+  sample_count, expires_at`;
+- a forbidden-key check rejects any `cek/iv/key/plaintext/decrypted/secret/...`
+  field ever appearing in the player-facing response, for **both** player kinds;
+- a media-segment decrypt run asserts neither the CEK nor the decrypted bytes
+  reach the scoped (player-facing) output.
+
+This means the two ends of the chain already meet in the middle: the upstream rail
+(envelope unwrap, pending Anders) hands the CEK only into the decrypt boundary, and
+the downstream boundary provably emits scoped output with the key confined.
+
 ## Isolation tier — evidence for the open question
 
 PC2 runs both `ddrm-decrypt` and the players as **`wasm32-wasip1`**, and the

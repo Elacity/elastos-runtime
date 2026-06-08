@@ -508,4 +508,106 @@ mod tests {
             "decrypted plaintext must never cross the provider boundary to the caller"
         );
     }
+
+    // --- decrypt -> player consumer contract (Day 13) -----------------------
+    //
+    // The chain's downstream boundary. Both viewer capsules consume scoped
+    // output ONLY; neither ever receives the CEK. Pins PC2's contract where the
+    // media player gets decrypted fMP4 segments and the non-media player gets
+    // render_only plaintext — in both cases addressed by an opaque session, with
+    // key material confined to this provider (Irzhy invariant #2 at the edge).
+
+    /// A media-player session (video/audio): streamed segments.
+    fn media_decrypt_request() -> DecryptSessionRequestV1 {
+        let mut request = decrypt_request();
+        request.action = "stream".to_string();
+        request.viewer_interface = "elastos.viewer/media@1".to_string();
+        request.output_kind = "stream".to_string();
+        request.release_receipt.action = "stream".to_string();
+        request.reason = "open protected media stream".to_string();
+        request
+    }
+
+    /// Field names that, if they ever appeared in a scoped response, would mean
+    /// key material or raw content escaped the provider boundary.
+    const FORBIDDEN_SCOPED_KEYS: &[&str] = &[
+        "cek",
+        "cek_b64",
+        "iv",
+        "iv_b64",
+        "key",
+        "keys",
+        "plaintext",
+        "decrypted",
+        "secret",
+        "private_key",
+        "rendered_bytes",
+        "output",
+    ];
+
+    /// Keys the scoped response is allowed to carry — metadata only.
+    const ALLOWED_SCOPED_KEYS: &[&str] = &[
+        "schema",
+        "session_id",
+        "object_cid",
+        "viewer_interface",
+        "output_kind",
+        "is_protected",
+        "sample_count",
+        "expires_at",
+    ];
+
+    fn assert_scoped_response_is_metadata_only(request: &DecryptSessionRequestV1) {
+        // A representative decrypt meta as produced by the cenc engine.
+        let meta = json!({ "is_protected": true, "sample_count": 1 });
+        let data = ok_data(scoped_session_response(request, &meta));
+        let obj = data.as_object().expect("scoped response must be an object");
+
+        for key in obj.keys() {
+            assert!(
+                ALLOWED_SCOPED_KEYS.contains(&key.as_str()),
+                "scoped response carried an unexpected key `{key}` for {}",
+                request.viewer_interface
+            );
+            assert!(
+                !FORBIDDEN_SCOPED_KEYS.contains(&key.as_str()),
+                "scoped response leaked forbidden key `{key}` for {}",
+                request.viewer_interface
+            );
+        }
+
+        // The player references the session by opaque id, never by key material.
+        assert_eq!(data["session_id"], json!(request.session_id));
+    }
+
+    #[test]
+    fn media_player_scoped_response_is_metadata_only() {
+        assert_scoped_response_is_metadata_only(&media_decrypt_request());
+    }
+
+    #[test]
+    fn non_media_player_scoped_response_is_metadata_only() {
+        assert_scoped_response_is_metadata_only(&decrypt_request());
+    }
+
+    /// Media-player variant of the containment check: a real decrypted segment
+    /// must not let the CEK or plaintext reach the scoped (player-facing) output.
+    #[test]
+    fn media_segment_decrypt_keeps_cek_and_plaintext_off_the_player_boundary() {
+        let plaintext = b"the quick brown fox jumps over!!";
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+        let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
+
+        let (_segment_bytes, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let serialized =
+            serde_json::to_string(&scoped_session_response(&media_decrypt_request(), &meta)).unwrap();
+
+        assert!(!serialized.contains(&cek_b64), "CEK must not reach the media player");
+        assert!(
+            !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
+            "decrypted media must not reach the player as plaintext in the scoped response"
+        );
+    }
 }
