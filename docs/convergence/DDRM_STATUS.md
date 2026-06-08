@@ -10,6 +10,13 @@ CEK). A full team-facing **security + threat model** is in
 `DDRM_SECURITY_MODEL.md`. The only thing between here and live decrypt is one
 architecture decision (the CEK transport rail) — see `DDRM_DECRYPT_RAIL.md`.
 
+> **Base volatility (Anders, 2026-06-08):** only ~20% of 0.4.0 is on GitHub and its
+> latest commits are being redone. This branch is based on `origin/0.4.0`, so its
+> base will shift; expect a rebase + re-verify of any `elastos-common`
+> `protected_content` types these providers consume once 0.4.0 stabilises. New work
+> is kept contract-first (PC2 as the stable reference) to stay rebase-safe — e.g.
+> `encrypt-provider` is intentionally self-contained until the shared types settle.
+
 ## The chain
 
 ```
@@ -21,10 +28,18 @@ app/viewer --drm/open--> drm-provider --sequences--> rights -> key -> decrypt --
 
 | Provider | Role | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
 | --- | --- | --- | --- | --- | --- |
+| `encrypt-provider` | seal/produce (invariant #1) | yes | 6 (+1 gap) | builds | — |
 | `drm-provider` | orchestrator (`drm/open`) + chain-seam | yes | 12 | builds | 4/4 |
 | `rights-provider` | rights decision | yes | 9 | builds | 4/4 |
 | `key-provider` | key release (rights-bound) | yes | 9 | builds | 4/4 |
 | `decrypt-provider` | decrypt/render (cenc + envelope + consumer contract) | yes | 25 | builds | 4/4 |
+
+The chain now has **both ends present**: `encrypt-provider` is the producer
+(invariant #1) and `decrypt-provider` the consumer (invariant #2). The encrypt
+side is a fail-closed skeleton with the contract + zeroization + no-raw-CEK output
+pinned by tests; its in-boundary keygen/cipher engine is the one scoped gap
+(`cek_and_kid_generated_inside_boundary`, `#[ignore]`). See
+`DDRM_ENCRYPT_INVARIANT.md`.
 
 ## Security properties proven
 

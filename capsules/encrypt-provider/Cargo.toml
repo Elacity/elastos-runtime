@@ -1,0 +1,31 @@
+[package]
+name = "encrypt-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS protected-content encrypt/seal provider capsule (invariant #1: in-boundary CEK+KID)"
+license = "MIT"
+
+[[bin]]
+name = "encrypt-provider"
+path = "src/main.rs"
+
+# NOTE (Day 16, 0.4.0 base volatility): this capsule is intentionally
+# self-contained and does NOT depend on `elastos-common` yet. Anders flagged that
+# only ~20% of 0.4.0 is on GitHub and its latest commits are being redone, so the
+# shared `protected_content` types may still move. The encrypt contract here is
+# derived from the *stable* PC2 reference (`cenc-encrypt`) and the durable
+# SealedObjectV1/KeyEnvelopeV1 shape; reconcile to `elastos-common` once 0.4.0
+# stabilises (tracked in DDRM_ENCRYPT_INVARIANT.md).
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+zeroize = "1"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

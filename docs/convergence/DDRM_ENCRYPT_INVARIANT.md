@@ -1,0 +1,97 @@
+# dDRM encrypt side — invariant #1, the gap, and the target contract
+
+**Status:** encrypt boundary pinned by characterization tests; in-boundary CEK/KID
+generation engine is a known, scoped gap. Branch: `feat/decrypt-provider-cenc`.
+
+This is the *producer* end of the dDRM chain and the home of **Irzhy's security
+invariant #1**:
+
+> During encryption, the CEK and KID should be generated within a wasm boundary;
+> only the ciphertext and its relatives should be set as output of the process and
+> used by the other components of the workflow.
+
+The decrypt side (invariant #2) is already pinned end-to-end (envelope spec +
+cenc + consumer contract — see `DDRM_STATUS.md`). This doc closes the loop on the
+encrypt side.
+
+## What PC2 does today (the stable reference)
+
+PC2's encrypt path (`pc2-node`), traced against the repo:
+
+| Step | Where | File |
+|---|---|---|
+| Generate CEK (`randomBytes(16)`) + KID (`randomUUID`) | **Node/TS host** | `src/services/media/dashPackager.ts::generateCEK` |
+| Escrow/seal the CEK (Chipotle) | host → provider | `dashPackager.ts::encryptMediaCEK` |
+| CENC-encrypt fMP4 segments (AES-128-CTR) | **wasm** (`cenc-encrypt`) | `crates/cenc-encrypt/src/lib.rs` |
+| Zeroize raw CEK | host (`cek.fill(0)`) + wasm (`cek_bytes … = 0`) | both |
+| Emit ciphertext + IVs + PSSH/tenc (KID) | wasm output | `cenc-encrypt` `EncryptResult` |
+
+**The cipher and zeroization are disciplined**, and `cenc-encrypt`'s output only
+ever carries ciphertext + IVs + KID-derived boxes — it **never emits the CEK**.
+That satisfies invariant #1's *output* half.
+
+**The gap:** CEK/KID **generation happens in the Node host**, and the raw CEK is
+held in host memory long enough to be passed *into* the wasm encryptor
+(`cek_b64`). That is precisely the part of invariant #1 that is not yet in-boundary
+— Irzhy's concern, verbatim.
+
+## What the runtime has today
+
+- `elastos-common` already defines the durable **output types**: `SealedObjectV1`
+  (`payload_cid`, `rights_policy_cid`, `key_envelope`, `viewer`) and
+  `KeyEnvelopeV1` (`scheme`, `kid`, **`wrapped_cek`**, `policy_hash`, `algorithms`).
+  Note: the CEK only ever exists as `wrapped_cek` in these types — the shape itself
+  forbids a raw CEK in output.
+- There is **no `encrypt-provider` capsule** producing them. Structural gap.
+
+## Decision: a dedicated `encrypt-provider` capsule
+
+Encrypt is a distinct, high-authority concern (it mints the only true secret), so
+it gets its own provider — not folded into decrypt or the trusted core.
+
+- **Tier:** `microvm` provider (max isolation), same as the rest of the chain;
+  ships as wasm-proven today, microVM as the hardening upgrade (same Rust source).
+- **Invariant #1, enforced by construction:**
+  - the **caller never supplies a CEK** — `SealRequest` has no key field and
+    `deny_unknown_fields` wire-rejects any smuggled `cek`/`cek_b64`;
+  - the CEK+KID are **minted inside the boundary** (the engine);
+  - the plaintext asset is referenced by handle and consumed in-boundary;
+  - outputs carry only `payload_cid` (ciphertext), `kid`, IV(s), and a
+    **`wrapped_cek`** — never the raw CEK or plaintext;
+  - the raw CEK is **zeroized** before the boundary returns.
+
+### Base-volatility note (Anders, 2026-06-08)
+
+Only ~20% of 0.4.0 is on GitHub and its latest commits are being redone. So the
+`encrypt-provider` skeleton is **intentionally self-contained** (no
+`elastos-common` dependency yet): its contract is derived from the *stable* PC2
+reference + the durable `SealedObjectV1` shape. **Reconcile to `elastos-common`
+once 0.4.0 stabilises** (replace local `SealRequest`/sealed-output modelling with
+the shared `protected_content` types, exactly as the other providers do).
+
+## Invariant #1 → enforcement (executable)
+
+All in `capsules/encrypt-provider/src/main.rs`, all passing except the marked gap:
+
+| Invariant #1 clause | Test | State |
+|---|---|---|
+| Caller cannot supply a CEK (key minted in-boundary) | `seal_request_cannot_carry_a_cek_on_the_wire` | ✅ pass |
+| Output carries only sealed/non-secret material (no raw CEK) | `sealed_output_never_carries_raw_cek` | ✅ pass |
+| Raw CEK zeroized after use | `cek_is_zeroized_after_use` | ✅ pass |
+| Boundary blocks raw_cek + plaintext authority | `status_blocks_raw_cek_and_plaintext_authority` | ✅ pass |
+| Nothing seals by accident (fail-closed) | `seal_fails_closed_until_engine_configured` | ✅ pass |
+| Weak scheme rejected | `seal_rejects_unsupported_scheme` | ✅ pass |
+| **CEK+KID generated in-boundary (no host involvement)** | `cek_and_kid_generated_inside_boundary` | ⏳ `#[ignore]` — scoped landing |
+
+## The scoped landing (what closes the gap)
+
+Wire the in-boundary engine: mint CEK (CSPRNG) + KID inside the capsule,
+CENC-encrypt the referenced asset (vendor PC2 `cenc-encrypt` the same way
+`decrypt-provider` vendored `cenc-decrypt`), seal the CEK to the rights/key
+authority via the PQ-hybrid envelope (proven wasm-viable, `DDRM_STATUS.md` §PQ),
+upload ciphertext, return a `SealedObjectV1`, then zeroize. Un-`ignore`
+`cek_and_kid_generated_inside_boundary` when done.
+
+Open question for Anders: should the runtime keep PC2's split (CEK escrow to a
+key/license provider) or mint+seal entirely within `encrypt-provider`? Either way,
+generation moves in-boundary — that is the invariant.
