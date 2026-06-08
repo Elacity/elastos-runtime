@@ -387,6 +387,41 @@ the init to `decrypt_segment`. Box layouts validated against PC2 `mp4box.rs`/`ce
 Base ladder otherwise unchanged (default 25; `rail-shim` 45); `wasm32-wasip1` clean;
 `ddrm-verify.sh` PASS.
 
+### Real ML-DSA-65 signature primitive — the last PQ placeholder closed (Day 32)
+
+The PQ envelope's seal-signature was a **`StubSigner`/`StubVerifier`** (a SHA-256
+placeholder behind the `CekSealVerifier` slot). The **real FIPS 204 ML-DSA-65**
+primitive is now wired in, behind a new `pq-mldsa` feature (separate axis — the
+default build + base ladder stay byte-stable):
+
+- `pq_envelope::mldsa::MlDsa65Verifier` (production) implements `CekSealVerifier` over
+  RustCrypto `ml-dsa` 0.1 (same family as the already-vetted `ml-kem`). The decrypt
+  boundary only ever **verifies** — construction (`VerifyingKey::new_from_slice`) + verify
+  need **no RNG**, so it compiles cleanly to **`wasm32-wasip1`** (the real constraint:
+  ML-DSA verify inside the WASI sandbox). Fail-closed: a wrong-size key encoding yields
+  no verifier; a malformed/non-matching signature verifies `false` (no panic, no
+  which-half probe). `ml-dsa` is pulled with `default-features = false` (no pkcs8 /
+  getrandom).
+- **Proven (feature `pq-mldsa`, +5 tests → 34):** the real primitive plugs into the exact
+  `hybrid_unwrap` path (genuine seal signature → CEK recovered; tampered sig → `BadSignature`);
+  rejects a **wrong key**; rejects a **tampered body**; fails closed on **malformed**
+  encodings.
+- **Committed KAT** (`tests/vectors/mldsa65_kat.json`, schema `MlDsaKatVector`): a
+  verifying key + signature over a fixed canonical transcript, generated deterministically
+  via `SigningKey::from_seed`. Replayed under `pq-mldsa` (verify-accept + tamper-sig/body
+  fail-closed). It pins the real primitive across refactor/rebase/port **and upstream-crate
+  drift** — if `ml-dsa` ever changed its keygen/signature output, this would stop verifying.
+
+**What this means for "quantum-proof":** the PQ rail is no longer stubbed anywhere — the
+shipped signature primitive is real and WASI-verified. The remaining PQ gaps are now purely
+*external*: Anders' Q2 transition policy (straight ML-DSA-65 vs hybrid ECDSA+ML-DSA during
+PC2's migration) and landing the rail (the `rail-shim` flag-flip, which already accepts any
+`CekSealVerifier` — `MlDsa65Verifier` drops straight in).
+
+Base ladder byte-stable (default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 /
+vectors 40 / rail-shim 45); new `pq-mldsa` = **34**; `wasm32-wasip1` clean (default +
+`pq-mldsa`); `ddrm-verify.sh` PASS.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
@@ -398,7 +433,9 @@ Three sharpened sub-questions remain for Anders:
 1. Does the **dKMS seal directly** to the decrypt session key (key-provider as a
    pure broker that never holds a raw CEK), or is a key-provider **re-seal** ok?
 2. Signature during transition: straight to **ml-dsa-65**, or a **hybrid**
-   (ECDSA + ml-dsa) while PC2's classical path is migrated?
+   (ECDSA + ml-dsa) while PC2's classical path is migrated? *(The real ML-DSA-65
+   verifier is now built + WASI-verified behind `pq-mldsa` and drops into the
+   `CekSealVerifier` slot — this is purely a policy choice now, not a build gap.)*
 3. Does the provider-invocation rail expose an in-capsule `carrier_invoke` client
    a microvm provider may use today, or is that still landing?
 

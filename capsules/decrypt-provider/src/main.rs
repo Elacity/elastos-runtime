@@ -28,7 +28,7 @@ mod pq_envelope;
 // Portable golden-vector schema (features `vectors` / `rail-shim`):
 // substrate-independent fixtures the engines and the rail shim are replayed
 // against. See src/vector_format.rs.
-#[cfg(any(feature = "vectors", feature = "rail-shim"))]
+#[cfg(any(feature = "vectors", feature = "rail-shim", feature = "pq-mldsa"))]
 mod vector_format;
 // Rail transport shim (feature `rail-shim`): adapter from a sealed-CEK carrier to
 // the proven unwrap->cenc engines. Tested island, not wired into dispatch.

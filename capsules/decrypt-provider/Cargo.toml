@@ -33,6 +33,12 @@ pq-rail-prep = ["pq-envelope"]
 # A tested island, NOT wired into OpenSession/dispatch — the day Anders confirms
 # the rail (DDRM_DECRYPT_RAIL.md) it becomes a flag flip. OFF by default.
 rail-shim = ["rail-prep", "pq-rail-prep"]
+# pq-mldsa: plug the REAL ML-DSA-65 (FIPS 204) signature primitive into the
+# CekSealVerifier slot, replacing the test stub on the PQ rail. Verify-only in the
+# decrypt boundary (the VM verifies the key authority's seal signature before
+# unwrap). Pure-Rust, rng-free verify path -> builds to wasm32-wasip1. OFF by
+# default (separate axis): the default build + base ladder stay byte-stable.
+pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).
@@ -64,6 +70,12 @@ ml-kem = { version = "0.2.3", optional = true }
 x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"], optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
+# ML-DSA-65 (FIPS 204) signature — the shipped PQ-rail seal-signature primitive
+# behind CekSealVerifier (feature `pq-mldsa`). Same RustCrypto family as ml-kem
+# (consistent provenance/maintenance); deterministic from-seed keygen keeps the
+# committed KAT reproducible. default-features off (no pkcs8/getrandom) — the
+# decrypt boundary only verifies, so no RNG is pulled into the wasm build.
+ml-dsa = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }

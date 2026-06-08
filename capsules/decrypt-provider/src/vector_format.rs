@@ -124,3 +124,18 @@ pub struct PqVector {
     /// The plaintext bytes the segment's single sample must decrypt to.
     pub expected_plaintext_b64: String,
 }
+
+/// ML-DSA-65 (FIPS 204) seal-signature known-answer test: a verifying key + a
+/// signature over a fixed canonical transcript. Pins the real signature primitive
+/// (behind `CekSealVerifier`) across refactor/rebase/port and upstream-crate drift
+/// — if `ml-dsa` changed its keygen or signature output this would stop verifying.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MlDsaKatVector {
+    pub description: String,
+    /// ML-DSA-65 verifying key (FIPS 204 `pkEncode`).
+    pub verifying_key_b64: String,
+    /// The canonical transcript the signature covers.
+    pub transcript_b64: String,
+    /// The ML-DSA-65 signature over `transcript`.
+    pub signature_b64: String,
+}

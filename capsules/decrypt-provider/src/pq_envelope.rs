@@ -70,6 +70,42 @@ pub trait CekSealVerifier {
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;
 }
 
+/// Real ML-DSA-65 (FIPS 204) seal-signature verifier — the shipped PQ-rail
+/// signature primitive plugged into the `CekSealVerifier` slot in place of the
+/// test stub. The decrypt boundary only ever *verifies* (the key authority signs
+/// the CEK-seal), so construction + verify need NO RNG and pull no `getrandom`,
+/// keeping this compilable to `wasm32-wasip1`. Fail-closed: a wrong-size key
+/// encoding yields no verifier (`from_encoded` → `None`) and a malformed or
+/// non-matching signature verifies `false` — no panic, no which-half state probe.
+#[cfg(feature = "pq-mldsa")]
+pub mod mldsa {
+    use super::CekSealVerifier;
+    use ml_dsa::{KeyInit, MlDsa65, Signature, Verifier, VerifyingKey};
+
+    pub struct MlDsa65Verifier {
+        vk: VerifyingKey<MlDsa65>,
+    }
+
+    impl MlDsa65Verifier {
+        /// Build from the FIPS 204 verifying-key encoding (Algorithm 22 `pkEncode`)
+        /// the key authority publishes. `None` on a wrong-size/malformed encoding.
+        pub fn from_encoded(bytes: &[u8]) -> Option<Self> {
+            VerifyingKey::<MlDsa65>::new_from_slice(bytes)
+                .ok()
+                .map(|vk| Self { vk })
+        }
+    }
+
+    impl CekSealVerifier for MlDsa65Verifier {
+        fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+            match Signature::<MlDsa65>::try_from(sig) {
+                Ok(s) => self.vk.verify(msg, &s).is_ok(),
+                Err(_) => false,
+            }
+        }
+    }
+}
+
 /// A PQ-hybrid sealed CEK envelope. Carries only public/sealed material; the CEK
 /// exists only after a correct in-VM unwrap.
 pub struct PqSealedEnvelope {
@@ -377,6 +413,182 @@ mod tests {
             !bytes.windows(cek.len()).any(|w| w == cek),
             "the raw CEK must never appear in the sealed PQ envelope"
         );
+    }
+
+    // --- real ML-DSA-65 signature primitive (feature = "pq-mldsa") -------------
+    //
+    // Swap the test stub for the real FIPS 204 ML-DSA-65 primitive behind the same
+    // `CekSealVerifier` slot the rail uses. These pin that the real verify accepts
+    // a genuine seal signature, plugs into the actual `hybrid_unwrap` path, and
+    // fails closed on every corruption (tampered sig / wrong key / tampered body /
+    // malformed encoding). Signing keys are derived deterministically from a fixed
+    // seed (`from_seed`), so no RNG/`getrandom` is needed.
+
+    /// Test-only real ML-DSA-65 signer (the key-authority side). Mirrors the stub
+    /// signer's shape so it drops into `seal()` unchanged.
+    #[cfg(feature = "pq-mldsa")]
+    struct MlDsa65Signer {
+        sk: ml_dsa::SigningKey<ml_dsa::MlDsa65>,
+    }
+
+    #[cfg(feature = "pq-mldsa")]
+    impl CekSealSigner for MlDsa65Signer {
+        fn sign(&self, msg: &[u8]) -> Vec<u8> {
+            use ml_dsa::{SignatureEncoding, Signer};
+            self.sk.sign(msg).to_bytes().to_vec()
+        }
+    }
+
+    #[cfg(feature = "pq-mldsa")]
+    fn mldsa_keypair(seed: [u8; 32]) -> (MlDsa65Signer, Vec<u8>) {
+        use ml_dsa::{Keypair, MlDsa65, SigningKey};
+        let s: ml_dsa::B32 = seed.into();
+        let sk = SigningKey::<MlDsa65>::from_seed(&s);
+        let vk_bytes = sk.verifying_key().encode().to_vec();
+        (MlDsa65Signer { sk }, vk_bytes)
+    }
+
+    /// The real primitive plugs into the exact `hybrid_unwrap` path: a genuine
+    /// ML-DSA-65 seal signature is accepted (CEK recovered), a tampered one fails
+    /// closed with `BadSignature` — same contract the stub satisfied.
+    #[cfg(feature = "pq-mldsa")]
+    #[test]
+    fn mldsa_real_signature_drives_hybrid_unwrap() {
+        let (signer, vk_bytes) = mldsa_keypair([7u8; 32]);
+        let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk_bytes).expect("verifier from vk");
+
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let env = seal(&public, &cek, &signer);
+
+        let recovered = hybrid_unwrap(&secret, &env, &verifier).expect("unwrap with real ML-DSA-65");
+        assert_eq!(recovered.as_slice(), &cek, "real ML-DSA-65 verify gates a correct unwrap");
+
+        let mut tampered = env;
+        tampered.signature[0] ^= 0xFF;
+        assert_eq!(
+            hybrid_unwrap(&secret, &tampered, &verifier).unwrap_err(),
+            PqEnvelopeError::BadSignature,
+            "a tampered ML-DSA-65 signature must fail closed"
+        );
+    }
+
+    /// A seal signed by one key must not verify under a different key.
+    #[cfg(feature = "pq-mldsa")]
+    #[test]
+    fn mldsa_wrong_key_fails_closed() {
+        let (signer_a, _vk_a) = mldsa_keypair([1u8; 32]);
+        let (_signer_b, vk_b) = mldsa_keypair([2u8; 32]);
+        let verifier_b = mldsa::MlDsa65Verifier::from_encoded(&vk_b).expect("verifier b");
+
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let env = seal(&public, &cek, &signer_a);
+
+        assert_eq!(
+            hybrid_unwrap(&secret, &env, &verifier_b).unwrap_err(),
+            PqEnvelopeError::BadSignature,
+            "a seal signed by key A must not verify under key B"
+        );
+    }
+
+    /// A tampered transcript (signed body) must not verify under a valid signature.
+    #[cfg(feature = "pq-mldsa")]
+    #[test]
+    fn mldsa_tampered_body_fails_closed() {
+        use ml_dsa::{SignatureEncoding, Signer};
+        let (signer, vk_bytes) = mldsa_keypair([4u8; 32]);
+        let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk_bytes).expect("verifier");
+
+        let msg = b"elastos-pq-hybrid-threshold-v0/cek-seal/v1 :: transcript";
+        let sig = signer.sk.sign(msg).to_bytes().to_vec();
+        assert!(verifier.verify(msg, &sig), "a genuine signature verifies");
+
+        let mut bad = msg.to_vec();
+        bad[0] ^= 0xFF;
+        assert!(!verifier.verify(&bad, &sig), "a tampered body must fail closed");
+    }
+
+    /// Malformed encodings fail closed without panicking: a wrong-size signature
+    /// verifies `false`; a wrong-size verifying-key encoding yields no verifier.
+    #[cfg(feature = "pq-mldsa")]
+    #[test]
+    fn mldsa_malformed_inputs_fail_closed() {
+        let (_signer, vk_bytes) = mldsa_keypair([3u8; 32]);
+        let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk_bytes).expect("verifier");
+        assert!(!verifier.verify(b"msg", &[0u8; 8]), "wrong-size signature must fail closed");
+        assert!(
+            mldsa::MlDsa65Verifier::from_encoded(&[0u8; 8]).is_none(),
+            "wrong-size verifying-key encoding must yield no verifier"
+        );
+    }
+
+    // --- committed ML-DSA-65 known-answer test (KAT) --------------------------
+    //
+    // A portable golden pinning the real FIPS 204 primitive across refactor/rebase/
+    // port AND upstream-crate drift: if `ml-dsa` ever changed its from-seed keygen
+    // or signature output, this committed (vk, transcript, signature) triple would
+    // stop verifying. Regenerate with:
+    //   `cargo test --features "gen-vectors,pq-mldsa" emit_mldsa_kat`
+
+    /// Fixed transcript the KAT signs — stands in for a canonical CEK-seal payload.
+    #[cfg(feature = "pq-mldsa")]
+    const MLDSA_KAT_TRANSCRIPT: &[u8] =
+        b"elastos-pq-hybrid-threshold-v0/cek-seal/v1 :: ml-dsa-65 known-answer transcript";
+
+    #[cfg(all(feature = "gen-vectors", feature = "pq-mldsa"))]
+    #[test]
+    fn emit_mldsa_kat() {
+        use base64::Engine as _;
+        use ml_dsa::{Keypair, MlDsa65, SignatureEncoding, Signer, SigningKey};
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let seed: ml_dsa::B32 = [0x5Au8; 32].into();
+        let sk = SigningKey::<MlDsa65>::from_seed(&seed);
+        let sig = sk.sign(MLDSA_KAT_TRANSCRIPT).to_bytes().to_vec();
+        let vk = sk.verifying_key().encode().to_vec();
+
+        let v = crate::vector_format::MlDsaKatVector {
+            description: "ML-DSA-65 (FIPS 204) seal-signature KAT: verifying key + signature over a fixed canonical CEK-seal transcript; from_seed([0x5A;32]) deterministic".to_string(),
+            verifying_key_b64: b64.encode(&vk),
+            transcript_b64: b64.encode(MLDSA_KAT_TRANSCRIPT),
+            signature_b64: b64.encode(&sig),
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/mldsa65_kat.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn mldsa_kat_golden_verifies_and_fails_closed() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let v: crate::vector_format::MlDsaKatVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/mldsa65_kat.json"
+        )))
+        .unwrap();
+        let vk = b64.decode(&v.verifying_key_b64).unwrap();
+        let transcript = b64.decode(&v.transcript_b64).unwrap();
+        let sig = b64.decode(&v.signature_b64).unwrap();
+
+        let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk).expect("KAT verifying key decodes");
+        assert!(
+            verifier.verify(&transcript, &sig),
+            "the committed ML-DSA-65 KAT signature must verify"
+        );
+
+        let mut bad_sig = sig.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(!verifier.verify(&transcript, &bad_sig), "tampered KAT signature must fail closed");
+
+        let mut bad_body = transcript.clone();
+        bad_body[0] ^= 0xFF;
+        assert!(!verifier.verify(&bad_body, &sig), "tampered KAT body must fail closed");
     }
 
     // --- full pre-rail data path (feature = "pq-rail-prep") --------------------
