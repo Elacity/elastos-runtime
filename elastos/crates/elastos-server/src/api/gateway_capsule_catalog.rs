@@ -1,11 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use elastos_common::{CapsuleManifest, CapsuleRole, CapsuleType};
-use serde::Serialize;
+use elastos_common::{
+    AffordanceApprovalMode, AffordanceRisk, CapsuleAffordanceDescriptor,
+    CapsuleInterfaceDescriptor, CapsuleManifest, CapsuleRole, CapsuleType,
+};
+use serde::{Deserialize, Serialize};
 
 use super::*;
 
 const CAPSULE_CATALOG_SCHEMA: &str = "elastos.capsules.catalog/v1";
+const CAPSULE_INTERFACE_REGISTRY_SCHEMA: &str = "elastos.capsules.interfaces/v1";
+const CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA: &str = "elastos.capsules.invoke-result/v1";
 
 pub(super) async fn capsule_catalog(
     State(state): State<GatewayState>,
@@ -19,6 +24,149 @@ pub(super) async fn capsule_catalog(
         )
             .into_response(),
     }
+}
+
+pub(super) async fn capsule_interfaces(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    match require_capsule_catalog_token(&state.data_dir, &headers) {
+        Ok(_) => Json(capsule_interface_registry_summary(&state.data_dir)).into_response(),
+        Err(err) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub(super) async fn capsule_interface_invoke(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(request): Json<CapsuleInterfaceInvokeRequest>,
+) -> Response {
+    let resolved = match resolve_capsule_affordance(&state.data_dir, &request) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    let allowed_app = resolved.capsule.clone();
+    let (caller_app, context) = match require_home_launch_token_for_any_app_context(
+        &state.data_dir,
+        &headers,
+        &[allowed_app.as_str()],
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    let request_id = format!(
+        "capsule-affordance:{}:{}:{}",
+        resolved.capsule,
+        resolved.method.id,
+        now_ts()
+    );
+    if let Err(err) = append_provider_effect_audit(
+        &state.data_dir,
+        ProviderEffectAuditInput {
+            capsule_id: &resolved.capsule,
+            event_type: "capsule.affordance.requested",
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
+            request_id: &request_id,
+            result: "requested",
+            reason: &format!(
+                "{} requested {} through {}",
+                caller_app, resolved.method.id, resolved.interface_id
+            ),
+        },
+    ) {
+        return capsule_invoke_error(
+            &resolved,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_failed",
+            &err.to_string(),
+        );
+    }
+
+    let output = match enforce_affordance_invocation_policy(&resolved) {
+        Ok(()) => match dispatch_capsule_affordance(&state, &context, &resolved, &request).await {
+            Ok(output) => output,
+            Err((status, code, message)) => {
+                let _ = append_provider_effect_audit(
+                    &state.data_dir,
+                    ProviderEffectAuditInput {
+                        capsule_id: &resolved.capsule,
+                        event_type: "capsule.affordance.failed",
+                        principal_id: &context.principal_id,
+                        session_id: &context.session_id,
+                        request_id: &request_id,
+                        result: "failed",
+                        reason: &message,
+                    },
+                );
+                return capsule_invoke_error(&resolved, status, code, &message);
+            }
+        },
+        Err((status, code, message)) => {
+            let _ = append_provider_effect_audit(
+                &state.data_dir,
+                ProviderEffectAuditInput {
+                    capsule_id: &resolved.capsule,
+                    event_type: "capsule.affordance.failed",
+                    principal_id: &context.principal_id,
+                    session_id: &context.session_id,
+                    request_id: &request_id,
+                    result: "failed",
+                    reason: message,
+                },
+            );
+            return capsule_invoke_error(&resolved, status, code, message);
+        }
+    };
+
+    if let Err(err) = append_provider_effect_audit(
+        &state.data_dir,
+        ProviderEffectAuditInput {
+            capsule_id: &resolved.capsule,
+            event_type: "capsule.affordance.completed",
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
+            request_id: &request_id,
+            result: "completed",
+            reason: &format!("Runtime completed {}", resolved.method.id),
+        },
+    ) {
+        return capsule_invoke_error(
+            &resolved,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_failed",
+            &err.to_string(),
+        );
+    }
+
+    Json(CapsuleInterfaceInvokeResponse {
+        schema: CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA.to_string(),
+        status: "ok".to_string(),
+        capsule: resolved.capsule,
+        interface: resolved.interface_id,
+        method: resolved.method.id,
+        request_id,
+        output,
+    })
+    .into_response()
 }
 
 pub(super) fn require_capsule_catalog_token(
@@ -65,6 +213,12 @@ pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCata
             "shell" => counts.shell += 1,
             _ => {}
         }
+        counts.interfaces += capsule.interfaces.len();
+        counts.methods += capsule
+            .interfaces
+            .iter()
+            .map(|interface| interface.methods.len())
+            .sum::<usize>();
         if capsule.launchable {
             counts.launchable += 1;
         }
@@ -86,6 +240,248 @@ pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCata
             drm_note: "Protected apps and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
         },
     }
+}
+
+pub(super) fn capsule_interface_registry_summary(
+    data_dir: &std::path::Path,
+) -> CapsuleInterfaceRegistryResponse {
+    let catalog = capsule_catalog_summary(data_dir);
+    let mut interfaces = Vec::new();
+    for capsule in catalog.capsules {
+        for interface in capsule.interfaces {
+            interfaces.push(CapsuleInterfaceSummary {
+                capsule: capsule.name.clone(),
+                capsule_version: capsule.version.clone(),
+                title: capsule.title.clone(),
+                role: capsule.role.clone(),
+                capsule_type: capsule.capsule_type.clone(),
+                cid: capsule.cid.clone(),
+                trust_state: capsule.trust_state.clone(),
+                interface,
+            });
+        }
+    }
+
+    let mut counts = CapsuleInterfaceRegistryCounts::default();
+    counts.capsules = interfaces
+        .iter()
+        .map(|interface| interface.capsule.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    counts.interfaces = interfaces.len();
+    counts.methods = interfaces
+        .iter()
+        .map(|summary| summary.interface.methods.len())
+        .sum();
+
+    CapsuleInterfaceRegistryResponse {
+        schema: CAPSULE_INTERFACE_REGISTRY_SCHEMA.to_string(),
+        counts,
+        interfaces,
+        policy: CapsuleInterfaceRegistryPolicy {
+            descriptor_state: "manifest-declared".to_string(),
+            descriptor_note: "Interfaces describe callable affordances declared by installed apps and providers. They are not authority grants; Runtime approval, expiry, and audit still govern invocation.".to_string(),
+            invocation_state: "runtime-gated".to_string(),
+            invocation_note: "0.4.0 executes low-risk Runtime Marketplace bindings and fails closed for high-risk or user-approval methods until approval/provider binding is complete.".to_string(),
+        },
+    }
+}
+
+fn resolve_capsule_affordance(
+    data_dir: &std::path::Path,
+    request: &CapsuleInterfaceInvokeRequest,
+) -> anyhow::Result<ResolvedCapsuleAffordance> {
+    let capsule_name = request.capsule.trim();
+    let interface_id = request.interface.trim();
+    let method_id = request.method.trim();
+    if capsule_name.is_empty() || interface_id.is_empty() || method_id.is_empty() {
+        anyhow::bail!("capsule, interface, and method are required");
+    }
+
+    let catalog = capsule_catalog_summary(data_dir);
+    let capsule = catalog
+        .capsules
+        .iter()
+        .find(|candidate| candidate.name == capsule_name)
+        .ok_or_else(|| anyhow::anyhow!("capsule not found: {}", capsule_name))?;
+    let interface = capsule
+        .interfaces
+        .iter()
+        .find(|candidate| candidate.id == interface_id)
+        .ok_or_else(|| anyhow::anyhow!("interface not declared: {}", interface_id))?;
+    let method = interface
+        .methods
+        .iter()
+        .find(|candidate| candidate.id == method_id)
+        .ok_or_else(|| anyhow::anyhow!("method not declared: {}", method_id))?;
+
+    Ok(ResolvedCapsuleAffordance {
+        capsule: capsule.name.clone(),
+        interface_id: interface.id.clone(),
+        method: method.clone(),
+    })
+}
+
+fn enforce_affordance_invocation_policy(
+    resolved: &ResolvedCapsuleAffordance,
+) -> Result<(), (StatusCode, &'static str, &'static str)> {
+    if resolved.method.approval == AffordanceApprovalMode::User {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "approval_required",
+            "user-approved affordance invocation is not enabled yet",
+        ));
+    }
+    if matches!(
+        resolved.method.risk,
+        AffordanceRisk::Payment
+            | AffordanceRisk::Rights
+            | AffordanceRisk::Actuator
+            | AffordanceRisk::Privileged
+    ) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "approval_required",
+            "high-risk affordances require explicit user approval before invocation",
+        ));
+    }
+    Ok(())
+}
+
+async fn dispatch_capsule_affordance(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    resolved: &ResolvedCapsuleAffordance,
+    request: &CapsuleInterfaceInvokeRequest,
+) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+    let resource = resolved.method.resource.as_deref().unwrap_or_default();
+    let operation = resolved.method.operation.as_deref().unwrap_or_default();
+    match (resource, operation) {
+        ("elastos://capsules/*", "list") => {
+            serde_json::to_value(capsule_catalog_summary(&state.data_dir))
+                .map(|catalog| serde_json::json!({ "catalog": catalog }))
+                .map_err(|err| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "serialization_failed",
+                        err.to_string(),
+                    )
+                })
+        }
+        ("elastos://capsules/*", "launch") => {
+            dispatch_capsule_launch_affordance(state, context, request).await
+        }
+        _ => Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "affordance_not_bound",
+            format!(
+                "{} is declared but not yet bound to a Runtime/provider handler",
+                resolved.method.id
+            ),
+        )),
+    }
+}
+
+async fn dispatch_capsule_launch_affordance(
+    state: &GatewayState,
+    context: &HomeLaunchTokenContext,
+    request: &CapsuleInterfaceInvokeRequest,
+) -> Result<serde_json::Value, (StatusCode, &'static str, String)> {
+    let target = request
+        .input
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if target.is_empty() || target == HOME_CAPSULE_ID {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "invalid Home target".to_string(),
+        ));
+    }
+
+    let catalog = capsule_catalog_summary(&state.data_dir);
+    let catalog_target = catalog
+        .capsules
+        .iter()
+        .find(|capsule| capsule.name == target || capsule.launch_target.as_deref() == Some(target))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "target_not_found",
+                "launch target not found".to_string(),
+            )
+        })?;
+    if !catalog_target.launchable {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "target_not_launchable",
+            "target is not installed and launchable".to_string(),
+        ));
+    }
+
+    let target_name = catalog_target
+        .launch_target
+        .as_deref()
+        .unwrap_or(catalog_target.name.as_str());
+    let target_summary = home_launch_target(&state.data_dir, target_name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "target_not_found",
+            "Home launch target not found".to_string(),
+        )
+    })?;
+    let launch =
+        launch_runtime_backed_home_target(&state.data_dir, target_summary.target.as_str(), context)
+            .await;
+    let route = append_home_launch_token(
+        &state.data_dir,
+        &target_summary.route,
+        target_summary.target.as_str(),
+        &BTreeMap::new(),
+        context,
+    )
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "launch_token_failed",
+            err.to_string(),
+        )
+    })?;
+
+    Ok(serde_json::json!({
+        "target": target_summary.target,
+        "title": target_summary.title,
+        "route": route,
+        "attach_kind": target_summary.attach_kind,
+        "role": target_summary.role,
+        "target_kind": target_summary.target_kind,
+        "launch_status": launch.as_ref().map(|summary| summary.status.clone()),
+        "launch_detail": launch.as_ref().and_then(|summary| summary.detail.clone()),
+        "capsule_id": launch.and_then(|summary| summary.capsule_id),
+    }))
+}
+
+fn capsule_invoke_error(
+    resolved: &ResolvedCapsuleAffordance,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "schema": CAPSULE_INTERFACE_INVOKE_RESULT_SCHEMA,
+            "status": "error",
+            "code": code,
+            "message": message,
+            "capsule": resolved.capsule,
+            "interface": resolved.interface_id,
+            "method": resolved.method.id,
+        })),
+    )
+        .into_response()
 }
 
 fn catalog_capsule_summary(
@@ -150,6 +546,7 @@ fn catalog_capsule_summary(
             })
             .collect(),
         capabilities: manifest.capabilities,
+        interfaces: manifest.interfaces,
         viewer: manifest.viewer,
         cid,
         cid_state: cid_state.to_string(),
@@ -346,6 +743,8 @@ struct CapsuleCatalogCounts {
     total: usize,
     installed: usize,
     launchable: usize,
+    interfaces: usize,
+    methods: usize,
     apps: usize,
     viewers: usize,
     providers: usize,
@@ -388,6 +787,8 @@ struct CapsuleSummary {
     requires: Vec<CapsuleRequirementSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interfaces: Vec<CapsuleInterfaceDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,6 +813,71 @@ struct CapsuleSummary {
 struct CapsuleRequirementSummary {
     name: String,
     kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CapsuleInterfaceInvokeRequest {
+    capsule: String,
+    interface: String,
+    method: String,
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct CapsuleInterfaceInvokeResponse {
+    schema: String,
+    status: String,
+    capsule: String,
+    interface: String,
+    method: String,
+    request_id: String,
+    output: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct ResolvedCapsuleAffordance {
+    capsule: String,
+    interface_id: String,
+    method: CapsuleAffordanceDescriptor,
+}
+
+#[derive(Serialize)]
+pub(super) struct CapsuleInterfaceRegistryResponse {
+    schema: String,
+    counts: CapsuleInterfaceRegistryCounts,
+    interfaces: Vec<CapsuleInterfaceSummary>,
+    policy: CapsuleInterfaceRegistryPolicy,
+}
+
+#[derive(Default, Serialize)]
+struct CapsuleInterfaceRegistryCounts {
+    capsules: usize,
+    interfaces: usize,
+    methods: usize,
+}
+
+#[derive(Serialize)]
+struct CapsuleInterfaceSummary {
+    capsule: String,
+    capsule_version: String,
+    title: String,
+    role: CapsuleRole,
+    #[serde(rename = "type")]
+    capsule_type: CapsuleType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cid: Option<String>,
+    trust_state: String,
+    interface: CapsuleInterfaceDescriptor,
+}
+
+#[derive(Serialize)]
+struct CapsuleInterfaceRegistryPolicy {
+    descriptor_state: String,
+    descriptor_note: String,
+    invocation_state: String,
+    invocation_note: String,
 }
 
 #[cfg(test)]
@@ -452,6 +918,27 @@ mod tests {
         }
     }
 
+    fn write_capsule_json(data_dir: &std::path::Path, name: &str, manifest: serde_json::Value) {
+        let dir = data_dir.join("capsules").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("capsule.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        if manifest
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|capsule_type| capsule_type == "wasm")
+        {
+            fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
+            fs::create_dir_all(dir.join("browser")).unwrap();
+            fs::write(dir.join("browser").join("index.html"), "<!doctype html>").unwrap();
+        } else {
+            fs::write(dir.join("index.html"), "<!doctype html>").unwrap();
+        }
+    }
+
     #[test]
     fn capsule_catalog_lists_roles_and_launchable_capsules() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -481,5 +968,154 @@ mod tests {
         assert!(!provider.launchable);
         assert!(provider.repository.is_none());
         assert!(provider.source_path.is_none());
+    }
+
+    #[test]
+    fn capsule_interface_registry_lists_declared_affordances() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_capsule_json(
+            data_dir.path(),
+            "marketplace",
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "marketplace",
+                "version": "0.1.0",
+                "description": "Marketplace test capsule",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "marketplace.wasm",
+                "signature": "test-signature",
+                "interfaces": [{
+                    "id": "elastos.marketplace.catalog",
+                    "version": "0.1.0",
+                    "methods": [
+                        {
+                            "id": "catalog.list",
+                            "risk": "read",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://capsules/*",
+                            "operation": "list"
+                        },
+                        {
+                            "id": "capsule.open",
+                            "risk": "launch",
+                            "approval": "runtime_policy",
+                            "audit": "event",
+                            "resource": "elastos://capsules/*",
+                            "operation": "launch"
+                        }
+                    ]
+                }]
+            }),
+        );
+        let catalog = capsule_catalog_summary(data_dir.path());
+        assert_eq!(catalog.counts.interfaces, 1);
+        assert_eq!(catalog.counts.methods, 2);
+        let marketplace = catalog
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "marketplace")
+            .unwrap();
+        assert_eq!(
+            marketplace.interfaces[0].id,
+            "elastos.marketplace.catalog"
+        );
+
+        let registry = capsule_interface_registry_summary(data_dir.path());
+        assert_eq!(registry.schema, CAPSULE_INTERFACE_REGISTRY_SCHEMA);
+        assert_eq!(registry.counts.capsules, 1);
+        assert_eq!(registry.counts.interfaces, 1);
+        assert_eq!(registry.counts.methods, 2);
+        assert_eq!(registry.interfaces[0].capsule, "marketplace");
+        assert_eq!(
+            registry.interfaces[0].interface.methods[1].id,
+            "capsule.open"
+        );
+        assert_eq!(registry.policy.invocation_state, "runtime-gated");
+    }
+
+    #[test]
+    fn capsule_affordance_resolves_declared_descriptor() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_capsule_json(
+            data_dir.path(),
+            "marketplace",
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "marketplace",
+                "version": "0.1.0",
+                "description": "Marketplace test capsule",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "marketplace.wasm",
+                "signature": "test-signature",
+                "interfaces": [{
+                    "id": "elastos.marketplace.catalog",
+                    "version": "0.1.0",
+                    "methods": [{
+                        "id": "catalog.list",
+                        "risk": "read",
+                        "approval": "runtime_policy",
+                        "audit": "event",
+                        "resource": "elastos://capsules/*",
+                        "operation": "list"
+                    }]
+                }]
+            }),
+        );
+
+        let request = CapsuleInterfaceInvokeRequest {
+            capsule: "marketplace".to_string(),
+            interface: "elastos.marketplace.catalog".to_string(),
+            method: "catalog.list".to_string(),
+            input: serde_json::json!({}),
+        };
+        let resolved = resolve_capsule_affordance(data_dir.path(), &request).unwrap();
+        assert_eq!(resolved.capsule, "marketplace");
+        assert_eq!(resolved.interface_id, "elastos.marketplace.catalog");
+        assert_eq!(resolved.method.id, "catalog.list");
+    }
+
+    #[test]
+    fn capsule_interface_invoke_request_rejects_hidden_authority_fields() {
+        let err = serde_json::from_value::<CapsuleInterfaceInvokeRequest>(serde_json::json!({
+            "capsule": "marketplace",
+            "interface": "elastos.marketplace.catalog",
+            "method": "catalog.list",
+            "input": {},
+            "principal_id": "person:other",
+            "_runtime_invocation": {
+                "schema": "forged"
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn capsule_affordance_policy_rejects_high_risk_without_approval_binding() {
+        let resolved = ResolvedCapsuleAffordance {
+            capsule: "wallet".to_string(),
+            interface_id: "elastos.wallet.payment".to_string(),
+            method: CapsuleAffordanceDescriptor {
+                id: "payment.send".to_string(),
+                description: None,
+                risk: AffordanceRisk::Payment,
+                approval: AffordanceApprovalMode::RuntimePolicy,
+                audit: elastos_common::AffordanceAuditMode::Full,
+                resource: Some("elastos://wallet/*".to_string()),
+                operation: Some("send".to_string()),
+                input_schema: None,
+                output_schema: None,
+            },
+        };
+
+        let err = enforce_affordance_invocation_policy(&resolved).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "approval_required");
     }
 }

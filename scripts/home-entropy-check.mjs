@@ -172,6 +172,7 @@ function assertGatewayRequestStructsRejectUnknownFields() {
     "ChatRoomMemberRemoveBody",
     "ChatRoomInviteRevokeBody",
     "RoomUploadStartBody",
+    "CapsuleInterfaceInvokeRequest",
   ];
   const missing = names.filter((name) => {
     const pattern = new RegExp(
@@ -190,8 +191,11 @@ function assertGatewayRequestStructsRejectUnknownFields() {
     ) &&
       gatewayTests.includes(
         "test_chat_request_bodies_reject_hidden_identity_fields",
+      ) &&
+      gatewayApi.includes(
+        "capsule_interface_invoke_request_rejects_hidden_authority_fields",
       ),
-    "Gateway request-body strictness must keep regression tests for wallet and chat authority fields",
+    "Gateway request-body strictness must keep regression tests for wallet, chat, and capsule interface authority fields",
   );
 }
 
@@ -778,6 +782,7 @@ const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_home_token.rs",
   "elastos/crates/elastos-server/src/api/gateway_inbox.rs",
   "elastos/crates/elastos-server/src/api/gateway_models.rs",
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
   "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
   "elastos/crates/elastos-server/src/api/gateway_room.rs",
   "elastos/crates/elastos-server/src/api/gateway_server.rs",

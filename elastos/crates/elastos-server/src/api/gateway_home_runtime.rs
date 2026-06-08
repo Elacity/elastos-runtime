@@ -55,7 +55,7 @@ pub(super) async fn home_launch(
     }))
 }
 
-fn append_home_launch_token(
+pub(super) fn append_home_launch_token(
     data_dir: &std::path::Path,
     route: &str,
     target: &str,
@@ -202,7 +202,7 @@ pub(super) fn apply_room_access(
     summary.browser_access_block_reason = access.block_reason;
 }
 
-async fn launch_runtime_backed_home_target(
+pub(super) async fn launch_runtime_backed_home_target(
     data_dir: &FsPath,
     target: &str,
     context: &HomeLaunchTokenContext,
