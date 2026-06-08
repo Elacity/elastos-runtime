@@ -4,8 +4,13 @@
 #
 # Decrypts ElastOS's committed classical golden vector
 # (capsules/decrypt-provider/tests/vectors/classical_cenc.json) using PC2
-# `ddrm-decrypt`'s REAL code — envelope ECDH unwrap + CENC AES-128-CTR sample
-# decrypt — and asserts byte-for-byte parity (recovered CEK and plaintext).
+# `ddrm-decrypt`'s REAL code and asserts byte-for-byte parity, at TWO layers:
+#   - primitive: envelope ECDH unwrap + CENC AES-128-CTR sample decrypt;
+#   - session (the rail carrier path): PC2's PUBLIC session API
+#     `session::unwrap_envelope` -> `media::decrypt_segment` — the same
+#     entrypoints the production decrypt runtime calls — proving our Option-A
+#     carrier is wire-compatible with PC2's session model, not just its crypto.
+# Each layer also checks negative parity: a tampered carrier fails closed in PC2.
 #
 # This makes the "byte-compatible with PC2 ddrm-decrypt" claim *executable*: the
 # two independent implementations are run against the same bytes.

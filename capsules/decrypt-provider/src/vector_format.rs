@@ -13,6 +13,8 @@
 //! but every consumer path (ECDH/x25519 DH, ML-KEM decapsulate, AES open, CENC
 //! decrypt) is deterministic given the captured material, so replay needs no RNG.
 
+#![allow(dead_code)] // schema structs: not every field is read under every feature
+
 use serde::{Deserialize, Serialize};
 
 /// Classical CEK-seal path: P-256 ECDH envelope unwrap → CENC AES-128-CTR decrypt.
@@ -47,6 +49,37 @@ pub struct RoundTripVector {
     /// The encrypted fMP4 segment the producer emitted.
     pub encrypted_segment_b64: String,
     /// The plaintext the producer encrypted (and the consumer must recover).
+    pub expected_plaintext_b64: String,
+}
+
+/// Rail carrier wire shape (rail Option A — the decrypt VM *receives* sealed
+/// material): the sealed CEK + ciphertext the runtime hands the decrypt boundary
+/// on `OpenSession`, captured as a portable golden and replayed through
+/// `rail_shim::decrypt_from_carrier` (not the raw engines). For the classical
+/// profile the `sealed_cek` is the flat P-256 ECDH envelope, **byte-identical**
+/// to the PC2-conformant `classical_cenc.json` — so this same golden is also
+/// driven through PC2's public session API (`unwrap_envelope` →
+/// `media::decrypt_segment`) by `scripts/pc2-conformance.sh`.
+///
+/// `session_secret_key_b64` is NOT part of the production carrier (the VM's
+/// session secret stays in-VM); it is carried here only so the replay can
+/// reconstruct the VM side of the boundary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RailCarrierVector {
+    pub description: String,
+    /// Seal profile tag: "ClassicalP256" or "PqHybrid".
+    pub profile: String,
+    /// VM session secret (replay aid; never on the wire). Classical: P-256 SEC1
+    /// scalar (32 bytes).
+    pub session_secret_key_b64: String,
+    /// The sealed CEK as it travels in the carrier (classical: flat envelope blob).
+    pub sealed_cek_b64: String,
+    /// The ciphertext fMP4 segment to decrypt.
+    pub ciphertext_segment_b64: String,
+    /// Optional init segment (e.g. `tenc` defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_segment_b64: Option<String>,
+    /// The plaintext the segment must decrypt to.
     pub expected_plaintext_b64: String,
 }
 

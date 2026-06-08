@@ -285,4 +285,66 @@ mod tests {
             "a malformed PQ carrier must fail closed"
         );
     }
+
+    // --- portable carrier golden (the carrier WIRE SHAPE, replayed through the
+    //     shim entrypoint and cross-checked against PC2's session API) ---
+
+    #[cfg(not(feature = "gen-vectors"))]
+    fn rail_carrier_classical() -> crate::vector_format::RailCarrierVector {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/rail_carrier_classical.json"
+        )))
+        .unwrap()
+    }
+
+    #[cfg(not(feature = "gen-vectors"))]
+    fn classical_session(v: &crate::vector_format::RailCarrierVector) -> p256::SecretKey {
+        p256::SecretKey::from_slice(&b64().decode(&v.session_secret_key_b64).unwrap()).unwrap()
+    }
+
+    /// The committed carrier golden replays through `decrypt_from_carrier` (the
+    /// exact entrypoint `OpenSession` will call) — pinning the carrier wire shape,
+    /// not just the engine bytes, across refactor/rebase/port.
+    #[cfg(not(feature = "gen-vectors"))]
+    #[test]
+    fn rail_carrier_golden_replays_through_shim() {
+        let v = rail_carrier_classical();
+        assert_eq!(v.profile, "ClassicalP256");
+        let carrier = SealedDecryptCarrier {
+            profile: SealProfile::ClassicalP256,
+            sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+        };
+        let (output, meta) =
+            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_session(&v)), &carrier, &StubVerifier)
+                .expect("carrier golden should decrypt through the shim");
+
+        let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
+        let off = carrier.ciphertext_segment.len() - expected.len();
+        assert_eq!(&output[off..], expected.as_slice());
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    /// A tampered carrier golden must fail closed through the shim too.
+    #[cfg(not(feature = "gen-vectors"))]
+    #[test]
+    fn rail_carrier_golden_tampered_fails_closed() {
+        let v = rail_carrier_classical();
+        let mut sealed = b64().decode(&v.sealed_cek_b64).unwrap();
+        let n = sealed.len();
+        sealed[n - 1] ^= 0xFF;
+        let carrier = SealedDecryptCarrier {
+            profile: SealProfile::ClassicalP256,
+            sealed_cek: sealed,
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: None,
+        };
+        assert!(
+            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_session(&v)), &carrier, &StubVerifier)
+                .is_err(),
+            "a tampered carrier golden must fail closed"
+        );
+    }
 }

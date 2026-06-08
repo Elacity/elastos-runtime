@@ -1,22 +1,28 @@
 //! Executable cross-implementation conformance driver.
 //!
 //! Reads ElastOS's committed classical golden vector and decrypts it using PC2
-//! `ddrm-decrypt`'s REAL code — the same envelope unwrap and CENC sample-decrypt
-//! the production decrypt runtime uses — then asserts byte-for-byte parity:
+//! `ddrm-decrypt`'s REAL code, then asserts byte-for-byte parity at two layers:
 //!
 //!   1. envelope:  parse -> ecdh_unwrap -> extract_keys_blob  ==>  vector CEK
 //!   2. cenc:      parse_segment -> decrypt_samples           ==>  vector plaintext
+//!   3. tamper:    a corrupted envelope is rejected (fail-closed parity)
+//!   4. session (the rail carrier path): install a session holding the vector's
+//!      key, then PC2's PUBLIC `session::unwrap_envelope` (L1 ECDH + L2 CEK store)
+//!      -> `media::decrypt_segment` (tenc IV-size + moof/traf/senc walk) ==> vector
+//!      plaintext; and a tampered carrier fails closed inside unwrap_envelope.
+//!      This proves our Option-A carrier is wire-compatible with PC2's session
+//!      model — the exact entrypoints the production decrypt runtime calls — not
+//!      merely its crypto primitives.
 //!
 //! This turns the "byte-compatible with PC2 ddrm-decrypt" claim from an assertion
 //! into something that fails loudly (exit 1) if the two implementations ever
 //! diverge. Compiled on demand against the PC2 repo by `scripts/pc2-conformance.sh`.
-//!
-//! Each argument is a path to a classical vector; every vector is checked for
-//! positive parity (CEK + plaintext) AND negative parity (a tampered envelope is
-//! rejected by PC2 too — both implementations fail closed identically).
 
 use base64::Engine as _;
-use ddrm_decrypt::{cenc, envelope, mp4box};
+use ddrm_decrypt::{cenc, envelope, media, mp4box};
+use ddrm_decrypt::session::{self, SessionState};
+use ddrm_decrypt::state::{next_handle, SESSIONS};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::SecretKey;
 use std::process::exit;
 
@@ -89,6 +95,61 @@ fn check_vector(path: &str) {
         exit(1);
     }
     println!("  tamper: PC2 ddrm-decrypt rejected the corrupted envelope — fail-closed parity OK");
+
+    // 4. Session-level parity (the rail carrier path): drive the SAME sealed
+    //    bytes + segment through PC2's PUBLIC session API — the entrypoints the
+    //    production decrypt runtime calls. A session holding the vector's key
+    //    `unwrap_envelope`s the carrier (L1 ECDH + L2 CEK store) and then
+    //    `media::decrypt_segment` decrypts it (tenc IV-size + moof/traf/senc walk).
+    //    This proves our Option-A carrier is wire-compatible with PC2's *session
+    //    model*, not merely its crypto primitives.
+    let install_session = |label: &str| -> u32 {
+        let sk = SecretKey::from_slice(&sk_bytes).expect("p256 session secret key");
+        let pk_point = sk.public_key().to_encoded_point(true);
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(pk_point.as_bytes());
+        let handle = next_handle();
+        SESSIONS.with(|s| {
+            s.borrow_mut().insert(
+                handle,
+                SessionState {
+                    session_id: format!("{label}-{handle}"),
+                    secret_key: sk,
+                    public_key_compressed: pk,
+                    created_at: 0,
+                },
+            )
+        });
+        handle
+    };
+
+    let handle = install_session("conformance");
+    let req = session::unwrap_envelope(handle, &sealed)
+        .expect("PC2 session::unwrap_envelope rejected our carrier");
+    let seg_out = media::decrypt_segment(req, None, &segment, false)
+        .expect("PC2 media::decrypt_segment failed");
+    let off = segment.len() - expected_pt.len();
+    if seg_out.len() != segment.len() || seg_out[off..] != expected_pt[..] {
+        eprintln!("FAIL: PC2 session-level decrypt produced the wrong plaintext");
+        exit(1);
+    }
+    println!(
+        "  session: PC2 unwrap_envelope + decrypt_segment recovered the plaintext (carrier path) — parity OK"
+    );
+
+    // Negative parity at the session boundary: a tampered carrier must fail
+    // closed inside PC2's unwrap_envelope too (no CEK ever lands in L2).
+    let mut tampered_carrier = sealed.clone();
+    let m = tampered_carrier.len();
+    tampered_carrier[m - 1] ^= 0xFF;
+    let tamper_handle = install_session("conformance-tamper");
+    if session::unwrap_envelope(tamper_handle, &tampered_carrier).is_ok() {
+        eprintln!("FAIL: PC2 session accepted a tampered carrier (expected fail-closed)");
+        exit(1);
+    }
+    println!(
+        "  session-tamper: PC2 unwrap_envelope rejected the corrupted carrier — fail-closed parity OK"
+    );
 }
 
 fn main() {

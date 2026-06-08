@@ -386,6 +386,40 @@ mod tests {
         );
     }
 
+    /// Emit the rail carrier golden (rail Option A) by repackaging the committed
+    /// classical vector as a `RailCarrierVector`. Deriving from
+    /// `classical_cenc.json` guarantees the carrier's `sealed_cek` is
+    /// byte-identical to the PC2-conformant fixture, so the carrier golden and the
+    /// cross-impl conformance check exercise the same bytes. Run AFTER
+    /// `emit_classical_vector`:
+    /// `cargo test --features gen-vectors emit_classical_vector && \
+    ///  cargo test --features gen-vectors emit_rail_carrier_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_rail_carrier_vector() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        let classical: crate::vector_format::ClassicalVector = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/classical_cenc.json")).unwrap(),
+        )
+        .unwrap();
+        let carrier = crate::vector_format::RailCarrierVector {
+            description:
+                "rail Option A carrier (classical P-256): sealed CEK + segment -> \
+                 decrypt_from_carrier; sealed_cek byte-identical to classical_cenc.json \
+                 (PC2-conformant via session unwrap_envelope + decrypt_segment)"
+                    .to_string(),
+            profile: "ClassicalP256".to_string(),
+            session_secret_key_b64: classical.session_secret_key_b64,
+            sealed_cek_b64: classical.sealed_envelope_b64,
+            ciphertext_segment_b64: classical.encrypted_segment_b64,
+            init_segment_b64: None,
+            expected_plaintext_b64: classical.expected_plaintext_b64,
+        };
+        let path = format!("{dir}/rail_carrier_classical.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&carrier).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
     /// Replay a committed classical vector through the engines (no in-test
     /// sealing): proves the portable bytes still decrypt after any refactor.
     #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]

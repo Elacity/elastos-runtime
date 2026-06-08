@@ -307,6 +307,34 @@ Q1 (dKMS-direct vs re-seal) does not touch the adapter; Q2 (signature scheme) pl
 in through the `CekSealVerifier`; profile is a per-deployment `SealProfile` pick.
 Precise wire-up + question→knob mapping: `DDRM_DECRYPT_RAIL.md` §"Rail transport shim".
 
+### Rail carrier pinned as a portable golden + checked against PC2's session API (Day 28)
+
+The shim was proven in-process (Day 27); now its **carrier wire shape** is locked
+the same way every engine is — a substrate-independent golden — and cross-checked
+against PC2's *session model*, not just its crypto primitives:
+
+- `tests/vectors/rail_carrier_classical.json` (schema `RailCarrierVector`) captures
+  the rail Option-A carrier `{profile, sealed_cek, ciphertext_segment, init?,
+  expected_plaintext}`. It is **derived from** `classical_cenc.json`, so its
+  `sealed_cek` is byte-identical to the PC2-conformant fixture.
+- `rail_shim::tests::rail_carrier_golden_replays_through_shim` replays it through
+  **`decrypt_from_carrier`** (the exact entrypoint `OpenSession` will call) and
+  recovers the plaintext; `…_tampered_fails_closed` pins fail-closed. So the
+  carrier format now survives refactor/rebase/port, pinned at the shim boundary.
+- **`scripts/pc2-conformance.sh` now checks two layers** against PC2's real code:
+  the existing primitive parity (`envelope` + `cenc`) **and** the session/carrier
+  path — a session holding the vector key runs PC2's public
+  `session::unwrap_envelope` (L1 ECDH + L2 CEK store) → `media::decrypt_segment`
+  (tenc IV-size + moof/traf/senc walk) and recovers the exact plaintext, for both
+  the v3 and v2 envelopes; a tampered carrier fails closed inside `unwrap_envelope`
+  too. This proves our Option-A carrier is wire-compatible with the **entrypoints
+  PC2 production calls**, not merely its primitives.
+
+`vectors` stays **37** and the base ladder is unchanged (25/27/29/31); `rail-shim`
+= **43** (+2 carrier-golden); builds clean to `wasm32-wasip1`; `ddrm-verify.sh`
+PASS (now including the two-layer session conformance). The carrier golden is the
+artifact `OpenSession` will accept on the day Anders confirms the rail.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
