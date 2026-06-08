@@ -607,4 +607,129 @@ mod tests {
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         eprintln!("wrote {path}");
     }
+
+    /// Mux N encrypted samples into a multi-sample fMP4 segment:
+    /// moof{traf{trun(per-sample sizes), senc(per-sample 8-byte IVs, no subsamples)}}+mdat.
+    /// Box framing mirrors PC2 `cenc-encrypt::mp4box::build_senc` (full-sample,
+    /// flags=0) and the trun sample-size-present (0x000200) shape our decrypt
+    /// parser + PC2 `decrypt_segment` consume (proven by the Day-31 cenc goldens).
+    #[cfg(feature = "gen-vectors")]
+    fn mux_multisample_segment(ciphertext: &[u8], sizes: &[u32], ivs: &[[u8; 8]]) -> Vec<u8> {
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00]; // v0, flags=sample-size-present
+        trun_content.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
+        for &sz in sizes {
+            trun_content.extend_from_slice(&sz.to_be_bytes());
+        }
+        let trun = make_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0, 0, 0]; // v0, flags=0 (no subsamples)
+        senc_content.extend_from_slice(&(ivs.len() as u32).to_be_bytes());
+        for iv8 in ivs {
+            senc_content.extend_from_slice(iv8);
+        }
+        let senc = make_box(b"senc", &senc_content);
+
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mut segment = moof;
+        segment.extend_from_slice(&make_box(b"mdat", ciphertext));
+        segment
+    }
+
+    /// Mux a single subsample-encrypted sample (clear leader + encrypted body):
+    /// senc flags=0x000002 with one subsample table entry, mirroring PC2
+    /// `cenc-encrypt::mp4box::build_senc_with_subsamples` (8-byte IV +
+    /// subsample_count(u16) + per-subsample clear(u16)+encrypted(u32)).
+    #[cfg(feature = "gen-vectors")]
+    fn mux_subsample_segment(ciphertext: &[u8], iv8: &[u8; 8], subs: &[cenc::SubsampleEntry]) -> Vec<u8> {
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        let trun = make_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0x00, 0x00, 0x02, 0, 0, 0, 1]; // flags=subsamples, count=1
+        senc_content.extend_from_slice(iv8);
+        senc_content.extend_from_slice(&(subs.len() as u16).to_be_bytes());
+        for s in subs {
+            senc_content.extend_from_slice(&(s.clear as u16).to_be_bytes());
+            senc_content.extend_from_slice(&s.protected.to_be_bytes());
+        }
+        let senc = make_box(b"senc", &senc_content);
+
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mut segment = moof;
+        segment.extend_from_slice(&make_box(b"mdat", ciphertext));
+        segment
+    }
+
+    #[cfg(feature = "gen-vectors")]
+    fn write_roundtrip_vector(file: &str, description: &str, kid_hex: &str, cek: &[u8], segment: &[u8], plaintext: &[u8]) {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v = json!({
+            "description": description,
+            "kid_hex": kid_hex,
+            "cek_b64": b64.encode(cek),
+            "encrypted_segment_b64": b64.encode(segment),
+            "expected_plaintext_b64": b64.encode(plaintext),
+        });
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../decrypt-provider/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/{file}");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Regenerate the MULTI-SAMPLE round-trip golden (real playback shape).
+    /// `cargo test --features gen-vectors emit_roundtrip_multisample_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_roundtrip_multisample_vector() {
+        // Produce 4 samples with the REAL in-boundary engine: one CEK, per-sample
+        // unique IVs (seed+index), full-sample encryption (clear_leader=0).
+        let minted = mint_cek_and_kid().expect("mint");
+        let plaintext: &[u8] = b"frame0-bytes....frame1-longer-bytes....frame2..frame3-final-bytes!";
+        let sizes: [u32; 4] = [16, 23, 8, 19];
+        assert_eq!(sizes.iter().sum::<u32>() as usize, plaintext.len());
+        let iv_seed = [0x33u8; 8];
+        let (ciphertext, ivs, _subs) =
+            cenc::encrypt_samples(plaintext, &minted.cek, &sizes, &iv_seed, 0).expect("encrypt");
+        let segment = mux_multisample_segment(&ciphertext, &sizes, &ivs);
+        write_roundtrip_vector(
+            "roundtrip_multisample_encrypt_to_decrypt.json",
+            "encrypt-provider in-boundary mint+CENC (4 full samples) -> decrypt-provider cenc; CEK captured (rail stand-in)",
+            &minted.kid_hex,
+            &*minted.cek,
+            &segment,
+            plaintext,
+        );
+    }
+
+    /// Regenerate the SUBSAMPLE round-trip golden (clear-leader + encrypted body).
+    /// `cargo test --features gen-vectors emit_roundtrip_subsample_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_roundtrip_subsample_vector() {
+        // One sample, 16-byte clear leader (codec header) + encrypted body — the
+        // real engine emits the subsample {clear, protected} framing we mux.
+        let minted = mint_cek_and_kid().expect("mint");
+        let plaintext: &[u8] = b"CLEAR-CODEC-HDR!!encrypted media payload bytes following the leader.";
+        let sizes = [plaintext.len() as u32];
+        let clear_leader = 16u32;
+        let iv_seed = [0x44u8; 8];
+        let (ciphertext, ivs, subs) =
+            cenc::encrypt_samples(plaintext, &minted.cek, &sizes, &iv_seed, clear_leader).expect("encrypt");
+        let segment = mux_subsample_segment(&ciphertext, &ivs[0], &subs[0]);
+        write_roundtrip_vector(
+            "roundtrip_subsample_encrypt_to_decrypt.json",
+            "encrypt-provider in-boundary mint+CENC (subsample: 16B clear leader) -> decrypt-provider cenc; CEK captured (rail stand-in)",
+            &minted.kid_hex,
+            &*minted.cek,
+            &segment,
+            plaintext,
+        );
+    }
 }

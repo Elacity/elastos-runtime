@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 36).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `90899e70d` + Day-36 reconcile-prep, ~40 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 37).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `d1035d98b` + Day-37 producer round-trips, ~41 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -128,7 +128,7 @@ counts per feature:
 | `rail-prep` | 27 | classical `ecdh_unwrap → cenc` composition (Day 18) |
 | `pq-envelope` | 29 | PQ-hybrid CEK-seal envelope island (Day 20) |
 | `pq-rail-prep` | 31 | full PQ data path `hybrid_unwrap → cenc` (Day 21) |
-| `vectors` | 40 | replay portable goldens: v3+v2, round-trip, + multi-sample/subsample/init-IV (Days 22, 24, 26, 31) |
+| `vectors` | 42 | replay portable goldens: v3+v2, encrypt↔decrypt round-trips (single + **multi-sample + subsample**), multi-sample/subsample/init-IV cenc (Days 22, 24, 26, 31, 37) |
 | `rail-shim` | 45 | carrier→engine adapter (`decrypt_from_carrier`) + carrier goldens, both profiles (Days 27–30) |
 | `pq-mldsa` | 34 | real FIPS 204 ML-DSA-65 verifier in the `CekSealVerifier` slot + KAT (Day 32) |
 | `rail-shim-mldsa` | 54 | the real ML-DSA-65 verified through `decrypt_from_carrier` on a committed carrier golden (Day 33) |
@@ -170,9 +170,14 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
   envelope versions — now at **two layers**: the crypto primitives (`envelope`+`cenc`)
   and PC2's **public session API** (`session::unwrap_envelope` → `media::decrypt_segment`,
   the carrier path). Skips clean when PC2 is absent.
-- **Both invariants pinned on one artifact** (Day 26): `encrypt-provider`'s real
-  in-boundary engine emits `roundtrip_encrypt_to_decrypt.json`, which `decrypt-provider`
-  replays back to the original plaintext (`vectors`) — invariant #1 ↔ #2 compose.
+- **Both invariants pinned on one artifact, over real playback shapes** (Days 26, 37):
+  `encrypt-provider`'s real in-boundary engine emits round-trip goldens —
+  `roundtrip_encrypt_to_decrypt.json` (single sample) plus
+  `roundtrip_multisample_encrypt_to_decrypt.json` (4 samples, per-sample IVs) and
+  `roundtrip_subsample_encrypt_to_decrypt.json` (16-byte clear leader + encrypted
+  body) — which `decrypt-provider` replays back to the producer's exact plaintext
+  (`vectors`), CEK contained. Producer mux mirrors PC2 `cenc-encrypt::mp4box`
+  (`build_senc` / `build_senc_with_subsamples`); the gate exercises all three by name.
 - **The rail is a flag-flip, not a design** (Days 27–28): `decrypt-provider/src/rail_shim.rs`
   (`rail-shim`, default OFF, **not** wired into dispatch) is the carrier→engine adapter
   for rail Option A — `decrypt_from_carrier(session, carrier, verifier)` routes a sealed
@@ -336,7 +341,7 @@ scripts/ddrm-ladder-check.sh                    # ladder counts + wasm builds �
 for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo test); done
 
 # decrypt-provider feature ladder (tested islands; counts in §3)
-# default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 40 /
+# default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 42 /
 # rail-shim 45 / pq-mldsa 34 / rail-shim-mldsa 54 / harden 65
 ( cd capsules/decrypt-provider && \
   for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa rail-shim-mldsa harden; do \
@@ -439,7 +444,8 @@ next context can continue cold.
 - **D33** verify the real ML-DSA-65 through `decrypt_from_carrier` on a carrier golden (`rail-shim-mldsa`=54) (`aadb4f1fc`).
 - **D34** adversarial negative-space + containment sweep behind `harden` (=65) (`b1f8b7dd5`).
 - **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + handover refresh (`90899e70d`).
-- **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name.
+- **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name (`d1035d98b`).
+- **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name.
 
 ---
 

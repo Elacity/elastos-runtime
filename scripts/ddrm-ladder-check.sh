@@ -43,7 +43,7 @@ LADDER=(
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"
   "decrypt-provider pq-rail-prep|decrypt-provider|pq-rail-prep|31"
-  "decrypt-provider vectors|decrypt-provider|vectors|40"
+  "decrypt-provider vectors|decrypt-provider|vectors|42"
   "decrypt-provider rail-shim|decrypt-provider|rail-shim|45"
   "decrypt-provider pq-mldsa|decrypt-provider|pq-mldsa|34"
   "decrypt-provider rail-shim-mldsa|decrypt-provider|rail-shim-mldsa|54"
@@ -70,21 +70,24 @@ for row in "${LADDER[@]}"; do
   fi
 done
 
-# --- 1b. cross-invariant seam: the encrypt->decrypt round-trip MUST be exercised -
+# --- 1b. cross-invariant seam: the encrypt->decrypt round-trips MUST be exercised -
 #
-# The round-trip golden (produced by encrypt-provider's real in-boundary engine,
-# replayed by decrypt-provider) is the one artifact that pins invariant #1 <-> #2.
-# Run it BY NAME so a rename / cfg-drift / encrypt-side break that silently drops
-# it from the `vectors` suite fails the gate instead of just shifting the count.
+# The round-trip goldens (produced by encrypt-provider's real in-boundary engine,
+# replayed by decrypt-provider) are the artifacts that pin invariant #1 <-> #2 over
+# real playback shapes: single-sample, multi-sample, and subsample (clear leader).
+# Run them BY NAME (filter `round_trip_golden` -> exactly these 3) so a rename /
+# cfg-drift / encrypt-side break that silently drops one fails the gate instead of
+# just shifting the count.
+SEAM_EXPECTED=3
 echo
 bold "== dDRM ladder (1b/2): encrypt<->decrypt seam exercised =="
-seam_out="$(cd "$CAPSULES/decrypt-provider" && cargo test --features vectors encrypt_to_decrypt_round_trip_golden 2>/dev/null)"
+seam_out="$(cd "$CAPSULES/decrypt-provider" && cargo test --features vectors round_trip_golden 2>/dev/null)"
 seam_passed="$(printf '%s\n' "$seam_out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
 seam_failed="$(printf '%s\n' "$seam_out" | sed -n 's/.*ok\. [0-9]* passed; \([0-9]*\) failed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
-if [ "$seam_passed" -eq 1 ] && [ "$seam_failed" -eq 0 ]; then
-  green "  ok    encrypt_to_decrypt_round_trip_golden — 1 passed (seam live)"
+if [ "$seam_passed" -eq "$SEAM_EXPECTED" ] && [ "$seam_failed" -eq 0 ]; then
+  green "  ok    *_round_trip_golden — $seam_passed passed (single + multisample + subsample seams live)"
 else
-  red "  FAIL  encrypt_to_decrypt_round_trip_golden — expected 1 passed / 0 failed, got $seam_passed/$seam_failed (seam dropped?)"
+  red "  FAIL  *_round_trip_golden — expected $SEAM_EXPECTED passed / 0 failed, got $seam_passed/$seam_failed (a seam dropped?)"
   rc=1
 fi
 

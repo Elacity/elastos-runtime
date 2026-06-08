@@ -579,6 +579,85 @@ mod tests {
         );
     }
 
+    /// Replay the producer's MULTI-SAMPLE round-trip golden (real playback shape):
+    /// encrypt-provider's real engine sealed 4 samples with per-sample IVs; this
+    /// provider must recover the exact concatenated plaintext, report N samples,
+    /// and leak neither CEK nor plaintext across the scoped boundary.
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn encrypt_to_decrypt_multisample_round_trip_golden() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v: crate::vector_format::RoundTripVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/roundtrip_multisample_encrypt_to_decrypt.json"
+        )))
+        .unwrap();
+
+        let cek_b64 = v.cek_b64.clone();
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
+
+        let (output, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let mdat_off = segment.len() - expected.len();
+        assert_eq!(
+            &output[mdat_off..],
+            expected.as_slice(),
+            "decrypt-provider must recover every sample encrypt-provider sealed"
+        );
+        assert_eq!(meta["is_protected"], json!(true));
+        assert!(
+            meta["sample_count"].as_u64().unwrap() >= 2,
+            "the golden is a multi-sample segment"
+        );
+
+        let response = scoped_session_response(&decrypt_request(), &meta);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(std::str::from_utf8(&expected).unwrap()),
+            "plaintext must not cross the boundary"
+        );
+    }
+
+    /// Replay the producer's SUBSAMPLE round-trip golden (clear leader + encrypted
+    /// body): the real engine left a 16-byte codec header in the clear and
+    /// encrypted the remainder; this provider must reconstruct the full sample
+    /// (clear bytes untouched, body decrypted) back to the producer's plaintext.
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn encrypt_to_decrypt_subsample_round_trip_golden() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v: crate::vector_format::RoundTripVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/roundtrip_subsample_encrypt_to_decrypt.json"
+        )))
+        .unwrap();
+
+        let cek_b64 = v.cek_b64.clone();
+        let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
+        let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
+
+        let (output, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
+        let mdat_off = segment.len() - expected.len();
+        // The clear leader survives untouched and the body decrypts: the whole
+        // sample equals the producer's original plaintext.
+        assert_eq!(
+            &output[mdat_off..],
+            expected.as_slice(),
+            "subsample reconstruction must equal the producer's plaintext"
+        );
+        assert_eq!(meta["is_protected"], json!(true));
+        assert_eq!(meta["sample_count"], json!(1));
+
+        let response = scoped_session_response(&decrypt_request(), &meta);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(std::str::from_utf8(&expected).unwrap()),
+            "plaintext must not cross the boundary"
+        );
+    }
+
     #[test]
     fn decrypt_session_segment_fails_closed_on_bad_cek() {
         let short_cek = base64::engine::general_purpose::STANDARD.encode([0u8; 8]);

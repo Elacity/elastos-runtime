@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~40 commits**, tip `90899e70d` + Day-36 reconcile-prep)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~41 commits**, tip `d1035d98b` + Day-37 producer round-trips)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -471,6 +471,21 @@ ladder byte-stable) adds an adversarial negative-space + containment sweep (+11 
 This makes "**fail-closed and panic-free under adversarial input**" — a core capability-
 security claim — executable, on the exact boundaries the rail will expose. Base ladder
 byte-stable; `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
+
+### Producer round-trip widened to real playback shapes (Day 37)
+
+Day 26 pinned invariant #1 ↔ #2 on a single-sample artifact; the decrypt side already
+proved multi-sample / subsample / non-default-IV shapes (Day 31). Day 37 closes that
+asymmetry **from the producer end**: `encrypt-provider`'s real in-boundary engine
+(`mint CEK+KID → cenc::encrypt_samples`) now emits two more round-trip goldens —
+`roundtrip_multisample_encrypt_to_decrypt.json` (4 samples, per-sample IVs) and
+`roundtrip_subsample_encrypt_to_decrypt.json` (16-byte clear leader + encrypted body) —
+muxed with framing that mirrors PC2 `cenc-encrypt::mp4box::build_senc` /
+`build_senc_with_subsamples`. `decrypt-provider` replays each back to the producer's
+**exact** plaintext with the CEK off the scoped boundary (`vectors` 40 → **42**). The gate
+(`ddrm-ladder-check.sh`) runs all three `*_round_trip_golden` tests **by name** (asserts 3
+passed), so an encrypt-side change that breaks decrypt over any shape fails the gate.
+`wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
 
 ## The one open decision (for Anders / Irzhy)
 
