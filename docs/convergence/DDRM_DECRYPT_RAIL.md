@@ -127,6 +127,23 @@ Reproduce:
 cd capsules/decrypt-provider && cargo build --target wasm32-wasip1
 ```
 
+### WASI-sandbox execution — confirmed (2026-06-08)
+
+Beyond compiling, `decrypt-provider.wasm` *executes* correctly under a real WASI
+host (wasmtime 45.0.1), driving its newline-delimited JSON protocol over
+stdin/stdout. The fail-closed security contract holds in the sandbox:
+
+| Input | Result |
+| --- | --- |
+| `status` | advertises blocked raw authority (`raw_cek`, `raw_plaintext`, …) |
+| malformed op | `invalid_request` (rejected) |
+| valid `open_session` | `not_configured` (fails closed until the rail lands) |
+| `open_session` with `output_kind: raw_plaintext` | `invalid_request` (rejected up front) |
+
+Reusable harness: `capsules/decrypt-provider/scripts/wasm-smoke.sh` (exit 0 on all
+pass; suitable for CI). This upgrades the evidence from "compiles to wasm" to
+"runs correctly and stays fail-closed in the wasm substrate."
+
 ## What is NOT blocked (and is done/ready)
 
 - The cenc engine is vendored, characterization-tested, and proven to contain +
