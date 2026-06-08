@@ -761,4 +761,86 @@ mod tests {
         let result = parse(&sealed).and_then(|p| ecdh_unwrap(&sk, &p));
         assert!(result.is_err(), "a corrupted classical vector must fail closed");
     }
+
+    // --- adversarial negative-space sweep (feature = "harden") ----------------
+    //
+    // `parse` is the untrusted-input boundary the rail exposes (it ingests
+    // attacker-controlled envelope bytes). These sweeps prove it fails closed on
+    // every malformed shape and NEVER panics — a panic in a wasm capsule is a
+    // denial-of-service. Mirrors the careful bounds-checks PC2's `unwrapECDHEnvelope`
+    // performs; coarse `EnvelopeError` carries no bytes, so errors leak nothing.
+
+    #[cfg(feature = "harden")]
+    fn valid_classical_envelope() -> (SecretKey, Vec<u8>) {
+        let sk = SecretKey::random(&mut OsRng);
+        let env = make_envelope(&sk, &[0xABu8; 16], 0x03);
+        (sk, env)
+    }
+
+    /// Every proper prefix (truncation at every length) must fail closed.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_parse_truncations_fail_closed() {
+        let (_sk, env) = valid_classical_envelope();
+        assert!(parse(&env).is_ok(), "the full envelope must parse");
+        for t in 0..env.len() {
+            assert!(
+                parse(&env[..t]).is_err(),
+                "truncation to {t} bytes must fail closed (got Ok)"
+            );
+        }
+    }
+
+    /// Arbitrary single-byte corruption at every position must never panic
+    /// (Ok or Err are both acceptable; the invariant is "no panic").
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_parse_never_panics_on_byte_flips() {
+        let (_sk, env) = valid_classical_envelope();
+        for i in 0..env.len() {
+            let mut e = env.clone();
+            e[i] ^= 0xFF;
+            let _ = parse(&e); // must not panic
+        }
+    }
+
+    /// Oversized length prefixes (claim more bytes than present) fail closed.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_parse_oversized_length_prefixes_fail_closed() {
+        let (_sk, env) = valid_classical_envelope();
+
+        // eph_len lives at bytes 4..6 and is always present in a valid envelope.
+        let mut big_eph = env.clone();
+        big_eph[4] = 0xFF;
+        big_eph[5] = 0xFF;
+        assert!(parse(&big_eph).is_err(), "oversized eph_len must fail closed");
+
+        // sig_len lives right after eph_pub_key + IV (v=0x03): 4 + 2 + 33 + 16 = 55.
+        let mut big_sig = env.clone();
+        big_sig[55] = 0xFF;
+        big_sig[56] = 0xFF;
+        assert!(parse(&big_sig).is_err(), "oversized sig_len must fail closed");
+    }
+
+    /// Tampering anywhere in the envelope yields only a coarse `EnvelopeError`
+    /// (no field-level probe, no bytes) when carried through unwrap.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_classical_tamper_errors_are_coarse() {
+        let (sk, env) = valid_classical_envelope();
+        for i in 0..env.len() {
+            let mut e = env.clone();
+            e[i] ^= 0xFF;
+            if let Ok(parsed) = parse(&e) {
+                if let Err(err) = ecdh_unwrap(&sk, &parsed) {
+                    // The only surfaces are the two coarse variants.
+                    assert!(
+                        matches!(err, EnvelopeError::BadEnvelope | EnvelopeError::DecryptFailed),
+                        "error surface must stay coarse"
+                    );
+                }
+            }
+        }
+    }
 }

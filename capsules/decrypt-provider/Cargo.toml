@@ -44,6 +44,12 @@ pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
 # the real PQ signature verified through the exact `decrypt_from_carrier`
 # entrypoint OpenSession will call. OFF by default; combines rail-shim + pq-mldsa.
 rail-shim-mldsa = ["rail-shim", "pq-mldsa"]
+# harden: adversarial negative-space + containment test sweeps over the untrusted-
+# input boundaries the rail exposes (envelope::parse, PqSealedEnvelope::from_bytes,
+# decrypt_from_carrier dispatch) — every malformed shape must fail closed and never
+# panic; error/response surfaces must leak no CEK/plaintext. Test-only gate (pulls
+# all engines + the real verifier); OFF by default, base ladder stays byte-stable.
+harden = ["rail-shim-mldsa"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

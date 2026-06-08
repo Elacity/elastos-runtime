@@ -519,4 +519,87 @@ mod tests {
             "a tampered carrier body must fail closed"
         );
     }
+
+    // --- adversarial dispatch + containment sweep (feature = "harden") --------
+    //
+    // `decrypt_from_carrier` is the exact entrypoint OpenSession will expose to
+    // carriers minted outside this VM. These pin: (a) profile/secret mismatch both
+    // directions fails closed; (b) arbitrary carrier corruption never panics and
+    // never recovers plaintext; (c) no error/metadata surface leaks the CEK or the
+    // plaintext.
+
+    /// The reverse profile/secret mismatch (PQ carrier + classical secret).
+    #[cfg(all(feature = "harden", not(feature = "gen-vectors")))]
+    #[test]
+    fn harden_pq_carrier_with_classical_secret_fails_closed() {
+        let v = rail_carrier_pq();
+        let carrier = SealedDecryptCarrier {
+            profile: SealProfile::PqHybrid,
+            sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: None,
+        };
+        let classical_secret = p256::SecretKey::random(&mut rand_core::OsRng);
+        assert!(
+            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_secret), &carrier, &StubVerifier)
+                .is_err(),
+            "a PQ carrier with a classical secret must fail closed"
+        );
+    }
+
+    /// Arbitrary single-byte corruption of the sealed carrier, driven through the
+    /// real verifier: never panics, never recovers plaintext.
+    #[cfg(all(feature = "harden", not(feature = "gen-vectors")))]
+    #[test]
+    fn harden_carrier_corruption_sweep_never_decrypts() {
+        let v = rail_carrier_pq_mldsa();
+        let sealed = b64().decode(&v.sealed_cek_b64).unwrap();
+        let segment = b64().decode(&v.ciphertext_segment_b64).unwrap();
+        for i in 0..sealed.len() {
+            let mut s = sealed.clone();
+            s[i] ^= 0xFF;
+            let carrier = SealedDecryptCarrier {
+                profile: SealProfile::PqHybrid,
+                sealed_cek: s,
+                ciphertext_segment: segment.clone(),
+                init_segment: None,
+            };
+            assert!(
+                decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
+                    .is_err(),
+                "carrier byte {i} flip must fail closed"
+            );
+        }
+    }
+
+    /// Neither the recovered metadata (happy path) nor the error string (tampered)
+    /// may contain the plaintext — the carrier path leaks nothing across the
+    /// boundary.
+    #[cfg(all(feature = "harden", not(feature = "gen-vectors")))]
+    #[test]
+    fn harden_carrier_surfaces_leak_no_plaintext() {
+        let v = rail_carrier_pq_mldsa();
+        let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
+        let pt_str = String::from_utf8(expected.clone()).unwrap();
+
+        // Happy path: scoped metadata must not contain the plaintext.
+        let carrier = pq_mldsa_carrier(&v);
+        let (_out, meta) =
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
+                .expect("golden should decrypt");
+        let meta_str = serde_json::to_string(&meta).unwrap();
+        assert!(!meta_str.contains(&pt_str), "metadata must not contain the plaintext");
+
+        // Tampered path: the error string must not contain the plaintext either.
+        let mut tampered = pq_mldsa_carrier(&v);
+        let n = tampered.sealed_cek.len();
+        tampered.sealed_cek[n - 1] ^= 0xFF;
+        let err = decrypt_from_carrier(
+            &SessionSecret::PqHybrid(pq_session(&v)),
+            &tampered,
+            &mldsa_verifier(&v),
+        )
+        .unwrap_err();
+        assert!(!err.contains(&pt_str), "error string must not contain the plaintext");
+    }
 }

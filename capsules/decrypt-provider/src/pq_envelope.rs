@@ -889,4 +889,92 @@ mod tests {
             "a corrupted PQ vector must fail closed"
         );
     }
+
+    // --- adversarial negative-space sweep on the PQ wire-decode (harden) ------
+    //
+    // `PqSealedEnvelope::from_bytes` is the untrusted-input boundary for the PQ
+    // rail. AEAD (AES-256-GCM) makes the unwrap fail-closed even when a corrupted
+    // carrier decodes, but the decoder itself must also fail closed on every
+    // malformed length-prefixed shape and never panic.
+
+    #[cfg(feature = "harden")]
+    fn valid_pq_envelope_bytes() -> Vec<u8> {
+        let (_secret, public) = gen_session();
+        seal(&public, &[0x42u8; 16], &StubSigner).to_bytes()
+    }
+
+    /// Every proper prefix of the wire envelope must fail closed in `from_bytes`.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_pq_from_bytes_truncations_fail_closed() {
+        let bytes = valid_pq_envelope_bytes();
+        assert!(PqSealedEnvelope::from_bytes(&bytes).is_ok(), "the full wire form must decode");
+        for t in 0..bytes.len() {
+            assert!(
+                PqSealedEnvelope::from_bytes(&bytes[..t]).is_err(),
+                "truncation to {t} bytes must fail closed"
+            );
+        }
+    }
+
+    /// Single-byte corruption at every position must never panic in `from_bytes`.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_pq_from_bytes_never_panics_on_byte_flips() {
+        let bytes = valid_pq_envelope_bytes();
+        for i in 0..bytes.len() {
+            let mut b = bytes.clone();
+            b[i] ^= 0xFF;
+            let _ = PqSealedEnvelope::from_bytes(&b); // must not panic
+        }
+    }
+
+    /// Oversized length prefixes (claiming more bytes than present) fail closed —
+    /// including a `u32::MAX` prefix (exercises the `checked_add` overflow guard).
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_pq_from_bytes_oversized_length_prefixes_fail_closed() {
+        let bytes = valid_pq_envelope_bytes();
+        // The first u32 length prefix is the ML-KEM ciphertext length at offset 32.
+        let mut big = bytes.clone();
+        big[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            PqSealedEnvelope::from_bytes(&big).is_err(),
+            "a u32::MAX length prefix must fail closed (no overflow, no over-read)"
+        );
+    }
+
+    /// Whole-envelope corruption sweep: a tampered-but-decodable carrier must STILL
+    /// fail closed at unwrap (AEAD auth / signature), never yielding a CEK.
+    #[cfg(feature = "harden")]
+    #[test]
+    fn harden_pq_corruption_sweep_never_recovers_cek() {
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let good = seal(&public, &cek, &StubSigner);
+        let bytes = good.to_bytes();
+
+        for i in 0..bytes.len() {
+            let mut b = bytes.clone();
+            b[i] ^= 0xFF;
+            // Decode may succeed or fail; if it decodes, the unwrap MUST fail closed.
+            if let Ok(env) = PqSealedEnvelope::from_bytes(&b) {
+                match hybrid_unwrap(&secret, &env, &StubVerifier) {
+                    Ok(recovered) => panic!(
+                        "byte {i} flip unexpectedly recovered a CEK ({} bytes)",
+                        recovered.len()
+                    ),
+                    Err(e) => assert!(
+                        matches!(
+                            e,
+                            PqEnvelopeError::BadSignature
+                                | PqEnvelopeError::DecapFailed
+                                | PqEnvelopeError::UnsealFailed
+                        ),
+                        "error surface must stay coarse"
+                    ),
+                }
+            }
+        }
+    }
 }

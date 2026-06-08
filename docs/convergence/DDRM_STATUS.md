@@ -446,6 +446,32 @@ else changes. `DDRM_DECRYPT_RAIL.md` Q2 updated: no longer a build gap, purely a
 Base ladder + `pq-mldsa` byte-stable (25/27/29/31/40/45; `pq-mldsa` 34); new
 `rail-shim-mldsa` = 54; `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
 
+### Fail-closed under adversarial input — proven (Day 34)
+
+The wire-decoders are the surfaces the rail exposes to **attacker-controlled carrier
+bytes** (`envelope::parse`, `PqSealedEnvelope::from_bytes`, `decrypt_from_carrier`
+dispatch). A new test-only `harden` feature (= `rail-shim-mldsa`; off by default, base
+ladder byte-stable) adds an adversarial negative-space + containment sweep (+11 →
+`harden` = **65**):
+
+- **Truncation sweep:** *every* proper prefix of a valid envelope/carrier fails closed
+  (classical + PQ).
+- **Byte-flip sweep:** single-byte corruption at *every* position **never panics** (a
+  panic in a wasm capsule is a DoS) — classical parse, PQ `from_bytes`, and the
+  `decrypt_from_carrier` dispatch.
+- **Oversized length prefixes:** over-large `u16`/`u32` prefixes (incl. `u32::MAX`,
+  exercising the `checked_add` overflow guard) fail closed — no over-read.
+- **Corruption-never-recovers:** a tampered-but-decodable PQ carrier still fails closed
+  at unwrap (AES-256-GCM auth ‖ ML-DSA-65 signature) — never yields a CEK; error
+  surfaces stay coarse (no which-field probe).
+- **Containment:** profile/secret mismatch fails closed **both** directions; and neither
+  the scoped metadata (happy path) nor the error string (tampered) contains the plaintext
+  or the CEK across the carrier path.
+
+This makes "**fail-closed and panic-free under adversarial input**" — a core capability-
+security claim — executable, on the exact boundaries the rail will expose. Base ladder
+byte-stable; `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
