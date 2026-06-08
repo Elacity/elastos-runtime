@@ -39,7 +39,9 @@ DIM='\033[2m'
 NC='\033[0m'
 
 # Default publish scope: runtime core + chat demo (3 modes: native, microVM, WASM).
-# ipfs-provider, availability-provider, wallet-provider, drm-provider, rights-provider, key-provider, decrypt-provider, and tunnel-provider are supported direct command assets.
+# ipfs-provider, availability-provider, wallet-provider, object-provider,
+# content-block-graph-provider, drm-provider, rights-provider, key-provider,
+# decrypt-provider, and tunnel-provider are supported direct command assets.
 # They are not part of the managed user runtime, but fresh installs must
 # provision them for share/open/public-share.
 DEFAULT_CAPSULES=(
@@ -71,12 +73,15 @@ SUPPORT_BINARY_ASSETS=(
     webspace-provider
     chain-provider
     wallet-provider
+    object-provider
+    content-block-graph-provider
     drm-provider
     rights-provider
     key-provider
     decrypt-provider
     ipfs-provider
     availability-provider
+    operator-drive-adapter
     site-provider
     tunnel-provider
 )
