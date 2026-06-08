@@ -335,6 +335,30 @@ against PC2's *session model*, not just its crypto primitives:
 PASS (now including the two-layer session conformance). The carrier golden is the
 artifact `OpenSession` will accept on the day Anders confirms the rail.
 
+### PQ carrier golden — profile symmetry closed (Day 30)
+
+Day 28 pinned the *classical* carrier as a portable golden + PC2 session conformance;
+the **PQ-hybrid** profile now has the matching carrier golden:
+
+- `tests/vectors/rail_carrier_pq.json` (schema `RailCarrierVector`, `profile: PqHybrid`):
+  the `sealed_cek` is `PqSealedEnvelope::to_bytes()` (the carrier wire form the shim's
+  `from_bytes` decodes); the VM session secret is carried as its **two parts** (x25519
+  static secret + ML-KEM-768 decapsulation key) so replay reconstructs it with **no RNG**.
+- `rail_shim::tests::rail_carrier_pq_golden_replays_through_shim` replays it through
+  `decrypt_from_carrier`'s PQ branch (`from_bytes` → `decrypt_pq_sealed_segment`) and
+  recovers the plaintext; `…_tampered_fails_closed` pins fail-closed.
+- New `seal_support::session_secret_from_parts` reconstructs `SessionKemSecret`
+  deterministically (mirrors the VM restoring its own session key).
+
+**Deliberately no PC2 cross-impl layer for this profile.** The PQ-hybrid profile is
+runtime-only (`elastos-pq-hybrid-threshold-v0`); PC2's `ddrm-decrypt` is classical
+P-256 and has **no PQ session counterpart**, so there is no reference implementation to
+check byte-parity against. (The classical carrier remains two-layer PC2-conformant.)
+
+Base ladder unchanged (25/27/29/31, `vectors` 37); `rail-shim` = **45** (+2 PQ carrier);
+builds clean to `wasm32-wasip1`; `ddrm-verify.sh` PASS. Both rail profiles now have a
+carrier golden replayed through the exact `OpenSession` entrypoint.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

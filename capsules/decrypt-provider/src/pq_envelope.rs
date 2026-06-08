@@ -281,6 +281,18 @@ pub(crate) mod seal_support {
         )
     }
 
+    /// Reconstruct the VM session secret from its serialized parts (the x25519
+    /// static secret + the ML-KEM-768 decapsulation key) — deterministic, no RNG.
+    /// Mirrors how the live VM would restore its session key, and how the PQ golden
+    /// vectors are replayed.
+    pub fn session_secret_from_parts(x25519_secret: &[u8; 32], mlkem_dk_bytes: &[u8]) -> SessionKemSecret {
+        use ml_kem::{Encoded, EncodedSizeUser};
+        let x25519 = XStaticSecret::from(*x25519_secret);
+        let enc = Encoded::<MlKemDk>::try_from(mlkem_dk_bytes).expect("ML-KEM dk size");
+        let mlkem_dk = MlKemDk::from_bytes(&enc);
+        SessionKemSecret { x25519, mlkem_dk }
+    }
+
     /// Seal a CEK to a published session public key exactly as the key authority
     /// would (independently constructing the wire shape), so the round-trip pins
     /// the rail contract end to end.
@@ -510,6 +522,48 @@ mod tests {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
         std::fs::create_dir_all(dir).unwrap();
         let path = format!("{dir}/pq_hybrid_cenc.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Emit the PQ rail carrier golden (rail Option A, `PqHybrid` profile): the
+    /// `sealed_cek` is `PqSealedEnvelope::to_bytes()` (the carrier wire form the
+    /// shim's `from_bytes` decodes), and the VM session secret is carried as its
+    /// two parts (x25519 + ML-KEM dk) so the replay reconstructs it with no RNG.
+    /// There is deliberately no PC2 cross-impl layer for this profile — PC2 has no
+    /// PQ session counterpart (the PQ profile is runtime-only). Run:
+    /// `cargo test --features gen-vectors emit_rail_carrier_pq`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_rail_carrier_pq() {
+        use base64::Engine as _;
+        use ml_kem::EncodedSizeUser;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = gen_session();
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let plaintext = b"the quick brown fox jumps over!!";
+        let env = seal(&public, &cek, &StubSigner);
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        let v = crate::vector_format::RailCarrierVector {
+            description:
+                "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768): sealed CEK \
+                 (PqSealedEnvelope::to_bytes) + segment -> decrypt_from_carrier PQ branch; \
+                 runtime-only profile (no PC2 session counterpart, so no cross-impl layer)"
+                    .to_string(),
+            profile: "PqHybrid".to_string(),
+            session_secret_key_b64: b64.encode(secret.x25519.to_bytes()),
+            mlkem_dk_b64: Some(b64.encode(&secret.mlkem_dk.as_bytes()[..])),
+            sealed_cek_b64: b64.encode(env.to_bytes()),
+            ciphertext_segment_b64: b64.encode(&segment),
+            init_segment_b64: None,
+            expected_plaintext_b64: b64.encode(plaintext),
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/rail_carrier_pq.json");
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         eprintln!("wrote {path}");
     }

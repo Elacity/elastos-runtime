@@ -410,6 +410,7 @@ mod tests {
                     .to_string(),
             profile: "ClassicalP256".to_string(),
             session_secret_key_b64: classical.session_secret_key_b64,
+            mlkem_dk_b64: None,
             sealed_cek_b64: classical.sealed_envelope_b64,
             ciphertext_segment_b64: classical.encrypted_segment_b64,
             init_segment_b64: None,

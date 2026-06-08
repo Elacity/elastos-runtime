@@ -95,7 +95,9 @@ pub fn decrypt_from_carrier(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pq_envelope::seal_support::{gen_session, seal, StubSigner, StubVerifier};
+    use crate::pq_envelope::seal_support::{
+        gen_session, seal, session_secret_from_parts, StubSigner, StubVerifier,
+    };
     use base64::Engine as _;
 
     fn b64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -345,6 +347,71 @@ mod tests {
             decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_session(&v)), &carrier, &StubVerifier)
                 .is_err(),
             "a tampered carrier golden must fail closed"
+        );
+    }
+
+    // --- PQ-hybrid carrier golden (runtime-only profile; no PC2 counterpart) ---
+
+    #[cfg(not(feature = "gen-vectors"))]
+    fn rail_carrier_pq() -> crate::vector_format::RailCarrierVector {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/rail_carrier_pq.json"
+        )))
+        .unwrap()
+    }
+
+    #[cfg(not(feature = "gen-vectors"))]
+    fn pq_session(v: &crate::vector_format::RailCarrierVector) -> crate::pq_envelope::SessionKemSecret {
+        let x: [u8; 32] = b64().decode(&v.session_secret_key_b64).unwrap().try_into().unwrap();
+        let dk = b64()
+            .decode(v.mlkem_dk_b64.as_ref().expect("PQ carrier needs mlkem_dk"))
+            .unwrap();
+        session_secret_from_parts(&x, &dk)
+    }
+
+    /// The PQ carrier golden replays through `decrypt_from_carrier`'s PQ branch
+    /// (`from_bytes` → `decrypt_pq_sealed_segment`), pinning the runtime-only
+    /// profile's carrier wire shape with no RNG at replay.
+    #[cfg(not(feature = "gen-vectors"))]
+    #[test]
+    fn rail_carrier_pq_golden_replays_through_shim() {
+        let v = rail_carrier_pq();
+        assert_eq!(v.profile, "PqHybrid");
+        let carrier = SealedDecryptCarrier {
+            profile: SealProfile::PqHybrid,
+            sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+        };
+        let (output, meta) =
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &StubVerifier)
+                .expect("PQ carrier golden should decrypt through the shim");
+
+        let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
+        let off = carrier.ciphertext_segment.len() - expected.len();
+        assert_eq!(&output[off..], expected.as_slice());
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    /// A tampered PQ carrier golden must fail closed through the shim too.
+    #[cfg(not(feature = "gen-vectors"))]
+    #[test]
+    fn rail_carrier_pq_golden_tampered_fails_closed() {
+        let v = rail_carrier_pq();
+        let mut sealed = b64().decode(&v.sealed_cek_b64).unwrap();
+        let n = sealed.len();
+        sealed[n - 1] ^= 0xFF; // corrupt the signature tail
+        let carrier = SealedDecryptCarrier {
+            profile: SealProfile::PqHybrid,
+            sealed_cek: sealed,
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: None,
+        };
+        assert!(
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &StubVerifier)
+                .is_err(),
+            "a tampered PQ carrier golden must fail closed"
         );
     }
 }

@@ -70,9 +70,14 @@ pub struct RailCarrierVector {
     /// Seal profile tag: "ClassicalP256" or "PqHybrid".
     pub profile: String,
     /// VM session secret (replay aid; never on the wire). Classical: P-256 SEC1
-    /// scalar (32 bytes).
+    /// scalar (32 bytes). PQ-hybrid: the x25519 static secret (32 bytes).
     pub session_secret_key_b64: String,
-    /// The sealed CEK as it travels in the carrier (classical: flat envelope blob).
+    /// PQ-hybrid only: the ML-KEM-768 decapsulation key (FIPS 203 encoded form) —
+    /// the second half of the VM session secret. Absent for the classical profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mlkem_dk_b64: Option<String>,
+    /// The sealed CEK as it travels in the carrier (classical: flat envelope blob;
+    /// PQ-hybrid: `PqSealedEnvelope::to_bytes()`).
     pub sealed_cek_b64: String,
     /// The ciphertext fMP4 segment to decrypt.
     pub ciphertext_segment_b64: String,
