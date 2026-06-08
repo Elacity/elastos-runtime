@@ -157,8 +157,11 @@ but verified the impact:
 
 ## Commits (on `feat/decrypt-provider-cenc`, not yet pushed — GitHub suspension)
 
-17 commits ahead of `origin/0.4.0` (the original 14 below, plus Day 15 status/PQ,
-Day 16 encrypt-provider, Day 17 drift guard). Newest last:
+**17 of our commits** (the original 14 below, plus Day 15 status/PQ, Day 16
+encrypt-provider, Day 17 drift guard). Note: `git rev-list --count
+origin/0.4.0..HEAD` reports **19** against the force-pushed base because 2 orphaned
+old-upstream commits are still in range — the rebase (`PUSH_PLAN.md`) drops them.
+Newest last:
 
 1. `docs(convergence)` — north-star playbook, product vision PRD, v0.4.0 plan
 2. `feat(decrypt-provider)` — vendor PC2 cenc-decrypt engine as fail-closed backend
