@@ -144,6 +144,20 @@ Reusable harness: `capsules/decrypt-provider/scripts/wasm-smoke.sh` (exit 0 on a
 pass; suitable for CI). This upgrades the evidence from "compiles to wasm" to
 "runs correctly and stays fail-closed in the wasm substrate."
 
+## Chain status (`rights -> key -> decrypt`)
+
+| Provider | Contract + validation | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
+| --- | --- | --- | --- | --- | --- |
+| `decrypt-provider` | yes (+ tested decrypt-step core seam) | yes | 17 | builds | `scripts/wasm-smoke.sh` |
+| `key-provider` | yes (+ rights-receipt binding: allowed + principal/session/object/right must match) | yes | 9 | builds | `scripts/wasm-smoke.sh` |
+| `rights-provider` | (declared; not yet brought to this bar) | — | — | — | — |
+
+`key-provider` now verifies the upstream rights decision before it would ever
+release a key (the `rights -> key` link): a denied, malformed, or mis-bound
+`RightsDecisionReceiptV1` is rejected with `invalid_request`; a valid request
+still fails closed (`not_configured`) until the PQ-hybrid dKMS backend exists.
+The CEK only ever appears here as `key_envelope.wrapped_cek` — never raw.
+
 ## What is NOT blocked (and is done/ready)
 
 - The cenc engine is vendored, characterization-tested, and proven to contain +

@@ -6,7 +6,7 @@
 
 use elastos_common::protected_content::{
     validate_protected_content_key_envelope_algorithms, KeyReleaseRequestV1,
-    KEY_RELEASE_REQUEST_SCHEMA, PROTECTED_CONTENT_ACTIONS,
+    KEY_RELEASE_REQUEST_SCHEMA, PROTECTED_CONTENT_ACTIONS, RIGHTS_DECISION_RECEIPT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -125,6 +125,7 @@ fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), Str
     require_non_empty(&request.session_id, "session_id")?;
     require_identifier(&request.object_cid, "object_cid")?;
     validate_action(&request.action)?;
+    validate_rights_receipt(request)?;
     require_non_empty(&request.reason, "reason")?;
     require_non_empty(&request.key_envelope.scheme, "key_envelope.scheme")?;
     require_supported_scheme(&request.key_envelope.scheme)?;
@@ -140,6 +141,36 @@ fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), Str
     validate_protected_content_key_envelope_algorithms(&request.key_envelope.algorithms)?;
     if request.expires_at == 0 {
         return Err("expires_at is required".to_string());
+    }
+    Ok(())
+}
+
+/// Verify the upstream rights decision authorizes *this* key release.
+///
+/// The key boundary must never release on a receipt that is denied, malformed, or
+/// bound to a different principal/session/object/right. This is the `rights -> key`
+/// link of the dDRM chain: rights authority lives in rights-provider; key-provider
+/// fails closed unless it is handed a matching, allowed decision.
+fn validate_rights_receipt(request: &KeyReleaseRequestV1) -> Result<(), String> {
+    let receipt = &request.rights_receipt;
+    if receipt.schema != RIGHTS_DECISION_RECEIPT_SCHEMA {
+        return Err("rights receipt schema is unsupported".to_string());
+    }
+    require_non_empty(&receipt.request_id, "rights_receipt.request_id")?;
+    if !receipt.allowed {
+        return Err("rights receipt does not authorize this action".to_string());
+    }
+    if receipt.principal_id != request.principal_id {
+        return Err("rights receipt principal does not match request".to_string());
+    }
+    if receipt.session_id != request.session_id {
+        return Err("rights receipt session does not match request".to_string());
+    }
+    if receipt.content_id != request.object_cid {
+        return Err("rights receipt content does not match request object".to_string());
+    }
+    if receipt.right != request.action {
+        return Err("rights receipt right does not match requested action".to_string());
     }
     Ok(())
 }
@@ -228,9 +259,9 @@ fn main() {
 mod tests {
     use super::*;
     use elastos_common::protected_content::{
-        KeyEnvelopeAlgorithmsV1, KeyEnvelopeV1, DEFAULT_PROTECTED_CONTENT_CIPHER,
-        DEFAULT_PROTECTED_CONTENT_KEMS, DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME,
-        DEFAULT_PROTECTED_CONTENT_SIGNATURES,
+        KeyEnvelopeAlgorithmsV1, KeyEnvelopeV1, RightsDecisionReceiptV1,
+        DEFAULT_PROTECTED_CONTENT_CIPHER, DEFAULT_PROTECTED_CONTENT_KEMS,
+        DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME, DEFAULT_PROTECTED_CONTENT_SIGNATURES,
     };
 
     fn key_release_request() -> KeyReleaseRequestV1 {
@@ -241,6 +272,18 @@ mod tests {
             session_id: "session:test".to_string(),
             object_cid: "bafybeigprotectedcontent".to_string(),
             action: "view".to_string(),
+            rights_receipt: RightsDecisionReceiptV1 {
+                schema: RIGHTS_DECISION_RECEIPT_SCHEMA.to_string(),
+                request_id: "rights:test".to_string(),
+                content_id: "bafybeigprotectedcontent".to_string(),
+                principal_id: "person:local:test".to_string(),
+                session_id: "session:test".to_string(),
+                right: "view".to_string(),
+                provider: "rights-provider".to_string(),
+                allowed: true,
+                issued_at: 1_800_000_000,
+                expires_at: 1_900_000_000,
+            },
             key_envelope: KeyEnvelopeV1 {
                 scheme: "elastos-pq-hybrid-threshold-v0".to_string(),
                 kid: "kid:test".to_string(),
@@ -323,6 +366,43 @@ mod tests {
         let provider = KeyProvider;
         let mut request = key_release_request();
         request.key_envelope.algorithms.kem = vec!["x25519".to_string()];
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    #[test]
+    fn release_rejects_denied_rights_receipt() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.rights_receipt.allowed = false;
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    #[test]
+    fn release_rejects_rights_receipt_bound_to_other_principal() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.rights_receipt.principal_id = "person:local:attacker".to_string();
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    #[test]
+    fn release_rejects_rights_receipt_for_other_object() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.rights_receipt.content_id = "bafybeigsomethingelse".to_string();
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    #[test]
+    fn release_rejects_rights_receipt_for_other_action() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.action = "download".to_string();
+        // receipt still authorizes only "view"
 
         assert_eq!(error_code(provider.release(request)), "invalid_request");
     }
