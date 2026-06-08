@@ -46,6 +46,7 @@ LADDER=(
   "decrypt-provider vectors|decrypt-provider|vectors|42"
   "decrypt-provider rail-shim|decrypt-provider|rail-shim|45"
   "decrypt-provider pq-mldsa|decrypt-provider|pq-mldsa|34"
+  "decrypt-provider pq-mldsa-hybrid|decrypt-provider|pq-mldsa-hybrid|37"
   "decrypt-provider rail-shim-mldsa|decrypt-provider|rail-shim-mldsa|54"
   "decrypt-provider harden|decrypt-provider|harden|65"
 )
@@ -101,8 +102,9 @@ if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
     "rights-provider|"
     "key-provider|"
     "decrypt-provider|"
-    "decrypt-provider|pq-mldsa"
-    "decrypt-provider|rail-shim-mldsa"
+      "decrypt-provider|pq-mldsa"
+      "decrypt-provider|pq-mldsa-hybrid"
+      "decrypt-provider|rail-shim-mldsa"
   )
   for row in "${WASM[@]}"; do
     IFS='|' read -r dir features <<< "$row"

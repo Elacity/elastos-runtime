@@ -106,6 +106,91 @@ pub mod mldsa {
     }
 }
 
+/// Hybrid (classical + post-quantum) seal-signature verifier — the OTHER answer to
+/// Anders' open Q2 (`DDRM_DECRYPT_RAIL.md`). A classical **ECDSA-P256** signature
+/// AND a PQ **ML-DSA-65** signature over the same payload must **both** verify;
+/// either failing fails closed. This is the migration-period profile: during PC2's
+/// classical→PQ transition the key authority can dual-sign, so a verifier that
+/// trusts neither algorithm alone still accepts the seal — defense-in-depth without
+/// a flag day. It plugs into the exact same `CekSealVerifier` slot as the straight
+/// `MlDsa65Verifier`, so with both pre-proven the rail landing is a pure policy
+/// pick (which verifier `OpenSession` constructs), never a build gap.
+///
+/// Wire layout of the hybrid signature: `u32 ecdsa_len ‖ ecdsa(DER) ‖ u32 mldsa_len
+/// ‖ mldsa`. Verify-only + RNG-free → `wasm32-wasip1`-clean. Fail-closed: a wrong
+/// key, malformed half, or trailing bytes verify `false` with no which-half probe.
+#[cfg(feature = "pq-mldsa-hybrid")]
+pub mod hybrid {
+    use super::mldsa::MlDsa65Verifier;
+    use super::CekSealVerifier;
+    use p256::ecdsa::{signature::Verifier as _, Signature as EcdsaSig, VerifyingKey as EcdsaVk};
+
+    pub struct HybridVerifier {
+        ecdsa: EcdsaVk,
+        mldsa: MlDsa65Verifier,
+    }
+
+    impl HybridVerifier {
+        /// Build from the key authority's published keys: the ECDSA verifying key
+        /// (SEC1 point, compressed or uncompressed) + the ML-DSA-65 verifying-key
+        /// encoding. `None` if either is malformed (fail-closed construction).
+        pub fn from_encoded(ecdsa_sec1: &[u8], mldsa_vk: &[u8]) -> Option<Self> {
+            let ecdsa = EcdsaVk::from_sec1_bytes(ecdsa_sec1).ok()?;
+            let mldsa = MlDsa65Verifier::from_encoded(mldsa_vk)?;
+            Some(Self { ecdsa, mldsa })
+        }
+
+        /// Split a hybrid signature into (ecdsa_der, mldsa) halves; `None` on any
+        /// malformed/truncated framing or trailing bytes.
+        fn split(sig: &[u8]) -> Option<(&[u8], &[u8])> {
+            fn rd<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Option<&'a [u8]> {
+                let end = off.checked_add(n)?;
+                if end > b.len() {
+                    return None;
+                }
+                let s = &b[*off..end];
+                *off = end;
+                Some(s)
+            }
+            let mut off = 0usize;
+            let l0 = u32::from_be_bytes(rd(sig, &mut off, 4)?.try_into().ok()?) as usize;
+            let ecdsa = rd(sig, &mut off, l0)?;
+            let l1 = u32::from_be_bytes(rd(sig, &mut off, 4)?.try_into().ok()?) as usize;
+            let mldsa = rd(sig, &mut off, l1)?;
+            if off != sig.len() {
+                return None; // no trailing bytes — exact framing only
+            }
+            Some((ecdsa, mldsa))
+        }
+
+        /// Encode a hybrid signature from its two halves (key-authority/test side).
+        #[allow(dead_code)] // the decrypt boundary only verifies; encode is signer-side
+        pub fn encode_signature(ecdsa_der: &[u8], mldsa: &[u8]) -> Vec<u8> {
+            let mut v = Vec::with_capacity(8 + ecdsa_der.len() + mldsa.len());
+            v.extend_from_slice(&(ecdsa_der.len() as u32).to_be_bytes());
+            v.extend_from_slice(ecdsa_der);
+            v.extend_from_slice(&(mldsa.len() as u32).to_be_bytes());
+            v.extend_from_slice(mldsa);
+            v
+        }
+    }
+
+    impl CekSealVerifier for HybridVerifier {
+        fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+            let (ecdsa_sig, mldsa_sig) = match Self::split(sig) {
+                Some(halves) => halves,
+                None => return false,
+            };
+            let es = match EcdsaSig::from_der(ecdsa_sig) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            // BOTH halves must verify — classical AND post-quantum.
+            self.ecdsa.verify(msg, &es).is_ok() && self.mldsa.verify(msg, mldsa_sig)
+        }
+    }
+}
+
 /// A PQ-hybrid sealed CEK envelope. Carries only public/sealed material; the CEK
 /// exists only after a correct in-VM unwrap.
 pub struct PqSealedEnvelope {
@@ -520,6 +605,135 @@ mod tests {
         assert!(
             mldsa::MlDsa65Verifier::from_encoded(&[0u8; 8]).is_none(),
             "wrong-size verifying-key encoding must yield no verifier"
+        );
+    }
+
+    // --- hybrid ECDSA-P256 + ML-DSA-65 verifier (feature `pq-mldsa-hybrid`) -----
+    //
+    // Pre-prove Anders' OTHER Q2 answer: a dual-signature verifier where BOTH a
+    // classical ECDSA-P256 and a PQ ML-DSA-65 signature must verify. Drives the same
+    // `hybrid_unwrap` path the straight-ML-DSA verifier uses, so the rail landing is
+    // a pure policy pick. ECDSA signing is deterministic (RFC6979), ML-DSA from a
+    // fixed seed — no RNG needed.
+
+    /// Test-only hybrid signer (key-authority side): one ECDSA-P256 key + one
+    /// ML-DSA-65 key, emitting the `u32 ecdsa_len ‖ DER ‖ u32 mldsa_len ‖ mldsa`
+    /// wire shape `HybridVerifier` consumes.
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    struct HybridSigner {
+        ecdsa: p256::ecdsa::SigningKey,
+        mldsa: MlDsa65Signer,
+    }
+
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    impl CekSealSigner for HybridSigner {
+        fn sign(&self, msg: &[u8]) -> Vec<u8> {
+            use ml_dsa::{SignatureEncoding, Signer as _};
+            use p256::ecdsa::{signature::Signer as _, Signature as EcdsaSig};
+            let es: EcdsaSig = self.ecdsa.sign(msg);
+            let der = es.to_der();
+            let m = self.mldsa.sk.sign(msg).to_bytes().to_vec();
+            hybrid::HybridVerifier::encode_signature(der.as_bytes(), &m)
+        }
+    }
+
+    /// Deterministic hybrid keypair from two seeds. Returns the signer + the
+    /// published verifying keys (ECDSA SEC1 compressed point, ML-DSA-65 encoding).
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    fn hybrid_keypair(ecdsa_seed: [u8; 32], mldsa_seed: [u8; 32]) -> (HybridSigner, Vec<u8>, Vec<u8>) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let ecdsa = p256::ecdsa::SigningKey::from_slice(&ecdsa_seed).expect("valid p256 scalar");
+        let ecdsa_sec1 = ecdsa
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        let (mldsa, mldsa_vk) = mldsa_keypair(mldsa_seed);
+        (HybridSigner { ecdsa, mldsa }, ecdsa_sec1, mldsa_vk)
+    }
+
+    /// Happy path: a dual-signed seal drives `hybrid_unwrap` to the CEK, and a
+    /// tampered signature fails closed with `BadSignature`.
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    #[test]
+    fn hybrid_real_signatures_drive_hybrid_unwrap() {
+        let (signer, ecdsa_vk, mldsa_vk) = hybrid_keypair([0x11u8; 32], [0x22u8; 32]);
+        let verifier = hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
+
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let env = seal(&public, &cek, &signer);
+
+        let recovered = hybrid_unwrap(&secret, &env, &verifier).expect("unwrap with hybrid verify");
+        assert_eq!(recovered.as_slice(), &cek, "hybrid (ECDSA+ML-DSA) verify gates the unwrap");
+
+        let mut tampered = env;
+        tampered.signature[0] ^= 0xFF;
+        assert_eq!(
+            hybrid_unwrap(&secret, &tampered, &verifier).unwrap_err(),
+            PqEnvelopeError::BadSignature,
+            "a tampered hybrid signature must fail closed"
+        );
+    }
+
+    /// BOTH halves are required: a wrong ECDSA key OR a wrong ML-DSA key fails
+    /// closed even though the other half is valid (defense-in-depth, not OR-trust).
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    #[test]
+    fn hybrid_requires_both_halves() {
+        let (signer, ecdsa_vk, mldsa_vk) = hybrid_keypair([0x11u8; 32], [0x22u8; 32]);
+        let (_other, ecdsa_vk_other, mldsa_vk_other) = hybrid_keypair([0x33u8; 32], [0x44u8; 32]);
+
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let env = seal(&public, &cek, &signer);
+
+        // Right ML-DSA key, WRONG ECDSA key -> fail closed.
+        let v_bad_ecdsa =
+            hybrid::HybridVerifier::from_encoded(&ecdsa_vk_other, &mldsa_vk).expect("verifier");
+        assert_eq!(
+            hybrid_unwrap(&secret, &env, &v_bad_ecdsa).unwrap_err(),
+            PqEnvelopeError::BadSignature,
+            "wrong ECDSA half must fail closed even with a valid ML-DSA half"
+        );
+
+        // Right ECDSA key, WRONG ML-DSA key -> fail closed.
+        let v_bad_mldsa =
+            hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk_other).expect("verifier");
+        assert_eq!(
+            hybrid_unwrap(&secret, &env, &v_bad_mldsa).unwrap_err(),
+            PqEnvelopeError::BadSignature,
+            "wrong ML-DSA half must fail closed even with a valid ECDSA half"
+        );
+    }
+
+    /// Malformed hybrid framing (truncation, trailing bytes, garbage) verifies
+    /// `false` without panicking, and a malformed key encoding yields no verifier.
+    #[cfg(feature = "pq-mldsa-hybrid")]
+    #[test]
+    fn hybrid_malformed_inputs_fail_closed() {
+        let (signer, ecdsa_vk, mldsa_vk) = hybrid_keypair([0x11u8; 32], [0x22u8; 32]);
+        let verifier = hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
+
+        let (_secret, public) = gen_session();
+        let env = seal(&public, &[0x42u8; 16], &signer);
+        let good = &env.signature;
+        let msg = env.signed_payload();
+        assert!(verifier.verify(&msg, good), "the genuine hybrid signature verifies");
+
+        // Every proper prefix must fail closed (no panic, no partial-accept).
+        for n in 0..good.len() {
+            assert!(!verifier.verify(&msg, &good[..n]), "prefix len {n} must fail closed");
+        }
+        // Trailing byte appended -> exact-framing check rejects it.
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert!(!verifier.verify(&msg, &trailing), "trailing bytes must fail closed");
+        // Garbage / wrong-size key encodings.
+        assert!(!verifier.verify(&msg, &[0u8; 8]), "garbage signature must fail closed");
+        assert!(
+            hybrid::HybridVerifier::from_encoded(&[0u8; 8], &mldsa_vk).is_none(),
+            "malformed ECDSA key encoding must yield no verifier"
         );
     }
 

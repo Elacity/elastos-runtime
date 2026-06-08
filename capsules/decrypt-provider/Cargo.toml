@@ -39,6 +39,13 @@ rail-shim = ["rail-prep", "pq-rail-prep"]
 # unwrap). Pure-Rust, rng-free verify path -> builds to wasm32-wasip1. OFF by
 # default (separate axis): the default build + base ladder stay byte-stable.
 pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
+# pq-mldsa-hybrid: the OTHER answer to Anders' open Q2 (DDRM_DECRYPT_RAIL.md) —
+# a HYBRID seal-signature verifier where a classical ECDSA-P256 signature AND a PQ
+# ML-DSA-65 signature must BOTH verify (defense-in-depth during PC2's classical->PQ
+# migration). Slots into the SAME CekSealVerifier the rail uses, so once both Q2
+# answers are pre-proven the rail landing is a pure policy pick. Enables the ecdsa
+# feature on the (already-present) p256 dep only when active; OFF by default.
+pq-mldsa-hybrid = ["pq-mldsa", "p256/ecdsa"]
 # rail-shim-mldsa: the rail-shim carrier path driven by the REAL ML-DSA-65
 # verifier (not the stub) on a committed golden — the strongest pre-rail proof:
 # the real PQ signature verified through the exact `decrypt_from_carrier`

@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 40).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `b3b5f0a9d` + Day-40 integrity audit, ~44 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 41).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `4f0cc653a` + Day-41 hybrid verifier, ~45 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -131,6 +131,7 @@ counts per feature:
 | `vectors` | 42 | replay portable goldens: v3+v2, encrypt↔decrypt round-trips (single + **multi-sample + subsample**), multi-sample/subsample/init-IV cenc (Days 22, 24, 26, 31, 37) |
 | `rail-shim` | 45 | carrier→engine adapter (`decrypt_from_carrier`) + carrier goldens, both profiles (Days 27–30) |
 | `pq-mldsa` | 34 | real FIPS 204 ML-DSA-65 verifier in the `CekSealVerifier` slot + KAT (Day 32) |
+| `pq-mldsa-hybrid` | 37 | hybrid ECDSA-P256 + ML-DSA-65 verifier (BOTH must verify) — the other Q2 answer (Day 41) |
 | `rail-shim-mldsa` | 54 | the real ML-DSA-65 verified through `decrypt_from_carrier` on a committed carrier golden (Day 33) |
 | `harden` | 65 | adversarial negative-space + containment sweep over the wire-decoders (Day 34) |
 | `gen-vectors` | — | regenerate the committed vectors (writes `tests/vectors/`) |
@@ -199,6 +200,10 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
   replayed through `decrypt_from_carrier` verified by the production `MlDsa65Verifier`
   (`rail-shim-mldsa`) — plaintext recovered + fail-closed on tampered sig / wrong key /
   tampered body. *The real PQ signature, through the real rail entrypoint, on a portable artifact.*
+- **Both Q2 signature answers pre-proven** (Day 41, `pq-mldsa-hybrid`): a hybrid
+  ECDSA-P256 + ML-DSA-65 `HybridVerifier` (BOTH halves must verify) drives the same
+  `hybrid_unwrap` path — happy path, both-halves-required, tampered, and malformed framing
+  all proven; `wasm32-wasip1`-clean. Q2 is now a pure policy pick, not a build task.
 - **Fail-closed + panic-free under adversarial input** (Day 34, `harden`): truncation,
   single-byte-flip, and oversized-length-prefix sweeps over `envelope::parse`,
   `PqSealedEnvelope::from_bytes`, and the `decrypt_from_carrier` dispatch — every malformed
@@ -349,9 +354,9 @@ for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo te
 
 # decrypt-provider feature ladder (tested islands; counts in §3)
 # default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 42 /
-# rail-shim 45 / pq-mldsa 34 / rail-shim-mldsa 54 / harden 65
+# rail-shim 45 / pq-mldsa 34 / pq-mldsa-hybrid 37 / rail-shim-mldsa 54 / harden 65
 ( cd capsules/decrypt-provider && \
-  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa rail-shim-mldsa harden; do \
+  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa pq-mldsa-hybrid rail-shim-mldsa harden; do \
     cargo test --features $f; done )
 
 # regenerate the committed golden vectors (only when intentionally changing them)
@@ -455,7 +460,8 @@ next context can continue cold.
 - **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name (`c63c375db`).
 - **D38** prove PC2 consumes the producer's output: drive the multi-sample + subsample producer segments through PC2's real `mp4box`+`cenc` (byte parity + wrong-CEK key-bound) in `pc2-conformance.sh` (`926b9adcb`).
 - **D39** reconcile `encrypt-provider` to `elastos-common`: sealed output now the shared `SealedObjectV1`/`KeyEnvelopeV1` (typed), algorithm set checked by the shared validator; only input `SealRequest` stays local; Day-16 self-containment retired (`b3b5f0a9d`).
-- **D40** integrity audit: every claim→gate mapped (table in `DDRM_STATUS.md`), no orphan vectors / dead flags, counts re-validated fresh; **WASI smoke wired into `ddrm-verify.sh` as gate 4/4** (skips clean w/o wasmtime) — the last doc-only claim is now gate-backed.
+- **D40** integrity audit: every claim→gate mapped (table in `DDRM_STATUS.md`), no orphan vectors / dead flags, counts re-validated fresh; **WASI smoke wired into `ddrm-verify.sh` as gate 4/4** (skips clean w/o wasmtime) — the last doc-only claim is now gate-backed (`4f0cc653a`).
+- **D41** pre-prove Anders' OTHER Q2 answer: a hybrid ECDSA-P256 + ML-DSA-65 `HybridVerifier` (feature `pq-mldsa-hybrid`=37, BOTH halves must verify, `wasm32-wasip1`-clean) through the same `hybrid_unwrap` path — Q2 is now a pure policy pick, both answers drop-in.
 
 ---
 

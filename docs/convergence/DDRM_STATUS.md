@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~44 commits**, tip `b3b5f0a9d` + Day-40 integrity audit)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~45 commits**, tip `4f0cc653a` + Day-41 hybrid verifier)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -448,6 +448,32 @@ else changes. `DDRM_DECRYPT_RAIL.md` Q2 updated: no longer a build gap, purely a
 Base ladder + `pq-mldsa` byte-stable (25/27/29/31/40/45; `pq-mldsa` 34); new
 `rail-shim-mldsa` = 54; `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
 
+### Both Q2 answers pre-proven — hybrid ECDSA+ML-DSA verifier (Day 41)
+
+The straight-ML-DSA-65 answer to Anders' open Q2 was proven Day 32–33. Day 41
+pre-proves the **other** answer so Q2 is purely a policy pick, never a build task: a
+**hybrid** seal-signature verifier where a classical **ECDSA-P256** signature AND a PQ
+**ML-DSA-65** signature must **both** verify — the migration-period profile (the key
+authority can dual-sign while PC2 moves classical→PQ; a verifier trusting neither
+algorithm alone still accepts).
+
+- **`pq_envelope::hybrid::HybridVerifier`** (new feature `pq-mldsa-hybrid = pq-mldsa
+  + p256/ecdsa`, off by default). Slots into the **same** `CekSealVerifier` the rail
+  uses, driven through the exact `hybrid_unwrap` path the straight verifier uses — so
+  `OpenSession` just constructs whichever verifier the policy selects.
+- **Fail-closed, defense-in-depth (not OR-trust):** wire shape `u32 ecdsa_len ‖
+  DER ‖ u32 mldsa_len ‖ mldsa`; **both halves required** (a valid ECDSA half with a
+  wrong ML-DSA key still fails, and vice-versa), tampered signature → `BadSignature`,
+  every proper prefix / trailing byte / garbage framing verifies `false` without
+  panic, malformed key encoding yields no verifier. Verify-only + RNG-free →
+  `wasm32-wasip1`-clean.
+- **Proven (feature `pq-mldsa-hybrid`, +3 tests → 37):** `hybrid_real_signatures_drive_hybrid_unwrap`,
+  `hybrid_requires_both_halves`, `hybrid_malformed_inputs_fail_closed`.
+
+Base ladder byte-stable; new `pq-mldsa-hybrid` = **37**; `wasm32-wasip1` clean
+(default + `pq-mldsa` + `pq-mldsa-hybrid` + `rail-shim-mldsa`); `ddrm-verify.sh` PASS.
+`DDRM_DECRYPT_RAIL.md` Q2 updated: both answers now drop-in, the rail is pure wiring.
+
 ### Fail-closed under adversarial input — proven (Day 34)
 
 The wire-decoders are the surfaces the rail exposes to **attacker-controlled carrier
@@ -520,6 +546,7 @@ memory.
 | **executes under WASI, fail-closed end-to-end** | gate 4 WASI smoke — `ddrm-chain-smoke.sh` under wasmtime (added to the standing gate Day 40; skips clean w/o wasmtime) |
 | encrypt↔decrypt seam over real shapes (single/multi/subsample) | gate 3 seam — all 3 `*_round_trip_golden` run by name (3 passed) |
 | real ML-DSA-65 verified through the rail entrypoint | gate 3 — `rail-shim-mldsa` rung (54) + committed `rail_carrier_pq_mldsa.json` |
+| hybrid ECDSA+ML-DSA verifier (both Q2 answers pre-proven) | gate 3 — `pq-mldsa-hybrid` rung (37) |
 | fail-closed + panic-free under adversarial input | gate 3 — `harden` rung (65) |
 
 **Orphan / dead-surface sweep:** all **13** committed golden vectors in
@@ -541,9 +568,11 @@ Three sharpened sub-questions remain for Anders:
 1. Does the **dKMS seal directly** to the decrypt session key (key-provider as a
    pure broker that never holds a raw CEK), or is a key-provider **re-seal** ok?
 2. Signature during transition: straight to **ml-dsa-65**, or a **hybrid**
-   (ECDSA + ml-dsa) while PC2's classical path is migrated? *(The real ML-DSA-65
-   verifier is now built + WASI-verified behind `pq-mldsa` and drops into the
-   `CekSealVerifier` slot — this is purely a policy choice now, not a build gap.)*
+   (ECDSA + ml-dsa) while PC2's classical path is migrated? *(BOTH answers are now
+   built + WASI-verified and drop into the `CekSealVerifier` slot: straight ML-DSA-65
+   behind `pq-mldsa`/`rail-shim-mldsa`, and the hybrid ECDSA-P256+ML-DSA-65
+   `HybridVerifier` behind `pq-mldsa-hybrid` (Day 41). Purely a policy choice now, not
+   a build gap — `OpenSession` constructs whichever verifier is selected.)*
 3. Does the provider-invocation rail expose an in-capsule `carrier_invoke` client
    a microvm provider may use today, or is that still landing?
 
