@@ -34,15 +34,15 @@ const assert = (condition, message) => {
   }
 };
 
-const walletIndex = read("capsules/wallet/index.html");
-const walletPreferences = read("capsules/wallet/wallet-preferences.js");
-const walletFormat = read("capsules/wallet/wallet-format.js");
+const walletIndex = read("capsules/wallet/browser/index.html");
+const walletPreferences = read("capsules/wallet/browser/wallet-preferences.js");
+const walletFormat = read("capsules/wallet/browser/wallet-format.js");
 const browserSources = [
-  "capsules/browser/index.html",
-  "capsules/browser/browser.js",
-  "capsules/browser/browser-runtime-api.js",
-  "capsules/browser/browser-webrtc.js",
-  "capsules/browser/browser-remote-display.js",
+  "capsules/browser/browser/index.html",
+  "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-runtime-api.js",
+  "capsules/browser/browser/browser-webrtc.js",
+  "capsules/browser/browser/browser-remote-display.js",
 ].map(read).join("\n");
 
 assert(

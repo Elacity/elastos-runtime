@@ -6,7 +6,6 @@ use serde::Serialize;
 use super::*;
 
 const CAPSULE_CATALOG_SCHEMA: &str = "elastos.capsules.catalog/v1";
-const FIRST_PARTY_SOURCE_REPOSITORY: &str = "https://github.com/Elacity/elastos-runtime";
 
 pub(super) async fn capsule_catalog(
     State(state): State<GatewayState>,
@@ -79,12 +78,12 @@ pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCata
         counts,
         capsules,
         policy: CapsuleCatalogPolicy {
-            install_state: "signed-cid-install-pending".to_string(),
-            install_note: "Marketplace can launch installed capsules now. Remote install must verify signed CID manifests and provider policy before enabling one-click install.".to_string(),
+            install_state: "signed-app-install-pending".to_string(),
+            install_note: "Marketplace can open installed apps now. Installing new apps will require verified app signatures, receipts, and provider policy.".to_string(),
             payment_state: "provider-rail-required".to_string(),
-            payment_note: "Paid capsules and services must use wallet/payment provider receipts, not embedded payment SDKs.".to_string(),
+            payment_note: "Paid apps and services must use wallet/payment provider receipts, not embedded payment SDKs.".to_string(),
             drm_state: "provider-rail-required".to_string(),
-            drm_note: "Protected capsules and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
+            drm_note: "Protected apps and content must use rights, key, and decrypt providers for dDRM enforcement.".to_string(),
         },
     }
 }
@@ -108,9 +107,9 @@ fn catalog_capsule_summary(
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty())
     {
-        "signed"
+        "manifest-signature-declared"
     } else {
-        "unsigned-local"
+        "no-manifest-signature"
     };
     let cid = component
         .and_then(|entry| entry.cid.as_deref())
@@ -166,12 +165,8 @@ fn catalog_capsule_summary(
         .to_string(),
         install_path: component.and_then(|entry| entry.install_path.clone()),
         release_path: component.and_then(|entry| entry.release_path.clone()),
-        repository: component
-            .and_then(|entry| entry.repository.clone())
-            .or_else(|| Some(FIRST_PARTY_SOURCE_REPOSITORY.to_string())),
-        source_path: component
-            .and_then(|entry| entry.source_path.clone())
-            .or_else(|| Some(format!("capsules/{name}"))),
+        repository: component.and_then(|entry| entry.repository.clone()),
+        source_path: component.and_then(|entry| entry.source_path.clone()),
     }
 }
 
@@ -212,8 +207,8 @@ fn capsule_category_order(category: &str) -> u8 {
 
 fn capsule_trust_state(signature_state: &str, cid_state: &str) -> &'static str {
     match (signature_state, cid_state) {
-        ("signed", "cid-published") => "signed-cid",
-        ("signed", _) => "signed-local",
+        ("manifest-signature-declared", "cid-published") => "cid-with-manifest-signature",
+        ("manifest-signature-declared", _) => "local-manifest-signature",
         (_, "cid-published") => "cid-without-manifest-signature",
         _ => "local-dev",
     }
@@ -427,6 +422,11 @@ mod tests {
     fn write_capsule(data_dir: &std::path::Path, name: &str, role: &str, capsule_type: &str) {
         let dir = data_dir.join("capsules").join(name);
         fs::create_dir_all(&dir).unwrap();
+        let entrypoint = match capsule_type {
+            "wasm" => format!("{name}.wasm"),
+            "microvm" => "rootfs.ext4".to_string(),
+            _ => "index.html".to_string(),
+        };
         fs::write(
             dir.join("capsule.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -437,20 +437,26 @@ mod tests {
                 "author": "elastos",
                 "role": role,
                 "type": capsule_type,
-                "entrypoint": "index.html",
+                "entrypoint": entrypoint,
                 "signature": "test-signature"
             }))
             .unwrap(),
         )
         .unwrap();
-        fs::write(dir.join("index.html"), "<!doctype html>").unwrap();
+        if capsule_type == "wasm" {
+            fs::write(dir.join(format!("{name}.wasm")), b"\0asm").unwrap();
+            fs::create_dir_all(dir.join("browser")).unwrap();
+            fs::write(dir.join("browser/index.html"), "<!doctype html>").unwrap();
+        } else {
+            fs::write(dir.join("index.html"), "<!doctype html>").unwrap();
+        }
     }
 
     #[test]
     fn capsule_catalog_lists_roles_and_launchable_capsules() {
         let data_dir = tempfile::tempdir().unwrap();
-        write_capsule(data_dir.path(), "marketplace", "app", "data");
-        write_capsule(data_dir.path(), "documents", "viewer", "data");
+        write_capsule(data_dir.path(), "marketplace", "app", "wasm");
+        write_capsule(data_dir.path(), "documents", "viewer", "wasm");
         write_capsule(data_dir.path(), "object-provider", "provider", "microvm");
 
         let catalog = capsule_catalog_summary(data_dir.path());
@@ -466,20 +472,14 @@ mod tests {
             .find(|capsule| capsule.name == "marketplace")
             .unwrap();
         assert!(marketplace.launchable);
-        assert_eq!(marketplace.trust_state, "signed-local");
+        assert_eq!(marketplace.trust_state, "local-manifest-signature");
         let provider = catalog
             .capsules
             .iter()
             .find(|capsule| capsule.name == "object-provider")
             .unwrap();
         assert!(!provider.launchable);
-        assert_eq!(
-            provider.repository.as_deref(),
-            Some(FIRST_PARTY_SOURCE_REPOSITORY)
-        );
-        assert_eq!(
-            provider.source_path.as_deref(),
-            Some("capsules/object-provider")
-        );
+        assert!(provider.repository.is_none());
+        assert!(provider.source_path.is_none());
     }
 }

@@ -4,22 +4,22 @@ import vm from "node:vm";
 
 const repoRoot = new URL("../", import.meta.url);
 const browserSource = [
-  "capsules/browser/browser.js",
-  "capsules/browser/browser-clipboard.js",
-  "capsules/browser/browser-history.js",
-  "capsules/browser/browser-input-surface.js",
-  "capsules/browser/browser-input.js",
-  "capsules/browser/browser-location.js",
-  "capsules/browser/browser-remote-display.js",
-  "capsules/browser/browser-runtime-api.js",
-  "capsules/browser/browser-status.js",
-  "capsules/browser/browser-webrtc.js",
+  "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-clipboard.js",
+  "capsules/browser/browser/browser-history.js",
+  "capsules/browser/browser/browser-input-surface.js",
+  "capsules/browser/browser/browser-input.js",
+  "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-remote-display.js",
+  "capsules/browser/browser/browser-runtime-api.js",
+  "capsules/browser/browser/browser-status.js",
+  "capsules/browser/browser/browser-webrtc.js",
   "scripts/browser-selkies-control-service.mjs",
 ]
   .map((path) => fs.readFileSync(new URL(path, repoRoot), "utf8"))
   .join("\n");
 const browserStyle = fs.readFileSync(
-  new URL("capsules/browser/style.css", repoRoot),
+  new URL("capsules/browser/browser/style.css", repoRoot),
   "utf8",
 );
 const homeShellWindowsSource = fs.readFileSync(

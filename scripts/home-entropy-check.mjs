@@ -567,63 +567,63 @@ const activeUiFiles = [
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
   "capsules/system/browser/style.css",
-  "capsules/wallet-metamask/index.html",
-  "capsules/wallet-metamask/wallet-metamask.js",
-  "capsules/wallet-metamask/style.css",
-  "capsules/wallet-unisat/index.html",
-  "capsules/wallet-unisat/wallet-unisat.js",
-  "capsules/wallet-unisat/style.css",
-  "capsules/wallet/index.html",
-  "capsules/wallet/wallet.js",
-  "capsules/wallet/wallet-account-actions.js",
-  "capsules/wallet/wallet-activity.js",
-  "capsules/wallet/wallet-api.js",
-  "capsules/wallet/wallet-create-account-flow.js",
-  "capsules/wallet/wallet-flows.js",
-  "capsules/wallet/wallet-format.js",
-  "capsules/wallet/wallet-preferences.js",
-  "capsules/wallet/wallet-receive-flow.js",
-  "capsules/wallet/wallet-requests.js",
-  "capsules/wallet/wallet-render.js",
-  "capsules/wallet/wallet-state.js",
-  "capsules/wallet/style.css",
-  "capsules/browser/index.html",
-  "capsules/browser/browser.js",
-  "capsules/browser/browser-clipboard.js",
-  "capsules/browser/browser-history.js",
-  "capsules/browser/browser-input.js",
-  "capsules/browser/browser-input-surface.js",
-  "capsules/browser/browser-location.js",
-  "capsules/browser/browser-remote-display.js",
-  "capsules/browser/browser-runtime-api.js",
-  "capsules/browser/browser-status.js",
-  "capsules/browser/browser-webrtc.js",
-  "capsules/browser/style.css",
-  "capsules/documents/index.html",
-  "capsules/inbox/index.html",
-  "capsules/library/index.html",
-  "capsules/library/library.css",
-  "capsules/library/src/actions.js",
-  "capsules/library/src/api.js",
+  "capsules/wallet-metamask/browser/index.html",
+  "capsules/wallet-metamask/browser/wallet-metamask.js",
+  "capsules/wallet-metamask/browser/style.css",
+  "capsules/wallet-unisat/browser/index.html",
+  "capsules/wallet-unisat/browser/wallet-unisat.js",
+  "capsules/wallet-unisat/browser/style.css",
+  "capsules/wallet/browser/index.html",
+  "capsules/wallet/browser/wallet.js",
+  "capsules/wallet/browser/wallet-account-actions.js",
+  "capsules/wallet/browser/wallet-activity.js",
+  "capsules/wallet/browser/wallet-api.js",
+  "capsules/wallet/browser/wallet-create-account-flow.js",
+  "capsules/wallet/browser/wallet-flows.js",
+  "capsules/wallet/browser/wallet-format.js",
+  "capsules/wallet/browser/wallet-preferences.js",
+  "capsules/wallet/browser/wallet-receive-flow.js",
+  "capsules/wallet/browser/wallet-requests.js",
+  "capsules/wallet/browser/wallet-render.js",
+  "capsules/wallet/browser/wallet-state.js",
+  "capsules/wallet/browser/style.css",
+  "capsules/browser/browser/index.html",
+  "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-clipboard.js",
+  "capsules/browser/browser/browser-history.js",
+  "capsules/browser/browser/browser-input.js",
+  "capsules/browser/browser/browser-input-surface.js",
+  "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-remote-display.js",
+  "capsules/browser/browser/browser-runtime-api.js",
+  "capsules/browser/browser/browser-status.js",
+  "capsules/browser/browser/browser-webrtc.js",
+  "capsules/browser/browser/style.css",
+  "capsules/documents/browser/index.html",
+  "capsules/inbox/browser/index.html",
+  "capsules/library/browser/index.html",
+  "capsules/library/browser/library.css",
+  "capsules/library/browser/src/actions.js",
+  "capsules/library/browser/src/api.js",
   "capsules/chat-room/browser/index.html",
   "capsules/chat-room/browser/style.css",
-  "capsules/gba-emulator/index.html",
-  "capsules/gba-emulator/style.css",
-  "capsules/gba-emulator/emulator.js",
+  "capsules/gba-emulator/browser/index.html",
+  "capsules/gba-emulator/browser/style.css",
+  "capsules/gba-emulator/browser/emulator.js",
 ];
 
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
   "capsules/system/browser/index.html",
-  "capsules/wallet-metamask/index.html",
-  "capsules/wallet-unisat/index.html",
-  "capsules/wallet/index.html",
-  "capsules/browser/index.html",
-  "capsules/documents/index.html",
-  "capsules/inbox/index.html",
-  "capsules/library/index.html",
+  "capsules/wallet-metamask/browser/index.html",
+  "capsules/wallet-unisat/browser/index.html",
+  "capsules/wallet/browser/index.html",
+  "capsules/browser/browser/index.html",
+  "capsules/documents/browser/index.html",
+  "capsules/inbox/browser/index.html",
+  "capsules/library/browser/index.html",
   "capsules/chat-room/browser/index.html",
-  "capsules/gba-emulator/index.html",
+  "capsules/gba-emulator/browser/index.html",
 ];
 
 const staleCopy = [
@@ -655,10 +655,10 @@ for (const file of activeHtmlFiles) {
 
 const lightTokenFiles = [
   "capsules/chat-room/browser/style.css",
-  "capsules/gba-emulator/style.css",
+  "capsules/gba-emulator/browser/style.css",
   "capsules/system/browser/style.css",
-  "capsules/documents/index.html",
-  "capsules/inbox/index.html",
+  "capsules/documents/browser/index.html",
+  "capsules/inbox/browser/index.html",
 ];
 
 const lightTokens = new Map([
@@ -686,7 +686,7 @@ for (const file of lightTokenFiles) {
   }
 }
 
-const libraryStyle = read("capsules/library/library.css");
+const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
   ["--bg", "#f6f7f9"],
   ["--sidebar-bg", "#f0f1f4"],
@@ -698,7 +698,7 @@ for (const [token, value] of new Map([
   ["--brand", "#f6921a"],
   ["--accent", "#007aff"],
 ])) {
-  assertToken(libraryStyle, "capsules/library/library.css", token, value);
+  assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
 
 const shellStyle = read("capsules/home/browser/style.css");
@@ -814,7 +814,7 @@ const archivePolicyDoc = read("docs/ARCHIVE_POLICY.md");
 const documentsProvider = read(
   "elastos/crates/elastos-server/src/documents.rs",
 );
-const documentsReadme = read("capsules/documents/README.md");
+const documentsReadme = read("capsules/documents/browser/README.md");
 const authContract = read("elastos/crates/elastos-auth/src/lib.rs");
 const webauthnIdentity = read(
   "elastos/crates/elastos-identity/src/webauthn.rs",
@@ -1045,7 +1045,7 @@ const gatewayBrowserRouteTests = read(
 );
 const debugPolicy = read("DEBUG.md");
 const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260607d";
+const homeAssetVersion = "home-20260607e";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1364,6 +1364,12 @@ assert(
 assert(
   shellJs.includes('library: new Set(["archive-manager", "chat-room"])'),
   "Home must allow Library picker results to return only to Archive and Chat Room",
+);
+assert(
+  shellJs.includes('marketplace: "runtime-target"') &&
+    shellJs.includes('if (policy === "runtime-target")') &&
+    shellJs.includes("return target !== SHELL_APP_ID;"),
+  "Home must allow Marketplace to open installed Runtime targets while still blocking Home self-launch",
 );
 assert(
   shellJs.includes('"home:close-self"'),
@@ -1973,12 +1979,12 @@ for (const component of [
   }
 }
 assert(
-  read("capsules/marketplace/marketplace.js").includes(
+  read("capsules/marketplace/browser/marketplace.js").includes(
     'fetch("/api/capsules/catalog"',
   ),
   "Marketplace must read the canonical capsule catalog, not an app-scoped marketplace catalog",
 );
-const marketplaceUi = read("capsules/marketplace/marketplace.js");
+const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
 assert(
   marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
     marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
@@ -1999,46 +2005,59 @@ assert(
   ),
   "Marketplace route must delegate to the canonical capsule catalog",
 );
+const marketplaceCatalogGateway = read(
+  "elastos/crates/elastos-server/src/api/gateway_capsule_catalog.rs",
+);
+assert(
+  marketplaceCatalogGateway.includes("signed-app-install-pending") &&
+    marketplaceCatalogGateway.includes("Marketplace can open installed apps now.") &&
+    !marketplaceCatalogGateway.includes("signed-cid-install-pending") &&
+    !marketplaceCatalogGateway.includes("signed CID manifests") &&
+    !marketplaceCatalogGateway.includes("launch installed capsules") &&
+    !marketplaceCatalogGateway.includes("Paid capsules") &&
+    !marketplaceCatalogGateway.includes("Protected capsules"),
+  "Marketplace catalog policy must describe install/payment/dDRM state in app-facing language",
+);
 
-const documents = read("capsules/documents/index.html");
-const archiveManager = read("capsules/archive-manager/index.html");
+const documents = read("capsules/documents/browser/index.html");
+const archiveManager = read("capsules/archive-manager/browser/index.html");
 const archiveManagerManifest = read("capsules/archive-manager/capsule.json");
-const inbox = read("capsules/inbox/index.html");
-const libraryIndex = read("capsules/library/index.html");
-const libraryCss = read("capsules/library/library.css");
-const libraryApp = read("capsules/library/src/app.js");
-const libraryActions = read("capsules/library/src/actions.js");
-const libraryApi = read("capsules/library/src/api.js");
-const libraryDialog = read("capsules/library/src/dialog.js");
-const libraryEditor = read("capsules/library/src/editor.js");
-const libraryEvents = read("capsules/library/src/events.js");
-const libraryMenu = read("capsules/library/src/menu.js");
-const libraryModel = read("capsules/library/src/model.js");
-const libraryNavigation = read("capsules/library/src/navigation.js");
-const libraryPreview = read("capsules/library/src/preview.js");
-const libraryRealtime = read("capsules/library/src/realtime.js");
-const libraryRender = read("capsules/library/src/render.js");
-const librarySelection = read("capsules/library/src/selection.js");
-const libraryState = read("capsules/library/src/state.js");
-const libraryUploads = read("capsules/library/src/uploads.js");
+const inbox = read("capsules/inbox/browser/index.html");
+const libraryIndex = read("capsules/library/browser/index.html");
+const libraryCss = read("capsules/library/browser/library.css");
+const libraryApp = read("capsules/library/browser/src/app.js");
+const libraryActions = read("capsules/library/browser/src/actions.js");
+const libraryApi = read("capsules/library/browser/src/api.js");
+const libraryDialog = read("capsules/library/browser/src/dialog.js");
+const libraryEditor = read("capsules/library/browser/src/editor.js");
+const libraryEvents = read("capsules/library/browser/src/events.js");
+const libraryMenu = read("capsules/library/browser/src/menu.js");
+const libraryModel = read("capsules/library/browser/src/model.js");
+const libraryNavigation = read("capsules/library/browser/src/navigation.js");
+const libraryPreview = read("capsules/library/browser/src/preview.js");
+const libraryRealtime = read("capsules/library/browser/src/realtime.js");
+const libraryRender = read("capsules/library/browser/src/render.js");
+const librarySelection = read("capsules/library/browser/src/selection.js");
+const libraryState = read("capsules/library/browser/src/state.js");
+const libraryUploads = read("capsules/library/browser/src/uploads.js");
 const library = readAll([
-  "capsules/library/index.html",
-  "capsules/library/library.css",
-  "capsules/library/src/app.js",
-  "capsules/library/src/actions.js",
-  "capsules/library/src/api.js",
-  "capsules/library/src/dialog.js",
-  "capsules/library/src/editor.js",
-  "capsules/library/src/events.js",
-  "capsules/library/src/menu.js",
-  "capsules/library/src/model.js",
-  "capsules/library/src/navigation.js",
-  "capsules/library/src/preview.js",
-  "capsules/library/src/realtime.js",
-  "capsules/library/src/render.js",
-  "capsules/library/src/selection.js",
-  "capsules/library/src/state.js",
-  "capsules/library/src/uploads.js",
+  "capsules/library/browser/index.html",
+  "capsules/library/browser/library.css",
+  "capsules/library/browser/src/app.js",
+  "capsules/library/browser/src/actions.js",
+  "capsules/library/browser/src/api.js",
+  "capsules/library/browser/src/dialog.js",
+  "capsules/library/browser/src/editor.js",
+  "capsules/library/browser/src/events.js",
+  "capsules/library/browser/src/menu.js",
+  "capsules/library/browser/src/model.js",
+  "capsules/library/browser/src/navigation.js",
+  "capsules/library/browser/src/preview.js",
+  "capsules/library/browser/src/realtime.js",
+  "capsules/library/browser/src/render.js",
+  "capsules/library/browser/src/selection.js",
+  "capsules/library/browser/src/state.js",
+  "capsules/library/browser/src/uploads.js",
 ]);
 const objectProviderManifest = read("capsules/object-provider/capsule.json");
 const objectProviderImpl = read("elastos/crates/elastos-server/src/library.rs");
@@ -2060,54 +2079,54 @@ const webspaceProvider = read("capsules/webspace-provider/src/main.rs");
 const webspaceCmd = read("elastos/crates/elastos-server/src/webspace_cmd.rs");
 const serverMain = read("elastos/crates/elastos-server/src/main.rs");
 const providerRegistry = read("elastos/crates/elastos-runtime/src/provider/registry.rs");
-const libraryDesktopIcon = read("capsules/library/icons/sidebar-folder-desktop.svg");
+const libraryDesktopIcon = read("capsules/library/browser/icons/sidebar-folder-desktop.svg");
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
 const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
 const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
 const namespacesDoc = read("docs/NAMESPACES.md");
 const chatStyle = read("capsules/chat-room/browser/style.css");
-const gba = read("capsules/gba-emulator/index.html");
-const gbaStyle = read("capsules/gba-emulator/style.css");
-const gbaJs = read("capsules/gba-emulator/emulator.js");
+const gba = read("capsules/gba-emulator/browser/index.html");
+const gbaStyle = read("capsules/gba-emulator/browser/style.css");
+const gbaJs = read("capsules/gba-emulator/browser/emulator.js");
 const system = read("capsules/system/browser/index.html");
 const systemJs = read("capsules/system/browser/system.js");
 const systemStyle = read("capsules/system/browser/style.css");
-const walletMetamask = read("capsules/wallet-metamask/index.html");
-const walletMetamaskJs = read("capsules/wallet-metamask/wallet-metamask.js");
-const walletUnisat = read("capsules/wallet-unisat/index.html");
-const walletUnisatJs = read("capsules/wallet-unisat/wallet-unisat.js");
-const wallet = read("capsules/wallet/index.html");
+const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
+const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
+const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
+const walletUnisatJs = read("capsules/wallet-unisat/browser/wallet-unisat.js");
+const wallet = read("capsules/wallet/browser/index.html");
 const walletJs = readAll([
-  "capsules/wallet/wallet.js",
-  "capsules/wallet/wallet-account-actions.js",
-  "capsules/wallet/wallet-activity.js",
-  "capsules/wallet/wallet-api.js",
-  "capsules/wallet/wallet-create-account-flow.js",
-  "capsules/wallet/wallet-flows.js",
-  "capsules/wallet/wallet-format.js",
-  "capsules/wallet/wallet-preferences.js",
-  "capsules/wallet/wallet-receive-flow.js",
-  "capsules/wallet/wallet-requests.js",
-  "capsules/wallet/wallet-render.js",
-  "capsules/wallet/wallet-send-flow.js",
-  "capsules/wallet/wallet-state.js",
+  "capsules/wallet/browser/wallet.js",
+  "capsules/wallet/browser/wallet-account-actions.js",
+  "capsules/wallet/browser/wallet-activity.js",
+  "capsules/wallet/browser/wallet-api.js",
+  "capsules/wallet/browser/wallet-create-account-flow.js",
+  "capsules/wallet/browser/wallet-flows.js",
+  "capsules/wallet/browser/wallet-format.js",
+  "capsules/wallet/browser/wallet-preferences.js",
+  "capsules/wallet/browser/wallet-receive-flow.js",
+  "capsules/wallet/browser/wallet-requests.js",
+  "capsules/wallet/browser/wallet-render.js",
+  "capsules/wallet/browser/wallet-send-flow.js",
+  "capsules/wallet/browser/wallet-state.js",
 ]);
-const walletStyle = read("capsules/wallet/style.css");
+const walletStyle = read("capsules/wallet/browser/style.css");
 const browserManifest = read("capsules/browser/capsule.json");
-const browser = read("capsules/browser/index.html");
+const browser = read("capsules/browser/browser/index.html");
 const browserJs = readAll([
-  "capsules/browser/browser.js",
-  "capsules/browser/browser-clipboard.js",
-  "capsules/browser/browser-history.js",
-  "capsules/browser/browser-input.js",
-  "capsules/browser/browser-input-surface.js",
-  "capsules/browser/browser-location.js",
-  "capsules/browser/browser-remote-display.js",
-  "capsules/browser/browser-runtime-api.js",
-  "capsules/browser/browser-status.js",
-  "capsules/browser/browser-webrtc.js",
+  "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-clipboard.js",
+  "capsules/browser/browser/browser-history.js",
+  "capsules/browser/browser/browser-input.js",
+  "capsules/browser/browser/browser-input-surface.js",
+  "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-remote-display.js",
+  "capsules/browser/browser/browser-runtime-api.js",
+  "capsules/browser/browser/browser-status.js",
+  "capsules/browser/browser/browser-webrtc.js",
 ]);
-const browserStyle = read("capsules/browser/style.css");
+const browserStyle = read("capsules/browser/browser/style.css");
 assert(
   browserJs.includes(
     "window.__elastosBrowserReleaseRuntimePage = releaseRuntimePageForUnload",
@@ -2120,9 +2139,9 @@ assert(
     ),
   "Browser must expose only its same-origin hosted-page release hook/current page id to Home and the gateway must route close_page so iframe teardown can release singleton providers",
 );
-const walletWalletconnect = read("capsules/wallet-walletconnect/index.html");
+const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.html");
 const walletWalletconnectJs = read(
-  "capsules/wallet-walletconnect/wallet-walletconnect.js",
+  "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
 );
 const homeSmoke = read("scripts/home-camofox-smoke.mjs");
 const systemSmoke = read("scripts/system-camofox-smoke.mjs");
@@ -3951,8 +3970,8 @@ assert(
     ) &&
     !shellJs.includes("wallet-walletconnect") &&
     !systemJs.includes("wallet-walletconnect") &&
-    !read("components.json").includes('"wallet-walletconnect"'),
-  "WalletConnect must remain invisible and fail-closed until its SDK/configuration are pinned and tested",
+    read("components.json").includes('"wallet-walletconnect"'),
+  "WalletConnect must be installable as a capsule while its SDK/configuration stay fail-closed until pinned and tested",
 );
 assert(
   walletWalletconnect.includes('id="wallet-connect"') &&

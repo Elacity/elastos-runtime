@@ -511,14 +511,8 @@ build_packaged_capsule_archive() {
     [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
 
     case "$capsule_name" in
-        documents|library|marketplace|inbox)
-            required_files=(capsule.json index.html)
-            ;;
         chat-wasm)
             required_files=(chat-stdio.wasm)
-            ;;
-        gba-emulator)
-            required_files=(index.html emulator.js favicon.svg mgba.js mgba.wasm style.css)
             ;;
         gba-ucity)
             required_files=(ucity.gba)
@@ -719,7 +713,7 @@ build_platform_independent_direct_assets() {
     mkdir -p "$stage_dir"
     updates_json='{}'
 
-    for capsule in documents library marketplace inbox chat-wasm gba-emulator gba-ucity; do
+    for capsule in chat-wasm gba-ucity; do
         archive=$(build_packaged_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
@@ -734,7 +728,21 @@ build_platform_independent_direct_assets() {
     cp "$home_cli_archive" "$home_cli_staged"
     updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
 
-    for capsule in home system chat-room; do
+    for capsule in \
+        home \
+        system \
+        browser \
+        documents \
+        gba-emulator \
+        inbox \
+        library \
+        marketplace \
+        wallet \
+        wallet-metamask \
+        wallet-unisat \
+        wallet-walletconnect \
+        chat-room
+    do
         archive=$(build_browser_wasm_capsule_archive "$platform" "$capsule")
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
@@ -906,8 +914,26 @@ else
                 warn "No Cargo.toml for ${capsule}; skipping explicit build step"
                 continue
             fi
-            info "  Building ${capsule}..."
-            (cd "$capsule_dir" && cargo build --release 2>&1)
+            capsule_type="$(python3 - "$capsule_dir/capsule.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("")
+else:
+    print(json.loads(path.read_text(encoding="utf-8")).get("type", ""))
+PY
+)"
+            if [[ "$capsule_type" == "wasm" ]]; then
+                info "  Building ${capsule} (wasm32-wasip1)..."
+                ensure_rust_target_installed "wasm32-wasip1"
+                (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release 2>&1)
+            else
+                info "  Building ${capsule}..."
+                (cd "$capsule_dir" && cargo build --release 2>&1)
+            fi
         done
     fi
 fi

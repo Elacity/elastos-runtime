@@ -331,7 +331,7 @@ check_required 'BROWSER_RUNTIME_STREAM_TMP_DIR' elastos/crates/elastos-server/sr
 check_required 'test_browser_open_runtime_stream_socket_accepts_and_closes_fail_closed' elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs 'Browser open must test fail-closed Runtime stream socket attach'
 check_required 'test_browser_open_runtime_stream_relays_to_exit_ipc_without_host_network' elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs 'Browser open must test local Runtime-to-Exit relay without raw host networking'
 check_required 'browser\["attach_kind"\], "iframe"' elastos/crates/elastos-server/src/api/gateway_tests 'Home must open Browser as an ElastOS window, not a host tab'
-check_required '/api/apps/browser/open' capsules/browser/browser.js 'Browser UI must call the high-level Browser open route'
+check_required '/api/apps/browser/open' capsules/browser/browser/browser.js 'Browser UI must call the high-level Browser open route'
 check_required '/api/auth/sessions/refresh' elastos/crates/elastos-server/src/api/gateway.rs 'browser gateway must expose proof-bound session refresh through runtime auth'
 check_required 'invalid WebAuthn Origin header' elastos/crates/elastos-server/src/api/handlers/identity.rs 'WebAuthn RP derivation must fail closed on malformed browser origins'
 if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' capsules \

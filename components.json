@@ -100,6 +100,15 @@
         "aarch64-linux"
       ]
     },
+    "wallet-walletconnect": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "any"
+      ],
+      "note": "WASM capsule (wasm32-wasip1) - platform-independent, runs via runtime bridge"
+    },
     "content-block-graph-provider": {
       "cid": "",
       "sha256": "",
@@ -671,6 +680,20 @@
         }
       }
     },
+    "wallet-walletconnect": {
+      "install_path": "capsules/wallet-walletconnect",
+      "description": "Optional WalletConnect approval-method connector capsule",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet-walletconnect.tar.gz",
+          "extract_path": "wallet-walletconnect",
+          "install_path": "capsules/wallet-walletconnect"
+        }
+      }
+    },
     "wallet": {
       "install_path": "capsules/wallet",
       "description": "Wallet accounts, balances, approvals, and approval methods",
@@ -1053,6 +1076,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "object-provider",
         "content-block-graph-provider",
@@ -1082,6 +1106,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "object-provider",
         "content-block-graph-provider",
@@ -1154,6 +1179,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "object-provider",
         "content-block-graph-provider",
@@ -1189,6 +1215,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "object-provider",
         "content-block-graph-provider",
@@ -1232,6 +1259,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "browser",
         "chat",

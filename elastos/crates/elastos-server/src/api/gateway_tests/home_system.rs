@@ -1838,6 +1838,65 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
 }
 
 #[tokio::test]
+async fn test_home_launch_materializes_source_wasm_capsule_before_runtime_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        MARKETPLACE_CAPSULE_ID,
+        "app",
+        "Marketplace test capsule",
+        None,
+    );
+    let marketplace_dir = dir.path().join("capsules").join(MARKETPLACE_CAPSULE_ID);
+    let built_wasm = marketplace_dir
+        .join("target")
+        .join("wasm32-wasip1")
+        .join("release")
+        .join("marketplace.wasm");
+    std::fs::create_dir_all(built_wasm.parent().unwrap()).unwrap();
+    std::fs::write(&built_wasm, b"\0asm").unwrap();
+    assert!(!marketplace_dir.join("marketplace.wasm").exists());
+
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let runtime = start_fake_runtime(dir.path(), bus, "marketplace-peer").await;
+    let app = gateway_router(test_state(dir.path()));
+
+    let launch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"marketplace"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(launch.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["launch_status"], "launched");
+
+    let launch_requests = runtime.launch_requests.lock().await;
+    let launch_path = launch_requests
+        .last()
+        .and_then(|request| request["path"].as_str())
+        .expect("runtime launch path");
+    assert!(launch_path.ends_with("/dev-capsules/marketplace"));
+    let launch_bundle = std::path::Path::new(launch_path);
+    assert!(launch_bundle.join("capsule.json").is_file());
+    assert!(launch_bundle.join("marketplace.wasm").is_file());
+    assert!(
+        !marketplace_dir.join("marketplace.wasm").exists(),
+        "source tree should not be dirtied with generated wasm"
+    );
+}
+
+#[tokio::test]
 async fn test_home_launch_reports_system_launch_failure_when_runtime_cannot_start() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));

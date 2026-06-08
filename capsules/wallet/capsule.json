@@ -5,8 +5,8 @@
   "description": "View Wallet accounts, balances, approvals, and approval methods",
   "author": "elastos",
   "role": "app",
-  "type": "data",
-  "entrypoint": "index.html",
+  "type": "wasm",
+  "entrypoint": "wallet.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false

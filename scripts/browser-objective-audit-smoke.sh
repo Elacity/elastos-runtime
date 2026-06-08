@@ -139,7 +139,7 @@ node -e '
     process.exit(1);
   }
   const browserUiAudioCriterion = audit.criteria.find((item) => item.id === "browser_ui_audio_unlock_path");
-  if (!browserUiAudioCriterion || browserUiAudioCriterion.ok !== true || !browserUiAudioCriterion.evidence?.includes("capsules/browser/browser.js")) {
+  if (!browserUiAudioCriterion || browserUiAudioCriterion.ok !== true || !browserUiAudioCriterion.evidence?.includes("capsules/browser/browser/browser.js")) {
     console.error("browser_ui_audio_unlock_path criterion must pass and cite Browser UI source");
     process.exit(1);
   }

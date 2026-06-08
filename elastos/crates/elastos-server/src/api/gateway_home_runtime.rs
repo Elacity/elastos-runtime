@@ -213,6 +213,18 @@ async fn launch_runtime_backed_home_target(
         return None;
     }
 
+    let runtime_capsule_dir =
+        match materialize_source_wasm_capsule_for_runtime(data_dir, &capsule_dir, &manifest) {
+            Ok(path) => path,
+            Err(err) => {
+                return Some(GatewayRuntimeLaunchOutcome {
+                    status: "failed".to_string(),
+                    capsule_id: None,
+                    detail: Some(err.to_string()),
+                });
+            }
+        };
+
     if let Err(err) = crate::runtime_control::ensure_runtime_for_home(data_dir).await {
         return Some(GatewayRuntimeLaunchOutcome {
             status: "failed".to_string(),
@@ -222,7 +234,8 @@ async fn launch_runtime_backed_home_target(
     }
 
     Some(
-        match launch_runtime_capsule(data_dir, &capsule_dir, &manifest.name, context).await {
+        match launch_runtime_capsule(data_dir, &runtime_capsule_dir, &manifest.name, context).await
+        {
             Ok(outcome) => outcome,
             Err(err) => GatewayRuntimeLaunchOutcome {
                 status: "failed".to_string(),
@@ -231,6 +244,35 @@ async fn launch_runtime_backed_home_target(
             },
         },
     )
+}
+
+fn materialize_source_wasm_capsule_for_runtime(
+    data_dir: &FsPath,
+    capsule_dir: &FsPath,
+    manifest: &elastos_common::CapsuleManifest,
+) -> anyhow::Result<PathBuf> {
+    let entrypoint = capsule_dir.join(&manifest.entrypoint);
+    if entrypoint.is_file() || manifest.capsule_type != CapsuleType::Wasm {
+        return Ok(capsule_dir.to_path_buf());
+    }
+
+    let built_entrypoint = capsule_dir
+        .join("target")
+        .join("wasm32-wasip1")
+        .join("release")
+        .join(&manifest.entrypoint);
+    if !built_entrypoint.is_file() {
+        return Ok(capsule_dir.to_path_buf());
+    }
+
+    let bundle_dir = data_dir.join("dev-capsules").join(&manifest.name);
+    std::fs::create_dir_all(&bundle_dir)?;
+    std::fs::copy(
+        capsule_dir.join("capsule.json"),
+        bundle_dir.join("capsule.json"),
+    )?;
+    std::fs::copy(&built_entrypoint, bundle_dir.join(&manifest.entrypoint))?;
+    Ok(bundle_dir)
 }
 
 async fn launch_runtime_capsule(

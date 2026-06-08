@@ -321,14 +321,14 @@ async function runConnectorSmoke({ connectorId, scriptPath, installProvider }) {
 const results = [];
 results.push(await runConnectorSmoke({
   connectorId: "wallet-metamask",
-  scriptPath: "capsules/wallet-metamask/wallet-metamask.js",
+  scriptPath: "capsules/wallet-metamask/browser/wallet-metamask.js",
   installProvider(windowObject, provider) {
     windowObject.ethereum = provider;
   },
 }));
 results.push(await runConnectorSmoke({
   connectorId: "wallet-walletconnect",
-  scriptPath: "capsules/wallet-walletconnect/wallet-walletconnect.js",
+  scriptPath: "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
   installProvider() {},
 }));
 

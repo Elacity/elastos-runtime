@@ -783,14 +783,14 @@ async fn setup_server_infrastructure_impl(
                     tracing::warn!("Failed to register Carrier gossip provider: {}", e);
                 }
                 if !external_availability_registered {
-                    let availability_provider: Arc<dyn provider::Provider> = Arc::new(
-                        elastos_server::carrier::CarrierAvailabilityProvider::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
+                    let availability_provider: Arc<dyn provider::Provider> =
+                        Arc::new(
+                            elastos_server::carrier::CarrierAvailabilityProvider::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
                             carrier_node.gossip_state.clone(),
                             Arc::downgrade(&provider_registry),
                             data_dir.clone(),
                             carrier_peer_attestation_exchange_config_from_env(),
-                        ),
-                    );
+                        ));
                     if let Err(e) = provider_registry
                         .register_sub_provider("availability", availability_provider)
                         .await

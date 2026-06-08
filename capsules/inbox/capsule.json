@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "description": "Review requests",
   "role": "app",
-  "type": "data",
+  "type": "wasm",
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "inbox.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false

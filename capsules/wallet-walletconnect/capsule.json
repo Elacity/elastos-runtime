@@ -5,8 +5,8 @@
   "description": "Connect WalletConnect as an optional approval method",
   "author": "elastos",
   "role": "app",
-  "type": "data",
-  "entrypoint": "index.html",
+  "type": "wasm",
+  "entrypoint": "wallet-walletconnect.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false

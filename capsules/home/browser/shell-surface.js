@@ -40,7 +40,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260607d";
+} from "./shell-core.js?v=home-20260607e";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -54,7 +54,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260607d";
+} from "./shell-windows.js?v=home-20260607e";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

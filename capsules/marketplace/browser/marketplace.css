@@ -68,7 +68,7 @@ button {
   display: none !important;
 }
 
-.app-center-container {
+.marketplace-container {
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -1062,7 +1062,7 @@ button {
     overflow: auto;
   }
 
-  .app-center-container {
+  .marketplace-container {
     min-height: 100vh;
     height: auto;
   }

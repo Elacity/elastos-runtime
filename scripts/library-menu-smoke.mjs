@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import http from "node:http";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -8,8 +8,14 @@ import { createRequire } from "node:module";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
 
-const capsuleRoot = path.resolve("capsules/library");
-const archiveManagerRoot = path.resolve("capsules/archive-manager");
+function browserAssetRoot(capsuleName) {
+  const capsuleRoot = path.resolve("capsules", capsuleName);
+  const browserRoot = path.join(capsuleRoot, "browser");
+  return existsSync(browserRoot) ? browserRoot : capsuleRoot;
+}
+
+const capsuleRoot = browserAssetRoot("library");
+const archiveManagerRoot = browserAssetRoot("archive-manager");
 const token = "library-menu-smoke-token";
 const principalRoot = "localhost://Users/smoke";
 const desktopUri = `${principalRoot}/Desktop`;

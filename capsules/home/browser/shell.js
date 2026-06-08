@@ -20,12 +20,12 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260607d";
+} from "./shell-core.js?v=home-20260607e";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260607d";
+} from "./shell-chrome.js?v=home-20260607e";
 import {
   renderDesktop,
   renderTaskbar,
@@ -45,7 +45,7 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260607d";
+} from "./shell-surface.js?v=home-20260607e";
 import {
   configureWindowHooks,
   renderBootError,
@@ -56,7 +56,7 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260607d";
+} from "./shell-windows.js?v=home-20260607e";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -64,7 +64,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260607d";
+} from "./shell-auth.js?v=home-20260607e";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -88,7 +88,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "library"]),
-  marketplace: "visible-target",
+  marketplace: "runtime-target",
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
@@ -492,6 +492,9 @@ function canOpenTargetFromHomeMessage(context, target) {
   }
   if (policy === "visible-target") {
     return !!targetById(shellState.currentSummary, target) && target !== SHELL_APP_ID;
+  }
+  if (policy === "runtime-target") {
+    return target !== SHELL_APP_ID;
   }
   return policy.has(target);
 }

@@ -177,7 +177,7 @@
     return {
       id: name,
       name: capsule.title || titleCase(name),
-      developer: capsule.author || "ElastOS",
+      developer: capsule.author || "Unknown publisher",
       category,
       description: capsule.description || "App metadata available through Runtime.",
       shortDesc: shortDescription(capsule.description),
@@ -222,7 +222,8 @@
     if (name.includes("wallet") || name.includes("chain") || name.includes("block") || name.includes("nft")) {
       return "blockchain";
     }
-    if (name.includes("defi") || name.includes("swap") || name.includes("market")) {
+    if (name.includes("market")) return "marketplace";
+    if (name.includes("defi") || name.includes("swap")) {
       return "defi";
     }
     if (name.includes("player") || name.includes("viewer") || name.includes("media") || name.includes("gba") || name.includes("archive")) {
@@ -285,7 +286,7 @@
       permissions.push(...capsule.requires.map((req) => `Requires ${req.name || "app"} (${req.kind || "app"})`));
     }
     if (capsule.cid) permissions.push("Verified app identity");
-    if (capsule.trust_state) permissions.push(`Trust ${capsule.trust_state}`);
+    if (capsule.trust_state) permissions.push(`Trust ${trustLabel(capsule.trust_state)}`);
     return permissions;
   }
 
@@ -433,7 +434,7 @@
         <div class="app-card-footer">
           <div class="app-footer-left">
             <span class="app-size">${escapeHtml(app.size)}</span>
-            <span class="app-price free">${app.cid ? "Verified" : "Local"}</span>
+            <span class="app-price free">${packageLabel(app)}</span>
           </div>
           ${actionButton(app)}
         </div>
@@ -538,11 +539,36 @@
   function distributionItems(app) {
     return [
       `Source: ${app.source || "runtime"}`,
-      `Trust: ${app.trustState || "local-dev"}`,
-      `Signature: ${app.signatureState || "unknown"}`,
+      `Trust: ${trustLabel(app.trustState)}`,
+      `Signature: ${signatureLabel(app.signatureState)}`,
       `App identity: ${app.cid ? "Verified SmartWeb app" : "Local app"}`,
       app.repository ? `Repository: ${app.repository}` : "",
     ].filter(Boolean);
+  }
+
+  function packageLabel(app) {
+    if (app.trustState === "cid-with-manifest-signature") return "Verified";
+    if (app.trustState === "local-manifest-signature") return "Signed local";
+    if (app.cid) return "Verified";
+    return "Local";
+  }
+
+  function trustLabel(stateValue) {
+    const labels = {
+      "cid-with-manifest-signature": "Verified SmartWeb app",
+      "local-manifest-signature": "Signed local app",
+      "cid-without-manifest-signature": "Verification incomplete",
+      "local-dev": "Local app",
+    };
+    return labels[stateValue] || "Not declared";
+  }
+
+  function signatureLabel(stateValue) {
+    const labels = {
+      "manifest-signature-declared": "Declared in manifest",
+      "no-manifest-signature": "Not declared",
+    };
+    return labels[stateValue] || "Unknown";
   }
 
   function showInstallPending(appId) {
