@@ -16,8 +16,18 @@ serde_json = "1.0"
 aes = "0.8"
 ctr = "0.9"
 base64 = "0.22"
+# dDRM CEK-sealing envelope (P-256 ECDH unwrap, AES-256-CBC) — see src/envelope.rs.
+# Mirrors PC2 ddrm-decrypt so CEK recovery + content decryption stay colocated in
+# this provider's wasm boundary (CEK never crosses FFI).
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+elliptic-curve = { version = "0.13", default-features = false, features = ["sec1"] }
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+zeroize = "1"
 
 [dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
 
 [profile.release]
 opt-level = "s"

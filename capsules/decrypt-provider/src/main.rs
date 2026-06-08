@@ -19,6 +19,7 @@ use std::io::{self, BufRead, Write};
 // contract in a later step (see docs/convergence/CONVERGENCE_PLAYBOOK.md §6).
 #[allow(dead_code)]
 mod cenc;
+mod envelope;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
