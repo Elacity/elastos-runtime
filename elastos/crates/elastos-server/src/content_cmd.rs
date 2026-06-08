@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use elastos_runtime::provider::{
+    ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
+};
+use serde_json::{json, Value};
 
 #[derive(Subcommand)]
 pub enum ContentCommand {
@@ -30,6 +34,38 @@ pub enum ContentCommand {
         /// Link in rel=cid form; may be repeated
         #[arg(long = "link")]
         links: Vec<String>,
+    },
+
+    /// Run the Runtime-provider-only content repair worker
+    #[command(name = "repair-worker")]
+    RepairWorker {
+        /// Ignore next-check timers and retry eligible tasks immediately
+        #[arg(long)]
+        force: bool,
+
+        /// Also health-check currently healthy tasks
+        #[arg(long)]
+        include_healthy_check: bool,
+
+        /// Maximum tasks to examine in one run
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Maximum retry attempts per CID before this run skips it
+        #[arg(long)]
+        max_attempts: Option<u32>,
+
+        /// Maximum failed repairs allowed before this run throttles remaining tasks
+        #[arg(long)]
+        failure_budget: Option<u32>,
+    },
+
+    /// Print content availability, storage-accounting, and repair status
+    #[command(name = "status")]
+    Status {
+        /// Optional CID; omit for the provider-wide availability dashboard
+        #[arg(long)]
+        cid: Option<String>,
     },
 }
 
@@ -82,8 +118,107 @@ pub async fn run(cmd: ContentCommand) -> anyhow::Result<()> {
             };
             println!("{cid}");
         }
+        ContentCommand::RepairWorker {
+            force,
+            include_healthy_check,
+            limit,
+            max_attempts,
+            failure_budget,
+        } => {
+            let registry = crate::get_content_registry().await?;
+            let response = run_repair_worker_via_provider(
+                &registry,
+                repair_worker_request(
+                    force,
+                    include_healthy_check,
+                    limit,
+                    max_attempts,
+                    failure_budget,
+                ),
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        ContentCommand::Status { cid } => {
+            let registry = crate::get_content_registry().await?;
+            let response =
+                run_status_via_provider(&registry, status_request(cid.as_deref())).await?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
     }
     Ok(())
+}
+
+async fn run_status_via_provider(
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    request: Value,
+) -> anyhow::Result<Value> {
+    registry
+        .invoke_provider(ProviderInvocation {
+            source: "content-provider".to_string(),
+            target: "content".to_string(),
+            op: "status".to_string(),
+            request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("content status failed: {err}"))
+}
+
+async fn run_repair_worker_via_provider(
+    registry: &elastos_runtime::provider::ProviderRegistry,
+    request: Value,
+) -> anyhow::Result<Value> {
+    registry
+        .invoke_provider(ProviderInvocation {
+            source: "content-provider".to_string(),
+            target: "content".to_string(),
+            op: "repair_worker".to_string(),
+            request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("content repair-worker failed: {err}"))
+}
+
+fn repair_worker_request(
+    force: bool,
+    include_healthy_check: bool,
+    limit: Option<usize>,
+    max_attempts: Option<u32>,
+    failure_budget: Option<u32>,
+) -> Value {
+    let mut request = json!({
+        "op": "repair_worker",
+        "force": force,
+        "include_healthy_check": include_healthy_check,
+    });
+    if let Some(limit) = limit {
+        request["limit"] = Value::from(limit as u64);
+    }
+    if let Some(max_attempts) = max_attempts {
+        request["max_attempts"] = Value::from(u64::from(max_attempts));
+    }
+    if let Some(failure_budget) = failure_budget {
+        request["failure_budget"] = Value::from(u64::from(failure_budget));
+    }
+    request
+}
+
+fn status_request(cid: Option<&str>) -> Value {
+    let mut request = json!({
+        "op": "status",
+    });
+    if let Some(cid) = cid.filter(|value| !value.trim().is_empty()) {
+        request["cid"] = Value::String(cid.to_string());
+    }
+    request
 }
 
 async fn publish_object_dir(
@@ -206,5 +341,28 @@ mod tests {
         assert!(validate_entry_name("release.json").is_ok());
         assert!(validate_entry_name("../release.json").is_err());
         assert!(validate_entry_name("nested/release.json").is_err());
+    }
+
+    #[test]
+    fn content_command_builds_repair_worker_request() {
+        let request = repair_worker_request(true, true, Some(5), Some(2), Some(1));
+
+        assert_eq!(request["op"], "repair_worker");
+        assert_eq!(request["force"], true);
+        assert_eq!(request["include_healthy_check"], true);
+        assert_eq!(request["limit"], 5);
+        assert_eq!(request["max_attempts"], 2);
+        assert_eq!(request["failure_budget"], 1);
+    }
+
+    #[test]
+    fn content_command_builds_status_request() {
+        let dashboard = status_request(None);
+        assert_eq!(dashboard["op"], "status");
+        assert!(dashboard.get("cid").is_none());
+
+        let object = status_request(Some(TEST_CID));
+        assert_eq!(object["op"], "status");
+        assert_eq!(object["cid"], TEST_CID);
     }
 }

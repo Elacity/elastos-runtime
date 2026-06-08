@@ -7,7 +7,7 @@
 
 use elastos_common::protected_content::{
     DecryptSessionRequestV1, DECRYPT_SESSION_REQUEST_SCHEMA, PROTECTED_CONTENT_ACTIONS,
-    PROTECTED_CONTENT_OUTPUTS,
+    PROTECTED_CONTENT_OUTPUTS, RELEASE_RECEIPT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -108,6 +108,44 @@ impl DecryptProvider {
             "next_required_providers": [
                 "key-provider"
             ],
+            "contract": {
+                "schema": "elastos.protected-content.decrypt-provider/v1",
+                "authority_boundary": "viewer-scoped decrypt/render sessions only",
+                "denied_to_apps": [
+                    "raw_cek",
+                    "raw_plaintext",
+                    "filesystem",
+                    "key_backend_sdk",
+                    "kms_node_credentials",
+                    "chain_rpc",
+                    "wallet_rpc",
+                    "provider_credentials"
+                ],
+                "operations": {
+                    "open_session": {
+                        "input_schema": DECRYPT_SESSION_REQUEST_SCHEMA,
+                        "input": [
+                            "request_id",
+                            "principal_id",
+                            "session_id",
+                            "object_cid",
+                            "action",
+                            "viewer_interface",
+                            "release_receipt",
+                            "output_kind",
+                            "reason",
+                            "expires_at"
+                        ],
+                        "output": "viewer-scoped decrypt session receipt"
+                    },
+                    "render": {
+                        "input_schema": DECRYPT_SESSION_REQUEST_SCHEMA,
+                        "output": "bounded rendered output for an authorized viewer capsule"
+                    }
+                },
+                "supported_outputs": PROTECTED_CONTENT_OUTPUTS,
+                "status": "fail_closed_until_key_release_and_decrypt_backend_configured"
+            },
         }))
     }
 
@@ -142,11 +180,52 @@ fn validate_decrypt_session_request(request: &DecryptSessionRequestV1) -> Result
     require_identifier(&request.object_cid, "object_cid")?;
     validate_action(&request.action)?;
     require_non_empty(&request.viewer_interface, "viewer_interface")?;
-    require_non_empty(&request.release_receipt_id, "release_receipt_id")?;
+    validate_release_receipt_binding(request)?;
     validate_output_kind(&request.output_kind)?;
     require_non_empty(&request.reason, "reason")?;
     if request.expires_at == 0 {
         return Err("expires_at is required".to_string());
+    }
+    Ok(())
+}
+
+fn validate_release_receipt_binding(request: &DecryptSessionRequestV1) -> Result<(), String> {
+    let receipt = &request.release_receipt;
+    if receipt.schema != RELEASE_RECEIPT_SCHEMA {
+        return Err("release receipt schema is unsupported".to_string());
+    }
+    require_identifier(&receipt.request_id, "release_receipt.request_id")?;
+    require_identifier(&receipt.object_cid, "release_receipt.object_cid")?;
+    require_non_empty(&receipt.principal_id, "release_receipt.principal_id")?;
+    require_non_empty(&receipt.session_id, "release_receipt.session_id")?;
+    validate_action(&receipt.action)?;
+    require_non_empty(&receipt.provider, "release_receipt.provider")?;
+    if receipt.provider != "key-provider" {
+        return Err("release receipt provider must be key-provider".to_string());
+    }
+    if !matches!(receipt.status.as_str(), "released" | "issued") {
+        return Err("release receipt must be issued or released".to_string());
+    }
+    if receipt.object_cid != request.object_cid {
+        return Err("release receipt object_cid must match decrypt object_cid".to_string());
+    }
+    if receipt.principal_id != request.principal_id {
+        return Err("release receipt principal_id must match decrypt principal_id".to_string());
+    }
+    if receipt.session_id != request.session_id {
+        return Err("release receipt session_id must match decrypt session_id".to_string());
+    }
+    if receipt.action != request.action {
+        return Err("release receipt action must match decrypt action".to_string());
+    }
+    if receipt.issued_at == 0 {
+        return Err("release receipt issued_at is required".to_string());
+    }
+    if receipt.expires_at == 0 {
+        return Err("release receipt expires_at is required".to_string());
+    }
+    if receipt.expires_at < request.expires_at {
+        return Err("release receipt must cover the decrypt session expiry".to_string());
     }
     Ok(())
 }
@@ -238,6 +317,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elastos_common::protected_content::ReleaseReceiptV1;
 
     fn decrypt_request() -> DecryptSessionRequestV1 {
         DecryptSessionRequestV1 {
@@ -248,7 +328,18 @@ mod tests {
             object_cid: "bafybeigprotectedcontent".to_string(),
             action: "view".to_string(),
             viewer_interface: "elastos.viewer/document@1".to_string(),
-            release_receipt_id: "key-release:test".to_string(),
+            release_receipt: ReleaseReceiptV1 {
+                schema: RELEASE_RECEIPT_SCHEMA.to_string(),
+                request_id: "key-release:test".to_string(),
+                object_cid: "bafybeigprotectedcontent".to_string(),
+                principal_id: "person:local:test".to_string(),
+                session_id: "session:test".to_string(),
+                action: "view".to_string(),
+                provider: "key-provider".to_string(),
+                status: "released".to_string(),
+                issued_at: 1_800_000_000,
+                expires_at: 1_900_000_000,
+            },
             output_kind: "rendered".to_string(),
             reason: "open protected document".to_string(),
             expires_at: 1_900_000_000,
@@ -284,6 +375,14 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("raw_plaintext")));
+        assert_eq!(
+            data["contract"]["schema"],
+            "elastos.protected-content.decrypt-provider/v1"
+        );
+        assert_eq!(
+            data["contract"]["status"],
+            "fail_closed_until_key_release_and_decrypt_backend_configured"
+        );
     }
 
     #[test]
@@ -333,6 +432,30 @@ mod tests {
         let provider = DecryptProvider;
         let mut request = decrypt_request();
         request.object_cid = "..".to_string();
+
+        assert_eq!(
+            error_code(provider.open_session(request)),
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn open_session_rejects_denied_release_receipt() {
+        let provider = DecryptProvider;
+        let mut request = decrypt_request();
+        request.release_receipt.status = "denied".to_string();
+
+        assert_eq!(
+            error_code(provider.open_session(request)),
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn open_session_rejects_mismatched_release_receipt() {
+        let provider = DecryptProvider;
+        let mut request = decrypt_request();
+        request.release_receipt.object_cid = "bafybeigother".to_string();
 
         assert_eq!(
             error_code(provider.open_session(request)),

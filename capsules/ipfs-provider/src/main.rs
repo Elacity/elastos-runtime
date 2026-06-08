@@ -41,6 +41,8 @@ enum Request {
         filename: String,
         #[serde(default = "default_true")]
         pin: bool,
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
     },
     AddPath {
         path: String, // absolute filesystem path
@@ -51,11 +53,15 @@ enum Request {
         files: Vec<DirFile>,
         #[serde(default = "default_true")]
         pin: bool,
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
     },
     Cat {
         cid: String,
         #[serde(default)]
         path: Option<String>,
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
     },
     CatToPath {
         cid: String,
@@ -77,9 +83,13 @@ enum Request {
     },
     Pin {
         cid: String,
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
     },
     Unpin {
         cid: String,
+        #[serde(default, rename = "_runtime_invocation")]
+        _runtime_invocation: Option<serde_json::Value>,
     },
     Health,
     Status,
@@ -250,18 +260,19 @@ impl IpfsProvider {
                 data,
                 filename,
                 pin,
+                ..
             } => self.add_bytes(&data, &filename, pin),
             Request::AddPath { path, pin } => self.add_path(&path, pin),
-            Request::AddDirectory { files, pin } => self.add_directory(files, pin),
-            Request::Cat { cid, path } => self.cat(&cid, path.as_deref()),
+            Request::AddDirectory { files, pin, .. } => self.add_directory(files, pin),
+            Request::Cat { cid, path, .. } => self.cat(&cid, path.as_deref()),
             Request::CatToPath { cid, path, dest } => {
                 self.cat_to_path(&cid, path.as_deref(), &dest)
             }
             Request::GetBytes { cid, path } => self.cat(&cid, path.as_deref()),
             Request::Ls { cid } => self.ls(&cid),
             Request::DownloadDirectory { cid, dest } => self.download_directory(&cid, &dest),
-            Request::Pin { cid } => self.pin(&cid),
-            Request::Unpin { cid } => self.unpin(&cid),
+            Request::Pin { cid, .. } => self.pin(&cid),
+            Request::Unpin { cid, .. } => self.unpin(&cid),
             Request::Health => self.health(),
             Request::Status => self.status(),
             Request::Shutdown => self.shutdown(),
@@ -1517,6 +1528,7 @@ mod tests {
                 data,
                 filename,
                 pin,
+                ..
             } => {
                 assert_eq!(data, "aGVsbG8=");
                 assert_eq!(filename, "test.txt");
@@ -1527,11 +1539,40 @@ mod tests {
     }
 
     #[test]
+    fn test_request_accepts_runtime_invocation_metadata() {
+        let runtime = r#"{
+            "schema":"elastos.provider.invocation/v1",
+            "source":"content-provider",
+            "target":"ipfs",
+            "op":"add_bytes",
+            "transport":"runtime-local-provider-plane",
+            "transfer":"bytes"
+        }"#;
+        let json = format!(
+            r#"{{"op":"add_bytes","data":"aGVsbG8=","filename":"test.txt","pin":true,"_runtime_invocation":{runtime}}}"#
+        );
+        let req: Request = serde_json::from_str(&json).expect("Should parse runtime envelope");
+        assert!(matches!(req, Request::AddBytes { .. }));
+
+        let json = r#"{"op":"cat","cid":"QmTest","_runtime_invocation":{"schema":"elastos.provider.invocation/v1"}}"#;
+        let req: Request = serde_json::from_str(json).expect("Should parse runtime cat envelope");
+        assert!(matches!(req, Request::Cat { .. }));
+    }
+
+    #[test]
+    fn test_request_still_rejects_unknown_fields() {
+        let json =
+            r#"{"op":"add_bytes","data":"aGVsbG8=","filename":"test.txt","pin":true,"admin":true}"#;
+        let err = serde_json::from_str::<Request>(json).expect_err("Should reject unknown fields");
+        assert!(err.to_string().contains("unknown field `admin`"));
+    }
+
+    #[test]
     fn test_cat_request_deserialization() {
         let json = r#"{"op":"cat","cid":"QmTest","path":"file.txt"}"#;
         let req: Request = serde_json::from_str(json).expect("Should parse cat");
         match req {
-            Request::Cat { cid, path } => {
+            Request::Cat { cid, path, .. } => {
                 assert_eq!(cid, "QmTest");
                 assert_eq!(path.as_deref(), Some("file.txt"));
             }
