@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-08 (end of Day 17).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `742f62482`).
+**Last updated:** 2026-06-08 (end of Day 24).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `8cb43b814`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -22,13 +22,20 @@ protected content while never letting it *hold* the keys.
 Over Days 1–17 we brought the **entire dDRM provider chain to a proven,
 fail-closed, wasm-built, contract-tested bar**, pinned **both** security invariants
 (encrypt + decrypt), proved the **post-quantum crypto compiles in wasm**, and made
-the work **rebase-safe** against Anders' in-flight 0.4.0. Everything is isolated on
+the work **rebase-safe** against Anders' in-flight 0.4.0. Days 18–24 then advanced
+every *unblocked* edge of the rail right up to the transport decision: closed the
+encrypt in-boundary-keygen gap, de-risked the PQ-hybrid envelope, **proved the full
+PQ dDRM data path end-to-end pre-rail**, locked the engines with **portable golden
+vectors**, and made the "byte-compatible with PC2" claim **executable** via a
+standing cross-impl conformance gate (`ddrm-verify.sh`). Everything is isolated on
 local branches because **GitHub push access is suspended** (see §6).
 
-The chain is **blocked on one architectural decision from Anders** (the CEK
-transport rail) and one **engine landing on each end** (in-boundary keygen for
-encrypt; envelope-unwrap+cenc wiring for decrypt). Neither is started because both
-depend on Anders' answer. Everything that *can* be done ahead of that, *is* done.
+The chain is **blocked on exactly one architectural decision from Anders** (the CEK
+transport rail — `DDRM_DECRYPT_RAIL.md`). Everything else that depended on it has
+been pinned, de-risked, or proven pre-rail: the only remaining work behind the
+blocker is the **transport shim** that wires the (already-proven) unwrap→cenc
+composition to whatever rail Anders confirms. Everything that *can* be done ahead of
+that answer, *is* done.
 
 ---
 
@@ -87,19 +94,34 @@ The four-stage chain **plus** the encrypt producer, all fail-closed and wasm-bui
 
 | Provider | Role | Host tests | wasm | Notes |
 |---|---|---|---|---|
-| `capsules/encrypt-provider` | seal/produce (invariant #1) | 6 (+1 ignored gap) | builds | self-contained; in-boundary keygen engine = the gap |
+| `capsules/encrypt-provider` | seal/produce (invariant #1) | 13 | builds | self-contained; **in-boundary CEK+KID keygen closed** (Day 19) |
 | `capsules/drm-provider` | orchestrator `drm/open` + chain-seam | 12 | builds | declares canonical open sequence |
 | `capsules/rights-provider` | rights decision | 9 | builds | wire-rejects hidden authority |
 | `capsules/key-provider` | key release (rights-bound) | 9 | builds | verifies upstream RightsDecisionReceipt |
 | `capsules/decrypt-provider` | decrypt/render (invariant #2) | 25 | builds | cenc engine + envelope spec + consumer contract |
 
-**61 host tests green; 1 ignored (the encrypt in-boundary-keygen gap).**
+**68 host tests green; 0 ignored** (Day 19 closed the encrypt keygen gap: 6+1-ignored → 13).
+
+The `decrypt-provider` also carries **feature-gated tested islands** (Parallel
+Change — off by default, so the base surface above is unchanged). Cumulative test
+counts per feature:
+
+| `cargo test --features …` | count | what it adds |
+|---|---|---|
+| *(default)* | 25 | the shipped decrypt contract |
+| `rail-prep` | 27 | classical `ecdh_unwrap → cenc` composition (Day 18) |
+| `pq-envelope` | 29 | PQ-hybrid CEK-seal envelope island (Day 20) |
+| `pq-rail-prep` | 31 | full PQ data path `hybrid_unwrap → cenc` (Day 21) |
+| `vectors` | 36 | replay portable golden vectors v3+v2 (Days 22, 24) |
+| `gen-vectors` | — | regenerate the committed vectors (writes `tests/vectors/`) |
 
 Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
 - Zero ambient authority surfaced; every provider advertises + wire-rejects raw
   authority (`deny_unknown_fields`).
 - Fail-closed by default (`not_configured` until a real backend exists).
 - **CEK containment + zeroization** at both ends.
+- **Invariant #1 closed:** `encrypt-provider` mints CEK+KID with a CSPRNG **inside**
+  the boundary and the seal engine emits no key material (Day 19).
 - **Authorization binding** (rights receipt → key release).
 - **Contracts compose** (cross-provider seam tests).
 - **Upstream rail contract** captured as an executable spec
@@ -108,6 +130,16 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
 - **Downstream consumer contract** pinned for both players (metadata-only output).
 - **PQ-hybrid compiles in wasm** (`ml-kem 0.2.3`, `ml-dsa 0.0.4` → `wasm32-wasip1`,
   Rust 1.89). GO with a pin-exact caveat (`ml-dsa` is 0.0.x).
+- **Full PQ dDRM data path proven pre-rail** (Day 21): `pq_envelope.rs`
+  `decrypt_pq_sealed_segment` chains `x25519+ml-kem-768` hybrid unwrap → cenc
+  decrypt, CEK in `Zeroizing` throughout, never on the boundary.
+- **Engines pinned by portable golden vectors** (Days 22, 24): substrate-independent
+  fixtures in `decrypt-provider/tests/vectors/` (classical v3 + v2, and PQ-hybrid)
+  replayed with no in-test sealing and no RNG.
+- **Cross-impl conformance is executable** (Days 23–24): `scripts/pc2-conformance.sh`
+  decrypts our committed vectors with PC2 `ddrm-decrypt`'s **real code** and asserts
+  byte-for-byte parity (CEK + plaintext) plus fail-closed parity on tamper, for both
+  envelope versions. Skips clean when PC2 is absent.
 
 ---
 
@@ -137,10 +169,12 @@ All in `docs/convergence/`. Read 1→3 to onboard; the rest are reference.
 11. **`MAC.md` / `RUN_HOME_LOCALLY.md`** (in `docs/`) — run the UI locally on macOS
     (`elastos gateway` not `serve`; use `localhost:8090` for WebAuthn).
 
-**Full prior conversation transcript** (every decision, verbatim):
-`/Users/sash/.cursor/projects/Users-sash-code-elastos-runtime/agent-transcripts/6f8c08cd-415d-4f58-b41d-74e2724fb796/6f8c08cd-415d-4f58-b41d-74e2724fb796.jsonl`
-— search it by keyword (filename, error, "Day N") if you need the why behind a
-decision.
+**Full prior conversation transcripts** (every decision, verbatim) — search by
+keyword (filename, error, "Day N") if you need the why behind a decision:
+- Days 1–17: `…/agent-transcripts/6f8c08cd-415d-4f58-b41d-74e2724fb796/6f8c08cd-415d-4f58-b41d-74e2724fb796.jsonl`
+- Days 18–24: `…/agent-transcripts/43110c1d-e79d-43d4-818b-4a2f0fb3233b/43110c1d-e79d-43d4-818b-4a2f0fb3233b.jsonl`
+
+(both under `/Users/sash/.cursor/projects/Users-sash-code-elastos-runtime/`)
 
 ---
 
@@ -164,9 +198,9 @@ decision.
   branches**; nothing is pushed. We can `git fetch` (read) but not push. Plan to
   push = `PUSH_PLAN.md`.
 - **0.4.0 is in flux.** Anders force-pushed it and more redones are coming. **Do not
-  rebase onto it yet.** When it settles: run `scripts/ddrm-drift-check.sh` (must
-  PASS), then follow the rebase recipe in `PUSH_PLAN.md`. A safety backup of our tip
-  is `backup/decrypt-provider-cenc-preD17`.
+  rebase onto it yet.** When it settles: run `scripts/ddrm-verify.sh` (drift +
+  cross-impl conformance, must PASS), then follow the rebase recipe in
+  `PUSH_PLAN.md`. A safety backup of our tip is `backup/decrypt-provider-cenc-preD17`.
 - **Contract converged — zero type drift.** `elastos-common/protected_content.rs`
   is byte-identical between our branch and the redone 0.4.0. Our providers were
   built against the exact types Anders independently landed. Keep it that way; the
@@ -204,41 +238,50 @@ Older/unrelated: `sash/local-test*` (Mac VZ core work, intentionally separate),
 1. **The decrypt rail** (BLOCKER, needs Anders). How the sealed CEK reaches
    decrypt-provider. We chose Hybrid (decrypt *receives* sealed material; upstream
    is a provider chain) + Irzhy's secured ECDH+DSA channel, PQ-hybrid. **3 sharpened
-   questions for Anders** in `DDRM_DECRYPT_RAIL.md` / `DDRM_STATUS.md`. Wiring is a
-   small, well-scoped landing once answered (contract + both ends already pinned).
-2. **Encrypt in-boundary keygen engine** (invariant #1 gap). PC2 mints the CEK in
-   the Node host; the runtime must mint it inside `encrypt-provider`. The contract,
-   zeroization, and no-raw-CEK output are pinned; only the generator/cipher engine
-   is unwired. Marked by `cek_and_kid_generated_inside_boundary` (`#[ignore]`).
-3. **PQ migration of the envelope.** `envelope.rs` is the classical PC2 spec
-   (characterization-tested). Shipping needs the PQ-hybrid profile — proven
-   wasm-viable, not yet wired.
+   questions for Anders** in `DDRM_DECRYPT_RAIL.md` / `DDRM_STATUS.md`. The full
+   unwrap→cenc composition is proven for both the classical (`rail-prep`) and PQ
+   (`pq-rail-prep`) profiles — so once answered, the remaining work is the
+   **transport shim**, not the crypto or the engines.
+2. ~~Encrypt in-boundary keygen engine (invariant #1 gap).~~ **CLOSED (Day 19).**
+   `encrypt-provider` now mints CEK+KID with a CSPRNG inside the boundary and the
+   seal engine emits no key material; `cek_and_kid_generated_inside_boundary` and
+   `seal_engine_emits_no_key_material` pass. See `DDRM_ENCRYPT_INVARIANT.md`.
+3. **PQ migration of the envelope** (de-risked, not yet shipped). `envelope.rs` is
+   the classical PC2 spec; `pq_envelope.rs` proves the PQ-hybrid profile end to end
+   behind `pq-envelope`/`pq-rail-prep`. Wiring it into dispatch lands with the rail.
 4. **Carrier iroh/Hickory upgrade** — deferred (MSRV 1.91), operator decision.
 5. **Rebase onto stabilised 0.4.0** — deferred until Anders stops force-pushing.
+   Pre-rebase gate is now `scripts/ddrm-verify.sh` (drift + cross-impl conformance).
 
 ---
 
 ## 9. How to verify (commands)
 
 ```bash
-# dDRM contract intact on the current base? (run before any rebase/PR)
-scripts/ddrm-drift-check.sh                     # expect PASS
+# THE standing pre-rebase/PR gate: contract drift + PC2 cross-impl conformance.
+# Conformance skips clean if the PC2 repo is absent; set PC2_REPO to point it.
+scripts/ddrm-verify.sh                          # expect: ALL GATES PASS
 
-# per-provider host tests (fast, authoritative)
+# (the gate's two parts, runnable on their own)
+scripts/ddrm-drift-check.sh                     # expect PASS
+scripts/pc2-conformance.sh                      # expect PASS (or SKIP without PC2)
+
+# per-provider host tests (fast, authoritative): 13+12+9+9+25 = 68 green, 0 ignored
 for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo test); done
+
+# decrypt-provider feature ladder (tested islands; counts in §3)
+( cd capsules/decrypt-provider && \
+  for f in rail-prep pq-envelope pq-rail-prep vectors; do cargo test --features $f; done )
+
+# regenerate the committed golden vectors (only when intentionally changing them)
+( cd capsules/decrypt-provider && cargo test --features gen-vectors emit_ )
 
 # whole chain under the WASI sandbox (needs: rustup target add wasm32-wasip1; brew install wasmtime)
 scripts/ddrm-chain-smoke.sh                     # 4 chain providers PASS
 
 # wasm build of a provider
 ( cd capsules/decrypt-provider && rustup run 1.89.0 cargo build --target wasm32-wasip1 --release )
-
-# PQ-in-wasm spike (throwaway; proves ml-kem/ml-dsa compile to wasm)
-# see DDRM_STATUS.md §PQ-hybrid-in-wasm viability for the exact recipe
 ```
-
-Note: the `ReadLints` tool times out on this repo (~10s) — not a blocker;
-`cargo build`/`cargo test` warnings are authoritative.
 
 ---
 
@@ -306,23 +349,39 @@ next context can continue cold.
 - **D15** refresh status; prove PQ-hybrid compiles in wasm (ml-kem/ml-dsa).
 - **D16** `encrypt-provider` skeleton; pin invariant #1; capture in-boundary-keygen gap.
 - **D17** 0.4.0 force-push reconciled (zero type drift); `ddrm-drift-check.sh`; deferred rebase.
+- **D17.5** `HANDOVER.md` single-entry onboarding (`14cb2306d`).
+- **D18** prep rail-landing: classical `ecdh_unwrap → cenc` composition behind `rail-prep` (`27cce2d5e`).
+- **D19** close invariant #1: in-boundary CEK+KID keygen + seal engine; 68 green/0 ignored (`ec6fd6dcf`).
+- **D20** de-risk PQ-hybrid CEK-seal envelope island behind `pq-envelope` (`38fa91a48`).
+- **D21** prove full PQ dDRM data path end-to-end pre-rail behind `pq-rail-prep` (`ee5b084f9`).
+- **D22** pin both engines with portable golden vectors (`vectors`/`gen-vectors`) (`7df180297`).
+- **D23** make PC2 cross-impl conformance executable (`scripts/pc2-conformance.sh`) (`8bf242a20`).
+- **D24** promote conformance to a standing gate (`ddrm-verify.sh`) + v2 vector + tamper parity (`8cb43b814`).
 
 ---
 
 ## 13. Next
 
-The Day 18 prompt is provided by the user (the prior agent presented it). If you do
-not have it, the highest-value **unblocked** options, in order, are:
-1. **Prep the rail landing** so it's a 1-hour wire-up once Anders answers: write the
-   `envelope::ecdh_unwrap` + `cenc::process` composition behind a feature flag /
-   `#[ignore]`d integration test in decrypt-provider (no behaviour change).
-2. **Vendor PC2 `cenc-encrypt`** into `encrypt-provider` as the in-boundary engine
-   backend (mirrors how decrypt-provider vendored `cenc-decrypt`), closing the
-   invariant #1 gap up to keygen.
-3. **PQ envelope spike** — a characterization test of the PQ-hybrid seal/unwrap
-   shape (x25519+ml-kem-768, ml-dsa-65) alongside the classical `envelope.rs`, so
-   the crypto upgrade is de-risked before the rail lands.
+The Days 18–24 options (rail-prep, encrypt keygen, PQ envelope, PQ data path,
+golden vectors, executable conformance) are **done**. The rail itself remains
+blocked on Anders. The next-day prompt is normally provided by the prior agent; if
+you do not have it, the highest-value **unblocked** options, in order, are:
+
+1. **Widen the conformance/golden surface toward the live rail's wire shape** — e.g.
+   PQ-vector cross-checks once a reference exists, multi-sample/subsample cenc
+   vectors, or an `init`-segment (`tenc`) vector — so more of the contract is pinned
+   by executable parity before wiring.
+2. **Author the rail transport shim behind a flag, fully tested, un-wired** — the
+   thin adapter that hands a sealed envelope to `decrypt_pq_sealed_segment`
+   (`pq-rail-prep`) for each rail option in `DDRM_DECRYPT_RAIL.md`, so the day Anders
+   answers it is a flag flip, not a design.
+3. **Reconcile-prep for 0.4.0** — keep `ddrm-verify.sh` green; tighten the drift
+   guard / `PUSH_PLAN.md` rebase recipe so the eventual rebase is button-press.
+4. **Encrypt→decrypt round-trip golden** — a vector produced by `encrypt-provider`'s
+   in-boundary seal and consumed by the decrypt engines, pinning both invariants on
+   one artifact.
 
 Whatever you pick: keep it isolated on `feat/decrypt-provider-cenc`, pin it with
-tests, keep the chain green (`scripts/ddrm-drift-check.sh` + provider tests), update
-`DDRM_STATUS.md`, and end the day by presenting the next 10/10 prompt.
+characterization tests, keep the gate green (`scripts/ddrm-verify.sh` + the 68
+provider tests), update `DDRM_STATUS.md`, and end the day by presenting the next
+10/10 prompt.
