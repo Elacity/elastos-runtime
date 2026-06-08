@@ -20,6 +20,11 @@ use std::io::{self, BufRead, Write};
 #[allow(dead_code)]
 mod cenc;
 mod envelope;
+// PQ-hybrid CEK-seal de-risking island (feature `pq-envelope`): the post-quantum
+// analogue of `envelope.rs`, proving x25519+ml-kem-768 -> AEAD unwrap recovers a
+// CEK in `Zeroizing`. Not wired into dispatch; see DDRM_DECRYPT_RAIL.md §PQ.
+#[cfg(feature = "pq-envelope")]
+mod pq_envelope;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,

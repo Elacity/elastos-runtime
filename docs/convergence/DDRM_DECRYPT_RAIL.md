@@ -203,6 +203,16 @@ rights → key → decrypt authority separation.
   ECDSA; the shipped rail must use the runtime PQ-hybrid profile
   (`x25519 + ml-kem-768`, `ml-dsa-65`, `elastos-pq-hybrid-threshold-v0`) — keep
   PC2's envelope structure + discipline, upgrade the crypto.
+- **PQ profile de-risked (Day 20):** the PQ-hybrid seal/unwrap shape is built and
+  characterization-tested as `decrypt-provider/src/pq_envelope.rs` (feature
+  `pq-envelope`, default OFF) — `x25519+ml-kem-768` hybrid KEM → SHA-256 KDF →
+  AES-256-GCM unwrap recovers the CEK in `Zeroizing`; wrong KEM secret / tampered
+  blob / bad signature all fail closed; the signature sits behind a
+  `CekSealVerifier` abstraction so `ml-dsa-65` (or a hybrid) plugs in cleanly; and
+  it builds to `wasm32-wasip1`. So once Q2 (signature scheme) is answered, swapping
+  the classical `envelope.rs` path for the PQ one is a known-good drop-in, not a
+  research task. Details + versions: `DDRM_STATUS.md` §"PQ-hybrid envelope
+  de-risked".
 
 Full write-up + threat model + invariant→test table: `DDRM_SECURITY_MODEL.md`.
 

@@ -128,6 +128,31 @@ is still `0.0.x` (early, pre-1.0 API churn likely); `ml-kem` is more settled at
 `0.2.x`. Recommend pinning exact versions and keeping the signature scheme behind
 the envelope abstraction so a hybrid (ECDSA + ml-dsa) transition stays cheap.
 
+### PQ-hybrid envelope de-risked end-to-end (Day 20)
+
+Beyond "the crates compile", the **seal/unwrap shape now composes and recovers a
+CEK** — `decrypt-provider/src/pq_envelope.rs`, the PQ analogue of the classical
+`envelope.rs`, behind the `pq-envelope` feature (default OFF, Parallel Change):
+
+- **Hybrid KEM:** `x25519` DH ‖ `ML-KEM-768`; the AES-256-GCM wrap key is derived
+  (SHA-256 KDF, labelled + length-prefixed) from **both** shared secrets, so
+  confidentiality holds if **either** primitive stays unbroken.
+- **AEAD wrap:** authenticated — a wrong KEM secret or tampered blob fails closed
+  (`UnsealFailed`), no plaintext on error.
+- **Signature behind `CekSealVerifier`** so ml-dsa-65 (or hybrid ECDSA+ml-dsa)
+  plugs in without touching the unwrap path (honours the caveat above).
+- **CEK returned in `Zeroizing`**; the raw CEK never appears in the sealed bytes.
+- **Unwrap needs no RNG and no outbound authority** — a pure in-VM transform, like
+  the classical path.
+
+Pinned by 4 characterization tests (`pq_hybrid_round_trip_recovers_cek`,
+`wrong_session_secret_fails_closed`, `tampered_signature_fails_closed`,
+`sealed_envelope_has_no_raw_cek`) and **proven to build to `wasm32-wasip1`** under
+`1.89.0` with the feature on. Resolved versions: `ml-kem 0.2.3`, `x25519-dalek 2`,
+`aes-gcm 0.10`, `sha2 0.10`. Run: `cargo test --features pq-envelope` (29 green:
+25 default + 4 PQ). **The PQ rail is now a known-good drop-in for the classical
+envelope the moment Anders confirms the transport + signature scheme.**
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
