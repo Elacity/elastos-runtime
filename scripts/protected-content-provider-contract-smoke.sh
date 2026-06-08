@@ -104,6 +104,19 @@ RIGHTS_ACCESS = {
     "policy_ref": "bafybeigpolicy",
 }
 
+RIGHTS_RECEIPT = {
+    "schema": "elastos.rights.decision.receipt/v1",
+    "request_id": "rights:test",
+    "content_id": "bafybeigprotectedcontent",
+    "principal_id": "person:local:test",
+    "session_id": "session:test",
+    "right": "view",
+    "provider": "rights-provider",
+    "allowed": True,
+    "issued_at": 1_800_000_000,
+    "expires_at": 1_900_000_000,
+}
+
 KEY_RELEASE = {
     "schema": "elastos.key_release.request/v1",
     "request_id": "key-release:test",
@@ -111,8 +124,22 @@ KEY_RELEASE = {
     "session_id": "session:test",
     "object_cid": "bafybeigprotectedcontent",
     "action": "view",
+    "rights_receipt": RIGHTS_RECEIPT,
     "key_envelope": KEY_ENVELOPE,
     "reason": "open protected document",
+    "expires_at": 1_900_000_000,
+}
+
+RELEASE_RECEIPT = {
+    "schema": "elastos.release.receipt/v1",
+    "request_id": "key-release:test",
+    "object_cid": "bafybeigprotectedcontent",
+    "principal_id": "person:local:test",
+    "session_id": "session:test",
+    "action": "view",
+    "provider": "key-provider",
+    "status": "released",
+    "issued_at": 1_800_000_000,
     "expires_at": 1_900_000_000,
 }
 
@@ -124,7 +151,7 @@ DECRYPT_SESSION = {
     "object_cid": "bafybeigprotectedcontent",
     "action": "view",
     "viewer_interface": "elastos.viewer/document@1",
-    "release_receipt_id": "key-release:test",
+    "release_receipt": RELEASE_RECEIPT,
     "output_kind": "rendered",
     "reason": "open protected document",
     "expires_at": 1_900_000_000,

@@ -169,7 +169,8 @@ check_required 'edge_release_channel_path' elastos/crates/elastos-server/src/sit
 check_required 'publisher_release_manifest_path' elastos/crates/elastos-server/src/api/gateway_site.rs 'gateway must read release manifests from Publisher state'
 check_required 'publish_to_content_availability' elastos/crates/elastos-server/src/gateway_cmd.rs 'public gateway publish must route through content availability'
 check_forbidden_in_path 'publish_to_ipfs|no CID in ipfs-provider response' elastos/crates/elastos-server/src/gateway_cmd.rs 'public gateway publish must not bind directly to ipfs-provider'
-check_required 'send_raw\("availability"' elastos/crates/elastos-server/src/content.rs 'content provider must keep the internal availability provider seam'
+check_required 'ProviderInvocation' elastos/crates/elastos-server/src/content.rs 'content provider must use the provider invocation envelope'
+check_required '"availability",' elastos/crates/elastos-server/src/content.rs 'content provider must keep the internal availability provider seam'
 check_required '"availability",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://availability for the availability provider'
 check_required '"wallet",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://wallet for the wallet provider'
 check_required '"drm",' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider registry must reserve elastos://drm for the protected-content provider'
@@ -431,13 +432,14 @@ ordinary_roles = {"app", "viewer", "content"}
 # System is the runtime-owned approval/diagnostic surface. Dedicated wallet
 # connector capsules and the Browser shell are privileged adapter UIs, not
 # general app authority.
-ordinary_capsules_with_privileged_authority_ui = {"system", "wallet-metamask", "wallet-unisat", "wallet", "wallet-walletconnect", "browser"}
+ordinary_capsules_with_privileged_authority_ui = {"system", "wallet-metamask", "wallet-unisat", "wallet", "wallet-walletconnect", "browser", "library"}
 system_only_elastos_backends = {
     "elacity",
     "elacity-sdk",
     "gateway",
     "chain",
     "wallet",
+    "library",
     "ipfs",
     "ipfs-cluster",
     "ipfs-provider",
@@ -540,6 +542,7 @@ for path in manifest_paths:
             "elastos://exit": "raw Browser Exit provider namespace",
             "elastos://browser-engine": "raw Browser Engine provider namespace",
             "elastos://wallet": "raw wallet provider namespace",
+            "elastos://object": "raw object provider namespace",
             "elastos://ipfs": "raw IPFS backend namespace",
             "elastos://availability": "raw availability backend namespace",
             "elastos://drm": "raw protected-content backend namespace",
@@ -554,6 +557,7 @@ for path in manifest_paths:
             "browser-stream-bridge": "raw Browser Engine byte transport bridge",
             "browser-local-exit": "raw Browser local Exit daemon",
             "wallet-provider": "raw wallet backend provider",
+            "object-provider": "raw object backend provider",
             "ipfs-provider": "raw IPFS backend provider",
             "availability-provider": "raw availability backend provider",
             "drm-provider": "raw protected-content backend provider",
@@ -627,6 +631,7 @@ required = {
     "browser-stream-bridge",
     "browser-local-exit",
     "webspace-provider",
+    "object-provider",
     "home-cli",
     "home",
     "system",
@@ -654,6 +659,7 @@ required_demo = {
     "browser-stream-bridge",
     "browser-local-exit",
     "webspace-provider",
+    "object-provider",
     "home-cli",
     "home",
     "system",

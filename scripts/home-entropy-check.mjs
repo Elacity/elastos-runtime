@@ -656,7 +656,6 @@ const lightTokenFiles = [
   "capsules/system/browser/style.css",
   "capsules/documents/index.html",
   "capsules/inbox/index.html",
-  "capsules/library/index.html",
 ];
 
 const lightTokens = new Map([
@@ -793,6 +792,7 @@ const browserCapsulesApi = read(
 const viewerGatewayApi = read(
   "elastos/crates/elastos-server/src/api/viewer_gateway.rs",
 );
+const archivePolicyDoc = read("docs/ARCHIVE_POLICY.md");
 const documentsProvider = read(
   "elastos/crates/elastos-server/src/documents.rs",
 );
@@ -829,6 +829,7 @@ const notifications = read(
 const carrierBridge = read(
   "elastos/crates/elastos-server/src/carrier_bridge.rs",
 );
+const carrierRuntime = read("elastos/crates/elastos-server/src/carrier.rs");
 const runtimeCore = read("elastos/crates/elastos-server/src/runtime.rs");
 const runtimeControl = read(
   "elastos/crates/elastos-server/src/runtime_control.rs",
@@ -1026,7 +1027,7 @@ const gatewayBrowserRouteTests = read(
 );
 const debugPolicy = read("DEBUG.md");
 const gbaScript = read("scripts/gba.sh");
-const homeAssetVersion = "home-20260526d";
+const homeAssetVersion = "home-20260603c";
 assertUsersSelfReferencesAreApproved();
 assert(
   shellIndex.includes('role="listbox"'),
@@ -1100,10 +1101,11 @@ assert(
   "Home PWA manifest must include a 512px install icon",
 );
 assert(
-  shellServiceWorker.includes(
-    `elastos-home-${homeAssetVersion.slice("home-".length)}`,
-  ),
-  "Home service worker cache key must match the browser asset version",
+  shellServiceWorker.includes('const CACHE_PREFIX = "elastos-home-";') &&
+    shellServiceWorker.includes("caches.delete(key)") &&
+    shellServiceWorker.includes("self.registration.unregister()") &&
+    shellServiceWorker.includes('self.addEventListener("fetch", () => {});'),
+  "Home service worker must actively remove old Home caches and unregister instead of preserving stale shell assets",
 );
 assert(
   !shellServiceWorker.includes("elastos-home-shell"),
@@ -1181,6 +1183,10 @@ assert(
 assert(
   shellJs.includes("SHELL_MESSAGE_OPEN_TARGET_SOURCES"),
   "Home open-target messages must stay source-gated",
+);
+assert(
+  shellJs.includes('library: new Set(["documents", "library"])'),
+  "Home must allow Library sidebar Open in New Window while keeping the source-gated policy explicit",
 );
 assert(
   shellIndex.includes(`shell.js?v=${homeAssetVersion}`),
@@ -1927,8 +1933,71 @@ for (const component of ["home", "system", "documents", "library", "inbox"]) {
 }
 
 const documents = read("capsules/documents/index.html");
+const archiveManager = read("capsules/archive-manager/index.html");
+const archiveManagerManifest = read("capsules/archive-manager/capsule.json");
 const inbox = read("capsules/inbox/index.html");
-const library = read("capsules/library/index.html");
+const libraryIndex = read("capsules/library/index.html");
+const libraryCss = read("capsules/library/library.css");
+const libraryApp = read("capsules/library/src/app.js");
+const libraryActions = read("capsules/library/src/actions.js");
+const libraryApi = read("capsules/library/src/api.js");
+const libraryDialog = read("capsules/library/src/dialog.js");
+const libraryEditor = read("capsules/library/src/editor.js");
+const libraryEvents = read("capsules/library/src/events.js");
+const libraryMenu = read("capsules/library/src/menu.js");
+const libraryModel = read("capsules/library/src/model.js");
+const libraryNavigation = read("capsules/library/src/navigation.js");
+const libraryPreview = read("capsules/library/src/preview.js");
+const libraryRealtime = read("capsules/library/src/realtime.js");
+const libraryRender = read("capsules/library/src/render.js");
+const librarySelection = read("capsules/library/src/selection.js");
+const libraryState = read("capsules/library/src/state.js");
+const libraryUploads = read("capsules/library/src/uploads.js");
+const library = readAll([
+  "capsules/library/index.html",
+  "capsules/library/library.css",
+  "capsules/library/src/app.js",
+  "capsules/library/src/actions.js",
+  "capsules/library/src/api.js",
+  "capsules/library/src/dialog.js",
+  "capsules/library/src/editor.js",
+  "capsules/library/src/events.js",
+  "capsules/library/src/menu.js",
+  "capsules/library/src/model.js",
+  "capsules/library/src/navigation.js",
+  "capsules/library/src/preview.js",
+  "capsules/library/src/realtime.js",
+  "capsules/library/src/render.js",
+  "capsules/library/src/selection.js",
+  "capsules/library/src/state.js",
+  "capsules/library/src/uploads.js",
+]);
+const objectProviderManifest = read("capsules/object-provider/capsule.json");
+const objectProviderImpl = read("elastos/crates/elastos-server/src/library.rs");
+const gatewayProviderProxy = read("elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs");
+const libraryGatewayTests = read("elastos/crates/elastos-server/src/api/gateway_tests/library.rs");
+const retiredObjectProviderMarkers = {
+  oldBinary: ["library", "provider"].join("-"),
+  oldNamespace: ["elastos://", "library"].join(""),
+  oldSchemeRegistration: [
+    'CapsuleProvider::with_scheme(bridge, "',
+    "library",
+    '")',
+  ].join(""),
+};
+const contentProvider = read("elastos/crates/elastos-server/src/content.rs");
+const contentCmd = read("elastos/crates/elastos-server/src/content_cmd.rs");
+const availabilityProvider = read("capsules/availability-provider/src/main.rs");
+const webspaceProvider = read("capsules/webspace-provider/src/main.rs");
+const webspaceCmd = read("elastos/crates/elastos-server/src/webspace_cmd.rs");
+const serverMain = read("elastos/crates/elastos-server/src/main.rs");
+const providerRegistry = read("elastos/crates/elastos-runtime/src/provider/registry.rs");
+const libraryDesktopIcon = read("capsules/library/icons/sidebar-folder-desktop.svg");
+const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
+const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
+const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
+const fileManagerMigrationDoc = read("docs/FILE_MANAGER_MIGRATION.md");
+const todayLibraryTracker = read("TODAY.md");
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/index.html");
 const gbaStyle = read("capsules/gba-emulator/style.css");
@@ -2169,28 +2238,965 @@ assert(
   "Inbox mobile panels must use compact Home-aligned spacing",
 );
 assert(
-  library.includes("home:open-target"),
+  libraryApi.includes("home:open-target"),
   "Library opens must use Home orchestration",
 );
+{
+  const openObjectStart = libraryActions.indexOf("async function openObject(object)");
+  const viewerIndex = libraryActions.indexOf("const viewer = viewerOptions(object)[0];", openObjectStart);
+  const previewIndex = libraryActions.indexOf("if (canPreviewObject(object))", openObjectStart);
+  assert(
+    openObjectStart >= 0 && viewerIndex > openObjectStart && previewIndex > viewerIndex,
+    "Library double-click must prefer the installed default viewer before falling back to internal preview",
+  );
+}
 assert(
-  library.includes("home:deliver-to-target"),
+  libraryApi.includes("home:deliver-to-target"),
   "Library picker returns must use Home orchestration",
 );
 assert(
-  library.includes("home:close-self"),
+  libraryApi.includes("home:close-self"),
   "Library picker must close itself through Home after a successful attach",
 );
 assert(
-  library.includes("chat-room:attach-library-item"),
+  libraryActions.includes("chat-room:attach-library-item"),
   "Library must return selected documents using the Chat Room attach contract",
 );
 assert(
-  library.includes("Publish the document before attaching it."),
-  "Library must fail clearly when a draft is selected for Chat Room attachment",
+  libraryActions.includes("Publish this object before attaching it."),
+  "Library must fail clearly when a local-only object is selected for Chat Room attachment",
 );
 assert(
-  library.includes("data-attach-uri"),
-  "Library attach mode must expose published URI selection state",
+  libraryActions.includes("publishedCid(object)") &&
+    libraryActions.includes("object.published") &&
+    libraryActions.includes("elastos://"),
+  "Library attach mode must return published elastos:// object URIs",
+);
+assert(
+  libraryApp.includes('desktop: "icons/sidebar-folder-desktop.svg"') &&
+    !libraryApp.includes('trash: "icons/trash.svg"'),
+  "Library sidebar must expose Desktop and keep Trash as a hidden operation, not a visible root",
+);
+assert(
+  libraryDesktopIcon.includes('width="12px"') && libraryDesktopIcon.includes('height="12px"'),
+  "Library Desktop sidebar icon must use compact sidebar sizing",
+);
+assert(
+    objectProviderManifest.includes('"role": "provider"') &&
+    objectProviderManifest.includes('"name": "object-provider"') &&
+    objectProviderManifest.includes('"provides": "elastos://object/*"') &&
+    objectProviderManifest.includes('"resource": "elastos://object/*"') &&
+    !objectProviderManifest.includes(retiredObjectProviderMarkers.oldNamespace) &&
+    objectProviderManifest.includes('"audit_events"') &&
+    ["publish", "unpublish", "repair", "share", "events"].every((op) =>
+      objectProviderManifest.includes(`"${op}"`),
+    ),
+  "Object provider must be the only provider capsule authority metadata for every routed operation",
+);
+assert(
+  serverInfra.includes('find_installed_provider_binary("object-provider")') &&
+    !serverInfra.includes(
+      `find_installed_provider_binary("${retiredObjectProviderMarkers.oldBinary}")`,
+    ) &&
+    serverInfra.includes('CapsuleProvider::with_scheme(bridge.clone(), "object")') &&
+    !serverInfra.includes(retiredObjectProviderMarkers.oldSchemeRegistration) &&
+    !serverInfra.includes("ObjectProvider::new("),
+  "Runtime server must register object-provider only, without the retired object provider alias",
+);
+assert(
+  objectProviderImpl.includes('("desktop", "Desktop", format!("{root}/Desktop"), "directory")') &&
+    !objectProviderImpl.includes('("trash", "Trash", format!("{root}/.Trash"), "directory")'),
+  "Object provider roots must expose Desktop and omit visible Trash",
+);
+assert(
+  gatewayApi.includes('"/api/provider/object/upload"') &&
+    gatewayApi.includes('"/api/provider/object/upload/start"') &&
+    gatewayApi.includes('"/api/provider/object/upload/:upload_id/chunk"') &&
+    gatewayApi.includes('"/api/provider/object/upload/:upload_id/finish"') &&
+    gatewayApi.includes("LIBRARY_UPLOAD_CHUNK_MAX_BYTES") &&
+    gatewayApi.includes("pub(super) async fn gateway_library_upload") &&
+    gatewayApi.includes("pub(super) async fn gateway_library_upload_start") &&
+    gatewayApi.includes("pub(super) async fn gateway_library_upload_chunk") &&
+    gatewayApi.includes("pub(super) async fn gateway_library_upload_finish") &&
+    gatewayApi.includes("elastos.object.upload-session/v1") &&
+    gatewayApi.includes("http-chunk-session") &&
+    gatewayApi.includes("client_waits_for_chunk_ack") &&
+    gatewayApi.includes("LIBRARY_TRANSFER_RECEIPT_SCHEMA") &&
+    gatewayApi.includes("x-elastos-transfer-receipt") &&
+    objectProviderImpl.includes("pub fn handle_library_upload_bytes(") &&
+    objectProviderImpl.includes("fn write_library_file_bytes("),
+  "Object-provider raw browser uploads must route through Runtime auth/audit, emit transfer receipts, and use the shared object-provider byte-write helper",
+);
+assert(
+  gatewayApi.includes('"/api/provider/object/download/raw"') &&
+    gatewayApi.includes("pub(super) async fn gateway_library_download") &&
+    gatewayApi.includes("LIBRARY_TRANSFER_RECEIPT_SCHEMA") &&
+    gatewayApi.includes("x-elastos-transfer-receipt") &&
+    gatewayApi.includes("fn library_download_byte_range(") &&
+    gatewayApi.includes("StatusCode::PARTIAL_CONTENT") &&
+    gatewayApi.includes("StatusCode::RANGE_NOT_SATISFIABLE") &&
+    gatewayApi.includes("LibraryArchiveFormat::parse") &&
+    gatewayApi.includes('"archive" => archive_format_value = Some(value.into_owned())') &&
+    objectProviderImpl.includes("pub(crate) enum LibraryArchiveFormat") &&
+    objectProviderImpl.includes("pub(crate) fn handle_library_download_bytes_with_format(") &&
+    objectProviderImpl.includes("pub(crate) async fn handle_library_download_bytes_runtime(") &&
+    objectProviderImpl.includes("archive_format: LibraryArchiveFormat") &&
+    objectProviderImpl.includes("async fn webspace_download_bytes(") &&
+    objectProviderImpl.includes("fn library_download_object(") &&
+    libraryActions.includes("downloadObjectRaw({ uri: object.uri })") &&
+    libraryActions.includes('downloadObjectRaw({ uri: object.uri, archive: "zip" })') &&
+    !libraryActions.includes('providerApi("download"') &&
+    !libraryActions.includes("base64ToBlob"),
+  "Library raw browser downloads must route through Runtime auth/audit and the shared Library/WebSpace byte-read helpers without JSON/base64 app fallbacks",
+);
+assert(
+  gatewayApi.includes('"compress_archive"') &&
+    objectProviderImpl.includes("CompressArchive {") &&
+    objectProviderImpl.includes("fn compress_library_archive(") &&
+    objectProviderImpl.includes("fn archive_library_single_zip(") &&
+    objectProviderImpl.includes("archive_library_selection_zip(data_dir, principal_id, &targets)") &&
+    objectProviderImpl.includes('capabilities.push("compress_archive")') &&
+    libraryActions.includes('providerApi("compress_archive"') &&
+    libraryActions.includes("async function compressObjectToZip(object)") &&
+    libraryActions.includes("async function compressSelectedObjectsToZip()") &&
+    libraryApp.includes('menuAction("Compress to ZIP"') &&
+    libraryApp.includes('menuAction("Compress Selected to ZIP"') &&
+    libraryState.includes('"compress_archive"'),
+  "Library Compress to ZIP must be provider-owned, capability-gated, cache-invalidating, and available for single objects and same-folder selections",
+);
+assert(
+  archiveManagerManifest.includes('"name": "archive-manager"') &&
+    archiveManagerManifest.includes('"role": "viewer"') &&
+    archiveManager.includes("ElastOS Archive") &&
+    archiveManager.includes("/api/viewers/archive-manager/library-object") &&
+    archiveManager.includes('url.searchParams.set("stat_only", "true")') &&
+    archiveManager.includes('url.searchParams.set("entries", "true")') &&
+    archiveManager.includes("/api/viewers/archive-manager/library-roots") &&
+    archiveManager.includes('url.searchParams.set("preview_entry", path)') &&
+    archiveManager.includes("Archive Contents") &&
+    archiveManager.includes("Extract Selected") &&
+    archiveManager.includes("Select all safe") &&
+    archiveManager.includes("Invert") &&
+    archiveManager.includes("Cancel pending") &&
+    archiveManager.includes("handleEntryKeyboard") &&
+    archiveManager.includes("Provider preview loaded.") &&
+    archiveManager.includes("async function extractSelectedEntries()") &&
+    archiveManager.includes("async function cancelPendingExtract()") &&
+    archiveManager.includes("async function selectPreviewEntry(path)") &&
+    archiveManager.includes("renderEntries()") &&
+    archiveManager.includes("Extraction is policy-gated") &&
+    objectProviderImpl.includes("LIBRARY_ARCHIVE_ENTRIES_SCHEMA") &&
+    objectProviderImpl.includes("LIBRARY_ARCHIVE_EXTRACT_ENTRIES_SCHEMA") &&
+    objectProviderImpl.includes("LIBRARY_ARCHIVE_PREVIEW_ENTRY_SCHEMA") &&
+    objectProviderImpl.includes("MAX_ARCHIVE_LIST_ENTRIES") &&
+    objectProviderImpl.includes("MAX_ARCHIVE_PREVIEW_BYTES") &&
+    objectProviderImpl.includes("ArchiveEntries {") &&
+    objectProviderImpl.includes("ArchivePreviewEntry {") &&
+    objectProviderImpl.includes("ArchiveExtractEntries {") &&
+    objectProviderImpl.includes("fn library_archive_entries(") &&
+    objectProviderImpl.includes("fn archive_preview_entry(") &&
+    objectProviderImpl.includes("fn archive_preview_entry_for_object(") &&
+    objectProviderImpl.includes("fn preview_zip_archive_entry(") &&
+    objectProviderImpl.includes("fn preview_tar_archive_entry(") &&
+    objectProviderImpl.includes("fn extract_library_archive_entries(") &&
+    objectProviderImpl.includes("fn extract_archive_entries_to_webspace_destination(") &&
+    objectProviderImpl.includes("fn ensure_webspace_archive_write_allowed(") &&
+    objectProviderImpl.includes("fn webspace_archive_object(") &&
+    objectProviderImpl.includes("resolver_target_redacted") &&
+    objectProviderImpl.includes("enum ArchiveConflictPolicy") &&
+    objectProviderImpl.includes("fn normalized_archive_entry_path(") &&
+    objectProviderImpl.includes('vec!["archive-manager"]') &&
+    objectProviderImpl.includes('"archive-manager" => "Archive"') &&
+    viewerGatewayApi.includes("stat_only") &&
+    viewerGatewayApi.includes("entries: bool") &&
+    viewerGatewayApi.includes("preview_entry: Option<String>") &&
+    viewerGatewayApi.includes('"archive_entries"') &&
+    viewerGatewayApi.includes('"archive_preview_entry"') &&
+    viewerGatewayApi.includes('"archive_extract_entries"') &&
+    viewerGatewayApi.includes("viewer_library_roots_get") &&
+    viewerGatewayApi.includes("viewer_library_object_post") &&
+    viewerGatewayApi.includes("ensure_viewer_can_view_library_object") &&
+    viewerGatewayApi.includes("handle_object_provider_runtime_request") &&
+    viewerGatewayApi.includes("viewer supports Library object metadata only") &&
+    viewerGatewayApi.includes("viewer does not support Library object writes") &&
+    libraryActions.includes("query.archiveSupport = JSON.stringify") &&
+    libraryActions.includes("contentCid(object)") &&
+    libraryApp.includes('viewer?.id === "archive-manager"') &&
+    libraryMenuSmoke.includes("Legacy.7z") &&
+    libraryMenuSmoke.includes("archive_entries") &&
+    libraryMenuSmoke.includes("archive_preview_entry") &&
+    libraryMenuSmoke.includes("archive_extract_entries") &&
+    libraryMenuSmoke.includes("Nested/deep.txt") &&
+    libraryMenuSmoke.includes("#destination-roots") &&
+    libraryMenuSmoke.includes("#entry-preview") &&
+    libraryMenuSmoke.includes("#select-all-safe") &&
+    libraryMenuSmoke.includes("#cancel-extract") &&
+    libraryMenuSmoke.includes("#extract-status") &&
+    libraryMenuSmoke.includes("policy_gated_unsupported_archive_family") &&
+    libraryMenuSmoke.includes('message?.target === "archive-manager"') &&
+    libraryGatewayTests.includes("/api/viewers/archive-manager/library-object?uri=") &&
+    libraryGatewayTests.includes("test_library_provider_lists_supported_archive_entries_through_viewer_route") &&
+    libraryGatewayTests.includes("test_library_provider_lists_unsafe_archive_entries_as_blocked") &&
+    libraryGatewayTests.includes("test_library_provider_selectively_extracts_archive_entries_through_viewer_route") &&
+    libraryGatewayTests.includes("test_library_provider_selective_extract_blocks_unsafe_entries") &&
+    libraryGatewayTests.includes("test_library_gateway_lists_external_webspace_archive_entries_without_resolver_leak") &&
+    libraryGatewayTests.includes("test_library_gateway_imports_external_webspace_archive_entries_to_local_library") &&
+    libraryGatewayTests.includes("test_library_gateway_webspace_archive_writeback_requires_mutable_write_adapter") &&
+    libraryGatewayTests.includes("elastos.library.archive-preview-entry/v1") &&
+    libraryGatewayTests.includes("/api/viewers/archive-manager/library-roots") &&
+    libraryGatewayTests.includes("/api/provider/object/archive_preview_entry") &&
+    libraryGatewayTests.includes("resolver_target_redacted") &&
+    libraryGatewayTests.includes("mutable destination Space") &&
+    libraryGatewayTests.includes("elastos.library.archive-entries/v1") &&
+    libraryGatewayTests.includes("elastos.library.archive-extract-entries/v1") &&
+    libraryGatewayTests.includes("StatusCode::FORBIDDEN") &&
+    archivePolicyDoc.includes("No generic non-tar/non-zip family is approved in this branch") &&
+    archivePolicyDoc.includes(".7z") &&
+    archivePolicyDoc.includes(".rar") &&
+    archivePolicyDoc.includes("Unsupported families remain visible as policy-gated archives"),
+  "Archive must provide an installed viewer shell, stat-only/archive-entry/preview/root viewer routes, supported-family browsing, preview, selective extraction, policy-gated unsupported archive UX, conflict/cancel receipts, policy documentation, and no direct viewer provider access or unsafe extraction",
+);
+assert(
+  gatewayApi.includes("HOME_DESKTOP_OBJECTS_SCHEMA") &&
+    gatewayApi.includes("home_desktop_objects_summary") &&
+    gatewayApi.includes("home_desktop_events_signature") &&
+    gatewayApi.includes('registry.send_raw("object", &request).await') &&
+    gatewayApi.includes('"op": "list"') &&
+    gatewayApi.includes('"op": "events"') &&
+    gatewayApi.includes('"uri": uri'),
+  "Home desktop must project localhost://Users/self/Desktop through the registered object provider, not direct filesystem access or server-local helpers",
+);
+assert(
+  shellCore.includes("function desktopObjects(summary)") &&
+    shellCore.includes("function desktopObjectEntryId(object)") &&
+    shellCore.includes("function desktopLayoutEntries(summary)"),
+  "Home layout state must treat Library Desktop objects as first-class desktop entries",
+);
+assert(
+  shellSurface.includes("attachDesktopObjectInteractions") &&
+    shellSurface.includes("export function openSelectedDesktopEntry()") &&
+    shellSurface.includes('openTarget("library", { query: { uri: object.uri } })') &&
+    shellSurface.includes("desktopObjectViewer(object)") &&
+    shellSurface.includes('openTarget(viewer,') &&
+    shellSurface.includes('objectUri: object.uri') &&
+    shellSurface.includes("function desktopObjectContextMenuItems(target)") &&
+    shellSurface.includes('action: "open-desktop-object-new-window"') &&
+    shellSurface.includes('action: "download-desktop-object"') &&
+    shellSurface.includes('action: "properties-desktop-object"') &&
+    shellSurface.includes("function libraryActionForObject(object, action)") &&
+    shellSurface.includes('action === "download-desktop-object" ? "download" : "properties"') &&
+    shellJs.includes("openSelectedDesktopEntry()") &&
+    !shellJs.includes("openTarget(shellState.selectedDesktopTargetId)"),
+  "Home desktop objects must open and expose object actions through Library/Documents orchestration",
+);
+assert(
+  libraryState.includes("initialObjectUri: queryParams.get(\"objectUri\")") &&
+    libraryState.includes("initialAction: queryParams.get(\"action\")") &&
+    libraryState.includes("initialActionHandled: false") &&
+    libraryApp.includes("async function runInitialObjectAction()") &&
+    libraryApp.includes("const object = objectByUri(state.initialObjectUri)") &&
+    libraryApp.includes("state.currentObject?.uri === state.initialObjectUri") &&
+    libraryApp.includes('state.initialAction === "properties"') &&
+    libraryApp.includes('state.initialAction === "download"') &&
+    libraryApp.includes("await downloadObject(object)"),
+  "Library must accept Home-delegated object actions by launch query without moving object-provider authority into Home",
+);
+assert(
+  shellJs.includes("desktopObjectsChanged(previous, summary)") &&
+    shellJs.includes('kind === "home.desktop.changed"'),
+  "Home shell must refresh when Library Desktop objects change",
+);
+assert(
+  libraryApp.includes('menuAction("Open With", null') &&
+    libraryApp.includes("children: viewers.map") &&
+    libraryApp.includes('menuAction("Sort By", null') &&
+    libraryApp.includes('menuAction("Name"') &&
+    libraryApp.includes('menuAction("Date Modified"') &&
+    libraryApp.includes('menuAction("New", null') &&
+    libraryApp.includes('menuAction("Folder"') &&
+    libraryApp.includes('menuAction("Show Hidden"') &&
+    libraryApp.includes("library.showHidden") &&
+    libraryApp.includes('menuAction("Paste Into Folder"') &&
+    libraryApp.includes('menuAction("Properties"') &&
+    libraryApp.includes('menuAction("Delete"') &&
+    libraryApp.includes('if (canPasteInto(state.currentUri)) actions.push(menuAction("Paste"') &&
+    libraryMenu.includes('if (!menuActions.length)') &&
+    !libraryApp.includes('menuAction("Undo"') &&
+    !libraryApp.includes("Copy Runtime URI") &&
+    !libraryApp.includes("Get Info") &&
+    !/[⌘⌫⇧]/.test(library) &&
+    !/(Apple|Finder|-apple|BlinkMac|SF Pro)/.test(library),
+  "Library context menus must use clear file-manager labels without platform-branded shortcuts",
+);
+assert(
+  libraryDialog.includes("properties-card") &&
+    libraryDialog.includes("window-item-properties") &&
+    libraryDialog.includes("item-props-tabview") &&
+    libraryDialog.includes("item-props-tab-btn") &&
+    libraryDialog.includes("item-props-tab-content") &&
+    libraryDialog.includes("item-props-tbl") &&
+    libraryDialog.includes('data-tab="general"') &&
+    libraryDialog.includes('data-tab="runtime"') &&
+    libraryDialog.includes("propertiesPanel(\"general\"") &&
+    libraryDialog.includes("propertiesPanel(\"runtime\"") &&
+    libraryDialog.includes("propertiesPanel(\"archive\"") &&
+    libraryDialog.includes("smartWebIdentity") &&
+    libraryDialog.includes("safeAvailabilitySummary") &&
+    libraryDialog.includes("safePublishReceiptSummary") &&
+    libraryDialog.includes("safeShareReceiptSummary") &&
+    libraryDialog.includes("Published CID") &&
+    libraryDialog.includes("Published Link") &&
+    libraryDialog.includes("publishedCid(object)") &&
+    libraryDialog.includes("propertiesVisibilitySummary") &&
+    libraryDialog.includes("copyableValue(identity.contentId") &&
+    libraryDialog.includes("data-prop-copy") &&
+    libraryDialog.includes("props-copy-btn") &&
+    libraryDialog.includes("item-prop-badge") &&
+    libraryDialog.includes("Availability Summary") &&
+    libraryDialog.includes("Publish Receipt Summary") &&
+    libraryDialog.includes("Share Receipt Summary") &&
+    !libraryDialog.includes("Availability Receipt") &&
+    !libraryDialog.includes("Share Receipt</strong>") &&
+    !libraryDialog.includes("item-props-tab-btn-versions") &&
+    libraryDialog.includes("Resolver Target") &&
+    libraryCss.includes(".window-item-properties") &&
+    libraryCss.includes(".item-props-tab-content-selected") &&
+    libraryCss.includes(".item-prop-label") &&
+    libraryCss.includes(".item-prop-val") &&
+    libraryCss.includes(".props-copy-btn") &&
+    libraryCss.includes(".item-prop-badge") &&
+    !libraryCss.includes(".properties-hero") &&
+    !libraryCss.includes(".properties-icon"),
+  "Library Properties must render a compact tabbed property table instead of a wide diagnostic metadata grid",
+);
+assert(
+  objectProviderImpl.includes("published_cid: Option<String>") &&
+    objectProviderImpl.includes("fn raw_sha256_cid(") &&
+    objectProviderImpl.includes("\"current_cid\"") &&
+    libraryApp.includes("publishedCid(object)") &&
+    libraryApp.includes("Copy Published Link") &&
+    libraryApp.includes("Copy Content CID") &&
+    libraryActions.includes("publishedCid(object)") &&
+    libraryMenuSmoke.includes("SMOKE_LOCAL_CONTENT_CID") &&
+    libraryMenuSmoke.includes("SMOKE_PUBLISHED_CID"),
+  "Library object model must separate current file-byte content_cid from published_cid/public elastos:// links",
+);
+assert(
+  fileManagerMigrationDoc.includes("Local mutable storage") &&
+    fileManagerMigrationDoc.includes("CID is content identity, not a storage-location guarantee") &&
+    fileManagerMigrationDoc.includes("Private files are SmartWeb object heads") &&
+    todayLibraryTracker.includes("Library object identity is split deliberately") &&
+    todayLibraryTracker.includes("current immutable raw-byte `content_cid`") &&
+    todayLibraryTracker.includes("public `elastos://` links use `published_cid`"),
+  "Docs must explain that local files are provider-owned mutable storage with CIDs, while published_cid is the public SmartWeb availability identity",
+);
+assert(
+  libraryApi.includes("/api/provider/object/upload") &&
+    libraryApi.includes("/api/provider/object/upload/start") &&
+    libraryApi.includes("/api/provider/object/upload/${encodeURIComponent(uploadId)}/chunk") &&
+    libraryApi.includes("CHUNKED_UPLOAD_THRESHOLD_BYTES") &&
+    libraryApi.includes("CHUNKED_UPLOAD_BYTES") &&
+    libraryApi.includes("uploadFailureMessage") &&
+    libraryApi.includes("public gateway body-size limit") &&
+    !libraryApi.includes("/api/provider/library/upload"),
+  "Library upload must use object-provider upload only, use chunk sessions for large files, and explain edge-proxy 413 body-size failures",
+);
+assert(
+  library.includes("elements.statusText.classList.toggle(\"hidden\", !text)") &&
+    libraryMenuSmoke.includes("public gateway body-size limit"),
+  "Library status messages, including upload body-size failures, must be visible to users",
+);
+assert(
+  libraryMenuSmoke.includes("/api/provider/object/") &&
+    libraryMenuSmoke.includes("/api/provider/object/upload/start") &&
+    libraryMenuSmoke.includes("LargeVideo.mp4") &&
+    libraryMenuSmoke.includes("http-chunk-session") &&
+    !libraryMenuSmoke.includes("/api/provider/library/"),
+  "Library menu smoke must exercise canonical object-provider routes without retired library-provider fallback paths",
+);
+assert(
+  !library.includes("moveObjectWithPrompt") &&
+    !library.includes("copyObjectWithPrompt") &&
+    !library.includes("window.prompt") &&
+    !library.includes("window.confirm") &&
+    !library.includes("Restore to URI") &&
+    !library.includes("repairSelectedObjects") &&
+    !library.includes("Repair availability"),
+  "Library must not ship browser-native prompts/confirms, raw create/move/copy/restore prompts, or repair-only implementation leftovers",
+);
+assert(
+  !libraryIndex.includes('id="selection-actions"') &&
+    !library.includes("renderSelectionActions") &&
+    !library.includes("data-selection-action"),
+  "Library must keep actions in the file right-click menu, not a disruptive selection strip",
+);
+assert(
+  libraryApp.includes("function activeRootForUri(uri)") &&
+    libraryApp.includes(".sort((left, right) => right.uri.length - left.uri.length)") &&
+    libraryApp.includes('sidebar: document.querySelector(".sidebar")') &&
+    libraryApp.includes("function orderRoots(roots)") &&
+    libraryApp.includes("function reorderPlace(sourceRootId, targetRootId") &&
+    libraryApp.includes("localStorage.setItem(\"library.sidebarOrder\"") &&
+    libraryState.includes("sidebarOrder: readStoredStringArray(storage.getItem(\"library.sidebarOrder\"))") &&
+    libraryApp.includes("function showPlaceMenu(uri, x, y)") &&
+    libraryApp.includes('menuAction("Open in New Window", () => openTarget("library", { uri: root.uri }))') &&
+    libraryEvents.includes('elements.sidebar?.addEventListener("contextmenu"') &&
+    libraryEvents.includes('elements.places.addEventListener("contextmenu"') &&
+    libraryEvents.includes('application/x-elastos-library-root-id') &&
+    libraryEvents.includes("markPlaceDropTarget(elements, button, event)") &&
+    libraryEvents.includes("showPlaceMenu(button.dataset.uri, event.clientX, event.clientY)") &&
+    libraryEvents.includes("event.stopPropagation();\n    hideMenu();") &&
+    libraryCss.includes(".place.window-sidebar-item-dragging") &&
+    libraryCss.includes(".place[data-drop-position=\"before\"]"),
+  "Library sidebar must suppress browser right-click on chrome, expose Open/Open in New Window on place items, persist user root ordering, and mark only the most specific active place",
+);
+assert(
+  libraryRender.includes('const badgesMarkup = badges ? `<span class="badges">${badges}</span>` : "";') &&
+    libraryCss.includes("grid-template-rows: 45px auto 18px;") &&
+    libraryCss.includes('.content[data-view="grid"] .badges') &&
+    libraryCss.includes('.content[data-view="list"] .badges') &&
+    !libraryCss.includes(".badges {\n      position: absolute") &&
+    !libraryCss.includes(".content[data-view=\"list\"] .badges {\n      display: none;"),
+  "Library Published/blocked/trash badges must be layout participants and remain visible in list view instead of overlaying icons or disappearing",
+);
+assert(
+  libraryRender.includes('elements.content.dataset.empty = "true"') &&
+    libraryRender.includes('class="empty-inner"') &&
+    libraryCss.includes('.content[data-empty="true"]') &&
+    libraryRender.includes("No connected spaces") &&
+    libraryRender.includes("Provider-backed spaces") &&
+    libraryRender.includes("writable spaces use provider-owned storage") &&
+    libraryActions.includes("This Space is read-only.") &&
+    !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
+  "Library empty Spaces states must be centered and explicit instead of rendering a cramped generic folder message",
+);
+assert(
+  ['"refresh"', '"cache"', '"sync"'].every((op) => webspaceProvider.includes(op)) &&
+    webspaceProvider.includes("Refresh {") &&
+    webspaceProvider.includes("Cache {") &&
+    webspaceProvider.includes("Sync {") &&
+    webspaceProvider.includes("fn refresh_handle(") &&
+    webspaceProvider.includes("fn cache_handle(") &&
+    webspaceProvider.includes("fn sync_handle(") &&
+    webspaceProvider.includes("elastos.webspace.refresh-receipt/v1") &&
+    webspaceProvider.includes("elastos.webspace.cache-receipt/v1") &&
+    webspaceProvider.includes("elastos.webspace.sync-receipt/v1") &&
+    webspaceProvider.includes("refresh_replaces_index_and_persists_refreshed_head") &&
+    webspaceProvider.includes("sync_clears_dirty_fork_head_without_claiming_byte_sync") &&
+    webspaceCmd.includes("async fn refresh(") &&
+    webspaceCmd.includes("async fn cache(") &&
+    webspaceCmd.includes("async fn sync(") &&
+    serverMain.includes("Refresh {") &&
+    serverMain.includes("Cache {") &&
+    serverMain.includes("Sync {"),
+  "WebSpace provider must expose real provider-owned refresh/cache/sync lifecycle operations and CLI verbs instead of only static head/status metadata",
+);
+assert(
+  webspaceProvider.includes('"health"') &&
+    webspaceProvider.includes("Health {") &&
+    webspaceProvider.includes("fn health_report(") &&
+    webspaceProvider.includes("fn health_for_handle(") &&
+    webspaceProvider.includes("elastos.webspace.health/v1") &&
+    webspaceProvider.includes("elastos.webspace.resolver-health/v1") &&
+    webspaceProvider.includes(
+      "health_reports_external_resolver_attention_and_metadata_readiness",
+    ) &&
+    webspaceProvider.includes("dirty_head_count") &&
+    webspaceCmd.includes("async fn health(") &&
+    webspaceCmd.includes("WebSpace health:") &&
+    serverMain.includes("Health {"),
+  "WebSpace provider must expose resolver health as a provider/CLI contract with metadata-ready, mounted-no-index, and dirty-head coverage",
+);
+assert(
+  ['"write"', '"mkdir"', '"delete"'].every((op) => webspaceProvider.includes(op)) &&
+    webspaceProvider.includes("OBJECT_TABLE_SCHEMA") &&
+    webspaceProvider.includes("struct WebSpaceObject") &&
+    webspaceProvider.includes("fn write_handle(") &&
+    webspaceProvider.includes("fn mkdir_handle(") &&
+    webspaceProvider.includes("fn delete_handle(") &&
+    webspaceProvider.includes("materialized_object_handle") &&
+    webspaceProvider.includes("elastos.webspace.write-receipt/v1") &&
+    webspaceProvider.includes("elastos.webspace.mkdir-receipt/v1") &&
+    webspaceProvider.includes("elastos.webspace.delete-receipt/v1") &&
+    webspaceProvider.includes("DEFAULT_MUTABLE_ACCESS_POLICY") &&
+    webspaceProvider.includes("mutable_mount_materializes_objects_and_persists_them") &&
+    objectProviderImpl.includes("async fn webspace_write_bytes(") &&
+    objectProviderImpl.includes("async fn webspace_mkdir(") &&
+    objectProviderImpl.includes("async fn webspace_delete_permanently(") &&
+    objectProviderImpl.includes("handle_library_upload_bytes_runtime") &&
+    gatewayProviderProxy.includes("handle_library_upload_bytes_runtime") &&
+    libraryGatewayTests.includes(
+      "test_library_gateway_mutates_writable_webspace_through_runtime_provider",
+    ),
+  "WebSpace provider and Library gateway must support local materialized mutable WebSpace objects without exposing raw resolver authority",
+);
+assert(
+  providerRegistry.includes("fn apply_provider_byte_range(") &&
+    providerRegistry.includes("fn apply_provider_stream_response(") &&
+    providerRegistry.includes("fn decode_provider_stream_payload(") &&
+    providerRegistry.includes('const PROVIDER_STREAM_SCHEMA: &str = "elastos.provider.stream/v1"') &&
+    providerRegistry.includes('const PROVIDER_STREAM_ENCODING: &str = "base64-chunks"') &&
+    providerRegistry.includes("fn attach_provider_invocation_envelope(") &&
+    providerRegistry.includes("elastos.provider.invocation/v1") &&
+    providerRegistry.includes("runtime-local-provider-plane") &&
+    providerRegistry.includes("carrier-provider-plane") &&
+    providerRegistry.includes("struct ProviderCarrierRoute") &&
+    providerRegistry.includes("enum ProviderInvocationTransport") &&
+    providerRegistry.includes("trait ProviderCarrierInvoker") &&
+    providerRegistry.includes("set_carrier_invoker") &&
+    providerRegistry.includes("provider_carrier_route_receipt") &&
+    providerRegistry.includes("route.peer_did.as_deref()") &&
+    providerRegistry.includes(
+      "Carrier provider invocation requires registered Carrier invoker",
+    ) &&
+    providerRegistry.includes("fn provider_invocation_capability(") &&
+    providerRegistry.includes("provider byte range requires response data.data base64 payload") &&
+    providerRegistry.includes("provider stream expected {expected} bytes") &&
+    providerRegistry.includes("provider stream chunk index mismatch") &&
+    providerRegistry.includes("base64::engine::general_purpose::STANDARD") &&
+    providerRegistry.includes("provider byte range expected {expected} bytes") &&
+    providerRegistry.includes("provider invocation request must not predeclare runtime field") &&
+    providerRegistry.includes('response["data"]["runtime_invocation"]["schema"]') &&
+    providerRegistry.includes('response["_runtime_transfer"]["capability"]') &&
+    providerRegistry.includes('response["_runtime_transfer"]["transport"]') &&
+    providerRegistry.includes("test_provider_invocation_attaches_range_progress_transfer_receipt") &&
+    providerRegistry.includes('assert_eq!(sliced, b"abcdefghij");') &&
+    providerRegistry.includes(
+      "test_provider_invocation_stream_normalizes_range_progress_transfer_receipt",
+    ) &&
+    providerRegistry.includes("test_provider_invocation_rejects_malformed_stream_payload") &&
+    providerRegistry.includes("test_provider_invocation_rejects_predeclared_runtime_metadata") &&
+    providerRegistry.includes("test_provider_invocation_carrier_routes_through_registered_invoker") &&
+    providerRegistry.includes("test_provider_invocation_carrier_requires_registered_invoker"),
+  "Runtime provider invocation must send typed source/target/capability envelopes to target providers, enforce byte-range and stream receipts, expose Carrier provider-plane transport, and reject malformed provider stream payloads",
+);
+assert(
+  carrierRuntime.includes('"provider_invoke"') &&
+    carrierRuntime.includes("MAX_CARRIER_REPLICATION_CANDIDATES") &&
+    carrierRuntime.includes("MAX_CARRIER_AVAILABILITY_TICKET_LEN") &&
+    carrierRuntime.includes("MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN") &&
+    carrierRuntime.includes("struct CarrierAvailabilityRequirements") &&
+    carrierRuntime.includes("struct CarrierReplicationProof") &&
+    carrierRuntime.includes("remote_receipt: Option<serde_json::Value>") &&
+    carrierRuntime.includes("carrier_provider_invoke_registry") &&
+    carrierRuntime.includes("validate_carrier_provider_invocation") &&
+    carrierRuntime.includes("decode_carrier_provider_stream_payload") &&
+    carrierRuntime.includes("remote_content_provider_response_bytes") &&
+    carrierRuntime.includes("remote_content_receipt_peer_selection_summary") &&
+    carrierRuntime.includes("remote_content_receipt_peer_selection_replicas_summary") &&
+    carrierRuntime.includes("remote_content_receipt_accounting_summary") &&
+    carrierRuntime.includes("remote_content_receipt_abuse_controls_summary") &&
+    carrierRuntime.includes("carrier_provider_target_allowed") &&
+    carrierRuntime.includes("fetch_content_via_carrier_provider_invocation") &&
+    carrierRuntime.includes("ensure_content_via_carrier_provider_invocation") &&
+    carrierRuntime.includes("import_content_via_carrier_provider_invocation") &&
+    carrierRuntime.includes("import_object_content_via_carrier_provider_invocation") &&
+    carrierRuntime.includes("import_exact_content_via_carrier_provider_invocation") &&
+    carrierRuntime.includes("MAX_CARRIER_OBJECT_IMPORT_FILES") &&
+    carrierRuntime.includes("MAX_CARRIER_OBJECT_IMPORT_BYTES") &&
+    carrierRuntime.includes("remote_content_receipt_summary") &&
+    carrierRuntime.includes("content_availability_replicas") &&
+    carrierRuntime.includes("carrier_replica_candidate_score") &&
+    carrierRuntime.includes("CarrierPeerReputation") &&
+    carrierRuntime.includes("CarrierPeerReputationStore") &&
+    carrierRuntime.includes("carrier_reputation_score") &&
+    carrierRuntime.includes("carrier-peer-reputation.json") &&
+    carrierRuntime.includes("with_provider_registry_and_data_dir") &&
+    carrierRuntime.includes("save_carrier_peer_reputation") &&
+    carrierRuntime.includes("content_availability_replicas_with_reputation") &&
+    carrierRuntime.includes('"selection_reason"') &&
+    carrierRuntime.includes('"local_reputation"') &&
+    carrierRuntime.includes('"replica_summary_limit"') &&
+    carrierRuntime.includes('"replicas_truncated"') &&
+    carrierRuntime.includes("carrier_peer_selection_json") &&
+    carrierRuntime.includes("carrier_provider_quota") &&
+    carrierRuntime.includes("carrier_abuse_controls_json") &&
+    carrierRuntime.includes("carrier_remote_candidate_limit") &&
+    carrierRuntime.includes('["remote_receipt"]["abuse_controls"]') &&
+    carrierRuntime.includes('"requirements_exceed_quota"') &&
+    carrierRuntime.includes('"effective_max_replicas"') &&
+    carrierRuntime.includes('"carrier_provider_invocation_guardrail"') &&
+    carrierRuntime.includes("test_carrier_quota_marks_impossible_replica_requirements") &&
+    carrierRuntime.includes(
+      "test_carrier_remote_candidate_limit_keeps_live_multi_peer_requirement",
+    ) &&
+    carrierRuntime.includes("carrier_provider_replication") &&
+    carrierRuntime.includes('"remote_receipt"') &&
+    carrierRuntime.includes('"storage_quota_status"') &&
+    carrierRuntime.includes('"content_bytes"') &&
+    carrierRuntime.includes('"local_only": true') &&
+    carrierRuntime.includes('"transfer": "stream"') &&
+    carrierRuntime.includes("ProviderTransfer::Stream") &&
+    carrierRuntime.includes('"carrier_provider_invoke"') &&
+    carrierRuntime.includes('"content" | "availability" | "rights" | "key" | "decrypt" | "drm"') &&
+    carrierRuntime.includes("CarrierProviderInvoker") &&
+    carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
+    carrierRuntime.includes("invoke_provider(") &&
+    carrierRuntime.includes("carrier_endpoint_matches_peer") &&
+    carrierRuntime.includes("provider_invoke carrier metadata must not expose connect_ticket") &&
+    carrierRuntime.includes("test_carrier_provider_invoke_dispatches_runtime_enveloped_request") &&
+    carrierRuntime.includes("test_carrier_provider_invoke_accepts_stream_contract_metadata") &&
+    carrierRuntime.includes("test_carrier_provider_invoke_rejects_stream_without_contract_metadata") &&
+    carrierRuntime.includes("test_carrier_provider_invoke_rejects_raw_backend_target") &&
+    carrierRuntime.includes("test_carrier_availability_fetch_uses_provider_invocation_transport") &&
+    carrierRuntime.includes("test_carrier_replication_proof_uses_remote_content_provider_invocation") &&
+    carrierRuntime.includes("test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails") &&
+    carrierRuntime.includes("test_carrier_replication_prefers_object_import_when_manifest_exists") &&
+    carrierRuntime.includes("test_carrier_availability_ensure_proves_remote_replica_via_provider_plane") &&
+    carrierRuntime.includes(
+      "test_carrier_availability_requires_remote_attempt_for_live_proof_when_min_met",
+    ) &&
+    carrierRuntime.includes("test_carrier_peer_selection_proof_redacts_connect_tickets") &&
+    carrierRuntime.includes(
+      "test_remote_content_receipt_peer_selection_summary_redacts_replica_rows",
+    ) &&
+    carrierRuntime.includes(
+      "test_remote_content_receipt_peer_selection_summary_marks_truncated_rows",
+    ) &&
+    carrierRuntime.includes("test_content_availability_replicas_are_scored_and_sorted") &&
+    carrierRuntime.includes("test_content_availability_replicas_apply_local_runtime_reputation") &&
+    carrierRuntime.includes("test_carrier_peer_reputation_persists_local_history") &&
+    carrierRuntime.includes("test_content_availability_replicas_ignore_signed_repair_only_announcements") &&
+    carrierRuntime.includes("test_content_availability_replicas_ignore_oversized_candidate_metadata") &&
+    carrierRuntime.includes('remote_transfer["transfer"], "stream"') &&
+    serverInfra.includes("set_carrier_invoker") &&
+    serverInfra.includes("CarrierAvailabilityProvider::with_provider_registry") &&
+    serverInfra.includes("CarrierProviderInvoker::new()") &&
+    serverInfra.includes("maybe_spawn_content_repair_scheduler") &&
+    serverInfra.includes("ELASTOS_CONTENT_REPAIR_SCHEDULER") &&
+    serverInfra.includes("invoke_content_repair_worker(") &&
+    serverInfra.includes("content_repair_scheduler_config_clamps_operator_env") &&
+    serverInfra.includes("content_repair_scheduler_is_opt_in"),
+  "Carrier provider invocation must be Runtime-mediated over provider_invoke, service-provider-only, Stream-contract validated for Carrier availability fetch, registered only with the built-in Carrier node, prove remote replicas through remote content/ensure+status, enforce bounded peer-selection/quota metadata, ignore repair-only announcements as candidates, provide an opt-in bounded content repair scheduler, and must not leak raw connect tickets",
+);
+assert(
+  contentProvider.includes("struct AvailabilityRequirements") &&
+    contentProvider.includes("struct ContentRepairTask") &&
+    contentProvider.includes("struct ContentFetchTransfer") &&
+    contentProvider.includes("IMPORT_EXACT_MAX_BYTES") &&
+    contentProvider.includes("IMPORT_OBJECT_MAX_FILES") &&
+    contentProvider.includes("AVAILABILITY_DASHBOARD_SCHEMA") &&
+    contentProvider.includes("CONTENT_ACCOUNTING_SCHEMA") &&
+    contentProvider.includes("CONTENT_STORAGE_QUOTA_SCHEMA") &&
+    contentProvider.includes("CONTENT_ABUSE_CONTROLS_SCHEMA") &&
+    contentProvider.includes("REPAIR_TASK_SCHEMA") &&
+    contentProvider.includes("REPAIR_WORKER_RUN_SCHEMA") &&
+    contentProvider.includes("REPAIR_WORKER_ABUSE_CONTROLS_SCHEMA") &&
+    contentProvider.includes("REPAIR_WORKER_DEFAULT_MAX_ATTEMPTS") &&
+    contentProvider.includes('"repair_worker"') &&
+    contentProvider.includes("fn record_repair_task(") &&
+    contentProvider.includes("fn availability_dashboard(") &&
+    contentProvider.includes("fn availability_quota_status(") &&
+    contentProvider.includes("fn content_accounting_json(") &&
+    contentProvider.includes("fn content_accounting_observation_from_publish_request(") &&
+    contentProvider.includes("fn content_accounting_from_previous_or_unknown(") &&
+    contentProvider.includes("fn local_abuse_controls_json(") &&
+    contentProvider.includes("fn provider_abuse_controls_json(") &&
+    contentProvider.includes('"verified_remote_receipts"') &&
+    contentProvider.includes('"recent_remote_replicas"') &&
+    contentProvider.includes('"recent_remote_replica_limit"') &&
+    contentProvider.includes('"recent_remote_replicas_truncated"') &&
+    contentProvider.includes('"local_reputation"') &&
+    contentProvider.includes('"local_runtime"') &&
+    contentProvider.includes('"replica_bytes_estimate"') &&
+    contentProvider.includes('"storage_quota_policy"') &&
+    contentProvider.includes('"abuse_controls"') &&
+    contentProvider.includes('dashboard["data"]["proofs"]["live_multi_peer"]') &&
+    contentProvider.includes('dashboard["data"]["quota"]["by_status"]["within_quota"]') &&
+    contentProvider.includes("async fn run_repair_worker(") &&
+    contentProvider.includes("fn validate_repair_worker_invocation(") &&
+    contentProvider.includes("repair-tasks.jsonl") &&
+    contentProvider.includes("fn provider_transfer_value(") &&
+    contentProvider.includes("async fn import_exact(") &&
+    contentProvider.includes("async fn import_object(") &&
+    contentProvider.includes("fn validate_import_exact_invocation(") &&
+    contentProvider.includes("fn validate_import_object_invocation(") &&
+    contentProvider.includes("fn validate_import_object_payload_bounds(") &&
+    contentProvider.includes("fn validate_runtime_invocation_fields(") &&
+    contentProvider.includes("fn provider_stream_payload_bytes(") &&
+    contentProvider.includes("fn validate_network_availability_claim(") &&
+    contentProvider.includes("content_repair_worker_guardrail") &&
+    contentProvider.includes("runtime_invocation_required") &&
+    contentProvider.includes('"requirements": requirements.to_json()') &&
+    contentProvider.includes('ProviderTransfer::Stream =>') &&
+    contentProvider.includes('content fetch transfer must be bytes or stream') &&
+    contentProvider.includes('fn provider_response_stream(') &&
+    contentProvider.includes("content_fetch_propagates_range_progress_transfer_receipt") &&
+    contentProvider.includes("content_fetch_stream_returns_provider_stream_payload") &&
+    contentProvider.includes("content_fetch_ranges_availability_provider_when_local_backend_misses") &&
+    contentProvider.includes(
+      "content_fetch_stream_ranges_availability_provider_when_local_backend_misses",
+    ) &&
+    contentProvider.includes("content_fetch_local_only_skips_availability_provider") &&
+    contentProvider.includes("multi-peer availability requires live_multi_peer_proof=true") &&
+    contentProvider.includes("network availability peer_selection requires mode or strategy") &&
+    contentProvider.includes("Carrier availability announcement requires a topic") &&
+    contentProvider.includes("content_publish_rejects_unproven_multi_peer_availability_claim") &&
+    contentProvider.includes("content_publish_requires_peer_selection_policy_metadata") &&
+    contentProvider.includes("content_publish_records_local_only_repair_task") &&
+    contentProvider.includes("content_import_exact_accepts_matching_cid_stream") &&
+    contentProvider.includes("content_import_exact_rejects_cid_mismatch_and_unpins_import") &&
+    contentProvider.includes("content_import_exact_requires_runtime_provider_invocation") &&
+    contentProvider.includes("content_import_object_requires_runtime_provider_invocation") &&
+    contentProvider.includes("content_import_object_reconstructs_manifest_directory") &&
+    contentProvider.includes('"carrier_object_import"') &&
+    contentProvider.includes('status["data"]["accounting"]["content_bytes"]') &&
+    contentProvider.includes("content_repair_worker_requires_runtime_provider_invocation") &&
+    contentProvider.includes("content_repair_worker_retries_queued_availability_task") &&
+    contentProvider.includes("content_repair_worker_enforces_attempt_budget") &&
+    contentProvider.includes("content_status_without_cid_returns_availability_dashboard") &&
+    contentProvider.includes('dashboard["data"]["proofs"]["recent_remote_replicas"]') &&
+    contentCmd.includes("#[command(name = \"repair-worker\")]") &&
+    contentCmd.includes("fn repair_worker_request(") &&
+    contentCmd.includes("fn content_command_builds_repair_worker_request(") &&
+    contentCmd.includes("ProviderInvocationTransport::Local") &&
+    contentCmd.includes("ProviderTransfer::Json") &&
+    contentProvider.includes("content_publish_enforces_availability_requirements") &&
+    availabilityProvider.includes("requirements: Value") &&
+    availabilityProvider.includes("fn upstream_peer_selection(") &&
+    availabilityProvider.includes("multi-replica availability target response requires peer_selection metadata") &&
+    availabilityProvider.includes("upstream_multi_replica_network_available_requires_peer_selection"),
+  "Content availability must enforce requested replica/quota/live-proof requirements before recording network/Carrier availability claims, persist repair task state, keep repair-worker passes Runtime-provider-internal with bounded guardrails, and propagate provider byte-range/progress receipts plus optional Stream payloads through fetch",
+);
+assert(
+    objectProviderImpl.includes("fn shared_access_decision(") &&
+    objectProviderImpl.includes("fn shared_access_open_contract(") &&
+    objectProviderImpl.includes("fn validate_shared_access_recipient_proof(") &&
+    objectProviderImpl.includes("fn shared_access_recipient_proof_state(") &&
+    objectProviderImpl.includes("elastos.library.recipient-proof/v1") &&
+    objectProviderImpl.includes("elastos.library.recipient-proof-state/v1") &&
+    objectProviderImpl.includes("recipient_proof requires proof_binding_id") &&
+    objectProviderImpl.includes("requires passkey proof binding") &&
+    gatewayProviderProxy.includes('object.remove("recipient_proof")') &&
+    gatewayProviderProxy.includes('"proof_binding_id": context.proof_binding_id.as_deref().unwrap_or_default()') &&
+    gatewayProviderProxy.includes('"source": "runtime-launch-grant"') &&
+    objectProviderImpl.includes("elastos.library.access-decision/v1") &&
+    objectProviderImpl.includes("elastos.library.shared-open/v1") &&
+    objectProviderImpl.includes("runtime-provider-fetch") &&
+    objectProviderImpl.includes('"allowed": false') &&
+    objectProviderImpl.includes('"reason": err.to_string()') &&
+    libraryDialog.includes("Share Grants / Key Release") &&
+    libraryDialog.includes("Recipient Grants / Key Release") &&
+    libraryDialog.includes("contentSecurity?.published_payload") &&
+    libraryMenuSmoke.includes("Share Grants / Key Release") &&
+    libraryMenuSmoke.includes("Recipient Grants / Key Release") &&
+    libraryMenuSmoke.includes("not_required_for_plain_published_content") &&
+    libraryGatewayTests.includes("ready_for_plain_content_fetch") &&
+    libraryGatewayTests.includes("recipient_proof_verified") &&
+    libraryGatewayTests.includes("authority.proof_binding_id") &&
+    libraryGatewayTests.includes("requires Runtime recipient_proof") &&
+    libraryGatewayTests.includes("not authorized"),
+  "Library recipient sharing must expose explicit access decisions, Runtime recipient-proof state, open contracts, key-release state, and denied-access audit coverage",
+);
+assert(
+  libraryApp.includes("function syncPlacesActive()") &&
+    libraryRender.includes('loading="eager" decoding="async"') &&
+    !library.includes("hydrateInlineIcons") &&
+    !library.includes("loadIconMarkup") &&
+    !/function renderAll\(\) \{\s*renderPlaces\(\);/.test(library),
+  "Library must not rebuild the sidebar or run async icon hydration on every folder render",
+);
+assert(
+  libraryNavigation.includes("LIBRARY_HISTORY_SCHEMA") &&
+    libraryNavigation.includes("LIBRARY_HISTORY_GUARD_SCHEMA") &&
+    libraryNavigation.includes("window.history.pushState") &&
+    libraryNavigation.includes("window.history.replaceState") &&
+    libraryEvents.includes('window.addEventListener("popstate"') &&
+    libraryNavigation.includes("window.history.back()") &&
+    libraryNavigation.includes("window.history.forward()"),
+  "Library must take over browser Back/Forward for Library navigation instead of letting native history leave the capsule",
+);
+assert(
+  libraryRender.includes("document.createDocumentFragment()") &&
+    libraryRender.includes("elements.content.replaceChildren(fragment)"),
+  "Library content pane must redraw with one DOM replacement to avoid sluggish view changes",
+);
+assert(
+  libraryCss.includes("--explorer-list-columns: 30px minmax(260px, 1fr) 170px 86px 180px;") &&
+    libraryCss.includes(".content[data-view=\"list\"] .item-date {\n      grid-column: 3;") &&
+    libraryCss.includes(".explore-table-headers-th--size {\n      grid-column: 4;\n      padding: 0 10px;\n      text-align: right;") &&
+    libraryCss.includes(".explore-table-headers-th--type {\n      grid-column: 5;"),
+  "Library list rows and headers must share one file-list column grid",
+);
+assert(
+  libraryCss.includes("max-height: calc(100vh - 16px);") &&
+    libraryMenu.includes("event.stopPropagation();") &&
+    libraryMenu.includes("contextMenu.style.visibility = \"hidden\"") &&
+    libraryMenu.includes("function normalizedMenuActions(actions)") &&
+    libraryMenu.includes("divider.setAttribute(\"role\", \"separator\")"),
+  "Library context menu must use one viewport-aware renderer whose action buttons do not get swallowed by document click handling",
+);
+assert(
+  libraryMenuSmoke.includes("PASS Library menu smoke") &&
+    libraryMenuSmoke.includes("openBackgroundMenu") &&
+    libraryMenuSmoke.includes("openItemMenu") &&
+    libraryMenuSmoke.includes("Spaces background menu") &&
+    libraryMenuSmoke.includes('label: "Spaces"') &&
+    !libraryMenuSmoke.includes('label: "WebSpaces"') &&
+    libraryMenuSmoke.includes("right-click must not open the Library context menu") &&
+    libraryMenuSmoke.includes("right-click must cancel the browser context menu") &&
+    libraryMenuSmoke.includes("sidebar place menu") &&
+    libraryMenuSmoke.includes("Open in New Window") &&
+    libraryMenuSmoke.includes("sidebar must mark only") &&
+    libraryMenuSmoke.includes("empty state must be centered horizontally") &&
+    libraryMenuSmoke.includes("Published badge must be visible in ${view} view") &&
+    libraryMenuSmoke.includes("New Folder must use inline naming, not window.prompt") &&
+    libraryMenuSmoke.includes("window.history.back()") &&
+    libraryMenuSmoke.includes("window.history.forward()") &&
+    libraryMenuSmoke.includes("Upload must use the raw Library upload transport") &&
+    libraryMenuSmoke.includes("Drop upload must use the raw Library upload transport") &&
+    libraryMenuSmoke.includes("F2 rename must call rename") &&
+    libraryMenuSmoke.includes("Selected-name click must not start rename; rename is explicit through context menu or F2") &&
+    libraryMenuSmoke.includes("Folder Download must use the raw Library download transport") &&
+    libraryMenuSmoke.includes("Download must use the raw Library download transport") &&
+    libraryMenuSmoke.includes("Compress to ZIP must call compress_archive") &&
+    libraryMenuSmoke.includes("Compress Selected to ZIP must call compress_archive") &&
+    libraryMenuSmoke.includes("mounted WebSpace menu") &&
+    libraryMenuSmoke.includes("indexed WebSpace file menu") &&
+    libraryMenuSmoke.includes("/WebSpaces/Cloud/Drive/Project X/file.pdf") &&
+    libraryMenuSmoke.includes("Indexed WebSpace Download must use the raw Library download transport") &&
+    libraryMenuSmoke.includes("Elastos content WebSpace file menu") &&
+    libraryMenuSmoke.includes("Status must call status") &&
+    libraryMenuSmoke.includes("Repair must call repair") &&
+    libraryMenuSmoke.includes("Share must copy the published elastos:// link") &&
+    libraryMenuSmoke.includes("Double-clicking a selected folder name must open it instead of starting rename") &&
+    libraryMenuSmoke.includes("List-view double-clicking a selected folder name must open it instead of starting rename") &&
+    libraryMenuSmoke.includes("List-view double-clicking a selected file name must open it without later starting rename") &&
+    libraryMenuSmoke.includes("List-view double-clicking the active rename editor must not also open/read the file") &&
+    libraryMenuSmoke.includes("Shift-click must select a visible range in list view") &&
+    libraryMenuSmoke.includes("Enter on a selected file must open/read it") &&
+    libraryMenuSmoke.includes("Shift-F10 selected file menu") &&
+    libraryMenuSmoke.includes("Enter on multiple selected files must open every selected item") &&
+    libraryMenuSmoke.includes("Double-clicking a selected file name must open it instead of starting rename") &&
+    libraryMenuSmoke.includes("Double-click preview without an installed viewer must call read") &&
+    libraryMenuSmoke.includes("Copy/Paste Into Folder must call copy") &&
+    libraryMenuSmoke.includes("Drag/drop move must call move") &&
+    libraryMenuSmoke.includes("Alt-drag/drop copy must call copy") &&
+    libraryMenuSmoke.includes("Publish must call publish") &&
+    libraryMenuSmoke.includes("Delete Permanently must use in-app confirmation, not window.confirm") &&
+    libraryMenuSmoke.includes("Delete must move the object to Trash"),
+  "Library must have an operator smoke for context-menu reliability, WebSpaces read-only behavior, and core object journeys",
+);
+assert(
+  !libraryEvents.includes("NAME_CLICK_RENAME_DELAY_MS") &&
+    !libraryEvents.includes("cancelPendingNameClickRename") &&
+    !libraryEvents.includes("clickedName") &&
+    !sourceBlock(
+      libraryEvents,
+      'elements.content.addEventListener("click"',
+      "Library click handler",
+    ).includes("startRename(") &&
+    libraryEvents.includes("function isNameEditorTarget(target)") &&
+    sourceBlock(
+      libraryEvents,
+      'elements.content.addEventListener("dblclick"',
+      "Library double-click handler",
+    ).includes("isNameEditorTarget(event.target)") &&
+    libraryEvents.includes("selectRangeTo(item.dataset.uri") &&
+    libraryEvents.includes('event.key === "Enter"') &&
+    libraryEvents.includes("openSelectedObjects(objects, openObject, showError)") &&
+    libraryEvents.includes("async function openSelectedObjects(objects, openObject, showError)") &&
+    libraryEvents.includes('event.key === "ContextMenu"') &&
+    libraryEvents.includes('event.shiftKey && event.key === "F10"') &&
+    libraryEvents.includes("isMenuOpen(elements)") &&
+    libraryEvents.includes('if (event.key === "F2" && !editable)') &&
+    libraryApp.includes('menuAction("Rename", () => startRename(object))'),
+  "Library rename must be explicit through context menu/F2; content clicks must never start rename, and range selection/keyboard open/context menu must stay wired",
+);
+assert(
+  libraryLiveSmoke.includes("verify_public_library_assets") &&
+    libraryLiveSmoke.includes("/apps/library/src/uploads.js") &&
+    libraryLiveSmoke.includes("/apps/library/src/api.js") &&
+    libraryLiveSmoke.includes("/api/provider/object/upload") &&
+    libraryLiveSmoke.includes("/api/provider/object/upload/start") &&
+    libraryLiveSmoke.includes("CHUNKED_UPLOAD_THRESHOLD_BYTES") &&
+    libraryLiveSmoke.includes("http-chunk-session") &&
+    libraryLiveSmoke.includes("/api/provider/object/download/raw") &&
+    libraryLiveSmoke.includes("raw download readback mismatch") &&
+	    libraryLiveSmoke.includes("elastos.object.transfer.receipt/v1") &&
+	    libraryLiveSmoke.includes("function isNameEditorTarget(target)") &&
+	    libraryLiveSmoke.includes("NAME_CLICK_RENAME_DELAY_MS") &&
+	    libraryLiveSmoke.includes("clickedName") &&
+	    libraryLiveSmoke.includes("cancelPendingNameClickRename") &&
+    libraryLiveSmoke.includes("selectRangeTo(item.dataset.uri") &&
+    libraryLiveSmoke.includes('event.key === "Enter"') &&
+    libraryLiveSmoke.includes("openSelectedObjects(objects, openObject, showError)") &&
+    libraryLiveSmoke.includes('event.key === "ContextMenu"') &&
+    libraryLiveSmoke.includes('event.shiftKey && event.key === "F10"') &&
+	    libraryLiveSmoke.includes("signed provider path skipped") &&
+    libraryLiveSmoke.includes("PASS Library live publish/share smoke"),
+  "Library live smoke must verify public static assets without a signed session and provider publish/share with a signed Home session",
+);
+assert(
+  libraryIndex.includes('rel="stylesheet" href="library.css"') &&
+    libraryIndex.includes('type="module" src="src/app.js"') &&
+    !libraryIndex.includes("<style>") &&
+    !libraryIndex.includes("function renderContent"),
+  "Library index must stay a static shell with CSS and app code split out",
+);
+assert(
+  libraryApp.includes('from "./model.js"') &&
+    libraryApp.includes('from "./actions.js"') &&
+    libraryApp.includes('from "./api.js"') &&
+    libraryApp.includes('from "./dialog.js"') &&
+    libraryApp.includes('from "./editor.js"') &&
+    libraryApp.includes('from "./events.js"') &&
+    libraryApp.includes('from "./menu.js"') &&
+    libraryApp.includes('from "./navigation.js"') &&
+    libraryApp.includes('from "./preview.js"') &&
+    libraryApp.includes('from "./realtime.js"') &&
+    libraryApp.includes('from "./render.js"') &&
+    libraryApp.includes('from "./selection.js"') &&
+    libraryApp.includes('from "./state.js"') &&
+    libraryApp.includes('from "./uploads.js"') &&
+    !libraryApp.includes("function renderContent(") &&
+    !libraryApp.includes("function uploadFiles(") &&
+    !libraryApp.includes("function handleLibraryEventsPayload(") &&
+    libraryActions.includes("createLibraryActions") &&
+    libraryActions.includes("function openObject(") &&
+    libraryActions.includes("function uploadFiles(") &&
+    libraryActions.includes("function publishObject(") &&
+    libraryActions.includes("uploadObject({") &&
+    libraryActions.includes("downloadObjectRaw({") &&
+    !libraryActions.includes("fileToBase64") &&
+    libraryApi.includes("createLibraryRuntime") &&
+    libraryApi.includes("/api/provider/object/upload") &&
+    libraryApi.includes("/api/provider/object/download/raw") &&
+    libraryApi.includes("x-elastos-transfer-receipt") &&
+    libraryApi.includes("XMLHttpRequest") &&
+    libraryDialog.includes("createLibraryDialog") &&
+    libraryEditor.includes("createLibraryEditor") &&
+    libraryEditor.includes("function startCreateObject(") &&
+    libraryEvents.includes("bindLibraryEvents") &&
+    libraryEvents.includes("elements.content.addEventListener(") &&
+    libraryEvents.includes("elements.places.addEventListener(") &&
+    libraryMenu.includes("createLibraryMenu") &&
+    libraryNavigation.includes("createLibraryNavigation") &&
+    libraryPreview.includes("createLibraryPreview") &&
+    libraryRealtime.includes("createLibraryRealtime") &&
+    libraryRealtime.includes("new EventSource(") &&
+    libraryRealtime.includes("function handleLibraryEventsPayload(") &&
+    libraryRender.includes("createLibraryRenderer") &&
+    libraryRender.includes("function renderContent(") &&
+    libraryModel.includes("export function iconFor") &&
+    librarySelection.includes("createLibrarySelection") &&
+    libraryState.includes("createLibraryState") &&
+    libraryState.includes("cacheFolderListing") &&
+    libraryState.includes("MUTATING_PROVIDER_OPS") &&
+    libraryUploads.includes("createLibraryUploads") &&
+    libraryUploads.includes("function scheduleUploadRender(") &&
+    libraryUploads.includes("window.requestAnimationFrame("),
+  "Library app must keep pure model helpers, Runtime provider/frame calls, action control, dialog control, inline editor control, UI event binding, menu rendering, navigation/history, preview control, realtime refresh, content rendering, selection state, state/cache ownership, and upload progress split into dedicated modules",
+);
+assert(
+  libraryPerformanceSmoke.includes("PASS Library performance smoke") &&
+    libraryPerformanceSmoke.includes("renderPlacesCount === 1") &&
+    libraryPerformanceSmoke.includes("iconFetchCount === 0") &&
+    libraryPerformanceSmoke.includes("lastContentRender?.objectCount === 1000") &&
+    libraryPerformanceSmoke.includes("lastContentRender?.chunked === true") &&
+    libraryPerformanceSmoke.includes("Upload progress must render through a scheduled frame") &&
+    libraryPerformanceSmoke.includes("Upload progress rendered too often"),
+  "Library must have a performance smoke for sidebar stability, icon hydration removal, bounded render cost, and upload-progress render coalescing",
 );
 assert(
   !library.includes("entry-details"),
@@ -2201,15 +3207,15 @@ assert(
   "Library cards must not show raw storage addresses by default",
 );
 assert(
-  library.includes("min-height: 100dvh;"),
+  libraryCss.includes("min-height: 100dvh;"),
   "Library must use dynamic viewport height",
 );
 assert(
-  library.includes(".toolbar {\n        display: grid;"),
+  libraryCss.includes(".toolbar {\n        display: grid;"),
   "Library toolbar must stack on narrow screens",
 );
 assert(
-  library.includes("padding: 4px;") && library.includes("border-radius: 14px;"),
+  libraryCss.includes("padding: 4px;") && libraryCss.includes("border-radius: 14px;"),
   "Library mobile panels must use compact Home-aligned spacing",
 );
 assert(
@@ -3012,6 +4018,7 @@ assert(
   "System must not hold browser wallet adapter authority",
 );
 const tasks = read("TASKS.md");
+const today = read("TODAY.md");
 const browserPlanningSurface = [
   tasks,
   read("docs/BROWSER_CAPSULE.md"),
@@ -5356,6 +6363,74 @@ assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority();
 assert(
   !tasks.includes("- [x]"),
   "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md",
+);
+const productionStorageTaskLines =
+  tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
+  [];
+assert(
+  productionStorageTaskLines.length === 1 &&
+    productionStorageTaskLines[0].includes(
+      "BLOCKER - production multi-peer availability/storage markets require real external infrastructure before this can close",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "production independent provider-network quota-ledger federation beyond the configured bounded endpoint quorum",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "production network-wide abuse throttles/banlists/abuse ledgers beyond the configured bounded abuse-control endpoint quorum",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "production cross-runtime peer reputation trust policy, third-party attestations, revocation, and fleet-wide reputation exchange beyond the configured Carrier peer-attestation endpoint quorum",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "production storage-market offer/pricing/SLA execution beyond the configured storage-market endpoint-quorum admission gate",
+    ) &&
+    productionStorageTaskLines[0].includes(
+      "repair-fleet worker attestation/SLA/settlement beyond configured dispatch quorum",
+    ),
+  "TASKS.md must keep exactly one open production multi-peer availability/storage infrastructure blocker",
+  productionStorageTaskLines,
+);
+assert(
+  !tasks.includes("branch-local availability/storage foundations") &&
+    !tasks.includes("signed bounded remote admission preflight") &&
+    !tasks.includes("configured federated quota-ledger exchange") &&
+    !tasks.includes("configured federated abuse-control exchange") &&
+    !tasks.includes("configured Carrier peer-attestation exchange") &&
+    !tasks.includes("configured external storage-market admission") &&
+    !tasks.includes("configured external repair-fleet dispatch"),
+  "TASKS.md must not re-list completed branch-local availability/storage proof slices as open work",
+);
+assert(
+  today.includes(
+    "Branch-local protected-recipient and availability/storage proof work is",
+  ) &&
+    today.includes(
+      "Production multi-peer availability and storage markets are now explicitly",
+    ) &&
+    today.includes(
+      "marked as a `TASKS.md` blocker, not branch-local release work",
+    ),
+  "TODAY.md must distinguish completed branch-local proof work from the open production infrastructure blocker",
+);
+assert(
+  today.includes(
+    "Production multi-peer availability and storage markets require real",
+  ) &&
+    today.includes("production infrastructure and remain outside this branch scope") &&
+    today.includes("local endpoint shim, receipt-only schema, policy/status") &&
+    today.includes("storage-market pricing/SLA/settlement/escrow"),
+  "TODAY.md must keep a hard production-infrastructure gate so local proof/status shims cannot be mistaken for production completion",
+);
+assert(
+    today.includes("configured federated quota-ledger endpoint-quorum exchange tests") &&
+    today.includes("configured federated abuse-control endpoint-quorum exchange tests") &&
+    today.includes("configured Carrier peer-attestation endpoint-quorum exchange tests") &&
+    today.includes("configured storage-market endpoint-quorum admission tests") &&
+    today.includes("configured external repair-fleet endpoint-quorum dispatch tests") &&
+    today.includes("node scripts/home-entropy-check.mjs") &&
+    today.includes("bash scripts/check-wci-alignment.sh") &&
+    today.includes("git diff --check"),
+  "TODAY.md completion audit must record quota-ledger, abuse-control, storage-market, and Carrier peer-attestation quorum proofs plus entropy/alignment gates",
 );
 assert(
   !runtimeChecklist.includes("Shared is useful"),
