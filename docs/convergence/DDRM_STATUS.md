@@ -226,6 +226,30 @@ and plaintext both match). **Two independent implementations now agree on the ex
 bytes of the classical CEK rail — the strongest convergence evidence short of a
 shared test crate, and a regression tripwire if either wire format drifts.**
 
+### Conformance promoted to a standing gate + widened (Day 24)
+
+The cross-impl check is now part of the standard pre-rebase/pre-PR gate and covers
+more of the contract:
+
+- **`scripts/ddrm-verify.sh`** — one button-press aggregator that runs (1) the
+  contract drift check and (2) the PC2 cross-impl conformance. Exits non-zero if
+  either gate fails; the conformance step **skips clean** when PC2 is absent, so
+  the gate is safe to run anywhere. This is now the recommended first check before
+  any rebase onto a moving 0.4.0.
+- **Two envelope versions** are cross-checked: `classical_cenc.json` (**v3**,
+  random IV) and `classical_cenc_v2.json` (**v2**, IV derived from the ephemeral
+  pubkey) — both PC2-supported wire shapes. Each is replayed in-repo
+  (`--features vectors` = **36 green**, +1 for the v2 replay).
+- **Negative parity:** for every vector the harness also tampers the envelope and
+  asserts **PC2 fails closed too** (`tamper: ... rejected ... fail-closed parity
+  OK`) — proving both implementations reject the same corruption rather than
+  silently leaking plaintext.
+
+Current result against the live PC2 checkout: **PASS** for v3 + v2, positive and
+negative. Base suites unchanged (25/27/29/31); chain 68; drift PASS. **The rail
+contract is now guarded on both the happy path and the fail-closed path, across
+both envelope versions, by code that runs the reference implementation.**
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

@@ -335,11 +335,10 @@ mod tests {
         segment
     }
 
-    /// Regenerate the committed classical vector. Run:
-    /// `cargo test --features gen-vectors emit_classical_vector`
+    /// Emit a classical vector for the given envelope `version` (0x03 random-IV or
+    /// 0x02 fixed-IV — both PC2-supported wire shapes).
     #[cfg(feature = "gen-vectors")]
-    #[test]
-    fn emit_classical_vector() {
+    fn write_classical_vector(version: u8, file: &str, description: &str) {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -347,11 +346,11 @@ mod tests {
         let cek = [0x11u8; 16];
         let iv8 = [0x22u8; 8];
         let plaintext = b"the quick brown fox jumps over!!";
-        let sealed = make_envelope(&sk, &cek, 0x03);
+        let sealed = make_envelope(&sk, &cek, version);
         let segment = build_encrypted_segment_for_vector(plaintext, &cek, &iv8);
 
         let v = crate::vector_format::ClassicalVector {
-            description: "P-256 ECDH envelope (v3) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt".to_string(),
+            description: description.to_string(),
             session_secret_key_b64: b64.encode(sk.to_bytes()),
             sealed_envelope_b64: b64.encode(&sealed),
             cek_b64: b64.encode(cek),
@@ -360,24 +359,41 @@ mod tests {
         };
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
         std::fs::create_dir_all(dir).unwrap();
-        let path = format!("{dir}/classical_cenc.json");
+        let path = format!("{dir}/{file}");
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         eprintln!("wrote {path}");
     }
 
-    /// Replay the committed classical vector through the engines (no in-test
+    /// Regenerate the committed classical vectors. Run:
+    /// `cargo test --features gen-vectors emit_classical`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_vector() {
+        write_classical_vector(
+            0x03,
+            "classical_cenc.json",
+            "P-256 ECDH envelope (v3, random IV) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt",
+        );
+    }
+
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_classical_v2_vector() {
+        write_classical_vector(
+            0x02,
+            "classical_cenc_v2.json",
+            "P-256 ECDH envelope (v2, IV derived from eph pubkey) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt",
+        );
+    }
+
+    /// Replay a committed classical vector through the engines (no in-test
     /// sealing): proves the portable bytes still decrypt after any refactor.
     #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
-    #[test]
-    fn classical_golden_vector_replays() {
+    fn replay_classical_vector(json: &str) {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
-        let v: crate::vector_format::ClassicalVector = serde_json::from_str(include_str!(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/classical_cenc.json")
-        ))
-        .unwrap();
-
+        let v: crate::vector_format::ClassicalVector = serde_json::from_str(json).unwrap();
         let sk = SecretKey::from_slice(&b64.decode(&v.session_secret_key_b64).unwrap()).unwrap();
         let sealed = b64.decode(&v.sealed_envelope_b64).unwrap();
         let parsed = parse(&sealed).unwrap();
@@ -391,6 +407,24 @@ mod tests {
         let mdat_off = segment.len() - expected.len();
         assert_eq!(&output[mdat_off..], expected.as_slice(), "vector plaintext recovered via cenc");
         assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_golden_vector_replays() {
+        replay_classical_vector(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc.json"
+        )));
+    }
+
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn classical_v2_golden_vector_replays() {
+        replay_classical_vector(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc_v2.json"
+        )));
     }
 
     /// A corrupted vector must fail closed (no plaintext on tampered input).

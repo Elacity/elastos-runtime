@@ -1,0 +1,8 @@
+{
+  "description": "P-256 ECDH envelope (v2, IV derived from eph pubkey) -> CENC AES-128-CTR; byte-compatible with PC2 ddrm-decrypt",
+  "session_secret_key_b64": "DT8Uht+bhpqa/Qd0Tu3jy4LOcTnIOv/sY6u2kQV3gp4=",
+  "sealed_envelope_b64": "AAAAAgAhA8IKvLdT3MXfd57Yj5PsL+knX/MtsGc2tH8KOKRRdOCJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgfw8CYTs+3yMvDAe54TNqtUhXKPj5gfI4J/kwwUbQjRg=",
+  "cek_b64": "EREREREREREREREREREREQ==",
+  "encrypted_segment_b64": "AAAAPG1vb2YAAAA0dHJhZgAAABR0cnVuAAACAAAAAAEAAAAgAAAAGHNlbmMAAAAAAAAAASIiIiIiIiIiAAAAKG1kYXScNDPiT64BF0MfL13dprDn+6eX7LyGcmlu1lMPPiQQpA==",
+  "expected_plaintext_b64": "dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyISE="
+}
