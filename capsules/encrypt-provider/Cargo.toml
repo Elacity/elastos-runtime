@@ -21,6 +21,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 zeroize = "1"
+# In-boundary CENC AES-128-CTR cipher (vendored from PC2 cenc-encrypt — see
+# src/cenc.rs) so content encryption stays colocated with key generation inside
+# this boundary (invariant #1). Symmetric to decrypt-provider's AES-CTR core.
+aes = "0.8"
+ctr = "0.9"
+# CSPRNG for in-boundary CEK + KID minting. getrandom resolves to the WASI
+# `random_get` source on wasm32-wasip1, so keygen happens inside the sandbox.
+getrandom = "0.2"
 
 [dev-dependencies]
 

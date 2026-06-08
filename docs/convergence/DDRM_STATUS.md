@@ -28,17 +28,21 @@ app/viewer --drm/open--> drm-provider --sequences--> rights -> key -> decrypt --
 
 | Provider | Role | Fail-closed | Host tests | wasm32-wasip1 | WASI smoke |
 | --- | --- | --- | --- | --- | --- |
-| `encrypt-provider` | seal/produce (invariant #1) | yes | 6 (+1 gap) | builds | — |
+| `encrypt-provider` | seal/produce (invariant #1) | yes | 13 | builds | — |
 | `drm-provider` | orchestrator (`drm/open`) + chain-seam | yes | 12 | builds | 4/4 |
 | `rights-provider` | rights decision | yes | 9 | builds | 4/4 |
 | `key-provider` | key release (rights-bound) | yes | 9 | builds | 4/4 |
 | `decrypt-provider` | decrypt/render (cenc + envelope + consumer contract) | yes | 25 (+2 `rail-prep`) | builds | 4/4 |
 
 The chain now has **both ends present**: `encrypt-provider` is the producer
-(invariant #1) and `decrypt-provider` the consumer (invariant #2). The encrypt
-side is a fail-closed skeleton with the contract + zeroization + no-raw-CEK output
-pinned by tests; its in-boundary keygen/cipher engine is the one scoped gap
-(`cek_and_kid_generated_inside_boundary`, `#[ignore]`). See
+(invariant #1) and `decrypt-provider` the consumer (invariant #2). **The encrypt
+side's in-boundary keygen gap is CLOSED (Day 19):** the CEK+KID are now minted with
+a CSPRNG inside the wasm boundary (`getrandom` → WASI `random_get`) and consumed by
+a vendored CENC AES-128-CTR cipher (PC2 `cenc-encrypt` @ `a0a910158`), with the CEK
+held in `Zeroizing` and an output type (`SealedSegment`) that has no CEK field. The
+once-`#[ignore]`d `cek_and_kid_generated_inside_boundary` now passes. Only the full
+`seal` (PQ-envelope CEK escrow + fMP4 packaging + ciphertext availability) remains,
+behind a fail-closed `seal` — it shares the decrypt side's rail dependency. See
 `DDRM_ENCRYPT_INVARIANT.md`.
 
 ## Security properties proven
@@ -165,7 +169,9 @@ but verified the impact:
   base. Run it before any rebase/PR; it fails loudly if a future 0.4.0 redo moves a
   type. **Currently: PASS.**
 - All five providers' host tests pass against the current tree:
-  `encrypt 6(+1 ignored)`, `drm 12`, `rights 9`, `key 9`, `decrypt 25` → **61 green**.
+  `encrypt 13`, `drm 12`, `rights 9`, `key 9`, `decrypt 25` → **68 green, 0 ignored**
+  (Day 19 closed the encrypt keygen gap: 6+1-ignored → 13). `decrypt` adds **+2**
+  under `--features rail-prep` (Day-18 rail-landing composition).
 - Rebase recipe + safety backup (`backup/decrypt-provider-cenc-preD17`):
   `PUSH_PLAN.md` § "Base moved".
 

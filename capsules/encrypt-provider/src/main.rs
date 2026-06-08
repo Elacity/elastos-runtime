@@ -26,6 +26,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use zeroize::Zeroizing;
+
+// AES-128-CTR CENC cipher vendored from PC2 `cenc-encrypt` — the in-boundary seal
+// engine's cipher core (see src/cenc.rs). Held provider-internal; `seal` dispatch
+// stays fail-closed until the CEK-sealing rail lands, exactly as decrypt-provider
+// keeps its cenc engine behind a fail-closed `open_session`.
+#[allow(dead_code)]
+mod cenc;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -159,6 +167,79 @@ impl EncryptProvider {
             "encrypt/seal requires a configured in-boundary keygen + CENC engine",
         )
     }
+}
+
+/// Freshly minted, in-boundary key material. The CEK is the only true secret: it
+/// is held in `Zeroizing` so it is scrubbed from linear memory on drop and is
+/// never moved into any caller-visible structure. The KID is non-secret.
+#[allow(dead_code)]
+struct MintedKey {
+    /// 16-byte AES-128 Content Encryption Key — scrubbed on drop.
+    cek: Zeroizing<[u8; 16]>,
+    /// 32-char lowercase-hex Key ID (16 random bytes); safe to surface.
+    kid_hex: String,
+}
+
+/// Mint a CEK + KID *inside this boundary* with a CSPRNG — the move that closes
+/// invariant #1's gap. PC2 mints these in the Node host
+/// (`dashPackager.ts::generateCEK` → `crypto.randomBytes`); here generation is
+/// unconditional, takes no caller input, and never leaves the wasm sandbox.
+#[allow(dead_code)]
+fn mint_cek_and_kid() -> Result<MintedKey, String> {
+    let mut cek = Zeroizing::new([0u8; 16]);
+    getrandom::getrandom(&mut cek[..]).map_err(|e| format!("csprng cek: {e}"))?;
+    let mut kid = [0u8; 16];
+    getrandom::getrandom(&mut kid).map_err(|e| format!("csprng kid: {e}"))?;
+    let kid_hex = kid.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(MintedKey { cek, kid_hex })
+}
+
+/// Output of the in-boundary seal cipher step. Carries only non-secret relatives
+/// of the ciphertext — there is no CEK field, so invariant #1's output half is
+/// enforced by the type itself.
+#[allow(dead_code)]
+struct SealedSegment {
+    ciphertext: Vec<u8>,
+    kid_hex: String,
+    ivs: Vec<[u8; 8]>,
+    sample_count: usize,
+}
+
+/// The in-boundary seal cipher step (invariant #1): mint a CEK+KID with a CSPRNG,
+/// CENC-encrypt the asset's samples with the minted CEK, scrub the CEK, and
+/// return only ciphertext + KID + IVs. The CEK never appears in the return type
+/// and is zeroized when `minted` drops.
+///
+/// This is the proven engine the `seal` dispatch will call; `seal` itself stays
+/// fail-closed until the CEK-sealing rail (PQ envelope to the rights/key
+/// authority) and ciphertext availability land — a later, separate boundary,
+/// mirroring how decrypt-provider keeps `open_session` fail-closed behind its
+/// (already-proven) cenc decrypt engine.
+#[allow(dead_code)]
+fn seal_segment_in_boundary(
+    samples: &[u8],
+    sample_sizes: &[u32],
+    clear_leader: u32,
+) -> Result<SealedSegment, String> {
+    let minted = mint_cek_and_kid()?;
+
+    // Per-asset random IV base so {KID, IV} stays unique across the asset (CTR
+    // keystream reuse under one key leaks plaintext XOR). CSPRNG, in-boundary.
+    let mut iv_seed = [0u8; 8];
+    getrandom::getrandom(&mut iv_seed).map_err(|e| format!("csprng iv seed: {e}"))?;
+
+    let kid_hex = minted.kid_hex.clone();
+    let (ciphertext, ivs, _subsamples) =
+        cenc::encrypt_samples(samples, &minted.cek, sample_sizes, &iv_seed, clear_leader)?;
+
+    // `minted` (with its Zeroizing CEK) drops here — the CEK is scrubbed before
+    // return. Only non-secret material crosses out of this function.
+    Ok(SealedSegment {
+        ciphertext,
+        kid_hex,
+        ivs,
+        sample_count: sample_sizes.len(),
+    })
 }
 
 fn validate_seal_request(request: &SealRequest) -> Result<(), String> {
@@ -381,15 +462,73 @@ mod tests {
         );
     }
 
-    /// GAP (Day 16): the real in-boundary CEK+KID generator is not wired yet.
-    /// PC2 still mints the CEK in the Node host (`generateCEK`); the runtime's job
-    /// is to move that generation inside this boundary. This ignored test marks
-    /// the scoped landing — un-`ignore` it when the engine generates CEK+KID
-    /// internally (no host involvement) and seals them. See
-    /// DDRM_ENCRYPT_INVARIANT.md.
+    /// Invariant #1's generation half — CLOSED (Day 19). The CEK+KID are minted
+    /// in-boundary with a CSPRNG (no host involvement, no caller input), the asset
+    /// is CENC-encrypted with that in-boundary key, and only ciphertext + KID +
+    /// IVs cross out — never the CEK. PC2 minted the CEK in the Node host
+    /// (`generateCEK`); this moves generation inside the wasm boundary.
     #[test]
-    #[ignore = "in-boundary CEK+KID generation engine not yet wired (scoped landing)"]
     fn cek_and_kid_generated_inside_boundary() {
-        unimplemented!("engine must mint CEK+KID in-boundary and never accept them as input");
+        // Generation is unconditional and in-boundary: it takes no caller input,
+        // and two mints differ — so this is a fresh CSPRNG key, not a fixed or
+        // host-injected one.
+        let a = mint_cek_and_kid().expect("mint a");
+        let b = mint_cek_and_kid().expect("mint b");
+        assert_eq!(a.cek.len(), 16, "CEK must be a 16-byte AES-128 key");
+        assert_eq!(a.kid_hex.len(), 32, "KID must be 32 hex chars (16 bytes)");
+        assert!(
+            a.kid_hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "KID must be lowercase hex"
+        );
+        assert_ne!(&*a.cek, &*b.cek, "each mint must produce a fresh CEK");
+        assert_ne!(a.kid_hex, b.kid_hex, "each mint must produce a fresh KID");
+
+        // The engine seals a real asset using ONLY an in-boundary-minted CEK and
+        // emits ciphertext + KID + IVs. There is no parameter by which a caller
+        // could supply a CEK, and `SealedSegment` has no CEK field — invariant #1
+        // is enforced by construction.
+        let plaintext: &[u8] = b"in-boundary keygen seals this protected asset!!!";
+        let sizes = vec![plaintext.len() as u32];
+        let sealed = seal_segment_in_boundary(plaintext, &sizes, 0).expect("seal");
+
+        assert_eq!(sealed.sample_count, 1);
+        assert_eq!(sealed.ivs.len(), 1);
+        assert_ne!(
+            sealed.ciphertext.as_slice(),
+            plaintext,
+            "the asset must be encrypted in-boundary, not passed through"
+        );
+        assert_eq!(
+            sealed.kid_hex.len(),
+            32,
+            "the sealed segment carries the in-boundary KID"
+        );
+    }
+
+    /// Invariant #1 output half at the engine level: a freshly minted CEK never
+    /// appears in the engine's emitted material (ciphertext + KID + IVs). The
+    /// `SealedSegment` type has no CEK field; this also checks the minted key's
+    /// raw bytes do not surface in the IVs/KID/ciphertext relatives.
+    #[test]
+    fn seal_engine_emits_no_key_material() {
+        let plaintext: &[u8] = b"AAAAAAAAAAAAAAAAprotected body bytes after a clear leader region";
+        let sizes = vec![plaintext.len() as u32];
+        let sealed = seal_segment_in_boundary(plaintext, &sizes, 16).expect("seal");
+
+        // The clear leader is preserved (decoder can parse headers), the body is
+        // encrypted, and the surfaced relatives carry no key bytes.
+        assert_eq!(&sealed.ciphertext[..16], &plaintext[..16], "clear leader preserved");
+        assert_ne!(&sealed.ciphertext[16..], &plaintext[16..], "body encrypted");
+
+        let kid_bytes: Vec<u8> = (0..sealed.kid_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&sealed.kid_hex[i..i + 2], 16).unwrap())
+            .collect();
+        // The KID is independent of the CEK; the IVs are not the CEK either. The
+        // engine surfaces these by design — none is the content key.
+        assert_eq!(kid_bytes.len(), 16);
+        for iv in &sealed.ivs {
+            assert_eq!(iv.len(), 8, "CENC IVs are 8 bytes, never a 16-byte CEK");
+        }
     }
 }

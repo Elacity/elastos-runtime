@@ -1,7 +1,10 @@
 # dDRM encrypt side — invariant #1, the gap, and the target contract
 
-**Status:** encrypt boundary pinned by characterization tests; in-boundary CEK/KID
-generation engine is a known, scoped gap. Branch: `feat/decrypt-provider-cenc`.
+**Status:** encrypt boundary pinned by characterization tests; **the in-boundary
+CEK/KID generation gap is CLOSED (Day 19)** — CEK+KID are now minted with a CSPRNG
+inside the wasm boundary and consumed by a vendored CENC cipher; only the sealing
+rail (PQ-envelope CEK escrow) + ciphertext availability remain, behind a
+fail-closed `seal`. Branch: `feat/decrypt-provider-cenc`.
 
 This is the *producer* end of the dDRM chain and the home of **Irzhy's security
 invariant #1**:
@@ -81,17 +84,41 @@ All in `capsules/encrypt-provider/src/main.rs`, all passing except the marked ga
 | Boundary blocks raw_cek + plaintext authority | `status_blocks_raw_cek_and_plaintext_authority` | ✅ pass |
 | Nothing seals by accident (fail-closed) | `seal_fails_closed_until_engine_configured` | ✅ pass |
 | Weak scheme rejected | `seal_rejects_unsupported_scheme` | ✅ pass |
-| **CEK+KID generated in-boundary (no host involvement)** | `cek_and_kid_generated_inside_boundary` | ⏳ `#[ignore]` — scoped landing |
+| **CEK+KID generated in-boundary (no host involvement)** | `cek_and_kid_generated_inside_boundary` | ✅ pass (Day 19) |
+| Engine emits no key material (ciphertext + KID + IVs only) | `seal_engine_emits_no_key_material` | ✅ pass (Day 19) |
 
-## The scoped landing (what closes the gap)
+## What closed the gap (Day 19)
 
-Wire the in-boundary engine: mint CEK (CSPRNG) + KID inside the capsule,
-CENC-encrypt the referenced asset (vendor PC2 `cenc-encrypt` the same way
-`decrypt-provider` vendored `cenc-decrypt`), seal the CEK to the rights/key
-authority via the PQ-hybrid envelope (proven wasm-viable, `DDRM_STATUS.md` §PQ),
-upload ciphertext, return a `SealedObjectV1`, then zeroize. Un-`ignore`
-`cek_and_kid_generated_inside_boundary` when done.
+Vendored PC2 `cenc-encrypt`'s AES-128-CTR cipher core (`crates/cenc-encrypt` @
+`a0a910158`) into `capsules/encrypt-provider/src/cenc.rs` — the symmetric
+counterpart of the AES-CTR core `decrypt-provider` vendored from `cenc-decrypt`,
+plus the in-boundary keygen PC2 lacks:
+
+- `mint_cek_and_kid()` mints a 16-byte CEK + 16-byte KID with a CSPRNG
+  (`getrandom` → WASI `random_get` on `wasm32-wasip1`). Generation is
+  unconditional, takes **no caller input**, and never leaves the sandbox — this is
+  the precise move that closes the gap (PC2 minted these in the Node host via
+  `dashPackager.ts::generateCEK`).
+- `seal_segment_in_boundary()` mints the key, CENC-encrypts the asset's samples
+  with it, scrubs the CEK on drop (`Zeroizing<[u8; 16]>`), and returns
+  `SealedSegment` — **which has no CEK field**, so the output half of invariant #1
+  is enforced by construction.
+
+**Scope held deliberately tight (one boundary at a time):** the cipher core only.
+PC2's full fMP4 box surgery (mp4box) and Elacity PSSH injection were **not**
+vendored — PSSH embeds chain/Lit authority, a PC2 trust-model concern we must
+*translate*, not copy (ACL law). Those + the actual CEK sealing are a later
+boundary, so `seal` dispatch stays fail-closed, exactly as decrypt-provider keeps
+`open_session` fail-closed behind its already-proven cenc engine.
+
+## What remains (not the keygen gap)
+
+Wire the full `seal`: seal the minted CEK to the rights/key authority via the
+PQ-hybrid envelope (proven wasm-viable, `DDRM_STATUS.md` §PQ), package the full
+fMP4 (mp4box) + translated protection metadata, upload ciphertext, return a
+`SealedObjectV1`. This depends on the same CEK-transport rail the decrypt side
+awaits (Anders).
 
 Open question for Anders: should the runtime keep PC2's split (CEK escrow to a
 key/license provider) or mint+seal entirely within `encrypt-provider`? Either way,
-generation moves in-boundary — that is the invariant.
+generation already moved in-boundary — that is the invariant, and it is now met.
