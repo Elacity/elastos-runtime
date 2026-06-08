@@ -96,6 +96,11 @@ pub struct RailCarrierVector {
     pub init_segment_b64: Option<String>,
     /// The plaintext the segment must decrypt to.
     pub expected_plaintext_b64: String,
+    /// PQ-hybrid + real-signature only: the published ML-DSA-65 verifying key the
+    /// `MlDsa65Verifier` is built from to verify the carrier's seal signature.
+    /// Absent for stub-signed or classical carriers (the stub verifier holds no key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa_vk_b64: Option<String>,
 }
 
 /// PQ-hybrid CEK-seal path: x25519+ML-KEM-768 unwrap → CENC AES-128-CTR decrypt.

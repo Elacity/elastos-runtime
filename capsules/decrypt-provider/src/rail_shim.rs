@@ -414,4 +414,109 @@ mod tests {
             "a tampered PQ carrier golden must fail closed"
         );
     }
+
+    // --- PQ carrier golden verified by the REAL ML-DSA-65 primitive -----------
+    //
+    // The strongest pre-rail proof: a committed carrier whose seal signature is a
+    // genuine FIPS 204 ML-DSA-65 signature, replayed through the exact
+    // `decrypt_from_carrier` entrypoint `OpenSession` will call, verified by the
+    // production `MlDsa65Verifier` (not the stub). Pins "real PQ signature through
+    // the real rail entrypoint on a portable artifact" + fail-closed.
+
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    fn rail_carrier_pq_mldsa() -> crate::vector_format::RailCarrierVector {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/rail_carrier_pq_mldsa.json"
+        )))
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    fn mldsa_verifier(v: &crate::vector_format::RailCarrierVector) -> crate::pq_envelope::mldsa::MlDsa65Verifier {
+        let vk = b64()
+            .decode(v.mldsa_vk_b64.as_ref().expect("real-signed PQ carrier needs mldsa_vk"))
+            .unwrap();
+        crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(&vk).expect("ML-DSA-65 vk decodes")
+    }
+
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    fn pq_mldsa_carrier(v: &crate::vector_format::RailCarrierVector) -> SealedDecryptCarrier {
+        SealedDecryptCarrier {
+            profile: SealProfile::PqHybrid,
+            sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
+            ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
+            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+        }
+    }
+
+    /// The real-ML-DSA-65-signed carrier golden recovers plaintext through the shim
+    /// when verified by the production `MlDsa65Verifier`.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn rail_carrier_pq_mldsa_golden_replays_with_real_verifier() {
+        let v = rail_carrier_pq_mldsa();
+        assert_eq!(v.profile, "PqHybrid");
+        let carrier = pq_mldsa_carrier(&v);
+        let (output, meta) = decrypt_from_carrier(
+            &SessionSecret::PqHybrid(pq_session(&v)),
+            &carrier,
+            &mldsa_verifier(&v),
+        )
+        .expect("real-ML-DSA-65 carrier golden should decrypt through the shim");
+
+        let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
+        let off = carrier.ciphertext_segment.len() - expected.len();
+        assert_eq!(&output[off..], expected.as_slice());
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+    }
+
+    /// A tampered seal signature fails closed under the real verifier.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn rail_carrier_pq_mldsa_golden_tampered_signature_fails_closed() {
+        let v = rail_carrier_pq_mldsa();
+        let mut carrier = pq_mldsa_carrier(&v);
+        let n = carrier.sealed_cek.len();
+        carrier.sealed_cek[n - 1] ^= 0xFF; // corrupt the signature tail
+        assert!(
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
+                .is_err(),
+            "a tampered ML-DSA-65 carrier signature must fail closed"
+        );
+    }
+
+    /// The carrier must not verify under a DIFFERENT ML-DSA-65 verifying key.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn rail_carrier_pq_mldsa_golden_wrong_verifying_key_fails_closed() {
+        use ml_dsa::{Keypair, MlDsa65, SigningKey};
+        let v = rail_carrier_pq_mldsa();
+        let carrier = pq_mldsa_carrier(&v);
+
+        // A genuine but unrelated verifying key (deterministic from a different seed).
+        let other_seed: ml_dsa::B32 = [0xABu8; 32].into();
+        let other_vk = SigningKey::<MlDsa65>::from_seed(&other_seed).verifying_key().encode().to_vec();
+        let wrong = crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(&other_vk).unwrap();
+
+        assert!(
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &wrong).is_err(),
+            "a carrier signed by key A must not verify under key B"
+        );
+    }
+
+    /// Tampering the signed envelope body (the wrapped CEK) fails closed.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn rail_carrier_pq_mldsa_golden_tampered_body_fails_closed() {
+        let v = rail_carrier_pq_mldsa();
+        let mut carrier = pq_mldsa_carrier(&v);
+        let mid = carrier.sealed_cek.len() / 2; // lands in the signed envelope body
+        carrier.sealed_cek[mid] ^= 0xFF;
+        assert!(
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
+                .is_err(),
+            "a tampered carrier body must fail closed"
+        );
+    }
 }

@@ -39,6 +39,11 @@ rail-shim = ["rail-prep", "pq-rail-prep"]
 # unwrap). Pure-Rust, rng-free verify path -> builds to wasm32-wasip1. OFF by
 # default (separate axis): the default build + base ladder stay byte-stable.
 pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
+# rail-shim-mldsa: the rail-shim carrier path driven by the REAL ML-DSA-65
+# verifier (not the stub) on a committed golden — the strongest pre-rail proof:
+# the real PQ signature verified through the exact `decrypt_from_carrier`
+# entrypoint OpenSession will call. OFF by default; combines rail-shim + pq-mldsa.
+rail-shim-mldsa = ["rail-shim", "pq-mldsa"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

@@ -216,7 +216,12 @@ each is a one-line selection):
   either way the decrypt VM receives a sealed carrier; only *who sealed it* differs.
 - **Q2 (signature scheme — `ml-dsa-65` vs hybrid `ECDSA+ml-dsa`):** the PQ path
   verifies through a `CekSealVerifier`, so the chosen verifier plugs in without
-  touching `rail_shim.rs`.
+  touching `rail_shim.rs`. **No longer a build gap (Day 32–33):** the real FIPS 204
+  ML-DSA-65 verifier (`pq_envelope::mldsa::MlDsa65Verifier`, feature `pq-mldsa`) is
+  built, `wasm32-wasip1`-verified, and proven end-to-end through `decrypt_from_carrier`
+  on a committed real-signed carrier golden (`rail_carrier_pq_mldsa.json`, feature
+  `rail-shim-mldsa`). Q2 is now a pure policy choice (straight ML-DSA-65 vs a hybrid
+  during PC2's migration) — the primitive and its rail integration already exist.
 - **Profile choice (classical migration vs PQ target):** selected per-deployment by
   `SealProfile`; classical exists only for PC2 parity during migration.
 

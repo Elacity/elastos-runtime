@@ -665,6 +665,7 @@ mod tests {
             ciphertext_segment_b64: classical.encrypted_segment_b64,
             init_segment_b64: None,
             expected_plaintext_b64: classical.expected_plaintext_b64,
+            mldsa_vk_b64: None,
         };
         let path = format!("{dir}/rail_carrier_classical.json");
         std::fs::write(&path, serde_json::to_string_pretty(&carrier).unwrap()).unwrap();

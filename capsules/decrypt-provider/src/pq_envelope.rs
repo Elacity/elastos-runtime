@@ -772,10 +772,56 @@ mod tests {
             ciphertext_segment_b64: b64.encode(&segment),
             init_segment_b64: None,
             expected_plaintext_b64: b64.encode(plaintext),
+            mldsa_vk_b64: None,
         };
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
         std::fs::create_dir_all(dir).unwrap();
         let path = format!("{dir}/rail_carrier_pq.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Emit the PQ rail carrier golden signed by the REAL ML-DSA-65 primitive (not
+    /// the stub). The `sealed_cek` signature is a genuine FIPS 204 signature and the
+    /// committed `mldsa_vk_b64` is the published verifying key the replay builds
+    /// `MlDsa65Verifier` from — so the carrier replays through `decrypt_from_carrier`
+    /// verified by the real primitive, the exact path the rail flag-flips on. The
+    /// key authority key is deterministic (`from_seed`), so the golden is reproducible.
+    /// Run: `cargo test --features "gen-vectors,pq-mldsa" emit_rail_carrier_pq_mldsa`
+    #[cfg(all(feature = "gen-vectors", feature = "pq-mldsa"))]
+    #[test]
+    fn emit_rail_carrier_pq_mldsa() {
+        use base64::Engine as _;
+        use ml_kem::EncodedSizeUser;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (signer, vk_bytes) = mldsa_keypair([0x5Au8; 32]);
+        let (secret, public) = gen_session();
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let plaintext = b"the quick brown fox jumps over!!";
+        let env = seal(&public, &cek, &signer); // real ML-DSA-65 seal signature
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        let v = crate::vector_format::RailCarrierVector {
+            description:
+                "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768 + REAL ML-DSA-65 \
+                 signature): sealed CEK (PqSealedEnvelope::to_bytes, signature is a \
+                 genuine FIPS 204 ML-DSA-65 sig) + segment -> decrypt_from_carrier PQ \
+                 branch verified by MlDsa65Verifier(mldsa_vk_b64); runtime-only profile"
+                    .to_string(),
+            profile: "PqHybrid".to_string(),
+            session_secret_key_b64: b64.encode(secret.x25519.to_bytes()),
+            mlkem_dk_b64: Some(b64.encode(&secret.mlkem_dk.as_bytes()[..])),
+            sealed_cek_b64: b64.encode(env.to_bytes()),
+            ciphertext_segment_b64: b64.encode(&segment),
+            init_segment_b64: None,
+            expected_plaintext_b64: b64.encode(plaintext),
+            mldsa_vk_b64: Some(b64.encode(&vk_bytes)),
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/rail_carrier_pq_mldsa.json");
         std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
         eprintln!("wrote {path}");
     }

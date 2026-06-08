@@ -422,6 +422,30 @@ Base ladder byte-stable (default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-pr
 vectors 40 / rail-shim 45); new `pq-mldsa` = **34**; `wasm32-wasip1` clean (default +
 `pq-mldsa`); `ddrm-verify.sh` PASS.
 
+### Real ML-DSA-65 verified through the rail entrypoint — loop closed (Day 33)
+
+Day 32 proved the real primitive in `hybrid_unwrap`; Day 33 drives it through the **exact
+`decrypt_from_carrier` entrypoint** `OpenSession` flag-flips on, on a **committed
+real-signed carrier golden** (feature `rail-shim-mldsa = rail-shim + pq-mldsa`):
+
+- `tests/vectors/rail_carrier_pq_mldsa.json` — a PQ-hybrid carrier whose `sealed_cek`
+  signature is a **genuine FIPS 204 ML-DSA-65 signature** (key authority key deterministic
+  via `from_seed`, so the golden is reproducible). It carries the published verifying key
+  (`mldsa_vk_b64`, new optional `RailCarrierVector` field — needed because the real verifier
+  holds a key where the stub held none).
+- Replayed through `decrypt_from_carrier`'s PQ branch verified by the production
+  `MlDsa65Verifier(mldsa_vk_b64)` (**not** the stub): plaintext recovered; and fail-closed on
+  (a) **tampered signature**, (b) a **different verifying key**, (c) a **tampered envelope body**.
+  +4 tests → `rail-shim-mldsa` = **54**.
+
+This is the strongest possible pre-rail proof: *the real PQ signature, verified through the
+real rail entrypoint, on a portable committed artifact.* The day Anders answers Q2, the live
+`OpenSession` passes a `MlDsa65Verifier` into the one `decrypt_from_carrier` call — nothing
+else changes. `DDRM_DECRYPT_RAIL.md` Q2 updated: no longer a build gap, purely a policy choice.
+
+Base ladder + `pq-mldsa` byte-stable (25/27/29/31/40/45; `pq-mldsa` 34); new
+`rail-shim-mldsa` = 54; `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
