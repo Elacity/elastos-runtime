@@ -14,7 +14,7 @@ export function shortUri(uri) {
 
 export function baseName(uri) {
   const clean = String(uri || "").replace(/\/+$/, "");
-  return clean.split("/").pop() || "Explorer";
+  return clean.split("/").pop() || "Library";
 }
 
 export function parentUri(uri) {

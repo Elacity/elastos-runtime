@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "object-provider",
   "version": "0.1.0",
-  "description": "Principal-root object authority for Explorer/Library",
+  "description": "Principal-root object authority for Library",
   "author": "elastos",
   "role": "provider",
   "type": "microvm",

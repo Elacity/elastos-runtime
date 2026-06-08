@@ -76,7 +76,7 @@ export function createLibraryNavigation({
     if (data.schema === LIBRARY_HISTORY_GUARD_SCHEMA) {
       const entry = state.historyEntries[state.historyIndex] || createHistoryEntry(state.currentUri);
       window.history.pushState(libraryHistoryState(entry), "", window.location.href);
-      setStatus("Explorer kept focus.");
+      setStatus("Library kept focus.");
       return;
     }
     if (data.schema !== LIBRARY_HISTORY_SCHEMA || !data.key || !data.uri) return;

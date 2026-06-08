@@ -708,7 +708,7 @@ import { createLibraryUploads } from "./uploads.js";
       const family = support.family || "archive";
       const archiveViewer = viewerOptions(object).find((viewer) => viewer?.id === "archive-manager");
       if (archiveViewer && openWithViewer(object, archiveViewer.id)) {
-        setStatus(`Opening ${object.name || "archive"} in Archive Manager for ${family} policy inspection.`);
+        setStatus(`Opening ${object.name || "archive"} in Archive for ${family} policy inspection.`);
         return;
       }
       setStatus(`${object.name || "Archive"} is a ${family} archive. Extraction is disabled pending dependency and release-policy review.`);
@@ -844,7 +844,7 @@ import { createLibraryUploads } from "./uploads.js";
 
     function showError(error) {
       console.error(error);
-      setStatus(error && error.message ? error.message : "Explorer action failed.");
+      setStatus(error && error.message ? error.message : "Library action failed.");
     }
 
     function bindEvents() {
@@ -903,7 +903,7 @@ import { createLibraryUploads } from "./uploads.js";
         startLibraryEventStream();
       } catch (error) {
         showError(error);
-        elements.content.innerHTML = `<div class="empty"><div><h2>Could not load Explorer</h2><p>${escapeHtml(error.message || "Runtime object provider unavailable.")}</p></div></div>`;
+        elements.content.innerHTML = `<div class="empty"><div><h2>Could not load Library</h2><p>${escapeHtml(error.message || "Runtime object provider unavailable.")}</p></div></div>`;
       }
     }
 
