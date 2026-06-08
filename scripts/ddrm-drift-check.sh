@@ -43,6 +43,12 @@ REQUIRED_CONSTS=(
   "RIGHTS_DECISION_RECEIPT_SCHEMA"
   "PROTECTED_CONTENT_ACTIONS"
   "PROTECTED_CONTENT_OUTPUTS"
+  # Default algorithm sets consumed by drm/key (the PQ-hybrid negotiation surface;
+  # the crown-jewel mandate lives here — a rename must fail loud, not silently).
+  "DEFAULT_PROTECTED_CONTENT_CIPHER"
+  "DEFAULT_PROTECTED_CONTENT_KEMS"
+  "DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME"
+  "DEFAULT_PROTECTED_CONTENT_SIGNATURES"
 )
 
 REQUIRED_STRUCTS=(
@@ -50,6 +56,7 @@ REQUIRED_STRUCTS=(
   "KeyEnvelopeV1"
   "KeyEnvelopeAlgorithmsV1"
   "RightsPolicyV1"
+  "ViewerRequirementV1"
   "KeyReleaseRequestV1"
   "DecryptSessionRequestV1"
   "DecryptSessionV1"
@@ -57,8 +64,15 @@ REQUIRED_STRUCTS=(
   "RightsDecisionReceiptV1"
 )
 
+# Free functions the chain calls into. A rename here breaks drm + key compilation
+# but leaves every struct/const intact, so it must be pinned explicitly.
+REQUIRED_FNS=(
+  "validate_protected_content_key_envelope_algorithms"
+)
+
 # Field-level invariants: the chain-binding fields whose loss would silently break
-# authorization composition (rights -> key -> decrypt). Format: "Struct:field".
+# authorization composition (rights -> key -> decrypt) or PQ-algorithm negotiation.
+# Format: "Struct:field".
 REQUIRED_FIELDS=(
   "KeyReleaseRequestV1:rights_receipt"
   "DecryptSessionRequestV1:release_receipt"
@@ -66,6 +80,11 @@ REQUIRED_FIELDS=(
   "ReleaseReceiptV1:action"
   "RightsDecisionReceiptV1:allowed"
   "KeyEnvelopeV1:wrapped_cek"
+  # PQ negotiation surface validated by validate_protected_content_key_envelope_algorithms.
+  "KeyEnvelopeAlgorithmsV1:cipher"
+  "KeyEnvelopeAlgorithmsV1:kem"
+  "KeyEnvelopeAlgorithmsV1:signature"
+  "KeyEnvelopeAlgorithmsV1:share_scheme"
 )
 
 fail=0
@@ -91,6 +110,17 @@ for s in "${REQUIRED_STRUCTS[@]}"; do
     green "  ok   $s"
   else
     red   "  MISS $s"
+    fail=1
+  fi
+done
+
+echo
+bold "free functions:"
+for fn in "${REQUIRED_FNS[@]}"; do
+  if grep -qE "pub fn ${fn}\b" "$PC"; then
+    green "  ok   $fn"
+  else
+    red   "  MISS $fn"
     fail=1
   fi
 done

@@ -1,37 +1,79 @@
 # Reinstatement Push Plan — local branches → PRs
 
 **Status:** Ready. Execute the moment GitHub push access is restored.
-**Date:** 2026-06-08
+**Date:** 2026-06-09 (rebase recipe verified against git reality on Day 36)
 **Base for every branch:** `origin/0.4.0`.
 
-> ## ⚠️ Base moved — rebase before pushing (2026-06-08, Day 17)
+> ## ⚠️ Base moved — rebase before pushing (recipe is button-press below)
 >
 > Anders **force-pushed `origin/0.4.0`** (`42e4d7ffd` → `67b7560a7`), redoing
-> commits as warned, and **more redones are still coming** ("3 latest will be
-> redone soon and the rest to follow; aiming to finish 0.4.0 today"). So **do not
-> rebase yet** — wait until 0.4.0 stops moving, then rebase each branch.
+> commits as warned. Our branch has therefore **diverged** from `origin/0.4.0`
+> (verified Day 36: `git merge-base --is-ancestor origin/0.4.0 feat/decrypt-provider-cenc`
+> → **not an ancestor**; merge-base is `589092b95`, with **3** base commits since).
+> Do **not** rebase until 0.4.0 stops moving — then run §"Rebase recipe" below.
 >
-> **Good news — the contract converged.** `elastos-common/protected_content.rs` is
-> **byte-identical** between `feat/decrypt-provider-cenc` and the redone
-> `origin/0.4.0` (verified: `git diff HEAD..origin/0.4.0 -- …/protected_content.rs`
-> = 0 lines). The redone base independently added the exact types our providers
-> were already built against (`RightsDecisionReceiptV1`, `KeyReleaseRequestV1.
-> rights_receipt`, typed `DecryptSessionRequestV1.release_receipt`,
-> `ReleaseReceiptV1.session_id/action`). **Zero type drift.**
->
-> **Rebase recipe for `feat/decrypt-provider-cenc`** (when 0.4.0 settles):
-> ```bash
-> git fetch origin 0.4.0
-> scripts/ddrm-drift-check.sh            # must PASS first (guards the contract)
-> git branch -f backup/ddrm-preD<N> feat/decrypt-provider-cenc   # safety
-> git rebase --onto origin/0.4.0 <parent-of-our-first-commit> feat/decrypt-provider-cenc
-> # Conflicts will be ONLY in capsules/{decrypt,key,drm}-provider/src/main.rs,
-> # and ONLY because the base lacks our additions — resolve "keep both": take the
-> # base's structure + re-apply our cenc/envelope/rights-binding/seam/consumer
-> # additions. No type reconciliation needed (contract is identical).
-> ```
-> A safety backup of the pre-rebase tip is kept at
-> `backup/decrypt-provider-cenc-preD17`.
+> **The contract converged — still zero type drift (re-verified Day 36).**
+> `elastos-common/protected_content.rs` is **byte-identical** between
+> `feat/decrypt-provider-cenc` and `origin/0.4.0`
+> (`git diff origin/0.4.0..feat/decrypt-provider-cenc -- …/protected_content.rs` = 0
+> lines). The redone base independently added the exact types our providers were
+> built against (`RightsDecisionReceiptV1`, `KeyReleaseRequestV1.rights_receipt`,
+> typed `DecryptSessionRequestV1.release_receipt`, `ReleaseReceiptV1.session_id/action`),
+> plus the PQ-negotiation surface (`KeyEnvelopeAlgorithmsV1`,
+> `validate_protected_content_key_envelope_algorithms`, the `DEFAULT_*` algorithm
+> sets). `scripts/ddrm-drift-check.sh` now pins **all** of these (13 consts / 10
+> structs / 1 fn / 10 fields), so the rebase is a button-press verification, not an
+> archaeology dig.
+
+## Rebase recipe (run when 0.4.0 settles)
+
+**Pre-flight (once):**
+```bash
+git fetch origin 0.4.0
+scripts/ddrm-verify.sh                 # gate must be GREEN on the current tip first
+```
+
+**Per branch** — rebase onto the fresh `origin/0.4.0`, then re-verify. Because the
+base was force-pushed, use `--onto` with the *current* merge-base (not a hard-coded
+parent), so only our own commits replay:
+
+```bash
+B=feat/decrypt-provider-cenc           # repeat for each branch in the push order
+git branch -f "backup/${B##*/}-prerebase" "$B"          # safety snapshot
+git rebase --onto origin/0.4.0 "$(git merge-base origin/0.4.0 "$B")" "$B"
+# ...resolve conflicts (see churn points below), then:
+scripts/ddrm-verify.sh                 # for the dDRM branch: must be ALL GATES PASS
+#   (other branches: cargo build/test for the crate they touch — see per-PR plan)
+git range-diff origin/0.4.0...@{-1} origin/0.4.0...HEAD   # confirm nothing dropped
+```
+
+**Branch order & expected conflict surface** (cross-checked against git Day 36):
+
+| Order | Branch | ahead | conflict surface on rebase |
+|---|---|---|---|
+| 1 | `fix/crosvm-darwin-build` | 3 | none expected (platform-gating new files) |
+| 2 | `fix/home-summary-resilience` | 4 | stacked on #1 — rebase #1 first, then this onto it |
+| 3 | `chore/bincode-2x` | 3 | **bincode call-sites** if the base touched serialization; keep `bincode::config::legacy()`, re-run the wire-format golden |
+| 4 | `chore/carrier-iroh-upgrade` | 3 | docs/audit.toml only — none expected |
+| 5 | `feat/decrypt-provider-cenc` | 39 | `capsules/{decrypt,key,drm}-provider/src/main.rs` only — see below |
+
+**Known churn points (resolution = "keep both", no type reconciliation needed):**
+- **dDRM providers** (`capsules/{decrypt,key,drm,rights}-provider`): conflicts arise
+  only because the base lacks *our additions* (cenc/envelope/rights-binding/seam/
+  consumer contract). Take the base's structure + re-apply our additions. The
+  contract types are identical, so there is **no type reconciliation** — confirm with
+  `scripts/ddrm-drift-check.sh` (PASS) immediately after resolving.
+- **`encrypt-provider` self-containment:** it deliberately has **no `elastos-common`
+  dep** to survive 0.4.0 churn, so it should **not** conflict on rebase. Only *after*
+  the rebase is green do you reconcile it to the shared types (drift-check prints the
+  list; tracked in `DDRM_ENCRYPT_INVARIANT.md`). Do not fold that reconcile into the
+  rebase — keep it a separate, reviewable commit.
+- **bincode 2.x:** if the new base changed any capability-token serialization, keep
+  the `legacy()` config and re-run the round-trip golden before pushing.
+
+A safety backup of an early pre-rebase tip is kept at
+`backup/decrypt-provider-cenc-preD17`; each rebase also snapshots
+`backup/<branch>-prerebase` per the recipe above.
 
 While GitHub access is suspended, all work has been committed to isolated local
 branches, each scoped to one reviewable concern. This is the exact order and
@@ -46,11 +88,15 @@ then the larger dDRM feature.
 
 | # | Branch | Ahead | PR title | Depends on |
 |---|---|---|---|---|
-| 1 | `fix/crosvm-darwin-build` | 1 | fix(crosvm): compile on non-Linux hosts so 0.4.0 builds/runs on macOS | — |
-| 2 | `fix/home-summary-resilience` | 2 | fix(home): reset corrupt browser-state instead of failing the home summary | #1 (stacked) |
-| 3 | `chore/bincode-2x` | 1 | chore(runtime): migrate bincode 1.3 → 2.x with wire-format compat tests | — |
-| 4 | `chore/carrier-iroh-upgrade` | 1 | docs(carrier): iroh/Hickory upgrade decision memo + correct audit.toml rationale | — |
-| 5 | `feat/decrypt-provider-cenc` | 11+ | feat(ddrm): decrypt-provider cenc engine, chain providers proven, rail spec + alignment | — |
+| 1 | `fix/crosvm-darwin-build` | 3 | fix(crosvm): compile on non-Linux hosts so 0.4.0 builds/runs on macOS | — |
+| 2 | `fix/home-summary-resilience` | 4 | fix(home): reset corrupt browser-state instead of failing the home summary | #1 (stacked) |
+| 3 | `chore/bincode-2x` | 3 | chore(runtime): migrate bincode 1.3 → 2.x with wire-format compat tests | — |
+| 4 | `chore/carrier-iroh-upgrade` | 3 | docs(carrier): iroh/Hickory upgrade decision memo + correct audit.toml rationale | — |
+| 5 | `feat/decrypt-provider-cenc` | 39 | feat(ddrm): decrypt-provider cenc engine, chain providers proven, rail spec + alignment | — |
+
+> Ahead-counts re-measured against the force-pushed `origin/0.4.0` on Day 36
+> (`git rev-list --count origin/0.4.0..<branch>`); they include the divergence from
+> the rewritten base and will collapse to the intended-commit count after rebase.
 
 Notes:
 - **#2 is stacked on #1** (it contains the crosvm commit). Either land #1 first
@@ -111,7 +157,9 @@ Notes:
 ## Pre-push checklist (per branch)
 - `git log --oneline origin/0.4.0..<branch>` shows only the intended commits.
 - No secrets / no `build/` or `scripts/dev/` local artifacts staged.
-- Branch is a clean descendant of `origin/0.4.0` (rebase if main has moved).
+- Branch is a clean descendant of `origin/0.4.0` (rebase per the recipe if it moved;
+  `git merge-base --is-ancestor origin/0.4.0 <branch>` should succeed post-rebase).
+- For `feat/decrypt-provider-cenc`: `scripts/ddrm-verify.sh` = ALL GATES PASS.
 - PR body: 1–3 bullet summary + the test plan above.
 
 ## After Anders' answers land

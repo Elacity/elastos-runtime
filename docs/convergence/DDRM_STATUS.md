@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **+38 commits**, tip `b1f8b7dd5`, end of Day 35)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~40 commits**, tip `90899e70d` + Day-36 reconcile-prep)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -520,6 +520,28 @@ but verified the impact:
   under `--features rail-prep` (Day-18 rail-landing composition).
 - Rebase recipe + safety backup (`backup/decrypt-provider-cenc-preD17`):
   `PUSH_PLAN.md` § "Base moved".
+
+**Day 36 reconcile-prep re-verification.** Re-measured against the force-pushed base:
+- `origin/0.4.0` is **no longer an ancestor** of our branch (diverged; merge-base
+  `589092b95`, +3 base commits). The rebase recipe now uses `git rebase --onto
+  origin/0.4.0 "$(git merge-base …)"` so only our own commits replay, with a
+  `ddrm-verify.sh` checkpoint after each branch and `git range-diff` to confirm
+  nothing drops. `PUSH_PLAN.md` § "Rebase recipe" is now button-press + has the
+  per-branch conflict surface (incl. the `encrypt-provider` self-containment and
+  bincode-2x churn points).
+- **Contract still byte-identical** (re-verified): `git diff
+  origin/0.4.0..feat/decrypt-provider-cenc -- …/protected_content.rs` = 0 lines.
+- **Drift guard widened to the full consumed surface** (was a Day-17 subset): now
+  pins **13 consts / 10 structs / 1 free fn / 10 fields**, adding the genuinely-
+  consumed-but-unpinned symbols — `validate_protected_content_key_envelope_algorithms`
+  (called by drm + key), the `DEFAULT_PROTECTED_CONTENT_*` algorithm sets,
+  `ViewerRequirementV1`, and the PQ-negotiation fields on `KeyEnvelopeAlgorithmsV1`
+  (`cipher`/`kem`/`signature`/`share_scheme`). A rename of any now fails the guard
+  loudly instead of surfacing as a compile error mid-rebase.
+- **The encrypt↔decrypt seam is now gate-enforced:** `ddrm-ladder-check.sh` runs
+  `encrypt_to_decrypt_round_trip_golden` **by name** and asserts 1 passed, so an
+  encrypt-side change that breaks decrypt (or a silent cfg/rename drop of the
+  cross-invariant golden) fails the gate.
 
 ## Commits (on `feat/decrypt-provider-cenc`, not yet pushed — GitHub suspension)
 

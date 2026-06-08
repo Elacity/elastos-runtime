@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 34).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `b1f8b7dd5`, 38 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 36).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `90899e70d` + Day-36 reconcile-prep, ~40 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -438,7 +438,8 @@ next context can continue cold.
 - **D32** wire the real FIPS 204 ML-DSA-65 into the `CekSealVerifier` slot behind `pq-mldsa` (=34) (`d6899b9ed`).
 - **D33** verify the real ML-DSA-65 through `decrypt_from_carrier` on a carrier golden (`rail-shim-mldsa`=54) (`aadb4f1fc`).
 - **D34** adversarial negative-space + containment sweep behind `harden` (=65) (`b1f8b7dd5`).
-- **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + this refresh.
+- **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + handover refresh (`90899e70d`).
+- **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name.
 
 ---
 

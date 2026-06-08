@@ -70,6 +70,24 @@ for row in "${LADDER[@]}"; do
   fi
 done
 
+# --- 1b. cross-invariant seam: the encrypt->decrypt round-trip MUST be exercised -
+#
+# The round-trip golden (produced by encrypt-provider's real in-boundary engine,
+# replayed by decrypt-provider) is the one artifact that pins invariant #1 <-> #2.
+# Run it BY NAME so a rename / cfg-drift / encrypt-side break that silently drops
+# it from the `vectors` suite fails the gate instead of just shifting the count.
+echo
+bold "== dDRM ladder (1b/2): encrypt<->decrypt seam exercised =="
+seam_out="$(cd "$CAPSULES/decrypt-provider" && cargo test --features vectors encrypt_to_decrypt_round_trip_golden 2>/dev/null)"
+seam_passed="$(printf '%s\n' "$seam_out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
+seam_failed="$(printf '%s\n' "$seam_out" | sed -n 's/.*ok\. [0-9]* passed; \([0-9]*\) failed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
+if [ "$seam_passed" -eq 1 ] && [ "$seam_failed" -eq 0 ]; then
+  green "  ok    encrypt_to_decrypt_round_trip_golden — 1 passed (seam live)"
+else
+  red "  FAIL  encrypt_to_decrypt_round_trip_golden — expected 1 passed / 0 failed, got $seam_passed/$seam_failed (seam dropped?)"
+  rc=1
+fi
+
 # --- 2. wasm32-wasip1 builds (dir | features) -------------------------------
 echo
 bold "== dDRM ladder (2/2): wasm32-wasip1 builds =="
