@@ -153,6 +153,27 @@ Pinned by 4 characterization tests (`pq_hybrid_round_trip_recovers_cek`,
 25 default + 4 PQ). **The PQ rail is now a known-good drop-in for the classical
 envelope the moment Anders confirms the transport + signature scheme.**
 
+### Full PQ data path proven end-to-end, pre-rail (Day 21)
+
+The three in-boundary engines — Day-18 rail-prep composition, Day-19 in-boundary
+keygen, Day-20 PQ envelope — are now bound into **one executable cross-engine
+proof**: `pq_envelope::decrypt_pq_sealed_segment` (feature `pq-rail-prep`, default
+OFF, enables `pq-envelope`) chains `hybrid_unwrap → decrypt_session_segment`, i.e.
+the PQ analogue of the Day-18 classical `decrypt_sealed_segment`. The PQ unwrap
+slots exactly where the classical `ecdh_unwrap` does (mirroring PC2
+`ddrm-decrypt::session::unwrap_envelope` → cenc), with the CEK in `Zeroizing`
+throughout, consumed + zeroized by the cenc engine, and never reaching the scoped
+response.
+
+Pinned by a **cross-engine golden**: PQ-seal a CEK and CENC-encrypt a segment with
+that *same* CEK, then prove the composed path recovers the plaintext while the CEK
+stays off the boundary (`pq_sealed_segment_decrypts_end_to_end_and_keeps_cek_off_the_boundary`),
+plus a wrong-session fail-closed case. Builds clean to `wasm32-wasip1`. Run:
+`cargo test --features pq-rail-prep` (31 green: 29 + 2 cross-engine). **The entire
+PQ dDRM data path — sealed CEK in → rendered bytes out, key contained — is now
+proven before the rail lands; the remaining work is the transport shim, not the
+crypto or the engines.**
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

@@ -177,10 +177,21 @@ of a decrypt, and is zeroized.
 | Sealed output carries only ciphertext + wrapped CEK (no raw CEK) | `encrypt-provider` | `sealed_output_never_carries_raw_cek` (green) |
 | Raw CEK zeroized after use | `encrypt-provider` | `cek_is_zeroized_after_use` (green) |
 | Boundary blocks raw_cek + plaintext authority | `encrypt-provider` | `status_blocks_raw_cek_and_plaintext_authority` (green) |
-| **CEK+KID generated in-boundary (no host)** | `encrypt-provider` | `cek_and_kid_generated_inside_boundary` (`#[ignore]` — scoped landing) |
+| **CEK+KID generated in-boundary (no host)** | `encrypt-provider` | `cek_and_kid_generated_inside_boundary` (green, Day 19) |
+| Engine emits only ciphertext + KID + IVs (no CEK) | `encrypt-provider` | `seal_engine_emits_no_key_material` (green, Day 19) |
 
-Full analysis + the PC2 gap (CEK currently minted in the Node host) +
-reconciliation plan: `DDRM_ENCRYPT_INVARIANT.md`.
+Full analysis + the (now-closed) PC2 host-keygen gap + reconciliation plan:
+`DDRM_ENCRYPT_INVARIANT.md`.
+
+**PQ-hybrid rail + full data path (de-risked pre-rail, feature-gated):**
+
+| Rule | Enforced by | Test |
+|---|---|---|
+| PQ-hybrid (x25519+ml-kem-768) unwrap recovers CEK in `Zeroizing` | `pq_envelope.rs` | `pq_hybrid_round_trip_recovers_cek` (`--features pq-envelope`) |
+| Wrong session secret / tampered blob / bad signature fail closed | `pq_envelope.rs` | `wrong_session_secret_fails_closed`, `tampered_signature_fails_closed` |
+| CEK never in the sealed PQ envelope cleartext | `pq_envelope.rs` | `sealed_envelope_has_no_raw_cek` |
+| **Full PQ path: sealed CEK → unwrap → cenc decrypt → scoped output, CEK off boundary** | `pq_envelope.rs` | `pq_sealed_segment_decrypts_end_to_end_and_keeps_cek_off_the_boundary` (`--features pq-rail-prep`) |
+| Full PQ path fails closed on wrong session | `pq_envelope.rs` | `pq_sealed_segment_wrong_session_fails_closed` |
 
 Run the unified proof: `scripts/ddrm-chain-smoke.sh` (all four chain providers
 under wasmtime).
@@ -189,16 +200,18 @@ under wasmtime).
 
 1. **The live decrypt rail wiring** (§6): provisioning the decrypt session key +
    having the key authority seal the CEK to it with the **PQ-hybrid**
-   KEM/signature, then composing `envelope`-unwrap + `cenc::process` inside
+   KEM/signature, then composing the unwrap + `cenc::process` inside
    decrypt-provider. Pending Anders' confirmation of (a) Option A and (b)
    dKMS-direct-seal vs key-provider re-seal, and (c) sig scheme during transition
-   (ml-dsa-65 vs hybrid). The byte contract and both chain ends are already
-   pinned, so this is a small, well-scoped landing once confirmed.
-2. **In-boundary CEK+KID generation** (invariant #1): `encrypt-provider`'s engine
-   that mints the CEK/KID inside the boundary (closing the PC2 host-keygen gap),
-   CENC-encrypts, seals, and returns a `SealedObjectV1`. Contract + zeroization +
-   no-raw-CEK output are already pinned by tests; only the generator/cipher engine
-   is unwired. See `DDRM_ENCRYPT_INVARIANT.md`.
+   (ml-dsa-65 vs hybrid). **De-risked:** the byte contract, both chain ends, the
+   PQ-hybrid envelope, AND the full composed path (`decrypt_pq_sealed_segment`,
+   feature `pq-rail-prep`) are all pinned + wasm-built, so this is now a small
+   transport shim once confirmed.
+2. **The full `seal` on the encrypt side** (invariant #1): the in-boundary CEK+KID
+   generation gap is **closed** (Day 19 — `cek_and_kid_generated_inside_boundary`
+   green); what remains is sealing the minted CEK via the PQ-hybrid envelope + fMP4
+   packaging + ciphertext availability, which shares the decrypt rail dependency.
+   See `DDRM_ENCRYPT_INVARIANT.md`.
 
 ## 11. Glossary
 

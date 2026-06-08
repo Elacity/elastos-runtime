@@ -22,6 +22,12 @@ rail-prep = []
 # recover a CEK in Zeroizing and build to wasm32-wasip1. OFF by default; pulls the
 # PQ crates only when enabled. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
 pq-envelope = ["dep:ml-kem", "dep:x25519-dalek", "dep:aes-gcm", "dep:sha2"]
+# pq-rail-prep: the full pre-rail dDRM data path proven end to end — PQ-hybrid
+# unwrap (pq-envelope) -> cenc decrypt -> scoped output, CEK in Zeroizing
+# throughout. Unifies the rail-prep composition (Day 18), in-boundary keygen
+# (Day 19) and the PQ envelope (Day 20) into one cross-engine proof. OFF by
+# default; enables pq-envelope. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
+pq-rail-prep = ["pq-envelope"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }

@@ -162,6 +162,37 @@ pub fn hybrid_unwrap(
     Ok(Zeroizing::new(cek))
 }
 
+/// Full pre-rail dDRM data path (PREP — feature `pq-rail-prep`, not wired into
+/// dispatch). Chains the PQ-hybrid CEK unwrap into the decrypt-step cenc engine,
+/// i.e. the post-quantum analogue of `decrypt_sealed_segment` (Day-18 rail-prep).
+///
+/// `PQ-sealed envelope → hybrid_unwrap → CEK (Zeroizing) → cenc decrypt → scoped
+/// output`. Mirrors PC2 `ddrm-decrypt::session::unwrap_envelope` (recover CEK) →
+/// cenc decrypt, with the PQ unwrap slotting exactly where the classical
+/// `ecdh_unwrap` does. The CEK lives in `Zeroizing` for its whole lifetime, is
+/// consumed + zeroized by the cenc engine, and never reaches the scoped response.
+///
+/// This is the single operation the Hybrid rail invokes under the PQ profile once
+/// Anders confirms the transport + signature scheme — proving all three
+/// in-boundary engines compose end to end before the rail lands.
+#[cfg(feature = "pq-rail-prep")]
+pub fn decrypt_pq_sealed_segment(
+    session: &SessionKemSecret,
+    sealed_envelope: &PqSealedEnvelope,
+    verifier: &impl CekSealVerifier,
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, serde_json::Value), String> {
+    use base64::Engine as _;
+
+    let cek = hybrid_unwrap(session, sealed_envelope, verifier).map_err(|err| format!("{err:?}"))?;
+    // Bridge the recovered CEK into the cenc engine's command surface, held in
+    // `Zeroizing` so it is scrubbed across the internal hand-off (same discipline
+    // as the classical `decrypt_sealed_segment`).
+    let cek_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(cek.as_slice()));
+    crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +310,110 @@ mod tests {
         assert!(
             !bytes.windows(cek.len()).any(|w| w == cek),
             "the raw CEK must never appear in the sealed PQ envelope"
+        );
+    }
+
+    // --- full pre-rail data path (feature = "pq-rail-prep") --------------------
+    //
+    // PQ-seal a CEK + CENC-encrypt a segment with that SAME CEK (cross-engine
+    // golden), then prove the composed path (hybrid_unwrap -> cenc decrypt)
+    // recovers the plaintext while the CEK never reaches the scoped response.
+    // Run with: cargo test --features pq-rail-prep
+
+    #[cfg(feature = "pq-rail-prep")]
+    fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (8 + content.len()) as u32;
+        let mut b = size.to_be_bytes().to_vec();
+        b.extend_from_slice(box_type);
+        b.extend_from_slice(content);
+        b
+    }
+
+    /// Minimal single-sample encrypted fMP4 segment: moof{traf{trun,senc}} +
+    /// mdat{ciphertext}. Independently constructed (matches the decrypt-step
+    /// golden) so the cross-engine round-trip pins the full path.
+    #[cfg(feature = "pq-rail-prep")]
+    fn build_encrypted_segment(plaintext: &[u8], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+        use aes::cipher::{KeyIvInit, StreamCipher};
+        type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
+
+        let mut iv16 = [0u8; 16];
+        iv16[..8].copy_from_slice(iv8);
+        let mut ciphertext = plaintext.to_vec();
+        let mut cipher = Aes128Ctr::new(cek.into(), (&iv16).into());
+        cipher.apply_keystream(&mut ciphertext);
+
+        let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        trun_content.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        let trun = make_box(b"trun", &trun_content);
+
+        let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+        senc_content.extend_from_slice(iv8);
+        let senc = make_box(b"senc", &senc_content);
+
+        let mut traf_content = trun;
+        traf_content.extend_from_slice(&senc);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+        let mdat = make_box(b"mdat", &ciphertext);
+
+        let mut segment = moof;
+        segment.extend_from_slice(&mdat);
+        segment
+    }
+
+    #[cfg(feature = "pq-rail-prep")]
+    #[test]
+    fn pq_sealed_segment_decrypts_end_to_end_and_keeps_cek_off_the_boundary() {
+        use base64::Engine as _;
+
+        let (secret, public) = gen_session();
+        let plaintext = b"the quick brown fox jumps over!!"; // 32 bytes
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+
+        // Key authority seals the CEK to the decrypt session; producer CENC-encrypts
+        // the segment with that same CEK.
+        let env = seal(&public, &cek, &StubSigner);
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        // The whole pre-rail path: PQ-sealed envelope + encrypted segment ->
+        // plaintext recovered inside the boundary, CEK recovered only via the
+        // hybrid KEM unwrap.
+        let (output, meta) =
+            super::decrypt_pq_sealed_segment(&secret, &env, &StubVerifier, &segment, None).unwrap();
+
+        let moof_len = segment.len() - (8 + plaintext.len());
+        let mdat_off = moof_len + 8;
+        assert_eq!(&output[mdat_off..mdat_off + plaintext.len()], plaintext);
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+        assert_eq!(meta["sample_count"], serde_json::json!(1));
+
+        // Containment: the CEK never appears in the metadata that would surface,
+        // and never appeared in the sealed envelope.
+        let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
+        let meta_str = serde_json::to_string(&meta).unwrap();
+        assert!(!meta_str.contains(&cek_b64), "CEK must not surface in decrypt metadata");
+        assert!(
+            !env.to_bytes().windows(cek.len()).any(|w| w == cek),
+            "CEK must not appear in the sealed PQ envelope"
+        );
+    }
+
+    #[cfg(feature = "pq-rail-prep")]
+    #[test]
+    fn pq_sealed_segment_wrong_session_fails_closed() {
+        let (_secret_a, public_a) = gen_session();
+        let (secret_b, _public_b) = gen_session();
+        let cek = [0x11u8; 16];
+        let iv8 = [0x22u8; 8];
+        let env = seal(&public_a, &cek, &StubSigner);
+        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &iv8);
+
+        // The wrong session secret cannot unwrap the CEK -> the whole path fails
+        // closed before any segment is decrypted.
+        assert!(
+            super::decrypt_pq_sealed_segment(&secret_b, &env, &StubVerifier, &segment, None).is_err()
         );
     }
 }
