@@ -276,6 +276,37 @@ composition** (an asset sealed here decrypts there); the **seal/envelope transpo
 is exactly what lands when Anders confirms the rail. The byte-identical cipher cores
 (both `apply_keystream` AES-128-CTR with `pad_iv`) make that composition sound.
 
+### Rail transport shim — the rail is now a flag flip, not a design (Day 27)
+
+Everything *downstream* of the rail was proven (unwrap + cenc, both classical and
+PQ). The missing piece was the **carrier→engine adapter**: the thin code that takes
+the sealed-CEK material off the wire and hands it to the right engine. That adapter
+now exists behind the `rail-shim` feature (`decrypt-provider/src/rail_shim.rs`,
+default OFF, **NOT** wired into `OpenSession`/dispatch — a Parallel-Change island):
+
+- `SealedDecryptCarrier { profile, sealed_cek, ciphertext_segment, init_segment }` —
+  carries only sealed/public bytes (**never** a raw CEK), mirroring rail Option A
+  (decrypt VM *receives* VM-sealed material) and PC2 `session::unwrap_envelope`
+  (the VM holds the session key; the envelope arrives from outside).
+- `decrypt_from_carrier(session, carrier, verifier)` dispatches on profile:
+  `ClassicalP256` → `decrypt_sealed_segment` (`rail-prep`); `PqHybrid` →
+  new **`PqSealedEnvelope::from_bytes`** wire-decode → `decrypt_pq_sealed_segment`
+  (`pq-rail-prep`). The VM session secret is a separate argument — never a carrier
+  field. CEK materializes only inside the engine, in `Zeroizing`, off the response.
+- **7 characterization tests** (`cargo test --features rail-shim` = **41 green**):
+  classical happy path is driven by the committed `classical_cenc.json` golden (so
+  the shim and PC2-conformance share one fixture); PQ happy path uses the shared
+  `seal_support` sealer; fail-closed is pinned for wrong session (both profiles),
+  malformed carrier (both), profile/secret mismatch, and tampered PQ signature.
+
+The base ladder is **unchanged** (25/27/29/31, `vectors` 37); `rail-shim` builds
+clean to `wasm32-wasip1`; `ddrm-verify.sh` PASS. The day Anders answers, `OpenSession`
+adds exactly one call — `rail_shim::decrypt_from_carrier(&vm_session_secret,
+&carrier, &verifier)?` — then maps `(bytes, meta)` into the existing scoped response.
+Q1 (dKMS-direct vs re-seal) does not touch the adapter; Q2 (signature scheme) plugs
+in through the `CekSealVerifier`; profile is a per-deployment `SealProfile` pick.
+Precise wire-up + question→knob mapping: `DDRM_DECRYPT_RAIL.md` §"Rail transport shim".
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step

@@ -28,6 +28,11 @@ pq-envelope = ["dep:ml-kem", "dep:x25519-dalek", "dep:aes-gcm", "dep:sha2"]
 # (Day 19) and the PQ envelope (Day 20) into one cross-engine proof. OFF by
 # default; enables pq-envelope. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
 pq-rail-prep = ["pq-envelope"]
+# rail-shim: the transport adapter from a sealed-CEK carrier (rail Option A) to
+# the already-proven unwrap->cenc engines, for BOTH profiles (classical + PQ).
+# A tested island, NOT wired into OpenSession/dispatch — the day Anders confirms
+# the rail (DDRM_DECRYPT_RAIL.md) it becomes a flag flip. OFF by default.
+rail-shim = ["rail-prep", "pq-rail-prep"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

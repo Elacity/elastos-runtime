@@ -102,6 +102,50 @@ impl PqSealedEnvelope {
         v
     }
 
+    /// Decode a sealed envelope from its `to_bytes()` wire form — the wire-decode
+    /// the live rail performs on the carrier it receives (Option A,
+    /// `DDRM_DECRYPT_RAIL.md`). Coarse `UnsealFailed` on any malformed/truncated
+    /// input so a forged carrier cannot probe which field failed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqEnvelopeError> {
+        fn read<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], PqEnvelopeError> {
+            let end = off.checked_add(n).ok_or(PqEnvelopeError::UnsealFailed)?;
+            if end > b.len() {
+                return Err(PqEnvelopeError::UnsealFailed);
+            }
+            let s = &b[*off..end];
+            *off = end;
+            Ok(s)
+        }
+        fn read_u32(b: &[u8], off: &mut usize) -> Result<usize, PqEnvelopeError> {
+            let s = read(b, off, 4)?;
+            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
+        }
+
+        let mut off = 0usize;
+        let eph: [u8; 32] = read(bytes, &mut off, 32)?
+            .try_into()
+            .map_err(|_| PqEnvelopeError::UnsealFailed)?;
+        let ct_len = read_u32(bytes, &mut off)?;
+        let ct_bytes = read(bytes, &mut off, ct_len)?;
+        let kem_ct =
+            Ciphertext::<MlKem768>::try_from(ct_bytes).map_err(|_| PqEnvelopeError::UnsealFailed)?;
+        let nonce: [u8; 12] = read(bytes, &mut off, 12)?
+            .try_into()
+            .map_err(|_| PqEnvelopeError::UnsealFailed)?;
+        let wrapped_len = read_u32(bytes, &mut off)?;
+        let wrapped_cek = read(bytes, &mut off, wrapped_len)?.to_vec();
+        let sig_len = read_u32(bytes, &mut off)?;
+        let signature = read(bytes, &mut off, sig_len)?.to_vec();
+
+        Ok(PqSealedEnvelope {
+            eph_x25519_pub: eph,
+            kem_ct,
+            nonce,
+            wrapped_cek,
+            signature,
+        })
+    }
+
     /// The bytes the signature covers (everything except the signature itself).
     fn signed_payload(&self) -> Vec<u8> {
         let mut v = Vec::new();
@@ -193,8 +237,12 @@ pub fn decrypt_pq_sealed_segment(
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
+/// Key-authority-side seal helpers — the counterpart of the in-VM unwrap. Shared
+/// by the unit tests and the rail-shim tests (so the carrier path is exercised
+/// with the same sealing the round-trip pins). Test-only — never compiled into a
+/// shipped build, so it carries no production dependency weight.
 #[cfg(test)]
-mod tests {
+pub(crate) mod seal_support {
     use super::*;
     use ml_kem::kem::Encapsulate;
     use rand_core::{OsRng, RngCore};
@@ -203,10 +251,10 @@ mod tests {
     /// Signer behind the same abstraction as the verifier. A deterministic stub
     /// stands in for ml-dsa-65 — the round-trip proves the abstraction binds the
     /// envelope, not the specific signature primitive.
-    trait CekSealSigner {
+    pub trait CekSealSigner {
         fn sign(&self, msg: &[u8]) -> Vec<u8>;
     }
-    struct StubSigner;
+    pub struct StubSigner;
     impl CekSealSigner for StubSigner {
         fn sign(&self, msg: &[u8]) -> Vec<u8> {
             let mut h = Sha256::new();
@@ -215,14 +263,14 @@ mod tests {
             h.finalize().to_vec()
         }
     }
-    struct StubVerifier;
+    pub struct StubVerifier;
     impl CekSealVerifier for StubVerifier {
         fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
             StubSigner.sign(msg).as_slice() == sig
         }
     }
 
-    fn gen_session() -> (SessionKemSecret, SessionKemPublic) {
+    pub fn gen_session() -> (SessionKemSecret, SessionKemPublic) {
         let mut rng = OsRng;
         let x_sk = XStaticSecret::random_from_rng(&mut rng);
         let x_pk = XPublicKey::from(&x_sk);
@@ -236,7 +284,7 @@ mod tests {
     /// Seal a CEK to a published session public key exactly as the key authority
     /// would (independently constructing the wire shape), so the round-trip pins
     /// the rail contract end to end.
-    fn seal(public: &SessionKemPublic, cek: &[u8], signer: &impl CekSealSigner) -> PqSealedEnvelope {
+    pub fn seal(public: &SessionKemPublic, cek: &[u8], signer: &impl CekSealSigner) -> PqSealedEnvelope {
         let mut rng = OsRng;
         // x25519 ephemeral DH half.
         let eph = EphemeralSecret::random_from_rng(&mut rng);
@@ -263,6 +311,12 @@ mod tests {
         env.signature = signer.sign(&env.signed_payload());
         env
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seal_support::*;
+    use super::*;
 
     #[test]
     fn pq_hybrid_round_trip_recovers_cek() {

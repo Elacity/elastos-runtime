@@ -184,6 +184,47 @@ live wasm substrate.
 - Once the rail is chosen, wiring is a small, well-scoped step: validated
   request (+ material) → `cenc::process` → scoped output.
 
+### Rail transport shim — the carrier→engine adapter is built (Day 27)
+
+The adapter that takes the **sealed-CEK carrier off the wire** and routes it to
+the proven in-boundary engines now exists behind the `rail-shim` feature
+(`capsules/decrypt-provider/src/rail_shim.rs`, default OFF, NOT wired into
+`OpenSession`). It encodes recommended **Option A** (decrypt VM *receives*
+VM-sealed material) for **both** profiles:
+
+- `SealedDecryptCarrier { profile, sealed_cek, ciphertext_segment, init_segment }`
+  — carries only sealed/public bytes, **never** a raw CEK.
+- `SessionSecret` (the VM's in-VM session key, a separate argument — never on the
+  wire) dispatches: `ClassicalP256` → `decrypt_sealed_segment` (`rail-prep`);
+  `PqHybrid` → `PqSealedEnvelope::from_bytes` (new wire-decode) →
+  `decrypt_pq_sealed_segment` (`pq-rail-prep`).
+- 7 characterization tests pin it: classical happy path (driven by the committed
+  `classical_cenc.json` golden, so the shim and PC2-conformance share one fixture)
+  + PQ happy path; and fail-closed for wrong session (both profiles), malformed
+  carrier (both), profile/secret mismatch, and tampered PQ signature.
+
+**The single line `OpenSession` adds the day the rail is confirmed:**
+```rust
+let (bytes, meta) =
+    rail_shim::decrypt_from_carrier(&vm_session_secret, &carrier, &verifier)?;
+// then map (bytes, meta) into the existing scoped media response.
+```
+
+How the open questions map onto this (so none of them is now a *design* task —
+each is a one-line selection):
+- **Q1 (dKMS-direct seal vs key-provider re-seal):** does not touch the adapter —
+  either way the decrypt VM receives a sealed carrier; only *who sealed it* differs.
+- **Q2 (signature scheme — `ml-dsa-65` vs hybrid `ECDSA+ml-dsa`):** the PQ path
+  verifies through a `CekSealVerifier`, so the chosen verifier plugs in without
+  touching `rail_shim.rs`.
+- **Profile choice (classical migration vs PQ target):** selected per-deployment by
+  `SealProfile`; classical exists only for PC2 parity during migration.
+
+The remaining genuinely-blocked pieces are *external* to this capsule: who mints
+the carrier (runtime/key-provider, Q1), the concrete signature primitive (Q2), and
+the carrier delivery field/transport (whether `DecryptSessionRequestV1` grows a
+`material` field, or it arrives via `carrier_invoke`).
+
 ## Inter-stage CEK transport — ECDH + DSA, PQ-hybrid (Irzhy, 2026-06-08)
 
 Irzhy independently flagged this exact gap and proposed: either wrap key-release +

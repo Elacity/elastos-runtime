@@ -29,6 +29,10 @@ mod pq_envelope;
 // fixtures the engines are replayed against. See src/vector_format.rs.
 #[cfg(feature = "vectors")]
 mod vector_format;
+// Rail transport shim (feature `rail-shim`): adapter from a sealed-CEK carrier to
+// the proven unwrap->cenc engines. Tested island, not wired into dispatch.
+#[cfg(feature = "rail-shim")]
+mod rail_shim;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
