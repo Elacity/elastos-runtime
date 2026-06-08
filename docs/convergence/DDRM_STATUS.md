@@ -204,6 +204,28 @@ green** (31 + 4 golden). Builds clean to `wasm32-wasip1`. **The engines are now
 refactor-/rebase-/port-safe and the classical path is conformance-checkable against
 PC2 — independent of any in-test seal helper.**
 
+### PC2 cross-impl conformance is now executable (Day 23)
+
+The "byte-compatible with PC2 `ddrm-decrypt`" claim is no longer an assertion — it
+**runs**. `scripts/pc2-conformance.sh` decrypts the committed `classical_cenc.json`
+using PC2 `ddrm-decrypt`'s **real code** and asserts byte-for-byte parity end to
+end:
+
+1. **CEK transport** — PC2 `envelope::parse → ecdh_unwrap → extract_keys_blob`
+   recovers the **same 16-byte CEK** from our sealed envelope.
+2. **Media** — PC2 `mp4box::parse_segment → cenc::decrypt_samples` decrypts our
+   segment to the **same plaintext**.
+
+The harness compiles a small driver (`scripts/pc2-conformance/driver.rs`) against
+the PC2 repo on demand via a temp crate, so **no absolute path or PC2 coupling ever
+enters the ElastOS build graph**. It resolves PC2 via `PC2_REPO` (default
+`/Users/sash/Documents/Cursor/pc2.net/pc2-node`) and **skips clean (exit 0)** when
+PC2 is absent, so the default chain is never broken; it **fails (exit 1) only on a
+genuine divergence**. Current result against the live PC2 checkout: **PASS** (CEK
+and plaintext both match). **Two independent implementations now agree on the exact
+bytes of the classical CEK rail — the strongest convergence evidence short of a
+shared test crate, and a regression tripwire if either wire format drifts.**
+
 ## The one open decision (for Anders / Irzhy)
 
 How the CEK reaches the decrypt boundary. **Hybrid chosen** (decrypt step
