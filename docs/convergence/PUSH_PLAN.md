@@ -51,7 +51,7 @@ git range-diff origin/0.4.0...@{-1} origin/0.4.0...HEAD   # confirm nothing drop
 
 | Order | Branch | ahead | conflict surface on rebase |
 |---|---|---|---|
-| 1 | `fix/crosvm-darwin-build` | 3 | none expected (platform-gating new files) |
+| 1 | `fix/crosvm-darwin-build` | 3 | none expected (platform-gating new files); **build-verified green on macOS Day 42** |
 | 2 | `fix/home-summary-resilience` | 4 | stacked on #1 — rebase #1 first, then this onto it |
 | 3 | `chore/bincode-2x` | 3 | **bincode call-sites** if the base touched serialization; keep `bincode::config::legacy()`, re-run the wire-format golden |
 | 4 | `chore/carrier-iroh-upgrade` | 3 | docs/audit.toml only — none expected |
@@ -115,6 +115,11 @@ Notes:
   change on Linux (production microVM networking path unchanged).
 - **Test plan:** Linux CI green (no functional delta). macOS: `cargo build -p
   elastos-server` succeeds; `elastos gateway` serves Home at `localhost:8090`.
+- **Verified green on macOS (Day 42, Darwin 25.4.0 arm64):** `cargo test -p
+  elastos-crosvm` = **18 passed / 0 failed** (incl. the fail-closed stub tests),
+  the `elastos-crosvm` crate compiles **warning-free**, and `cargo build -p
+  elastos-server` finishes clean. Branch is build-verified, not just authored —
+  ready to push as-is once GitHub access returns.
 
 ### #2 `fix/home-summary-resilience`
 - **What:** a corrupt/stale `browser-state.json` (cosmetic UI state) resets to
