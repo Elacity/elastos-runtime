@@ -9,14 +9,15 @@ license = "MIT"
 name = "encrypt-provider"
 path = "src/main.rs"
 
-# NOTE (Day 16, 0.4.0 base volatility): this capsule is intentionally
-# self-contained and does NOT depend on `elastos-common` yet. Anders flagged that
-# only ~20% of 0.4.0 is on GitHub and its latest commits are being redone, so the
-# shared `protected_content` types may still move. The encrypt contract here is
-# derived from the *stable* PC2 reference (`cenc-encrypt`) and the durable
-# SealedObjectV1/KeyEnvelopeV1 shape; reconcile to `elastos-common` once 0.4.0
-# stabilises (tracked in DDRM_ENCRYPT_INVARIANT.md).
+# NOTE (Day 39): reconciled to `elastos-common` (Day 16's self-containment retired).
+# The capsule was kept self-contained while Anders redid 0.4.0; the contract has
+# since been byte-identical for many days and `ddrm-drift-check.sh` pins the full
+# consumed surface, so the duplication was a rebase liability, not a safeguard. The
+# sealed OUTPUT is now the shared `SealedObjectV1`/`KeyEnvelopeV1`; only the encrypt
+# INPUT (`SealRequest`) stays local — there is no shared seal-request type yet
+# (tracked in DDRM_ENCRYPT_INVARIANT.md).
 [dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"

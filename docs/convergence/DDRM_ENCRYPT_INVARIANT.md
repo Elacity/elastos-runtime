@@ -63,14 +63,27 @@ it gets its own provider — not folded into decrypt or the trusted core.
     **`wrapped_cek`** — never the raw CEK or plaintext;
   - the raw CEK is **zeroized** before the boundary returns.
 
-### Base-volatility note (Anders, 2026-06-08)
+### elastos-common reconcile — DONE (Day 39)
 
-Only ~20% of 0.4.0 is on GitHub and its latest commits are being redone. So the
-`encrypt-provider` skeleton is **intentionally self-contained** (no
-`elastos-common` dependency yet): its contract is derived from the *stable* PC2
-reference + the durable `SealedObjectV1` shape. **Reconcile to `elastos-common`
-once 0.4.0 stabilises** (replace local `SealRequest`/sealed-output modelling with
-the shared `protected_content` types, exactly as the other providers do).
+Days 16–38 kept `encrypt-provider` **self-contained** (no `elastos-common` dep)
+while Anders redid 0.4.0, so churn in the shared `protected_content` types could
+not break the producer. That risk is gone: the contract has been byte-identical for
+many days and `ddrm-drift-check.sh` pins the full consumed surface — the duplication
+was a rebase liability, not a safeguard. Reconciled:
+
+- The sealed **OUTPUT** now uses the shared
+  `elastos_common::protected_content::SealedObjectV1` / `KeyEnvelopeV1` /
+  `KeyEnvelopeAlgorithmsV1` / `ViewerRequirementV1` (the `sealed_output_*` test
+  builds the *typed* shared struct, so a raw-CEK field cannot exist by
+  construction), and the producer's algorithm set is checked by the shared
+  `validate_protected_content_key_envelope_algorithms` — the same validator
+  `key-provider` runs downstream.
+- The local `SEALED_OBJECT_SCHEMA` const was removed in favour of the shared one.
+- **Local-by-design residue:** the encrypt **INPUT** `SealRequest` stays local —
+  there is no shared seal-request type in `protected_content` yet. If one is added
+  (e.g. `EncryptSealRequestV1`), pin it in the drift guard and adopt it here.
+
+13 tests green, `wasm32-wasip1` build clean, full `ddrm-verify.sh` PASS.
 
 ## Invariant #1 → enforcement (executable)
 

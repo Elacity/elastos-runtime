@@ -142,11 +142,13 @@ for f in "${REQUIRED_FIELDS[@]}"; do
 done
 
 echo
-bold "encrypt-provider — reconcile-to-elastos-common list (informational):"
-echo "  encrypt-provider is intentionally self-contained while 0.4.0 churns."
-echo "  When 0.4.0 stabilises, replace its local types with shared ones:"
-echo "    local SealRequest          -> add an EncryptSealRequestV1 to protected_content (or reuse)"
-echo "    local sealed output (test) -> elastos_common::protected_content::SealedObjectV1"
+bold "encrypt-provider — elastos-common reconcile status (informational):"
+echo "  RECONCILED (Day 39): the sealed OUTPUT now uses the shared"
+echo "    elastos_common::protected_content::SealedObjectV1 / KeyEnvelopeV1; the"
+echo "    producer algorithm set is checked by the shared validator."
+echo "  Remaining local-by-design: the encrypt INPUT SealRequest — there is no"
+echo "    shared seal-request type yet. If one is added to protected_content"
+echo "    (e.g. EncryptSealRequestV1), pin it above and adopt it here."
 echo "  Tracking: docs/convergence/DDRM_ENCRYPT_INVARIANT.md"
 
 echo

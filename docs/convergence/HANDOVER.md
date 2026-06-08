@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 38).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `c63c375db` + Day-38 producer↔PC2 conformance, ~42 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 39).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `926b9adcb` + Day-39 encrypt reconcile, ~43 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -110,7 +110,7 @@ The four-stage chain **plus** the encrypt producer, all fail-closed and wasm-bui
 
 | Provider | Role | Host tests | wasm | Notes |
 |---|---|---|---|---|
-| `capsules/encrypt-provider` | seal/produce (invariant #1) | 13 | builds | self-contained; **in-boundary CEK+KID keygen closed** (Day 19) |
+| `capsules/encrypt-provider` | seal/produce (invariant #1) | 13 | builds | **in-boundary CEK+KID keygen closed** (Day 19); output reconciled to shared `SealedObjectV1` (Day 39) |
 | `capsules/drm-provider` | orchestrator `drm/open` + chain-seam | 12 | builds | declares canonical open sequence |
 | `capsules/rights-provider` | rights decision | 9 | builds | wire-rejects hidden authority |
 | `capsules/key-provider` | key release (rights-bound) | 9 | builds | verifies upstream RightsDecisionReceipt |
@@ -274,8 +274,10 @@ keyword (filename, error, "Day N") if you need the why behind a decision:
 - **PC2 uses classical crypto (P-256 ECDH/ECDSA); the Runtime mandates PQ-hybrid**
   (`x25519+ml-kem-768`, `ml-dsa-65`). Keep PC2's envelope *structure*, upgrade the
   *crypto*.
-- **`encrypt-provider` is intentionally self-contained** (no `elastos-common` dep)
-  to survive 0.4.0 churn — reconcile once it stabilises (drift-check prints the list).
+- **`encrypt-provider` is reconciled to `elastos-common`** (Day 39): its sealed
+  **output** is the shared `SealedObjectV1`/`KeyEnvelopeV1`; only the **input**
+  `SealRequest` stays local (no shared seal-request type yet). The Day-16
+  self-containment is retired (the contract is stable + drift-pinned).
 
 ---
 
@@ -450,7 +452,8 @@ next context can continue cold.
 - **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + handover refresh (`90899e70d`).
 - **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name (`d1035d98b`).
 - **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name (`c63c375db`).
-- **D38** prove PC2 consumes the producer's output: drive the multi-sample + subsample producer segments through PC2's real `mp4box`+`cenc` (byte parity + wrong-CEK key-bound) in `pc2-conformance.sh`.
+- **D38** prove PC2 consumes the producer's output: drive the multi-sample + subsample producer segments through PC2's real `mp4box`+`cenc` (byte parity + wrong-CEK key-bound) in `pc2-conformance.sh` (`926b9adcb`).
+- **D39** reconcile `encrypt-provider` to `elastos-common`: sealed output now the shared `SealedObjectV1`/`KeyEnvelopeV1` (typed), algorithm set checked by the shared validator; only input `SealRequest` stays local; Day-16 self-containment retired.
 
 ---
 

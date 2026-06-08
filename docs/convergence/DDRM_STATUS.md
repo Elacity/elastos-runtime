@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~42 commits**, tip `c63c375db` + Day-38 producer↔PC2 conformance)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~43 commits**, tip `926b9adcb` + Day-39 encrypt→elastos-common reconcile)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -14,8 +14,10 @@ architecture decision (the CEK transport rail) — see `DDRM_DECRYPT_RAIL.md`.
 > latest commits are being redone. This branch is based on `origin/0.4.0`, so its
 > base will shift; expect a rebase + re-verify of any `elastos-common`
 > `protected_content` types these providers consume once 0.4.0 stabilises. New work
-> is kept contract-first (PC2 as the stable reference) to stay rebase-safe — e.g.
-> `encrypt-provider` is intentionally self-contained until the shared types settle.
+> is kept contract-first (PC2 as the stable reference) to stay rebase-safe. The
+> contract has since held byte-identical for many days, so `encrypt-provider`'s
+> sealed output was reconciled to the shared `SealedObjectV1` (Day 39); only its
+> input `SealRequest` stays local (no shared seal-request type yet).
 
 ## The chain
 

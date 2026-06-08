@@ -23,6 +23,7 @@
 //! Until the real in-boundary engine (keygen + CENC encrypt + CEK sealing) is
 //! wired, every operation validates fully and then fails closed.
 
+use elastos_common::protected_content::SEALED_OBJECT_SCHEMA;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -40,8 +41,9 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
 
+// The encrypt INPUT request schema stays local — there is no shared seal-request
+// type in `elastos-common` yet (the OUTPUT `SealedObjectV1` is the shared type).
 const SEAL_REQUEST_SCHEMA: &str = "elastos.encrypt.seal.request/v1";
-const SEALED_OBJECT_SCHEMA: &str = "elastos.sealed.object/v1";
 const SUPPORTED_SCHEMES: &[&str] = &["elastos-pq-hybrid-threshold-v0"];
 
 /// A request to seal a plaintext asset into protected content.
@@ -401,36 +403,52 @@ mod tests {
     }
 
     /// Invariant #1 at the *output* boundary (mirrors PC2 `cenc-encrypt`'s
-    /// EncryptResult, which only emits ciphertext + IVs). A representative sealed
-    /// output carries the *wrapped* CEK and KID, but never the raw key bytes nor a
-    /// `cek`/`cek_b64` field.
+    /// EncryptResult, which only emits ciphertext + IVs). The sealed output is the
+    /// SHARED `elastos_common::protected_content::SealedObjectV1` (Day-39 reconcile):
+    /// it carries the *wrapped* CEK + KID by construction and — because the type has
+    /// no raw-key field and `deny_unknown_fields` — cannot carry the raw key bytes
+    /// nor a `cek`/`cek_b64` field. The producer's algorithm set is also accepted by
+    /// the shared validator, proving the output converges with the chain contract.
     #[test]
     fn sealed_output_never_carries_raw_cek() {
-        // Representative in-boundary state: a freshly minted CEK and the sealed
-        // output the engine will return. The raw CEK lives only in `cek` here.
+        use elastos_common::protected_content::{
+            validate_protected_content_key_envelope_algorithms, KeyEnvelopeAlgorithmsV1,
+            KeyEnvelopeV1, SealedObjectV1, ViewerRequirementV1,
+        };
+
+        // Representative in-boundary state: the raw CEK lives only in `cek` here.
         let cek: [u8; 16] = [0x5Au8; 16];
         let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
 
-        let sealed_output = json!({
-            "schema": SEALED_OBJECT_SCHEMA,
-            "payload_cid": "bafyciphertext",
-            "rights_policy_cid": "bafyrightspolicy",
-            "availability_receipt_cid": "bafyavail",
-            "key_envelope": {
-                "scheme": "elastos-pq-hybrid-threshold-v0",
-                "kid": "0123456789abcdef0123456789abcdef",
-                // sealed, not raw — this is the only form the CEK may take in output
-                "wrapped_cek": "c2VhbGVkLWNlay1ieXRlcw==",
-                "policy_hash": "deadbeef",
-                "algorithms": {
-                    "cipher": "aes-256-gcm",
-                    "signature": ["ml-dsa-65"],
-                    "kem": ["x25519", "ml-kem-768"],
-                    "share_scheme": "shamir-t-of-n"
-                }
+        let algorithms = KeyEnvelopeAlgorithmsV1 {
+            cipher: "aes-256-gcm".to_string(),
+            signature: vec!["ml-dsa-65".to_string()],
+            kem: vec!["x25519".to_string(), "ml-kem-768".to_string()],
+            share_scheme: "shamir-t-of-n".to_string(),
+        };
+        // Convergence: the producer's PQ-hybrid algorithm set is accepted by the
+        // shared chain validator (key-provider runs the same check downstream).
+        validate_protected_content_key_envelope_algorithms(&algorithms)
+            .expect("producer algorithm set must satisfy the shared chain validator");
+
+        // The sealed output is the SHARED type — no raw-CEK field exists to set.
+        let sealed_output = SealedObjectV1 {
+            schema: SEALED_OBJECT_SCHEMA.to_string(),
+            payload_cid: "bafyciphertext".to_string(),
+            rights_policy_cid: "bafyrightspolicy".to_string(),
+            availability_receipt_cid: "bafyavail".to_string(),
+            key_envelope: KeyEnvelopeV1 {
+                scheme: "elastos-pq-hybrid-threshold-v0".to_string(),
+                kid: "0123456789abcdef0123456789abcdef".to_string(),
+                // sealed, not raw — the only form the CEK may take in output.
+                wrapped_cek: "c2VhbGVkLWNlay1ieXRlcw==".to_string(),
+                policy_hash: "deadbeef".to_string(),
+                algorithms,
             },
-            "viewer": {}
-        });
+            viewer: ViewerRequirementV1 {
+                required_interface: "media".to_string(),
+            },
+        };
 
         let serialized = serde_json::to_string(&sealed_output).unwrap();
         assert!(

@@ -63,11 +63,11 @@ git range-diff origin/0.4.0...@{-1} origin/0.4.0...HEAD   # confirm nothing drop
   consumer contract). Take the base's structure + re-apply our additions. The
   contract types are identical, so there is **no type reconciliation** — confirm with
   `scripts/ddrm-drift-check.sh` (PASS) immediately after resolving.
-- **`encrypt-provider` self-containment:** it deliberately has **no `elastos-common`
-  dep** to survive 0.4.0 churn, so it should **not** conflict on rebase. Only *after*
-  the rebase is green do you reconcile it to the shared types (drift-check prints the
-  list; tracked in `DDRM_ENCRYPT_INVARIANT.md`). Do not fold that reconcile into the
-  rebase — keep it a separate, reviewable commit.
+- **`encrypt-provider` → `elastos-common`:** reconciled on Day 39 — its sealed
+  **output** now uses the shared `SealedObjectV1`/`KeyEnvelopeV1`, so on rebase it
+  shares the same contract-conflict surface as the other providers (resolve "keep
+  both", then `ddrm-drift-check.sh` PASS). Its **input** `SealRequest` stays local
+  (no shared seal-request type), so that file region won't conflict on type grounds.
 - **bincode 2.x:** if the new base changed any capability-token serialization, keep
   the `legacy()` config and re-run the round-trip golden before pushing.
 
