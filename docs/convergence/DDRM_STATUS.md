@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~43 commits**, tip `926b9adcb` + Day-39 encrypt→elastos-common reconcile)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~44 commits**, tip `b3b5f0a9d` + Day-40 integrity audit)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -502,6 +502,33 @@ envelope+session parity; producer round-trips, which carry no envelope, run the
 segment-decrypt parity). PC2 decrypts our producer's output byte-for-byte —
 **our producer ↔ PC2's real decrypt is now executable**, not just our internal
 round-trip. `ddrm-verify.sh` PASS with PC2 present.
+
+## Integrity audit — every claim maps to a gate (Day 40)
+
+A "trust-but-verify-the-verifier" pass: every "proven"/count claim above was checked
+against something the standing gate (`scripts/ddrm-verify.sh`) or a named test
+actually enforces. Counts were re-validated by running the suites fresh, not from
+memory.
+
+| Claim | Enforced by (re-run Day 40) |
+|---|---|
+| 5 providers fail-closed, host-tested (13/12/9/9/25 = 68) | gate 3 ladder — per-provider suites, counts asserted |
+| decrypt feature ladder (27/29/31/42/45/34/54/65) | gate 3 ladder — each rung run, count asserted (a dropped/feature-gated-out test fails the gate) |
+| contract types intact on the current base | gate 1 drift — 13 consts / 10 structs / 1 fn / 10 fields |
+| byte-compatible with PC2 (consumer *and* producer) | gate 2 conformance — classical envelope+session + producer round-trip segments through PC2's real code; skips clean w/o PC2 |
+| builds to `wasm32-wasip1` (5 providers + PQ/rail features) | gate 3 ladder — 7 wasm builds |
+| **executes under WASI, fail-closed end-to-end** | gate 4 WASI smoke — `ddrm-chain-smoke.sh` under wasmtime (added to the standing gate Day 40; skips clean w/o wasmtime) |
+| encrypt↔decrypt seam over real shapes (single/multi/subsample) | gate 3 seam — all 3 `*_round_trip_golden` run by name (3 passed) |
+| real ML-DSA-65 verified through the rail entrypoint | gate 3 — `rail-shim-mldsa` rung (54) + committed `rail_carrier_pq_mldsa.json` |
+| fail-closed + panic-free under adversarial input | gate 3 — `harden` rung (65) |
+
+**Orphan / dead-surface sweep:** all **13** committed golden vectors in
+`decrypt-provider/tests/vectors/` are referenced by at least one test or the
+conformance script (no orphan fixtures). Every decrypt-provider feature flag is a
+ladder rung except `gen-vectors` (a fixture-regeneration tool, intentionally not a
+test rung) — no documented-but-unwired flags. The only previously doc-only claim
+("executes under WASI") is now gate-backed (gate 4). `ddrm-verify.sh`: **ALL GATES
+PASS** (with PC2 + wasmtime present on this machine).
 
 ## The one open decision (for Anders / Irzhy)
 

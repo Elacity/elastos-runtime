@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 39).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `926b9adcb` + Day-39 encrypt reconcile, ~43 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 40).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `b3b5f0a9d` + Day-40 integrity audit, ~44 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -332,11 +332,12 @@ Older/unrelated: `sash/local-test*` (Mac VZ core work, intentionally separate),
 ## 9. How to verify (commands)
 
 ```bash
-# THE standing pre-rebase/PR gate: contract drift + PC2 conformance + ladder/wasm.
+# THE standing pre-rebase/PR gate: drift + PC2 conformance + ladder/wasm + WASI smoke.
 # Gate 3 (ladder) asserts every test count + the wasm builds, so a dropped or
-# feature-gated-out test FAILS the gate. Conformance skips clean without PC2.
+# feature-gated-out test FAILS the gate. Gate 2 (conformance) skips clean without PC2;
+# gate 4 (WASI smoke) skips clean without wasmtime.
 scripts/ddrm-verify.sh                          # expect: ALL GATES PASS
-DDRM_VERIFY_FAST=1 scripts/ddrm-verify.sh       # skip the heavy ladder gate (1+2 only)
+DDRM_VERIFY_FAST=1 scripts/ddrm-verify.sh       # skip the heavy gates 3+4 (1+2 only)
 
 # (the gate's three parts, runnable on their own)
 scripts/ddrm-drift-check.sh                     # contract drift — expect PASS
@@ -453,7 +454,8 @@ next context can continue cold.
 - **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name (`d1035d98b`).
 - **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name (`c63c375db`).
 - **D38** prove PC2 consumes the producer's output: drive the multi-sample + subsample producer segments through PC2's real `mp4box`+`cenc` (byte parity + wrong-CEK key-bound) in `pc2-conformance.sh` (`926b9adcb`).
-- **D39** reconcile `encrypt-provider` to `elastos-common`: sealed output now the shared `SealedObjectV1`/`KeyEnvelopeV1` (typed), algorithm set checked by the shared validator; only input `SealRequest` stays local; Day-16 self-containment retired.
+- **D39** reconcile `encrypt-provider` to `elastos-common`: sealed output now the shared `SealedObjectV1`/`KeyEnvelopeV1` (typed), algorithm set checked by the shared validator; only input `SealRequest` stays local; Day-16 self-containment retired (`b3b5f0a9d`).
+- **D40** integrity audit: every claim→gate mapped (table in `DDRM_STATUS.md`), no orphan vectors / dead flags, counts re-validated fresh; **WASI smoke wired into `ddrm-verify.sh` as gate 4/4** (skips clean w/o wasmtime) — the last doc-only claim is now gate-backed.
 
 ---
 
