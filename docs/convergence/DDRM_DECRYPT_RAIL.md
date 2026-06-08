@@ -91,6 +91,26 @@ logged, or surfaced (already enforced in the vendored engine).
 3. Does the provider-invocation rail expose an in-capsule `carrier_invoke`
    client today that a microvm provider may use, or is that still landing?
 
+## Isolation tier — wasm now, microVM as hardening (recommendation)
+
+All providers declare `type: microvm`, but the microVM substrate (CrosvmProvider)
+is Linux+KVM only and is not the live path on dev/macOS today; the capsules that
+actually execute cross-platform are `wasm` (`home`, `system`) and `data`.
+
+Recommendation for `decrypt-provider`:
+- Ship as **`wasm` (`wasm32-wasip1`)** now. The cenc engine is pure compute
+  (AES-128-CTR + fMP4 parsing, stdio only) — an ideal wasm workload with zero
+  ambient authority. It runs on macOS today and composes cleanly with the Hybrid
+  rail (decrypt step *receives* material → no outbound authority needed).
+- Treat **microVM as a later max-isolation upgrade** for a Linux/KVM (or Mac VZ)
+  deployment. Because the logic is pure Rust, the same capsule targets both tiers;
+  only the manifest `type` and transport change.
+- The fail-closed security contract and CEK containment are enforced by the
+  capability model + provider boundary, not by the VM, so the tier choice does
+  not weaken the security guarantees.
+- First concrete task on `wasm` confirmation: verify `elastos-common`
+  (`protected_content`) compiles clean to `wasm32-wasip1`.
+
 ## What is NOT blocked (and is done/ready)
 
 - The cenc engine is vendored, characterization-tested, and proven to contain +
