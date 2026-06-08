@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~41 commits**, tip `d1035d98b` + Day-37 producer round-trips)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~42 commits**, tip `c63c375db` + Day-38 producer↔PC2 conformance)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -486,6 +486,20 @@ muxed with framing that mirrors PC2 `cenc-encrypt::mp4box::build_senc` /
 (`ddrm-ladder-check.sh`) runs all three `*_round_trip_golden` tests **by name** (asserts 3
 passed), so an encrypt-side change that breaks decrypt over any shape fails the gate.
 `wasm32-wasip1` clean; `ddrm-verify.sh` PASS.
+
+### Producer output proven consumable by PC2's real decrypt (Day 38)
+
+The Day-37 round-trips proved *our* producer ↔ *our* consumer. Day 38 closes the
+convergence-critical loop: the multi-sample + subsample segments
+`encrypt-provider`'s real in-boundary engine emitted are now driven through **PC2
+`ddrm-decrypt`'s real `mp4box::parse_segment` + `cenc::decrypt_samples`** in
+`scripts/pc2-conformance.sh`, asserting byte-for-byte plaintext parity plus a
+wrong-CEK key-bound check (PC2 must NOT recover the plaintext under a flipped CEK).
+The driver dispatches on schema (classical envelope vectors keep their two-layer
+envelope+session parity; producer round-trips, which carry no envelope, run the
+segment-decrypt parity). PC2 decrypts our producer's output byte-for-byte —
+**our producer ↔ PC2's real decrypt is now executable**, not just our internal
+round-trip. `ddrm-verify.sh` PASS with PC2 present.
 
 ## The one open decision (for Anders / Irzhy)
 

@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 37).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `d1035d98b` + Day-37 producer round-trips, ~41 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 38).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `c63c375db` + Day-38 producer↔PC2 conformance, ~42 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -164,12 +164,16 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
 - **Engines pinned by portable golden vectors** (Days 22, 24): substrate-independent
   fixtures in `decrypt-provider/tests/vectors/` (classical v3 + v2, and PQ-hybrid)
   replayed with no in-test sealing and no RNG.
-- **Cross-impl conformance is executable** (Days 23–24, 28): `scripts/pc2-conformance.sh`
+- **Cross-impl conformance is executable** (Days 23–24, 28, 31, 38): `scripts/pc2-conformance.sh`
   decrypts our committed vectors with PC2 `ddrm-decrypt`'s **real code** and asserts
   byte-for-byte parity (CEK + plaintext) plus fail-closed parity on tamper, for both
-  envelope versions — now at **two layers**: the crypto primitives (`envelope`+`cenc`)
+  envelope versions — at **two layers**: the crypto primitives (`envelope`+`cenc`)
   and PC2's **public session API** (`session::unwrap_envelope` → `media::decrypt_segment`,
-  the carrier path). Skips clean when PC2 is absent.
+  the carrier path), over single/multi-sample/subsample/init-IV shapes. **And the
+  producer half** (Day 38): the segments `encrypt-provider`'s real engine emitted
+  (multi-sample + subsample) are decrypted by PC2's `mp4box`+`cenc` to the producer's
+  exact bytes (+ wrong-CEK key-bound check) — proving PC2 consumes *our producer's
+  output*, not only our consumer. Skips clean when PC2 is absent.
 - **Both invariants pinned on one artifact, over real playback shapes** (Days 26, 37):
   `encrypt-provider`'s real in-boundary engine emits round-trip goldens —
   `roundtrip_encrypt_to_decrypt.json` (single sample) plus
@@ -445,7 +449,8 @@ next context can continue cold.
 - **D34** adversarial negative-space + containment sweep behind `harden` (=65) (`b1f8b7dd5`).
 - **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + handover refresh (`90899e70d`).
 - **D36** reconcile-prep: widen drift guard to full consumed surface (fn + DEFAULT_* + PQ-algo fields), button-press rebase recipe, gate the encrypt↔decrypt seam by name (`d1035d98b`).
-- **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name.
+- **D37** widen the producer round-trip to real shapes: encrypt-provider emits multi-sample + subsample round-trip goldens, replayed byte-exact by decrypt (`vectors`=42); gate asserts all 3 seams by name (`c63c375db`).
+- **D38** prove PC2 consumes the producer's output: drive the multi-sample + subsample producer segments through PC2's real `mp4box`+`cenc` (byte parity + wrong-CEK key-bound) in `pc2-conformance.sh`.
 
 ---
 
