@@ -6,12 +6,18 @@
 //! through this provider.
 
 use elastos_common::protected_content::{
-    DecryptSessionRequestV1, DECRYPT_SESSION_REQUEST_SCHEMA, PROTECTED_CONTENT_ACTIONS,
-    PROTECTED_CONTENT_OUTPUTS,
+    DecryptSessionRequestV1, ReleaseReceiptV1, DECRYPT_SESSION_REQUEST_SCHEMA,
+    PROTECTED_CONTENT_ACTIONS, PROTECTED_CONTENT_OUTPUTS, RELEASE_RECEIPT_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+
+// CENC/AES-128-CTR decrypt engine vendored from PC2 `cenc-decrypt`. Held here as a
+// provider-internal backend; wired into open_session/render behind the fail-closed
+// contract in a later step (see docs/convergence/CONVERGENCE_PLAYBOOK.md §6).
+#[allow(dead_code)]
+mod cenc;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -142,11 +148,22 @@ fn validate_decrypt_session_request(request: &DecryptSessionRequestV1) -> Result
     require_identifier(&request.object_cid, "object_cid")?;
     validate_action(&request.action)?;
     require_non_empty(&request.viewer_interface, "viewer_interface")?;
-    require_non_empty(&request.release_receipt_id, "release_receipt_id")?;
+    validate_release_receipt(&request.release_receipt)?;
     validate_output_kind(&request.output_kind)?;
     require_non_empty(&request.reason, "reason")?;
     if request.expires_at == 0 {
         return Err("expires_at is required".to_string());
+    }
+    Ok(())
+}
+
+fn validate_release_receipt(receipt: &ReleaseReceiptV1) -> Result<(), String> {
+    if receipt.schema != RELEASE_RECEIPT_SCHEMA {
+        return Err("release receipt schema is unsupported".to_string());
+    }
+    require_non_empty(&receipt.request_id, "release_receipt.request_id")?;
+    if receipt.status != "released" {
+        return Err("release receipt status must be released".to_string());
     }
     Ok(())
 }
@@ -248,7 +265,18 @@ mod tests {
             object_cid: "bafybeigprotectedcontent".to_string(),
             action: "view".to_string(),
             viewer_interface: "elastos.viewer/document@1".to_string(),
-            release_receipt_id: "key-release:test".to_string(),
+            release_receipt: ReleaseReceiptV1 {
+                schema: RELEASE_RECEIPT_SCHEMA.to_string(),
+                request_id: "key-release:test".to_string(),
+                object_cid: "bafybeigprotectedcontent".to_string(),
+                principal_id: "person:local:test".to_string(),
+                session_id: "session:test".to_string(),
+                action: "view".to_string(),
+                provider: "key-provider".to_string(),
+                status: "released".to_string(),
+                issued_at: 1_800_000_000,
+                expires_at: 1_900_000_000,
+            },
             output_kind: "rendered".to_string(),
             reason: "open protected document".to_string(),
             expires_at: 1_900_000_000,
