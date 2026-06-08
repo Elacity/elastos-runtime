@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **+14 commits**)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **+38 commits**, tip `b1f8b7dd5`, end of Day 35)
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail

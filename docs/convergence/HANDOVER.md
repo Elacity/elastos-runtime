@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-08 (end of Day 28).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `363d75b09`, 32 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 34).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `b1f8b7dd5`, 38 commits ahead of `origin/0.4.0`).
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -32,17 +32,26 @@ the rail itself: an **encrypt→decrypt round-trip golden** (both invariants on 
 artifact), the **rail transport shim behind a flag** (`rail-shim`) so the rail is now
 a *flag-flip not a design*, and the shim's **carrier wire shape pinned as a portable
 golden** that is also driven through **PC2's real session API** (`unwrap_envelope` →
-`media::decrypt_segment`). Everything is isolated on local branches because **GitHub
-push access is suspended** (see §6).
+`media::decrypt_segment`). Days 29–34 then made the **crypto core feature-complete,
+PQ-proven, and adversarially hardened**: widened the cenc goldens to **real playback
+shapes** (multi-sample / subsample / non-default-IV via init-`tenc`, all PC2-conformant);
+**replaced the PQ signature stub with the real FIPS 204 `ml-dsa-65` primitive** (RustCrypto
+`ml-dsa`, verify-only, `wasm32-wasip1`-clean) and proved it **through the exact
+`decrypt_from_carrier` rail entrypoint** on a committed real-signed carrier golden; and
+added an **adversarial negative-space + containment sweep** (`harden`) proving the
+untrusted-input decoders fail closed and never panic. The verification gate
+(`ddrm-verify.sh`) is now **authoritative over the whole ladder** (asserted test counts +
+wasm builds). Everything is isolated on local branches because **GitHub push access is
+suspended** (see §6).
 
 The chain is **blocked on exactly one architectural decision from Anders** (the CEK
 transport rail — `DDRM_DECRYPT_RAIL.md`). Everything that depended on it has been
-pinned, de-risked, or proven pre-rail — *including the transport shim itself*, which
-is built and fully tested behind the `rail-shim` flag for both the classical and PQ
-profiles. The only work that remains behind the blocker is the **one-line
-`OpenSession` wire-up** (`rail_shim::decrypt_from_carrier(...)`) once Anders confirms
-who mints the carrier and the signature primitive. Everything that *can* be done
-ahead of that answer, *is* done.
+pinned, de-risked, or proven pre-rail — *including the transport shim itself and the real
+PQ signature primitive*, both built and fully tested. The remaining PQ items are now pure
+**policy** (Anders' Q2: straight `ml-dsa-65` vs hybrid during PC2's migration), not build
+gaps. The only work left behind the blocker is the **one-line `OpenSession` wire-up**
+(`rail_shim::decrypt_from_carrier(...)`, passing a `MlDsa65Verifier`) once Anders confirms
+who mints the carrier. Everything that *can* be done ahead of that answer, *is* done.
 
 ---
 
@@ -119,9 +128,16 @@ counts per feature:
 | `rail-prep` | 27 | classical `ecdh_unwrap → cenc` composition (Day 18) |
 | `pq-envelope` | 29 | PQ-hybrid CEK-seal envelope island (Day 20) |
 | `pq-rail-prep` | 31 | full PQ data path `hybrid_unwrap → cenc` (Day 21) |
-| `vectors` | 37 | replay portable golden vectors v3+v2 + encrypt→decrypt round-trip (Days 22, 24, 26) |
-| `rail-shim` | 43 | carrier→engine adapter (`decrypt_from_carrier`) + carrier golden, both profiles (Days 27–28) |
+| `vectors` | 40 | replay portable goldens: v3+v2, round-trip, + multi-sample/subsample/init-IV (Days 22, 24, 26, 31) |
+| `rail-shim` | 45 | carrier→engine adapter (`decrypt_from_carrier`) + carrier goldens, both profiles (Days 27–30) |
+| `pq-mldsa` | 34 | real FIPS 204 ML-DSA-65 verifier in the `CekSealVerifier` slot + KAT (Day 32) |
+| `rail-shim-mldsa` | 54 | the real ML-DSA-65 verified through `decrypt_from_carrier` on a committed carrier golden (Day 33) |
+| `harden` | 65 | adversarial negative-space + containment sweep over the wire-decoders (Day 34) |
 | `gen-vectors` | — | regenerate the committed vectors (writes `tests/vectors/`) |
+
+The standing gate `scripts/ddrm-verify.sh` now asserts **all** of these counts +
+the wasm builds (gate 3, `ddrm-ladder-check.sh`), so a dropped/feature-gated-out
+test fails the gate rather than passing silently.
 
 Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
 - Zero ambient authority surfaced; every provider advertises + wire-rejects raw
@@ -136,8 +152,12 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
   (`decrypt-provider/src/envelope.rs`: P-256 ECDH unwrap → AES-256-CBC, vendored
   from PC2 `ddrm-decrypt`).
 - **Downstream consumer contract** pinned for both players (metadata-only output).
-- **PQ-hybrid compiles in wasm** (`ml-kem 0.2.3`, `ml-dsa 0.0.4` → `wasm32-wasip1`,
-  Rust 1.89). GO with a pin-exact caveat (`ml-dsa` is 0.0.x).
+- **PQ-hybrid is real, not stubbed, and wasm-clean** (Day 32): the signature is the
+  **real FIPS 204 ML-DSA-65** (`ml-dsa 0.1`, RustCrypto — same family as `ml-kem 0.2.3`),
+  verify-only + rng-free so it builds to `wasm32-wasip1`. `pq_envelope::mldsa::MlDsa65Verifier`
+  fills the `CekSealVerifier` slot; pinned by a committed deterministic KAT
+  (`mldsa65_kat.json`) + fail-closed tests. The PQ signature is no longer a build gap —
+  only Anders' Q2 transition *policy* remains.
 - **Full PQ dDRM data path proven pre-rail** (Day 21): `pq_envelope.rs`
   `decrypt_pq_sealed_segment` chains `x25519+ml-kem-768` hybrid unwrap → cenc
   decrypt, CEK in `Zeroizing` throughout, never on the boundary.
@@ -161,6 +181,20 @@ Proven properties (all test-backed — see `DDRM_SECURITY_MODEL.md` §9):
   model. Q1 (who seals) doesn't touch it; Q2 (signature) plugs in via `CekSealVerifier`.
   The day Anders answers, `OpenSession` adds **one line**. (`DDRM_DECRYPT_RAIL.md` §"Rail
   transport shim".)
+- **Media goldens widened to real playback shapes** (Day 31): multi-sample, subsample
+  (clear+encrypted ranges), and a 16-byte-IV-via-init-`tenc` vector — each replayed
+  through our engine **and** PC2's real `cenc`/`media::decrypt_segment` (byte parity +
+  tamper fail-closed). `ClassicalVector` gained optional `init_segment_b64`/`iv_size`.
+- **Real ML-DSA-65 verified through the rail entrypoint** (Day 33): a committed carrier
+  golden (`rail_carrier_pq_mldsa.json`) whose seal signature is a genuine ML-DSA-65 sig,
+  replayed through `decrypt_from_carrier` verified by the production `MlDsa65Verifier`
+  (`rail-shim-mldsa`) — plaintext recovered + fail-closed on tampered sig / wrong key /
+  tampered body. *The real PQ signature, through the real rail entrypoint, on a portable artifact.*
+- **Fail-closed + panic-free under adversarial input** (Day 34, `harden`): truncation,
+  single-byte-flip, and oversized-length-prefix sweeps over `envelope::parse`,
+  `PqSealedEnvelope::from_bytes`, and the `decrypt_from_carrier` dispatch — every malformed
+  shape fails closed, never panics, never recovers a CEK; error/metadata surfaces leak no
+  plaintext/CEK; profile/secret mismatch fails closed both directions.
 
 ---
 
@@ -193,7 +227,7 @@ All in `docs/convergence/`. Read 1→3 to onboard; the rest are reference.
 **Full prior conversation transcripts** (every decision, verbatim) — search by
 keyword (filename, error, "Day N") if you need the why behind a decision:
 - Days 1–17: `…/agent-transcripts/6f8c08cd-415d-4f58-b41d-74e2724fb796/6f8c08cd-415d-4f58-b41d-74e2724fb796.jsonl`
-- Days 18–28: `…/agent-transcripts/43110c1d-e79d-43d4-818b-4a2f0fb3233b/43110c1d-e79d-43d4-818b-4a2f0fb3233b.jsonl`
+- Days 18–34: `…/agent-transcripts/43110c1d-e79d-43d4-818b-4a2f0fb3233b/43110c1d-e79d-43d4-818b-4a2f0fb3233b.jsonl`
 
 (both under `/Users/sash/.cursor/projects/Users-sash-code-elastos-runtime/`)
 
@@ -271,35 +305,47 @@ Older/unrelated: `sash/local-test*` (Mac VZ core work, intentionally separate),
    `encrypt-provider` now mints CEK+KID with a CSPRNG inside the boundary and the
    seal engine emits no key material; `cek_and_kid_generated_inside_boundary` and
    `seal_engine_emits_no_key_material` pass. See `DDRM_ENCRYPT_INVARIANT.md`.
-3. **PQ migration of the envelope** (de-risked, not yet shipped). `envelope.rs` is
-   the classical PC2 spec; `pq_envelope.rs` proves the PQ-hybrid profile end to end
-   behind `pq-envelope`/`pq-rail-prep`. Wiring it into dispatch lands with the rail.
+3. **PQ migration of the envelope** (de-risked + real primitive, not yet wired into
+   default dispatch). `envelope.rs` is the classical PC2 spec; `pq_envelope.rs` proves
+   the PQ-hybrid profile end to end behind `pq-envelope`/`pq-rail-prep`, and the signature
+   is now the **real FIPS 204 ML-DSA-65** (`pq-mldsa`/`rail-shim-mldsa`, Days 32–33), not a
+   stub. Wiring it into default dispatch lands with the rail; the remaining choice is
+   Anders' Q2 *policy* (straight ML-DSA vs hybrid during PC2's migration), not a build gap.
 4. **Carrier iroh/Hickory upgrade** — deferred (MSRV 1.91), operator decision.
 5. **Rebase onto stabilised 0.4.0** — deferred until Anders stops force-pushing.
-   Pre-rebase gate is now `scripts/ddrm-verify.sh` (drift + cross-impl conformance).
+   Pre-rebase gate is now `scripts/ddrm-verify.sh` (drift + cross-impl conformance +
+   ladder counts/wasm; `DDRM_VERIFY_FAST=1` skips the heavy ladder gate).
 
 ---
 
 ## 9. How to verify (commands)
 
 ```bash
-# THE standing pre-rebase/PR gate: contract drift + PC2 cross-impl conformance.
-# Conformance skips clean if the PC2 repo is absent; set PC2_REPO to point it.
+# THE standing pre-rebase/PR gate: contract drift + PC2 conformance + ladder/wasm.
+# Gate 3 (ladder) asserts every test count + the wasm builds, so a dropped or
+# feature-gated-out test FAILS the gate. Conformance skips clean without PC2.
 scripts/ddrm-verify.sh                          # expect: ALL GATES PASS
+DDRM_VERIFY_FAST=1 scripts/ddrm-verify.sh       # skip the heavy ladder gate (1+2 only)
 
-# (the gate's two parts, runnable on their own)
-scripts/ddrm-drift-check.sh                     # expect PASS
-scripts/pc2-conformance.sh                      # expect PASS (or SKIP without PC2)
+# (the gate's three parts, runnable on their own)
+scripts/ddrm-drift-check.sh                     # contract drift — expect PASS
+scripts/pc2-conformance.sh                      # cross-impl parity — PASS (or SKIP without PC2)
+scripts/ddrm-ladder-check.sh                    # ladder counts + wasm builds — expect INTACT
 
 # per-provider host tests (fast, authoritative): 13+12+9+9+25 = 68 green, 0 ignored
 for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo test); done
 
-# decrypt-provider feature ladder (tested islands; counts in §3 — 27/29/31/37/43)
+# decrypt-provider feature ladder (tested islands; counts in §3)
+# default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 40 /
+# rail-shim 45 / pq-mldsa 34 / rail-shim-mldsa 54 / harden 65
 ( cd capsules/decrypt-provider && \
-  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim; do cargo test --features $f; done )
+  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa rail-shim-mldsa harden; do \
+    cargo test --features $f; done )
 
 # regenerate the committed golden vectors (only when intentionally changing them)
 ( cd capsules/decrypt-provider && cargo test --features gen-vectors emit_ )
+# (the ML-DSA goldens need pq-mldsa too:)
+( cd capsules/decrypt-provider && cargo test --features "gen-vectors,pq-mldsa" emit_ )
 
 # whole chain under the WASI sandbox (needs: rustup target add wasm32-wasip1; brew install wasmtime)
 scripts/ddrm-chain-smoke.sh                     # 4 chain providers PASS
@@ -386,32 +432,45 @@ next context can continue cold.
 - **D26** encrypt→decrypt round-trip golden — both invariants on one artifact (`vectors`=37) (`48aef61c9`).
 - **D27** rail transport shim behind `rail-shim` — `decrypt_from_carrier`, both profiles, un-wired (`f3d09e922`).
 - **D28** pin the carrier as a portable golden + PC2 session-level conformance (`rail-shim`=43) (`363d75b09`).
+- **D29** refresh `HANDOVER.md` to current truth (Days 25–28) (`80137f260`).
+- **D30** PQ carrier golden through the shim — profile symmetry closed (`rail-shim`=45) (`e4e4d11c2`).
+- **D31** widen cenc goldens to real shapes (multi-sample/subsample/init-IV) + PC2 parity (`vectors`=40) (`787bb3acd`).
+- **D32** wire the real FIPS 204 ML-DSA-65 into the `CekSealVerifier` slot behind `pq-mldsa` (=34) (`d6899b9ed`).
+- **D33** verify the real ML-DSA-65 through `decrypt_from_carrier` on a carrier golden (`rail-shim-mldsa`=54) (`aadb4f1fc`).
+- **D34** adversarial negative-space + containment sweep behind `harden` (=65) (`b1f8b7dd5`).
+- **D35** make the gate authoritative (`ddrm-ladder-check.sh`: counts + wasm) + this refresh.
 
 ---
 
 ## 13. Next
 
-The Days 18–28 options (rail-prep, encrypt keygen, PQ envelope, PQ data path,
-golden vectors, executable conformance, encrypt→decrypt round-trip, **the rail
-transport shim**, and the carrier golden + PC2 session conformance) are **done**.
-The rail itself remains blocked on Anders — and the shim now reduces that to a
-one-line `OpenSession` wire-up. The next-day prompt is normally provided by the
-prior agent; if you do not have it, the highest-value **unblocked** options, in
-order, are:
+The Days 18–34 options are **done**: rail-prep, encrypt keygen, PQ envelope, PQ data
+path, golden vectors, executable conformance, encrypt→decrypt round-trip, the rail
+transport shim + carrier goldens (both profiles), widened cenc goldens (real playback
+shapes), the **real ML-DSA-65 primitive** wired + verified through the rail entrypoint,
+the **adversarial harden sweep**, and an **authoritative verification gate**. The
+`decrypt-provider` crypto core is now **feature-complete, PQ-proven, and hardened** —
+there is little high-value *novel engineering* left on it before the rail lands.
 
-1. **PQ carrier-golden symmetry** — emit `rail_carrier_pq.json` replayed through the
-   shim's PQ branch, explicitly recording that PC2 has no PQ session counterpart (so
-   no cross-impl layer) — closing the profile-symmetry gap left after Day 28.
-2. **Widen the cenc golden/conformance surface** — multi-sample / subsample vectors,
-   or an `init`-segment (`tenc` non-default IV size) vector, replayed through both the
-   engines and PC2's `decrypt_segment` — pinning more of the media contract by
-   executable parity before wiring.
-3. **Reconcile-prep for 0.4.0** — keep `ddrm-verify.sh` green; tighten the drift
-   guard / `PUSH_PLAN.md` rebase recipe so the eventual rebase is button-press.
-4. **Crosvm macOS build hygiene** (orthogonal, optional) — `object-provider` fails to
+The rail itself remains **blocked on Anders** (now a one-line `OpenSession` wire-up;
+the signature primitive is no longer a build gap — only Anders' Q2 policy). The
+next-day prompt is normally provided by the prior agent; if you do not have it, the
+highest-value **unblocked** options, in order, are:
+
+1. **Reconcile-prep for 0.4.0** — keep `ddrm-verify.sh` green; tighten the drift guard /
+   `PUSH_PLAN.md` rebase recipe so the eventual rebase onto a stabilised 0.4.0 is a
+   button-press. Highest leverage now that the core is done.
+2. **Encrypt-side `seal` completion** — the encrypt `seal` (PQ-envelope CEK escrow + fMP4
+   packaging + ciphertext availability) is still behind a fail-closed `seal`; it shares
+   the decrypt rail dependency but its in-boundary packaging can be advanced + pinned with
+   a round-trip golden against the decrypt side. See `DDRM_ENCRYPT_INVARIANT.md`.
+3. **Crosvm macOS build hygiene** (orthogonal, optional) — `object-provider` fails to
    build on macOS via `elastos-crosvm` (`libc` `sockaddr_in.sin_len`); a small
    platform-gating fix would restore a green `cargo build` there. Not on the dDRM
    critical path (crosvm is the Linux/KVM substrate, not the live macOS path).
+4. **Tighten the hybrid-signature transition** (de-risk Anders' Q2) — spike a hybrid
+   `ECDSA + ml-dsa-65` `CekSealVerifier` so *both* answers to Q2 are pre-proven, leaving
+   the rail landing a pure wiring step regardless of the policy chosen.
 
 Whatever you pick: keep it isolated on `feat/decrypt-provider-cenc`, pin it with
 characterization tests, keep the gate green (`scripts/ddrm-verify.sh` + the 68
