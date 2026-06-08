@@ -1,6 +1,9 @@
 //! Capsule manifest types
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::localhost::{
     is_runtime_system_service_resource, is_supported_resource_scheme,
@@ -49,6 +52,14 @@ pub struct CapsuleManifest {
     #[serde(default)]
     pub capabilities: Vec<String>,
 
+    /// Typed callable interfaces exposed by this capsule.
+    ///
+    /// Interface descriptors are discoverability metadata only. They do not
+    /// grant authority; runtime grants, approval policy, and audit still decide
+    /// who may invoke an affordance.
+    #[serde(default)]
+    pub interfaces: Vec<CapsuleInterfaceDescriptor>,
+
     #[serde(default)]
     pub resources: ResourceLimits,
 
@@ -86,6 +97,123 @@ pub struct CapsuleRequirement {
 pub enum RequirementKind {
     Capsule,
     External,
+}
+
+/// Typed callable interface exposed by a capsule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleInterfaceDescriptor {
+    pub id: String,
+    pub version: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub methods: Vec<CapsuleAffordanceDescriptor>,
+}
+
+impl CapsuleInterfaceDescriptor {
+    fn validate(&self) -> Result<(), String> {
+        validate_descriptor_id("interface id", &self.id)?;
+        if self.version.trim().is_empty() {
+            return Err(format!("interface {} version must not be empty", self.id));
+        }
+        if self.methods.is_empty() {
+            return Err(format!(
+                "interface {} must declare at least one method",
+                self.id
+            ));
+        }
+
+        let mut method_ids = BTreeSet::new();
+        for method in &self.methods {
+            method.validate(&self.id)?;
+            if !method_ids.insert(method.id.as_str()) {
+                return Err(format!(
+                    "interface {} declares duplicate method id {}",
+                    self.id, method.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A single user/agent-visible affordance method on an interface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CapsuleAffordanceDescriptor {
+    pub id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub risk: AffordanceRisk,
+    pub approval: AffordanceApprovalMode,
+    pub audit: AffordanceAuditMode,
+    #[serde(default)]
+    pub resource: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub input_schema: Option<Value>,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
+}
+
+impl CapsuleAffordanceDescriptor {
+    fn validate(&self, interface_id: &str) -> Result<(), String> {
+        validate_descriptor_id("method id", &self.id)?;
+        if let Some(resource) = &self.resource {
+            if !is_allowed_uri_scheme(resource) {
+                return Err(format!(
+                    "interface {} method {} resource {} uses an unsupported URI scheme; allowed: elastos://, localhost://",
+                    interface_id, self.id, resource
+                ));
+            }
+        }
+        if let Some(operation) = &self.operation {
+            validate_descriptor_id("method operation", operation)?;
+        }
+        validate_json_schema(
+            &format!("interface {} method {} input", interface_id, self.id),
+            self.input_schema.as_ref(),
+        )?;
+        validate_json_schema(
+            &format!("interface {} method {} output", interface_id, self.id),
+            self.output_schema.as_ref(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Whether Runtime can run the affordance without human approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffordanceApprovalMode {
+    None,
+    RuntimePolicy,
+    User,
+}
+
+/// Safety class declared by the capsule for review and policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffordanceRisk {
+    Read,
+    Write,
+    Launch,
+    Payment,
+    Rights,
+    Actuator,
+    Privileged,
+}
+
+/// Audit detail expected for an affordance invocation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffordanceAuditMode {
+    None,
+    Summary,
+    Event,
+    Full,
 }
 
 /// Current schema identifier for v1 manifests
@@ -268,6 +396,8 @@ impl CapsuleManifest {
             }
         }
 
+        self.validate_interfaces()?;
+
         for storage in &self.permissions.storage {
             if !is_allowed_uri_scheme(storage) {
                 return Err(format!(
@@ -298,10 +428,57 @@ impl CapsuleManifest {
     pub fn is_v1(&self) -> bool {
         self.schema == SCHEMA_V1
     }
+
+    fn validate_interfaces(&self) -> Result<(), String> {
+        let mut interface_ids = BTreeSet::new();
+        for interface in &self.interfaces {
+            interface.validate()?;
+            if !interface_ids.insert(interface.id.as_str()) {
+                return Err(format!(
+                    "manifest declares duplicate interface id {}",
+                    interface.id
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_allowed_uri_scheme(uri: &str) -> bool {
     is_supported_resource_scheme(uri)
+}
+
+fn validate_descriptor_id(kind: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} must not be empty", kind));
+    }
+    if trimmed != value {
+        return Err(format!("{} must not contain surrounding whitespace", kind));
+    }
+    if value.len() > 128 {
+        return Err(format!("{} must be 128 bytes or shorter", kind));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(format!(
+            "{} must not contain whitespace or control characters",
+            kind
+        ));
+    }
+    Ok(())
+}
+
+fn validate_json_schema(kind: &str, schema: Option<&Value>) -> Result<(), String> {
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    if schema.is_object() || schema.is_boolean() {
+        return Ok(());
+    }
+    Err(format!("{} schema must be a JSON object or boolean", kind))
 }
 
 /// Provider-only authority metadata.
@@ -574,6 +751,234 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_manifest_with_typed_interfaces() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "documents",
+            "description": "Document viewer",
+            "author": "elastos",
+            "role": "viewer",
+            "type": "wasm",
+            "entrypoint": "documents.wasm",
+            "interfaces": [{
+                "id": "elastos.documents.viewer",
+                "version": "0.1.0",
+                "description": "Open and preview document objects.",
+                "methods": [{
+                    "id": "document.open",
+                    "description": "Open a document object in the viewer.",
+                    "risk": "read",
+                    "approval": "runtime_policy",
+                    "audit": "event",
+                    "resource": "localhost://Users/self/Documents/*",
+                    "operation": "open",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "uri": { "type": "string" }
+                        },
+                        "required": ["uri"]
+                    },
+                    "output_schema": {
+                        "type": "object"
+                    }
+                }]
+            }]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.interfaces.len(), 1);
+        let interface = &manifest.interfaces[0];
+        assert_eq!(interface.id, "elastos.documents.viewer");
+        assert_eq!(interface.methods[0].id, "document.open");
+        assert_eq!(interface.methods[0].risk, AffordanceRisk::Read);
+        assert_eq!(
+            interface.methods[0].approval,
+            AffordanceApprovalMode::RuntimePolicy
+        );
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_duplicate_interface_ids() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "duplicate-interface",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [
+                {
+                    "id": "elastos.test",
+                    "version": "0.1.0",
+                    "methods": [{
+                        "id": "test.read",
+                        "risk": "read",
+                        "approval": "runtime_policy",
+                        "audit": "event"
+                    }]
+                },
+                {
+                    "id": "elastos.test",
+                    "version": "0.1.0",
+                    "methods": [{
+                        "id": "test.write",
+                        "risk": "write",
+                        "approval": "user",
+                        "audit": "full"
+                    }]
+                }
+            ]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("duplicate interface id"));
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_duplicate_method_ids() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "duplicate-method",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [{
+                "id": "elastos.test",
+                "version": "0.1.0",
+                "methods": [
+                    {
+                        "id": "test.read",
+                        "risk": "read",
+                        "approval": "runtime_policy",
+                        "audit": "event"
+                    },
+                    {
+                        "id": "test.read",
+                        "risk": "read",
+                        "approval": "runtime_policy",
+                        "audit": "event"
+                    }
+                ]
+            }]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("duplicate method id"));
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_unknown_method_fields() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "unknown-method-field",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [{
+                "id": "elastos.test",
+                "version": "0.1.0",
+                "methods": [{
+                    "id": "test.read",
+                    "risk": "read",
+                    "approval": "runtime_policy",
+                    "audit": "event",
+                    "ambient_host_access": true
+                }]
+            }]
+        }"#;
+
+        let err = serde_json::from_str::<CapsuleManifest>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_unsupported_resource_scheme() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "unsupported-resource-scheme",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [{
+                "id": "elastos.test",
+                "version": "0.1.0",
+                "methods": [{
+                    "id": "test.fetch",
+                    "risk": "read",
+                    "approval": "runtime_policy",
+                    "audit": "event",
+                    "resource": "https://example.invalid/object"
+                }]
+            }]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("unsupported URI scheme"));
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_non_schema_json_values() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-schema-shape",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [{
+                "id": "elastos.test",
+                "version": "0.1.0",
+                "methods": [{
+                    "id": "test.read",
+                    "risk": "read",
+                    "approval": "runtime_policy",
+                    "audit": "event",
+                    "input_schema": "string"
+                }]
+            }]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("schema must be a JSON object or boolean"));
+    }
+
+    #[test]
+    fn test_typed_interface_rejects_whitespace_in_descriptor_ids() {
+        let json = r#"{
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "bad-method-id",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "main.wasm",
+            "interfaces": [{
+                "id": "elastos.test",
+                "version": "0.1.0",
+                "methods": [{
+                    "id": "test read",
+                    "risk": "read",
+                    "approval": "runtime_policy",
+                    "audit": "event"
+                }]
+            }]
+        }"#;
+
+        let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("must not contain whitespace"));
+    }
+
+    #[test]
     fn test_parse_microvm_manifest() {
         let json = r#"{
             "schema": "elastos.capsule/v1",
@@ -680,14 +1085,14 @@ mod tests {
             "entrypoint": "rootfs.ext4",
             "providers": {
                 "local": "built-in",
-                "google": "elastos://QmProviderCID"
+                "cloud": "elastos://QmProviderCID"
             }
         }"#;
 
         let manifest: CapsuleManifest = serde_json::from_str(json).unwrap();
         let providers = manifest.providers.unwrap();
         assert_eq!(providers.get("local").unwrap(), "built-in");
-        assert_eq!(providers.get("google").unwrap(), "elastos://QmProviderCID");
+        assert_eq!(providers.get("cloud").unwrap(), "elastos://QmProviderCID");
     }
 
     #[test]
