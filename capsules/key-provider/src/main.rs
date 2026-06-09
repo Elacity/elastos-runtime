@@ -845,6 +845,10 @@ impl KeyProvider {
         // Assemble the recover bundle and DELEGATE to the node. The escrow blob + KID + scheme come
         // from the rights-bound key_envelope; the session key + transcript come from the runtime
         // context. NO key material is held here — only forwarded to the node + sealed result returned.
+        // Carry the rights receipt + the content/principal/session/right binding INTO recover so the
+        // NODE re-checks authorization in its OWN boundary (PC2's Lit action re-runs
+        // `hasAccessByContentId` in the TEE, `universal-decrypt-chipotle.js:560`–`:568`). The node
+        // refuses to recover for an unauthorized/foreign receipt even if THIS process is buggy.
         let recover_req = json!({
             "op": "recover",
             "wrapped_cek_b64": request.key_envelope.wrapped_cek,
@@ -857,8 +861,14 @@ impl KeyProvider {
             "content_hash_b64": session.content_hash_b64,
             "nonce_b64": session.nonce_b64,
             "init_segment_b64": session.init_segment_b64,
+            "rights_receipt": request.rights_receipt,
+            "content_id": request.object_cid,
+            "principal_id": request.principal_id,
+            "session_id": request.session_id,
+            "right": request.action,
         });
-        match delegate_to_dkms_node(&client.endpoint, &recover_req) {
+        // DELEGATE — but only after the node proves its pinned identity in the handshake.
+        match delegate_to_dkms_node(&client.endpoint, &client.verifying_key_b64, &recover_req) {
             // The node returns the suite-tagged material verbatim — pass it through unchanged.
             Ok(data) => Response::ok(data),
             Err(err) => Response::error("not_configured", err),
@@ -1045,10 +1055,52 @@ fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, Stri
 /// node owns spawn→teardown of its own boundary; we shut it down after the single recover. Any
 /// transport/protocol error fails closed. The runtime-core analogue of PC2's client RPCing the Lit
 /// network and only ever receiving the sealed envelope (`recoverCEKEnvelope`, `chipotle-client.ts:1438`).
+/// Verify a dKMS node's IDENTITY handshake response against the descriptor-PINNED verifying key.
+/// The node must (1) advertise exactly the pinned vk and (2) return a valid signature over the
+/// client's challenge under that vk — proving it holds the master-derived signing key BEHIND the
+/// published identity. Any mismatch/forgery/malformed input is an error, so the client fails closed
+/// BEFORE delegating recovery (the runtime-core analogue of pinning the Lit network's identity).
 #[cfg(feature = "key-authority-ref")]
-fn delegate_to_dkms_node(endpoint: &str, recover_req: &Value) -> Result<Value, String> {
+fn verify_hello_attestation(
+    pinned_vk_b64: &str,
+    node_vk_b64: &str,
+    challenge: &[u8],
+    attestation_b64: &str,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    if node_vk_b64 != pinned_vk_b64 {
+        return Err(
+            "dkms node identity mismatch: node vk does not match the pinned descriptor vk".to_string(),
+        );
+    }
+    let attestation = b64
+        .decode(attestation_b64)
+        .map_err(|_| "dkms node hello returned no/invalid attestation".to_string())?;
+    let pinned = b64
+        .decode(pinned_vk_b64)
+        .map_err(|e| format!("pinned dkms verifying key is not base64: {e}"))?;
+    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
+        .ok_or("pinned dkms verifying key is malformed")?;
+    if !ddrm_envelope::verify_attestation(&verifier, challenge, &attestation) {
+        return Err(
+            "dkms node identity attestation failed to verify under the pinned vk".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "key-authority-ref")]
+fn delegate_to_dkms_node(
+    endpoint: &str,
+    pinned_vk_b64: &str,
+    recover_req: &Value,
+) -> Result<Value, String> {
+    use base64::Engine as _;
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Command, Stdio};
+
+    let b64 = base64::engine::general_purpose::STANDARD;
 
     let mut child = Command::new(endpoint)
         .stdin(Stdio::piped())
@@ -1077,16 +1129,33 @@ fn delegate_to_dkms_node(endpoint: &str, recover_req: &Value) -> Result<Value, S
 
     // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
     // store path: the secret's location is the node's concern, never the client's.
-    let init_status = call(&json!({ "op": "init", "config": {} }));
-    let recover = init_status.and_then(|init| {
+    let recover = (|| {
+        let init = call(&json!({ "op": "init", "config": {} }))?;
         if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Err(format!(
                 "dkms node init failed: {}",
                 init.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error")
             ));
         }
+        // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything.
+        // We send a fresh random challenge and require a signature over it under the verifying key
+        // we PINNED from the descriptor — a forged/mismatched node fails closed here, never reaching
+        // recover (the runtime-core analogue of pinning the Lit network identity).
+        let challenge = ddrm_envelope::random_seed();
+        let hello = call(&json!({ "op": "hello", "challenge_b64": b64.encode(challenge) }))?;
+        if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(format!(
+                "dkms node hello failed: {}",
+                hello.get("message").and_then(|v| v.as_str()).unwrap_or("handshake rejected")
+            ));
+        }
+        let data = hello.get("data").ok_or("dkms node hello returned no attestation")?;
+        let node_vk_b64 = data.get("verifying_key_b64").and_then(|v| v.as_str()).unwrap_or("");
+        let attestation_b64 =
+            data.get("attestation_b64").and_then(|v| v.as_str()).unwrap_or("");
+        verify_hello_attestation(pinned_vk_b64, node_vk_b64, &challenge, attestation_b64)?;
         call(recover_req)
-    });
+    })();
 
     // Tear the node down regardless of outcome, then surface the result.
     let _ = call(&json!({ "op": "shutdown" }));
@@ -1853,6 +1922,40 @@ mod tests {
                 );
                 let _ = std::fs::remove_file(&path);
             }
+        }
+
+        /// Before delegating any recovery, the dkms client VERIFIES the node's identity handshake
+        /// against the descriptor-PINNED vk: a genuine attestation over the challenge is accepted,
+        /// while a mismatched node vk, a forged attestation (different node key), a replayed
+        /// challenge, or a malformed signature all fail closed — so an impersonated node is rejected.
+        #[test]
+        fn dkms_client_fails_closed_on_a_forged_or_mismatched_node_identity() {
+            let (signer, vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x51u8; 32]);
+            let pinned = b64().encode(&vk);
+            let challenge = ddrm_envelope::random_seed();
+            let genuine = b64().encode(ddrm_envelope::attest_challenge(&signer, &challenge));
+
+            // Happy path: pinned vk + genuine attestation over the challenge verifies.
+            assert!(verify_hello_attestation(&pinned, &pinned, &challenge, &genuine).is_ok());
+
+            // The node advertises a DIFFERENT vk than pinned → rejected (it is not the authority).
+            let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x52u8; 32]);
+            let other_b64 = b64().encode(&other_vk);
+            assert!(verify_hello_attestation(&pinned, &other_b64, &challenge, &genuine).is_err());
+
+            // Right vk advertised, but the attestation was signed by an IMPOSTOR key → rejected.
+            let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x53u8; 32]);
+            let forged = b64().encode(ddrm_envelope::attest_challenge(&impostor, &challenge));
+            assert!(verify_hello_attestation(&pinned, &pinned, &challenge, &forged).is_err());
+
+            // A genuine attestation REPLAYED against a different challenge → rejected.
+            let mut replay = challenge;
+            replay[0] ^= 1;
+            assert!(verify_hello_attestation(&pinned, &pinned, &replay, &genuine).is_err());
+
+            // A malformed/empty attestation → rejected (no panic).
+            assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "!!!not-base64").is_err());
+            assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "").is_err());
         }
 
         fn reference_provider() -> KeyProvider {

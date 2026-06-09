@@ -54,7 +54,7 @@ shared `protected_content` contracts.
 | 5 Purchase | `wallet-provider` + `chain-provider` | 🟦 signing + tx exist; **buyAccess not orchestrated by a content flow** | `capsules/wallet-provider`, `chain-provider` |
 | 6 Download | `content` fetch + `ipfs-provider` + `availability-provider` | 🟦 fetch/pin work | `elastos-server/src/content.rs` |
 | 7 Validate ownership | `rights-provider` → `chain-provider::has_access_by_content_id` | 🟦 **chain read is typed + tested**; rights-provider not yet calling it | `capsules/chain-provider`, `capsules/rights-provider` |
-| 7 Key release | `key-provider` (`release`) | 🟩 **canonical `release` ACTUALLY releases (reference backend, Day 70)**: validates the rights receipt → recovers the producer-escrowed CEK from the rights-bound `key_envelope` → re-seals to the runtime-injected decrypt session as `SealedDecryptMaterialV1`; fail-closed on denied/expired/kid-swap/forged-producer. **Day 83–84:** `dkms` is now a fail-closed EXTERNAL-authority seam (resolves a STABLE signer + recipient from a HANDED-IN `dkms_authority_descriptor`, re-seals via the same contract). **Day 85–86:** `dkms` runs the open END-TO-END (the live smoke drives it) and now REQUIRES the descriptor's published-identity pins (`verifying_key_b64` + `recipient_pub_b64`) — a pinless descriptor fails closed. **Day 87–88:** `dkms` SPLITS into a SECRET-HOLDING NODE (`capsules/dkms-authority`) + a PUBLIC-ONLY runtime — the descriptor carries NO master (schema v2: pins + endpoint), and `release` DELEGATES recovery to the node (spawn + JSON-RPC `recover`); the master/CEK NEVER enter the runtime; `lit` still `not_configured` | `capsules/key-provider`, `capsules/dkms-authority` |
+| 7 Key release | `key-provider` (`release`) | 🟩 **canonical `release` ACTUALLY releases (reference backend, Day 70)**: validates the rights receipt → recovers the producer-escrowed CEK from the rights-bound `key_envelope` → re-seals to the runtime-injected decrypt session as `SealedDecryptMaterialV1`; fail-closed on denied/expired/kid-swap/forged-producer. **Day 83–84:** `dkms` is now a fail-closed EXTERNAL-authority seam (resolves a STABLE signer + recipient from a HANDED-IN `dkms_authority_descriptor`, re-seals via the same contract). **Day 85–86:** `dkms` runs the open END-TO-END (the live smoke drives it) and now REQUIRES the descriptor's published-identity pins (`verifying_key_b64` + `recipient_pub_b64`) — a pinless descriptor fails closed. **Day 87–88:** `dkms` SPLITS into a SECRET-HOLDING NODE (`capsules/dkms-authority`) + a PUBLIC-ONLY runtime — the descriptor carries NO master (schema v2: pins + endpoint), and `release` DELEGATES recovery to the node (spawn + JSON-RPC `recover`); the master/CEK NEVER enter the runtime. **Day 89–90:** the delegation is an AUTHENTICATED CHANNEL — the client PINS the node vk + VERIFIES a `hello` attestation over a fresh challenge before delegating (forged/mismatched node refused at handshake), and the node RE-AUTHORIZES every `recover` in its own boundary (refuses a denied / content-or-principal-mismatched receipt) before touching key material; `lit` still `not_configured` | `capsules/key-provider`, `capsules/dkms-authority` |
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
@@ -105,7 +105,7 @@ interchangeable **key-delivery backends**, all producing the *same* suite-tagged
 | Backend | Suite tag | Role |
 |---|---|---|
 | **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps. **Day 81–82:** with `init.config.authority_key_store` (a path) its signer + KEM recipient are persisted ONCE (one 32-byte master seed, atomic write, 0600) and re-derived deterministically every launch → a STABLE published recipient (escrow-at-publish), fail-closed on a corrupt store |
-| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team). **Day 83–84:** the seam is real + fail-closed — `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from a HANDED-IN descriptor (the dKMS-provisioned key material, READ never minted), VERIFIES it against the descriptor's published `verifying_key_b64`/`recipient_pub_b64` pins, and recovers/re-seals through the SAME `SealedDecryptMaterialV1` contract; no descriptor → "no dKMS node provisioned". **Day 85–86:** the pins are now REQUIRED (a pinless descriptor fails closed — a real external authority always publishes its identity) and the open runs against it end-to-end (`authority.backend:"dkms"`). **Day 87–88:** the REMOTE dKMS shape is now REAL — a SECRET-HOLDING NODE capsule (`dkms-authority`) owns the master + exposes only `recover` (recovers + re-seals in its own boundary), and `key-provider` holds a PUBLIC-ONLY descriptor (pins + endpoint, NO master, schema v2) and DELEGATES recovery to the node (spawn + JSON-RPC); a master-bearing descriptor is REJECTED, so the runtime holds NO recovery secret. Next: a long-lived socket/RPC node transport + threshold shares across nodes |
+| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team). **Day 83–84:** the seam is real + fail-closed — `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from a HANDED-IN descriptor (the dKMS-provisioned key material, READ never minted), VERIFIES it against the descriptor's published `verifying_key_b64`/`recipient_pub_b64` pins, and recovers/re-seals through the SAME `SealedDecryptMaterialV1` contract; no descriptor → "no dKMS node provisioned". **Day 85–86:** the pins are now REQUIRED (a pinless descriptor fails closed — a real external authority always publishes its identity) and the open runs against it end-to-end (`authority.backend:"dkms"`). **Day 87–88:** the REMOTE dKMS shape is now REAL — a SECRET-HOLDING NODE capsule (`dkms-authority`) owns the master + exposes only `recover` (recovers + re-seals in its own boundary), and `key-provider` holds a PUBLIC-ONLY descriptor (pins + endpoint, NO master, schema v2) and DELEGATES recovery to the node (spawn + JSON-RPC); a master-bearing descriptor is REJECTED, so the runtime holds NO recovery secret. **Day 89–90:** the delegation is now an AUTHENTICATED CHANNEL — `key-provider` PINS the node's published vk and VERIFIES a `hello` ATTESTATION over a fresh challenge before delegating (forged/mismatched node refused at handshake), and the node RE-AUTHORIZES every `recover` in its own boundary (refuses a denied / content-or-principal-mismatched receipt) before touching key material — the runtime-core analogue of pinning the Lit identity + the Lit action's in-TEE `hasAccessByContentId`. Next: a long-lived socket/RPC node transport + threshold shares across nodes |
 | **Lit / Chipotle** (compat) | `p256-classical-compat` | Migration backend for existing PC2 content; **not** the product root |
 | Third parties (future) | (declared per backend) | Same `release → SealedDecryptMaterialV1` contract |
 
@@ -183,8 +183,8 @@ flowchart TB
     DRM[drm-provider<br/>orchestrate drm/open]
     RTS[rights-provider]
     CHN[chain-provider<br/>has_access_by_content_id]
-    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, delegates recovery]
-    NODE[dkms-authority node 🟩<br/>SECRET-HOLDING: owns master, recover-only<br/>recovers + re-seals in-boundary, never CEK/master]
+    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, PINS node vk<br/>verifies hello attestation, then delegates recovery]
+    NODE[dkms-authority node 🟩<br/>SECRET-HOLDING: owns master, hello + recover-only<br/>re-authorizes per recover, re-seals in-boundary, never CEK/master]
     DEC[decrypt-provider<br/>OpenSessionV1 — DONE]
     VIEW[viewer capsule<br/>scoped render]
   end
@@ -199,8 +199,9 @@ flowchart TB
   WLT -->|buyAccess| CHN
   DRM --> RTS --> CHN
   RTS -->|RightsDecisionReceiptV1| KEY
-  KEY -->|recover request: escrow + session key<br/>spawn + JSON-RPC, NO master| NODE
-  NODE -->|SealedDecryptMaterialV1<br/>re-sealed in the node| KEY
+  KEY -->|1. hello challenge — verify attestation vs pinned vk| NODE
+  KEY -->|2. recover: escrow + session key + rights receipt<br/>spawn + JSON-RPC, NO master| NODE
+  NODE -->|re-authorizes receipt, then SealedDecryptMaterialV1<br/>re-sealed in the node| KEY
   KEY -->|SealedDecryptMaterialV1<br/>CEK sealed to session pubkey| DEC
   DEC -->|scoped output| VIEW
   DEC -->|publishes session pubkey at init| KEY
@@ -368,6 +369,25 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 89–90):** the delegation becomes an AUTHENTICATED CHANNEL with a per-recover AUTHORIZATION the
+  node re-checks in its own boundary. Audited PC2 first: (a) the Lit action PINS the authority — it recomputes
+  `sha256(cek‖kid‖authority)` in the TEE and DENIES `kid_authority_mismatch` on a swapped authority/KID
+  (`universal-decrypt-chipotle.js:577`–`:590`); (b) the node RE-RUNS the access check in its own boundary —
+  `hasAccessByContentId(addr, normalizedKid)`, denying `access_denied` rather than trusting the caller
+  (`:560`–`:568`). Mirrored across three seams: (1) a NEW domain-separated `ddrm-envelope` attestation primitive —
+  `attest_challenge`/`verify_attestation` over `DKMS_HELLO_DOMAIN ‖ challenge`, the single source of truth so node +
+  client cannot drift (16→18). (2) the `dkms-authority` node gained a `hello` op (signs the client's fresh challenge
+  with its master-derived signing key, proving possession of the key behind the published vk) and now RE-AUTHORIZES
+  every `recover` in its own boundary — the request carries the `RightsDecisionReceiptV1` + content/principal/session/right
+  binding, and the node refuses unless the receipt is `allowed`, a protected-content action, and binds the SAME
+  identity the recover declares (4→6). (3) `key-provider`'s `dkms` client runs the IDENTITY HANDSHAKE before
+  delegating — requires the node to advertise EXACTLY the descriptor-pinned vk + a valid attestation over the
+  challenge (fail-closed on a forged/mismatched node) — then threads the receipt + binding into `recover` (39→40).
+  `ddrm-runtime-open` verify mode proves it cross-binary against the REAL node (step 13: attestation verifies under
+  the descriptor vk; a flipped vk + a replayed challenge rejected; step 14: the node refuses a DENIED / wrong-content
+  receipt), with the master never on the wire; the reference path stays green. Drift untouched (the node CONSUMES the
+  existing `RightsDecisionReceiptV1`). Gate: ladder INTACT (ddrm-envelope=18, dkms-authority=6,
+  key-provider[key-authority-ref]=40), drift PASS, all dDRM smokes green (incl. dkms), clippy clean.
 - **Status (Day 87–88):** the `dkms` authority SPLITS into a SECRET-HOLDING NODE + a PUBLIC-ONLY runtime, and
   recovery is DELEGATED across the process boundary — the first real step from the provisioned-descriptor seam
   toward a remote dKMS. Audited PC2 first: (a) the Lit/dKMS node recovers the CEK INSIDE the TEE

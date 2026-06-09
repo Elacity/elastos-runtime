@@ -343,6 +343,34 @@ impl CekSealVerifier for MlDsa65Verifier {
     }
 }
 
+/// Domain label for the dKMS-authority node IDENTITY handshake (Day 89–90). A client pins the
+/// node's published verifying key, sends a fresh random challenge, and the node returns a signature
+/// over `DKMS_HELLO_DOMAIN ‖ challenge` proving it holds the master-derived signing key BEHIND that
+/// vk — so a client can refuse to talk to an impersonated node before delegating any recovery. The
+/// label is domain-separated from the CEK-seal signatures so a hello attestation can never be
+/// replayed as a seal (or vice-versa). Defined ONCE here so the node + client cannot drift.
+pub const DKMS_HELLO_DOMAIN: &[u8] = b"elastos.dkms.authority/hello/v1";
+
+/// The NODE side of the identity handshake: sign `DKMS_HELLO_DOMAIN ‖ challenge` with the node's
+/// master-derived seal signing key. Returns the detached signature (the attestation).
+pub fn attest_challenge(signer: &impl seal::CekSealSigner, challenge: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DKMS_HELLO_DOMAIN.len() + challenge.len());
+    msg.extend_from_slice(DKMS_HELLO_DOMAIN);
+    msg.extend_from_slice(challenge);
+    signer.sign(&msg)
+}
+
+/// The CLIENT side of the identity handshake: verify a node's attestation over `challenge` under the
+/// authority's PINNED verifying key. `true` only when the signature is a valid ML-DSA-65 signature
+/// over `DKMS_HELLO_DOMAIN ‖ challenge` under `verifier` — a forged/mismatched node, a tampered
+/// challenge, or a malformed signature all return `false` (the client then fails closed).
+pub fn verify_attestation(verifier: &impl CekSealVerifier, challenge: &[u8], sig: &[u8]) -> bool {
+    let mut msg = Vec::with_capacity(DKMS_HELLO_DOMAIN.len() + challenge.len());
+    msg.extend_from_slice(DKMS_HELLO_DOMAIN);
+    msg.extend_from_slice(challenge);
+    verifier.verify(&msg, sig)
+}
+
 /// Hybrid (classical + post-quantum) seal-signature verifier — migration-period
 /// profile where a classical ECDSA-P256 signature AND a PQ ML-DSA-65 signature over
 /// the same payload must BOTH verify. Wire layout: `u32 ecdsa_len ‖ ecdsa(DER) ‖
@@ -826,6 +854,53 @@ mod tests {
         let mut t = sample_transcript();
         t.expires_at += 1;
         assert_ne!(base, t.to_aad(), "expiry change must change the AAD");
+    }
+
+    /// The dKMS-node identity handshake: a node's attestation over a challenge verifies under its
+    /// PINNED verifying key, and any forgery/tamper fails — so a client can pin + verify the node
+    /// before delegating recovery.
+    #[test]
+    fn dkms_hello_attestation_round_trips_and_rejects_forgery() {
+        let (signer, vk) = crate::seal::mldsa_seal_keypair([0x42u8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
+        let challenge = [0x9au8; 32];
+        let attestation = crate::attest_challenge(&signer, &challenge);
+        assert!(
+            crate::verify_attestation(&verifier, &challenge, &attestation),
+            "the genuine node's attestation verifies under its pinned vk"
+        );
+
+        // A different (impersonating) node's key does NOT verify under the pinned vk.
+        let (other_signer, _other_vk) = crate::seal::mldsa_seal_keypair([0x43u8; 32]);
+        let forged = crate::attest_challenge(&other_signer, &challenge);
+        assert!(
+            !crate::verify_attestation(&verifier, &challenge, &forged),
+            "an impersonating node's attestation must be rejected under the pinned vk"
+        );
+
+        // A tampered challenge (replay against a different nonce) fails.
+        let mut other_challenge = challenge;
+        other_challenge[0] ^= 1;
+        assert!(
+            !crate::verify_attestation(&verifier, &other_challenge, &attestation),
+            "an attestation over a different challenge must not verify"
+        );
+
+        // A malformed signature fails closed (no panic).
+        assert!(!crate::verify_attestation(&verifier, &challenge, b"not-a-signature"));
+    }
+
+    /// The hello attestation is domain-separated from CEK seals — a seal signature can never be
+    /// replayed as a node-identity attestation (different signed prefix).
+    #[test]
+    fn dkms_hello_is_domain_separated_from_seals() {
+        let (signer, vk) = crate::seal::mldsa_seal_keypair([7u8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
+        let challenge = [1u8; 32];
+        // A bare signature over the challenge WITHOUT the hello domain must not verify as an attestation.
+        use crate::seal::CekSealSigner as _;
+        let bare = signer.sign(&challenge);
+        assert!(!crate::verify_attestation(&verifier, &challenge, &bare));
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.

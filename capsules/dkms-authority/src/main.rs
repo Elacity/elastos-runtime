@@ -43,9 +43,21 @@ enum Request {
         config: Value,
     },
     Status,
+    /// IDENTITY HANDSHAKE (Day 89–90): a client pins the node's published verifying key, sends a
+    /// fresh random challenge, and the node returns a signature over it proving it holds the
+    /// master-derived signing key BEHIND that vk — so the client can refuse an impersonated node
+    /// before delegating any recovery. The runtime-core analogue of pinning the Lit network's
+    /// identity (the published `pkpId`/`authority`).
+    Hello {
+        challenge_b64: String,
+    },
     /// DELEGATED recovery: recover a producer-escrowed CEK in-boundary and re-seal it to the
     /// decrypt session. The CEK source (escrow blob), KID, scheme and producer key authenticate
-    /// the escrow; the session key + transcript AAD bind the re-seal. NO raw CEK on any wire.
+    /// the escrow; the session key + transcript AAD bind the re-seal. The rights receipt + the
+    /// content/principal/session binding let the node RE-CHECK authorization in its OWN boundary
+    /// (PC2's Lit action re-runs `hasAccessByContentId` in the TEE, `universal-decrypt-chipotle.js:560`–`:568`)
+    /// — it refuses to recover without a valid, content-bound authorization, even if the caller is
+    /// buggy/compromised. NO raw CEK on any wire.
     Recover {
         wrapped_cek_b64: String,
         scheme: String,
@@ -59,6 +71,14 @@ enum Request {
         nonce_b64: String,
         #[serde(default)]
         init_segment_b64: Option<String>,
+        /// The upstream rights decision the node RE-VALIDATES in its own boundary.
+        rights_receipt: elastos_common::protected_content::RightsDecisionReceiptV1,
+        /// The content/principal/session/right the receipt MUST bind — the node refuses a receipt
+        /// that does not match this declared identity (a replayed/foreign receipt is rejected).
+        content_id: String,
+        principal_id: String,
+        session_id: String,
+        right: String,
     },
     Shutdown,
 }
@@ -147,6 +167,7 @@ impl DkmsAuthorityNode {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
+            Request::Hello { challenge_b64 } => self.hello(&challenge_b64),
             Request::Recover {
                 wrapped_cek_b64,
                 scheme,
@@ -158,6 +179,11 @@ impl DkmsAuthorityNode {
                 content_hash_b64,
                 nonce_b64,
                 init_segment_b64,
+                rights_receipt,
+                content_id,
+                principal_id,
+                session_id,
+                right,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
                 scheme,
@@ -169,9 +195,40 @@ impl DkmsAuthorityNode {
                 content_hash_b64,
                 nonce_b64,
                 init_segment_b64,
+                rights_receipt,
+                content_id,
+                principal_id,
+                session_id,
+                right,
             }),
             Request::Shutdown => Response::empty_ok(),
         }
+    }
+
+    /// IDENTITY HANDSHAKE: sign the client's challenge with the node's master-derived signing key
+    /// and return the attestation + the published verifying key. The client verifies the attestation
+    /// against the vk it PINNED from the descriptor, proving it is talking to the authentic node
+    /// (not an impersonator) before it delegates any recovery. Requires `init` (no key, no identity).
+    fn hello(&self, challenge_b64: &str) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "dkms-authority node is not initialized (send `init` first)",
+                )
+            }
+        };
+        let challenge = match b64().decode(challenge_b64) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => return Response::error("invalid_request", "challenge_b64 must be non-empty"),
+            Err(_) => return Response::error("invalid_request", "challenge_b64 is not valid base64"),
+        };
+        let attestation = ddrm_envelope::attest_challenge(&authority.signer, &challenge);
+        Response::ok(json!({
+            "verifying_key_b64": b64().encode(&authority.verifying_key),
+            "attestation_b64": b64().encode(&attestation),
+        }))
     }
 
     /// Stand the node up from its durable master-seed store (config `authority_key_store`, else the
@@ -214,7 +271,7 @@ impl DkmsAuthorityNode {
             "provider": "dkms-authority",
             "version": PROVIDER_VERSION,
             "configured": self.authority.is_some(),
-            "supported_operations": ["status", "init", "recover"],
+            "supported_operations": ["status", "init", "hello", "recover"],
             // The node NEVER returns these — the master + raw CEK stay inside this boundary.
             "blocked_authority": ["raw_cek", "master_seed", "recipient_secret"],
         }))
@@ -233,6 +290,11 @@ impl DkmsAuthorityNode {
                 )
             }
         };
+        // RE-AUTHORIZE in this boundary FIRST — refuse to recover for an unauthorized caller before
+        // touching any key material (the node never trusts the client's claim).
+        if let Err(err) = reauthorize(&args) {
+            return Response::error("access_denied", err);
+        }
         let wrapped = match b64().decode(&args.wrapped_cek_b64) {
             Ok(bytes) => bytes,
             Err(_) => return Response::error("invalid_request", "wrapped_cek_b64 is not valid base64"),
@@ -294,6 +356,7 @@ impl DkmsAuthorityNode {
     }
 }
 
+#[derive(Clone)]
 struct RecoverArgs {
     wrapped_cek_b64: String,
     scheme: String,
@@ -305,6 +368,44 @@ struct RecoverArgs {
     content_hash_b64: String,
     nonce_b64: String,
     init_segment_b64: Option<String>,
+    rights_receipt: elastos_common::protected_content::RightsDecisionReceiptV1,
+    content_id: String,
+    principal_id: String,
+    session_id: String,
+    right: String,
+}
+
+/// RE-CHECK the rights authorization in the node's OWN boundary before recovering anything. The
+/// node does NOT trust the caller: the receipt must be a valid, ALLOWED, protected-content
+/// authorization that binds the SAME content/principal/session/right the recover declares — so a
+/// buggy/compromised client that forwards a denied, foreign, or incoherent receipt is refused. The
+/// runtime-core analogue of PC2's Lit action re-running `hasAccessByContentId` in the TEE
+/// (`universal-decrypt-chipotle.js:560`–`:568`) rather than trusting the caller's claim.
+fn reauthorize(args: &RecoverArgs) -> Result<(), String> {
+    use elastos_common::protected_content::{PROTECTED_CONTENT_ACTIONS, RIGHTS_DECISION_RECEIPT_SCHEMA};
+    let r = &args.rights_receipt;
+    if r.schema != RIGHTS_DECISION_RECEIPT_SCHEMA {
+        return Err("rights receipt schema is unsupported".to_string());
+    }
+    if !r.allowed {
+        return Err("rights receipt does not authorize this recovery".to_string());
+    }
+    if !PROTECTED_CONTENT_ACTIONS.contains(&r.right.as_str()) {
+        return Err(format!("rights receipt right is not a protected-content action: {}", r.right));
+    }
+    if r.content_id != args.content_id {
+        return Err("rights receipt content does not match the recover request".to_string());
+    }
+    if r.principal_id != args.principal_id {
+        return Err("rights receipt principal does not match the recover request".to_string());
+    }
+    if r.session_id != args.session_id {
+        return Err("rights receipt session does not match the recover request".to_string());
+    }
+    if r.right != args.right {
+        return Err("rights receipt right does not match the recover request".to_string());
+    }
+    Ok(())
 }
 
 fn b64() -> base64::engine::general_purpose::GeneralPurpose {
@@ -440,6 +541,27 @@ mod tests {
             .into_owned()
     }
 
+    const CONTENT: &str = "bafybeigdyrcontent";
+    const PRINCIPAL: &str = "did:key:zViewer";
+    const SESSION: &str = "session:abc";
+    const RIGHT: &str = "view";
+
+    /// A valid, ALLOWED rights receipt bound to the canonical test content/principal/session/right.
+    fn good_receipt() -> elastos_common::protected_content::RightsDecisionReceiptV1 {
+        elastos_common::protected_content::RightsDecisionReceiptV1 {
+            schema: elastos_common::protected_content::RIGHTS_DECISION_RECEIPT_SCHEMA.to_string(),
+            request_id: "rights:test".to_string(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
+            provider: "rights-provider".to_string(),
+            allowed: true,
+            issued_at: 1,
+            expires_at: u64::MAX,
+        }
+    }
+
     /// Escrow a CEK to the node's published recipient exactly as the producer does, then drive a
     /// transcript-bound `recover`; the sealed material the node returns opens to the SAME CEK.
     #[test]
@@ -476,6 +598,11 @@ mod tests {
             content_hash_b64: b64().encode(b"hash"),
             nonce_b64: b64().encode(b"nonce"),
             init_segment_b64: None,
+            rights_receipt: good_receipt(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
         });
         let data = ok_data(resp);
         // The response carries SEALED material only — never a raw CEK.
@@ -540,6 +667,11 @@ mod tests {
             content_hash_b64: b64().encode(b"h"),
             nonce_b64: b64().encode(b"n"),
             init_segment_b64: None,
+            rights_receipt: good_receipt(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
         });
         assert_eq!(error_code(&forged), "invalid_request");
 
@@ -556,6 +688,11 @@ mod tests {
             content_hash_b64: b64().encode(b"h"),
             nonce_b64: b64().encode(b"n"),
             init_segment_b64: None,
+            rights_receipt: good_receipt(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
         });
         assert_eq!(error_code(&pre), "not_configured");
         let _ = std::fs::remove_file(&store);
@@ -567,5 +704,115 @@ mod tests {
         std::env::remove_var(KEY_STORE_ENV);
         let mut node = DkmsAuthorityNode::default();
         assert_eq!(error_code(&node.init(json!({}))), "not_configured");
+    }
+
+    /// Build an initialized node plus a recover request whose escrow + transcript are valid, so a
+    /// re-auth test can vary ONLY the receipt/binding and observe the node's independent decision.
+    fn setup_recover(store: &str) -> (DkmsAuthorityNode, RecoverArgs) {
+        let mut node = DkmsAuthorityNode::default();
+        let init = ok_data(node.init(json!({ "authority_key_store": store })));
+        let recipient_pub = b64().decode(init["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub).unwrap();
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+        let cek: Vec<u8> = (0u8..32).collect();
+        let kid16 = [0xC5u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let escrow_aad = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_pub);
+        let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &escrow_aad, &producer_signer);
+        let (_session_secret, session_public) = ddrm_envelope::mint_session();
+        let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
+        let args = RecoverArgs {
+            wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
+            scheme: scheme.to_string(),
+            kid_hex,
+            producer_vk_b64: b64().encode(&producer_vk),
+            decrypt_session_pub_b64: session_pub_b64,
+            aad_b64: b64().encode(b"transcript"),
+            ciphertext_b64: b64().encode(b"ct"),
+            content_hash_b64: b64().encode(b"hash"),
+            nonce_b64: b64().encode(b"nonce"),
+            init_segment_b64: None,
+            rights_receipt: good_receipt(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
+        };
+        (node, args)
+    }
+
+    /// The node's IDENTITY handshake: a `hello` returns the published vk + an attestation that
+    /// verifies under that pinned vk for the supplied challenge — and refuses before `init`.
+    #[test]
+    fn hello_attests_node_identity_and_requires_init() {
+        let store = unique_store("hello");
+        let mut node = DkmsAuthorityNode::default();
+
+        // Before init there is no key material → fail closed.
+        assert_eq!(error_code(&node.hello(&b64().encode([1u8; 32]))), "not_configured");
+
+        let init = ok_data(node.init(json!({ "authority_key_store": store })));
+        let pinned_vk_b64 = init["seal_verifying_key_b64"].as_str().unwrap().to_string();
+
+        let challenge = ddrm_envelope::random_seed();
+        let resp = ok_data(node.hello(&b64().encode(challenge)));
+        // The node advertises the SAME vk it published at init (the pin).
+        assert_eq!(resp["verifying_key_b64"].as_str().unwrap(), pinned_vk_b64);
+
+        // The attestation verifies under the PINNED vk for THIS challenge.
+        let pinned = b64().decode(&pinned_vk_b64).unwrap();
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned).unwrap();
+        let attestation = b64().decode(resp["attestation_b64"].as_str().unwrap()).unwrap();
+        assert!(ddrm_envelope::verify_attestation(&verifier, &challenge, &attestation));
+
+        // An impersonating node's vk would NOT verify this attestation (client pins + rejects).
+        let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0xEEu8; 32]);
+        let other_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&other_vk).unwrap();
+        assert!(!ddrm_envelope::verify_attestation(&other_verifier, &challenge, &attestation));
+
+        // A different challenge (replay) does not verify under the genuine vk either.
+        let mut replay = challenge;
+        replay[0] ^= 1;
+        assert!(!ddrm_envelope::verify_attestation(&verifier, &replay, &attestation));
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// The node RE-AUTHORIZES in its own boundary: it refuses to recover when the receipt is denied,
+    /// or binds different content/principal/session/right than the recover declares — even though
+    /// the escrow + transcript are otherwise perfectly valid (a buggy/compromised caller is caught).
+    #[test]
+    fn recover_fails_closed_on_unauthorized_or_mismatched_receipt() {
+        let store = unique_store("reauth");
+        // One node + one valid escrow; each case clones the base args and varies ONLY the receipt.
+        let (node, base) = setup_recover(&store);
+
+        // Denied receipt → access_denied.
+        let mut denied = base.clone();
+        denied.rights_receipt.allowed = false;
+        assert_eq!(error_code(&node.recover(denied)), "access_denied");
+
+        // Receipt binds DIFFERENT content than the recover declares → access_denied.
+        let mut wrong_content = base.clone();
+        wrong_content.rights_receipt.content_id = "bafybeigOTHER".to_string();
+        assert_eq!(error_code(&node.recover(wrong_content)), "access_denied");
+
+        // Receipt binds DIFFERENT principal → access_denied.
+        let mut wrong_principal = base.clone();
+        wrong_principal.rights_receipt.principal_id = "did:key:zAttacker".to_string();
+        assert_eq!(error_code(&node.recover(wrong_principal)), "access_denied");
+
+        // Receipt right is not a protected-content action → access_denied.
+        let mut bad_right = base.clone();
+        bad_right.rights_receipt.right = "delete".to_string();
+        bad_right.right = "delete".to_string();
+        assert_eq!(error_code(&node.recover(bad_right)), "access_denied");
+
+        // Sanity: the SAME setup with a coherent allowed receipt recovers (re-auth is the only gate
+        // we varied above), proving the failures are the re-auth, not a broken fixture.
+        assert!(matches!(node.recover(base), Response::Ok { .. }));
+
+        let _ = std::fs::remove_file(&store);
     }
 }

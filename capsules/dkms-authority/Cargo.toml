@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Shared PQ-hybrid seal/unwrap — single source of truth with key-provider + decrypt-provider.
+# Shared PQ-hybrid seal/unwrap + node-identity attestation — single source of truth with key-provider.
 ddrm-envelope = { path = "../ddrm-envelope" }
+# Shared rights-receipt contract — the node RE-CHECKS authorization in its own boundary (reads the
+# canonical RightsDecisionReceiptV1; defines no new shared type).
+elastos-common = { path = "../../elastos/crates/elastos-common" }
 base64 = "0.22"
 zeroize = "1"
 

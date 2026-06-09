@@ -625,6 +625,119 @@ fn publish_escrow(
     Ok(fixture)
 }
 
+/// A complete `RightsDecisionReceiptV1` JSON the dkms node can deserialize (deny_unknown_fields).
+fn probe_receipt(allowed: bool, content_id: &str, principal_id: &str, right: &str) -> Value {
+    json!({
+        "schema": "elastos.rights.decision.receipt/v1",
+        "request_id": "probe",
+        "content_id": content_id,
+        "principal_id": principal_id,
+        "session_id": "probe-session",
+        "right": right,
+        "provider": "rights-provider",
+        "allowed": allowed,
+        "issued_at": 1,
+        "expires_at": u64::MAX,
+    })
+}
+
+/// Adversarial probe against the REAL dkms-authority node binary (verify mode only): prove, cross
+/// binary, that **(a)** a tampered/wrong NODE IDENTITY is rejected at the handshake — the node's
+/// attestation over a fresh challenge verifies under the descriptor-PINNED vk but NOT under a
+/// flipped vk or a replayed challenge — and **(b)** the node REFUSES a recover whose authorization
+/// does not bind the content/principal (a denied receipt, or one bound to other content) — even
+/// though the request is otherwise well-formed. The runtime-core analogue of PC2 pinning the Lit
+/// network identity (`universal-decrypt-chipotle.js:577`–`:590`) AND the Lit action re-running
+/// `hasAccessByContentId` in the TEE (`:560`–`:568`) rather than trusting the caller.
+fn dkms_node_adversarial_probe(
+    node_bin: &str,
+    node_store_path: &str,
+    pinned_vk_b64: &str,
+) -> Result<(), String> {
+    let mut node = Capsule::spawn("dkms-authority(probe)", node_bin)?;
+    ok_data(
+        &node.call(&json!({ "op": "init", "config": { "authority_key_store": node_store_path } }))?,
+        "dkms-authority init (probe)",
+    )?;
+
+    // (a) IDENTITY HANDSHAKE — the node proves possession of the master-derived signing key.
+    let challenge = ddrm_envelope::random_seed();
+    let hello = ok_data(
+        &node.call(&json!({ "op": "hello", "challenge_b64": B64.encode(challenge) }))?,
+        "dkms-authority hello (probe)",
+    )?;
+    if hello["verifying_key_b64"].as_str() != Some(pinned_vk_b64) {
+        node.shutdown();
+        return Err("dkms node hello advertised a vk that does not match the pinned descriptor".to_string());
+    }
+    let attestation = B64
+        .decode(hello["attestation_b64"].as_str().unwrap_or(""))
+        .map_err(|e| format!("node attestation is not base64: {e}"))?;
+    let pinned = B64.decode(pinned_vk_b64).map_err(|e| e.to_string())?;
+    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
+        .ok_or("pinned dkms vk is malformed")?;
+    if !ddrm_envelope::verify_attestation(&verifier, &challenge, &attestation) {
+        node.shutdown();
+        return Err("the genuine node attestation failed to verify under the pinned vk".to_string());
+    }
+    // A flipped (impersonator) vk must NOT verify this attestation → a swapped node is rejected.
+    let mut tampered = pinned.clone();
+    tampered[0] ^= 1;
+    if let Some(bad_verifier) = ddrm_envelope::MlDsa65Verifier::from_encoded(&tampered) {
+        if ddrm_envelope::verify_attestation(&bad_verifier, &challenge, &attestation) {
+            node.shutdown();
+            return Err("a tampered node identity (flipped vk) wrongly verified — pinning is broken".to_string());
+        }
+    }
+    // A replayed challenge must NOT verify under the genuine vk → no replay across nonces.
+    let mut replay = challenge;
+    replay[0] ^= 1;
+    if ddrm_envelope::verify_attestation(&verifier, &replay, &attestation) {
+        node.shutdown();
+        return Err("a replayed challenge wrongly verified — the attestation is not challenge-bound".to_string());
+    }
+    step(13, "dkms node IDENTITY pinned + verified cross-binary: the node's attestation verifies under the descriptor vk; a flipped vk + a replayed challenge are both rejected (impersonated node refused at handshake)");
+
+    // (b) NODE RE-AUTHORIZATION — the node refuses recover whose authorization does not bind the
+    // declared content/principal. Crypto fields are dummies: re-auth runs FIRST, so the node
+    // refuses BEFORE touching any key material.
+    let recover_base = |receipt: Value, content_id: &str| {
+        json!({
+            "op": "recover",
+            "wrapped_cek_b64": B64.encode(b"x"),
+            "scheme": SUITE_PQ_HYBRID,
+            "kid_hex": "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
+            "producer_vk_b64": B64.encode(b"x"),
+            "decrypt_session_pub_b64": B64.encode(b"x"),
+            "aad_b64": B64.encode(b"x"),
+            "ciphertext_b64": B64.encode(b"x"),
+            "content_hash_b64": B64.encode(b"x"),
+            "nonce_b64": B64.encode(b"x"),
+            "rights_receipt": receipt,
+            "content_id": content_id,
+            "principal_id": "did:key:zViewer",
+            "session_id": "probe-session",
+            "right": "view",
+        })
+    };
+    // Denied receipt → refused.
+    let denied = node.call(&recover_base(probe_receipt(false, "bafContent", "did:key:zViewer", "view"), "bafContent"))?;
+    if denied.get("status").and_then(Value::as_str) == Some("ok") {
+        node.shutdown();
+        return Err("the node recovered for a DENIED receipt — re-authorization is broken".to_string());
+    }
+    // Allowed receipt bound to OTHER content than the recover declares → refused.
+    let mismatched = node.call(&recover_base(probe_receipt(true, "bafOTHER", "did:key:zViewer", "view"), "bafContent"))?;
+    if mismatched.get("status").and_then(Value::as_str) == Some("ok") {
+        node.shutdown();
+        return Err("the node recovered for a receipt bound to DIFFERENT content — re-authorization is broken".to_string());
+    }
+    step(14, "dkms node RE-AUTHORIZED in its own boundary: it refused recover for a DENIED receipt and for a receipt bound to other content (the node never trusts the caller's claim)");
+
+    node.shutdown();
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -1463,6 +1576,23 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             return Err("the dkms authority descriptor was mutated across the open — it must be read-only published data".to_string());
         }
         step(12, "runtime-core host: the EXTERNAL dkms identity was PUBLIC-ONLY + read-only across the open (master stayed in the node; recovery was DELEGATED — never the secret)");
+
+        // Verify mode: prove the AUTHENTICATED channel cross-binary — a tampered node identity is
+        // rejected at the handshake, and the node refuses a recover whose authorization does not
+        // bind the content/principal. The happy-path open above already proved the genuine identity
+        // verifies + a content-bound recover decrypts; here we prove the adversarial edges.
+        if cfg.mode == OpenMode::Verify {
+            let node_bin = cfg
+                .dkms_authority_bin
+                .as_deref()
+                .ok_or("dkms verify mode requires a dkms_authority_bin")?;
+            let desc: Value = serde_json::from_slice(&before).map_err(|e| format!("parse dkms descriptor: {e}"))?;
+            let pinned_vk = desc
+                .get("verifying_key_b64")
+                .and_then(Value::as_str)
+                .ok_or("dkms descriptor missing verifying_key_b64")?;
+            dkms_node_adversarial_probe(node_bin, &node_store_path, pinned_vk)?;
+        }
     }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop
     // them and clean up the durable artifacts (key store + fixture + receipts) unless the
