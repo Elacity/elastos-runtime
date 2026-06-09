@@ -273,6 +273,69 @@ pub fn open_drm_plan(
     plan.execute(&mut runner)
 }
 
+/// A runtime-OWNED provider transport: the long-lived capability to drive one
+/// provider's steps. The runtime registers one transport per provider into a
+/// [`RuntimeCapabilityTable`] at startup — the analogue of PC2's `sessionService`
+/// singleton owning the per-backend view constructors
+/// (`export const sessionService = new BackendSessionService(...)`,
+/// `src/services/session/BackendSessionService.ts:495`). On each open the table asks the
+/// transport to OPEN a fresh [`ProviderHandle`], mirroring `getSessionView` constructing
+/// a fresh `BackendSessionView`/`WasmSessionView` per request from the runtime-owned
+/// record (`:368`). The runtime owns the transports; the open supplies only the plan.
+pub trait ProviderTransport {
+    /// The provider role this transport drives — matches a plan step's `provider`.
+    fn provider(&self) -> &str;
+    /// Open a fresh handle over this transport for ONE plan execution.
+    fn open(&self) -> Box<dyn ProviderHandle>;
+}
+
+/// The runtime-core capability table: a registry of runtime-OWNED provider transports.
+/// The runtime `register`s one transport per provider it can drive (at startup); on a
+/// dDRM open, [`open_drm_plan`] → `resolve(provider)` opens a fresh handle over the
+/// registered transport, or returns `None` for a provider the runtime never registered
+/// (→ the open fails closed). This is the concrete [`CapabilityTable`] the trusted core
+/// owns; the consumer smoke registers capsule-backed transports into the SAME type — no
+/// second code path. Mirrors the PC2 factory that dispatches on `stored.backend` to a
+/// runtime-owned view constructor, `null` for an unknown backend
+/// (`BackendSessionService.ts:368`–`:377`).
+#[derive(Default)]
+pub struct RuntimeCapabilityTable {
+    transports: BTreeMap<String, Box<dyn ProviderTransport>>,
+}
+
+impl RuntimeCapabilityTable {
+    pub fn new() -> Self {
+        Self {
+            transports: BTreeMap::new(),
+        }
+    }
+
+    /// Register a runtime-owned transport for its provider. Fails closed if that
+    /// provider already has a transport — a provider has exactly ONE owner, so a
+    /// second registration is a wiring bug, never a silent override.
+    pub fn register(&mut self, transport: Box<dyn ProviderTransport>) -> Result<(), String> {
+        let key = transport.provider().to_string();
+        if self.transports.contains_key(&key) {
+            return Err(format!(
+                "provider `{key}` already has a registered transport — a provider has one owner"
+            ));
+        }
+        self.transports.insert(key, transport);
+        Ok(())
+    }
+
+    /// The providers the runtime has registered a transport for.
+    pub fn registered_providers(&self) -> Vec<&str> {
+        self.transports.keys().map(String::as_str).collect()
+    }
+}
+
+impl CapabilityTable for RuntimeCapabilityTable {
+    fn resolve(&mut self, provider: &str) -> Option<Box<dyn ProviderHandle>> {
+        self.transports.get(provider).map(|t| t.open())
+    }
+}
+
 impl StepRunner for RuntimeStepRunner {
     fn run_step(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
         let provider = match &inputs.step.provider {
@@ -1054,5 +1117,83 @@ mod tests {
         assert!(err.contains("non-planned"), "{err}");
         // The composition root parses BEFORE resolving — a bad plan never reaches the table.
         assert!(resolved.borrow().is_empty());
+    }
+
+    // ── RuntimeCapabilityTable: the runtime-OWNED registry of provider transports ──
+
+    /// A runtime-owned transport backed by a fake handle — the test analogue of PC2's
+    /// per-backend view constructor the `sessionService` singleton owns.
+    struct FakeTransport {
+        provider: String,
+        invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl FakeTransport {
+        fn boxed(provider: &str, invoked: &std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Box<dyn ProviderTransport> {
+            Box::new(FakeTransport {
+                provider: provider.to_string(),
+                invoked: invoked.clone(),
+            })
+        }
+    }
+
+    impl ProviderTransport for FakeTransport {
+        fn provider(&self) -> &str {
+            &self.provider
+        }
+        fn open(&self) -> Box<dyn ProviderHandle> {
+            FakeHandle::boxed(&self.provider, &self.invoked)
+        }
+    }
+
+    #[test]
+    fn runtime_table_drives_the_plan_from_registered_transports() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(FakeTransport::boxed("rights", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("key", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("decrypt", &invoked)).unwrap();
+        assert_eq!(table.registered_providers(), vec!["decrypt", "key", "rights"]);
+        let report = open_drm_plan(&canonical_plan(), &mut table).expect("registered transports drive the plan");
+        assert!(report.artifact("decrypt_session").is_some());
+        assert_eq!(*invoked.borrow(), vec!["rights", "key", "decrypt", "decrypt"]);
+    }
+
+    #[test]
+    fn runtime_table_fails_closed_for_an_unregistered_required_provider() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        // The runtime registers rights + decrypt but NOT key — an open requiring key
+        // resolves to None and fails closed; no provider step ever runs.
+        table.register(FakeTransport::boxed("rights", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("decrypt", &invoked)).unwrap();
+        let err = open_drm_plan(&canonical_plan(), &mut table).unwrap_err();
+        assert!(err.contains("holds no handle for required provider `key`"), "{err}");
+        assert!(invoked.borrow().is_empty());
+    }
+
+    #[test]
+    fn runtime_table_rejects_a_duplicate_transport_registration() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(FakeTransport::boxed("key", &invoked)).unwrap();
+        let err = table.register(FakeTransport::boxed("key", &invoked)).unwrap_err();
+        assert!(err.contains("provider `key` already has a registered transport"), "{err}");
+    }
+
+    #[test]
+    fn runtime_table_opens_a_fresh_handle_per_open() {
+        // The runtime owns ONE transport per provider but resolves a FRESH handle on each
+        // open (PC2 reuses the singleton across requests, minting a view per request). Two
+        // opens over the same registered transports both succeed.
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(FakeTransport::boxed("rights", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("key", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("decrypt", &invoked)).unwrap();
+        open_drm_plan(&canonical_plan(), &mut table).expect("first open");
+        open_drm_plan(&canonical_plan(), &mut table).expect("second open over the same transports");
+        // Both opens drove the full chain (rights,key,decrypt,decrypt) ×2.
+        assert_eq!(invoked.borrow().len(), 8);
     }
 }

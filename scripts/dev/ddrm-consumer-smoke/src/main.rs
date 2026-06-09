@@ -29,11 +29,13 @@
 //! the smoke calls the runtime-core composition root `ddrm_plan_runner::open_drm_plan`,
 //! which parses the plan, RESOLVES each provider the plan requires from a runtime
 //! capability table, builds the `RuntimeStepRunner`, and executes — the SAME entrypoint
-//! the trusted core will call. The smoke supplies a `SmokeCapabilityTable` (the runtime
-//! analogue of PC2's backend-keyed session factory) that hands out three INJECTED
-//! per-provider handles (`RightsHandle`/`KeyHandle`/`DecryptHandle`), each wrapping one
-//! real capsule binary — no second code path. The core fails closed unless the table
-//! holds a handle for every provider the plan's `next_required_providers` names. Two
+//! the trusted core will call. The smoke REGISTERS three runtime-owned transports
+//! (`RightsTransport`/`KeyTransport`/`DecryptTransport`, each wrapping one real capsule
+//! binary) into the lib's `RuntimeCapabilityTable` — the same registry type the trusted
+//! core uses (the analogue of PC2's `sessionService` singleton owning the per-backend
+//! view constructors); each transport opens a fresh per-provider handle on demand. No
+//! second code path. The core fails closed unless the table has a transport registered
+//! for every provider the plan's `next_required_providers` names. Two
 //! fail-closed gates ride along: a transcript-mismatched seal must not open, and a
 //! TAMPERED plan edge (driven back through the SAME entrypoint) must be rejected by the
 //! real key-provider.
@@ -43,7 +45,7 @@
 use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
-use ddrm_plan_runner::{open_drm_plan, CapabilityTable, ProviderHandle, StepInputs};
+use ddrm_plan_runner::{open_drm_plan, ProviderHandle, ProviderTransport, RuntimeCapabilityTable, StepInputs};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -569,19 +571,38 @@ impl ProviderHandle for DecryptHandle {
     }
 }
 
-/// The runtime capability table the smoke supplies to `open_drm_plan` — the runtime
-/// analogue of PC2's backend-keyed session factory (`getSessionView(token)` dispatching
-/// on `stored.backend`). It holds the live capsule handles (shared so the post-walk
-/// fail-closed checks + shutdown can still reach them) plus the per-session material the
-/// runtime provisioned up front, and RESOLVES a fresh per-provider `ProviderHandle`
-/// (bound to the same capsules) on demand. The core calls `resolve` once per provider
-/// the plan requires; an un-named provider resolves to `None`.
-struct SmokeCapabilityTable {
+// The smoke registers three runtime-OWNED transports into the lib's
+// `RuntimeCapabilityTable` — the same registry type the trusted core will use. Each
+// transport holds a shared capsule cell (so the post-walk fail-closed checks + shutdown
+// can still reach the binaries) plus the per-session material the runtime provisioned up
+// front, and OPENS a fresh per-provider `ProviderHandle` (bound to the same capsule) on
+// each open — mirroring PC2's `sessionService` singleton owning the per-backend view
+// constructors and minting a fresh view per request.
+
+/// Runtime-owned `rights` transport: opens a `RightsHandle` over the rights capsule.
+struct RightsTransport {
     rights: Rc<RefCell<Option<Capsule>>>,
     chain_attestation: Value,
     chain_mode: String,
+}
+
+impl ProviderTransport for RightsTransport {
+    fn provider(&self) -> &str {
+        "rights"
+    }
+    fn open(&self) -> Box<dyn ProviderHandle> {
+        Box::new(RightsHandle {
+            rights: self.rights.clone(),
+            chain_attestation: self.chain_attestation.clone(),
+            chain_mode: self.chain_mode.clone(),
+        })
+    }
+}
+
+/// Runtime-owned `key` transport: opens a `KeyHandle` over the key-provider capsule,
+/// carrying the provisioned escrow + session material.
+struct KeyTransport {
     key: Rc<RefCell<Capsule>>,
-    decrypt: Rc<RefCell<Capsule>>,
     kid_hex: String,
     wrapped_cek_b64: String,
     producer_vk_b64: String,
@@ -591,31 +612,37 @@ struct SmokeCapabilityTable {
     nonce_b64: String,
 }
 
-impl CapabilityTable for SmokeCapabilityTable {
-    fn resolve(&mut self, provider: &str) -> Option<Box<dyn ProviderHandle>> {
-        match provider {
-            "rights" => Some(Box::new(RightsHandle {
-                rights: self.rights.clone(),
-                chain_attestation: self.chain_attestation.clone(),
-                chain_mode: self.chain_mode.clone(),
-            })),
-            "key" => Some(Box::new(KeyHandle {
-                key: self.key.clone(),
-                kid_hex: self.kid_hex.clone(),
-                wrapped_cek_b64: self.wrapped_cek_b64.clone(),
-                producer_vk_b64: self.producer_vk_b64.clone(),
-                session_pub_b64: self.session_pub_b64.clone(),
-                aad_b64: self.aad_b64.clone(),
-                content_hash_b64: self.content_hash_b64.clone(),
-                nonce_b64: self.nonce_b64.clone(),
-            })),
-            "decrypt" => Some(Box::new(DecryptHandle {
-                decrypt: self.decrypt.clone(),
-            })),
-            // The runtime holds no capability for the `content` (status/fetch) steps in
-            // this smoke — the core treats an un-resolved, un-required provider as a no-op.
-            _ => None,
-        }
+impl ProviderTransport for KeyTransport {
+    fn provider(&self) -> &str {
+        "key"
+    }
+    fn open(&self) -> Box<dyn ProviderHandle> {
+        Box::new(KeyHandle {
+            key: self.key.clone(),
+            kid_hex: self.kid_hex.clone(),
+            wrapped_cek_b64: self.wrapped_cek_b64.clone(),
+            producer_vk_b64: self.producer_vk_b64.clone(),
+            session_pub_b64: self.session_pub_b64.clone(),
+            aad_b64: self.aad_b64.clone(),
+            content_hash_b64: self.content_hash_b64.clone(),
+            nonce_b64: self.nonce_b64.clone(),
+        })
+    }
+}
+
+/// Runtime-owned `decrypt` transport: opens a `DecryptHandle` over the decrypt boundary.
+struct DecryptTransport {
+    decrypt: Rc<RefCell<Capsule>>,
+}
+
+impl ProviderTransport for DecryptTransport {
+    fn provider(&self) -> &str {
+        "decrypt"
+    }
+    fn open(&self) -> Box<dyn ProviderHandle> {
+        Box::new(DecryptHandle {
+            decrypt: self.decrypt.clone(),
+        })
     }
 }
 
@@ -709,22 +736,26 @@ fn run(args: &[String]) -> Result<(), String> {
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
-    // --- drive the chain THROUGH the runtime-core COMPOSITION ROOT: build the runtime
-    // capability table (the analogue of PC2's backend-keyed session factory) and hand it
-    // + the plan to `open_drm_plan`, which parses the plan, RESOLVES each required
-    // provider's handle from the table at ONE point, builds the RuntimeStepRunner, and
-    // executes. The smoke calls the SAME entrypoint the trusted core will — no second
-    // code path. The capsules are shared so the post-walk fail-closed checks + shutdown
-    // can still reach them after the table has handed handles to the core.
+    // --- drive the chain THROUGH the runtime-core COMPOSITION ROOT: REGISTER three
+    // runtime-owned transports into the lib's `RuntimeCapabilityTable` (the same registry
+    // the trusted core uses), then hand it + the plan to `open_drm_plan`, which parses the
+    // plan, RESOLVES each required provider's handle from the registered transports at ONE
+    // point, builds the RuntimeStepRunner, and executes. The smoke OWNS the transports the
+    // table hands out (the analogue of PC2's `sessionService` singleton owning the
+    // per-backend view constructors) — the SAME entrypoint + table the trusted core will
+    // use, no second code path. The capsules are shared so the post-walk fail-closed
+    // checks + shutdown can still reach them after the transports have been registered.
     let rights_cell = Rc::new(RefCell::new(rights));
     let key_cell = Rc::new(RefCell::new(key));
     let decrypt_cell = Rc::new(RefCell::new(decrypt));
-    let mut table = SmokeCapabilityTable {
+    let mut table = RuntimeCapabilityTable::new();
+    table.register(Box::new(RightsTransport {
         rights: rights_cell.clone(),
         chain_attestation: attestation,
         chain_mode: chain_mode.clone(),
+    }))?;
+    table.register(Box::new(KeyTransport {
         key: key_cell.clone(),
-        decrypt: decrypt_cell.clone(),
         kid_hex: kid_hex.clone(),
         wrapped_cek_b64: wrapped_cek_b64.clone(),
         producer_vk_b64: producer_vk_b64.clone(),
@@ -732,7 +763,10 @@ fn run(args: &[String]) -> Result<(), String> {
         aad_b64: B64.encode(&aad),
         content_hash_b64: B64.encode(&content_hash),
         nonce_b64: B64.encode(&nonce),
-    };
+    }))?;
+    table.register(Box::new(DecryptTransport {
+        decrypt: decrypt_cell.clone(),
+    }))?;
     let report = open_drm_plan(&plan_json, &mut table)?;
     if report.artifact("decrypt_session").is_none() {
         return Err("the core entrypoint finished without opening a decrypt session".to_string());
