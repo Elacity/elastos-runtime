@@ -11,21 +11,24 @@
 //!   1. the key authority publishes its ML-DSA-65 verifying key (`key init`);
 //!   2. the decrypt boundary is configured to trust it, then MINTS an in-sandbox
 //!      session keypair and PUBLISHES the public key (`decrypt init`, never the secret);
-//!   3. the authority seals a CEK to that published key, bound to the canonical
-//!      decrypt transcript (`key release_ref`) — the SAME `to_aad` both sides share;
+//!   3. the content CEK is ESCROWED to the authority's published recipient key, and the
+//!      authority's CANONICAL `release` op RECOVERS it in-boundary (from the rights-bound
+//!      key_envelope) and re-seals it to the published session key, bound to the canonical
+//!      decrypt transcript — the SAME `to_aad` both sides share. No raw CEK is handed in;
 //!   4. the decrypt boundary unwraps with its in-VM secret and decrypts a real CENC
 //!      segment (`decrypt open_session_v1`), returning ONLY a scoped session — no CEK,
 //!      no plaintext crosses the process boundary.
 //!
 //! The content `(CEK, ciphertext, plaintext)` is a committed golden
-//! (`capsules/decrypt-provider/tests/vectors/classical_cenc.json`); the authority is
-//! handed that CEK directly (the dev reference backend), seals it, and the boundary
-//! recovers it and decrypts — proving the rail, not the cenc engine (already pinned).
+//! (`capsules/decrypt-provider/tests/vectors/classical_cenc.json`); the CEK reaches the
+//! authority SEALED (escrowed, recovered in-boundary) via the canonical `release` op — no
+//! dev raw-CEK shim — and the boundary recovers it and decrypts, proving the rail end to
+//! end through the op drm-provider's plan actually names.
 //!
 //! Usage: ddrm-consumer-smoke <key-provider-bin> <decrypt-provider-bin> [drm-bin] [rights-bin]
 
 use base64::Engine as _;
-use ddrm_envelope::transcript::{release_receipt_hash, DecryptTranscriptV1};
+use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -200,7 +203,12 @@ fn fallback_rights_receipt() -> Value {
 /// Build the key-release request, binding the rights decision receipt under the
 /// field name the drm-provider's plan declares for the `rights_check -> key_release`
 /// edge (default `rights_receipt`).
-fn key_release_request(rights_receipt: Value, rights_field: &str) -> Value {
+fn key_release_request(
+    rights_receipt: Value,
+    rights_field: &str,
+    kid_hex: &str,
+    wrapped_cek_b64: &str,
+) -> Value {
     let mut req = json!({
         "schema": "elastos.key_release.request/v1",
         "request_id": RR_REQUEST_ID,
@@ -210,8 +218,10 @@ fn key_release_request(rights_receipt: Value, rights_field: &str) -> Value {
         "action": ACTION,
         "key_envelope": {
             "scheme": "elastos-pq-hybrid-threshold-v0",
-            "kid": "kid:smoke",
-            "wrapped_cek": "wrapped",
+            // The bytes16 KID the escrow is bound to, and the producer's escrow blob —
+            // the wrapped CEK rides INSIDE the rights-bound request (canonical `release`).
+            "kid": kid_hex,
+            "wrapped_cek": wrapped_cek_b64,
             "policy_hash": "sha256:smoke",
             "algorithms": {
                 "cipher": "aes-256-gcm",
@@ -495,14 +505,37 @@ fn run(args: &[String]) -> Result<(), String> {
         fallback_rights_receipt()
     };
 
-    // --- key authority: publish the seal verifying key. -----------------------------
+    // --- key authority: publish the seal verifying key AND the escrow recipient key. -
     let mut key = Capsule::spawn("key-provider", key_bin)?;
     let key_init = ok_data(&key.call(&json!({ "op": "init", "config": { "backend": "reference" } }))?, "key init")?;
     let vk_b64 = key_init["seal_verifying_key_b64"]
         .as_str()
         .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
         .to_string();
-    step(3, "key-provider: reference authority up; verifying key published");
+    let recipient_pub_b64 = key_init["seal_recipient_pub_b64"]
+        .as_str()
+        .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
+        .to_string();
+    step(3, "key-provider: reference authority up; verifying + escrow-recipient keys published");
+
+    // ESCROW the content CEK to the authority's recipient — so the CEK reaches the
+    // authority SEALED, recovered in-boundary, never handed in raw (no dev shim). The
+    // golden CEK is the content key; a producer (here, the smoke) seals it under the
+    // SHARED escrow AAD bound to a bytes16 KID, signed by its ML-DSA key. This is the
+    // exact producer→authority escrow the canonical `release` op recovers from.
+    let recipient_pub_bytes = B64.decode(&recipient_pub_b64).map_err(|e| e.to_string())?;
+    let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub_bytes)
+        .ok_or("key-provider published a malformed escrow recipient key")?;
+    let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+    let producer_vk_b64 = B64.encode(&producer_vk);
+    let cek_bytes = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
+    let kid16 = [0xC5u8; 16];
+    let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+    let escrow = escrow_aad(SUITE_PQ_HYBRID, &kid16, &recipient_pub_bytes);
+    let wrapped_cek_b64 = B64.encode(
+        ddrm_envelope::seal::seal_bound(&recipient_public, &cek_bytes, &escrow, &producer_signer)
+            .to_bytes(),
+    );
 
     // --- decrypt boundary: trust the authority, then MINT + PUBLISH a session key. --
     let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
@@ -522,29 +555,38 @@ fn run(args: &[String]) -> Result<(), String> {
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
+    // The CANONICAL `release` op (the one drm-provider's plan names): the authority
+    // RECOVERS the escrowed CEK from the rights-bound key_envelope and re-seals it to the
+    // published session key — no raw CEK is ever handed in.
     let release = ok_data(
         &key.call(&json!({
-            "op": "release_ref",
-            "request": key_release_request(rights_receipt.clone(), &rights_field),
-            "decrypt_session_pub_b64": session_pub_b64,
-            "cek_b64": GOLDEN_CEK_B64,
-            "aad_b64": B64.encode(&aad),
-            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-            "content_hash_b64": B64.encode(&content_hash),
-            "nonce_b64": B64.encode(&nonce),
+            "op": "release",
+            "request": key_release_request(rights_receipt.clone(), &rights_field, &kid_hex, &wrapped_cek_b64),
+            "session": {
+                "decrypt_session_pub_b64": session_pub_b64,
+                "producer_vk_b64": producer_vk_b64,
+                "aad_b64": B64.encode(&aad),
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": B64.encode(&content_hash),
+                "nonce_b64": B64.encode(&nonce),
+                "now_unix": NOW_UNIX,
+            }
         }))?,
-        "key release_ref",
+        "key release",
     )?;
     let material = release["material"].clone();
     if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
         return Err(format!("key-provider returned no sealed material: {release}"));
     }
-    // Containment on the key->decrypt wire: the raw CEK is never echoed.
+    // Containment on the key->decrypt wire: neither the raw CEK nor the escrow blob is echoed.
     let release_str = serde_json::to_string(&release).map_err(|e| e.to_string())?;
     if release_str.contains(GOLDEN_CEK_B64) {
         return Err("raw CEK leaked in the key-provider response".to_string());
     }
-    step(5, "key-provider: sealed the CEK to the published key, transcript-bound (no raw CEK on the wire)");
+    if release_str.contains(&wrapped_cek_b64) {
+        return Err("the producer escrow blob was echoed by the key authority".to_string());
+    }
+    step(5, "key-provider: canonical `release` recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no shim)");
 
     // --- decrypt: push the sealed material in, unwrap in-VM, decrypt the segment. ----
     let open = decrypt.call(&json!({
@@ -580,18 +622,21 @@ fn run(args: &[String]) -> Result<(), String> {
     let bad_aad = transcript_aad(&session_pub, &content_hash, &bad_nonce);
     let bad_release = ok_data(
         &key.call(&json!({
-            "op": "release_ref",
-            "request": key_release_request(rights_receipt.clone(), &rights_field),
-            "decrypt_session_pub_b64": session_pub_b64,
-            "cek_b64": GOLDEN_CEK_B64,
-            "aad_b64": B64.encode(&bad_aad),
-            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-            "content_hash_b64": B64.encode(&content_hash),
-            // The material's nonce still says nonce-1, so the boundary rebuilds the
-            // ORIGINAL transcript and the seal (bound to nonce-9) cannot open.
-            "nonce_b64": B64.encode(&nonce),
+            "op": "release",
+            "request": key_release_request(rights_receipt.clone(), &rights_field, &kid_hex, &wrapped_cek_b64),
+            "session": {
+                "decrypt_session_pub_b64": session_pub_b64,
+                "producer_vk_b64": producer_vk_b64,
+                "aad_b64": B64.encode(&bad_aad),
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": B64.encode(&content_hash),
+                // The material's nonce still says nonce-1, so the boundary rebuilds the
+                // ORIGINAL transcript and the seal (bound to nonce-9) cannot open.
+                "nonce_b64": B64.encode(&nonce),
+                "now_unix": NOW_UNIX,
+            }
         }))?,
-        "key release_ref (mismatch)",
+        "key release (mismatch)",
     )?;
     let bad_open = decrypt.call(&json!({
         "op": "open_session_v1",

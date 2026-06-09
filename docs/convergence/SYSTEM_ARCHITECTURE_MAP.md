@@ -54,7 +54,7 @@ shared `protected_content` contracts.
 | 5 Purchase | `wallet-provider` + `chain-provider` | 🟦 signing + tx exist; **buyAccess not orchestrated by a content flow** | `capsules/wallet-provider`, `chain-provider` |
 | 6 Download | `content` fetch + `ipfs-provider` + `availability-provider` | 🟦 fetch/pin work | `elastos-server/src/content.rs` |
 | 7 Validate ownership | `rights-provider` → `chain-provider::has_access_by_content_id` | 🟦 **chain read is typed + tested**; rights-provider not yet calling it | `capsules/chain-provider`, `capsules/rights-provider` |
-| 7 Key release | `key-provider` (`release`) | 🟥 validates rights receipt then `not_configured`; **needs a key authority (dKMS)** | `capsules/key-provider` |
+| 7 Key release | `key-provider` (`release`) | 🟩 **canonical `release` ACTUALLY releases (reference backend, Day 70)**: validates the rights receipt → recovers the producer-escrowed CEK from the rights-bound `key_envelope` → re-seals to the runtime-injected decrypt session as `SealedDecryptMaterialV1`; fail-closed on denied/expired/kid-swap/forged-producer; `dkms`/`lit` backends still `not_configured` | `capsules/key-provider` |
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
@@ -138,7 +138,7 @@ flowchart TB
   subgraph cons["CONSUMER — decrypt DONE, wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
-    KEY[key-provider 🟥<br/>pluggable; needs live authority]
+    KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
     VIEW[viewer ⬜ missing]
   end
@@ -251,11 +251,23 @@ decrypt-provider OpenSessionV1`.
   holding zero authority (it PLANS, the runtime EXECUTES). `ddrm-consumer-smoke.sh` now drives
   the REAL `drm open` and FOLLOWS the plan (order + binding edges + content identity) instead
   of a hardcoded sequence — one canonical path owned by the capsule (PRINCIPLES #10).
+- **Status (Day 70):** the CANONICAL `key-provider::release` (the op the Day-67 plan names)
+  ACTUALLY releases for the reference backend. Audited PC2's Lit authority
+  (`universal-decrypt-chipotle.js`: access-check `:560–568` → recover `Lit.Actions.Decrypt`
+  `:570–575` → CEK↔KID↔authority bind `:577–590` → seal-to-session `envelopeCEK` `:602–608`).
+  `release` validates the rights receipt, then for the reference backend RECOVERS the
+  producer-escrowed CEK from the rights-bound `key_envelope.wrapped_cek` (recomputing the shared
+  `escrow_aad`, verifying the producer vk) and re-seals it to the runtime-injected decrypt session
+  as `SealedDecryptMaterialV1`. The per-session material rides in a capsule-local `session`
+  context (shared `KeyReleaseRequestV1` byte-identical, drift untouched); fail-closed on
+  no-backend/no-session/denied/expired/kid-swap/scheme-mismatch/forged-producer. key-provider
+  27→33. `ddrm-consumer-smoke.sh` now escrows the golden CEK + drives the canonical `release`
+  (recover→reseal) — removing the raw-CEK shim; the consumer half runs through the op the plan names.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
-- **Still dev-shaped:** the orchestrator stands in for the runtime core (holds no keys);
-  the CEK is handed to the reference backend directly (prod recovers it from a
-  dKMS-wrapped envelope); not yet default-on inside the runtime; smoke is native (a
+- **Still dev-shaped:** the orchestrator smoke stands in for the runtime core (holds no keys),
+  which is not yet driving the canonical `release` default-on; the `reference` backend is dev-only
+  (production uses the `dkms`/`lit` backends, still `not_configured`); smoke is native (a
   `wasm32-wasip1` variant is a follow-up).
 
 ### Phase B — Real chain validation (Base) via `chain-provider` 🟦 UNDERWAY

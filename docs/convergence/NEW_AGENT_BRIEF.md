@@ -208,6 +208,7 @@ green + clippy clean. Commits are on `feat/decrypt-provider-cenc`.
 | 66 | C | **`content-market::listing_from_event`**: decodes real `DigitalAssetRegistered`/`AssetCreated` logs; the event path agrees with the calldata path cross-binary. |
 | 68 | C | **`encrypt-provider` content-addresses the ciphertext → real `payload_cid`** (CIDv1 raw/sha2-256 of the sealed segment, derived in-boundary exactly as PC2's Helia `unixfs.addBytes`; pure, no `kubo_api`/network, fail-closed > 1 MiB). `seal_inline` emits it (no more `bafybeig…` placeholder); golden pins 3 inputs to the EXACT CIDs PC2's `ipfs-unixfs-importer` produces. `ddrm-producer-smoke.sh` recomputes via the canonical `cid` crate and demands a byte-for-byte cross-binary match. payload_cid ≠ KID/contentId. encrypt-provider 17→20 / 19→22. |
 | 67 | **A wiring** | **`drm-provider::open` → executable `DrmOpenPlanV1`** (status `planned`, never `opened`): the capsule-owned canonical `drm/open` sequence + inter-step **binding edges** (rights⇒`RightsDecisionReceiptV1`→`key.rights_receipt`; key⇒`ReleaseReceiptV1`→`decrypt.release_receipt`; content identity==KID under both `content_id`/`object_cid`), zero authority. Consumer smoke now FOLLOWS the plan instead of hardcoding the order (PRINCIPLES #10). drm-provider=15. |
+| 70 | **A** | **the canonical `key-provider::release` actually releases (reference backend)** — recover the producer-escrowed CEK from the rights-bound `key_envelope` → re-seal to the runtime-injected decrypt session as `SealedDecryptMaterialV1`. Audited PC2's Lit authority (`universal-decrypt-chipotle.js`: access-check `:560–568` → recover `:570–575` → CEK↔KID↔authority bind `:577–590` → seal-to-session `:602–608`). The wrapped CEK rides INSIDE the validated request; per-session material is a capsule-local `session` context (shared `KeyReleaseRequestV1` byte-identical, drift untouched). Fail-closed: no backend/no session/denied/expired/kid-swap/scheme-mismatch/forged-producer. The op `drm-provider`'s `DrmOpenPlanV1` names is now real. key-provider 27→33; `ddrm-consumer-smoke.sh` escrows the golden CEK + drives the canonical `release` (recover→reseal), removing the raw-CEK `release_ref` shim. |
 | 69 | C | **`encrypt-provider::seal` runs the full production pipeline on HANDED-IN bytes → complete `SealedObjectV1`** (closes the dev `seal_inline` ↔ production `seal` gap). Audited PC2's input path (`dashPackager.ts`: host `readFileSync`:504 → `executeCENCEncrypt(.., seg.data)`:432 — the WASM fetches nothing). `seal` gained `content_b64`/`recipient_pub_b64`/`availability_receipt_cid` (`deny_unknown_fields` kept); given bytes+recipient it runs the ONE shared `run_seal_pipeline` (mint→CENC→content-address→escrow; `seal_inline` delegates too, PRINCIPLES #10) → `SealedObjectV1` with real `payload_cid`, bytes16-KID envelope, `policy_hash=sha256(rights_policy_cid)`, chain-validated PQ-hybrid suite. NO fetch authority; fail-closed without bytes+recipient. `ddrm-producer-smoke.sh` drives the real `seal`, deserializes into the SHARED `SealedObjectV1` + runs the SAME validator `key-provider` runs. encrypt-provider escrow 22→25. |
 
 **Blocked / upstream-only:** fold `SealedDecryptMaterialV1` into the shared `elastos-common`
@@ -217,11 +218,11 @@ contract (needs push access); dKMS-direct sealing producer (needs Anders).
 
 ## 5. What's next (unblocked candidates, pick the highest-value)
 
-1. **Key authority backend** — make one `key-provider` backend *actually release* (the
-   PQ-hybrid dKMS reference, or a Lit-compat backend) so the consumer half runs without the
-   dev escrow shim. This is now the highest-value unblocked seam: producer (mint → seal →
-   `SealedObjectV1`, Day 69) and orchestrator (Day 67) are real; the live key release is the
-   gap between them.
+1. **Runtime-core plan execution** — Day 67 landed `drm-provider::open → DrmOpenPlanV1` and
+   Day 70 made the canonical `key-provider::release` it names actually release. The remaining
+   keystone is the **runtime core** (not the dev orchestrator smoke) EXECUTING that plan
+   default-on: driving `rights → release → decrypt` itself with injected capabilities. Blocked
+   on the core's provider→provider rail being available; until then the consumer smoke stands in.
 2. **Live-Base read-only round trip** — real `eth_getLogs` → `listing_from_event` →
    `enrich_listing`, behind an opt-in env flag (like the existing live `has_access` smoke).
 3. **Producer IPFS pin + multi-block `payload_cid`** — Day 68/69 made the producer
@@ -229,6 +230,9 @@ contract (needs push access); dKMS-direct sealing producer (needs Anders).
    in today. The remaining producer-side work is the actual IPFS **pin** (a distinct
    capability from the CID, via `ipfs-provider`) and a multi-block (>1 MiB) `payload_cid` for
    large assets (today fail-closed above one chunk).
+4. **Production key authority** — a `dkms` (native) or `lit` (compat) `key-provider` backend
+   that releases like the `reference` backend now does, so the dev-only reference backend drops
+   out (`release` already routes per-backend; both are `not_configured` today).
 4. **Runtime-core plan execution** — Day 67 landed `drm-provider::open → DrmOpenPlanV1`
    (the capsule-owned canonical sequence + binding edges, `planned`), and the consumer
    smoke now FOLLOWS it. The remaining step is the **runtime core** (not the dev
@@ -310,9 +314,9 @@ scripts/ddrm-market-smoke.sh     # publish -> chain -> content-market (reconstru
 ```
 
 Current key ladder counts (update in lockstep when you add tests): `content-market`=29,
-`publish-provider`=16, `encrypt-provider [escrow]`=19, `key-provider [key-authority-ref]`=27,
+`publish-provider`=16, `key-provider [key-authority-ref]`=33,
 `decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10, `drm-provider`=15,
-`encrypt-provider`=20 (default) / 25 (`escrow`).
+`encrypt-provider`=20 (default) / 25 (`escrow`), `key-provider`=18 (default).
 
 ---
 

@@ -95,6 +95,13 @@ enum Request {
     Status,
     Release {
         request: Box<KeyReleaseRequestV1>,
+        /// Runtime-injected per-session context for the reference backend. ABSENT for the
+        /// fail-closed/route-only path. The escrow blob + KID + scheme are read from the
+        /// rights-bound `request.key_envelope` (NOT here); this carries only the material
+        /// the runtime injects at open time — the decrypt session's published key, the
+        /// producer's verifying key, and the decrypt-transcript binding.
+        #[serde(default)]
+        session: Option<ReleaseSessionContext>,
     },
     /// Reference key-authority seal (feature `key-authority-ref`, Phase A.2).
     /// Capsule-local op so the shared `KeyReleaseRequestV1` stays byte-identical:
@@ -112,7 +119,7 @@ enum Request {
         /// Sealed immediately, held in `Zeroizing`, and never echoed back.
         cek_b64: String,
         /// Canonical decrypt-transcript bytes the seal is bound to (AES-256-GCM AAD
-        /// + signed payload). Empty = unbound. The full `DecryptTranscriptV1`
+        /// plus signed payload). Empty = unbound. The full `DecryptTranscriptV1`
         /// encoding becomes shared when the contract opens.
         #[serde(default)]
         aad_b64: String,
@@ -153,6 +160,39 @@ enum Request {
         init_segment_b64: Option<String>,
     },
     Shutdown,
+}
+
+/// Runtime-injected session context for the canonical `release` op (reference backend).
+///
+/// The CEK source (the producer's escrow blob), the KID, and the scheme all come from the
+/// rights-bound `KeyReleaseRequestV1.key_envelope` — so the wrapped CEK travels inside the
+/// SAME object the rights step validated, not as a side-band parameter. This struct carries
+/// only the per-SESSION material the runtime injects at open time: the decrypt boundary's
+/// published key, the producer's verifying key (to authenticate the escrow), and the
+/// decrypt-transcript binding. Mirrors the jsParams PC2's client assembles for the Lit
+/// action (`recoverCEKEnvelope`, `chipotle-client.ts:1486-1510`): a session public key,
+/// a signed request, and the content references — never a raw CEK.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // fields are read only in the `key-authority-ref` build
+struct ReleaseSessionContext {
+    /// The decrypt boundary's published session public key (base64 of `session_public_bytes`).
+    decrypt_session_pub_b64: String,
+    /// The producer's published ML-DSA verifying key (base64) authenticating the escrow.
+    producer_vk_b64: String,
+    /// Canonical decrypt-transcript bytes the re-seal binds to. Empty = unbound.
+    #[serde(default)]
+    aad_b64: String,
+    /// Content fields carried straight into the sealed material (the authority never touches them).
+    ciphertext_b64: String,
+    content_hash_b64: String,
+    nonce_b64: String,
+    #[serde(default)]
+    init_segment_b64: Option<String>,
+    /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
+    /// authority refuses to release (fail-closed), never sealing a CEK past its window.
+    #[serde(default)]
+    now_unix: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,7 +282,7 @@ impl KeyProvider {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
-            Request::Release { request } => self.release(*request),
+            Request::Release { request, session } => self.release(*request, session),
             #[cfg(feature = "key-authority-ref")]
             Request::ReleaseRef {
                 request,
@@ -329,6 +369,7 @@ impl KeyProvider {
             };
         }
 
+        #[allow(unused_mut)]
         let mut data = json!({
             "provider": "key",
             "protocol_version": "1.0",
@@ -547,7 +588,7 @@ impl KeyProvider {
         }))
     }
 
-    fn release(&self, request: KeyReleaseRequestV1) -> Response {
+    fn release(&self, request: KeyReleaseRequestV1, session: Option<ReleaseSessionContext>) -> Response {
         // Validation (schema, rights-receipt binding, scheme, PQ-hybrid algorithms)
         // always runs *before* any backend is consulted: a malformed or
         // unauthorized request must never reach a key-delivery backend.
@@ -560,7 +601,131 @@ impl KeyProvider {
                 "not_configured",
                 "key release requires a configured key authority backend (reference | dkms | lit)",
             ),
+            // The reference backend ACTUALLY releases (Day 70): recover the producer-escrowed
+            // CEK from the rights-bound `key_envelope` and re-seal it to the decrypt session.
+            Some(KeyAuthorityBackend::Reference) => self.release_reference(&request, session),
             Some(backend) => self.release_via_backend(backend, &request),
+        }
+    }
+
+    /// Canonical reference-backend release (Day 70): the op `drm-provider`'s `DrmOpenPlanV1`
+    /// names for the key step. Mirrors PC2's Lit action (`universal-decrypt-chipotle.js`):
+    /// access-check (the rights receipt, already validated) → recover the CEK
+    /// (`Lit.Actions.Decrypt` ≈ recovering the producer-escrowed CEK in-boundary) →
+    /// CEK↔KID↔authority bind (the escrow AAD recompute) → seal-to-session (`envelopeCEK` ≈
+    /// `seal_recovered_cek_into_material`). The CEK source, KID and scheme come from the
+    /// rights-bound `key_envelope` — so the wrapped CEK rides inside the validated request,
+    /// not as a side-band param. The CEK stays in `Zeroizing` and leaves only SEALED.
+    fn release_reference(
+        &self,
+        request: &KeyReleaseRequestV1,
+        session: Option<ReleaseSessionContext>,
+    ) -> Response {
+        #[cfg(feature = "key-authority-ref")]
+        {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+
+            let authority = match self.reference.as_ref() {
+                Some(authority) => authority,
+                None => {
+                    return Response::error(
+                        "not_configured",
+                        "reference key authority backend selected but not initialized (init with backend=reference)",
+                    )
+                }
+            };
+            let session = match session {
+                Some(session) => session,
+                None => {
+                    return Response::error(
+                        "not_configured",
+                        "reference key authority release requires runtime-injected session context \
+                         (decrypt session key + producer vk + transcript)",
+                    )
+                }
+            };
+            // Refuse to release on an already-expired request (fail-closed), when the
+            // runtime supplies a clock. The CEK must never be sealed past its window.
+            if let Some(now) = session.now_unix {
+                if request.expires_at <= now {
+                    return Response::error("invalid_request", "key release request has expired");
+                }
+            }
+
+            // Escrow material rides inside the rights-bound key_envelope.
+            let wrapped = match b64.decode(&request.key_envelope.wrapped_cek) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        "key_envelope.wrapped_cek is not valid base64",
+                    )
+                }
+            };
+            let kid16 = match decode_kid_bytes16(&request.key_envelope.kid) {
+                Ok(k) => k,
+                Err(e) => return Response::error("invalid_request", e),
+            };
+            let producer_vk = match b64.decode(&session.producer_vk_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Response::error("invalid_request", "producer_vk_b64 is not valid base64")
+                }
+            };
+            let public = match b64
+                .decode(&session.decrypt_session_pub_b64)
+                .ok()
+                .and_then(|bytes| ddrm_envelope::session_public_from_bytes(&bytes))
+            {
+                Some(public) => public,
+                None => {
+                    return Response::error(
+                        "invalid_request",
+                        "decrypt_session_pub_b64 is not a valid session public key",
+                    )
+                }
+            };
+            let aad = match b64.decode(&session.aad_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => return Response::error("invalid_request", "aad_b64 is not valid base64"),
+            };
+
+            // Recover the escrowed CEK in this boundary (fail-closed on a foreign/tampered
+            // blob, a KID-swap, a scheme mismatch, or a forged producer); re-seal to the session.
+            let cek = match authority.recover_escrowed_cek(
+                &wrapped,
+                &request.key_envelope.scheme,
+                &kid16,
+                &producer_vk,
+            ) {
+                Ok(cek) => cek,
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        "escrowed CEK could not be recovered (foreign/tampered escrow, wrong KID/scheme, or bad producer key)",
+                    )
+                }
+            };
+
+            seal_recovered_cek_into_material(
+                authority,
+                &public,
+                cek.as_slice(),
+                &aad,
+                session.ciphertext_b64,
+                session.content_hash_b64,
+                session.nonce_b64,
+                session.init_segment_b64,
+            )
+        }
+        #[cfg(not(feature = "key-authority-ref"))]
+        {
+            let _ = (request, session);
+            Response::error(
+                "not_configured",
+                "reference key authority requires the key-authority-ref build",
+            )
         }
     }
 
@@ -923,7 +1088,7 @@ mod tests {
     fn release_fails_closed_until_backend_exists() {
         let provider = KeyProvider::default();
         assert_eq!(
-            error_code(provider.release(key_release_request())),
+            error_code(provider.release(key_release_request(), None)),
             "not_configured"
         );
     }
@@ -934,7 +1099,7 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.scheme = "frost-only".to_string();
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -943,7 +1108,7 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.algorithms.cipher = "aes-128-gcm".to_string();
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -952,7 +1117,7 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.algorithms.kem = vec!["x25519".to_string()];
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -961,7 +1126,7 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.allowed = false;
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -970,7 +1135,7 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.principal_id = "person:local:attacker".to_string();
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -979,7 +1144,7 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.content_id = "bafybeigsomethingelse".to_string();
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     #[test]
@@ -989,7 +1154,7 @@ mod tests {
         request.action = "download".to_string();
         // receipt still authorizes only "view"
 
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
+        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
     }
 
     // --- pluggable key authority backends (Phase A.1) -----------------------
@@ -1065,22 +1230,25 @@ mod tests {
     }
 
     #[test]
-    fn release_routes_to_reference_backend_fail_closed_until_seal_engine() {
-        let response = configured(KeyAuthorityBackend::Reference).release(key_release_request());
+    fn release_reference_fails_closed_without_session_context() {
+        // The reference backend now ACTUALLY releases (Day 70), but only with the
+        // runtime-injected session context; the canonical request alone fails closed
+        // (and an uninitialized authority, as here, fails closed too).
+        let response = configured(KeyAuthorityBackend::Reference).release(key_release_request(), None);
         assert_eq!(error_code_ref(&response), "not_configured");
         assert!(error_message(response).contains("reference"));
     }
 
     #[test]
     fn release_routes_to_dkms_backend_fail_closed_until_node() {
-        let response = configured(KeyAuthorityBackend::Dkms).release(key_release_request());
+        let response = configured(KeyAuthorityBackend::Dkms).release(key_release_request(), None);
         assert_eq!(error_code_ref(&response), "not_configured");
         assert!(error_message(response).contains("dKMS"));
     }
 
     #[test]
     fn release_routes_to_lit_backend_fail_closed_until_proxy() {
-        let response = configured(KeyAuthorityBackend::Lit).release(key_release_request());
+        let response = configured(KeyAuthorityBackend::Lit).release(key_release_request(), None);
         assert_eq!(error_code_ref(&response), "not_configured");
         assert!(error_message(response).contains("Lit"));
     }
@@ -1094,7 +1262,7 @@ mod tests {
         request.rights_receipt.allowed = false;
 
         assert_eq!(
-            error_code(configured(KeyAuthorityBackend::Reference).release(request)),
+            error_code(configured(KeyAuthorityBackend::Reference).release(request, None)),
             "invalid_request"
         );
     }
@@ -1341,6 +1509,178 @@ mod tests {
                 "invalid_request",
                 "a foreign producer vk must fail closed"
             );
+        }
+
+        // --- canonical `release` op, reference backend (Day 70) -------------------
+        //
+        // The op `drm-provider`'s DrmOpenPlanV1 names for the key step now ACTUALLY
+        // releases: it recovers the producer-escrowed CEK from the rights-bound
+        // key_envelope and re-seals it to the runtime-injected decrypt session. No raw
+        // CEK shim — the CEK reaches the authority SEALED and leaves SEALED.
+
+        /// A full escrow scenario: a producer escrows `cek` (bound to `kid`) to the
+        /// reference authority's recipient key, and we assemble the rights-bound request
+        /// (escrow blob inside the key_envelope) + the per-session material.
+        struct Scenario {
+            provider: KeyProvider,
+            request: KeyReleaseRequestV1,
+            producer_vk: Vec<u8>,
+            session_secret: ddrm_envelope::SessionKemSecret,
+            session_pub_b64: String,
+            transcript: Vec<u8>,
+            cek: Vec<u8>,
+        }
+
+        fn escrow_scenario() -> Scenario {
+            let b64 = b64();
+            let mut provider = KeyProvider::default();
+            let data = ok_data(provider.init(json!({ "backend": "reference" })));
+            let recip_bytes = b64
+                .decode(data["seal_recipient_pub_b64"].as_str().unwrap())
+                .unwrap();
+            let recipient_public =
+                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+
+            let (producer_signer, producer_vk) =
+                ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
+            let cek: Vec<u8> = (10u8..26).collect();
+            let kid = [0x5Cu8; 16];
+            let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
+            let escrow_aad =
+                ddrm_envelope::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip_bytes);
+            let wrapped = ddrm_envelope::seal::seal_bound(
+                &recipient_public,
+                &cek,
+                &escrow_aad,
+                &producer_signer,
+            )
+            .to_bytes();
+
+            let (session_secret, session_public) = ddrm_envelope::mint_session();
+            let session_pub_b64 =
+                b64.encode(ddrm_envelope::session_public_bytes(&session_public));
+
+            // The escrow blob rides INSIDE the rights-bound key_envelope (not side-band).
+            let mut request = key_release_request();
+            request.key_envelope.wrapped_cek = b64.encode(&wrapped);
+            request.key_envelope.kid = kid_hex;
+            // key_envelope.scheme is already SUPPORTED_SCHEMES[0] == SUITE_PQ_HYBRID.
+
+            Scenario {
+                provider,
+                request,
+                producer_vk,
+                session_secret,
+                session_pub_b64,
+                transcript: b"transcript:canonical-release".to_vec(),
+                cek,
+            }
+        }
+
+        fn session_ctx(
+            s: &Scenario,
+            producer_vk: &[u8],
+            now_unix: Option<u64>,
+        ) -> Option<ReleaseSessionContext> {
+            let b64 = b64();
+            let mut v = json!({
+                "decrypt_session_pub_b64": s.session_pub_b64,
+                "producer_vk_b64": b64.encode(producer_vk),
+                "aad_b64": b64.encode(&s.transcript),
+                "ciphertext_b64": b64.encode(b"ciphertext"),
+                "content_hash_b64": b64.encode(b"content-hash"),
+                "nonce_b64": b64.encode(b"nonce"),
+            });
+            if let Some(now) = now_unix {
+                v["now_unix"] = json!(now);
+            }
+            Some(serde_json::from_value(v).expect("session context parses"))
+        }
+
+        /// Grant → release: the canonical `release` recovers the escrowed CEK and seals it
+        /// to the session; the SAME unwrap the decrypt boundary uses opens it to the EXACT
+        /// producer CEK — with no raw CEK on the wire. The consumer half now runs without
+        /// the dev raw-CEK shim.
+        #[test]
+        fn canonical_release_recovers_escrow_and_seals_to_session() {
+            let b64 = b64();
+            let s = escrow_scenario();
+            let session = session_ctx(&s, &s.producer_vk, Some(1_850_000_000));
+            let out = ok_data(s.provider.release(s.request.clone(), session));
+
+            let sealed = b64
+                .decode(out["material"]["sealed_cek_b64"].as_str().unwrap())
+                .unwrap();
+            let envelope = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).unwrap();
+            let vk = b64
+                .decode(out["seal_verifying_key_b64"].as_str().unwrap())
+                .unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
+            let recovered = ddrm_envelope::hybrid_unwrap_bound(
+                &s.session_secret,
+                &envelope,
+                &s.transcript,
+                &verifier,
+            )
+            .unwrap();
+            assert_eq!(
+                recovered.as_slice(),
+                s.cek.as_slice(),
+                "the canonical release delivers the producer's CEK to the session"
+            );
+            assert_eq!(out["suite"], json!(ddrm_envelope::SUITE_PQ_HYBRID));
+            assert!(
+                !serde_json::to_string(&out).unwrap().contains(&b64.encode(&s.cek)),
+                "no raw CEK may appear in the release response"
+            );
+        }
+
+        /// A denied rights receipt is rejected BEFORE the escrow is ever touched
+        /// (validation precedes recover/seal) — the key boundary never releases on it.
+        #[test]
+        fn canonical_release_fails_closed_on_denied_receipt() {
+            let mut s = escrow_scenario();
+            s.request.rights_receipt.allowed = false;
+            let session = session_ctx(&s, &s.producer_vk, None);
+            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+        }
+
+        /// An already-expired request is refused when the runtime supplies a clock — the
+        /// authority never seals a CEK past its window.
+        #[test]
+        fn canonical_release_fails_closed_when_expired() {
+            let s = escrow_scenario();
+            let expires_at = s.request.expires_at;
+            let session = session_ctx(&s, &s.producer_vk, Some(expires_at)); // now == expiry -> expired
+            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+        }
+
+        /// A KID-swap (the request's key_envelope.kid no longer matches the escrow's bound
+        /// KID) fails closed at the AAD recompute — the wrong content's escrow can't open.
+        #[test]
+        fn canonical_release_fails_closed_on_kid_swap() {
+            let mut s = escrow_scenario();
+            s.request.key_envelope.kid = "ab".repeat(16); // a different, valid 32-hex KID
+            let session = session_ctx(&s, &s.producer_vk, None);
+            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+        }
+
+        /// A forged producer (the session vk doesn't match the escrow's signer) fails
+        /// closed at the signature verification inside recover.
+        #[test]
+        fn canonical_release_fails_closed_on_forged_producer() {
+            let s = escrow_scenario();
+            let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([8u8; 32]);
+            let session = session_ctx(&s, &other_vk, None);
+            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+        }
+
+        /// Without the runtime-injected session context, the canonical `release` fails
+        /// closed — the rights-bound request alone is not enough to seal to a session.
+        #[test]
+        fn canonical_release_requires_session_context() {
+            let s = escrow_scenario();
+            assert_eq!(error_code(s.provider.release(s.request, None)), "not_configured");
         }
 
         #[test]
