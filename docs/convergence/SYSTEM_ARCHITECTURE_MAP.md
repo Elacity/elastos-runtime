@@ -1,0 +1,235 @@
+# dDRM System Architecture Map — where we are, where we're going
+
+**Purpose.** A whole-system view: the full PC2/Elacity content journey (creator →
+publish → market → purchase → download → validate → key → decrypt → playback),
+mapped against what exists in the ElastOS runtime today, with a target architecture
+and a phased, testable road to "buy a video, validate on-chain with my wallet,
+receive the key, decrypt and play it" — entirely on capability-secure runtime
+patterns, conforming to Anders' principles.
+
+**Companion docs:** `CONVERGENCE_PLAYBOOK.md` (north star), `DDRM_STATUS.md` (chain
+status), `DDRM_DECRYPT_RAIL.md` (the decrypt boundary, now complete behind flags),
+`HANDOVER.md` (day log). This file is the *system* view; those are the *boundary* views.
+
+---
+
+## 1. The PC2 reference journey (what we are replicating the PATTERNS of)
+
+PC2 is a Node/TypeScript app on **Base mainnet (EVM 8453)**, Elacity **dDRM V3**
+contracts, with **Lit Protocol PKP ("Chipotle")** as the key-custody authority.
+
+| # | Stage | PC2 implementation (pattern) | Trust anchor |
+|---|---|---|---|
+| 1 | **Creator upload + process** | `elacity-creator` app → `media.ts` encode pipeline (FFmpeg → Bento4 fMP4/CMAF) → **CEK = 16 random bytes** → `cenc-encrypt` WASM (AES-128-CTR, clear-leader) → MPD/PSSH | CEK minted locally, authority deferred to Lit + chain |
+| 2 | **Sign + publish on-chain** | Channel contract `mint()`; operative sub-contract holds role tokens (`ACCESS_TOKEN_ID=1`); `contentId = KID` as `bytes16`; `tokenURI → ipfs://…/metadata.json` | Channel contract + AuthorityGateway |
+| 3 | **IPFS storage + pin** | Helia + `@helia/unixfs`; supernode Kubo + cluster pin; `ipfs.ela.city` gateway | Content-addressed = untrusted transport (ciphertext safe anywhere) |
+| 4 | **Market discovery** | `elacity-market` app; `ContentIndexerService` scans Base events → SQLite `content_catalog`; `/api/catalog` | Eventually-consistent index; chain is source of truth |
+| 5 | **Purchase access token** | `AuthorityGateway.buyAccess(...)` (USDC/USDT/ETH); buys operative **Access Token (role 1)** | On-chain token ownership = access root |
+| 6 | **Download to user node** | `ContentSeedingService.seedContent()`; writes `.ddrm` capsule descriptor; re-pins/serves | Encrypted blob; pin = availability not secrecy |
+| 7 | **Validate + key release** | **Lit Action** (`universal-decrypt-chipotle.js`): checks `hasAccessByContentId(holder,kid)` on-chain → PKP decrypts CEK in TEE → **ECDH-seals CEK to viewer's ephemeral P-256 session** | Lit PKP + AuthorityGateway eth_call |
+| 8 | **Decrypt + playback** | `ddrm-decrypt` WASM unwraps envelope → CENC segment decrypt → cleared fMP4 to dash.js / rendered pixels (`wasm-renderer`) | Decrypt runs in WASM on the node; client gets scoped output only |
+
+**Binding invariant (the crown jewel):** `SHA256(cek ‖ kid ‖ authority)` at both
+encrypt and decrypt; the CEK exists in clear only inside Lit TEE → ECDH envelope →
+WASM memory, never on the wire, never to the app.
+
+---
+
+## 2. The runtime today (what we actually have)
+
+The runtime is capability-secure: an Ed25519 capability-token core, WASM/WASI +
+microVM (crosvm) transports, a `carrier_invoke` app→provider rail and a
+runtime-mediated provider→provider rail, and honest fail-closed providers with
+shared `protected_content` contracts.
+
+**Legend:** ✅ implemented · 🟦 partial · 🟥 fail-closed skeleton · ⬜ missing
+
+| PC2 stage | Runtime counterpart | Status | Evidence |
+|---|---|---|---|
+| 1 Creator upload | `library` + `object-provider` + `content` publish | 🟦 plain upload works; encrypted publish disabled | `capsules/library`, `elastos-server/src/content.rs` |
+| 1 Process/encrypt | `encrypt-provider` (`seal`) | 🟥 `seal`→`not_configured`; **CEK mint + CENC engine proven in tests** | `capsules/encrypt-provider` |
+| 2 Publish on-chain | (content-registry publish op) | ⬜ missing; `chain-provider` has generic tx prepare/broadcast | `capsules/chain-provider` |
+| 3 IPFS pin | `ipfs-provider` + `content` | ✅ Kubo-backed add/cat/pin; publish with pin | `capsules/ipfs-provider` |
+| 4 Market discovery | `marketplace` | ⬜ app catalog only, **not a content rights market** | `capsules/marketplace` |
+| 5 Purchase | `wallet-provider` + `chain-provider` | 🟦 signing + tx exist; **buyAccess not orchestrated by a content flow** | `capsules/wallet-provider`, `chain-provider` |
+| 6 Download | `content` fetch + `ipfs-provider` + `availability-provider` | 🟦 fetch/pin work | `elastos-server/src/content.rs` |
+| 7 Validate ownership | `rights-provider` → `chain-provider::has_access_by_content_id` | 🟦 **chain read is typed + tested**; rights-provider not yet calling it | `capsules/chain-provider`, `capsules/rights-provider` |
+| 7 Key release | `key-provider` (`release`) | 🟥 validates rights receipt then `not_configured`; **needs a key authority (dKMS)** | `capsules/key-provider` |
+| 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
+| 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
+| — Orchestrator | `drm-provider` (`open`) | 🟥 declares canonical sequence, returns `not_configured` | `capsules/drm-provider` |
+
+**Headline:** the **hardest, most security-critical boundary — decrypt — is done**
+(transcript-bound, in-sandbox minted key, expiry+audit, suite-tagged material, all
+fail-closed, wasm-clean). The surrounding **infrastructure largely exists** (IPFS,
+chain reads incl. `has_access_by_content_id`, wallet/signing, content publish/fetch).
+What's missing is the **live orchestration wiring**, the **producer side** (encrypt
+seal + on-chain publish + content market), a **key authority** (the ElastOS-native
+PQ-hybrid dKMS, or a Lit-compat backend), and a **viewer**.
+
+---
+
+## 3. Architecture map — current state
+
+```mermaid
+flowchart TB
+  subgraph core["Trusted core — IMPLEMENTED"]
+    RT[elastos-runtime<br/>capability tokens]
+    SRV[elastos-server<br/>content / carrier bridge]
+    CAR[Carrier P2P]
+  end
+  subgraph infra["Infrastructure — IMPLEMENTED / PARTIAL"]
+    CNT[content provider ✅]
+    IPFS[ipfs-provider ✅]
+    CHN[chain-provider ✅<br/>has_access_by_content_id]
+    WLT[wallet-provider ✅]
+  end
+  subgraph ddrm["dDRM chain — FAIL-CLOSED skeletons"]
+    ENC[encrypt-provider 🟥<br/>engine proven]
+    DRM[drm-provider 🟥<br/>declares sequence]
+    RTS[rights-provider 🟥]
+    KEY[key-provider 🟥<br/>no authority]
+    DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
+  end
+  LIB[library 🟦] --> CNT --> IPFS
+  WLT --> CHN
+  DRM -. declared, not wired .-> RTS -. .-> KEY -. .-> DEC
+  RTS -. not yet .-> CHN
+  BR[browser] -->|external HTTPS| ELA[(ela.city — real purchase/playback today)]
+```
+
+Today, a real purchase+playback only works through the **external ela.city** site in
+the Browser — it is release evidence for an external path, **not** proof the in-repo
+provider chain is production-complete.
+
+---
+
+## 4. Architecture map — target state (all ElastOS-native)
+
+```mermaid
+flowchart TB
+  subgraph creator["CREATOR (produce)"]
+    CAPP[creator app<br/>library + packager]
+    PKG[media packager<br/>fMP4/CENC]
+    ENC[encrypt-provider<br/>CEK mint + CENC seal]
+    PUB[publish-provider<br/>on-chain mint via chain+wallet]
+  end
+  subgraph storage["STORAGE / DISCOVERY"]
+    IPFS[ipfs-provider<br/>pin/serve]
+    MKT[content-market provider<br/>index chain+IPFS]
+  end
+  subgraph consume["CONSUMER (open)"]
+    DRM[drm-provider<br/>orchestrate drm/open]
+    RTS[rights-provider]
+    CHN[chain-provider<br/>has_access_by_content_id]
+    KEY[key-provider<br/>dKMS authority / Lit-compat]
+    DEC[decrypt-provider<br/>OpenSessionV1 — DONE]
+    VIEW[viewer capsule<br/>scoped render]
+  end
+  WLT[wallet-provider]
+
+  CAPP --> PKG --> ENC -->|SealedObjectV1 + escrowed CEK| PUB
+  PUB -->|contentId=KID, tokenURI| CHN
+  ENC -->|ciphertext| IPFS
+  PUB --> IPFS
+  IPFS --> MKT
+  MKT -->|browse| DRM
+  WLT -->|buyAccess| CHN
+  DRM --> RTS --> CHN
+  RTS -->|RightsDecisionReceiptV1| KEY
+  KEY -->|SealedDecryptMaterialV1<br/>CEK sealed to session pubkey| DEC
+  DEC -->|scoped output| VIEW
+  DEC -->|publishes session pubkey at init| KEY
+```
+
+Every arrow is a capability-scoped provider invocation; no provider holds ambient
+authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
+
+---
+
+## 5. How the PC2 patterns move across (and what is dropped)
+
+| PC2 pattern | ElastOS-native home | Notes / principle |
+|---|---|---|
+| CEK = 16B random, CENC AES-128-CTR fMP4 | `encrypt-provider` (engine proven) | Mint **inside** the wasm boundary; output has no CEK field (invariant #1) |
+| KID as `bytes16` content id | shared `protected_content` + `chain-provider` | Already the rights-read key (`has_access_by_content_id`) |
+| `SHA256(cek‖kid‖authority)` binding | `DecryptTranscriptV1` (extended: principal/session/object/receipt/pubkey/suite/nonce) | We bind **more** than PC2 — full transcript, AEAD + ML-DSA-65 sig |
+| Lit PKP threshold custody | `key-provider` + **ElastOS-native PQ-hybrid dKMS** | Anders: Lit is a *compat backend behind key-provider*, not the product root |
+| Lit ECDH-seal to viewer session | `key-provider` → `SealedDecryptMaterialV1` → `decrypt-provider` | Done on our side; **producer side is the gap** |
+| `ddrm-decrypt` WASM unwrap + CENC | `decrypt-provider` rail-* | **Complete** (transcript-bound, in-sandbox key, expiry, audit) |
+| AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
+| `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
+| Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
+| Channel/operative mint | a `publish-provider` over `chain-provider`+`wallet-provider` | Missing; the on-chain producer step |
+| SQLite `content_catalog` indexer | a `content-market` provider | Missing; index chain events + IPFS metadata |
+| secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
+| Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
+
+---
+
+## 6. The road to a testable end-to-end (phased)
+
+Goal: **"buy a video → wallet+chain validates ownership → key released sealed to my
+decrypt sandbox → decrypt → play",** all on runtime providers. Phased so each phase
+is independently testable and each conforms to fail-closed + capability principles.
+
+### Phase A — Consumer half, runtime-native key authority (NO Lit, NO dKMS dependency)
+The single highest-value unblock. Build a **reference/dev key authority** inside (or
+behind) `key-provider` that does what the Lit Action does, but ElastOS-native:
+verify a `RightsDecisionReceiptV1`, then emit a `SealedDecryptMaterialV1` (CEK sealed
+to the decrypt sandbox's published session key, transcript-bound, ML-DSA-65 signed).
+Wire `drm-provider open → rights-provider → (chain has_access) → key-provider →
+decrypt-provider OpenSessionV1` **default-on for a dev profile**.
+- **Testable:** an in-runtime smoke that seals a CEK to a freshly-minted decrypt
+  session and plays a CENC segment through the full provider chain — no external deps.
+- **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
+  CEK is clear; everything fail-closed without the dev profile.
+
+### Phase B — Real chain validation (Base) via `chain-provider`
+Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real
+AuthorityGateway on Base, keyed by the KID. Now "do I own the access token?" is a real
+on-chain check with your wallet.
+- **Testable:** with a funded wallet holding an Elacity access token, the rights step
+  returns allowed for owned content and denies otherwise — the exact "blockchain
+  validation using my wallet" you described, but driven by the runtime.
+
+### Phase C — Producer half (encrypt → publish → IPFS → market)
+Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
+`publish-provider` (mint contentId=KID + tokenURI via chain+wallet), pin via
+`ipfs-provider`, and a `content-market` index.
+- **Testable:** create from `library`, publish, see it in the market, end to end.
+
+### Phase D — Viewer + full loop
+A `viewer` capsule that consumes the decrypt scoped output (rendered pixels / cleared
+media segments) so the user actually *sees* the asset in-runtime.
+- **Testable:** the complete journey you described, in-runtime, no ela.city.
+
+### Upstream (blocked, parallel)
+- Fold `SealedDecryptMaterialV1` into the shared `DecryptSessionRequestV1` (needs
+  GitHub push access restored).
+- Production PQ-hybrid threshold **dKMS** as the real key authority (Anders/dKMS team);
+  Lit/Chipotle becomes a *compat backend behind key-provider* for migration.
+
+---
+
+## 7. Principle conformance (non-negotiable, per Anders + Playbook)
+
+- **dDRM is the crown jewel** — every phase serves the protected-content loop.
+- **Capability security** — each step is a capability-scoped provider call; no ambient
+  authority; the decrypt VM has **no outbound key-fetch**.
+- **Fail-closed** — all live wiring lands behind dev/feature profiles; default stays
+  `not_configured`; the shared contract stays byte-identical until blessed.
+- **CEK containment** — CEK clear only inside the decrypt sandbox, in `Zeroizing`,
+  bound to the full transcript; never on the wire, never to the app.
+- **ElastOS-native PQ-hybrid is the root; P-256/Lit is compatibility, not product truth.**
+- **Contract-first, characterization tests before engines; isolated reversible commits.**
+
+---
+
+## 8. One-line status
+
+The **decrypt boundary is complete**; the **infrastructure exists**; the **missing
+middle is the key authority + orchestration wiring + producer/market/viewer**. The
+fastest path to a thing you can *test* is **Phase A** (a runtime-native key authority
+that feeds our already-proven `OpenSessionV1`), then **Phase B** (real Base validation
+with your wallet).

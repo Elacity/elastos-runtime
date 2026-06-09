@@ -486,35 +486,33 @@ next context can continue cold.
 
 ## 13. Next
 
-The Days 18–34 options are **done**: rail-prep, encrypt keygen, PQ envelope, PQ data
-path, golden vectors, executable conformance, encrypt→decrypt round-trip, the rail
-transport shim + carrier goldens (both profiles), widened cenc goldens (real playback
-shapes), the **real ML-DSA-65 primitive** wired + verified through the rail entrypoint,
-the **adversarial harden sweep**, and an **authoritative verification gate**. The
-`decrypt-provider` crypto core is now **feature-complete, PQ-proven, and hardened** —
-there is little high-value *novel engineering* left on it before the rail lands.
+**The decrypt boundary is COMPLETE** (Days 45–49): Option A push-in (`rail-live`),
+full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`),
+short-expiry + scoped CEK-free audit (`rail-audit`), and the consolidated suite-tagged
+`SealedDecryptMaterialV1` drop-in (`rail-material`). Anders confirmed the architecture
+on Day 45 and the boundary now implements his entire decrypt-side spec.
 
-The rail itself remains **blocked on Anders** (now a one-line `OpenSession` wire-up;
-the signature primitive is no longer a build gap — only Anders' Q2 policy). The
-next-day prompt is normally provided by the prior agent; if you do not have it, the
-highest-value **unblocked** options, in order, are:
+For the **whole-system** picture — the full PC2 creator→publish→market→purchase→
+download→validate→key→decrypt→playback journey mapped against the runtime, with a
+current/target architecture map and the phased road to a testable end-to-end — read
+**`SYSTEM_ARCHITECTURE_MAP.md`** (Day 49 research). Summary of where the gaps are:
 
-1. **Reconcile-prep for 0.4.0** — keep `ddrm-verify.sh` green; tighten the drift guard /
-   `PUSH_PLAN.md` rebase recipe so the eventual rebase onto a stabilised 0.4.0 is a
-   button-press. Highest leverage now that the core is done.
-2. **Encrypt-side `seal` completion** — the encrypt `seal` (PQ-envelope CEK escrow + fMP4
-   packaging + ciphertext availability) is still behind a fail-closed `seal`; it shares
-   the decrypt rail dependency but its in-boundary packaging can be advanced + pinned with
-   a round-trip golden against the decrypt side. See `DDRM_ENCRYPT_INVARIANT.md`.
-3. **Crosvm macOS build hygiene** (orthogonal, optional) — `object-provider` fails to
-   build on macOS via `elastos-crosvm` (`libc` `sockaddr_in.sin_len`); a small
-   platform-gating fix would restore a green `cargo build` there. Not on the dDRM
-   critical path (crosvm is the Linux/KVM substrate, not the live macOS path).
-4. **Tighten the hybrid-signature transition** (de-risk Anders' Q2) — spike a hybrid
-   `ECDSA + ml-dsa-65` `CekSealVerifier` so *both* answers to Q2 are pre-proven, leaving
-   the rail landing a pure wiring step regardless of the policy chosen.
+- ✅ **Done / exists:** the decrypt boundary; the trusted core; `ipfs-provider`,
+  `chain-provider` (incl. typed `has_access_by_content_id`), `wallet-provider`,
+  `content` publish/fetch.
+- ⬜ **Missing middle:** a **key authority** (ElastOS-native PQ-hybrid dKMS, or a
+  Lit-compat backend behind `key-provider`) that emits `SealedDecryptMaterialV1`; the
+  **live orchestration wiring** (`drm/open → rights → key → decrypt` default-on); the
+  **producer side** (encrypt `seal` + on-chain publish + content market); a **viewer**.
+
+Highest-value **unblocked** next step is **Phase A** in `SYSTEM_ARCHITECTURE_MAP.md §6`:
+a runtime-native (dev/reference) key authority behind `key-provider` that feeds the
+already-proven `OpenSessionV1`, wiring the consumer half end-to-end so it is *testable*
+without Lit/dKMS. Then **Phase B**: real Base validation via `chain-provider`.
+
+Still **blocked on others** (parallel): fold `SealedDecryptMaterialV1` into the shared
+`elastos-common` contract (needs push access); production dKMS (Anders/dKMS team).
 
 Whatever you pick: keep it isolated on `feat/decrypt-provider-cenc`, pin it with
-characterization tests, keep the gate green (`scripts/ddrm-verify.sh` + the 68
-provider tests), update `DDRM_STATUS.md`, and end the day by presenting the next
-10/10 prompt.
+characterization tests, keep the gate green (`scripts/ddrm-verify.sh` + the ladder),
+update `DDRM_STATUS.md`, and end the day by presenting the next 10/10 prompt.

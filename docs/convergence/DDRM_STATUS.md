@@ -13,6 +13,15 @@
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
 
+> **🗺️ WHOLE-SYSTEM MAP (Day 49).** For the full PC2 journey (creator → publish →
+> market → purchase → download → validate → key → decrypt → playback) mapped against
+> the runtime, current/target architecture diagrams, the PC2→runtime pattern-migration
+> table, and the phased road to a testable end-to-end, see
+> **`SYSTEM_ARCHITECTURE_MAP.md`**. Net: the decrypt boundary is done and the
+> infrastructure (IPFS/chain/wallet/content) exists; the missing middle is a **key
+> authority** + **orchestration wiring** + **producer/market/viewer**. Fastest testable
+> unblock = **Phase A** (runtime-native key authority feeding `OpenSessionV1`).
+
 > **🧾 Day 48 — short-expiry enforcement + scoped audit (Anders' "short expiry, audit", LANDED).**
 > `rail-audit`=62: new `OpenSessionAudited` op takes an injected capability clock
 > (`now_unix`, never ambient), REJECTS a stale grant (`now_unix` past the request or
