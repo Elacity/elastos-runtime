@@ -43,7 +43,7 @@ LADDER=(
   "rights-provider (default)|rights-provider||9"
   "rights-provider chain-rights|rights-provider|chain-rights|18"
   "ddrm-envelope (lib)|ddrm-envelope||14"
-  "ddrm-plan-runner (lib)|ddrm-plan-runner||14"
+  "ddrm-plan-runner (lib)|ddrm-plan-runner||21"
   "key-provider (default)|key-provider||18"
   "key-provider key-authority-ref|key-provider|key-authority-ref|33"
   "decrypt-provider (default)|decrypt-provider||25"

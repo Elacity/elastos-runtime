@@ -135,6 +135,104 @@ pub trait StepRunner {
     fn run_step(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String>;
 }
 
+/// A single injected provider capability. The runtime hands the core one of these per
+/// provider it is authorized to drive — the runtime-core analogue of PC2's
+/// per-request `BackendSessionView` (`secureViewSession.ts:124` resurrects it, then
+/// `media.ts:1207` threads it into `recoverCEKEnvelope`): a stage never opens its own
+/// connection, it uses the handle it was given. The handle builds its step's request
+/// from the executor-threaded inputs and invokes the provider; it produces the
+/// artifacts the plan's outgoing bindings name. The handle is the boundary at which
+/// authority enters — the [`RuntimeStepRunner`] over it holds none.
+pub trait ProviderHandle {
+    /// The provider role this handle services — matches a plan step's `provider`
+    /// (`rights`/`key`/`decrypt`/…), the normalized form of `next_required_providers`.
+    fn provider(&self) -> &str;
+
+    /// Drive ONE plan step for this provider, given the executor's threaded inputs +
+    /// context. Returns the artifacts the step produced (keyed by `produces`).
+    fn run(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String>;
+}
+
+/// The runtime-core `StepRunner`: it holds NO authority of its own — it walks each
+/// plan step to the injected [`ProviderHandle`] registered for that step's provider.
+/// This is what the trusted core wires to the real provider rail; the consumer smoke
+/// injects capsule-backed handles into the SAME type (no second code path).
+///
+/// Fail-closed construction ([`RuntimeStepRunner::new`]):
+///   * every provider the plan's `next_required_providers` names MUST have an injected
+///     handle — no ambient default, the core cannot fabricate a missing capability;
+///   * no STRAY handle may be injected for a provider the plan does not require — a
+///     capability the plan never authorized can never be invoked.
+///
+/// At execution a provider-call step whose provider has no handle and is not required
+/// (e.g. the `content` status/fetch steps this chain does not drive) is a no-op; a
+/// REQUIRED provider can never be missing because construction guaranteed it.
+pub struct RuntimeStepRunner {
+    handles: BTreeMap<String, Box<dyn ProviderHandle>>,
+}
+
+impl std::fmt::Debug for RuntimeStepRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only the provider KEYS — never the handles' contents (which may hold
+        // capability material). The runner itself carries no other authority.
+        f.debug_struct("RuntimeStepRunner")
+            .field("providers", &self.provider_keys())
+            .finish()
+    }
+}
+
+impl RuntimeStepRunner {
+    /// Inject the provider handles for a plan, fail-closed. See the type docs.
+    pub fn new(
+        plan: &DrmOpenPlan,
+        handles: Vec<Box<dyn ProviderHandle>>,
+    ) -> Result<Self, String> {
+        let required = plan.required_provider_keys();
+        let mut map: BTreeMap<String, Box<dyn ProviderHandle>> = BTreeMap::new();
+        for h in handles {
+            let key = h.provider().to_string();
+            if !required.contains(&key) {
+                return Err(format!(
+                    "refusing a stray `{key}` handle: the plan does not name it in next_required_providers ({required:?})"
+                ));
+            }
+            if map.insert(key.clone(), h).is_some() {
+                return Err(format!("two handles injected for provider `{key}`"));
+            }
+        }
+        for req in &required {
+            if !map.contains_key(req) {
+                return Err(format!(
+                    "no capability handle injected for required provider `{req}` — the core cannot drive the plan"
+                ));
+            }
+        }
+        Ok(Self { handles: map })
+    }
+
+    /// The provider keys this runner can drive (one per injected handle).
+    pub fn provider_keys(&self) -> Vec<&str> {
+        self.handles.keys().map(String::as_str).collect()
+    }
+}
+
+impl StepRunner for RuntimeStepRunner {
+    fn run_step(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
+        let provider = match &inputs.step.provider {
+            Some(p) => p.as_str(),
+            // Runtime-event steps (no provider) are walked for ordering only.
+            None => return Ok(BTreeMap::new()),
+        };
+        match self.handles.get_mut(provider) {
+            Some(handle) => handle.run(inputs),
+            // A provider-call step with no injected handle is a runtime no-op (e.g. the
+            // `content` status/fetch steps); construction proved every REQUIRED provider
+            // has a handle, so this can only be an un-required step.
+            None => Ok(BTreeMap::new()),
+        }
+    }
+}
+
 /// What an execution produced: the steps that ran (in order) and the full artifact
 /// context at the end (keyed by `produces`).
 #[derive(Debug, Clone)]
@@ -157,6 +255,10 @@ pub struct DrmOpenPlan {
     pub viewer_interface: String,
     pub steps: Vec<PlanStep>,
     pub bindings: Vec<PlanBinding>,
+    /// The providers the runtime MUST be able to drive to run this plan (the plan's
+    /// `next_required_providers`, e.g. `["rights-provider", "key-provider", ...]`). The
+    /// runtime injects exactly one capability handle per entry; see [`RuntimeStepRunner`].
+    pub next_required_providers: Vec<String>,
 }
 
 impl DrmOpenPlan {
@@ -212,13 +314,26 @@ impl DrmOpenPlan {
 
         Self::assert_canonical_order(&steps)?;
 
+        let next_required_providers = parse_next_required_providers(plan)?;
+
         Ok(Self {
             content_id,
             object_cid,
             viewer_interface,
             steps,
             bindings,
+            next_required_providers,
         })
+    }
+
+    /// The providers this plan requires, normalized to their step-`provider` names
+    /// (`rights-provider` → `rights`) — the keys the runtime injects capability
+    /// handles under. A `RuntimeStepRunner` must hold one handle per entry.
+    pub fn required_provider_keys(&self) -> Vec<String> {
+        self.next_required_providers
+            .iter()
+            .map(|p| normalize_provider(p))
+            .collect()
     }
 
     /// The rights check must precede the key release, which must precede the decrypt
@@ -381,6 +496,30 @@ fn parse_bindings(plan: &Value) -> Result<Vec<PlanBinding>, String> {
     Ok(bindings)
 }
 
+fn parse_next_required_providers(plan: &Value) -> Result<Vec<String>, String> {
+    let arr = plan["next_required_providers"]
+        .as_array()
+        .ok_or("plan has no next_required_providers array")?;
+    if arr.is_empty() {
+        return Err("plan declares no required providers".to_string());
+    }
+    arr.iter()
+        .map(|p| {
+            p.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| "next_required_providers entry is not a non-empty string".to_string())
+        })
+        .collect()
+}
+
+/// Normalize a provider name to its step-`provider` key: the plan's
+/// `next_required_providers` carry the `-provider` suffix (`key-provider`) while a
+/// step's `provider` is the bare role (`key`). One identity, two spellings.
+fn normalize_provider(name: &str) -> String {
+    name.strip_suffix("-provider").unwrap_or(name).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,7 +552,8 @@ mod tests {
                 { "from_step": "key_release", "produces": "ReleaseReceiptV1", "into_step": "decrypt_session", "into_field": "release_receipt" },
                 { "from_step": "drm_open", "produces": "object_cid", "into_step": "decrypt_session", "into_field": "object_cid" },
                 { "from_step": "drm_open", "produces": "viewer_interface", "into_step": "decrypt_session", "into_field": "viewer_interface" }
-            ]
+            ],
+            "next_required_providers": ["rights-provider", "key-provider", "decrypt-provider"]
         })
     }
 
@@ -631,5 +771,134 @@ mod tests {
         // The very first provider-call step (content_status) cannot proceed.
         let err = plan.execute(&mut runner).unwrap_err();
         assert!(err.contains("no capability injected"), "{err}");
+    }
+
+    #[test]
+    fn parses_next_required_providers() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        assert_eq!(
+            plan.next_required_providers,
+            vec!["rights-provider", "key-provider", "decrypt-provider"]
+        );
+        // Normalized to the bare step-provider keys the runtime injects handles under.
+        assert_eq!(plan.required_provider_keys(), vec!["rights", "key", "decrypt"]);
+    }
+
+    #[test]
+    fn rejects_a_plan_with_no_required_providers() {
+        let mut p = canonical_plan();
+        p["next_required_providers"] = json!([]);
+        assert!(DrmOpenPlan::parse(&p).is_err());
+    }
+
+    // ── RuntimeStepRunner: the runtime-core StepRunner over injected provider handles ──
+
+    /// A capability handle for one provider, backed by a recorder rather than a real
+    /// capsule. Emits whatever artifacts the plan says its step produces.
+    struct FakeHandle {
+        provider: String,
+        invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl FakeHandle {
+        fn boxed(provider: &str, log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Box<dyn ProviderHandle> {
+            Box::new(FakeHandle {
+                provider: provider.to_string(),
+                invoked: log.clone(),
+            })
+        }
+    }
+
+    impl ProviderHandle for FakeHandle {
+        fn provider(&self) -> &str {
+            &self.provider
+        }
+        fn run(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
+            self.invoked.borrow_mut().push(self.provider.clone());
+            let mut out = BTreeMap::new();
+            match inputs.step.name.as_str() {
+                "rights_check" => {
+                    out.insert("RightsDecisionReceiptV1".to_string(), json!({ "allowed": true }));
+                }
+                "key_release" => {
+                    inputs.require_threaded("rights_receipt")?;
+                    out.insert("ReleaseReceiptV1".to_string(), json!({ "status": "released" }));
+                }
+                "decrypt_session" => {
+                    inputs.require_threaded("release_receipt")?;
+                    out.insert("decrypt_session".to_string(), json!({ "decision": "opened" }));
+                }
+                _ => {}
+            }
+            Ok(out)
+        }
+    }
+
+    fn handle_set(log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> Vec<Box<dyn ProviderHandle>> {
+        vec![
+            FakeHandle::boxed("rights", log),
+            FakeHandle::boxed("key", log),
+            FakeHandle::boxed("decrypt", log),
+        ]
+    }
+
+    #[test]
+    fn runtime_runner_drives_the_plan_through_injected_handles() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut runner = RuntimeStepRunner::new(&plan, handle_set(&log)).expect("handles cover the plan");
+        let report = plan.execute(&mut runner).expect("runtime runner drives the plan");
+        assert!(report.artifact("decrypt_session").is_some());
+        // Each required provider's handle was invoked, in canonical order; the unhandled
+        // `content` steps were no-ops (never routed to a handle). The decrypt handle is
+        // invoked twice because BOTH `decrypt_session` and `render` are decrypt-provider
+        // steps — render is a no-op here but still routes to the same injected handle.
+        assert_eq!(*log.borrow(), vec!["rights", "key", "decrypt", "decrypt"]);
+    }
+
+    #[test]
+    fn runtime_runner_refuses_to_build_without_a_required_handle() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // Drop the key handle — the plan requires key-provider, so construction fails closed.
+        let handles = vec![FakeHandle::boxed("rights", &log), FakeHandle::boxed("decrypt", &log)];
+        let err = RuntimeStepRunner::new(&plan, handles).unwrap_err();
+        assert!(err.contains("no capability handle injected for required provider `key`"), "{err}");
+    }
+
+    #[test]
+    fn runtime_runner_refuses_a_stray_unnamed_handle() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // A `wallet` handle the plan never names must be rejected — a capability the plan
+        // did not authorize can never enter the runner.
+        let mut handles = handle_set(&log);
+        handles.push(FakeHandle::boxed("wallet", &log));
+        let err = RuntimeStepRunner::new(&plan, handles).unwrap_err();
+        assert!(err.contains("stray `wallet` handle"), "{err}");
+    }
+
+    #[test]
+    fn runtime_runner_rejects_duplicate_handles() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut handles = handle_set(&log);
+        handles.push(FakeHandle::boxed("key", &log));
+        let err = RuntimeStepRunner::new(&plan, handles).unwrap_err();
+        assert!(err.contains("two handles injected for provider `key`"), "{err}");
+    }
+
+    #[test]
+    fn runtime_runner_never_invokes_a_handle_for_an_unnamed_provider() {
+        // The runner only ever routes by the step's provider; a `content`-step has no
+        // handle, so it is a no-op and no handle is invoked for it. Combined with the
+        // stray-handle rejection above, a handle is only ever invoked for a plan-named
+        // provider. Assert the content steps produced nothing and were not logged.
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut runner = RuntimeStepRunner::new(&plan, handle_set(&log)).unwrap();
+        plan.execute(&mut runner).unwrap();
+        assert!(!log.borrow().iter().any(|p| p == "content"));
+        assert_eq!(runner.provider_keys(), vec!["decrypt", "key", "rights"]);
     }
 }

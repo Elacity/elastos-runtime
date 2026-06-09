@@ -26,21 +26,27 @@
 //! end through the op drm-provider's plan actually names.
 //!
 //! The chain is no longer hand-walked here: the REAL `drm-provider` emits the plan and
-//! the runtime-core executor (`ddrm-plan-runner`) walks it — threading each binding edge
-//! into the next step and injecting this smoke's `SmokeRunner` per step. Two fail-closed
-//! gates ride along: a transcript-mismatched seal must not open, and a TAMPERED plan edge
-//! (driven back through the core) must be rejected by the real key-provider.
+//! the runtime-core executor (`ddrm-plan-runner`) walks it. The smoke drives it through
+//! the runtime-core `RuntimeStepRunner` over three INJECTED per-provider capability
+//! handles (`RightsHandle`/`KeyHandle`/`DecryptHandle`, each wrapping one real capsule
+//! binary) — the same injected-handle seam the trusted core will use with real
+//! providers, no second code path. Construction fails closed unless every provider the
+//! plan's `next_required_providers` names has a handle. Two fail-closed gates ride
+//! along: a transcript-mismatched seal must not open, and a TAMPERED plan edge (driven
+//! back through the core) must be rejected by the real key-provider.
 //!
 //! Usage: ddrm-consumer-smoke <key-provider-bin> <decrypt-provider-bin> <drm-bin> [rights-bin]
 
 use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
-use ddrm_plan_runner::{DrmOpenPlan, StepInputs, StepRunner};
+use ddrm_plan_runner::{DrmOpenPlan, ProviderHandle, RuntimeStepRunner, StepInputs};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::rc::Rc;
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -116,7 +122,7 @@ impl Capsule {
         serde_json::from_str(resp.trim()).map_err(|e| format!("{} sent non-JSON: {e}: {resp}", self.name))
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(&mut self) {
         let _ = self.call(&json!({ "op": "shutdown" }));
         let _ = self.child.wait();
     }
@@ -380,59 +386,50 @@ fn live_chain_attestation(bin: &str, rpc_url: &str) -> Result<Value, String> {
     }))
 }
 
-/// The runtime-injected step executor for the consumer half. Holds the live capsule
-/// handles plus the per-session material the runtime provisioned up front (the
-/// escrowed CEK + bytes16 KID, the producer's verifying key, the decrypt boundary's
-/// published session key, and the canonical transcript AAD). It drives ONE plan step
-/// per call, threading that step's plan-declared binding inputs into the request it
-/// sends — so order + binding come from the CORE walking the plan, never from this
-/// struct. It is the only thing here that touches a provider; the executor holds no
-/// authority of its own.
-struct SmokeRunner {
-    rights: Option<Capsule>,
-    chain_attestation: Value,
-    chain_mode: String,
-    key: Capsule,
-    decrypt: Capsule,
-    kid_hex: String,
-    wrapped_cek_b64: String,
-    producer_vk_b64: String,
-    session_pub_b64: String,
-    aad_b64: String,
-    content_hash_b64: String,
-    nonce_b64: String,
-    /// Suppress the progress prints on the second (broken-edge) execution.
-    verbose: bool,
-}
-
-impl SmokeRunner {
-    /// Thread the plan's binding inputs into a base request: each artifact lands under
-    /// the field name the PLAN's edge declared. A wrong edge therefore places it under
-    /// an unknown field (or omits it) and the real provider — `deny_unknown_fields`
-    /// over a required `rights_receipt` — fails closed.
-    fn thread_into(base: &mut Value, inputs: &StepInputs) {
-        if let Some(obj) = base.as_object_mut() {
-            for (field, artifact) in inputs.threaded_fields() {
-                obj.insert(field.clone(), artifact.clone());
-            }
+/// Thread the plan's binding inputs into a base request: each artifact lands under the
+/// field name the PLAN's edge declared. A wrong edge therefore places it under an
+/// unknown field (or omits it) and the real provider — `deny_unknown_fields` over a
+/// required field — fails closed.
+fn thread_into(base: &mut Value, inputs: &StepInputs) {
+    if let Some(obj) = base.as_object_mut() {
+        for (field, artifact) in inputs.threaded_fields() {
+            obj.insert(field.clone(), artifact.clone());
         }
     }
+}
 
-    /// `rights_check`: render the (live or mocked) on-chain ownership answer into a
-    /// typed `RightsDecisionReceiptV1` via the REAL rights-provider — the receipt that
-    /// gates the key release. Falls back to a hardcoded receipt only when no rights
-    /// binary was supplied.
-    fn run_rights(&mut self) -> Result<BTreeMap<String, Value>, String> {
-        let chain_mode = self.chain_mode.clone();
-        let attestation = self.chain_attestation.clone();
-        let receipt = if let Some(rights) = self.rights.as_mut() {
+// The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
+// INJECTED per-provider capability handles — the runtime-core analogue of PC2's
+// per-request `BackendSessionView` (resurrected in middleware, threaded into the
+// downstream stage). Each handle wraps one real capsule binary (the runtime would
+// inject real provider handles instead); the core routes each plan step to the handle
+// for that step's provider, and fails closed if a required handle is missing. The
+// capsules are shared (`Rc<RefCell<_>>`) so the post-walk fail-closed checks + shutdown
+// can still reach them after the runner has borrowed the handles.
+
+/// Injected `rights` capability: the REAL rights-provider rendering the (live or
+/// mocked) on-chain ownership answer into a typed `RightsDecisionReceiptV1` (falls back
+/// to a hardcoded receipt only when no rights binary was supplied).
+struct RightsHandle {
+    rights: Rc<RefCell<Option<Capsule>>>,
+    chain_attestation: Value,
+    chain_mode: String,
+}
+
+impl ProviderHandle for RightsHandle {
+    fn provider(&self) -> &str {
+        "rights"
+    }
+    fn run(&mut self, _inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
+        let mut guard = self.rights.borrow_mut();
+        let receipt = if let Some(rights) = guard.as_mut() {
             ok_data(&rights.call(&json!({ "op": "status" }))?, "rights status")?;
             let decision = ok_data(
                 &rights.call(&json!({
                     "op": "decide_access_from_chain",
                     "request_id": RR_REQUEST_ID,
                     "request": rights_access_request(),
-                    "chain_access": attestation,
+                    "chain_access": self.chain_attestation.clone(),
                     "now_unix": RR_ISSUED_AT,
                     "ttl_secs": EXPIRES_AT - RR_ISSUED_AT,
                 }))?,
@@ -440,11 +437,9 @@ impl SmokeRunner {
             )?;
             if decision["decision"].as_str() != Some("allowed") {
                 return Err(format!(
-                    "rights did not allow this content ({chain_mode}); the chain says you do not own it: {decision}"
+                    "rights did not allow this content ({}); the chain says you do not own it: {decision}",
+                    self.chain_mode
                 ));
-            }
-            if self.verbose {
-                step(4, &format!("rights-provider: on-chain ownership ({chain_mode}) -> allowed; typed receipt issued"));
             }
             decision["receipt"].clone()
         } else {
@@ -455,17 +450,33 @@ impl SmokeRunner {
             receipt,
         )]))
     }
+}
 
-    /// `key_release`: the canonical `release` op (the one drm-provider's plan names).
-    /// The rights receipt is threaded in by the executor; the authority RECOVERS the
-    /// escrowed CEK from the rights-bound `key_envelope` and re-seals it to the
-    /// published session key — no raw CEK ever handed in. Produces the release receipt
-    /// (threaded onward into decrypt) and the sealed material (carried in the context).
-    fn run_key_release(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
+/// Injected `key` capability: the canonical `release` op (the one drm-provider's plan
+/// names). The rights receipt is threaded in by the executor; the authority RECOVERS
+/// the escrowed CEK from the rights-bound `key_envelope` and re-seals it to the
+/// published session key — no raw CEK ever handed in. Produces the release receipt
+/// (threaded onward into decrypt) and the sealed material (carried in the context).
+struct KeyHandle {
+    key: Rc<RefCell<Capsule>>,
+    kid_hex: String,
+    wrapped_cek_b64: String,
+    producer_vk_b64: String,
+    session_pub_b64: String,
+    aad_b64: String,
+    content_hash_b64: String,
+    nonce_b64: String,
+}
+
+impl ProviderHandle for KeyHandle {
+    fn provider(&self) -> &str {
+        "key"
+    }
+    fn run(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
         let mut request = key_release_request_base(&self.kid_hex, &self.wrapped_cek_b64);
-        Self::thread_into(&mut request, inputs);
+        thread_into(&mut request, inputs);
         let release = ok_data(
-            &self.key.call(&json!({
+            &self.key.borrow_mut().call(&json!({
                 "op": "release",
                 "request": request,
                 "session": {
@@ -492,22 +503,30 @@ impl SmokeRunner {
         if release_str.contains(&self.wrapped_cek_b64) {
             return Err("the producer escrow blob was echoed by the key authority".to_string());
         }
-        if self.verbose {
-            step(5, "key-provider: canonical `release` recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no shim)");
-        }
         Ok(BTreeMap::from([
             ("ReleaseReceiptV1".to_string(), release_receipt_json()),
             ("material".to_string(), material),
         ]))
     }
+}
 
-    /// `decrypt_session`: push the executor-threaded release receipt + sealed material
-    /// into the boundary, which unwraps in-VM and decrypts a real CENC segment,
-    /// returning ONLY a scoped session — no CEK, no plaintext crosses the boundary.
-    fn run_decrypt_session(
-        &mut self,
-        inputs: &StepInputs,
-    ) -> Result<BTreeMap<String, Value>, String> {
+/// Injected `decrypt` capability: `open_session_v1` pushes the executor-threaded
+/// release receipt + sealed material into the boundary, which unwraps in-VM and
+/// decrypts a real CENC segment, returning ONLY a scoped session — no CEK, no plaintext
+/// crosses the boundary. The `render` step is also a decrypt-provider step but is a
+/// no-op here (the smoke drives the open, not playback).
+struct DecryptHandle {
+    decrypt: Rc<RefCell<Capsule>>,
+}
+
+impl ProviderHandle for DecryptHandle {
+    fn provider(&self) -> &str {
+        "decrypt"
+    }
+    fn run(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
+        if inputs.step.name != "decrypt_session" {
+            return Ok(BTreeMap::new());
+        }
         // The sealed material rides the context alongside the release receipt (it is
         // not a plan binding edge — only the receipt is — so read it from the context).
         let material = inputs
@@ -515,8 +534,8 @@ impl SmokeRunner {
             .ok_or("decrypt_session lost the sealed material produced by key_release")?
             .clone();
         let mut request = decrypt_request_base();
-        Self::thread_into(&mut request, inputs);
-        let open = self.decrypt.call(&json!({
+        thread_into(&mut request, inputs);
+        let open = self.decrypt.borrow_mut().call(&json!({
             "op": "open_session_v1",
             "request": request,
             "material": material,
@@ -540,27 +559,10 @@ impl SmokeRunner {
         if open_str.contains(GOLDEN_CEK_B64) || open_str.contains("the quick brown fox") {
             return Err("CEK or plaintext leaked from the decrypt boundary".to_string());
         }
-        if self.verbose {
-            step(6, "decrypt-provider: unwrapped in-VM + decrypted the segment; only a scoped session returned");
-        }
         Ok(BTreeMap::from([(
             "decrypt_session".to_string(),
             session.clone(),
         )]))
-    }
-}
-
-impl StepRunner for SmokeRunner {
-    fn run_step(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
-        match inputs.step.name.as_str() {
-            "rights_check" => self.run_rights(),
-            "key_release" => self.run_key_release(inputs),
-            "decrypt_session" => self.run_decrypt_session(inputs),
-            // content_status / content_fetch / render / runtime-event steps: the
-            // consumer smoke drives only the rights->key->decrypt core, so the rest
-            // are walked for ordering but invoke nothing.
-            _ => Ok(BTreeMap::new()),
-        }
     }
 }
 
@@ -655,27 +657,44 @@ fn run(args: &[String]) -> Result<(), String> {
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
-    // --- drive the chain THROUGH the runtime core: it walks the plan, threads each
-    // binding edge into the next step, and injects our SmokeRunner per step. ---------
-    let mut runner = SmokeRunner {
-        rights,
-        chain_attestation: attestation,
-        chain_mode,
-        key,
-        decrypt,
-        kid_hex: kid_hex.clone(),
-        wrapped_cek_b64: wrapped_cek_b64.clone(),
-        producer_vk_b64: producer_vk_b64.clone(),
-        session_pub_b64: session_pub_b64.clone(),
-        aad_b64: B64.encode(&aad),
-        content_hash_b64: B64.encode(&content_hash),
-        nonce_b64: B64.encode(&nonce),
-        verbose: true,
-    };
+    // --- drive the chain THROUGH the runtime core: build the runtime-core
+    // RuntimeStepRunner over three INJECTED per-provider handles (each wrapping a real
+    // capsule binary). Construction fails closed unless every provider the plan's
+    // `next_required_providers` names has a handle — the same seam the trusted core
+    // uses with real providers, no second code path. The capsules are shared so the
+    // post-walk fail-closed checks + shutdown can still reach them.
+    let rights_cell = Rc::new(RefCell::new(rights));
+    let key_cell = Rc::new(RefCell::new(key));
+    let decrypt_cell = Rc::new(RefCell::new(decrypt));
+    let handles: Vec<Box<dyn ProviderHandle>> = vec![
+        Box::new(RightsHandle {
+            rights: rights_cell.clone(),
+            chain_attestation: attestation,
+            chain_mode: chain_mode.clone(),
+        }),
+        Box::new(KeyHandle {
+            key: key_cell.clone(),
+            kid_hex: kid_hex.clone(),
+            wrapped_cek_b64: wrapped_cek_b64.clone(),
+            producer_vk_b64: producer_vk_b64.clone(),
+            session_pub_b64: session_pub_b64.clone(),
+            aad_b64: B64.encode(&aad),
+            content_hash_b64: B64.encode(&content_hash),
+            nonce_b64: B64.encode(&nonce),
+        }),
+        Box::new(DecryptHandle {
+            decrypt: decrypt_cell.clone(),
+        }),
+    ];
+    let mut runner = RuntimeStepRunner::new(&plan, handles)?;
     let report = plan.execute(&mut runner)?;
     if report.artifact("decrypt_session").is_none() {
         return Err("the executor finished without opening a decrypt session".to_string());
     }
+    // The walk succeeded — narrate the steps the core drove through the injected handles.
+    step(4, &format!("rights-provider: on-chain ownership ({chain_mode}) -> allowed; typed receipt issued"));
+    step(5, "key-provider: canonical `release` recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no shim)");
+    step(6, "decrypt-provider: unwrapped in-VM + decrypted the segment; only a scoped session returned");
 
     // --- fail-closed #1 (crypto binding): a replayed/altered transcript must not open.
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
@@ -688,7 +707,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .expect("key release request is an object")
         .insert("rights_receipt".to_string(), fallback_rights_receipt());
     let bad_release = ok_data(
-        &runner.key.call(&json!({
+        &key_cell.borrow_mut().call(&json!({
             "op": "release",
             "request": bad_req,
             "session": {
@@ -710,7 +729,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .insert("release_receipt".to_string(), release_receipt_json());
     bad_open_req["object_cid"] = json!(cid());
     bad_open_req["viewer_interface"] = json!(VIEWER);
-    let bad_open = runner.decrypt.call(&json!({
+    let bad_open = decrypt_cell.borrow_mut().call(&json!({
         "op": "open_session_v1",
         "request": bad_open_req,
         "material": bad_release["material"].clone(),
@@ -732,17 +751,22 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let tampered_plan = DrmOpenPlan::parse(&tampered)?;
-    runner.verbose = false;
+    // Re-run THROUGH the same runtime-core runner: the tampered plan only relabels the
+    // edge, so the SAME injected handles drive it and the real key-provider rejects the
+    // rights receipt threaded under the wrong field — fail-closed, cross-binary.
     match tampered_plan.execute(&mut runner) {
         Ok(_) => return Err("a tampered plan edge must NOT drive a successful open".to_string()),
         Err(_) => step(8, "runtime-core: a tampered binding edge failed closed at the real key-provider"),
     }
 
-    if let Some(rights) = runner.rights {
+    // Drop the runner first so its injected handles release their capsule references,
+    // then shut down the (now solely-held) capsules.
+    drop(runner);
+    if let Some(rights) = rights_cell.borrow_mut().as_mut() {
         rights.shutdown();
     }
-    runner.key.shutdown();
-    runner.decrypt.shutdown();
+    key_cell.borrow_mut().shutdown();
+    decrypt_cell.borrow_mut().shutdown();
     Ok(())
 }
 
