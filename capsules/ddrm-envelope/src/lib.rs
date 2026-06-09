@@ -317,6 +317,28 @@ pub fn derive_seed(master: &[u8; 32], label: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Compute the domain-separated IDENTITY of a 2-of-2 threshold NODE-SET:
+/// `SHA-256(DOMAIN ‖ [t] ‖ len(vk_a) ‖ vk_a ‖ len(vk_b) ‖ vk_b)`, with each `len` a 4-byte
+/// big-endian length prefix so two distinct `(vk_a, vk_b)` pairs can never collide by concatenation.
+/// This pins WHICH secret-holders back a threshold rail into a single stable id: a runtime that
+/// provisions a node-set can durably record this id at publish, then RE-DERIVE it from the published
+/// descriptor at open and fail closed if a node was silently swapped (the descriptor points at a
+/// different secret-holder than the producer escrowed to). Pure, no RNG — the single source of truth
+/// both the runtime (descriptor check) and any auditor share. Order matters: `(a,b) != (b,a)`.
+pub fn threshold_node_set_id(t: u8, vk_a: &[u8], vk_b: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"elastos.dkms.threshold.node-set/v1");
+    h.update([t]);
+    h.update((vk_a.len() as u32).to_be_bytes());
+    h.update(vk_a);
+    h.update((vk_b.len() as u32).to_be_bytes());
+    h.update(vk_b);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
 /// Mint a fresh 32-byte master seed from the OS RNG (WASI `random_get` on
 /// wasm32-wasip1). A durable key authority persists this ONCE and re-derives the same
 /// keypairs forever via [`mint_session_from_seed`] / [`seal::mldsa_seal_keypair`].
@@ -1301,6 +1323,37 @@ mod tests {
         assert!(crate::split_cek_xor(&[], &[]).is_err());
         assert!(crate::combine_cek_xor(&share1, &share2[..15]).is_err());
         assert!(crate::combine_cek_xor(&[], &[]).is_err());
+    }
+
+    /// The 2-of-2 node-set identity is deterministic, order-sensitive, and changes if ANY node's
+    /// identity changes — so a silently swapped node-set is detectable by comparing the id.
+    #[test]
+    fn threshold_node_set_id_pins_both_nodes() {
+        let vk_a = vec![0xA1u8; 40];
+        let vk_b = vec![0xB2u8; 52];
+        let id = crate::threshold_node_set_id(2, &vk_a, &vk_b);
+
+        // Deterministic: the same inputs always yield the same id.
+        assert_eq!(id, crate::threshold_node_set_id(2, &vk_a, &vk_b));
+        // Order matters — (a,b) is a DIFFERENT set-id than (b,a).
+        assert_ne!(id, crate::threshold_node_set_id(2, &vk_b, &vk_a));
+        // Swapping EITHER node's identity changes the id (a swapped secret-holder is detectable).
+        let vk_b2 = vec![0xB3u8; 52];
+        assert_ne!(id, crate::threshold_node_set_id(2, &vk_a, &vk_b2));
+        let vk_a2 = vec![0xA2u8; 40];
+        assert_ne!(id, crate::threshold_node_set_id(2, &vk_a2, &vk_b));
+        // The threshold parameter `t` is bound too.
+        assert_ne!(id, crate::threshold_node_set_id(3, &vk_a, &vk_b));
+        // Length-prefixing prevents a concatenation collision: (vk_a‖x, vk_b) != (vk_a, x‖vk_b).
+        let mut a_plus = vk_a.clone();
+        a_plus.extend_from_slice(&[0xCCu8; 4]);
+        let mut pre_b = vec![0xCCu8; 4];
+        pre_b.extend_from_slice(&vk_b);
+        assert_ne!(
+            crate::threshold_node_set_id(2, &a_plus, &vk_b),
+            crate::threshold_node_set_id(2, &vk_a, &pre_b),
+            "the length prefix must prevent a boundary-shift collision"
+        );
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.

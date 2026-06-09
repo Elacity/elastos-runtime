@@ -369,6 +369,27 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 101–102):** the live 2-of-2 threshold is now RESILIENT + IDENTITY-BOUND — the production `DrmHost`
+  rail provably FAILS CLOSED under a real node fault (either secret-holder down: no partial CEK, no single-node
+  fallback, no record persisted), and a silently SWAPPED node-set is DETECTED before the rail recovers anything.
+  Day 99–100 wired the threshold into the real open; this cycle proves it survives faults + pins WHO backs it.
+  Audited PC2 first: PC2's run-path resilience STOPS at retrying the whole opaque Lit RPC (`chipotle-client.ts:575`:
+  `RequestExpired` → "retry by re-running the Lit action") — a downed/swapped node lives INSIDE Lit's network, so PC2
+  has NO per-node fault semantics and NO inspectable node-set identity it can pin. The runtime is SUPERIOR — it owns
+  the two nodes and expresses both. (1) NODE-SET IDENTITY (single source of truth): new pure
+  `ddrm_envelope::threshold_node_set_id(t, vk_a, vk_b)` = domain-separated, length-prefixed `SHA-256` over both nodes'
+  vks + `t` (order-sensitive; 23→24). `publish_escrow` PINS it into the durable fixture (`node_set_id_b64`); `host.open()`
+  RE-DERIVES it from the published descriptor's `threshold` block and FAILS CLOSED on a mismatch (a node re-pointed at a
+  different secret-holder is caught BEFORE recovery, independent of the boundary's per-share seal check). (2) LIVE
+  NODE-FAULT gates 23–24 (verify, threshold-only): with the full 2-of-2 rail up, KILL node B's daemon → `host.open()`
+  fails closed + persists no record, restore; KILL node A's daemon → same; node A is RESTARTED so the post-shutdown
+  socket probes (steps 13–17) still connect (the daemon guards `dkms_daemon`/`dkms_daemon_b` are now `mut`). (3) SWAP
+  DETECTION gate 25: a descriptor whose node B is swapped to a rogue ML-DSA identity re-derives to a DIFFERENT
+  node-set-id than the pin — detected end-to-end (and the boundary independently rejects the rogue's seal under node B's
+  pinned vk, Day 97–98 step 20 — the swap fails at BOTH layers). Drift untouched (the node-set-id is a runtime-owned
+  durable artifact + a pure envelope primitive). Gate: ladder INTACT (ddrm-envelope=24, key-provider[key-authority-ref]=43,
+  decrypt-provider rail-material=68), drift PASS, all dDRM smokes green (reference + dkms single-node + the dkms 2-of-2
+  with the new node-fault + swap gates), clippy clean.
 - **Status (Day 99–100):** the 2-of-2 threshold now runs through the PRODUCTION `DrmHost` run-path, not just the
   verify-mode probe — the happy open itself provisions TWO secret-holding nodes, XOR-splits the CEK at publish,
   dual-recovers BOTH, and reconstructs the CEK ONLY inside the decrypt boundary (the CEK never exists whole before

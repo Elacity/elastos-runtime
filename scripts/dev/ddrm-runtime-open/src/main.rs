@@ -580,6 +580,11 @@ struct PublishEscrow {
     /// Node B's published verifying key — the decrypt boundary needs it (`authority_vk2_b64`) to
     /// unwrap share-2 in-VM. `None` for the single-node rail.
     vk2_b64: Option<String>,
+    /// 2-of-2 THRESHOLD (Day 101–102): the durably-pinned NODE-SET IDENTITY — a hash over `(t, vk_a,
+    /// vk_b)` (`ddrm_envelope::threshold_node_set_id`). The producer escrowed the two shares to THIS
+    /// node-set; the open RE-DERIVES it from the published descriptor and fails closed if a node was
+    /// silently swapped. `None` for the single-node rail.
+    node_set_id_b64: Option<String>,
 }
 
 impl PublishEscrow {
@@ -599,6 +604,9 @@ impl PublishEscrow {
         if let Some(vk2) = &self.vk2_b64 {
             v["vk2_b64"] = json!(vk2);
         }
+        if let Some(id) = &self.node_set_id_b64 {
+            v["node_set_id_b64"] = json!(id);
+        }
         v
     }
 
@@ -613,6 +621,7 @@ impl PublishEscrow {
         Ok(Self {
             wrapped_cek_share2_b64: opt("wrapped_cek_share2_b64"),
             vk2_b64: opt("vk2_b64"),
+            node_set_id_b64: opt("node_set_id_b64"),
             kid_hex: field("kid_hex")?,
             wrapped_cek_b64: field("wrapped_cek_b64")?,
             producer_vk_b64: field("producer_vk_b64")?,
@@ -697,8 +706,9 @@ fn publish_escrow(
     // RESOLVES. The master NEVER enters the runtime. The analogue of provisioning a dKMS node + its
     // published authority pubkey (PC2 holds only the public `pkpId`/`authority`, `chipotle-client.ts`).
     //
-    // `(node_b_vk, node_b_recipient)` is populated only for a 2-of-2 threshold provisioning.
-    let (recipient_pub_b64, node_b): (String, Option<(String, String)>) = match backend {
+    // For a 2-of-2 threshold, `node_b` carries `(node_a_vk, node_b_vk, node_b_recipient)` — node A's vk
+    // is threaded through so the producer can pin the node-set identity over BOTH vks. `None` otherwise.
+    let (recipient_pub_b64, node_b): (String, Option<(String, String, String)>) = match backend {
         AuthorityBackend::Reference => {
             let mut key = Capsule::spawn("key-provider(publish)", key_bin)?;
             let init = ok_data(
@@ -726,7 +736,7 @@ fn publish_escrow(
                 if vk_b == vk_a {
                     return Err("the two dkms nodes derived the SAME identity — a 2-of-2 split needs two DISTINCT secret-holders".to_string());
                 }
-                Some((vk_b, recipient_b))
+                Some((vk_a.clone(), vk_b, recipient_b))
             } else {
                 None
             };
@@ -739,7 +749,7 @@ fn publish_escrow(
                 "recipient_pub_b64": recipient_a,
                 "authority_endpoint": node_endpoint,
             });
-            if let Some((vk_b, recipient_b)) = &node_b {
+            if let Some((_vk_a, vk_b, recipient_b)) = &node_b {
                 descriptor["threshold"] = json!({
                     "t": 2,
                     "nodes": [
@@ -761,22 +771,29 @@ fn publish_escrow(
     let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
 
     // SINGLE NODE: escrow the WHOLE CEK to the authority's recipient. THRESHOLD: XOR-split the CEK and
-    // escrow share-1 to node A + share-2 to node B's recipient (neither node ever sees the whole key).
-    let (wrapped_cek_b64, wrapped_cek_share2_b64, vk2_b64) = match &node_b {
+    // escrow share-1 to node A + share-2 to node B's recipient (neither node ever sees the whole key),
+    // and PIN the node-set identity (a hash over both nodes' vks + t) so a later open detects a swap.
+    let (wrapped_cek_b64, wrapped_cek_share2_b64, vk2_b64, node_set_id_b64) = match &node_b {
         None => (
             escrow_share_to_recipient(&recipient_pub_b64, &cek_bytes, &kid16, &producer_signer)?,
             None,
             None,
+            None,
         ),
-        Some((vk_b, recipient_b)) => {
+        Some((vk_a, vk_b, recipient_b)) => {
             // A uniform random mask hides the CEK information-theoretically in either share alone.
             let seed = ddrm_envelope::random_seed();
             let mask: Vec<u8> = seed.iter().copied().take(cek_bytes.len()).collect();
             let (share1, share2) = ddrm_envelope::split_cek_xor(&cek_bytes, &mask)?;
+            // The producer escrowed the two shares to THIS node-set (node A's vk + node B's vk, t=2).
+            let vk_a_bytes = B64.decode(vk_a).map_err(|e| e.to_string())?;
+            let vk_b_bytes = B64.decode(vk_b).map_err(|e| e.to_string())?;
+            let node_set_id = ddrm_envelope::threshold_node_set_id(2, &vk_a_bytes, &vk_b_bytes);
             (
                 escrow_share_to_recipient(&recipient_pub_b64, &share1, &kid16, &producer_signer)?,
                 Some(escrow_share_to_recipient(recipient_b, &share2, &kid16, &producer_signer)?),
                 Some(vk_b.clone()),
+                Some(B64.encode(node_set_id)),
             )
         }
     };
@@ -792,6 +809,7 @@ fn publish_escrow(
         recipient_pub_b64,
         wrapped_cek_share2_b64,
         vk2_b64,
+        node_set_id_b64,
     };
     let bytes = serde_json::to_vec_pretty(&fixture.to_json()).map_err(|e| e.to_string())?;
     std::fs::write(fixture_path, bytes).map_err(|e| format!("write publish fixture: {e}"))?;
@@ -1899,7 +1917,10 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // For `dkms`, START the external NODE DAEMON listening on its socket BEFORE the rail comes up, so
     // the key-provider can CONNECT to it (rather than spawn it). The guard kills + reaps it on any
     // return path. The master is born + stays in the daemon's node-local store.
-    let _dkms_daemon = if cfg.authority == AuthorityBackend::Dkms {
+    // `mut` (and no leading underscore): the node-fault gates KILL + RESTART these guards to prove the
+    // live rail fails closed when a secret-holder goes down. On non-threshold/reference paths they are
+    // held only for their Drop (teardown) — referenced via the gates below so no unused warning.
+    let mut dkms_daemon = if cfg.authority == AuthorityBackend::Dkms {
         let node_bin = cfg
             .dkms_authority_bin
             .as_deref()
@@ -1912,7 +1933,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     };
     // 2-of-2 THRESHOLD: ALSO start node B's daemon (its own store/socket, the SAME known caller
     // allow-listed) so the key-provider's dual-recover can reach BOTH secret-holders.
-    let _dkms_daemon_b = if cfg.authority == AuthorityBackend::Dkms && cfg.threshold {
+    let mut dkms_daemon_b = if cfg.authority == AuthorityBackend::Dkms && cfg.threshold {
         let node_bin = cfg
             .dkms_authority_bin
             .as_deref()
@@ -2051,6 +2072,44 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     )?;
     if fixture.recipient_pub_b64 != recipient_pub_b64 {
         return Err("publish fixture recipient does not match the launched authority".to_string());
+    }
+    // 2-of-2 THRESHOLD (Day 101–102): PIN the node-set. The producer durably recorded the identity of
+    // the node-set it escrowed the two shares to (`node_set_id` over both nodes' vks + t). RE-DERIVE it
+    // from the PUBLISHED descriptor's `threshold` block and fail closed if they differ — so a descriptor
+    // whose node-set was silently swapped (one node re-pointed at a DIFFERENT secret-holder than the
+    // producer escrowed to) is DETECTED before the rail recovers anything. PC2 cannot do this: its
+    // node-set lives inside Lit's opaque network, so a swapped member is uninspectable.
+    if cfg.threshold {
+        let pinned = fixture
+            .node_set_id_b64
+            .as_ref()
+            .ok_or("a threshold publish fixture must pin a node_set_id")?;
+        let desc: Value = serde_json::from_slice(
+            &std::fs::read(&descriptor_path).map_err(|e| format!("re-read dkms descriptor: {e}"))?,
+        )
+        .map_err(|e| format!("parse dkms descriptor: {e}"))?;
+        let nodes = desc
+            .get("threshold")
+            .and_then(|t| t.get("nodes"))
+            .and_then(Value::as_array)
+            .ok_or("threshold descriptor carries no node list to pin")?;
+        if nodes.len() != 2 {
+            return Err("threshold descriptor must list exactly two nodes for a 2-of-2 node-set".to_string());
+        }
+        let vk_of = |i: usize| -> Result<Vec<u8>, String> {
+            let s = nodes[i]
+                .get("verifying_key_b64")
+                .and_then(Value::as_str)
+                .ok_or("threshold descriptor node is missing verifying_key_b64")?;
+            B64.decode(s).map_err(|e| e.to_string())
+        };
+        let derived = ddrm_envelope::threshold_node_set_id(2, &vk_of(0)?, &vk_of(1)?);
+        if B64.encode(derived) != *pinned {
+            return Err(
+                "the published descriptor's node-set does NOT match the producer-pinned node_set_id — a node was swapped"
+                    .to_string(),
+            );
+        }
     }
     // The session binding is the ONLY per-open part: compute the transcript AAD over the
     // decrypt boundary's freshly-minted session key, then bind the key transport's material
@@ -2281,6 +2340,72 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             ));
         }
         step(22, "key-provider (2-of-2): a 3-of-N threshold descriptor failed closed at init — the runtime never silently downgrades a stronger threshold");
+
+        // --- fail-closed #5 + #6 (NODE FAULT, Day 101–102): the LIVE 2-of-2 rail must fail closed if
+        // EITHER secret-holder goes down — NO partial CEK, NO single-node fallback, NO record persisted.
+        // PC2 cannot express this: a downed node lives inside Lit's opaque network, so its only recourse
+        // is to retry the whole opaque RPC (chipotle-client.ts:575); it has no per-node fault semantics.
+        // We OWN the two nodes, so we drive the real fault through the production host.
+        tamper.set(false); // step 10 left the plan source in tamper mode; restore the honest plan.
+        let persisted_threshold = DurableEventStore::load(&receipts_dir)?.len();
+        let node_bin = cfg
+            .dkms_authority_bin
+            .as_deref()
+            .ok_or("threshold node-fault gate requires a dkms_authority_bin")?;
+
+        // #5: node B DOWN → the dual-recover fails at node B; host.open fails closed, persists nothing.
+        if let Some(mut g) = dkms_daemon_b.take() {
+            let _ = g.child.kill();
+            let _ = g.child.wait();
+        }
+        if host.open(&cid(), VIEWER).is_ok() {
+            return Err("the 2-of-2 rail opened with node B DOWN — it must fail closed, never fall back to one node".to_string());
+        }
+        if DurableEventStore::load(&receipts_dir)?.len() != persisted_threshold {
+            return Err("a node-B-down open must persist no runtime-event record".to_string());
+        }
+        // Node B stays down — it is not needed downstream (the post-shutdown probes spawn their own
+        // daemons), and `dkms_daemon_b` is now None so there is nothing left to tear down for it.
+        step(23, "key-provider (2-of-2): node B DOWN → the live rail failed closed (no partial CEK, no single-node fallback, no record persisted)");
+
+        // #6: node A DOWN → the dual-recover fails at node A (recovered first); same fail-closed property.
+        if let Some(mut g) = dkms_daemon.take() {
+            let _ = g.child.kill();
+            let _ = g.child.wait();
+        }
+        if host.open(&cid(), VIEWER).is_ok() {
+            return Err("the 2-of-2 rail opened with node A DOWN — it must fail closed".to_string());
+        }
+        if DurableEventStore::load(&receipts_dir)?.len() != persisted_threshold {
+            return Err("a node-A-down open must persist no runtime-event record".to_string());
+        }
+        // RESTART node A: the post-shutdown adversarial probe (steps 13–17) connects to node A's socket.
+        dkms_daemon = Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64)?);
+        step(24, "key-provider (2-of-2): node A DOWN → the live rail failed closed; the runtime never degrades a 2-of-2 to a single node");
+
+        // --- fail-closed #7 (NODE-SET SWAP, Day 101–102): the producer durably PINNED the identity of
+        // the node-set it escrowed to (`node_set_id`). Prove a descriptor whose node B was silently
+        // re-pointed at a DIFFERENT secret-holder is DETECTED — its re-derived node-set id no longer
+        // matches the pin. PC2 cannot do this: its node-set is opaque inside Lit, so a swapped member is
+        // uninspectable. (The decrypt boundary independently rejects the swapped node's seal under the
+        // pinned node-B vk — Day 97–98 step 20 — so the swap fails at BOTH the descriptor + the boundary.)
+        let pinned = fixture
+            .node_set_id_b64
+            .as_ref()
+            .ok_or("threshold fixture must pin a node_set_id")?;
+        let desc: Value = serde_json::from_slice(
+            &std::fs::read(&descriptor_path).map_err(|e| format!("re-read descriptor for swap gate: {e}"))?,
+        )
+        .map_err(|e| format!("parse descriptor for swap gate: {e}"))?;
+        let nodes = desc["threshold"]["nodes"].as_array().ok_or("descriptor has no node list")?;
+        let vk_a = B64.decode(nodes[0]["verifying_key_b64"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+        // A rogue secret-holder's vk (a DISTINCT identity the attacker controls).
+        let (_rogue_signer, rogue_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0xE7u8; 32]);
+        let swapped_id = ddrm_envelope::threshold_node_set_id(2, &vk_a, &rogue_vk);
+        if B64.encode(swapped_id) == *pinned {
+            return Err("a node-set with node B swapped to a rogue identity matched the pinned id — the pin is not binding".to_string());
+        }
+        step(25, "runtime-core host: a node-set with node B SWAPPED to a rogue secret-holder is DETECTED (node-set-id pin mismatch) — a silently swapped node never passes the open");
     }
     } // end verify-only adversarial gates
 
@@ -2334,6 +2459,11 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     drop(rights_cell);
     drop(key_cell);
     drop(decrypt_cell);
+    // Tear down the external dkms daemons LAST — they had to outlive the post-shutdown probes
+    // (the adversarial probe connects to node A's socket). Explicit drop so the restarted node-A
+    // guard (Day 101–102 node-fault gate) is observably consumed here, not just at scope end.
+    drop(dkms_daemon);
+    drop(dkms_daemon_b);
     if !cfg.keep_work_dir {
         let _ = std::fs::remove_dir_all(&work_dir);
     }
