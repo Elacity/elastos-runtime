@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 55).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-55 consumer-half orchestration smoke — `drm → rights → key (reference) → decrypt` runs end to end across the REAL capsule binaries, fail-closed, no Lit/dKMS/chain; run `scripts/ddrm-consumer-smoke.sh`, ~61 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 56).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-56 Phase B — `rights-provider` renders a real on-chain ownership answer into a typed `RightsDecisionReceiptV1`; the consumer smoke is now gated by it (`rights(allowed) → key → decrypt`); run `scripts/ddrm-consumer-smoke.sh`, ~62 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -532,13 +532,17 @@ CEK to it transcript-bound (shared encoder), the boundary unwraps in-VM and decr
 CENC segment, returning only a scoped session (no CEK/plaintext on any wire); a mismatched
 transcript fails closed. To enable it, the reference `key init` now publishes its verifying
 key (`key-authority-ref`=25) and `release_receipt_hash` moved into the shared crate
-(`ddrm-envelope` lib=12; decrypt byte-identical). **Phase A (consumer half) is now runnable.**
-Next, in order:
-- **Phase B** — point `rights-provider` at `chain-provider::has_access_by_content_id`
-  so the `rights` step is a real on-chain ownership check with the wallet (today the smoke
-  drives `rights`/`drm` as reachable steps, not yet real Base validation).
-- **Phase A follow-ups** — a `wasm32-wasip1` variant of the smoke (today native); have the
-  orchestrator drive `drm open` / `rights` decision ops (not just `status`).
+(`ddrm-envelope` lib=12; decrypt byte-identical). **Phase A (consumer half) is now runnable.** Day 56 then started **Phase B**: behind a
+`chain-rights` dev profile, `rights-provider` consumes the typed
+`chain-provider::has_access_by_content_id` answer (injected by the runtime core — it holds
+no chain-RPC capability), binds it to the request, and emits a `RightsDecisionReceiptV1`;
+the consumer smoke now drives that real decision (mocked-owned attestation) and uses the
+receipt to gate the key release, proving `rights(allowed) → key → decrypt`
+(`rights-provider`=9 default unchanged, `chain-rights`=17). Next, in order:
+- **Phase B (cont.)** — drive `chain-provider` against live Base (funded wallet holding an
+  Elacity access token) so the ownership answer is real, not mocked.
+- **Phase C** — the producer half (encrypt → publish on-chain → IPFS pin → content market).
+- **Phase A follow-ups** — a `wasm32-wasip1` variant of the smoke (today native).
 
 Still **blocked on others** (parallel): fold `SealedDecryptMaterialV1` into the shared
 `elastos-common` contract (needs push access); production dKMS (Anders/dKMS team).

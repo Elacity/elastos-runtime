@@ -237,10 +237,17 @@ decrypt-provider OpenSessionV1`.
   dKMS-wrapped envelope); not yet default-on inside the runtime; smoke is native (a
   `wasm32-wasip1` variant is a follow-up).
 
-### Phase B — Real chain validation (Base) via `chain-provider`
+### Phase B — Real chain validation (Base) via `chain-provider` 🟦 UNDERWAY
 Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real
 AuthorityGateway on Base, keyed by the KID. Now "do I own the access token?" is a real
 on-chain check with your wallet.
+- **Status (Day 56):** the `rights → chain` link is wired behind a `chain-rights` dev
+  profile — `rights-provider` consumes the typed `has_access_by_content_id` answer
+  (injected by the runtime core; it holds no chain-RPC capability), binds it to the
+  request, and emits a `RightsDecisionReceiptV1` (owned → allowed, unowned → denied,
+  foreign/stale → fail-closed). The consumer smoke drives this real decision and gates
+  the key release on it. **Remaining:** drive `chain-provider` against **live Base** with
+  a funded wallet (today the on-chain answer is mocked at the provider boundary).
 - **Testable:** with a funded wallet holding an Elacity access token, the rights step
   returns allowed for owned content and denies otherwise — the exact "blockchain
   validation using my wallet" you described, but driven by the runtime.

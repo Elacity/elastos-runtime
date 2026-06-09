@@ -42,7 +42,8 @@ build key-provider --features key-authority-ref
 # session mint + publish at init. The consumer half needs both.
 build decrypt-provider --features rail-material,rail-mint
 build drm-provider
-build rights-provider
+# chain-rights: render the (mocked) on-chain ownership answer into a typed receipt.
+build rights-provider --features chain-rights
 
 KEY_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
 DECRYPT_BIN="${CAPSULES}/decrypt-provider/target/debug/decrypt-provider"

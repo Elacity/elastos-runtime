@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~61 commits**, tip Day-55 consumer-half orchestration smoke — the chain `drm → rights → key (reference) → decrypt` now runs end to end across the REAL capsule binaries, fail-closed, with no Lit/dKMS/chain; `scripts/ddrm-consumer-smoke.sh`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~62 commits**, tip Day-56 Phase B — `rights-provider` now renders a real on-chain ownership answer (`chain-provider::has_access_by_content_id`) into a typed `RightsDecisionReceiptV1`, and the consumer smoke is gated by it: `rights(allowed) → key → decrypt`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,27 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **⛓️ Day 56 — real on-chain ownership gates the rights step (Phase B, LANDED).**
+> The `rights` step is no longer a stub: behind a `chain-rights` dev profile,
+> `rights-provider` consumes the typed answer of `chain-provider::has_access_by_content_id`
+> (a `ChainAccessAttestationV1` injected by the runtime core — rights-provider holds NO
+> chain-RPC capability, that authority stays in `chain-provider`), **binds it to the
+> request** (content_id + right must match, else fail-closed), and renders a
+> `RightsDecisionReceiptV1` (`allowed = has_access`). Owned → `allowed`; unowned →
+> a real `denied` (key-provider then fails closed on it); a foreign/stale attestation
+> or bad request → `invalid_request`. The clock is injected (`now_unix` + `ttl_secs`),
+> never ambient. The op is isolated and additive: default build byte-identical
+> (rights-provider=9), the new feature is the single new rung (`chain-rights`=17); a
+> hidden `raw_chain_rpc` field is rejected (`deny_unknown_fields`). The **consumer smoke
+> now drives the REAL rights decision** (mocked-owned attestation, no live RPC) and uses
+> its emitted receipt to gate the key release — so it proves `rights(allowed) → key →
+> decrypt` end to end. **Gate:** smoke PASS, full ladder INTACT, drift PASS, no new warnings.
+> **What's still dev-shaped:** the on-chain answer is mocked in the smoke (a funded
+> wallet + live Base RPC through `chain-provider` is the next rung); the runtime core
+> that sequences `chain → rights → key` is still stood in for by the orchestrator.
+> **Next (Phase B cont. / C):** drive `chain-provider` against live Base for a real
+> token-ownership check; then begin the producer half (encrypt → publish → IPFS → market).
 
 > **▶️ Day 55 — consumer-half orchestration smoke: the chain RUNS end to end (Phase A.4, LANDED).**
 > The first point a human can drive the consumer half and SEE it work. A new

@@ -5,6 +5,8 @@
 //! key-backend authority, raw CEKs, or provider credentials through this provider.
 
 use elastos_common::protected_content::PROTECTED_CONTENT_ACTIONS;
+#[cfg(feature = "chain-rights")]
+use elastos_common::protected_content::{RightsDecisionReceiptV1, RIGHTS_DECISION_RECEIPT_SCHEMA};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -34,7 +36,37 @@ enum Request {
     CanDownload {
         request: ContentRightsRequest,
     },
+    /// Phase B (feature `chain-rights`): render the on-chain ownership answer into a
+    /// typed `RightsDecisionReceiptV1`. The runtime core supplies `chain_access` — the
+    /// typed result of `chain-provider::has_access_by_content_id` — and an injected
+    /// clock; this provider binds it to the request and emits the decision. It does NO
+    /// chain RPC itself.
+    #[cfg(feature = "chain-rights")]
+    DecideAccessFromChain {
+        request_id: String,
+        request: RightsAccessRequest,
+        chain_access: ChainAccessAttestationV1,
+        now_unix: u64,
+        ttl_secs: u64,
+    },
     Shutdown,
+}
+
+/// Typed on-chain ownership attestation (feature `chain-rights`): the exact shape
+/// `chain-provider::has_access_by_content_id` returns. It is data, not authority —
+/// rights-provider never holds the chain RPC capability; the runtime core obtained
+/// this from chain-provider and injects it. `deny_unknown_fields` keeps any raw RPC
+/// handle/credential from riding in.
+#[cfg(feature = "chain-rights")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChainAccessAttestationV1 {
+    network: String,
+    contract: String,
+    content_id: String,
+    subject: String,
+    right: String,
+    has_access: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,8 +143,79 @@ impl RightsProvider {
             Request::IsSubscriptionActive { request } => self.is_subscription_active(request),
             Request::CanStream { request } => self.can_stream(request),
             Request::CanDownload { request } => self.can_download(request),
+            #[cfg(feature = "chain-rights")]
+            Request::DecideAccessFromChain {
+                request_id,
+                request,
+                chain_access,
+                now_unix,
+                ttl_secs,
+            } => self.decide_access_from_chain(request_id, request, chain_access, now_unix, ttl_secs),
             Request::Shutdown => Response::empty_ok(),
         }
+    }
+
+    /// Phase B (feature `chain-rights`): turn a typed on-chain ownership answer into a
+    /// `RightsDecisionReceiptV1`. The attestation is bound to THIS request (matching
+    /// content_id and right) so a stale/foreign chain answer cannot be slid in; the
+    /// decision mirrors the chain (`allowed = has_access`) and a denial is a real,
+    /// configured answer (downstream key-provider then fails closed on it). The clock
+    /// is an injected capability input (`now_unix`), never an ambient read.
+    #[cfg(feature = "chain-rights")]
+    fn decide_access_from_chain(
+        &self,
+        request_id: String,
+        request: RightsAccessRequest,
+        attestation: ChainAccessAttestationV1,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Response {
+        if let Err(err) = validate_access_request(&request) {
+            return Response::error("invalid_request", err);
+        }
+        if request_id.trim().is_empty() {
+            return Response::error("invalid_request", "request_id is required");
+        }
+        if ttl_secs == 0 {
+            return Response::error("invalid_request", "ttl_secs must be positive");
+        }
+        // Bind the chain attestation to this exact question — no foreign/stale answer.
+        if attestation.content_id != request.content_id {
+            return Response::error(
+                "invalid_request",
+                "chain attestation content_id does not match the request",
+            );
+        }
+        if attestation.right != request.right {
+            return Response::error(
+                "invalid_request",
+                "chain attestation right does not match the requested action",
+            );
+        }
+
+        let allowed = attestation.has_access;
+        let receipt = RightsDecisionReceiptV1 {
+            schema: RIGHTS_DECISION_RECEIPT_SCHEMA.to_string(),
+            request_id,
+            content_id: request.content_id.clone(),
+            principal_id: request.principal_id.clone(),
+            session_id: request.session_id.clone(),
+            right: request.right.clone(),
+            provider: "rights-provider".to_string(),
+            allowed,
+            issued_at: now_unix,
+            expires_at: now_unix.saturating_add(ttl_secs),
+        };
+        Response::ok(json!({
+            "decision": if allowed { "allowed" } else { "denied" },
+            "receipt": serde_json::to_value(&receipt).unwrap_or(Value::Null),
+            // Provenance of the on-chain answer (data only — rights-provider did no RPC).
+            "chain_source": {
+                "network": attestation.network,
+                "contract": attestation.contract,
+                "subject": attestation.subject,
+            },
+        }))
     }
 
     fn init(&mut self, _config: Value) -> Response {
@@ -120,13 +223,7 @@ impl RightsProvider {
             "provider": "rights",
             "protocol_version": "1.0",
             "configured": false,
-            "supported_operations": [
-                "status",
-                "has_access_by_content_id",
-                "is_subscription_active",
-                "can_stream",
-                "can_download"
-            ],
+            "supported_operations": supported_operations(),
         }))
     }
 
@@ -135,13 +232,7 @@ impl RightsProvider {
             "provider": "rights",
             "version": PROVIDER_VERSION,
             "configured": false,
-            "supported_operations": [
-                "status",
-                "has_access_by_content_id",
-                "is_subscription_active",
-                "can_stream",
-                "can_download"
-            ],
+            "supported_operations": supported_operations(),
             "supported_actions": PROTECTED_CONTENT_ACTIONS,
             "blocked_authority": [
                 "contract_sdk",
@@ -200,6 +291,22 @@ impl RightsProvider {
             format!("{action} rights require a configured dDRM/chain policy backend"),
         )
     }
+}
+
+/// The operations this provider answers. `decide_access_from_chain` appears only
+/// under the `chain-rights` dev profile; the default build stays fail-closed.
+fn supported_operations() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut ops = vec![
+        "status",
+        "has_access_by_content_id",
+        "is_subscription_active",
+        "can_stream",
+        "can_download",
+    ];
+    #[cfg(feature = "chain-rights")]
+    ops.push("decide_access_from_chain");
+    ops
 }
 
 fn validate_access_request(request: &RightsAccessRequest) -> Result<(), String> {
@@ -475,5 +582,128 @@ mod tests {
         .to_string();
 
         assert!(err.contains("unknown field"));
+    }
+
+    // --- Phase B: on-chain ownership -> typed rights decision (feature `chain-rights`)
+    #[cfg(feature = "chain-rights")]
+    mod chain_rights {
+        use super::*;
+
+        const NOW: u64 = 1_800_000_000;
+        const TTL: u64 = 3_600;
+
+        fn attestation(has_access: bool) -> ChainAccessAttestationV1 {
+            ChainAccessAttestationV1 {
+                network: "base".to_string(),
+                contract: "0x00000000000000000000000000000000000000aa".to_string(),
+                content_id: "bafybeigprotectedcontent".to_string(),
+                subject: "0x00000000000000000000000000000000000000bb".to_string(),
+                right: "view".to_string(),
+                has_access,
+            }
+        }
+
+        fn decide(
+            provider: &RightsProvider,
+            req: RightsAccessRequest,
+            att: ChainAccessAttestationV1,
+        ) -> Response {
+            provider.decide_access_from_chain("rights:1".to_string(), req, att, NOW, TTL)
+        }
+
+        /// Owned content: the chain says yes -> an `allowed` decision carrying a
+        /// `RightsDecisionReceiptV1` bound to the request, ready for key-provider.
+        #[test]
+        fn owned_content_yields_an_allowed_receipt() {
+            let data = ok_data(decide(&RightsProvider, access_request(), attestation(true)));
+            assert_eq!(data["decision"], "allowed");
+            let r = &data["receipt"];
+            assert_eq!(r["schema"], RIGHTS_DECISION_RECEIPT_SCHEMA);
+            assert_eq!(r["allowed"], true);
+            assert_eq!(r["content_id"], "bafybeigprotectedcontent");
+            assert_eq!(r["principal_id"], "person:local:test");
+            assert_eq!(r["session_id"], "session:test");
+            assert_eq!(r["right"], "view");
+            assert_eq!(r["provider"], "rights-provider");
+            assert_eq!(r["request_id"], "rights:1");
+            assert_eq!(r["issued_at"], NOW);
+            assert_eq!(r["expires_at"], NOW + TTL);
+            // Provenance only — no chain RPC handle/credential surfaces.
+            assert_eq!(data["chain_source"]["network"], "base");
+        }
+
+        /// Unowned content: the chain says no -> a real `denied` decision (a configured
+        /// answer, not `not_configured`); the receipt is `allowed:false` so key-provider
+        /// fails closed on it.
+        #[test]
+        fn unowned_content_yields_a_denied_receipt() {
+            let data = ok_data(decide(&RightsProvider, access_request(), attestation(false)));
+            assert_eq!(data["decision"], "denied");
+            assert_eq!(data["receipt"]["allowed"], false);
+        }
+
+        /// A chain answer for a DIFFERENT object cannot be slid under this request.
+        #[test]
+        fn mismatched_content_id_fails_closed() {
+            let mut att = attestation(true);
+            att.content_id = "bafysomethingelse".to_string();
+            assert_eq!(error_code(decide(&RightsProvider, access_request(), att)), "invalid_request");
+        }
+
+        /// A chain answer for a DIFFERENT right cannot authorize this action.
+        #[test]
+        fn mismatched_right_fails_closed() {
+            let mut att = attestation(true);
+            att.right = "download".to_string();
+            assert_eq!(error_code(decide(&RightsProvider, access_request(), att)), "invalid_request");
+        }
+
+        /// The decision still validates the access request itself (e.g. action set).
+        #[test]
+        fn invalid_access_request_fails_closed() {
+            let mut req = access_request();
+            req.right = "raw_key".to_string();
+            let mut att = attestation(true);
+            att.right = "raw_key".to_string(); // make the attestation "match" so we test request validation
+            assert_eq!(error_code(decide(&RightsProvider, req, att)), "invalid_request");
+        }
+
+        /// A zero TTL is rejected (a decision must carry a bounded lifetime).
+        #[test]
+        fn zero_ttl_fails_closed() {
+            let resp =
+                RightsProvider.decide_access_from_chain("rights:1".to_string(), access_request(), attestation(true), NOW, 0);
+            assert_eq!(error_code(resp), "invalid_request");
+        }
+
+        /// Even under this profile, the plain `has_access_by_content_id` (no injected
+        /// chain answer) stays fail-closed — the default path never decides on its own.
+        #[test]
+        fn plain_access_check_stays_fail_closed() {
+            assert_eq!(
+                error_code(RightsProvider.has_access_by_content_id(access_request())),
+                "not_configured"
+            );
+        }
+
+        /// The injected attestation cannot smuggle a raw chain-RPC handle.
+        #[test]
+        fn attestation_rejects_hidden_chain_authority() {
+            let mut att = serde_json::to_value(attestation(true)).unwrap();
+            att.as_object_mut()
+                .unwrap()
+                .insert("raw_chain_rpc".to_string(), json!("must-not-be-accepted"));
+            let err = serde_json::from_value::<Request>(json!({
+                "op": "decide_access_from_chain",
+                "request_id": "rights:1",
+                "request": serde_json::to_value(access_request()).unwrap(),
+                "chain_access": att,
+                "now_unix": NOW,
+                "ttl_secs": TTL,
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unknown field"));
+        }
     }
 }

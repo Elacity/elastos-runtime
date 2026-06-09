@@ -135,7 +135,46 @@ fn decrypt_request() -> Value {
     })
 }
 
-fn key_release_request() -> Value {
+fn rights_access_request() -> Value {
+    json!({
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "content_id": OBJECT_CID,
+        "right": ACTION,
+        "reason": "open protected document",
+    })
+}
+
+/// A mocked on-chain ownership answer (stands in for `chain-provider::has_access_by_
+/// content_id`; no live RPC in the smoke). `has_access: true` => owned.
+fn owned_chain_attestation() -> Value {
+    json!({
+        "network": "base",
+        "contract": "0x00000000000000000000000000000000000000aa",
+        "content_id": OBJECT_CID,
+        "subject": "0x00000000000000000000000000000000000000bb",
+        "right": ACTION,
+        "has_access": true,
+    })
+}
+
+/// A hardcoded fallback receipt (used only when no rights binary is supplied).
+fn fallback_rights_receipt() -> Value {
+    json!({
+        "schema": "elastos.rights.decision.receipt/v1",
+        "request_id": "rights:smoke",
+        "content_id": OBJECT_CID,
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "right": ACTION,
+        "provider": "rights-provider",
+        "allowed": true,
+        "issued_at": RR_ISSUED_AT,
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+fn key_release_request(rights_receipt: Value) -> Value {
     json!({
         "schema": "elastos.key_release.request/v1",
         "request_id": RR_REQUEST_ID,
@@ -143,18 +182,7 @@ fn key_release_request() -> Value {
         "session_id": SESSION,
         "object_cid": OBJECT_CID,
         "action": ACTION,
-        "rights_receipt": {
-            "schema": "elastos.rights.decision.receipt/v1",
-            "request_id": "rights:smoke",
-            "content_id": OBJECT_CID,
-            "principal_id": PRINCIPAL,
-            "session_id": SESSION,
-            "right": ACTION,
-            "provider": "rights-provider",
-            "allowed": true,
-            "issued_at": RR_ISSUED_AT,
-            "expires_at": EXPIRES_AT,
-        },
+        "rights_receipt": rights_receipt,
         "key_envelope": {
             "scheme": "elastos-pq-hybrid-threshold-v0",
             "kid": "kid:smoke",
@@ -225,13 +253,33 @@ fn run(args: &[String]) -> Result<(), String> {
         step(1, "drm-provider: status ok (front door reachable)");
         drm.shutdown();
     }
-    if let Some(bin) = rights_bin {
+    // rights step: render the (mocked) on-chain ownership answer into a typed
+    // RightsDecisionReceiptV1 via the REAL rights-provider (feature `chain-rights`).
+    // The receipt then gates the key release. Falls back to a hardcoded receipt only
+    // when no rights binary is supplied.
+    let rights_receipt = if let Some(bin) = rights_bin {
         let mut rights = Capsule::spawn("rights-provider", bin)?;
-        let resp = rights.call(&json!({ "op": "status" }))?;
-        ok_data(&resp, "rights status")?;
-        step(2, "rights-provider: status ok (rights step reachable)");
+        ok_data(&rights.call(&json!({ "op": "status" }))?, "rights status")?;
+        let decision = ok_data(
+            &rights.call(&json!({
+                "op": "decide_access_from_chain",
+                "request_id": RR_REQUEST_ID,
+                "request": rights_access_request(),
+                "chain_access": owned_chain_attestation(),
+                "now_unix": RR_ISSUED_AT,
+                "ttl_secs": EXPIRES_AT - RR_ISSUED_AT,
+            }))?,
+            "rights decide_access_from_chain",
+        )?;
+        if decision["decision"].as_str() != Some("allowed") {
+            return Err(format!("rights did not allow owned content: {decision}"));
+        }
         rights.shutdown();
-    }
+        step(2, "rights-provider: on-chain ownership -> allowed; typed receipt issued");
+        decision["receipt"].clone()
+    } else {
+        fallback_rights_receipt()
+    };
 
     // --- key authority: publish the seal verifying key. -----------------------------
     let mut key = Capsule::spawn("key-provider", key_bin)?;
@@ -263,7 +311,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let release = ok_data(
         &key.call(&json!({
             "op": "release_ref",
-            "request": key_release_request(),
+            "request": key_release_request(rights_receipt.clone()),
             "decrypt_session_pub_b64": session_pub_b64,
             "cek_b64": GOLDEN_CEK_B64,
             "aad_b64": B64.encode(&aad),
@@ -319,7 +367,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let bad_release = ok_data(
         &key.call(&json!({
             "op": "release_ref",
-            "request": key_release_request(),
+            "request": key_release_request(rights_receipt.clone()),
             "decrypt_session_pub_b64": session_pub_b64,
             "cek_b64": GOLDEN_CEK_B64,
             "aad_b64": B64.encode(&bad_aad),
