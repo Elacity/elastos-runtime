@@ -262,10 +262,22 @@ on-chain check with your wallet.
   runtime. **Remaining:** a real KID/contentId↔contract mapping for your content, and the
   runtime core (not the dev orchestrator) sequencing `chain → rights → key → decrypt`.
 
-### Phase C — Producer half (encrypt → publish → IPFS → market)
+### Phase C — Producer half (encrypt → publish → IPFS → market) 🟦 UNDERWAY
 Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
 `publish-provider` (mint contentId=KID + tokenURI via chain+wallet), pin via
 `ipfs-provider`, and a `content-market` index.
+- **Status (Day 58 — contract pinned, fail-closed):** the producer↔consumer **identity
+  join** is locked: re-reading PC2 confirmed the chain keys on `hasAccessByContentId(
+  address holder, bytes16 contentId)` — the content identity is the **KID** (16 bytes),
+  not the IPFS CID (`payload_cid` is a separate field). `kid_to_content_id_bytes16`
+  proves the in-boundary KID is exactly that `bytes16 contentId` the consumer chain
+  (`chain content_id → rights → decrypt object_cid → transcript`) keys on. The
+  **CEK-escrow seam** (CEK → key authority, SEALED) is in place and **fail-closed** by
+  default (`escrow: not_configured`); the producer never ships a raw CEK. In-boundary
+  keygen + CENC are already proven (Days 19/31).
+- **Remaining:** the escrow ENGINE (Day 59 — authority publishes a recipient key, producer
+  seals the CEK via `ddrm-envelope`), a producer→consumer smoke on a FRESH CEK, then
+  `publish-provider` (mint KID + tokenURI) and the `content-market` index.
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

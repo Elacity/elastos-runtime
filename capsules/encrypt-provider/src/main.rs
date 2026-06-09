@@ -116,7 +116,11 @@ impl Response {
 }
 
 #[derive(Debug, Default)]
-struct EncryptProvider;
+struct EncryptProvider {
+    /// Where the in-boundary CEK is escrowed (sealed) so the key authority can later
+    /// re-seal it per decrypt session. Fail-closed by default — see [`CekEscrow`].
+    escrow: CekEscrow,
+}
 
 impl EncryptProvider {
     fn handle(&mut self, request: Request) -> Response {
@@ -152,6 +156,9 @@ impl EncryptProvider {
                 "chain_rpc",
                 "wallet_rpc"
             ],
+            // The CEK-escrow seam (CEK -> key authority, SEALED). Fail-closed until a
+            // key-authority recipient is configured; the producer never ships a raw CEK.
+            "escrow": self.escrow.tag(),
             // Outputs only ever carry sealed/non-secret material.
             "produces": SEALED_OBJECT_SCHEMA,
         }))
@@ -161,14 +168,92 @@ impl EncryptProvider {
         if let Err(err) = validate_seal_request(&request) {
             return Response::error("invalid_request", err);
         }
-        // Real engine (lands later): mint CEK+KID in-boundary, CENC-encrypt the
-        // asset, seal the CEK to the rights/key authority, upload ciphertext, and
-        // return a SealedObjectV1 — then zeroize the CEK. Until then, fail closed.
-        Response::error(
-            "not_configured",
-            "encrypt/seal requires a configured in-boundary keygen + CENC engine",
-        )
+        // Producer pipeline (invariant #1), in order:
+        //   1. mint CEK + KID in-boundary (proven: `cek_and_kid_generated_inside_boundary`)
+        //   2. CENC-encrypt the asset with that CEK (proven: `seal_engine_emits_no_key_material`)
+        //   3. ESCROW the CEK to the key authority — SEALED, never raw — so the authority
+        //      can later re-seal it per decrypt session (Anders' rail; key-provider side)
+        //   4. assemble a `SealedObjectV1` (KID + wrapped_cek + payload CID)
+        //   5. zeroize the CEK.
+        // The keygen + cipher are proven; the step that is not yet configured is the CEK
+        // escrow to a key authority, so the pipeline FAILS CLOSED at the escrow seam
+        // (rather than minting a key it cannot safely hand off). Day 59 wires the real
+        // PQ-hybrid escrow seal (ddrm-envelope) to the authority's published recipient key.
+        match self.escrow {
+            CekEscrow::NotConfigured => Response::error(
+                "not_configured",
+                "encrypt/seal requires a configured key-authority escrow recipient \
+                 (the CEK is SEALED to the authority, never shipped raw)",
+            ),
+        }
     }
+}
+
+/// The CEK-escrow seam — invariant #1's "seal the CEK to the authority" half.
+///
+/// The producer NEVER ships a raw CEK. After minting the CEK in-boundary it seals it
+/// to the **key authority's published recipient key**, so the authority (dKMS / Lit-
+/// compat / reference) can later recover it and re-seal it per decrypt session
+/// (Anders' rail; the `key-provider` side already opens the consumer half). Until a
+/// recipient is configured this is fail-closed — the producer refuses to mint a key
+/// it cannot safely hand off, mirroring PC2's split (host mints the CEK; the Lit
+/// Action later wraps it), but with the escrow made explicit and capability-scoped.
+#[derive(Debug, Default)]
+enum CekEscrow {
+    /// No key-authority escrow recipient configured (default → fail-closed).
+    #[default]
+    NotConfigured,
+}
+
+impl CekEscrow {
+    fn tag(&self) -> &'static str {
+        match self {
+            CekEscrow::NotConfigured => "not_configured",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EscrowError {
+    /// No key-authority recipient configured to seal the CEK to.
+    NotConfigured,
+}
+
+/// Seal the in-boundary CEK to the configured key-authority escrow recipient,
+/// returning ONLY the wrapped (sealed) CEK as base64 — never the raw key. Fail-closed
+/// until a recipient is configured; Day 59 fills this with the real PQ-hybrid seal
+/// (`ddrm-envelope`) to the authority's published recipient key. Kept as the seam now
+/// so the producer contract (and its fail-closed default) is pinned by tests first.
+#[allow(dead_code)]
+fn escrow_cek(_cek: &[u8], _kid_hex: &str, escrow: &CekEscrow) -> Result<String, EscrowError> {
+    match escrow {
+        CekEscrow::NotConfigured => Err(EscrowError::NotConfigured),
+    }
+}
+
+/// Convert the in-boundary KID (32 lowercase-hex chars / 16 bytes) into the on-chain
+/// `bytes16 contentId` the consumer chain keys on.
+///
+/// AUDIT-GROUNDED IDENTITY CONTRACT (PC2 `src/api/storage.ts`):
+/// `gateway.hasAccessByContentId(address holder, bytes16 contentId) view returns (bool)`
+/// — the chain's content identity is the **KID**, a 16-byte value, NOT the IPFS CID of
+/// the ciphertext (that is `SealedObjectV1::payload_cid`, a separate field). This is the
+/// single identity that must agree across the whole system: the KID the producer mints
+/// here is the `key_envelope.kid`, which becomes the `content_id` the rights step binds
+/// and the chain ownership call is keyed on, and the `object_cid` the decrypt transcript
+/// is welded to. Pinning the conversion here folds the "bytes16 KID" carry-forward into
+/// the producer half so producer and consumer cannot drift on what "the content" is.
+#[allow(dead_code)]
+fn kid_to_content_id_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
+    if kid_hex.len() != 32 || !kid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("KID must be 32 lowercase-hex chars (16 bytes) to be a bytes16 contentId".to_string());
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&kid_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("KID hex decode: {e}"))?;
+    }
+    Ok(out)
 }
 
 /// Freshly minted, in-boundary key material. The CEK is the only true secret: it
@@ -284,7 +369,7 @@ fn main() {
         PROVIDER_VERSION
     );
 
-    let mut provider = EncryptProvider;
+    let mut provider = EncryptProvider::default();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -339,7 +424,7 @@ mod tests {
 
     fn handle(value: Value) -> Response {
         let request: Request = serde_json::from_value(value).expect("request should parse");
-        EncryptProvider.handle(request)
+        EncryptProvider::default().handle(request)
     }
 
     fn ok_data(response: Response) -> Value {
@@ -377,6 +462,99 @@ mod tests {
         // A fully valid request must NOT seal by accident — no engine, no output.
         let code = error_code(handle(json!({ "op": "seal", "request": seal_request_json() })));
         assert_eq!(code, "not_configured");
+    }
+
+    /// Phase C escrow seam (invariant #1 hand-off half). The producer must seal the
+    /// in-boundary CEK to a KEY AUTHORITY before it can emit a SealedObject; with no
+    /// authority recipient configured the escrow — and therefore `seal` — FAILS CLOSED.
+    /// This is the seam the real PQ-hybrid escrow (Day 59) fills; pinned fail-closed
+    /// first so the default can never silently ship a key.
+    #[test]
+    fn escrow_fails_closed_without_a_key_authority() {
+        let cek = [0x5Au8; 16];
+        assert_eq!(
+            escrow_cek(&cek, "0123456789abcdef0123456789abcdef", &CekEscrow::NotConfigured),
+            Err(EscrowError::NotConfigured),
+            "no authority recipient -> the CEK cannot be escrowed -> fail closed"
+        );
+        // The seam advertises its fail-closed posture in status, and `seal` refuses.
+        let data = ok_data(handle(json!({ "op": "status" })));
+        assert_eq!(data["escrow"], json!("not_configured"));
+        let code = error_code(handle(json!({ "op": "seal", "request": seal_request_json() })));
+        assert_eq!(code, "not_configured");
+    }
+
+    /// AUDIT-GROUNDED identity join (PC2 `hasAccessByContentId(holder, bytes16 contentId)`):
+    /// the chain keys on the **KID** (a 16-byte value), not the IPFS CID. The KID the
+    /// producer mints in-boundary converts losslessly to that on-chain `bytes16 contentId`,
+    /// so producer identity == chain/rights/decrypt identity. This folds the bytes16 KID
+    /// carry-forward into the producer half.
+    #[test]
+    fn producer_kid_is_the_onchain_bytes16_content_id() {
+        let minted = mint_cek_and_kid().expect("mint");
+        let content_id = kid_to_content_id_bytes16(&minted.kid_hex).expect("kid -> bytes16");
+        assert_eq!(content_id.len(), 16, "on-chain contentId is bytes16");
+        // Lossless round-trip: the bytes16 contentId re-encodes to the exact KID hex.
+        let rehex: String = content_id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(rehex, minted.kid_hex, "KID <-> bytes16 contentId is lossless");
+    }
+
+    /// A KID that is not a 16-byte hex value cannot be a `bytes16` contentId — reject it,
+    /// so a malformed/oversized identifier can never be silently truncated into the
+    /// chain ownership call (which would gate the wrong content).
+    #[test]
+    fn non_bytes16_kid_is_rejected_as_content_id() {
+        assert!(kid_to_content_id_bytes16("deadbeef").is_err(), "too short");
+        assert!(
+            kid_to_content_id_bytes16("0123456789abcdef0123456789abcdefAA").is_err(),
+            "too long"
+        );
+        assert!(
+            kid_to_content_id_bytes16("zz23456789abcdef0123456789abcdef").is_err(),
+            "non-hex"
+        );
+    }
+
+    /// The producer↔consumer JOIN: the SealedObject a producer emits carries the minted
+    /// KID as `key_envelope.kid`, and THAT KID is exactly the value the consumer chain
+    /// keys on (its bytes16 contentId). One identity, end to end — pinned so the producer
+    /// and the (already-built) consumer chain cannot drift on "what the content is".
+    #[test]
+    fn sealed_object_kid_is_the_consumer_chain_content_id() {
+        use elastos_common::protected_content::{
+            KeyEnvelopeAlgorithmsV1, KeyEnvelopeV1, SealedObjectV1, ViewerRequirementV1,
+        };
+        let minted = mint_cek_and_kid().expect("mint");
+        let sealed = SealedObjectV1 {
+            schema: SEALED_OBJECT_SCHEMA.to_string(),
+            payload_cid: "bafyciphertext".to_string(), // the IPFS CID — a DIFFERENT identity
+            rights_policy_cid: "bafyrightspolicy".to_string(),
+            availability_receipt_cid: "bafyavail".to_string(),
+            key_envelope: KeyEnvelopeV1 {
+                scheme: "elastos-pq-hybrid-threshold-v0".to_string(),
+                kid: minted.kid_hex.clone(),
+                wrapped_cek: "c2VhbGVkLWNlay1ieXRlcw==".to_string(),
+                policy_hash: "deadbeef".to_string(),
+                algorithms: KeyEnvelopeAlgorithmsV1 {
+                    cipher: "aes-256-gcm".to_string(),
+                    signature: vec!["ml-dsa-65".to_string()],
+                    kem: vec!["x25519".to_string(), "ml-kem-768".to_string()],
+                    share_scheme: "shamir-t-of-n".to_string(),
+                },
+            },
+            viewer: ViewerRequirementV1 {
+                required_interface: "media".to_string(),
+            },
+        };
+        // The chain ownership identity derives from the ENVELOPE KID, not the payload CID.
+        let content_id =
+            kid_to_content_id_bytes16(&sealed.key_envelope.kid).expect("envelope kid -> bytes16");
+        let rehex: String = content_id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(rehex, minted.kid_hex);
+        assert_ne!(
+            sealed.payload_cid, sealed.key_envelope.kid,
+            "payload CID and contentId(KID) are distinct identities — must not be conflated"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~63 commits**, tip Day-57 Phase B cont. — the on-chain ownership answer is now characterized at the RPC boundary (`chain-provider::has_access_by_content_id` decodes owned/unowned/malformed via a mocked `eth_call`), its output shape is pinned 1:1 to `rights-provider`'s attestation, and the consumer smoke gained an **opt-in live mode** that drives the real `chain-provider` against Base for a true wallet-ownership check). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~64 commits**, tip Day-58 Phase C kickoff — the producer half's identity + escrow contract is pinned: `encrypt-provider`'s in-boundary KID is proven to be the on-chain `bytes16 contentId` the consumer chain keys on (audit-grounded against PC2 `hasAccessByContentId`), and the CEK→key-authority **escrow seam is fail-closed** by default (the producer never ships a raw CEK; encrypt=17)). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,29 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🏭 Day 58 — producer half kickoff: identity join + fail-closed CEK escrow (Phase C, LANDED).**
+> First Phase-C rung, and it's contract-first (no engine guesswork). Two things landed
+> in `encrypt-provider`, both pinned by tests, default still fail-closed. (1) **Identity
+> join, audit-grounded:** re-reading PC2 (`src/api/storage.ts`) confirmed the chain keys
+> ownership on `hasAccessByContentId(address holder, bytes16 contentId)` — the content
+> identity is the **KID** (16 bytes), NOT the IPFS CID (that's `payload_cid`, a separate
+> field). `kid_to_content_id_bytes16` now proves the in-boundary-minted KID converts
+> losslessly to that on-chain `bytes16 contentId`, and that the `SealedObjectV1` a
+> producer emits carries exactly the KID the consumer chain (`chain content_id → rights
+> binding → decrypt object_cid → transcript`) keys on — one identity end to end, so
+> producer and consumer cannot drift. This folds the "bytes16 KID" carry-forward into the
+> producer half. (2) **CEK escrow seam, fail-closed:** the producer must seal the CEK to a
+> **key authority** before it can emit a SealedObject (invariant #1's hand-off half,
+> mirroring PC2's host-mints / Lit-Action-wraps split but capability-scoped). With no
+> authority recipient configured the escrow — and therefore `seal` — fails closed
+> (`escrow_cek → NotConfigured`; status advertises `escrow: not_configured`); the producer
+> refuses to mint a key it cannot safely hand off. The in-boundary keygen + CENC cipher
+> were already proven (Days 19/31); this adds the contract around them. **Gate:** encrypt
+> ladder 13→17, full ladder INTACT, drift PASS, consumer smoke green, no new warnings.
+> **Next (Day 59):** the escrow ENGINE — key authority publishes a recipient key, the
+> producer seals the CEK to it via `ddrm-envelope`, and a producer→consumer smoke runs
+> `encrypt → SealedObjectV1 → key → decrypt` on a FRESH (non-golden) CEK.
 
 > **🔗 Day 57 — the on-chain ownership answer is real & verifiable end to end (Phase B cont., LANDED).**
 > Day 56 made `rights` consume a typed attestation; Day 57 makes that attestation

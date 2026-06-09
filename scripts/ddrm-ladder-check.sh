@@ -35,7 +35,7 @@ rc=0
 # Counts are pinned; update them in lockstep with the suites (and with
 # DDRM_STATUS.md / HANDOVER.md) when tests are intentionally added/removed.
 LADDER=(
-  "encrypt-provider (default)|encrypt-provider||13"
+  "encrypt-provider (default)|encrypt-provider||17"
   "drm-provider (default)|drm-provider||12"
   "rights-provider (default)|rights-provider||9"
   "rights-provider chain-rights|rights-provider|chain-rights|18"
