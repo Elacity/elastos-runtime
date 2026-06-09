@@ -11,10 +11,14 @@
 //! ALSO drives the two adversarial fail-closed gates.
 //!
 //! `authority.backend` selects the key authority — `reference` (a durable key store the runtime
-//! generates) or `dkms` (an EXTERNAL authority the publish phase provisions as an immutable
-//! descriptor, which the open then RESOLVES). The OPEN PATH is BACKEND-AGNOSTIC: only the key
-//! provider's `init` config differs — the analogue of PC2's `getSessionView(token)` dispatching on
-//! `stored.backend` (`BackendSessionService.ts:368`–`:377`) while the downstream open is identical.
+//! generates) or `dkms` (an EXTERNAL, SECRET-HOLDING node). For `dkms` the publish phase PROVISIONS
+//! the node (the master stays in the node's own store) and writes a PUBLIC-ONLY descriptor (the
+//! node's pins + endpoint, NO secret); at open, the `key-provider` holds only that public identity
+//! and DELEGATES recovery to the node — the master/CEK NEVER enter the runtime. The OPEN PATH is
+//! BACKEND-AGNOSTIC: only the key provider's `init` config differs — the analogue of PC2's
+//! `getSessionView(token)` dispatching on `stored.backend` (`BackendSessionService.ts:368`–`:377`)
+//! while the downstream open is identical, and PC2's client holding only the public `pkpId` and
+//! delegating recovery to the Lit network (`recoverCEKEnvelope`, `chipotle-client.ts:1438`).
 //! It drives the REAL capsule binaries over their newline-delimited JSON stdin/stdout protocol,
 //! proving the consumer half runs end to end:
 //!
@@ -531,53 +535,68 @@ fn publish_escrow(
     fixture_path: &std::path::Path,
     backend: AuthorityBackend,
     descriptor_path: &std::path::Path,
+    dkms_node_bin: Option<&str>,
+    node_store_path: &str,
 ) -> Result<PublishEscrow, String> {
-    // The producer/provisioner ALWAYS generates the authority's key material via the reference
-    // authority on a durable store (one master seed; STABLE vk + recipient). For `dkms`, this is the
-    // dKMS NODE PROVISIONING step: from that generated material we publish an immutable descriptor
-    // (master + the published-identity pins) the runtime later RESOLVES — the analogue of a dKMS
-    // node's provisioned shares + its published authority pubkey (PC2 caches the provisioned
-    // descriptor once, `chipotle-client.ts:935`, then only reads it).
-    let mut key = Capsule::spawn("key-provider(publish)", key_bin)?;
-    let init = ok_data(
-        &key.call(&json!({
-            "op": "init",
-            "config": { "backend": "reference", "authority_key_store": key_store_path }
-        }))?,
-        "key init (publish)",
-    )?;
-    let verifying_key_b64 = init["seal_verifying_key_b64"]
-        .as_str()
-        .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
-        .to_string();
-    let recipient_pub_b64 = init["seal_recipient_pub_b64"]
-        .as_str()
-        .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
-        .to_string();
-    key.shutdown();
-
-    // `dkms`: publish the immutable external-authority descriptor from the generated material. The
-    // master seed comes from the store the reference authority just persisted (the provisioner OWNS
-    // the key material), and the pins are EXACTLY what the authority published — so a later `dkms`
-    // launch re-derives the SAME identity and the pin check passes.
-    if backend == AuthorityBackend::Dkms {
-        let store: Value = serde_json::from_slice(
-            &std::fs::read(key_store_path).map_err(|e| format!("read key store for dkms provisioning: {e}"))?,
-        )
-        .map_err(|e| format!("parse key store for dkms provisioning: {e}"))?;
-        let master_seed_b64 = store["authority_seed_b64"]
-            .as_str()
-            .ok_or("key store is missing authority_seed_b64 (cannot provision a dkms descriptor)")?;
-        let descriptor = json!({
-            "schema": "elastos.dkms.authority/v1",
-            "authority_master_seed_b64": master_seed_b64,
-            "verifying_key_b64": verifying_key_b64,
-            "recipient_pub_b64": recipient_pub_b64,
-        });
-        let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| e.to_string())?;
-        std::fs::write(descriptor_path, bytes)
-            .map_err(|e| format!("write dkms authority descriptor: {e}"))?;
-    }
+    // PROVISION the selected authority and read its PUBLISHED identity (stable vk + recipient).
+    //
+    // `reference`: the in-runtime authority generates + persists its own master on a durable store.
+    //
+    // `dkms`: the SECRET-HOLDING NODE is provisioned — it generates + persists its master in its OWN
+    // node-local store (`node_store_path`), and the runtime only reads back its PUBLIC identity. We
+    // then publish a PUBLIC-ONLY descriptor (the node's pins + endpoint, NO master) the runtime later
+    // RESOLVES. The master NEVER enters the runtime. The analogue of provisioning a dKMS node + its
+    // published authority pubkey (PC2 holds only the public `pkpId`/`authority`, `chipotle-client.ts`).
+    let (_verifying_key_b64, recipient_pub_b64) = match backend {
+        AuthorityBackend::Reference => {
+            let mut key = Capsule::spawn("key-provider(publish)", key_bin)?;
+            let init = ok_data(
+                &key.call(&json!({
+                    "op": "init",
+                    "config": { "backend": "reference", "authority_key_store": key_store_path }
+                }))?,
+                "key init (publish)",
+            )?;
+            let vk = init["seal_verifying_key_b64"].as_str()
+                .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
+                .to_string();
+            let recipient = init["seal_recipient_pub_b64"].as_str()
+                .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
+                .to_string();
+            key.shutdown();
+            (vk, recipient)
+        }
+        AuthorityBackend::Dkms => {
+            let node_bin = dkms_node_bin.ok_or("dkms backend requires a dkms_authority_bin in the config")?;
+            let mut node = Capsule::spawn("dkms-authority(provision)", node_bin)?;
+            let init = ok_data(
+                &node.call(&json!({
+                    "op": "init",
+                    "config": { "authority_key_store": node_store_path }
+                }))?,
+                "dkms-authority init (provision)",
+            )?;
+            let vk = init["seal_verifying_key_b64"].as_str()
+                .ok_or("dkms-authority node did not publish a verifying key")?
+                .to_string();
+            let recipient = init["seal_recipient_pub_b64"].as_str()
+                .ok_or("dkms-authority node did not publish a recipient key")?
+                .to_string();
+            node.shutdown();
+            // Publish the PUBLIC-ONLY descriptor — pins + endpoint, NOTHING secret. The master lives
+            // ONLY in `node_store_path` (which this runtime created via the node but never reads).
+            let descriptor = json!({
+                "schema": "elastos.dkms.authority/v2",
+                "verifying_key_b64": vk,
+                "recipient_pub_b64": recipient,
+                "authority_endpoint": node_bin,
+            });
+            let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| e.to_string())?;
+            std::fs::write(descriptor_path, bytes)
+                .map_err(|e| format!("write dkms authority descriptor: {e}"))?;
+            (vk, recipient)
+        }
+    };
 
     let recipient_pub_bytes = B64.decode(&recipient_pub_b64).map_err(|e| e.to_string())?;
     let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub_bytes)
@@ -1037,8 +1056,9 @@ enum OpenMode {
 enum AuthorityBackend {
     /// In-runtime dev authority: the runtime GENERATES + persists its own master seed (durable key store).
     Reference,
-    /// External authority: the runtime is HANDED a descriptor (the dKMS-provisioned key material +
-    /// published-identity pins) and RESOLVES its identity from it — never minting.
+    /// External authority: a SECRET-HOLDING node owns the master; the runtime holds only its
+    /// PUBLIC identity (a public-only descriptor) and DELEGATES recovery to the node — never the
+    /// master, never the raw CEK.
     Dkms,
 }
 
@@ -1069,6 +1089,10 @@ struct OpenConfig {
     mode: OpenMode,
     /// Which key authority backend the open binds to (`authority.backend`, default `reference`).
     authority: AuthorityBackend,
+    /// The EXTERNAL dKMS authority NODE binary (`authority.dkms_authority_bin`). Required when
+    /// `authority.backend == dkms`: the publish phase provisions it (master stays in the node) and
+    /// the runtime delegates recovery to it. Absent for `reference`.
+    dkms_authority_bin: Option<String>,
 }
 
 impl OpenConfig {
@@ -1089,13 +1113,20 @@ impl OpenConfig {
         // `authority` is an OBJECT (room to carry per-backend descriptors later); today only its
         // `backend` tag is read. Absent → reference (back-compat). Fail-closed on an unknown tag or
         // a non-object `authority`.
-        let authority = match obj.get("authority") {
-            None => AuthorityBackend::Reference,
-            Some(Value::Object(auth)) => match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
-                "reference" => AuthorityBackend::Reference,
-                "dkms" => AuthorityBackend::Dkms,
-                other => return Err(format!("config `authority.backend` must be \"reference\" or \"dkms\", got {other:?}")),
-            },
+        let (authority, dkms_authority_bin) = match obj.get("authority") {
+            None => (AuthorityBackend::Reference, None),
+            Some(Value::Object(auth)) => {
+                let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
+                    "reference" => AuthorityBackend::Reference,
+                    "dkms" => AuthorityBackend::Dkms,
+                    other => return Err(format!("config `authority.backend` must be \"reference\" or \"dkms\", got {other:?}")),
+                };
+                let node_bin = auth.get("dkms_authority_bin").and_then(Value::as_str).map(str::to_string);
+                if backend == AuthorityBackend::Dkms && node_bin.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    return Err("config `authority.dkms_authority_bin` is required when authority.backend is \"dkms\"".to_string());
+                }
+                (backend, node_bin)
+            }
             Some(_) => return Err("config `authority` must be an object".to_string()),
         };
         Ok(Self {
@@ -1108,6 +1139,7 @@ impl OpenConfig {
             keep_work_dir: obj.get("keep_work_dir").and_then(Value::as_bool).unwrap_or(false),
             mode,
             authority,
+            dkms_authority_bin,
         })
     }
 }
@@ -1140,7 +1172,23 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let key_store_path = work_dir.join("authority-key-store.json").to_string_lossy().into_owned();
     let descriptor_path = work_dir.join("dkms-authority.json");
     let fixture_path = work_dir.join("publish-escrow.json");
-    let escrow = publish_escrow(key_bin, &key_store_path, &fixture_path, cfg.authority, &descriptor_path)?;
+    // The dKMS NODE's master store — node-local, the SECRET stays here. The runtime creates it via
+    // the node at provision time + names it in the env the node reads, but NEVER reads it itself.
+    let node_store_path = work_dir.join("dkms-node-master.json").to_string_lossy().into_owned();
+    if cfg.authority == AuthorityBackend::Dkms {
+        // Grant the (later) node child its store via the env it resolves — the key-provider client
+        // that spawns the node never passes or sees this path; it's the node's own concern.
+        std::env::set_var("DKMS_AUTHORITY_KEY_STORE", &node_store_path);
+    }
+    let escrow = publish_escrow(
+        key_bin,
+        &key_store_path,
+        &fixture_path,
+        cfg.authority,
+        &descriptor_path,
+        cfg.dkms_authority_bin.as_deref(),
+        &node_store_path,
+    )?;
     // The open path binds to the selected backend via its `init` config ONLY — the publish →
     // launch → open → recover/re-seal flow below is byte-identical across backends.
     let key_init_config = match cfg.authority {
@@ -1152,14 +1200,31 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     };
     // For `dkms`, snapshot the descriptor so we can PROVE the runtime treated it as immutable
     // published data (read-only) across the whole open — the key-provider only ever READS it.
+    // ALSO assert the descriptor handed to the runtime is PUBLIC-ONLY: it must carry NO master seed
+    // (the secret stays in the node), proving the master never crosses into the runtime.
     let descriptor_before = match cfg.authority {
-        AuthorityBackend::Dkms => Some(std::fs::read(&descriptor_path).map_err(|e| format!("read dkms descriptor: {e}"))?),
+        AuthorityBackend::Dkms => {
+            let bytes = std::fs::read(&descriptor_path).map_err(|e| format!("read dkms descriptor: {e}"))?;
+            let desc: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse dkms descriptor: {e}"))?;
+            if desc.get("authority_master_seed_b64").is_some() {
+                return Err("the dkms descriptor handed to the runtime carries a master seed — the secret must stay in the node".to_string());
+            }
+            if desc.get("verifying_key_b64").and_then(Value::as_str).is_none()
+                || desc.get("recipient_pub_b64").and_then(Value::as_str).is_none()
+                || desc.get("authority_endpoint").and_then(Value::as_str).is_none()
+            {
+                return Err("the dkms descriptor is not a complete PUBLIC-ONLY descriptor (need vk + recipient + endpoint)".to_string());
+            }
+            Some(bytes)
+        }
         AuthorityBackend::Reference => None,
     };
     step(1, &format!(
         "producer (publish-time): escrowed the CEK to the {} authority's STABLE recipient + wrote a durable publish fixture{}",
         cfg.authority.tag(),
-        if cfg.authority == AuthorityBackend::Dkms { " + provisioned the external dkms descriptor" } else { "" },
+        if cfg.authority == AuthorityBackend::Dkms {
+            " + provisioned the EXTERNAL dkms NODE (master stays in the node) + a PUBLIC-ONLY descriptor"
+        } else { "" },
     ));
 
     // --- the HOST LAUNCHES the rail. The smoke hands the host three launchers (each owning a
@@ -1211,7 +1276,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         "runtime-core host: LAUNCHED the rail via DrmHost::launch — key ({}), decrypt (per-open session key), rights",
         match cfg.authority {
             AuthorityBackend::Reference => "reference, relaunched from the durable store",
-            AuthorityBackend::Dkms => "dkms, resolved from the external descriptor",
+            AuthorityBackend::Dkms => "dkms, PUBLIC-ONLY client (delegates recovery to the external node)",
         }
     ));
 
@@ -1397,7 +1462,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         if after != before {
             return Err("the dkms authority descriptor was mutated across the open — it must be read-only published data".to_string());
         }
-        step(12, "runtime-core host: the external dkms descriptor was read-only across the open (immutable published identity)");
+        step(12, "runtime-core host: the EXTERNAL dkms identity was PUBLIC-ONLY + read-only across the open (master stayed in the node; recovery was DELEGATED — never the secret)");
     }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop
     // them and clean up the durable artifacts (key store + fixture + receipts) unless the
@@ -1493,12 +1558,28 @@ mod config_tests {
         assert!(OpenConfig::from_json(&base).unwrap().authority == AuthorityBackend::Reference);
 
         let mut dkms = base.clone();
-        dkms.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "dkms" }));
-        assert!(OpenConfig::from_json(&dkms).unwrap().authority == AuthorityBackend::Dkms);
+        dkms.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node" }),
+        );
+        let parsed = OpenConfig::from_json(&dkms).unwrap();
+        assert!(parsed.authority == AuthorityBackend::Dkms);
+        assert_eq!(parsed.dkms_authority_bin.as_deref(), Some("/node"));
 
         let mut explicit_ref = base.clone();
         explicit_ref.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "reference" }));
-        assert!(OpenConfig::from_json(&explicit_ref).unwrap().authority == AuthorityBackend::Reference);
+        let parsed_ref = OpenConfig::from_json(&explicit_ref).unwrap();
+        assert!(parsed_ref.authority == AuthorityBackend::Reference);
+        assert_eq!(parsed_ref.dkms_authority_bin, None);
+    }
+
+    #[test]
+    fn dkms_fails_closed_without_a_node_binary() {
+        let mut dkms = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        dkms.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "dkms" }));
+        let err = OpenConfig::from_json(&dkms)
+            .expect_err("dkms without a node binary must fail closed");
+        assert!(err.contains("dkms_authority_bin"), "the error names the missing field: {err}");
     }
 
     #[test]

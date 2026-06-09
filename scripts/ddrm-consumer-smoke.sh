@@ -17,10 +17,13 @@
 #
 # Usage:  scripts/ddrm-consumer-smoke.sh [--backend reference|dkms]
 #   --backend reference  (default) the in-runtime durable-key-store authority
-#   --backend dkms       the EXTERNAL authority: the publish phase provisions an immutable
-#                        descriptor, the open RESOLVES its identity from it (zero code change —
-#                        only OpenConfig.authority.backend differs, proving the open is
-#                        backend-agnostic, like PC2's getSessionView dispatch).
+#   --backend dkms       the EXTERNAL, SECRET-HOLDING authority NODE (dkms-authority capsule):
+#                        the publish phase PROVISIONS the node (its master stays in the node's own
+#                        store) + writes a PUBLIC-ONLY descriptor (pins + endpoint, NO secret); at
+#                        open, the key-provider holds only that public identity and DELEGATES
+#                        recovery to the node — the master/CEK NEVER enter the runtime. The open
+#                        path is otherwise byte-identical (only OpenConfig.authority differs),
+#                        like PC2's getSessionView dispatch + recoverCEKEnvelope delegation.
 # Exit:   0 on PASS, 1 on FAIL.
 
 set -uo pipefail
@@ -75,6 +78,18 @@ for bin in "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN"; do
   fi
 done
 
+# The `dkms` backend needs the EXTERNAL authority NODE binary (the secret-holding capsule the
+# publish phase provisions + the open delegates recovery to). Built only for that backend.
+DKMS_NODE_BIN=""
+if [[ "$BACKEND" == "dkms" ]]; then
+  build dkms-authority
+  DKMS_NODE_BIN="${CAPSULES}/dkms-authority/target/debug/dkms-authority"
+  if [[ ! -x "$DKMS_NODE_BIN" ]]; then
+    echo "FAIL: missing built binary ${DKMS_NODE_BIN}" >&2
+    exit 1
+  fi
+fi
+
 # Optional live wallet-ownership check: when DDRM_SMOKE_CHAIN_RPC is set we build and
 # pass the REAL chain-provider so the rights step queries the AuthorityGateway on Base
 # (your wallet vs the content's contentId). Offline (default) the orchestrator uses a
@@ -112,10 +127,16 @@ CHAIN_BIN_JSON=""
 if [[ ${#CHAIN_ARG[@]} -gt 0 ]]; then
   CHAIN_BIN_JSON=",\n  \"chain_bin\": \"${CHAIN_ARG[0]}\""
 fi
+# For `dkms`, the authority object ALSO names the external node binary the runtime provisions +
+# delegates recovery to (its master never crosses into the runtime).
+AUTHORITY_JSON="{ \"backend\": \"${BACKEND}\" }"
+if [[ "$BACKEND" == "dkms" ]]; then
+  AUTHORITY_JSON="{ \"backend\": \"dkms\", \"dkms_authority_bin\": \"${DKMS_NODE_BIN}\" }"
+fi
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddrm-runtime-open.XXXXXX")"
 CONFIG_JSON="${WORK_DIR}/open-config.json"
-printf '{\n  "mode": "verify",\n  "authority": { "backend": "%s" },\n  "key_bin": "%s",\n  "decrypt_bin": "%s",\n  "drm_bin": "%s",\n  "rights_bin": "%s",\n  "work_dir": "%s"%b\n}\n' \
-  "$BACKEND" "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" "${WORK_DIR}/run" "$CHAIN_BIN_JSON" > "$CONFIG_JSON"
+printf '{\n  "mode": "verify",\n  "authority": %s,\n  "key_bin": "%s",\n  "decrypt_bin": "%s",\n  "drm_bin": "%s",\n  "rights_bin": "%s",\n  "work_dir": "%s"%b\n}\n' \
+  "$AUTHORITY_JSON" "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" "${WORK_DIR}/run" "$CHAIN_BIN_JSON" > "$CONFIG_JSON"
 echo "config: ${CONFIG_JSON}"
 
 cargo run --quiet --manifest-path "${ORCH}/Cargo.toml" -- "$CONFIG_JSON"

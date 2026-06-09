@@ -1,0 +1,24 @@
+[package]
+name = "dkms-authority"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS dKMS EXTERNAL key authority node capsule (owns the master key material; recovers + re-seals in-boundary)"
+license = "MIT"
+
+[[bin]]
+name = "dkms-authority"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Shared PQ-hybrid seal/unwrap — single source of truth with key-provider + decrypt-provider.
+ddrm-envelope = { path = "../ddrm-envelope" }
+base64 = "0.22"
+zeroize = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

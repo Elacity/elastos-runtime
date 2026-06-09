@@ -26,12 +26,15 @@ const SUPPORTED_SCHEMES: &[&str] = &["elastos-pq-hybrid-threshold-v0"];
 const AUTHORITY_KEYSTORE_SCHEMA: &str = "elastos.key_authority.seed/v1";
 
 /// On-disk schema for the `dkms` EXTERNAL authority descriptor (feature `key-authority-ref`).
-/// Unlike the reference key store (which the runtime GENERATES + persists), this descriptor is
-/// PROVISIONED EXTERNALLY (by the dKMS) and HANDED IN — the runtime RESOLVES its authority
-/// identity from it, never minting. Mirrors PC2 resolving the external authority's key from
-/// config (`resolvePkpId(config)`, `chipotle-client.ts:963`–`:967`), not generating it.
+/// PUBLIC-ONLY (Day 87–88, v2): the descriptor carries the authority node's PUBLISHED identity
+/// (`verifying_key_b64` + `recipient_pub_b64`) and its `authority_endpoint` (where the node lives) —
+/// and NOTHING secret. The runtime (this `key-provider` CLIENT) holds only this public identity and
+/// DELEGATES recovery to the node; the master key material lives ONLY in the node. A descriptor that
+/// carries a master seed (the old v1 shape) is REJECTED — the secret must never reach the runtime.
+/// Mirrors PC2 holding only the external authority's PUBLIC `pkpId`/`authority` and RPCing the Lit
+/// network for recovery (`recoverCEKEnvelope`, `chipotle-client.ts:1438`), never the PKP secret.
 #[cfg(feature = "key-authority-ref")]
-const DKMS_AUTHORITY_DESCRIPTOR_SCHEMA: &str = "elastos.dkms.authority/v1";
+const DKMS_AUTHORITY_DESCRIPTOR_SCHEMA: &str = "elastos.dkms.authority/v2";
 
 /// Decrypt-material suite tags the hosted backends emit. These match the
 /// `SealedDecryptMaterialV1.suite` values the decrypt boundary already routes on
@@ -290,6 +293,29 @@ struct KeyProvider {
     /// backend is selected (feature `key-authority-ref`).
     #[cfg(feature = "key-authority-ref")]
     reference: Option<ReferenceAuthority>,
+    /// The `dkms` EXTERNAL authority CLIENT, constructed at `init` from a PUBLIC-ONLY descriptor
+    /// when the `dkms` backend is selected. Holds ONLY the node's published identity + endpoint —
+    /// NO master, NO recovery secret. `release` DELEGATES recovery to the node (feature
+    /// `key-authority-ref`).
+    #[cfg(feature = "key-authority-ref")]
+    dkms: Option<DkmsClientAuthority>,
+}
+
+/// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
+/// producer escrowed to + what the decrypt boundary trusts) and the `authority_endpoint` where the
+/// secret-holding node lives. The runtime holds NO master and NO recovery secret — it DELEGATES
+/// recovery to the node. The runtime-core analogue of PC2's client holding only the external
+/// authority's public `pkpId`/`authority` and RPCing the Lit network (`recoverCEKEnvelope`).
+#[cfg(feature = "key-authority-ref")]
+#[derive(Clone)]
+struct DkmsClientAuthority {
+    /// The node's published ML-DSA verifying key (base64) — the decrypt boundary trusts its seals.
+    verifying_key_b64: String,
+    /// The node's published KEM recipient (base64) — the producer escrows the CEK to it.
+    recipient_pub_b64: String,
+    /// Where the secret-holding authority node lives (its capsule binary path) — the granted
+    /// endpoint the client RPCs for `recover`. NOT a secret; an address (PC2's `pkpId` analogue).
+    endpoint: String,
 }
 
 impl KeyProvider {
@@ -374,20 +400,25 @@ impl KeyProvider {
         // unreadable store fails the open rather than silently minting a divergent authority.
         #[cfg(feature = "key-authority-ref")]
         {
-            self.reference = match self.backend {
-                Some(KeyAuthorityBackend::Reference) => match build_reference_authority(&config) {
-                    Ok(authority) => Some(authority),
-                    Err(err) => return Response::error("not_configured", err),
-                },
-                // The `dkms` backend RESOLVES its authority identity from a handed-in EXTERNAL
-                // descriptor (the dKMS-provisioned key material), never minting: no descriptor →
-                // unconfigured (release fails closed); a present-but-bad descriptor fails closed here.
-                Some(KeyAuthorityBackend::Dkms) => match build_dkms_authority(&config) {
-                    Ok(authority) => authority,
-                    Err(err) => return Response::error("not_configured", err),
-                },
-                _ => None,
-            };
+            match self.backend {
+                Some(KeyAuthorityBackend::Reference) => {
+                    self.reference = match build_reference_authority(&config) {
+                        Ok(authority) => Some(authority),
+                        Err(err) => return Response::error("not_configured", err),
+                    };
+                }
+                // The `dkms` backend RESOLVES the EXTERNAL authority's PUBLIC identity + endpoint
+                // from a handed-in PUBLIC-ONLY descriptor (Day 87–88) — NO master, NO recovery secret
+                // reaches the runtime. No descriptor → unconfigured (release fails closed); a
+                // present-but-bad (or secret-bearing) descriptor fails closed here.
+                Some(KeyAuthorityBackend::Dkms) => {
+                    self.dkms = match build_dkms_client(&config) {
+                        Ok(client) => client,
+                        Err(err) => return Response::error("not_configured", err),
+                    };
+                }
+                _ => {}
+            }
         }
 
         #[allow(unused_mut)]
@@ -412,6 +443,14 @@ impl KeyProvider {
             // (encrypt-provider) can escrow a freshly-minted CEK to it (Phase C).
             data["seal_recipient_pub_b64"] = json!(base64::engine::general_purpose::STANDARD
                 .encode(&authority.recipient_public));
+        }
+        // The `dkms` CLIENT republishes the EXTERNAL node's PUBLIC identity straight from the
+        // descriptor pins (no key material is held here) — same rail contract: the decrypt boundary
+        // trusts the vk, the producer escrows to the recipient.
+        #[cfg(feature = "key-authority-ref")]
+        if let Some(client) = self.dkms.as_ref() {
+            data["seal_verifying_key_b64"] = json!(client.verifying_key_b64);
+            data["seal_recipient_pub_b64"] = json!(client.recipient_pub_b64);
         }
         Response::ok(data)
     }
@@ -625,12 +664,13 @@ impl KeyProvider {
             // The reference backend ACTUALLY releases (Day 70): recover the producer-escrowed
             // CEK from the rights-bound `key_envelope` and re-seal it to the decrypt session.
             Some(KeyAuthorityBackend::Reference) => self.release_reference(&request, session),
-            // The `dkms` backend uses the SAME seal contract ONCE its external authority is
-            // resolved from a handed-in descriptor (Day 83–84); selected-but-unprovisioned
-            // (no descriptor) falls through to the fail-closed "no dKMS node" surface.
+            // The `dkms` backend DELEGATES recovery to the EXTERNAL authority node (Day 87–88):
+            // the runtime holds only the node's public identity, so it RPCs the node's endpoint to
+            // recover + re-seal — the master/CEK never enter the runtime. Selected-but-unprovisioned
+            // (no descriptor/endpoint) falls through to the fail-closed "no dKMS node" surface.
             #[cfg(feature = "key-authority-ref")]
-            Some(KeyAuthorityBackend::Dkms) if self.reference.is_some() => {
-                self.release_reference(&request, session)
+            Some(KeyAuthorityBackend::Dkms) if self.dkms.is_some() => {
+                self.release_dkms_delegated(&request, session)
             }
             Some(backend) => self.release_via_backend(backend, &request),
         }
@@ -755,6 +795,73 @@ impl KeyProvider {
                 "not_configured",
                 "reference key authority requires the key-authority-ref build",
             )
+        }
+    }
+
+    /// Canonical `dkms` release (Day 87–88): the runtime holds only the EXTERNAL authority's PUBLIC
+    /// identity, so it DELEGATES recovery to the secret-holding node. It assembles the recover bundle
+    /// (the producer-escrowed CEK from the rights-bound `key_envelope` + the per-open session material
+    /// the runtime injects), RPCs the node's granted `endpoint` for `recover`, and returns the node's
+    /// `SealedDecryptMaterialV1` verbatim. The master + raw CEK NEVER enter this process — exactly as
+    /// PC2's client RPCs the Lit network and only ever sees the sealed envelope (`recoverCEKEnvelope`,
+    /// `chipotle-client.ts:1438`; the Lit action recovers + seals in the TEE, returns only the
+    /// envelope, `universal-decrypt-chipotle.js:572`/`:602`/`:610`).
+    #[cfg(feature = "key-authority-ref")]
+    fn release_dkms_delegated(
+        &self,
+        request: &KeyReleaseRequestV1,
+        session: Option<ReleaseSessionContext>,
+    ) -> Response {
+        let client = match self.dkms.as_ref() {
+            Some(client) => client,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "dkms authority selected but no external node provisioned (provide a PUBLIC-ONLY dkms_authority_descriptor)",
+                )
+            }
+        };
+        let session = match session {
+            Some(session) => session,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "dkms key authority release requires runtime-injected session context \
+                     (decrypt session key + producer vk + transcript)",
+                )
+            }
+        };
+        // Fail-closed on an already-expired request (the node would seal a CEK past its window).
+        if let Some(now) = session.now_unix {
+            if request.expires_at <= now {
+                return Response::error("invalid_request", "key release request has expired");
+            }
+        }
+        // The KID must be the on-chain bytes16 the escrow AAD binds (validated shape).
+        let kid_hex = match decode_kid_bytes16(&request.key_envelope.kid) {
+            Ok(_) => request.key_envelope.kid.clone(),
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        // Assemble the recover bundle and DELEGATE to the node. The escrow blob + KID + scheme come
+        // from the rights-bound key_envelope; the session key + transcript come from the runtime
+        // context. NO key material is held here — only forwarded to the node + sealed result returned.
+        let recover_req = json!({
+            "op": "recover",
+            "wrapped_cek_b64": request.key_envelope.wrapped_cek,
+            "scheme": request.key_envelope.scheme,
+            "kid_hex": kid_hex,
+            "producer_vk_b64": session.producer_vk_b64,
+            "decrypt_session_pub_b64": session.decrypt_session_pub_b64,
+            "aad_b64": session.aad_b64,
+            "ciphertext_b64": session.ciphertext_b64,
+            "content_hash_b64": session.content_hash_b64,
+            "nonce_b64": session.nonce_b64,
+            "init_segment_b64": session.init_segment_b64,
+        });
+        match delegate_to_dkms_node(&client.endpoint, &recover_req) {
+            // The node returns the suite-tagged material verbatim — pass it through unchanged.
+            Ok(data) => Response::ok(data),
+            Err(err) => Response::error("not_configured", err),
         }
     }
 
@@ -887,22 +994,18 @@ fn build_reference_authority(config: &Value) -> Result<ReferenceAuthority, Strin
     })
 }
 
-/// Resolve the `dkms` EXTERNAL authority from a handed-in descriptor (the dKMS-provisioned key
-/// material), NEVER minting. `None` when no descriptor is configured (the backend is selected but
-/// unconfigured → `release` fails closed, the PC2 "backend selected, no node provisioned" shape).
-/// A present descriptor is READ (never written), its provisioned master material resolved into the
-/// stable authority. The descriptor MUST PIN the published external identity (`verifying_key_b64`
-/// AND `recipient_pub_b64`, what the producer escrowed to + the decrypt boundary trusts) and the
-/// resolved keys are VERIFIED against the pins — a pinless descriptor fails closed (a real external
-/// authority always publishes its identity), and a mismatch fails closed. Mirrors PC2 resolving the
-/// authority key from config (`resolvePkpId(config)`, `chipotle-client.ts:963`–`:967`) rather than
-/// generating it, and treating that descriptor as immutable published data (provisioned once + cached,
-/// `chipotle-client.ts:935`/`:950`, never rewritten on the read path).
+/// Resolve the `dkms` EXTERNAL authority CLIENT from a handed-in PUBLIC-ONLY descriptor (Day 87–88),
+/// NEVER minting and NEVER holding key material. `None` when no descriptor is configured (the backend
+/// is selected but unconfigured → `release` fails closed, the PC2 "backend selected, no node
+/// provisioned" shape). A present descriptor is READ (never written): it MUST carry the node's
+/// PUBLISHED identity (`verifying_key_b64` AND `recipient_pub_b64`, what the producer escrowed to +
+/// the decrypt boundary trusts) and its `authority_endpoint` (where the secret-holding node lives).
+/// It MUST NOT carry any secret: an `authority_master_seed_b64` (the old v1 shape) is REJECTED —
+/// the recovery secret must never reach the runtime. Mirrors PC2 holding only the external authority's
+/// PUBLIC `pkpId`/`authority` and delegating recovery to the Lit network (`recoverCEKEnvelope`,
+/// `chipotle-client.ts:1438`), never the PKP secret.
 #[cfg(feature = "key-authority-ref")]
-fn build_dkms_authority(config: &Value) -> Result<Option<ReferenceAuthority>, String> {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
+fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, String> {
     let path = match config.get("dkms_authority_descriptor").and_then(|v| v.as_str()) {
         Some(path) => path,
         None => return Ok(None),
@@ -911,54 +1014,95 @@ fn build_dkms_authority(config: &Value) -> Result<Option<ReferenceAuthority>, St
     let desc: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("dkms authority descriptor {path} is corrupt: {e}"))?;
     if desc.get("schema").and_then(|v| v.as_str()) != Some(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA) {
-        return Err(format!("dkms authority descriptor {path} has an unexpected schema"));
-    }
-    // The dKMS-provisioned master key material (handed in — NOT generated here).
-    let seed_b64 = desc
-        .get("authority_master_seed_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("dkms authority descriptor {path} is missing authority_master_seed_b64"))?;
-    let seed_bytes = b64
-        .decode(seed_b64)
-        .map_err(|e| format!("dkms authority descriptor {path} master seed is not base64: {e}"))?;
-    if seed_bytes.len() != 32 {
         return Err(format!(
-            "dkms authority descriptor {path} master seed is {} bytes, expected 32",
-            seed_bytes.len()
+            "dkms authority descriptor {path} has an unexpected schema (expected {DKMS_AUTHORITY_DESCRIPTOR_SCHEMA}, the PUBLIC-ONLY shape)"
         ));
     }
-    let mut master = [0u8; 32];
-    master.copy_from_slice(&seed_bytes);
-    let authority = reference_authority_from_master(&master);
+    // HARD BOUNDARY: a secret-bearing descriptor is rejected. The runtime must NEVER be handed the
+    // master — it holds only the node's PUBLIC identity + endpoint and delegates recovery.
+    if desc.get("authority_master_seed_b64").is_some() {
+        return Err(format!(
+            "dkms authority descriptor {path} carries a master seed — the runtime must hold the PUBLIC identity ONLY (the secret stays in the node)"
+        ));
+    }
+    let field = |key: &str, what: &str| {
+        desc.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("dkms authority descriptor {path} is missing {key} ({what})"))
+    };
+    let verifying_key_b64 = field("verifying_key_b64", "an external authority must publish its identity")?;
+    let recipient_pub_b64 = field("recipient_pub_b64", "an external authority must publish its escrow recipient")?;
+    let endpoint = field("authority_endpoint", "the runtime must know where to delegate recovery")?;
+    Ok(Some(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint }))
+}
 
-    // The descriptor MUST PUBLISH its external identity, and the resolved keys MUST match it
-    // (fail-closed). A real external authority ALWAYS publishes its identity (the producer
-    // escrows to it; the decrypt boundary trusts it) — a pinless descriptor is rejected, never
-    // silently trusted, and a mismatch proves the runtime would have resolved a DIFFERENT
-    // authority than the one provisioned, which would strand every CEK escrowed to the published one.
-    let expected_vk = desc
-        .get("verifying_key_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!(
-            "dkms authority descriptor {path} is missing verifying_key_b64 (an external authority must publish its identity)"
-        ))?;
-    if b64.encode(&authority.verifying_key) != expected_vk {
+/// DELEGATE one `recover` to the EXTERNAL dKMS authority node over the capsule protocol: spawn the
+/// granted `endpoint` binary, `init` it (the node resolves its OWN master store — from its config or
+/// the `DKMS_AUTHORITY_KEY_STORE` env the provisioner set; this client never passes or sees the
+/// secret store path), send the recover bundle, and return the node's sealed material `data`. The
+/// node owns spawn→teardown of its own boundary; we shut it down after the single recover. Any
+/// transport/protocol error fails closed. The runtime-core analogue of PC2's client RPCing the Lit
+/// network and only ever receiving the sealed envelope (`recoverCEKEnvelope`, `chipotle-client.ts:1438`).
+#[cfg(feature = "key-authority-ref")]
+fn delegate_to_dkms_node(endpoint: &str, recover_req: &Value) -> Result<Value, String> {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(endpoint)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("dkms authority node ({endpoint}) failed to launch: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("dkms node: no stdin")?;
+    let mut stdout = BufReader::new(child.stdout.take().ok_or("dkms node: no stdout")?);
+
+    // One request line in, one response line out (the node's protocol).
+    let mut call = |req: &Value| -> Result<Value, String> {
+        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+        writeln!(stdin, "{line}").map_err(|e| format!("write to dkms node: {e}"))?;
+        stdin.flush().map_err(|e| e.to_string())?;
+        let mut resp = String::new();
+        let n = stdout
+            .read_line(&mut resp)
+            .map_err(|e| format!("read from dkms node: {e}"))?;
+        if n == 0 {
+            return Err("dkms node closed its output unexpectedly".to_string());
+        }
+        serde_json::from_str::<Value>(resp.trim())
+            .map_err(|e| format!("dkms node sent non-JSON: {e}: {resp}"))
+    };
+
+    // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
+    // store path: the secret's location is the node's concern, never the client's.
+    let init_status = call(&json!({ "op": "init", "config": {} }));
+    let recover = init_status.and_then(|init| {
+        if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(format!(
+                "dkms node init failed: {}",
+                init.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error")
+            ));
+        }
+        call(recover_req)
+    });
+
+    // Tear the node down regardless of outcome, then surface the result.
+    let _ = call(&json!({ "op": "shutdown" }));
+    let _ = child.wait();
+
+    let recover = recover?;
+    if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Err(format!(
-            "dkms authority descriptor {path} verifying_key_b64 does not match the provisioned key material"
+            "dkms node recover failed: {}",
+            recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
         ));
     }
-    let expected_recip = desc
-        .get("recipient_pub_b64")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!(
-            "dkms authority descriptor {path} is missing recipient_pub_b64 (an external authority must publish its escrow recipient)"
-        ))?;
-    if b64.encode(&authority.recipient_public) != expected_recip {
-        return Err(format!(
-            "dkms authority descriptor {path} recipient_pub_b64 does not match the provisioned key material"
-        ));
-    }
-    Ok(Some(authority))
+    recover
+        .get("data")
+        .cloned()
+        .ok_or_else(|| "dkms node returned ok without sealed material".to_string())
 }
 
 /// Deterministically derive the stable reference authority (signer + KEM recipient) from one
@@ -1482,6 +1626,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "key-authority-ref")]
+    fn error_message_ref(response: &Response) -> &str {
+        match response {
+            Response::Error { message, .. } => message,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
     // --- reference key-authority seal engine (Phase A.2) --------------------
 
     #[cfg(feature = "key-authority-ref")]
@@ -1571,39 +1723,32 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
 
-        /// Write a `dkms` EXTERNAL authority descriptor (the dKMS-provisioned key material, handed
-        /// in) for a given master seed. Optionally PINS the published identity (verifying key +
-        /// recipient) the producer escrows to. Returns the descriptor path.
-        fn write_dkms_descriptor(tag: &str, master: &[u8; 32], pin: bool) -> String {
+        /// Write a `dkms` PUBLIC-ONLY authority descriptor (Day 87–88): the node's published identity
+        /// (verifying key + recipient) + its endpoint — and NOTHING secret. Returns the descriptor path.
+        fn write_dkms_descriptor(tag: &str, master: &[u8; 32], endpoint: &str) -> String {
+            // The node would derive + publish these; we derive them here only to FORGE a realistic
+            // public descriptor for the client tests (the master itself is NEVER written to it).
             let authority = reference_authority_from_master(master);
-            let mut desc = json!({
+            let desc = json!({
                 "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
-                "authority_master_seed_b64": b64().encode(master),
+                "verifying_key_b64": b64().encode(&authority.verifying_key),
+                "recipient_pub_b64": b64().encode(&authority.recipient_public),
+                "authority_endpoint": endpoint,
             });
-            if pin {
-                desc.as_object_mut().unwrap().insert(
-                    "verifying_key_b64".into(),
-                    json!(b64().encode(&authority.verifying_key)),
-                );
-                desc.as_object_mut().unwrap().insert(
-                    "recipient_pub_b64".into(),
-                    json!(b64().encode(&authority.recipient_public)),
-                );
-            }
             let path = unique_store_path(tag);
             std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
             path
         }
 
-        /// The `dkms` backend RESOLVES its authority from a handed-in descriptor (never minting),
-        /// publishes the descriptor's external identity, and a CEK escrowed at publish time to that
-        /// recipient recovers + re-seals through the SAME `SealedDecryptMaterialV1` contract — so the
-        /// stable-recipient pattern carries to a non-reference authority. Mirrors PC2 resolving the
-        /// external authority's key from config (`resolvePkpId(config)`) rather than generating it.
+        /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in
+        /// PUBLIC-ONLY descriptor (never minting, never holding a secret), and REPUBLISHES that
+        /// identity on the rail (same vk + recipient the producer escrows to / the decrypt boundary
+        /// trusts). The client holds the endpoint to DELEGATE recovery — but no key material. Mirrors
+        /// PC2 holding only the external authority's public `pkpId`/`authority` (`recoverCEKEnvelope`).
         #[test]
-        fn dkms_resolves_a_stable_external_authority_from_a_descriptor() {
+        fn dkms_resolves_a_public_only_external_identity_from_a_descriptor() {
             let master = [0x7au8; 32];
-            let path = write_dkms_descriptor("dkms-stable", &master, true);
+            let path = write_dkms_descriptor("dkms-pub", &master, "/path/to/dkms-authority");
             let cfg = json!({ "backend": "dkms", "dkms_authority_descriptor": path });
 
             // Two separate inits resolve the SAME published identity from the SAME descriptor.
@@ -1613,41 +1758,58 @@ mod tests {
             let d2 = ok_data(second.init(cfg.clone()));
             assert_eq!(d1["seal_verifying_key_b64"], d2["seal_verifying_key_b64"]);
             assert_eq!(d1["seal_recipient_pub_b64"], d2["seal_recipient_pub_b64"]);
-            assert!(second.reference.is_some(), "dkms resolved an authority from the descriptor");
 
-            // A CEK escrowed at publish time to the descriptor's recipient recovers on a relaunch.
-            let recip_bytes = b64().decode(d1["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
-            let recipient_public = ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
-            let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([9u8; 32]);
-            let cek: Vec<u8> = (0u8..16).collect();
-            let kid = [0x55u8; 16];
-            let aad = ddrm_envelope::transcript::escrow_aad(
-                ddrm_envelope::SUITE_PQ_HYBRID,
-                &kid,
-                &recip_bytes,
+            // The client holds the PUBLIC identity + endpoint, and NO recovery secret: `reference`
+            // (which owns a recipient_secret + signer) is never populated for `dkms`.
+            assert!(second.dkms.is_some(), "dkms resolved a public client from the descriptor");
+            assert!(
+                second.reference.is_none(),
+                "the dkms client must hold NO recovery secret (no ReferenceAuthority)"
             );
-            let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &aad, &producer_signer)
-                .to_bytes();
-            let recovered = second
-                .reference
-                .as_ref()
-                .unwrap()
-                .recover_escrowed_cek(&wrapped, ddrm_envelope::SUITE_PQ_HYBRID, &kid, &producer_vk)
-                .expect("the descriptor-resolved authority recovers a publish-time escrow");
-            assert_eq!(&recovered[..], &cek[..]);
+            // The republished identity matches the descriptor pins exactly (no derivation here).
+            let client = second.dkms.as_ref().unwrap();
+            assert_eq!(d2["seal_verifying_key_b64"].as_str().unwrap(), client.verifying_key_b64);
+            assert_eq!(d2["seal_recipient_pub_b64"].as_str().unwrap(), client.recipient_pub_b64);
+            assert_eq!(client.endpoint, "/path/to/dkms-authority");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// HARD BOUNDARY (Day 87–88): a descriptor that carries a master seed is REJECTED — the
+        /// recovery secret must NEVER reach the runtime, even if a misconfigured provisioner leaks it.
+        #[test]
+        fn dkms_fails_closed_on_a_secret_bearing_descriptor() {
+            let master = [0x21u8; 32];
+            let authority = reference_authority_from_master(&master);
+            let path = unique_store_path("dkms-secret");
+            // A public descriptor that ALSO (wrongly) carries the master seed.
+            let desc = json!({
+                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+                "verifying_key_b64": b64().encode(&authority.verifying_key),
+                "recipient_pub_b64": b64().encode(&authority.recipient_public),
+                "authority_endpoint": "/path/to/dkms-authority",
+                "authority_master_seed_b64": b64().encode(master), // MUST be rejected
+            });
+            std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
+            let mut p = KeyProvider::default();
+            let resp = p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": path }));
+            assert_eq!(error_code_ref(&resp), "not_configured");
+            assert!(
+                error_message_ref(&resp).contains("master seed"),
+                "the rejection must name the leaked secret"
+            );
+            assert!(p.dkms.is_none());
             let _ = std::fs::remove_file(&path);
         }
 
         /// Fail-closed: a selected `dkms` backend with NO descriptor stays unconfigured (the
         /// "no dKMS node provisioned" surface); a present-but-bad descriptor (corrupt JSON, wrong
-        /// schema, malformed seed, or a published identity that does not match the provisioned key
-        /// material) fails the init — never a silent or divergent authority.
+        /// schema) fails the init — never a silent or divergent authority.
         #[test]
         fn dkms_fails_closed_on_a_missing_or_bad_descriptor() {
             // No descriptor -> selected but unconfigured -> release fails closed with "no dKMS node".
             let mut bare = KeyProvider::default();
             assert!(matches!(bare.init(json!({ "backend": "dkms" })), Response::Ok { .. }));
-            assert!(bare.reference.is_none());
+            assert!(bare.dkms.is_none());
             assert_eq!(
                 error_code_ref(&bare.release(key_release_request(), None)),
                 "not_configured"
@@ -1662,67 +1824,35 @@ mod tests {
                 "not_configured"
             );
             let _ = std::fs::remove_file(&corrupt);
-
-            // A pinned identity that does NOT match the provisioned master material.
-            let master = [0x01u8; 32];
-            let path = unique_store_path("dkms-mismatch");
-            let desc = json!({
-                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
-                "authority_master_seed_b64": b64().encode(master),
-                "verifying_key_b64": b64().encode(reference_authority_from_master(&master).verifying_key),
-                "recipient_pub_b64": b64().encode([0u8; 8]), // not the derived recipient
-            });
-            std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
-            let mut q = KeyProvider::default();
-            assert_eq!(
-                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": path }))),
-                "not_configured"
-            );
-            let _ = std::fs::remove_file(&path);
         }
 
-        /// A real external authority ALWAYS publishes its identity, so a PINLESS descriptor (no
-        /// `verifying_key_b64` / `recipient_pub_b64`) is rejected — the runtime never silently trusts
-        /// a master seed it cannot cross-check against a published identity (Day 85–86).
+        /// A real external authority ALWAYS publishes its identity AND its endpoint, so a descriptor
+        /// missing any of `verifying_key_b64` / `recipient_pub_b64` / `authority_endpoint` is rejected —
+        /// the runtime never half-resolves an external authority it cannot trust or reach.
         #[test]
-        fn dkms_fails_closed_on_a_pinless_descriptor() {
+        fn dkms_fails_closed_on_an_incomplete_public_descriptor() {
             let master = [0x33u8; 32];
-            // No pins at all.
-            let bare = unique_store_path("dkms-pinless");
-            std::fs::write(
-                &bare,
-                serde_json::to_vec(&json!({
-                    "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
-                    "authority_master_seed_b64": b64().encode(master),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let mut p = KeyProvider::default();
-            assert_eq!(
-                error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": bare }))),
-                "not_configured"
-            );
-            let _ = std::fs::remove_file(&bare);
+            let authority = reference_authority_from_master(&master);
+            let vk = b64().encode(&authority.verifying_key);
+            let recip = b64().encode(&authority.recipient_public);
 
-            // Verifying key pinned but recipient pin missing — still fails closed (BOTH required).
-            let half = unique_store_path("dkms-halfpin");
-            std::fs::write(
-                &half,
-                serde_json::to_vec(&json!({
-                    "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
-                    "authority_master_seed_b64": b64().encode(master),
-                    "verifying_key_b64": b64().encode(reference_authority_from_master(&master).verifying_key),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            let mut q = KeyProvider::default();
-            assert_eq!(
-                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": half }))),
-                "not_configured"
-            );
-            let _ = std::fs::remove_file(&half);
+            // No pins / no endpoint at all.
+            for desc in [
+                json!({ "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA }),
+                // vk only (missing recipient + endpoint).
+                json!({ "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA, "verifying_key_b64": vk }),
+                // pins present but NO endpoint (cannot delegate recovery).
+                json!({ "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA, "verifying_key_b64": vk, "recipient_pub_b64": recip }),
+            ] {
+                let path = unique_store_path("dkms-incomplete");
+                std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
+                let mut p = KeyProvider::default();
+                assert_eq!(
+                    error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": path }))),
+                    "not_configured"
+                );
+                let _ = std::fs::remove_file(&path);
+            }
         }
 
         fn reference_provider() -> KeyProvider {
