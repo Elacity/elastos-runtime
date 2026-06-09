@@ -65,6 +65,13 @@ enum Request {
         request: Box<DecryptSessionRequestV1>,
         material: RailMaterial,
     },
+    // Transcript-bound live rail (feature `rail-bind`, Anders Day-45 decision): the
+    // sealed material is cryptographically welded to the full request transcript.
+    #[cfg(feature = "rail-bind")]
+    OpenSessionBound {
+        request: Box<DecryptSessionRequestV1>,
+        material: BoundRailMaterial,
+    },
     Shutdown,
 }
 
@@ -84,6 +91,110 @@ struct RailMaterial {
     /// Optional init segment (e.g. `tenc` IV defaults), base64.
     #[serde(default)]
     init_segment_b64: Option<String>,
+}
+
+/// Transcript-bound decrypt material (feature `rail-bind`). Extends `RailMaterial`
+/// with the replay nonce and the object content hash that the sealed CEK is bound
+/// to (the remaining transcript fields are taken from the authenticated request +
+/// the boundary's own provisioned state, never trusted from the carrier).
+#[cfg(feature = "rail-bind")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundRailMaterial {
+    sealed_cek_b64: String,
+    ciphertext_b64: String,
+    #[serde(default)]
+    init_segment_b64: Option<String>,
+    /// Per-release replay nonce (key-authority chosen); bound into the transcript.
+    nonce_b64: String,
+    /// Object content hash (binds the CEK to THIS content; Anders' "object CID/
+    /// content hash"), base64.
+    content_hash_b64: String,
+}
+
+/// Canonical decrypt transcript (feature `rail-bind`) — the exact field set Anders
+/// requires the sealed material to bind (Day-45 decision): principal, session,
+/// object CID + content hash, action, viewer interface, output kind, expiry,
+/// release-receipt hash, decrypt-session public key, algorithm suite, provider
+/// identity, and a replay nonce. `to_aad()` is a domain-separated, length-prefixed
+/// encoding used as the AES-256-GCM AAD and signed alongside the envelope, so any
+/// mismatch fails closed before a CEK exists.
+#[cfg(feature = "rail-bind")]
+struct DecryptTranscriptV1<'a> {
+    suite_id: &'a str,
+    provider_id: &'a str,
+    principal_id: &'a str,
+    session_id: &'a str,
+    object_cid: &'a str,
+    content_hash: &'a [u8],
+    action: &'a str,
+    viewer_interface: &'a str,
+    output_kind: &'a str,
+    expires_at: u64,
+    release_receipt_hash: [u8; 32],
+    decrypt_session_pub: &'a [u8],
+    nonce: &'a [u8],
+}
+
+#[cfg(feature = "rail-bind")]
+const DECRYPT_TRANSCRIPT_LABEL: &[u8] = b"elastos-ddrm/decrypt-transcript/v1";
+#[cfg(feature = "rail-bind")]
+const DECRYPT_SUITE_ID: &str = "elastos-pq-hybrid-threshold-v0";
+#[cfg(feature = "rail-bind")]
+const DECRYPT_PROVIDER_ID: &str = "decrypt-provider";
+
+#[cfg(feature = "rail-bind")]
+impl DecryptTranscriptV1<'_> {
+    /// Deterministic, unambiguous AAD: a domain label then every field
+    /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
+    /// transcripts can collide and no field can be slid into another.
+    fn to_aad(&self) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut put = |bytes: &[u8]| {
+            v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            v.extend_from_slice(bytes);
+        };
+        put(DECRYPT_TRANSCRIPT_LABEL);
+        put(self.suite_id.as_bytes());
+        put(self.provider_id.as_bytes());
+        put(self.principal_id.as_bytes());
+        put(self.session_id.as_bytes());
+        put(self.object_cid.as_bytes());
+        put(self.content_hash);
+        put(self.action.as_bytes());
+        put(self.viewer_interface.as_bytes());
+        put(self.output_kind.as_bytes());
+        put(&self.expires_at.to_be_bytes());
+        put(&self.release_receipt_hash);
+        put(self.decrypt_session_pub);
+        put(self.nonce);
+        v
+    }
+}
+
+/// Bind the release receipt into the transcript by hashing its identifying fields
+/// (Anders: "release receipt hash"). Deterministic + domain-separated.
+#[cfg(feature = "rail-bind")]
+fn release_receipt_hash(receipt: &ReleaseReceiptV1) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"elastos-ddrm/release-receipt/v1");
+    for field in [
+        receipt.schema.as_str(),
+        receipt.request_id.as_str(),
+        receipt.object_cid.as_str(),
+        receipt.principal_id.as_str(),
+        receipt.session_id.as_str(),
+        receipt.action.as_str(),
+        receipt.provider.as_str(),
+        receipt.status.as_str(),
+    ] {
+        h.update((field.len() as u32).to_be_bytes());
+        h.update(field.as_bytes());
+    }
+    h.update(receipt.issued_at.to_be_bytes());
+    h.update(receipt.expires_at.to_be_bytes());
+    h.finalize().into()
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +236,12 @@ struct DecryptProvider {
     session: Option<rail_shim::SessionSecret>,
     #[cfg(feature = "rail-live")]
     authority_vk: Option<Vec<u8>>,
+    // The published decrypt-session public key (transcript binding, `rail-bind`).
+    // It is minted in-sandbox and is what the key authority seals the CEK to; it
+    // is bound into the transcript so a carrier cannot be replayed against a
+    // different session key.
+    #[cfg(feature = "rail-bind")]
+    session_pub: Option<Vec<u8>>,
 }
 
 impl DecryptProvider {
@@ -137,6 +254,10 @@ impl DecryptProvider {
             #[cfg(feature = "rail-live")]
             Request::OpenSessionLive { request, material } => {
                 self.open_session_live(*request, &material)
+            }
+            #[cfg(feature = "rail-bind")]
+            Request::OpenSessionBound { request, material } => {
+                self.open_session_bound(*request, &material)
             }
             Request::Shutdown => Response::empty_ok(),
         }
@@ -268,6 +389,95 @@ impl DecryptProvider {
         match rail_shim::decrypt_from_carrier(session, &carrier, &verifier) {
             Ok((_plaintext, meta)) => scoped_session_response(&request, &meta),
             // Coarse, uniform failure — never reveal which step failed (no oracle).
+            Err(_) => Response::error("decrypt_failed", "decrypt session could not be opened"),
+        }
+    }
+
+    /// Transcript-bound live rail (feature `rail-bind`, Anders Day-45 decision). Same
+    /// in-boundary unwrap→decrypt→scoped-output as `open_session_live`, but the CEK
+    /// is cryptographically WELDED to the full request transcript (AES-256-GCM AAD +
+    /// ML-DSA-65 signature over `payload ‖ transcript`). The transcript is rebuilt
+    /// here from the AUTHENTICATED request + the boundary's own provisioned session
+    /// public key (never trusted from the carrier), so a CEK sealed for one
+    /// (principal, session, object, receipt, session key, suite, provider, nonce)
+    /// cannot be replayed against any other — it fails closed at the GCM tag /
+    /// signature before any plaintext exists.
+    #[cfg(feature = "rail-bind")]
+    fn open_session_bound(&self, request: DecryptSessionRequestV1, material: &BoundRailMaterial) -> Response {
+        use base64::Engine as _;
+
+        if let Err(err) = validate_decrypt_session_request(&request) {
+            return Response::error("invalid_request", err);
+        }
+
+        let session = match self.session.as_ref() {
+            Some(s) => s,
+            None => return Response::error("not_configured", "decrypt session key is not provisioned in this boundary"),
+        };
+        let session_pub = match self.session_pub.as_ref() {
+            Some(p) => p,
+            None => return Response::error("not_configured", "decrypt session public key is not published"),
+        };
+        let authority_vk = match self.authority_vk.as_ref() {
+            Some(vk) => vk,
+            None => return Response::error("not_configured", "trusted key-authority verifying key is not configured"),
+        };
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sealed_cek = match b64.decode(&material.sealed_cek_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "sealed_cek_b64 is not valid base64"),
+        };
+        let ciphertext_segment = match b64.decode(&material.ciphertext_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "ciphertext_b64 is not valid base64"),
+        };
+        let init_segment = match material.init_segment_b64.as_deref().map(|s| b64.decode(s)) {
+            None => None,
+            Some(Ok(b)) => Some(b),
+            Some(Err(_)) => return Response::error("invalid_request", "init_segment_b64 is not valid base64"),
+        };
+        let nonce = match b64.decode(&material.nonce_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "nonce_b64 is not valid base64"),
+        };
+        let content_hash = match b64.decode(&material.content_hash_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "content_hash_b64 is not valid base64"),
+        };
+
+        let verifier = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
+            Some(v) => v,
+            None => return Response::error("not_configured", "configured key-authority verifying key is malformed"),
+        };
+
+        // Rebuild the transcript from the AUTHENTICATED request + provisioned state.
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &request.principal_id,
+            session_id: &request.session_id,
+            object_cid: &request.object_cid,
+            content_hash: &content_hash,
+            action: &request.action,
+            viewer_interface: &request.viewer_interface,
+            output_kind: &request.output_kind,
+            expires_at: request.expires_at,
+            release_receipt_hash: release_receipt_hash(&request.release_receipt),
+            decrypt_session_pub: session_pub,
+            nonce: &nonce,
+        }
+        .to_aad();
+
+        let carrier = rail_shim::SealedDecryptCarrier {
+            profile: rail_shim::SealProfile::PqHybrid,
+            sealed_cek,
+            ciphertext_segment,
+            init_segment,
+        };
+
+        match rail_shim::decrypt_from_carrier_bound(session, &carrier, &aad, &verifier) {
+            Ok((_plaintext, meta)) => scoped_session_response(&request, &meta),
             Err(_) => Response::error("decrypt_failed", "decrypt session could not be opened"),
         }
     }
@@ -1072,6 +1282,7 @@ mod tests {
         let mut provider = DecryptProvider {
             session: Some(session),
             authority_vk: Some(authority_vk),
+            ..Default::default()
         };
         let resp = provider.handle(Request::OpenSessionLive {
             request: Box::new(decrypt_request()),
@@ -1103,6 +1314,7 @@ mod tests {
         let provider = DecryptProvider {
             session: Some(session),
             authority_vk: Some(authority_vk),
+            ..Default::default()
         };
         let resp = provider.open_session_live(decrypt_request(), &material);
         assert_eq!(error_code(resp), "decrypt_failed", "a tampered carrier must fail closed");
@@ -1123,5 +1335,156 @@ mod tests {
         let provider = DecryptProvider::default();
         let resp = provider.open_session_live(decrypt_request(), &material);
         assert_eq!(error_code(resp), "not_configured");
+    }
+
+    // --- transcript-bound rail (feature `rail-bind`, Anders Day-45 decision) ------
+    //
+    // The headline security property: a CEK sealed for one decrypt transcript
+    // cannot be opened under any other. We seal a real ML-DSA-65 PQ-hybrid carrier
+    // bound to a transcript, drive it through `OpenSessionBound`, and prove (a) the
+    // matching transcript decrypts with no CEK/plaintext leak, and (b) a replay
+    // against a DIFFERENT session — and a tampered carrier — both fail closed.
+
+    #[cfg(feature = "rail-bind")]
+    fn bound_setup(
+        seed: [u8; 32],
+        seal_req: &DecryptSessionRequestV1,
+        cek: &[u8; 16],
+        plaintext: &[u8],
+        nonce: &[u8],
+        content_hash: &[u8],
+    ) -> (BoundRailMaterial, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>) {
+        use crate::pq_envelope::seal_support::{
+            gen_session, mldsa_seal_keypair, seal_bound, session_public_bytes,
+        };
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let (signer, authority_vk) = mldsa_seal_keypair(seed);
+
+        // The key authority seals BOUND to the transcript of `seal_req`.
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &seal_req.principal_id,
+            session_id: &seal_req.session_id,
+            object_cid: &seal_req.object_cid,
+            content_hash,
+            action: &seal_req.action,
+            viewer_interface: &seal_req.viewer_interface,
+            output_kind: &seal_req.output_kind,
+            expires_at: seal_req.expires_at,
+            release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+        }
+        .to_aad();
+
+        let segment = build_encrypted_segment(plaintext, cek, &[0x77u8; 8]);
+        let sealed = seal_bound(&public, cek, &aad, &signer).to_bytes();
+        let material = BoundRailMaterial {
+            sealed_cek_b64: b64.encode(&sealed),
+            ciphertext_b64: b64.encode(&segment),
+            init_segment_b64: None,
+            nonce_b64: b64.encode(nonce),
+            content_hash_b64: b64.encode(content_hash),
+        };
+        (material, crate::rail_shim::SessionSecret::PqHybrid(secret), authority_vk, pub_bytes)
+    }
+
+    #[cfg(feature = "rail-bind")]
+    #[test]
+    fn open_session_bound_decrypts_matching_transcript_without_leaking() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let plaintext = b"transcript-bound payload through the provider";
+        let (material, session, authority_vk, pub_bytes) =
+            bound_setup([0x55u8; 32], &req, &cek, plaintext, b"nonce-0001", &[0xABu8; 32]);
+
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.handle(Request::OpenSessionBound {
+            request: Box::new(req),
+            material,
+        });
+
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(serialized.contains("\"status\":\"ok\""), "matching transcript must open: {serialized}");
+        assert!(!serialized.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!serialized.contains(&b64.encode(cek)), "CEK must not leak");
+    }
+
+    #[cfg(feature = "rail-bind")]
+    #[test]
+    fn open_session_bound_fails_closed_on_replay_against_different_session() {
+        let seal_req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let (material, session, authority_vk, pub_bytes) =
+            bound_setup([0x66u8; 32], &seal_req, &cek, b"payload", b"nonce-0002", &[0xABu8; 32]);
+
+        // Submit the SAME sealed material under a different session id — exactly the
+        // replay the transcript binding must defeat. The boundary rebuilds the AAD
+        // from the (different) request, so the GCM tag / signature reject it.
+        let mut replay_req = decrypt_request();
+        replay_req.session_id = "session:attacker".to_string();
+
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.handle(Request::OpenSessionBound {
+            request: Box::new(replay_req),
+            material,
+        });
+        assert_eq!(error_code(resp), "decrypt_failed", "a CEK bound to one session must not open another");
+    }
+
+    #[cfg(feature = "rail-bind")]
+    #[test]
+    fn open_session_bound_fails_closed_on_nonce_mismatch_and_tamper() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+
+        // (a) replayed/altered nonce -> rebuilt transcript differs -> fail closed.
+        let (mut material, session, authority_vk, pub_bytes) =
+            bound_setup([0x77u8; 32], &req, &cek, b"payload", b"nonce-0003", &[0xABu8; 32]);
+        material.nonce_b64 = b64.encode(b"nonce-XXXX");
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.handle(Request::OpenSessionBound {
+            request: Box::new(decrypt_request()),
+            material,
+        });
+        assert_eq!(error_code(resp), "decrypt_failed", "a swapped replay nonce must fail closed");
+
+        // (b) tampered sealed carrier -> fail closed.
+        let (mut material2, session2, authority_vk2, pub_bytes2) =
+            bound_setup([0x88u8; 32], &req, &cek, b"payload", b"nonce-0004", &[0xABu8; 32]);
+        let mut sealed = b64.decode(&material2.sealed_cek_b64).unwrap();
+        sealed[0] ^= 0xFF;
+        material2.sealed_cek_b64 = b64.encode(&sealed);
+        let mut provider2 = DecryptProvider {
+            session: Some(session2),
+            authority_vk: Some(authority_vk2),
+            session_pub: Some(pub_bytes2),
+        };
+        let resp2 = provider2.handle(Request::OpenSessionBound {
+            request: Box::new(decrypt_request()),
+            material: material2,
+        });
+        assert_eq!(error_code(resp2), "decrypt_failed", "a tampered carrier must fail closed");
     }
 }

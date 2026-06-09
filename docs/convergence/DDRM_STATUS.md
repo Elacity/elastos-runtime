@@ -1,6 +1,25 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~49 commits**, tip Day-45 live rail). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Recommended rail (Option A) is now WIRED into the provider dispatch as a fail-closed reference (`rail-live`).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~50 commits**, tip Day-46 transcript binding). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); recommended rail (Option A) WIRED (`rail-live`) and sealed material now BINDS the full transcript (`rail-bind`).**
+
+> **🔒 Day 46 — sealed material binds the full transcript (Anders' Day-45 ask, LANDED).**
+> Anders confirmed the architecture (hybrid, ElastOS-native, Option A push-in, chain
+> `drm→rights→key/dKMS→decrypt`, in-sandbox session key, providers stay separate,
+> PQ-hybrid root) and added one hard requirement: the sealed material must bind the
+> **full decrypt transcript** with AEAD/AAD + signature + replay nonce. Done on the
+> PQ-hybrid profile (`rail-bind`=60): a capsule-local `DecryptTranscriptV1` (principal,
+> session, object CID + content hash, action, viewer interface, output kind, expiry,
+> release-receipt hash, decrypt-session pubkey, suite, provider, nonce) is the
+> AES-256-GCM **AAD** and is covered by the **ML-DSA-65 signature** (`hybrid_unwrap_bound`
+> / `seal_bound`). `OpenSessionBound` rebuilds the transcript from the authenticated
+> request + the boundary's own session pubkey (never the carrier) → a CEK sealed for
+> one transcript **cannot be replayed** against another: a different `session_id`, a
+> swapped nonce, and a tampered carrier all **fail closed**. `aad==b""` reproduces the
+> legacy envelope byte-for-byte, so every committed golden + the `rail-shim-mldsa`/
+> `harden` rungs are unchanged; default build still byte-identical + fail-closed.
+> Remaining (upstream/needs Anders, not our boundary): fold `sealed_decrypt_material`
+> into the shared contract, in-sandbox key mint+publish, dKMS-direct sealing. See
+> `DDRM_DECRYPT_RAIL.md` §Transcript binding.
 
 > **🔌 Day 45 — recommended rail WIRED (reference).** The recommended split
 > (Option A at the decrypt boundary: the VM *receives* sealed material) is no

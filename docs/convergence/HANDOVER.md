@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 45).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-45 live rail, ~49 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Recommended rail (Option A) now WIRED into provider dispatch as a fail-closed reference (`rail-live`), shared contract untouched.**
+**Last updated:** 2026-06-09 (end of Day 46).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-46 transcript binding, ~50 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45): Option A wired (`rail-live`) and the sealed CEK now BINDS the full decrypt transcript via AEAD AAD + ML-DSA-65 signature (`rail-bind`), shared contract still untouched.**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -141,6 +141,7 @@ counts per feature:
 | `rail-shim-mldsa` | 54 | the real ML-DSA-65 verified through `decrypt_from_carrier` on a committed carrier golden (Day 33) |
 | `harden` | 65 | adversarial negative-space + containment sweep over the wire-decoders (Day 34) |
 | `rail-live` | 57 | **recommended rail (Option A) WIRED into dispatch** — `OpenSessionLive` runs `decrypt_from_carrier` in-boundary, real PQ carrier decrypts through dispatch with no CEK/plaintext leak; tampered/unprovisioned fail closed (Day 45) |
+| `rail-bind` | 60 | **sealed CEK binds the full decrypt transcript** (Anders Day-45 ask) — `DecryptTranscriptV1` as AES-256-GCM AAD + ML-DSA-65 signature; `OpenSessionBound` rebuilds it from the authenticated request; replay against a different session / swapped nonce / tampered carrier all fail closed (Day 46) |
 | `gen-vectors` | — | regenerate the committed vectors (writes `tests/vectors/`) |
 
 The standing gate `scripts/ddrm-verify.sh` now asserts **all** of these counts +
@@ -361,9 +362,9 @@ for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo te
 
 # decrypt-provider feature ladder (tested islands; counts in §3)
 # default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 42 /
-# rail-shim 45 / pq-mldsa 34 / pq-mldsa-hybrid 37 / rail-shim-mldsa 54 / harden 65 / rail-live 57
+# rail-shim 45 / pq-mldsa 34 / pq-mldsa-hybrid 37 / rail-shim-mldsa 54 / harden 65 / rail-live 57 / rail-bind 60
 ( cd capsules/decrypt-provider && \
-  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa pq-mldsa-hybrid rail-shim-mldsa harden rail-live; do \
+  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa pq-mldsa-hybrid rail-shim-mldsa harden rail-live rail-bind; do \
     cargo test --features $f; done )
 
 # regenerate the committed golden vectors (only when intentionally changing them)
@@ -473,6 +474,7 @@ next context can continue cold.
 - **D43** build-verify push queue #3 + #2 on macOS: `chore/bincode-2x` **311 passed / 0 failed** incl. the capability-token byte-identity golden (`token_wire_format_is_bincode_1x_legacy`) — wire format provably unchanged; `fix/home-summary-resilience` builds clean + its `home_browser_state_*` tests pass (4 `home_launch`/`runtime_ensure` failures are **no-KVM env limits, identical on the crosvm branch → not a regression**, pass on Linux CI). Recorded in `PUSH_PLAN.md` with a Linux-test-gating follow-up. dDRM gate still 4/4.
 - **D44** **0.4.0 RELEASED** (tag `v0.4.0`=`cae83c3c3`) — alignment audit: `protected_content.rs` **byte-identical** to the release; `ddrm-drift-check.sh` **passes against the released base**; crypto core validated green ON `v0.4.0` (overlay worktree: drift PASS, harden=65, pq-mldsa-hybrid=37, encrypt=13, pc2-conformance byte-compatible). Released providers are still fail-closed skeletons (no rail). Rebase surface MEASURED (`PUSH_PLAN.md`): decrypt/encrypt clean, **key+drm 3-way (needs Anders)**. Rail decision remains the one blocker.
 - **D45** **recommended rail WIRED into dispatch** (Option A, decision taken with the team): new `OpenSessionLive` op runs the proven `rail_shim::decrypt_from_carrier` in-boundary with a real `MlDsa65Verifier` and returns a scoped response. Feature `rail-live`=57: a real ML-DSA-65-signed PQ-hybrid carrier decrypts through the **actual provider dispatch** with **no CEK/plaintext leak**; tampered carrier + unprovisioned boundary both fail closed; `wasm32-wasip1`-clean. Shared `DecryptSessionRequestV1` **untouched** (material rides a capsule-local variant) → drift still PASS, default build byte-identical + fail-closed. The exact additive contract delta for default-on is written in `DDRM_DECRYPT_RAIL.md` (§Reference rail LANDED). Ladder gate now pins `rail-live`=57 + its wasm build. Only remaining step to live decrypt: Anders' thumbs-up on the contract field.
+- **D46** **Anders confirmed the rail** (hybrid, ElastOS-native, Option A push-in, chain `drm→rights→key/dKMS→decrypt`, in-sandbox session key, providers stay separate, PQ-hybrid root, P-256/Lit compat-only) and added one hard requirement: the sealed material must **bind the full decrypt transcript** (AEAD/AAD + signature + replay nonce). **LANDED** on the PQ profile (`rail-bind`=60): capsule-local `DecryptTranscriptV1` (principal, session, object CID+content hash, action, viewer interface, output kind, expiry, release-receipt hash, decrypt-session pubkey, suite, provider, nonce) is the AES-256-GCM **AAD** + covered by the **ML-DSA-65 signature** (`hybrid_unwrap_bound`/`seal_bound`, golden-safe: `aad==b""`==legacy). `OpenSessionBound` rebuilds the transcript from the **authenticated request** + the boundary's own session pubkey → a CEK bound to one transcript **cannot be replayed**: different `session_id` / swapped nonce / tampered carrier all fail closed. `rail-shim-mldsa`=54 + `harden`=65 unchanged → no golden disturbed; drift PASS; default byte-identical. Ladder pins `rail-bind`=60 + wasm. Remaining (upstream, needs Anders/dKMS): fold `sealed_decrypt_material` into the shared contract, in-sandbox key mint+publish, dKMS-direct sealing.
 
 ---
 

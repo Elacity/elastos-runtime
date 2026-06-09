@@ -72,17 +72,40 @@ pub fn decrypt_from_carrier(
     carrier: &SealedDecryptCarrier,
     verifier: &impl CekSealVerifier,
 ) -> Result<(Vec<u8>, Value), String> {
+    decrypt_from_carrier_bound(session, carrier, b"", verifier)
+}
+
+/// Transcript-bound carrier open (Anders, Day 45 decision): `decrypt_from_carrier`
+/// with the sealed CEK welded to `aad` — the canonical decrypt transcript
+/// (principal/session/object/receipt/session-pubkey/suite/provider/nonce). On the
+/// PQ-hybrid profile (the product target) the binding is enforced by the AEAD AAD
+/// + the signature over `payload ‖ aad`, so a CEK sealed for one transcript fails
+/// closed against any other. `aad == b""` is the legacy unbound behaviour.
+///
+/// Binding is a PQ-profile guarantee; the classical P-256 path is PC2-migration
+/// compatibility only (its AES-256-CBC envelope is not AEAD), so a non-empty `aad`
+/// on a classical carrier is rejected rather than silently unbound.
+pub fn decrypt_from_carrier_bound(
+    session: &SessionSecret,
+    carrier: &SealedDecryptCarrier,
+    aad: &[u8],
+    verifier: &impl CekSealVerifier,
+) -> Result<(Vec<u8>, Value), String> {
     let init = carrier.init_segment.as_deref();
     match (&carrier.profile, session) {
         (SealProfile::ClassicalP256, SessionSecret::ClassicalP256(sk)) => {
+            if !aad.is_empty() {
+                return Err("transcript binding requires the PQ-hybrid profile".to_string());
+            }
             crate::decrypt_sealed_segment(sk, &carrier.sealed_cek, &carrier.ciphertext_segment, init)
         }
         (SealProfile::PqHybrid, SessionSecret::PqHybrid(secret)) => {
             let envelope =
                 PqSealedEnvelope::from_bytes(&carrier.sealed_cek).map_err(|e| format!("{e:?}"))?;
-            crate::pq_envelope::decrypt_pq_sealed_segment(
+            crate::pq_envelope::decrypt_pq_sealed_segment_bound(
                 secret,
                 &envelope,
+                aad,
                 verifier,
                 &carrier.ciphertext_segment,
                 init,

@@ -1,9 +1,16 @@
 # dDRM Decrypt Rail — design decision (open)
 
-**Status:** Recommended rail (Option A) **WIRED as a fail-closed reference** behind
-`rail-live` (Day 45); shared contract untouched. The remaining decision is Anders'
-thumbs-up on the additive `DecryptSessionRequestV1` field (see §Reference rail
-LANDED). Routes to Anders.
+**Status:** **DECIDED by Anders (Day 45).** Hybrid path, ElastOS-native contract
+(not Lit/Chipotle); Option A at the decrypt boundary (sealed material pushed in, no
+outbound key-fetch); chain `drm → rights → key/dKMS → decrypt`; decrypt mints a
+per-session key in-sandbox; CEK sealed to that key (dKMS-direct preferred,
+key-provider re-seal as audited migration); keep key/decrypt providers separate;
+PQ-hybrid as the root, P-256/Lit as compatibility only. `DecryptSessionRequestV1`
+gains a backend-neutral `sealed_decrypt_material` envelope that **binds the full
+transcript**. The recommended rail is already WIRED as a fail-closed reference
+(`rail-live`), and the transcript binding is now implemented + proven (`rail-bind`,
+see §Transcript binding). Remaining: fold the blessed envelope into the shared
+contract (we can't push yet) + the upstream dKMS/key-provider sealing side.
 **Context:** Day 3 of the dDRM convergence. The PC2 `cenc-decrypt` engine is
 vendored and tested inside `decrypt-provider` (Day 1). This note records *why
 end-to-end wiring is blocked on a contract/architecture decision* and lays out
@@ -143,6 +150,46 @@ never a request field). Q1 (dKMS-direct vs key-provider re-seal) and Q2
 (ML-DSA-65 vs hybrid ECDSA+ML-DSA signature) do **not** change this shape — Q2
 plugs into the `CekSealVerifier` slot the rail already uses, and both answers are
 pre-proven.
+
+## Transcript binding — LANDED (`rail-bind`, Day 46)
+
+Anders' Day-45 decision added one hard requirement on top of Option A: the sealed
+material must be a **backend-neutral `sealed_decrypt_material` envelope that binds
+the full transcript** (principal, session, object CID/content hash, action, viewer
+interface, output kind, expiry, release-receipt hash, decrypt-session public key,
+algorithm suite, provider identity) with **nonce/replay protection, signature
+verification, AEAD/AAD binding, short expiry, audit, and zeroization**. That is the
+property that stops a validly-sealed CEK from being **replayed** against a different
+session/object/receipt.
+
+This is implemented and proven on our PQ-hybrid profile (feature `rail-bind`):
+
+- A capsule-local `DecryptTranscriptV1` encodes exactly that field set into a
+  domain-separated, length-prefixed AAD (`to_aad()`), with a SHA-256
+  `release_receipt_hash`, the in-sandbox `decrypt_session_pub`, the suite id
+  (`elastos-pq-hybrid-threshold-v0`), the provider id, and a replay `nonce`.
+- The PQ-hybrid envelope binds it **two ways**: the CEK is AES-256-GCM-wrapped with
+  the transcript as **AAD**, and the **ML-DSA-65 signature covers `payload ‖
+  transcript`**. (`hybrid_unwrap_bound` / `seal_bound`; `aad == b""` reproduces the
+  legacy envelope byte-for-byte, so every committed unbound golden is unchanged.)
+- `OpenSessionBound` rebuilds the transcript from the **authenticated request + the
+  boundary's own provisioned session public key** — never trusting it from the
+  carrier — then opens via `decrypt_from_carrier_bound`. The CEK only materializes
+  (in `Zeroizing`) after both the GCM tag and the signature accept; plaintext never
+  crosses to the caller.
+- Proven (`rail-bind`=60): a matching transcript decrypts with no CEK/plaintext
+  leak; a **replay against a different `session_id`**, a **swapped replay nonce**,
+  and a **tampered carrier** all **fail closed** (`decrypt_failed`).
+
+What this leaves for the upstream/contract side (needs Anders/dKMS, not blocking
+our boundary): (1) fold `sealed_decrypt_material` into the shared
+`DecryptSessionRequestV1` (we can't push while access is suspended — exact additive
+delta above, now extended with the transcript fields); (2) the **in-sandbox
+session-key mint + publish** step (currently the session key is *provisioned* into
+the boundary for the reference; minting needs `getrandom` under the feature — a
+small, isolated next step); (3) the **dKMS-direct sealing** producer (or the
+audited key-provider re-seal migration) on the key side. The decrypt boundary is
+ready for all three.
 
 ## Isolation tier — wasm now, microVM as hardening (recommendation)
 

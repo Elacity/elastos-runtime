@@ -27,7 +27,7 @@
 
 #![allow(dead_code)] // rail-candidate: tested island, not yet wired into dispatch
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use ml_kem::kem::Decapsulate;
 use ml_kem::{Ciphertext, KemCore, MlKem768};
@@ -305,7 +305,29 @@ pub fn hybrid_unwrap(
     envelope: &PqSealedEnvelope,
     verifier: &impl CekSealVerifier,
 ) -> Result<Zeroizing<Vec<u8>>, PqEnvelopeError> {
-    if !verifier.verify(&envelope.signed_payload(), &envelope.signature) {
+    hybrid_unwrap_bound(session, envelope, b"", verifier)
+}
+
+/// Transcript-bound unwrap (Anders, Day 45 decision): identical to `hybrid_unwrap`
+/// but BINDS the sealed CEK to an external `aad` transcript. The signature must
+/// cover `signed_payload() ‖ aad` AND the AES-256-GCM open uses `aad` as
+/// additional authenticated data — so the same sealed CEK is cryptographically
+/// welded to exactly one (principal, session, object, receipt, session pubkey,
+/// suite, provider, nonce) transcript. ANY transcript mismatch (replay against a
+/// different session/object/receipt, a swapped output kind, an expired window)
+/// fails closed at the GCM tag or the signature, before any plaintext exists.
+///
+/// `aad == b""` is exactly the legacy behaviour (GCM with zero-length AAD), so the
+/// committed unbound goldens are byte-for-byte unchanged.
+pub fn hybrid_unwrap_bound(
+    session: &SessionKemSecret,
+    envelope: &PqSealedEnvelope,
+    aad: &[u8],
+    verifier: &impl CekSealVerifier,
+) -> Result<Zeroizing<Vec<u8>>, PqEnvelopeError> {
+    let mut signed = envelope.signed_payload();
+    signed.extend_from_slice(aad);
+    if !verifier.verify(&signed, &envelope.signature) {
         return Err(PqEnvelopeError::BadSignature);
     }
 
@@ -322,7 +344,10 @@ pub fn hybrid_unwrap(
     let wrap_key = derive_wrap_key(x_ss.as_bytes(), pq_ss.as_slice());
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key[..]));
     let cek = cipher
-        .decrypt(Nonce::from_slice(&envelope.nonce), envelope.wrapped_cek.as_ref())
+        .decrypt(
+            Nonce::from_slice(&envelope.nonce),
+            Payload { msg: envelope.wrapped_cek.as_ref(), aad },
+        )
         .map_err(|_| PqEnvelopeError::UnsealFailed)?;
     Ok(Zeroizing::new(cek))
 }
@@ -348,9 +373,34 @@ pub fn decrypt_pq_sealed_segment(
     ciphertext_segment: &[u8],
     init_segment: Option<&[u8]>,
 ) -> Result<(Vec<u8>, serde_json::Value), String> {
+    decrypt_pq_sealed_segment_bound(
+        session,
+        sealed_envelope,
+        b"",
+        verifier,
+        ciphertext_segment,
+        init_segment,
+    )
+}
+
+/// Transcript-bound PQ data path: `decrypt_pq_sealed_segment` with the sealed CEK
+/// welded to `aad` (the canonical decrypt transcript). The CEK only materializes
+/// after BOTH the signature over `payload ‖ aad` and the AEAD-with-AAD open
+/// succeed — so a CEK sealed for one transcript can never decrypt content under a
+/// different one. Held in `Zeroizing` throughout; never reaches the scoped output.
+#[cfg(feature = "pq-rail-prep")]
+pub fn decrypt_pq_sealed_segment_bound(
+    session: &SessionKemSecret,
+    sealed_envelope: &PqSealedEnvelope,
+    aad: &[u8],
+    verifier: &impl CekSealVerifier,
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, serde_json::Value), String> {
     use base64::Engine as _;
 
-    let cek = hybrid_unwrap(session, sealed_envelope, verifier).map_err(|err| format!("{err:?}"))?;
+    let cek =
+        hybrid_unwrap_bound(session, sealed_envelope, aad, verifier).map_err(|err| format!("{err:?}"))?;
     // Bridge the recovered CEK into the cenc engine's command surface, held in
     // `Zeroizing` so it is scrubbed across the internal hand-off (same discipline
     // as the classical `decrypt_sealed_segment`).
@@ -427,6 +477,17 @@ pub(crate) mod seal_support {
         )
     }
 
+    /// Canonical published-pubkey encoding (`x25519(32) ‖ ML-KEM-768 ek`) — the
+    /// bytes the key authority seals to and that the decrypt boundary binds into the
+    /// transcript as `decrypt_session_pub`. Both sides must agree byte-for-byte.
+    pub fn session_public_bytes(public: &SessionKemPublic) -> Vec<u8> {
+        use ml_kem::EncodedSizeUser;
+        let mut v = Vec::new();
+        v.extend_from_slice(public.x25519.as_bytes());
+        v.extend_from_slice(public.mlkem_ek.as_bytes().as_slice());
+        v
+    }
+
     /// Reconstruct the VM session secret from its serialized parts (the x25519
     /// static secret + the ML-KEM-768 decapsulation key) — deterministic, no RNG.
     /// Mirrors how the live VM would restore its session key, and how the PQ golden
@@ -443,6 +504,20 @@ pub(crate) mod seal_support {
     /// would (independently constructing the wire shape), so the round-trip pins
     /// the rail contract end to end.
     pub fn seal(public: &SessionKemPublic, cek: &[u8], signer: &impl CekSealSigner) -> PqSealedEnvelope {
+        seal_bound(public, cek, b"", signer)
+    }
+
+    /// Transcript-bound seal — the key-authority counterpart of
+    /// `hybrid_unwrap_bound`. Wraps the CEK with `aad` as AES-256-GCM additional
+    /// authenticated data and signs `signed_payload() ‖ aad`, so the produced
+    /// envelope only opens under the identical transcript. `aad == b""` reproduces
+    /// `seal` exactly (committed goldens unchanged).
+    pub fn seal_bound(
+        public: &SessionKemPublic,
+        cek: &[u8],
+        aad: &[u8],
+        signer: &impl CekSealSigner,
+    ) -> PqSealedEnvelope {
         let mut rng = OsRng;
         // x25519 ephemeral DH half.
         let eph = EphemeralSecret::random_from_rng(&mut rng);
@@ -456,7 +531,7 @@ pub(crate) mod seal_support {
         let mut nonce = [0u8; 12];
         rng.fill_bytes(&mut nonce);
         let wrapped_cek = cipher
-            .encrypt(Nonce::from_slice(&nonce), cek)
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: cek, aad })
             .expect("aead wrap");
 
         let mut env = PqSealedEnvelope {
@@ -466,7 +541,9 @@ pub(crate) mod seal_support {
             wrapped_cek,
             signature: Vec::new(),
         };
-        env.signature = signer.sign(&env.signed_payload());
+        let mut signed = env.signed_payload();
+        signed.extend_from_slice(aad);
+        env.signature = signer.sign(&signed);
         env
     }
 }
