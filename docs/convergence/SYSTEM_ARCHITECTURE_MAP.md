@@ -104,7 +104,7 @@ interchangeable **key-delivery backends**, all producing the *same* suite-tagged
 
 | Backend | Suite tag | Role |
 |---|---|---|
-| **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps |
+| **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps. **Day 81–82:** with `init.config.authority_key_store` (a path) its signer + KEM recipient are persisted ONCE (one 32-byte master seed, atomic write, 0600) and re-derived deterministically every launch → a STABLE published recipient (escrow-at-publish), fail-closed on a corrupt store |
 | **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team) |
 | **Lit / Chipotle** (compat) | `p256-classical-compat` | Migration backend for existing PC2 content; **not** the product root |
 | Third parties (future) | (declared per backend) | Same `release → SealedDecryptMaterialV1` contract |
@@ -138,7 +138,7 @@ flowchart TB
   end
   subgraph cons["CONSUMER — decrypt DONE, core executor landed, rail-wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
-    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider<br/>ProviderLauncher + from_launchers = HOST launches the rail spawn->init->publish, fail-closed teardown<br/>DrmHost::open = trusted host: PlanSource fetch -> drive registry -> RuntimeEventSink emits receipt+audit<br/>DrmHost owns the rail: shutdown tears down every transport; PersistingEventSink over DurableEventStore writes atomic CEK-free records]
+    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider<br/>ProviderLauncher + from_launchers = HOST launches the rail spawn->init->publish, fail-closed teardown<br/>DrmHost::launch = trusted-core composition: bring up own rail from launchers + wire sink in one call<br/>DrmHost::open = trusted host: PlanSource fetch -> drive registry -> RuntimeEventSink emits receipt+audit<br/>DrmHost owns the rail: shutdown tears down every transport; PersistingEventSink over DurableEventStore writes atomic CEK-free records]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -216,7 +216,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | KID as `bytes16` content id | shared `protected_content` + `chain-provider` | Already the rights-read key (`has_access_by_content_id`) |
 | `SHA256(cek‖kid‖authority)` binding | `DecryptTranscriptV1` (extended: principal/session/object/receipt/pubkey/suite/nonce) | We bind **more** than PC2 — full transcript, AEAD + ML-DSA-65 sig |
 | Lit PKP threshold custody | `key-provider` + **ElastOS-native PQ-hybrid dKMS** | Anders: Lit is a *compat backend behind key-provider*, not the product root |
-| Lit ECDH-seal to viewer session | `key-provider` → `SealedDecryptMaterialV1` → `decrypt-provider` | Done both sides (dev-shaped): producer escrows the CEK, authority recovers + re-seals (Day 60 producer smoke) |
+| Lit ECDH-seal to viewer session | `key-provider` → `SealedDecryptMaterialV1` → `decrypt-provider` | Done both sides: producer escrows the CEK at PUBLISH time to the authority's STABLE durable-key-store recipient (Day 81–82), authority recovers + re-seals per open (Day 60 producer smoke) |
 | `ddrm-decrypt` WASM unwrap + CENC | `decrypt-provider` rail-* | **Complete** (transcript-bound, in-sandbox key, expiry, audit) |
 | AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
@@ -349,6 +349,22 @@ decrypt-provider OpenSessionV1`.
   corrupt, `BackendSessionService.ts:107`/`:140`–`:196`). The consumer smoke hands the host LAUNCHERS
   (capsule binaries) not pre-provisioned capsules, and reads the durable records back through a fresh
   `DurableEventStore::load`. ddrm-plan-runner 38→43; drift untouched.
+- **Status (Day 81–82):** the key authority gets a STABLE, DURABLE-KEY-STORE identity, so the producer
+  ESCROWS the CEK at PUBLISH time to a recipient any later launch re-derives identically — collapsing the
+  Day-79/80 "launch → publish → escrow → bind" dance. (1) `ddrm-envelope` DETERMINISTIC derivation:
+  `mint_session_from_seed(seed)` (ML-KEM-768 `generate_deterministic(d,z)` + x25519 from-seed via
+  domain-separated SHA-256 sub-seeds, NO RNG, byte-identical), `derive_seed(master,label)`, `random_seed()`;
+  14→16. (2) `key-provider` reference authority DURABLE KEY STORE: `init.config.authority_key_store` (a path)
+  loads-or-creates + atomically persists (`*.tmp`→`rename`, 0600) ONE 32-byte master seed and re-derives BOTH
+  the signer + the KEM recipient from it (STABLE across processes; fail-closed on a corrupt store; the dev
+  default still mints fresh per init); 33→35. (3) `ddrm-plan-runner` `DrmHost::launch(plan_source, launchers,
+  events)`: the trusted-core composition helper bringing up its OWN rail + wiring the sink in one call; 43→45.
+  Mirrors PC2's stable `DEFAULT_AUTHORITY` (baked into every video's PSSH at encode time, `dashPackager.ts:44`)
+  vs the per-open `WasmSessionView` session key, and PC2's encode-time escrow `encryptMediaCEK(cek,kid) →
+  authority: DEFAULT_AUTHORITY` (`dashPackager.ts:131`–`:140`). The consumer smoke runs a PUBLISH phase
+  (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
+  SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
+  re-escrows), binds only the per-open session AAD. drift untouched.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
 - **Still dev-shaped:** the `reference` key authority still MINTS its keys at init, so the runtime binds the

@@ -17,7 +17,9 @@ hybrid = ["p256"]
 
 [dependencies]
 # Hybrid KEM (x25519 + ML-KEM-768), AEAD wrap, KDF — the runtime PQ-hybrid profile.
-ml-kem = "0.2.3"
+# `deterministic`: from-seed (d,z) keygen so a durable key authority re-derives the SAME
+# recipient key every launch (escrow-at-publish to a stable recipient).
+ml-kem = { version = "0.2.3", features = ["deterministic"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 sha2 = { version = "0.10", default-features = false }

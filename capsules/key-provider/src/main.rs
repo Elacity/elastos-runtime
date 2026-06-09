@@ -18,6 +18,13 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 };
 const SUPPORTED_SCHEMES: &[&str] = &["elastos-pq-hybrid-threshold-v0"];
 
+/// On-disk schema for the durable authority key store (feature `key-authority-ref`). The
+/// store holds ONE 32-byte master seed; the stable signer + KEM recipient are deterministically
+/// re-derived from it on every launch, so a producer can escrow a CEK to the published recipient
+/// at PUBLISH time and any later authority launch resolves the identical recipient.
+#[cfg(feature = "key-authority-ref")]
+const AUTHORITY_KEYSTORE_SCHEMA: &str = "elastos.key_authority.seed/v1";
+
 /// Decrypt-material suite tags the hosted backends emit. These match the
 /// `SealedDecryptMaterialV1.suite` values the decrypt boundary already routes on
 /// (`capsules/decrypt-provider`): the PQ-hybrid product target vs the PC2/Lit
@@ -350,21 +357,20 @@ impl KeyProvider {
             }
         }
 
-        // Stand up the reference seal authority when that backend is selected.
+        // Stand up the reference seal authority when that backend is selected. When the
+        // operator configures a durable `authority_key_store` path, the authority is
+        // PRODUCTION-SHAPED: its master seed is loaded (or created + persisted ONCE) from that
+        // store, and both the signer and the KEM recipient are deterministically re-derived
+        // from it — so the recipient is STABLE across restarts (escrow-at-publish). Without a
+        // store, the dev default mints a fresh recipient per init. Fail-closed: a corrupt /
+        // unreadable store fails the open rather than silently minting a divergent authority.
         #[cfg(feature = "key-authority-ref")]
         {
             self.reference = match self.backend {
-                Some(KeyAuthorityBackend::Reference) => {
-                    let (signer, verifying_key) =
-                        ddrm_envelope::seal::mldsa_seal_keypair(ref_seal_seed(&config));
-                    let (recipient_secret, recipient_public) = ddrm_envelope::mint_session();
-                    Some(ReferenceAuthority {
-                        signer,
-                        verifying_key,
-                        recipient_public: ddrm_envelope::session_public_bytes(&recipient_public),
-                        recipient_secret,
-                    })
-                }
+                Some(KeyAuthorityBackend::Reference) => match build_reference_authority(&config) {
+                    Ok(authority) => Some(authority),
+                    Err(err) => return Response::error("not_configured", err),
+                },
                 _ => None,
             };
         }
@@ -837,6 +843,111 @@ fn decode_kid_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
+/// Build the reference authority for an `init`. With a durable `authority_key_store` path the
+/// authority is STABLE (its master seed is persisted + re-derived); without one it mints a
+/// fresh recipient per init (dev default, back-compatible).
+#[cfg(feature = "key-authority-ref")]
+fn build_reference_authority(config: &Value) -> Result<ReferenceAuthority, String> {
+    if let Some(path) = config.get("authority_key_store").and_then(|v| v.as_str()) {
+        let master = load_or_create_authority_seed(path)?;
+        return Ok(reference_authority_from_master(&master));
+    }
+    // Dev default (no durable store): the signer seed comes from config (or a fixed default)
+    // so the verifying key is stable, but the KEM recipient is minted fresh each init.
+    let (signer, verifying_key) = ddrm_envelope::seal::mldsa_seal_keypair(ref_seal_seed(config));
+    let (recipient_secret, recipient_public) = ddrm_envelope::mint_session();
+    Ok(ReferenceAuthority {
+        signer,
+        verifying_key,
+        recipient_public: ddrm_envelope::session_public_bytes(&recipient_public),
+        recipient_secret,
+    })
+}
+
+/// Deterministically derive the stable reference authority (signer + KEM recipient) from one
+/// persisted 32-byte master seed. Domain-separated sub-seeds keep the signing key and the
+/// encryption recipient independent. The SAME master always yields byte-identical keys.
+#[cfg(feature = "key-authority-ref")]
+fn reference_authority_from_master(master: &[u8; 32]) -> ReferenceAuthority {
+    let seal_seed = ddrm_envelope::derive_seed(master, b"key-authority/seal/v1");
+    let (signer, verifying_key) = ddrm_envelope::seal::mldsa_seal_keypair(seal_seed);
+    let recipient_seed = ddrm_envelope::derive_seed(master, b"key-authority/recipient/v1");
+    let (recipient_secret, recipient_public) = ddrm_envelope::mint_session_from_seed(recipient_seed);
+    ReferenceAuthority {
+        signer,
+        verifying_key,
+        recipient_public: ddrm_envelope::session_public_bytes(&recipient_public),
+        recipient_secret,
+    }
+}
+
+/// Load the authority's master seed from a durable key store, or create + persist one on first
+/// launch. Mirrors PC2's stable, long-lived authority identity (`DEFAULT_AUTHORITY`, baked into
+/// every video's PSSH at encode time, `dashPackager.ts:44`) — vs the per-open decrypt session
+/// key. Fail-closed: a present-but-corrupt store is an error, never a silent re-mint (which
+/// would strand every CEK escrowed to the prior recipient).
+#[cfg(feature = "key-authority-ref")]
+fn load_or_create_authority_seed(path: &str) -> Result<[u8; 32], String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let record: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("authority key store {path} is corrupt: {e}"))?;
+            if record.get("schema").and_then(|v| v.as_str()) != Some(AUTHORITY_KEYSTORE_SCHEMA) {
+                return Err(format!("authority key store {path} has an unexpected schema"));
+            }
+            let seed_b64 = record
+                .get("authority_seed_b64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("authority key store {path} is missing authority_seed_b64"))?;
+            let seed_bytes = b64
+                .decode(seed_b64)
+                .map_err(|e| format!("authority key store {path} seed is not base64: {e}"))?;
+            if seed_bytes.len() != 32 {
+                return Err(format!(
+                    "authority key store {path} seed is {} bytes, expected 32",
+                    seed_bytes.len()
+                ));
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&seed_bytes);
+            Ok(seed)
+        }
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let seed = ddrm_envelope::random_seed();
+            persist_authority_seed(path, &seed)?;
+            Ok(seed)
+        }
+        Err(e) => Err(format!("authority key store {path}: {e}")),
+    }
+}
+
+/// Atomically persist the authority master seed: write a temp sibling then `rename` into place
+/// (a crash never leaves a torn store), best-effort `0600` on unix. The seed is the authority's
+/// long-lived secret — it lives only in this durable store, never on a release wire.
+#[cfg(feature = "key-authority-ref")]
+fn persist_authority_seed(path: &str, seed: &[u8; 32]) -> Result<(), String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let record = json!({
+        "schema": AUTHORITY_KEYSTORE_SCHEMA,
+        "authority_seed_b64": b64.encode(seed),
+    });
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write authority key store {tmp}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("publish authority key store {path}: {e}")
+    })
+}
+
 #[cfg(feature = "key-authority-ref")]
 fn ref_seal_seed(config: &Value) -> [u8; 32] {
     use base64::Engine as _;
@@ -1283,6 +1394,84 @@ mod tests {
 
         fn b64() -> base64::engine::general_purpose::GeneralPurpose {
             base64::engine::general_purpose::STANDARD
+        }
+
+        fn unique_store_path(tag: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir()
+                .join(format!("ddrm-authority-{tag}-{}-{nanos}.json", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        /// Production-shaped authority: a durable key store makes the published verifying key
+        /// AND the KEM recipient STABLE across separate `init`s (separate processes), so a CEK
+        /// escrowed to the recipient at publish time still recovers after a relaunch — vs the
+        /// dev default minting a fresh recipient every init.
+        #[test]
+        fn authority_key_store_yields_a_stable_recipient_across_inits() {
+            let path = unique_store_path("stable");
+            let cfg = json!({ "backend": "reference", "authority_key_store": path });
+
+            let mut first = KeyProvider::default();
+            let d1 = ok_data(first.init(cfg.clone()));
+            let mut second = KeyProvider::default();
+            let d2 = ok_data(second.init(cfg.clone()));
+
+            assert_eq!(
+                d1["seal_verifying_key_b64"], d2["seal_verifying_key_b64"],
+                "the verifying key is stable across launches"
+            );
+            assert_eq!(
+                d1["seal_recipient_pub_b64"], d2["seal_recipient_pub_b64"],
+                "the escrow recipient is stable across launches (escrow-at-publish works)"
+            );
+
+            // A CEK escrowed to the FIRST launch's published recipient recovers on the SECOND.
+            let recip_bytes = b64().decode(d1["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
+            let recipient_public =
+                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+            let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([5u8; 32]);
+            let cek: Vec<u8> = (0u8..16).collect();
+            let kid = [0x42u8; 16];
+            let aad =
+                ddrm_envelope::transcript::escrow_aad(ddrm_envelope::SUITE_PQ_HYBRID, &kid, &recip_bytes);
+            let wrapped =
+                ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &aad, &producer_signer).to_bytes();
+            let recovered = second
+                .reference
+                .as_ref()
+                .unwrap()
+                .recover_escrowed_cek(&wrapped, ddrm_envelope::SUITE_PQ_HYBRID, &kid, &producer_vk)
+                .expect("the relaunched authority recovers a CEK escrowed at publish time");
+            assert_eq!(&recovered[..], &cek[..]);
+
+            // Distinct from the dev default, which mints a fresh recipient each init.
+            let mut ephemeral_a = KeyProvider::default();
+            let ea = ok_data(ephemeral_a.init(json!({ "backend": "reference" })));
+            let mut ephemeral_b = KeyProvider::default();
+            let eb = ok_data(ephemeral_b.init(json!({ "backend": "reference" })));
+            assert_ne!(
+                ea["seal_recipient_pub_b64"], eb["seal_recipient_pub_b64"],
+                "without a store the recipient is freshly minted per init"
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Fail-closed: a present-but-corrupt key store must error, never silently re-mint a
+        /// divergent authority (which would strand every CEK escrowed to the prior recipient).
+        #[test]
+        fn authority_key_store_fails_closed_on_a_corrupt_store() {
+            let path = unique_store_path("corrupt");
+            std::fs::write(&path, b"{ not valid json").unwrap();
+            let mut provider = KeyProvider::default();
+            let resp = provider.init(json!({ "backend": "reference", "authority_key_store": path }));
+            assert_eq!(error_code_ref(&resp), "not_configured");
+            let _ = std::fs::remove_file(&path);
         }
 
         fn reference_provider() -> KeyProvider {

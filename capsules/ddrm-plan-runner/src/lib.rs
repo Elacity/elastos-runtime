@@ -670,6 +670,22 @@ impl DrmHost {
         }
     }
 
+    /// Build a host that BRINGS UP ITS OWN RAIL: LAUNCH each provider via its
+    /// [`ProviderLauncher`] (in caller-supplied dependency order) into the capability table,
+    /// then wire the plan source + event sink. The composition lives HERE in the trusted
+    /// core — a caller hands the host launchers + a sink and gets back a host that owns the
+    /// rail, rather than assembling the table itself. Fail-closed: a launch failure tears
+    /// down the partially-launched rail (via [`RuntimeCapabilityTable::from_launchers`]) and
+    /// surfaces before any plan is fetched.
+    pub fn launch(
+        plan_source: Box<dyn PlanSource>,
+        launchers: Vec<Box<dyn ProviderLauncher>>,
+        events: Box<dyn RuntimeEventSink>,
+    ) -> Result<Self, String> {
+        let table = RuntimeCapabilityTable::from_launchers(launchers)?;
+        Ok(Self::new(plan_source, table, events))
+    }
+
     /// Open `content_id` under `viewer_interface`: fetch the plan, drive it through the
     /// runtime capability registry (parse → resolve each required transport → execute —
     /// exactly [`open_drm_plan`]'s core), then emit the plan's runtime-event steps in
@@ -1964,6 +1980,53 @@ mod tests {
         for p in ["rights", "key", "decrypt"] {
             assert!(log.contains(&format!("shutdown:{p}")), "{p} torn down");
         }
+    }
+
+    #[test]
+    fn host_launch_composes_the_rail_in_the_core() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // The host composes its OWN rail from launchers — the caller hands launchers + a sink,
+        // not a pre-built table.
+        let mut host = DrmHost::launch(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            vec![
+                launcher("rights", &log, &invoked, false),
+                launcher("key", &log, &invoked, false),
+                launcher("decrypt", &log, &invoked, false),
+            ],
+            Box::new(RecordingSink { emitted, refuse: None }),
+        )
+        .expect("the host launches its own rail");
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open over the launched rail");
+        host.shutdown().expect("teardown");
+        let log = log.borrow();
+        assert_eq!(log[0], "launch:rights");
+        for p in ["rights", "key", "decrypt"] {
+            assert!(log.contains(&format!("shutdown:{p}")), "{p} torn down");
+        }
+    }
+
+    #[test]
+    fn host_launch_fails_closed_when_the_rail_cannot_come_up() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let err = match DrmHost::launch(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            vec![
+                launcher("key", &log, &invoked, false),
+                launcher("decrypt", &log, &invoked, true),
+            ],
+            Box::new(RecordingSink { emitted, refuse: None }),
+        ) {
+            Ok(_) => panic!("a rail that cannot come up must fail the host build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("launching provider `decrypt` failed"), "{err}");
     }
 
     #[test]

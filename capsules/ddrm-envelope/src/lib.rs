@@ -256,6 +256,58 @@ pub fn mint_session() -> (SessionKemSecret, SessionKemPublic) {
     )
 }
 
+/// Derive a domain-separated 32-byte sub-seed from a master seed:
+/// `SHA-256(label ‖ master)`. Lets one persisted authority master seed deterministically
+/// fan out into independent sub-keys (e.g. the seal signer seed vs the KEM recipient seed)
+/// that can never be confused for one another. Pure, no RNG.
+pub fn derive_seed(master: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(label);
+    h.update(master);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
+/// Mint a fresh 32-byte master seed from the OS RNG (WASI `random_get` on
+/// wasm32-wasip1). A durable key authority persists this ONCE and re-derives the same
+/// keypairs forever via [`mint_session_from_seed`] / [`seal::mldsa_seal_keypair`].
+pub fn random_seed() -> [u8; 32] {
+    use rand_core::RngCore;
+    let mut seed = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+/// DETERMINISTICALLY derive a hybrid KEM keypair from a 32-byte seed — the same seed
+/// always yields byte-identical keys, with NO RNG. The key-authority analogue of
+/// [`mint_session`]: a durable authority persists one master seed and re-derives the
+/// SAME recipient key on every launch, so a producer can escrow a CEK to the published
+/// recipient ONCE (at publish time) and any later authority launch resolves the identical
+/// recipient. Domain-separated sub-seeds feed x25519 and ML-KEM-768 independently.
+pub fn mint_session_from_seed(seed: [u8; 32]) -> (SessionKemSecret, SessionKemPublic) {
+    use ml_kem::B32;
+    let x_seed = derive_seed(&seed, b"elastos-session/x25519/v1");
+    let d = derive_seed(&seed, b"elastos-session/ml-kem-d/v1");
+    let z = derive_seed(&seed, b"elastos-session/ml-kem-z/v1");
+    let x_sk = XStaticSecret::from(x_seed);
+    let x_pk = XPublicKey::from(&x_sk);
+    let d: B32 = d.into();
+    let z: B32 = z.into();
+    let (dk, ek) = MlKem768::generate_deterministic(&d, &z);
+    (
+        SessionKemSecret {
+            x25519: x_sk,
+            mlkem_dk: dk,
+        },
+        SessionKemPublic {
+            x25519: x_pk,
+            mlkem_ek: ek,
+        },
+    )
+}
+
 /// Verifier behind which the signature scheme is swapped (ml-dsa-65 / hybrid).
 pub trait CekSealVerifier {
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;
@@ -605,6 +657,40 @@ mod tests {
 
     fn cek() -> Vec<u8> {
         (0u8..16).collect()
+    }
+
+    #[test]
+    fn mint_session_from_seed_is_deterministic_and_usable() {
+        let seed = [0x4Du8; 32];
+        // Same seed → byte-identical published recipient key, every time.
+        let (_s1, p1) = mint_session_from_seed(seed);
+        let (s2, p2) = mint_session_from_seed(seed);
+        assert_eq!(
+            session_public_bytes(&p1),
+            session_public_bytes(&p2),
+            "a stable authority re-derives the SAME recipient key on every launch"
+        );
+        // A different seed → a different recipient.
+        let (_s3, p3) = mint_session_from_seed([0x4Eu8; 32]);
+        assert_ne!(session_public_bytes(&p1), session_public_bytes(&p3));
+        // The re-derived recipient still recovers a CEK escrowed to it (the escrow-at-publish
+        // path): seal to p1's published key, unwrap with a FRESH re-derivation of the secret.
+        let (signer, vk) = mldsa_seal_keypair(SEED);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).expect("verifier");
+        let aad = b"escrow:kid=abc";
+        let env = seal_bound(&p1, &cek(), aad, &signer);
+        let recovered = hybrid_unwrap_bound(&s2, &env, aad, &verifier).expect("open with re-derived secret");
+        assert_eq!(recovered.as_slice(), cek().as_slice());
+    }
+
+    #[test]
+    fn derive_seed_is_deterministic_and_domain_separated() {
+        let master = [0x11u8; 32];
+        assert_eq!(derive_seed(&master, b"seal"), derive_seed(&master, b"seal"));
+        // Different labels → independent sub-seeds (can't be confused for one another).
+        assert_ne!(derive_seed(&master, b"seal"), derive_seed(&master, b"recipient"));
+        // Different master → different sub-seed under the same label.
+        assert_ne!(derive_seed(&master, b"seal"), derive_seed(&[0x12u8; 32], b"seal"));
     }
 
     #[test]
