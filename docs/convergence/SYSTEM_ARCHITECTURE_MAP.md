@@ -116,6 +116,8 @@ configured = `release` fails closed. This is the structural model Day 50 lands.
 
 ## 3. Architecture map — current state
 
+**Legend:** ✅ done · 🟩 built cross-binary (offline-proven) · 🟦 partial · 🟥 fail-closed skeleton · ⬜ missing
+
 ```mermaid
 flowchart TB
   subgraph core["Trusted core — IMPLEMENTED"]
@@ -123,29 +125,40 @@ flowchart TB
     SRV[elastos-server<br/>content / carrier bridge]
     CAR[Carrier P2P]
   end
-  subgraph infra["Infrastructure — IMPLEMENTED / PARTIAL"]
-    CNT[content provider ✅]
-    IPFS[ipfs-provider ✅]
-    CHN[chain-provider ✅<br/>has_access_by_content_id]
-    WLT[wallet-provider ✅]
+  subgraph infra["Infrastructure — IMPLEMENTED"]
+    IPFS[ipfs-provider ✅<br/>pin/serve]
+    CHN[chain-provider ✅<br/>has_access_by_content_id + assemble_mint]
+    WLT[wallet-provider ✅<br/>signing]
   end
-  subgraph ddrm["dDRM chain — FAIL-CLOSED skeletons"]
-    ENC[encrypt-provider 🟥<br/>engine proven]
+  subgraph prod["PRODUCER + DISCOVERY — Phase C, built cross-binary (Days 58–66)"]
+    ENC[encrypt-provider 🟩<br/>seal_inline + CEK escrow]
+    PUBP[publish-provider 🟩<br/>UnsignedMintV1 contentId=KID]
+    MKT[content-market 🟩<br/>reconstruct / enrich / from_event]
+  end
+  subgraph cons["CONSUMER — decrypt DONE, wiring pending"]
     DRM[drm-provider 🟥<br/>declares sequence]
-    RTS[rights-provider 🟥]
-    KEY[key-provider 🟥<br/>no authority]
+    RTS[rights-provider 🟦<br/>chain-rights receipt]
+    KEY[key-provider 🟥<br/>pluggable; needs live authority]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
+    VIEW[viewer ⬜ missing]
   end
-  LIB[library 🟦] --> CNT --> IPFS
-  WLT --> CHN
-  DRM -. declared, not wired .-> RTS -. .-> KEY -. .-> DEC
-  RTS -. not yet .-> CHN
-  BR[browser] -->|external HTTPS| ELA[(ela.city — real purchase/playback today)]
+  ENC --> PUBP --> CHN
+  ENC -->|ciphertext| IPFS --> MKT
+  CHN --> MKT
+  WLT -. buyAccess .-> CHN
+  DRM -. declared .-> RTS --> CHN
+  RTS -->|receipt| KEY -->|SealedDecryptMaterialV1| DEC --> VIEW
+  DEC -->|publishes session pubkey| KEY
 ```
 
-Today, a real purchase+playback only works through the **external ela.city** site in
-the Browser — it is release evidence for an external path, **not** proof the in-repo
-provider chain is production-complete.
+The **producer→chain→discovery spine is built and proven cross-binary offline** (one
+identity — the KID — flows `encrypt → publish → chain calldata → market listing`, and the
+chain event, the calldata, and the IPFS metadata all agree). The **decrypt boundary is
+COMPLETE** behind `rail-*`. What remains for a real purchase+playback is **live wiring**
+(real RPC/IPFS), a **key authority** (dKMS / Lit-compat), the **drm-provider orchestration**,
+and a **viewer**. A real end-user purchase+playback today still only works through the
+external **ela.city** site in the Browser — evidence for the external path, not proof the
+in-repo chain is production-complete.
 
 ---
 
