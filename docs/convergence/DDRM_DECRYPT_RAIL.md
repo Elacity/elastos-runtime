@@ -184,12 +184,22 @@ This is implemented and proven on our PQ-hybrid profile (feature `rail-bind`):
 What this leaves for the upstream/contract side (needs Anders/dKMS, not blocking
 our boundary): (1) fold `sealed_decrypt_material` into the shared
 `DecryptSessionRequestV1` (we can't push while access is suspended — exact additive
-delta above, now extended with the transcript fields); (2) the **in-sandbox
-session-key mint + publish** step (currently the session key is *provisioned* into
-the boundary for the reference; minting needs `getrandom` under the feature — a
-small, isolated next step); (3) the **dKMS-direct sealing** producer (or the
-audited key-provider re-seal migration) on the key side. The decrypt boundary is
-ready for all three.
+delta above, now extended with the transcript fields); (2) the **dKMS-direct
+sealing** producer (or the audited key-provider re-seal migration) on the key side.
+The decrypt boundary is ready for both.
+
+### In-sandbox session-key mint + publish — LANDED (`rail-mint`, Day 47)
+
+Anders' requirement that *"decrypt-provider creates a per-session one-time public
+key inside its sandbox"* is implemented. Under `rail-mint`, `init` calls
+`pq_envelope::mint_session()` (x25519 + ML-KEM-768 via `OsRng` → WASI `random_get`,
+`wasm32-wasip1`-clean), holds the secret in-VM, and publishes the canonical pubkey
+bytes (`session_public_bytes`) + suite in the init response as
+`decrypt_session_public_key_b64`. The key authority seals to that published key
+(`session_public_from_bytes`), transcript-bound, and the boundary opens it with the
+minted secret — proven end to end with no injected secret and a fresh key per init.
+Minting is the ONLY entropy the boundary needs; the unwrap path remains RNG-free
+(separate feature axis), preserving the verify-only wasm property of the lower rungs.
 
 ## Isolation tier — wasm now, microVM as hardening (recommendation)
 

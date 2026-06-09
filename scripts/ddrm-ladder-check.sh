@@ -51,6 +51,7 @@ LADDER=(
   "decrypt-provider harden|decrypt-provider|harden|65"
   "decrypt-provider rail-live|decrypt-provider|rail-live|57"
   "decrypt-provider rail-bind|decrypt-provider|rail-bind|60"
+  "decrypt-provider rail-mint|decrypt-provider|rail-mint|62"
 )
 
 bold "== dDRM ladder (1/2): test suites + asserted counts =="
@@ -109,6 +110,7 @@ if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
       "decrypt-provider|rail-shim-mldsa"
       "decrypt-provider|rail-live"
       "decrypt-provider|rail-bind"
+      "decrypt-provider|rail-mint"
   )
   for row in "${WASM[@]}"; do
     IFS='|' read -r dir features <<< "$row"

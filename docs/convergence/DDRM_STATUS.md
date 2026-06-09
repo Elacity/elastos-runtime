@@ -1,6 +1,21 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~50 commits**, tip Day-46 transcript binding). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); recommended rail (Option A) WIRED (`rail-live`) and sealed material now BINDS the full transcript (`rail-bind`).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~51 commits**, tip Day-47 in-sandbox mint). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); Option A WIRED (`rail-live`), sealed material BINDS the full transcript (`rail-bind`), and the boundary MINTS + publishes its own per-session key in-sandbox (`rail-mint`).**
+
+> **🔑 Day 47 — in-sandbox session-key mint + publish (Anders' Day-45 ask, LANDED).**
+> Anders required the decrypt-provider to *"create a per-session one-time public key
+> inside its sandbox."* Done (`rail-mint`=62): `init` mints the per-session hybrid
+> KEM keypair (`pq_envelope::mint_session`, OsRng→WASI `random_get`, wasm-clean),
+> keeps the secret in-VM, and publishes the pubkey + suite. The faithful flow is
+> proven with **no injected secret**: sandbox mints + publishes → key authority
+> seals the CEK to the published key (transcript-bound) → the minted secret opens it
+> with no CEK/plaintext leak; a fresh key is minted per init. Minting is the only
+> entropy the boundary needs; the unwrap path stays RNG-free (its own feature).
+> Default build + every committed golden unchanged; drift PASS. The decrypt boundary
+> now implements **all three** of Anders' decrypt-side requirements (push-in Option A,
+> transcript binding, in-sandbox key). Remaining is upstream only: fold
+> `sealed_decrypt_material` into the shared contract (needs push access) + dKMS-direct
+> sealing (or audited key-provider re-seal). See `DDRM_DECRYPT_RAIL.md`.
 
 > **🔒 Day 46 — sealed material binds the full transcript (Anders' Day-45 ask, LANDED).**
 > Anders confirmed the architecture (hybrid, ElastOS-native, Option A push-in, chain

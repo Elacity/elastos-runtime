@@ -263,12 +263,47 @@ impl DecryptProvider {
         }
     }
 
+    #[cfg(not(feature = "rail-mint"))]
     fn init(&mut self, _config: Value) -> Response {
         Response::ok(json!({
             "provider": "decrypt",
             "protocol_version": "1.0",
             "configured": false,
             "supported_operations": ["status", "open_session", "render"],
+        }))
+    }
+
+    /// `init` under the in-sandbox mint (feature `rail-mint`, Anders' Day-45 ask):
+    /// the boundary MINTS its own per-session hybrid KEM keypair, keeps the secret
+    /// in-VM, and PUBLISHES the public key (+ suite) so the key authority can seal
+    /// the CEK to it. The optional `authority_vk_b64` config pins the trusted
+    /// key-authority verifying key. The secret never appears in the response.
+    #[cfg(feature = "rail-mint")]
+    fn init(&mut self, config: Value) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = crate::pq_envelope::mint_session();
+        let pub_bytes = crate::pq_envelope::session_public_bytes(&public);
+        self.session = Some(rail_shim::SessionSecret::PqHybrid(secret));
+        self.session_pub = Some(pub_bytes.clone());
+
+        if let Some(vk_b64) = config.get("authority_vk_b64").and_then(Value::as_str) {
+            match b64.decode(vk_b64) {
+                Ok(vk) => self.authority_vk = Some(vk),
+                Err(_) => return Response::error("invalid_request", "authority_vk_b64 is not valid base64"),
+            }
+        }
+
+        Response::ok(json!({
+            "provider": "decrypt",
+            "protocol_version": "1.0",
+            "configured": self.authority_vk.is_some(),
+            "supported_operations": ["status", "open_session", "render", "open_session_bound"],
+            "suite": "elastos-pq-hybrid-threshold-v0",
+            // The freshly-minted, in-sandbox session public key the key authority
+            // seals the CEK to. The matching secret never leaves this boundary.
+            "decrypt_session_public_key_b64": b64.encode(&pub_bytes),
         }))
     }
 
@@ -1354,9 +1389,8 @@ mod tests {
         nonce: &[u8],
         content_hash: &[u8],
     ) -> (BoundRailMaterial, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>) {
-        use crate::pq_envelope::seal_support::{
-            gen_session, mldsa_seal_keypair, seal_bound, session_public_bytes,
-        };
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -1486,5 +1520,98 @@ mod tests {
             material: material2,
         });
         assert_eq!(error_code(resp2), "decrypt_failed", "a tampered carrier must fail closed");
+    }
+
+    // --- in-sandbox session-key mint + publish (feature `rail-mint`) -------------
+    //
+    // The faithful end-to-end flow Anders specified: the sandbox MINTS its own
+    // per-session key at init and PUBLISHES the public key; the key authority seals
+    // the CEK to that published key (transcript-bound); the boundary opens it using
+    // the MINTED secret it holds — no secret is ever injected by the test.
+
+    #[cfg(feature = "rail-mint")]
+    #[test]
+    fn minted_session_publishes_key_and_opens_bound_carrier() {
+        use crate::pq_envelope::seal_support::{mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_from_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (signer, authority_vk) = mldsa_seal_keypair([0x99u8; 32]);
+
+        // Sandbox mints + publishes its session key at init.
+        let mut provider = DecryptProvider::default();
+        let init = provider.handle(Request::Init {
+            config: json!({ "authority_vk_b64": b64.encode(&authority_vk) }),
+        });
+        let init_json = serde_json::to_value(&init).unwrap();
+        assert_eq!(init_json["data"]["configured"], json!(true), "trusted vk pins configured");
+        let pub_bytes = b64
+            .decode(init_json["data"]["decrypt_session_public_key_b64"].as_str().unwrap())
+            .unwrap();
+        // The minted secret must never appear in the published init response.
+        assert!(!serde_json::to_string(&init).unwrap().contains("secret"));
+
+        // Key authority seals the CEK to the PUBLISHED key, bound to the transcript.
+        let public = session_public_from_bytes(&pub_bytes).expect("published key parses");
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let plaintext = b"minted-session faithful flow payload";
+        let nonce = b"nonce-mint-01";
+        let content_hash = [0xCDu8; 32];
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &req.principal_id,
+            session_id: &req.session_id,
+            object_cid: &req.object_cid,
+            content_hash: &content_hash,
+            action: &req.action,
+            viewer_interface: &req.viewer_interface,
+            output_kind: &req.output_kind,
+            expires_at: req.expires_at,
+            release_receipt_hash: release_receipt_hash(&req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+        }
+        .to_aad();
+        let segment = build_encrypted_segment(plaintext, &cek, &[0x77u8; 8]);
+        let sealed = seal_bound(&public, &cek, &aad, &signer).to_bytes();
+        let material = BoundRailMaterial {
+            sealed_cek_b64: b64.encode(&sealed),
+            ciphertext_b64: b64.encode(&segment),
+            init_segment_b64: None,
+            nonce_b64: b64.encode(nonce),
+            content_hash_b64: b64.encode(content_hash),
+        };
+
+        // Open using the MINTED secret the boundary holds (never injected).
+        let resp = provider.handle(Request::OpenSessionBound {
+            request: Box::new(req),
+            material,
+        });
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(serialized.contains("\"status\":\"ok\""), "minted+published flow must open: {serialized}");
+        assert!(!serialized.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!serialized.contains(&b64.encode(cek)), "CEK must not leak");
+    }
+
+    #[cfg(feature = "rail-mint")]
+    #[test]
+    fn minted_session_is_fresh_each_init() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key_of = |mut p: DecryptProvider| {
+            let r = p.handle(Request::Init { config: json!({}) });
+            serde_json::to_value(&r).unwrap()["data"]["decrypt_session_public_key_b64"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let k1 = key_of(DecryptProvider::default());
+        let k2 = key_of(DecryptProvider::default());
+        assert_ne!(k1, k2, "each sandbox mints a fresh per-session key");
+        // x25519(32) ‖ ML-KEM-768 ek(1184) = 1216 published bytes.
+        assert_eq!(b64.decode(&k1).unwrap().len(), 32 + 1184);
     }
 }

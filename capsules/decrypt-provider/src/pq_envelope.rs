@@ -65,6 +65,52 @@ pub struct SessionKemPublic {
     pub mlkem_ek: MlKemEk,
 }
 
+/// Canonical published-pubkey encoding (`x25519(32) ‖ ML-KEM-768 ek`) — the exact
+/// bytes the key authority seals to and that the decrypt boundary binds into the
+/// transcript as `decrypt_session_pub`. Both sides must agree byte-for-byte.
+pub fn session_public_bytes(public: &SessionKemPublic) -> Vec<u8> {
+    use ml_kem::EncodedSizeUser;
+    let mut v = Vec::new();
+    v.extend_from_slice(public.x25519.as_bytes());
+    v.extend_from_slice(public.mlkem_ek.as_bytes().as_slice());
+    v
+}
+
+/// Parse a published session public key back from `session_public_bytes`. `None` on
+/// any wrong-size/malformed encoding (fail-closed). The counterpart the key
+/// authority uses to seal to a boundary's freshly-minted, published key.
+pub fn session_public_from_bytes(bytes: &[u8]) -> Option<SessionKemPublic> {
+    use ml_kem::{Encoded, EncodedSizeUser};
+    if bytes.len() < 32 {
+        return None;
+    }
+    let (x, ek) = bytes.split_at(32);
+    let xarr: [u8; 32] = x.try_into().ok()?;
+    let x25519 = XPublicKey::from(xarr);
+    let enc = Encoded::<MlKemEk>::try_from(ek).ok()?;
+    let mlkem_ek = MlKemEk::from_bytes(&enc);
+    Some(SessionKemPublic { x25519, mlkem_ek })
+}
+
+/// Mint a fresh per-session hybrid KEM keypair INSIDE the decrypt sandbox (feature
+/// `rail-mint`, Anders' Day-45 requirement). The secret never leaves the boundary;
+/// the caller publishes `session_public_bytes(&public)` for the key authority to
+/// seal to. This is the ONE place the decrypt boundary needs entropy — keygen —
+/// and it uses `OsRng` (WASI `random_get` on wasm32-wasip1). The unwrap path stays
+/// RNG-free.
+#[cfg(feature = "rail-mint")]
+pub fn mint_session() -> (SessionKemSecret, SessionKemPublic) {
+    use rand_core::OsRng;
+    let mut rng = OsRng;
+    let x_sk = XStaticSecret::random_from_rng(&mut rng);
+    let x_pk = XPublicKey::from(&x_sk);
+    let (dk, ek) = MlKem768::generate(&mut rng);
+    (
+        SessionKemSecret { x25519: x_sk, mlkem_dk: dk },
+        SessionKemPublic { x25519: x_pk, mlkem_ek: ek },
+    )
+}
+
 /// Verifier behind which the signature scheme is swapped (ml-dsa-65 / hybrid).
 pub trait CekSealVerifier {
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;
@@ -475,17 +521,6 @@ pub(crate) mod seal_support {
             SessionKemSecret { x25519: x_sk, mlkem_dk: dk },
             SessionKemPublic { x25519: x_pk, mlkem_ek: ek },
         )
-    }
-
-    /// Canonical published-pubkey encoding (`x25519(32) ‖ ML-KEM-768 ek`) — the
-    /// bytes the key authority seals to and that the decrypt boundary binds into the
-    /// transcript as `decrypt_session_pub`. Both sides must agree byte-for-byte.
-    pub fn session_public_bytes(public: &SessionKemPublic) -> Vec<u8> {
-        use ml_kem::EncodedSizeUser;
-        let mut v = Vec::new();
-        v.extend_from_slice(public.x25519.as_bytes());
-        v.extend_from_slice(public.mlkem_ek.as_bytes().as_slice());
-        v
     }
 
     /// Reconstruct the VM session secret from its serialized parts (the x25519

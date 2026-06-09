@@ -74,6 +74,14 @@ rail-live = ["rail-shim", "pq-mldsa"]
 # Adds `OpenSessionBound`; default + all unbound goldens stay byte-identical
 # (empty AAD == legacy). OFF by default. See DDRM_DECRYPT_RAIL.md §Transcript binding.
 rail-bind = ["rail-live"]
+# rail-mint: the in-sandbox session-key step Anders requires — the decrypt boundary
+# MINTS its own per-session hybrid KEM keypair (x25519 + ML-KEM-768) at `init`,
+# holds the secret in-VM, and PUBLISHES the public key (+ suite) for the key
+# authority to seal the CEK to. This is the only place the decrypt boundary needs
+# entropy (keygen); the unwrap path stays RNG-free. OsRng -> WASI `random_get`, so
+# it builds + runs on wasm32-wasip1. OFF by default. Builds on rail-bind so the
+# minted key feeds the transcript-bound open. See DDRM_DECRYPT_RAIL.md §Transcript binding.
+rail-mint = ["rail-bind", "dep:rand_core", "dep:getrandom"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).
@@ -111,6 +119,10 @@ sha2 = { version = "0.10", default-features = false, optional = true }
 # committed KAT reproducible. default-features off (no pkcs8/getrandom) — the
 # decrypt boundary only verifies, so no RNG is pulled into the wasm build.
 ml-dsa = { version = "0.1", default-features = false, optional = true }
+# In-sandbox session-key MINT only (feature `rail-mint`). Optional so the default +
+# verify-only rungs pull no RNG; on wasm32-wasip1 getrandom uses WASI `random_get`.
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+getrandom = { version = "0.2", optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
