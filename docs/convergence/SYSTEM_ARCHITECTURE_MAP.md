@@ -205,7 +205,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
 | Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
-| Channel/operative mint | a `publish-provider` over `chain-provider`+`wallet-provider` | Missing; the on-chain producer step |
+| Channel/operative mint | `publish-provider` over `chain-provider`+`wallet-provider` | Assembly DONE (Day 61, fail-closed, unsigned mint); ABI-encode + broadcast is the next wire |
 | SQLite `content_catalog` indexer | a `content-market` provider | Missing; index chain events + IPFS metadata |
 | secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
 | Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
@@ -293,9 +293,21 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   `release_ref` (tampered/foreign blob fails closed). `scripts/ddrm-producer-smoke.sh`
   drives `encrypt → key[recover+re-seal] → decrypt` over the three REAL binaries — a video
   sealed *now* decrypts *now*, no golden, fail-closed, no key/plaintext leak on any wire.
-- **Remaining:** `publish-provider` (mint contentId=KID + tokenURI via chain+wallet — the
-  on-chain producer step), the `content-market` index, and real `plaintext_ref`→IPFS in the
-  producer op (today it takes inline bytes for the smoke).
+- **Status (Day 61 — `publish-provider` assembles the on-chain mint, fail-closed):** a new
+  capsule that takes a sealed asset's KID + IPFS metadata folder and ASSEMBLES the content
+  mint — but holds NO chain-RPC and NO wallet key. Audited PC2's real shapes
+  (`elacity-creator/app.js`) and mirrored them: `contentId == bytes16 KID` (`kidToContentId`,
+  `0x`+32 lowercase hex, no hash), `tokenURI = {metadataCid}/metadata.json`, mint
+  `mint(string,uint16,bytes,bytes)` on the Channel, `opType ∈ {free=0,buy_once=1,
+  buy_and_resell=2}`. `PreparePublish` emits a typed **`UnsignedMintV1`** (op/sell args left
+  STRUCTURED for `chain-provider` to ABI-encode) + a `PublishReceiptV1` status `prepared`
+  (never `published`) naming `chain-provider`+`wallet-provider` as the two providers that
+  must finish the loop — the "core injects capabilities" pattern. Fail-closed on a
+  non-`bytes16` KID, a paid listing without a price, a free listing with sale terms, or a bad
+  channel address (publish=13).
+- **Remaining:** wire `chain-provider` to ABI-encode + broadcast the `UnsignedMintV1` (turn
+  `prepared` into a real on-chain asset), a `content-market` index that scans the mint event,
+  and real `plaintext_ref`→IPFS in the producer op (today inline bytes for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

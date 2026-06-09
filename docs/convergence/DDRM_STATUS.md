@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~66 commits**, tip Day-60 Phase C — the producer half now runs ACROSS REAL PROCESSES: `encrypt-provider` (feature `escrow`) has a `seal_inline` wire op that mints a CEK *now*, CENC-encrypts fresh bytes into a decrypt-ready segment, and emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers that CEK from the blob and re-seals it to the decrypt session; and `ddrm-producer-smoke.sh` drives `encrypt → key[recover+re-seal] → decrypt` so a video sealed *now* decrypts *now* — no raw CEK and no plaintext on any wire, no golden, fail-closed throughout). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~67 commits**, tip Day-61 Phase C — the on-chain producer step now has a home: a new fail-closed `publish-provider` capsule ASSEMBLES the content mint — binding `contentId == bytes16 KID` (PC2 `kidToContentId`, no hash), deriving `tokenURI = {metadataCid}/metadata.json`, and emitting a typed *unsigned* `UnsignedMintV1` (`mint(string,uint16,bytes,bytes)`) for `chain-provider` to ABI-encode+broadcast and `wallet-provider` to sign — holding NO chain-RPC and NO wallet key itself (publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire, no golden). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,30 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **⛓️ Day 61 — `publish-provider`: the on-chain content mint, assembled fail-closed (Phase C, LANDED).**
+> Days 58–60 built the producer's *crypto* half (mint→escrow→recover→re-seal→decrypt);
+> Day 61 starts the producer's *on-chain* half — the step that registers content so the
+> consumer chain (`has_access_by_content_id`) can answer for it. Audited PC2 first
+> (`pc2-node/data/test-apps/elacity-creator/app.js`) and mirrored its REAL shapes: the
+> on-chain `contentId` **is** the KID (`kidToContentId`, app.js:1568 — `0x` + 32 lowercase
+> hex, **no hash, no truncation**; the legacy hash-derived id was deliberately removed),
+> mint is `mint(string _uri, uint16 opType, bytes opRawData, bytes sellRawData)` on the
+> creator's Channel (app.js:4948) with `_uri = {metadataCid}/metadata.json` (app.js:4946),
+> and `opType ∈ {FREE=0, BUY_ONCE=1, BUY_AND_RESELL=2}`. New `publish-provider` capsule:
+> `PreparePublish` validates a `PublishRequestV1`, binds **`content_id == bytes16 KID`**
+> (closing producer→chain→consumer identity end to end), derives the tokenURI the PC2 way,
+> and emits a typed **`UnsignedMintV1`** + a `PublishReceiptV1` whose status is `prepared`
+> (never `published`) and which names the two providers that must finish the loop. It holds
+> **no** chain-RPC and **no** wallet key — `opRawData`/`sellRawData` stay STRUCTURED so the
+> EVM specialist (`chain-provider`) owns the ABI encoding and `wallet-provider` signs:
+> the runtime's "core injects capabilities" pattern. Fail-closed: a non-`bytes16` KID, a
+> paid listing with no price, a free listing carrying sale terms, or a bad channel address
+> are all rejected; the receipt carries no signing/RPC authority (publish=13).
+> **Gate:** ladder INTACT (+ publish rung 13, + wasm publish build), drift PASS, **both**
+> smokes green (consumer + producer), clippy clean. **Next:** wire `chain-provider` to
+> ABI-encode + broadcast the `UnsignedMintV1` (and a `content-market` index that scans the
+> mint event), turning "prepared" into a real on-chain asset.
 
 > **🎬 Day 60 — the producer half runs ACROSS REAL PROCESSES (Phase C, LANDED).**
 > Day 59 proved the producer→authority→decrypt crypto spine on a fresh CEK in one test
