@@ -189,28 +189,25 @@ const DECRYPT_SUITE_ID: &str = "elastos-pq-hybrid-threshold-v0";
 const DECRYPT_PROVIDER_ID: &str = "decrypt-provider";
 
 /// Bind the release receipt into the transcript by hashing its identifying fields
-/// (Anders: "release receipt hash"). Deterministic + domain-separated.
+/// (Anders: "release receipt hash"). Delegates to the shared
+/// `ddrm_envelope::transcript::release_receipt_hash` so the key authority computes
+/// the IDENTICAL hash it seals into the transcript — one encoder, no drift. The
+/// output is byte-for-byte unchanged (the committed `rail-bind`/`rail-material`
+/// goldens replay).
 #[cfg(feature = "rail-bind")]
 fn release_receipt_hash(receipt: &ReleaseReceiptV1) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"elastos-ddrm/release-receipt/v1");
-    for field in [
-        receipt.schema.as_str(),
-        receipt.request_id.as_str(),
-        receipt.object_cid.as_str(),
-        receipt.principal_id.as_str(),
-        receipt.session_id.as_str(),
-        receipt.action.as_str(),
-        receipt.provider.as_str(),
-        receipt.status.as_str(),
-    ] {
-        h.update((field.len() as u32).to_be_bytes());
-        h.update(field.as_bytes());
-    }
-    h.update(receipt.issued_at.to_be_bytes());
-    h.update(receipt.expires_at.to_be_bytes());
-    h.finalize().into()
+    ddrm_envelope::transcript::release_receipt_hash(
+        &receipt.schema,
+        &receipt.request_id,
+        &receipt.object_cid,
+        &receipt.principal_id,
+        &receipt.session_id,
+        &receipt.action,
+        &receipt.provider,
+        &receipt.status,
+        receipt.issued_at,
+        receipt.expires_at,
+    )
 }
 
 #[derive(Debug, Serialize)]

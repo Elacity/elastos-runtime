@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 54).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-54 shared decrypt-transcript — the `to_aad` binding now lives once in `ddrm-envelope::transcript`; the key authority and the decrypt boundary derive the SAME AAD from one encoder, ~60 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 55).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-55 consumer-half orchestration smoke — `drm → rights → key (reference) → decrypt` runs end to end across the REAL capsule binaries, fail-closed, no Lit/dKMS/chain; run `scripts/ddrm-consumer-smoke.sh`, ~61 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -523,17 +523,22 @@ shared crate widened its surface (`pub signed_payload`, raw-type re-exports) and
 redundant `x25519-dalek`/`aes-gcm` deps were pruned from `decrypt-provider`. Day 54 then
 lifted the **decrypt-transcript `to_aad` into `ddrm-envelope::transcript`** (A.4, part 1):
 the AAD field set + encoder now lives once, so the key authority computes the SAME binding
-it seals to and the decrypt boundary rebuilds — `decrypt-provider` re-uses it byte-identically
-(rail-bind=60, rail-material=65), and `key-provider`'s reference backend gains an
-orchestration proof that it seals to the canonical shared transcript and fails closed on any
-field change (`key-authority-ref`=24; `ddrm-envelope` lib=10). Next, in order:
-- **Phase A.4 (cont.)** — wire the cross-binary dev-profile orchestration smoke
-  `drm/open → rights → key (reference) → decrypt (OpenSessionV1)` across the REAL capsule
-  entrypoints (mint in decrypt, seal in the reference authority to the shared transcript,
-  decrypt a segment) so the consumer half runs end-to-end without Lit/dKMS. This is the
-  first point a human can drive the chain.
+it seals to and the decrypt boundary rebuilds. Day 55 then **closed Phase A.4**: a new
+`scripts/ddrm-consumer-smoke.sh` + standalone dev orchestrator
+(`scripts/dev/ddrm-consumer-smoke`) builds the REAL capsule binaries and drives
+`drm/open → rights → key (reference) → decrypt (OpenSessionV1)` end to end — the authority
+publishes its vk, the boundary mints+publishes a session key, the authority seals the golden
+CEK to it transcript-bound (shared encoder), the boundary unwraps in-VM and decrypts a real
+CENC segment, returning only a scoped session (no CEK/plaintext on any wire); a mismatched
+transcript fails closed. To enable it, the reference `key init` now publishes its verifying
+key (`key-authority-ref`=25) and `release_receipt_hash` moved into the shared crate
+(`ddrm-envelope` lib=12; decrypt byte-identical). **Phase A (consumer half) is now runnable.**
+Next, in order:
 - **Phase B** — point `rights-provider` at `chain-provider::has_access_by_content_id`
-  for real Base validation with the wallet.
+  so the `rights` step is a real on-chain ownership check with the wallet (today the smoke
+  drives `rights`/`drm` as reachable steps, not yet real Base validation).
+- **Phase A follow-ups** — a `wasm32-wasip1` variant of the smoke (today native); have the
+  orchestrator drive `drm open` / `rights` decision ops (not just `status`).
 
 Still **blocked on others** (parallel): fold `SealedDecryptMaterialV1` into the shared
 `elastos-common` contract (needs push access); production dKMS (Anders/dKMS team).

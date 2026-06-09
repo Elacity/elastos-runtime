@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~60 commits**, tip Day-54 shared decrypt-transcript — the `to_aad` binding now lives once in `ddrm-envelope`; both the key authority and the decrypt boundary derive the SAME AAD from one encoder). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~61 commits**, tip Day-55 consumer-half orchestration smoke — the chain `drm → rights → key (reference) → decrypt` now runs end to end across the REAL capsule binaries, fail-closed, with no Lit/dKMS/chain; `scripts/ddrm-consumer-smoke.sh`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,33 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **▶️ Day 55 — consumer-half orchestration smoke: the chain RUNS end to end (Phase A.4, LANDED).**
+> The first point a human can drive the consumer half and SEE it work. A new
+> `scripts/ddrm-consumer-smoke.sh` + standalone dev orchestrator
+> (`scripts/dev/ddrm-consumer-smoke`, never shipped) builds the **real** capsule
+> binaries and drives them over their stdin/stdout JSON protocol:
+> `drm/open → rights → key (reference authority) → decrypt (OpenSessionV1)`.
+> The previously-unproven cross-process **key→decrypt handoff** now executes for real:
+> (1) the authority publishes its ML-DSA-65 verifying key at `key init`; (2) the
+> decrypt boundary trusts it, then MINTS + PUBLISHES an in-sandbox session key
+> (`decrypt init`, secret never leaves); (3) the authority seals the golden CEK to that
+> published key, **transcript-bound via the shared `ddrm-envelope` encoder**
+> (`key release_ref`); (4) the boundary unwraps in-VM and decrypts a real CENC segment
+> (`decrypt open_session_v1`), returning ONLY a scoped session (`is_protected`,
+> `sample_count`) — **no CEK, no plaintext crosses any process boundary**, asserted on
+> both wires. A transcript-mismatched seal (flipped nonce) **fails closed**. To unblock
+> the bootstrap ordering, the reference `key init` now **publishes its verifying key**
+> (`key-authority-ref`=25), and `release_receipt_hash` was lifted into the shared
+> `ddrm-envelope::transcript` so the authority and the boundary derive the IDENTICAL
+> receipt binding (`ddrm-envelope` lib=12; `decrypt-provider` byte-identical — rail-bind=60,
+> rail-material=65). **Gate:** smoke PASS, full ladder INTACT, drift PASS, no new warnings.
+> **What this is NOT yet:** the orchestrator stands in for the runtime core (it holds no
+> keys — it only sequences requests and computes the public transcript); the CEK is handed
+> to the dev reference backend directly (production recovers it from a dKMS-wrapped envelope);
+> `rights`/`drm` are driven as reachable steps, not yet real Base validation (Phase B).
+> **Next (Phase B):** point `rights-provider` at `chain-provider::has_access_by_content_id`
+> so the `rights` step is a real on-chain ownership check with the wallet.
 
 > **🧬 Day 54 — shared decrypt-transcript `to_aad` (Phase A.4, LANDED).**
 > The transcript binding is now a **single encoder** in `ddrm-envelope::transcript`

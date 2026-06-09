@@ -240,13 +240,25 @@ impl KeyProvider {
             };
         }
 
-        Response::ok(json!({
+        let mut data = json!({
             "provider": "key",
             "protocol_version": "1.0",
             "configured": false,
             "active_backend": self.backend.map(KeyAuthorityBackend::tag),
             "supported_operations": ["status", "release"],
-        }))
+        });
+        // A key authority PUBLISHES its verifying key so the decrypt boundary can be
+        // configured (at its own `init`) to trust this authority's seals BEFORE it
+        // mints + publishes a session key. This is what breaks the bootstrap ordering
+        // for `drm/open → rights → key → decrypt`: the vk is known up front, the
+        // session pubkey is minted after, and only then is the CEK sealed.
+        #[cfg(feature = "key-authority-ref")]
+        if let Some(authority) = self.reference.as_ref() {
+            use base64::Engine as _;
+            data["seal_verifying_key_b64"] = json!(base64::engine::general_purpose::STANDARD
+                .encode(&authority.verifying_key));
+        }
+        Response::ok(data)
     }
 
     /// Reference key-authority seal (feature `key-authority-ref`, Phase A.2). Runs
@@ -889,6 +901,30 @@ mod tests {
             ));
             assert!(provider.reference.is_some());
             provider
+        }
+
+        /// The reference authority publishes its ML-DSA-65 verifying key at `init`, so
+        /// the decrypt boundary can be configured to trust it BEFORE minting a session
+        /// (breaks the rail bootstrap ordering). The published vk is the SAME one the
+        /// seal is verified against, and it builds a real verifier.
+        #[test]
+        fn reference_init_publishes_the_seal_verifying_key() {
+            let b64 = b64();
+            let mut provider = KeyProvider::default();
+            let resp = provider.init(json!({ "backend": "reference" }));
+            let data = ok_data(resp);
+            let vk_b64 = data["seal_verifying_key_b64"]
+                .as_str()
+                .expect("reference init publishes the verifying key");
+            let vk = b64.decode(vk_b64).expect("vk is valid base64");
+            assert!(
+                ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).is_some(),
+                "the published vk must build a real verifier"
+            );
+            // A non-reference backend publishes no seal key.
+            let mut other = KeyProvider::default();
+            let other_data = ok_data(other.init(json!({ "backend": "lit" })));
+            assert!(other_data.get("seal_verifying_key_b64").is_none());
         }
 
         #[test]

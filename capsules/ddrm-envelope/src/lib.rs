@@ -79,6 +79,45 @@ pub mod transcript {
         pub nonce: &'a [u8],
     }
 
+    /// Bind a release receipt into the transcript by hashing its identifying fields
+    /// (Anders: "release receipt hash"). Deterministic + domain-separated, so both the
+    /// key authority (which seals to a transcript carrying this hash) and the decrypt
+    /// boundary (which recomputes it from the authenticated receipt) derive the SAME
+    /// `release_receipt_hash` — one encoder, no drift. Field set + order match PC2's
+    /// release receipt identity.
+    pub fn release_receipt_hash(
+        schema: &str,
+        request_id: &str,
+        object_cid: &str,
+        principal_id: &str,
+        session_id: &str,
+        action: &str,
+        provider: &str,
+        status: &str,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"elastos-ddrm/release-receipt/v1");
+        for field in [
+            schema,
+            request_id,
+            object_cid,
+            principal_id,
+            session_id,
+            action,
+            provider,
+            status,
+        ] {
+            h.update((field.len() as u32).to_be_bytes());
+            h.update(field.as_bytes());
+        }
+        h.update(issued_at.to_be_bytes());
+        h.update(expires_at.to_be_bytes());
+        h.finalize().into()
+    }
+
     impl DecryptTranscriptV1<'_> {
         /// Deterministic, unambiguous AAD: a domain label then every field
         /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
@@ -702,5 +741,59 @@ mod tests {
             Err(PqEnvelopeError::BadSignature),
             "a different transcript must fail closed"
         );
+    }
+
+    fn sample_receipt_hash() -> [u8; 32] {
+        crate::transcript::release_receipt_hash(
+            "elastos.release.receipt/v1",
+            "key-release:1",
+            "bafyobject",
+            "did:elastos:alice",
+            "sess-1",
+            "decrypt",
+            "key-provider",
+            "released",
+            1_800_000_000,
+            1_900_000_000,
+        )
+    }
+
+    /// The receipt hash both rail sides bind is deterministic from equal fields.
+    #[test]
+    fn receipt_hash_is_deterministic() {
+        assert_eq!(sample_receipt_hash(), sample_receipt_hash());
+    }
+
+    /// Any receipt field change yields a different hash (so a swapped receipt can't be
+    /// slid under an existing transcript binding).
+    #[test]
+    fn receipt_hash_changes_with_every_field() {
+        let base = sample_receipt_hash();
+        let changed = crate::transcript::release_receipt_hash(
+            "elastos.release.receipt/v1",
+            "key-release:1",
+            "bafyobject",
+            "did:elastos:alice",
+            "sess-1",
+            "decrypt",
+            "key-provider",
+            "denied", // status flipped
+            1_800_000_000,
+            1_900_000_000,
+        );
+        assert_ne!(base, changed, "a flipped status must change the receipt hash");
+        let later_expiry = crate::transcript::release_receipt_hash(
+            "elastos.release.receipt/v1",
+            "key-release:1",
+            "bafyobject",
+            "did:elastos:alice",
+            "sess-1",
+            "decrypt",
+            "key-provider",
+            "released",
+            1_800_000_000,
+            1_900_000_001, // expiry +1
+        );
+        assert_ne!(base, later_expiry, "a changed expiry must change the receipt hash");
     }
 }

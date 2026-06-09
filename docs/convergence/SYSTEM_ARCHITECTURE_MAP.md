@@ -218,17 +218,24 @@ Goal: **"buy a video → wallet+chain validates ownership → key released seale
 decrypt sandbox → decrypt → play",** all on runtime providers. Phased so each phase
 is independently testable and each conforms to fail-closed + capability principles.
 
-### Phase A — Consumer half, runtime-native key authority (NO Lit, NO dKMS dependency)
+### Phase A — Consumer half, runtime-native key authority (NO Lit, NO dKMS dependency) ✅ RUNNABLE
 The single highest-value unblock. Build a **reference/dev key authority** inside (or
 behind) `key-provider` that does what the Lit Action does, but ElastOS-native:
 verify a `RightsDecisionReceiptV1`, then emit a `SealedDecryptMaterialV1` (CEK sealed
 to the decrypt sandbox's published session key, transcript-bound, ML-DSA-65 signed).
 Wire `drm-provider open → rights-provider → (chain has_access) → key-provider →
-decrypt-provider OpenSessionV1` **default-on for a dev profile**.
-- **Testable:** an in-runtime smoke that seals a CEK to a freshly-minted decrypt
-  session and plays a CENC segment through the full provider chain — no external deps.
+decrypt-provider OpenSessionV1`.
+- **Status (Days 50–55):** A.1 pluggable multi-backend `key-provider`; A.2 reference
+  seal engine + shared `ddrm-envelope` crate; A.3/A.3b PQ crypto deduped to one home;
+  A.4 shared decrypt-transcript encoder + **the consumer half now RUNS end to end** via
+  `scripts/ddrm-consumer-smoke.sh` — the real capsule binaries seal a golden CEK to a
+  freshly-minted decrypt session and decrypt a CENC segment, fail-closed, no external deps.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
-  CEK is clear; everything fail-closed without the dev profile.
+  CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
+- **Still dev-shaped:** the orchestrator stands in for the runtime core (holds no keys);
+  the CEK is handed to the reference backend directly (prod recovers it from a
+  dKMS-wrapped envelope); not yet default-on inside the runtime; smoke is native (a
+  `wasm32-wasip1` variant is a follow-up).
 
 ### Phase B — Real chain validation (Base) via `chain-provider`
 Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real
