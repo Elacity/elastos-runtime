@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~48 commits**, tip `142f6339a` + Day-43 push-queue verify)
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~48 commits**, tip `6b0ba1e67` + Day-44 v0.4.0 alignment). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`).**
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail
@@ -10,14 +10,19 @@ CEK). A full team-facing **security + threat model** is in
 `DDRM_SECURITY_MODEL.md`. The only thing between here and live decrypt is one
 architecture decision (the CEK transport rail) — see `DDRM_DECRYPT_RAIL.md`.
 
-> **Base volatility (Anders, 2026-06-08):** only ~20% of 0.4.0 is on GitHub and its
-> latest commits are being redone. This branch is based on `origin/0.4.0`, so its
-> base will shift; expect a rebase + re-verify of any `elastos-common`
-> `protected_content` types these providers consume once 0.4.0 stabilises. New work
-> is kept contract-first (PC2 as the stable reference) to stay rebase-safe. The
-> contract has since held byte-identical for many days, so `encrypt-provider`'s
-> sealed output was reconciled to the shared `SealedObjectV1` (Day 39); only its
-> input `SealRequest` stays local (no shared seal-request type yet).
+> **✅ 0.4.0 RELEASED — alignment verified (Day 44).** 0.4.0 shipped (tag `v0.4.0`
+> = `cae83c3c3`). The contract-first bet paid off: `protected_content.rs` is
+> **byte-identical** between this branch and the released `v0.4.0`, and
+> `ddrm-drift-check.sh` **passes against the released base**. The crypto core was
+> validated green ON `v0.4.0` (content-overlay in a throwaway worktree): drift PASS,
+> `decrypt-provider` harden=65 + pq-mldsa-hybrid=37, `encrypt-provider`=13,
+> `pc2-conformance` byte-compatible. Released v0.4.0 ships the providers as
+> **fail-closed skeletons** (no CEK rail) — the rail decision is still the one
+> blocker. Rebase conflict surface is now MEASURED (see `PUSH_PLAN.md`): clean for
+> `decrypt-provider` (engine replaces skeleton) + `encrypt-provider` (new); genuine
+> **3-way for `key-provider` + `drm-provider`** (we and Anders both evolved them —
+> needs his intent). `encrypt-provider`'s sealed output already uses shared
+> `SealedObjectV1` (Day 39); only its input `SealRequest` stays local.
 
 ## The chain
 

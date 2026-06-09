@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 43).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `142f6339a` + Day-43 push-queue verify, ~48 commits ahead of `origin/0.4.0`).
+**Last updated:** 2026-06-09 (end of Day 44).
+**Active branch:** `feat/decrypt-provider-cenc` (tip `6b0ba1e67` + Day-44 v0.4.0 alignment, ~48 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`.**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -464,6 +464,7 @@ next context can continue cold.
 - **D41** pre-prove Anders' OTHER Q2 answer: a hybrid ECDSA-P256 + ML-DSA-65 `HybridVerifier` (feature `pq-mldsa-hybrid`=37, BOTH halves must verify, `wasm32-wasip1`-clean) through the same `hybrid_unwrap` path — Q2 is now a pure policy pick, both answers drop-in (`779c74ff6`, lock `a291becb7`).
 - **D42** build-hygiene (sibling branch, off the dDRM critical path): verified `fix/crosvm-darwin-build` is **green on this macOS** — `elastos-crosvm` 18 tests pass + warning-free, `elastos-server` builds clean; recorded in `PUSH_PLAN.md` (#1 now build-verified, not just authored). dDRM gate untouched (still 4/4).
 - **D43** build-verify push queue #3 + #2 on macOS: `chore/bincode-2x` **311 passed / 0 failed** incl. the capability-token byte-identity golden (`token_wire_format_is_bincode_1x_legacy`) — wire format provably unchanged; `fix/home-summary-resilience` builds clean + its `home_browser_state_*` tests pass (4 `home_launch`/`runtime_ensure` failures are **no-KVM env limits, identical on the crosvm branch → not a regression**, pass on Linux CI). Recorded in `PUSH_PLAN.md` with a Linux-test-gating follow-up. dDRM gate still 4/4.
+- **D44** **0.4.0 RELEASED** (tag `v0.4.0`=`cae83c3c3`) — alignment audit: `protected_content.rs` **byte-identical** to the release; `ddrm-drift-check.sh` **passes against the released base**; crypto core validated green ON `v0.4.0` (overlay worktree: drift PASS, harden=65, pq-mldsa-hybrid=37, encrypt=13, pc2-conformance byte-compatible). Released providers are still fail-closed skeletons (no rail). Rebase surface MEASURED (`PUSH_PLAN.md`): decrypt/encrypt clean, **key+drm 3-way (needs Anders)**. Rail decision remains the one blocker.
 
 ---
 

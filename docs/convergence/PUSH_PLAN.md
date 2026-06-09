@@ -1,29 +1,52 @@
 # Reinstatement Push Plan — local branches → PRs
 
 **Status:** Ready. Execute the moment GitHub push access is restored.
-**Date:** 2026-06-09 (rebase recipe verified against git reality on Day 36)
-**Base for every branch:** `origin/0.4.0`.
+**Date:** 2026-06-09 (rebase measured against the RELEASED `v0.4.0` on Day 44)
+**Base for every branch:** `v0.4.0` (`cae83c3c3`) — 0.4.0 is now released + tagged.
 
-> ## ⚠️ Base moved — rebase before pushing (recipe is button-press below)
+> ## ✅ 0.4.0 RELEASED + tagged `v0.4.0` (`cae83c3c3`) — alignment verified Day 44
 >
-> Anders **force-pushed `origin/0.4.0`** (`42e4d7ffd` → `67b7560a7`), redoing
-> commits as warned. Our branch has therefore **diverged** from `origin/0.4.0`
-> (verified Day 36: `git merge-base --is-ancestor origin/0.4.0 feat/decrypt-provider-cenc`
-> → **not an ancestor**; merge-base is `589092b95`, with **3** base commits since).
-> Do **not** rebase until 0.4.0 stops moving — then run §"Rebase recipe" below.
+> **0.4.0 has shipped** (tag `v0.4.0` = `cae83c3c3`; `origin/0.4.0` force-updated
+> `67b7560a7` → `cae83c3c3`). It stopped moving — the rebase is now unblocked. The
+> Day-44 alignment audit found:
 >
-> **The contract converged — still zero type drift (re-verified Day 36).**
+> **The contract held byte-identical to what shipped.**
 > `elastos-common/protected_content.rs` is **byte-identical** between
-> `feat/decrypt-provider-cenc` and `origin/0.4.0`
-> (`git diff origin/0.4.0..feat/decrypt-provider-cenc -- …/protected_content.rs` = 0
-> lines). The redone base independently added the exact types our providers were
-> built against (`RightsDecisionReceiptV1`, `KeyReleaseRequestV1.rights_receipt`,
-> typed `DecryptSessionRequestV1.release_receipt`, `ReleaseReceiptV1.session_id/action`),
-> plus the PQ-negotiation surface (`KeyEnvelopeAlgorithmsV1`,
-> `validate_protected_content_key_envelope_algorithms`, the `DEFAULT_*` algorithm
-> sets). `scripts/ddrm-drift-check.sh` now pins **all** of these (13 consts / 10
-> structs / 1 fn / 10 fields), so the rebase is a button-press verification, not an
-> archaeology dig.
+> `feat/decrypt-provider-cenc` and the released `v0.4.0`
+> (`git diff feat/decrypt-provider-cenc:…/protected_content.rs v0.4.0:…` = 0 lines),
+> and `scripts/ddrm-drift-check.sh` **PASSES against the released base** (13 consts /
+> 10 structs / 1 fn / 10 fields). Our entire chain was built against exactly the
+> contract that shipped.
+>
+> **Crown jewel validated green ON the released base (Day 44, content-overlay in a
+> throwaway worktree at `v0.4.0`):** drift-check PASS; `decrypt-provider` `harden`=65
+> + `pq-mldsa-hybrid`=37; `encrypt-provider`=13; `pc2-conformance.sh` byte-compatible.
+> So our crypto core rebases cleanly onto `v0.4.0`.
+>
+> **Released v0.4.0 ships the providers as fail-closed SKELETONS** (`decrypt-provider`
+> `open_session`/`render` return `not_configured` — no CEK rail). The rail decision
+> (`DDRM_DECRYPT_RAIL.md` Q1/Q2/Q3) is **still the one true blocker**; our branch has
+> the full in-VM engine + both Q2 answers pre-proven, ready to drop in behind it.
+>
+> **Measured rebase conflict surface** (real `git rebase --onto v0.4.0 42e4d7ffd`,
+> Day 44 — note the cut point is `42e4d7ffd`, the parent of our first convergence
+> commit, so Anders' shared `marketplace`/`library` commits are NOT replayed):
+> - `decrypt-provider/src/main.rs` — **clean reconcile**: our engine replaces the
+>   skeleton (resolve by taking our commit's content; `cenc/*` are new files).
+> - `key-provider/src/main.rs` **+** `drm-provider/src/main.rs` — **genuine 3-way**:
+>   WE evolved them (rights-receipt binding, WASI/test bar) AND Anders independently
+>   refactored them in `v0.4.0` (key +67/−37, drm trimmed). **Needs Anders' intent**
+>   to merge cleanly (see "for Anders" below).
+> - `encrypt-provider/**` — **no conflict**: absent in `v0.4.0`, purely our new capsule.
+> - `rights-provider` / `availability-provider` — we didn't touch `src` → **adopt
+>   Anders' v0.4.0 versions**.
+>
+> **For Anders:** contract aligned perfectly — thank you. Two asks before we land the
+> rebase: (1) your `v0.4.0` `key-provider` + `drm-provider` refactors overlap our
+> changes — can you confirm intent / whether our versions supersede? (2) the
+> decrypt rail (Q1/Q2/Q3 in `DDRM_DECRYPT_RAIL.md`) is the last blocker; our side has
+> both signature answers (ML-DSA-65 + hybrid ECDSA+ML-DSA) pre-proven and the engines
+> PC2-conformance-verified — ready to wire the day you pick the transport.
 
 ## Rebase recipe (run when 0.4.0 settles)
 
@@ -40,11 +63,15 @@ parent), so only our own commits replay:
 ```bash
 B=feat/decrypt-provider-cenc           # repeat for each branch in the push order
 git branch -f "backup/${B##*/}-prerebase" "$B"          # safety snapshot
-git rebase --onto origin/0.4.0 "$(git merge-base origin/0.4.0 "$B")" "$B"
+# Cut point = parent of our FIRST convergence commit, so Anders' shared
+# marketplace/library commits are not replayed onto v0.4.0 (it already has them).
+# For feat/decrypt-provider-cenc that is 42e4d7ffd (measured Day 44). For the other
+# branches use: CUT="$(git merge-base v0.4.0 "$B")" if they share no Anders commits.
+git rebase --onto v0.4.0 42e4d7ffd "$B"
 # ...resolve conflicts (see churn points below), then:
 scripts/ddrm-verify.sh                 # for the dDRM branch: must be ALL GATES PASS
 #   (other branches: cargo build/test for the crate they touch — see per-PR plan)
-git range-diff origin/0.4.0...@{-1} origin/0.4.0...HEAD   # confirm nothing dropped
+git range-diff v0.4.0...@{-1} v0.4.0...HEAD               # confirm nothing dropped
 ```
 
 **Branch order & expected conflict surface** (cross-checked against git Day 36):
