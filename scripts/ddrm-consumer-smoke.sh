@@ -22,7 +22,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CAPSULES="${REPO_ROOT}/capsules"
-ORCH="${REPO_ROOT}/scripts/dev/ddrm-consumer-smoke"
+ORCH="${REPO_ROOT}/scripts/dev/ddrm-runtime-open"
 
 echo "=============================================================="
 echo " dDRM consumer-half smoke — building real capsule binaries"
@@ -81,12 +81,26 @@ fi
 
 echo
 echo "=============================================================="
-echo " Orchestrating the chain"
+echo " Orchestrating the chain — via the runtime-core open entrypoint"
 echo "=============================================================="
 
-cargo run --quiet --manifest-path "${ORCH}/Cargo.toml" -- \
-  "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" ${CHAIN_ARG[@]+"${CHAIN_ARG[@]}"}
+# The smoke no longer assembles the host: it writes a TYPED CONFIG and INVOKES the
+# default-on runtime-core entrypoint `ddrm-runtime-open` (mode=verify, which also drives the
+# adversarial fail-closed gates). The runtime bin owns publish -> DrmHost::launch -> open ->
+# persist. We pass the provider binaries + a per-run work dir through the config file.
+CHAIN_BIN_JSON=""
+if [[ ${#CHAIN_ARG[@]} -gt 0 ]]; then
+  CHAIN_BIN_JSON=",\n  \"chain_bin\": \"${CHAIN_ARG[0]}\""
+fi
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddrm-runtime-open.XXXXXX")"
+CONFIG_JSON="${WORK_DIR}/open-config.json"
+printf '{\n  "mode": "verify",\n  "key_bin": "%s",\n  "decrypt_bin": "%s",\n  "drm_bin": "%s",\n  "rights_bin": "%s",\n  "work_dir": "%s"%b\n}\n' \
+  "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" "${WORK_DIR}/run" "$CHAIN_BIN_JSON" > "$CONFIG_JSON"
+echo "config: ${CONFIG_JSON}"
+
+cargo run --quiet --manifest-path "${ORCH}/Cargo.toml" -- "$CONFIG_JSON"
 status=$?
+rm -rf "$WORK_DIR"
 
 echo
 if [[ $status -eq 0 ]]; then

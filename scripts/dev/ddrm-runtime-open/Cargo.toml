@@ -1,16 +1,19 @@
 [package]
-name = "ddrm-consumer-smoke"
+name = "ddrm-runtime-open"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Dev-only orchestrator (NOT a capsule, never shipped): drives the REAL key-provider
-# and decrypt-provider binaries over their stdin/stdout JSON protocol to prove the
-# consumer half of the dDRM chain runs end to end — no Lit, no dKMS, no chain.
+# Default-on runtime-core OPEN entrypoint (dev driver, NOT a capsule, never shipped):
+# constructs the trusted `DrmHost` from `ProviderLauncher`s + a `DurableEventStore` and
+# drives a dDRM open reading a TYPED JSON CONFIG (provider binaries, work dir, viewer,
+# content id, publish-escrow fixture, mode) — NO smoke assembles the host. The producer's
+# escrow is a publish-time fixture this binary reads, not inline code. `ddrm-consumer-smoke.sh`
+# is now a thin caller that writes a config and INVOKES this binary.
 # See scripts/ddrm-consumer-smoke.sh and docs/convergence/SYSTEM_ARCHITECTURE_MAP.md.
 
 [[bin]]
-name = "ddrm-consumer-smoke"
+name = "ddrm-runtime-open"
 path = "src/main.rs"
 
 [dependencies]

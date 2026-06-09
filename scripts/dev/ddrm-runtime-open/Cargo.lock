@@ -162,16 +162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ddrm-consumer-smoke"
-version = "0.1.0"
-dependencies = [
- "base64",
- "ddrm-envelope",
- "ddrm-plan-runner",
- "serde_json",
-]
-
-[[package]]
 name = "ddrm-envelope"
 version = "0.1.0"
 dependencies = [
@@ -189,6 +179,16 @@ dependencies = [
 name = "ddrm-plan-runner"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "ddrm-runtime-open"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ddrm-envelope",
+ "ddrm-plan-runner",
  "serde_json",
 ]
 

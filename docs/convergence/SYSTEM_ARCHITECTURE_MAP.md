@@ -54,7 +54,7 @@ shared `protected_content` contracts.
 | 5 Purchase | `wallet-provider` + `chain-provider` | 🟦 signing + tx exist; **buyAccess not orchestrated by a content flow** | `capsules/wallet-provider`, `chain-provider` |
 | 6 Download | `content` fetch + `ipfs-provider` + `availability-provider` | 🟦 fetch/pin work | `elastos-server/src/content.rs` |
 | 7 Validate ownership | `rights-provider` → `chain-provider::has_access_by_content_id` | 🟦 **chain read is typed + tested**; rights-provider not yet calling it | `capsules/chain-provider`, `capsules/rights-provider` |
-| 7 Key release | `key-provider` (`release`) | 🟩 **canonical `release` ACTUALLY releases (reference backend, Day 70)**: validates the rights receipt → recovers the producer-escrowed CEK from the rights-bound `key_envelope` → re-seals to the runtime-injected decrypt session as `SealedDecryptMaterialV1`; fail-closed on denied/expired/kid-swap/forged-producer; `dkms`/`lit` backends still `not_configured` | `capsules/key-provider` |
+| 7 Key release | `key-provider` (`release`) | 🟩 **canonical `release` ACTUALLY releases (reference backend, Day 70)**: validates the rights receipt → recovers the producer-escrowed CEK from the rights-bound `key_envelope` → re-seals to the runtime-injected decrypt session as `SealedDecryptMaterialV1`; fail-closed on denied/expired/kid-swap/forged-producer. **Day 83–84:** `dkms` is now a fail-closed EXTERNAL-authority seam (resolves a STABLE signer + recipient from a HANDED-IN `dkms_authority_descriptor`, verifies the published-identity pins, re-seals via the same contract); `lit` still `not_configured` | `capsules/key-provider` |
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
@@ -105,7 +105,7 @@ interchangeable **key-delivery backends**, all producing the *same* suite-tagged
 | Backend | Suite tag | Role |
 |---|---|---|
 | **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps. **Day 81–82:** with `init.config.authority_key_store` (a path) its signer + KEM recipient are persisted ONCE (one 32-byte master seed, atomic write, 0600) and re-derived deterministically every launch → a STABLE published recipient (escrow-at-publish), fail-closed on a corrupt store |
-| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team) |
+| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team). **Day 83–84:** the seam is real + fail-closed — `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from a HANDED-IN descriptor (the dKMS-provisioned key material, READ never minted), VERIFIES it against the descriptor's published `verifying_key_b64`/`recipient_pub_b64` pins, and recovers/re-seals through the SAME `SealedDecryptMaterialV1` contract; no descriptor → "no dKMS node provisioned"; a true REMOTE dKMS would resolve PUBLIC-only keys + delegate recovery |
 | **Lit / Chipotle** (compat) | `p256-classical-compat` | Migration backend for existing PC2 content; **not** the product root |
 | Third parties (future) | (declared per backend) | Same `release → SealedDecryptMaterialV1` contract |
 
@@ -138,7 +138,7 @@ flowchart TB
   end
   subgraph cons["CONSUMER — decrypt DONE, core executor landed, rail-wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
-    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider<br/>ProviderLauncher + from_launchers = HOST launches the rail spawn->init->publish, fail-closed teardown<br/>DrmHost::launch = trusted-core composition: bring up own rail from launchers + wire sink in one call<br/>DrmHost::open = trusted host: PlanSource fetch -> drive registry -> RuntimeEventSink emits receipt+audit<br/>DrmHost owns the rail: shutdown tears down every transport; PersistingEventSink over DurableEventStore writes atomic CEK-free records]
+    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider<br/>ProviderLauncher + from_launchers = HOST launches the rail spawn->init->publish, fail-closed teardown<br/>DrmHost::launch = trusted-core composition: bring up own rail from launchers + wire sink in one call<br/>DrmHost::open = trusted host: PlanSource fetch -> drive registry -> RuntimeEventSink emits receipt+audit<br/>DrmHost owns the rail: shutdown tears down every transport; PersistingEventSink over DurableEventStore writes atomic CEK-free records<br/>ddrm-runtime-open bin = default-on entrypoint: typed JSON OpenConfig -> DrmHost::launch -> open, NO smoke assembles the host]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -365,13 +365,29 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 83–84):** the open BOOTS FROM CONFIG with NO smoke in the loop, and `dkms` resolves a STABLE
+  identity from a HANDED-IN descriptor. (1) NEW default-on runtime-core entrypoint `scripts/dev/ddrm-runtime-open`
+  (a `bin`, relocated from `ddrm-consumer-smoke`): reads a TYPED JSON CONFIG (`OpenConfig`: provider binaries,
+  work dir, viewer, content id, `mode`; fail-closed on missing/unreadable/malformed config, +5 config-parse
+  tests), builds the trusted `DrmHost` from `ProviderLauncher`s + a `DurableEventStore` via `DrmHost::launch`,
+  runs the publish-time escrow fixture, drives the open — `mode:"open"` is the operator path, `mode:"verify"`
+  adds the two adversarial fail-closed gates. (2) `key-provider` `dkms` external-authority seam:
+  `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from
+  a HANDED-IN descriptor (READ never minted/persisted), VERIFIES it against the descriptor's published
+  `verifying_key_b64`/`recipient_pub_b64` pins (fail-closed on mismatch), and recovers/re-seals through the SAME
+  `SealedDecryptMaterialV1` contract — so the durable-key-store stability pattern carries to a NON-reference
+  authority; no descriptor → selected-but-unconfigured; corrupt/wrong-schema/mismatched → init fails closed;
+  35→37. Mirrors PC2 booting `sessionService` ONCE from config (`BackendSessionService.ts:495`) + resolving the
+  external authority key from config (`resolvePkpId(config)`, `chipotle-client.ts:963`–`:967`), not minting.
+  `ddrm-consumer-smoke.sh` now just WRITES an `OpenConfig` JSON + INVOKES `ddrm-runtime-open` (no inline host
+  assembly). drift untouched.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
-- **Still dev-shaped:** the `reference` key authority still MINTS its keys at init, so the runtime binds the
-  cross-provider escrow/transcript material AFTER the rail launches (production uses the `dkms`/`lit`
-  backends with stable published recipients, still `not_configured`); folding the launchers + durable store
-  into a default-on runtime-core entrypoint a NON-smoke caller drives (the smoke is still the producer +
-  runtime bootstrap); smoke is native (a `wasm32-wasip1` variant is a follow-up).
+- **Still dev-shaped:** the live consumer smoke runs the in-runtime `reference` authority (the `dkms`
+  external-descriptor seam is unit-tested but not yet wired through the live smoke — needs a backend selector
+  in `OpenConfig`); a true REMOTE dKMS would resolve PUBLIC-only keys + DELEGATE recovery to the external node
+  (today `dkms` is a PROVISIONED-DESCRIPTOR seam holding the key material); smoke is native (a `wasm32-wasip1`
+  variant is a follow-up).
 
 ### Phase B — Real chain validation (Base) via `chain-provider` 🟦 UNDERWAY
 Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real

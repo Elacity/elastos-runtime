@@ -1,7 +1,15 @@
-//! dDRM consumer-half orchestration smoke (Phase A.4).
+//! `ddrm-runtime-open` — the default-on runtime-core OPEN entrypoint (Phase A wiring).
 //!
-//! Drives the REAL capsule binaries over their newline-delimited JSON stdin/stdout
-//! protocol to prove the consumer half of the Elacity dDRM chain runs end to end:
+//! This is the runtime bootstrap a non-smoke caller runs: it reads a TYPED JSON CONFIG
+//! (`OpenConfig`: provider binaries, work dir, viewer, content id, `mode`) and constructs the
+//! trusted `ddrm_plan_runner::DrmHost` from `ProviderLauncher`s + a `DurableEventStore` via
+//! `DrmHost::launch`, then drives the open. NO caller assembles the host — the binary owns the
+//! bootstrap (the analogue of PC2 booting `sessionService` ONCE from config,
+//! `BackendSessionService.ts:495`). The producer's escrow is a publish-time fixture this binary
+//! reads, not inline code. `mode:"open"` is the operator path (publish → launch → open →
+//! persist → durable CEK-free readback); `mode:"verify"` (what `ddrm-consumer-smoke.sh` runs)
+//! ALSO drives the two adversarial fail-closed gates. It drives the REAL capsule binaries over
+//! their newline-delimited JSON stdin/stdout protocol, proving the consumer half runs end to end:
 //!
 //!   drm/open  ->  rights  ->  key (reference authority)  ->  decrypt (OpenSessionV1)
 //!
@@ -971,14 +979,69 @@ impl PlanSource for SmokePlanSource {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
-    let key_bin = args.first().ok_or("missing <key-provider-bin>")?;
-    let decrypt_bin = args.get(1).ok_or("missing <decrypt-provider-bin>")?;
-    let drm_bin = args.get(2).ok_or("missing <drm-provider-bin>")?;
-    let rights_bin = args.get(3);
-    let chain_bin = args.get(4);
+/// How far this run drives the open. An operator runs `open` (publish → launch → open →
+/// persist → durable CEK-free readback); the consumer smoke runs `verify`, which ALSO drives
+/// the two adversarial fail-closed gates (a transcript-mismatched seal; a tampered plan edge).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenMode {
+    Open,
+    Verify,
+}
 
-    println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt, via the runtime-core host DrmHost::open) ==");
+/// The TYPED runtime-open config — the SINGLE input to this binary, read from a JSON file
+/// (argv[1]) or `DDRM_OPEN_CONFIG`. The runtime bootstrap is config-driven: NO caller assembles
+/// the host. Mirrors PC2 booting `sessionService` ONCE from config (`BackendSessionService.ts:495`),
+/// not per request.
+#[derive(Debug)]
+struct OpenConfig {
+    key_bin: String,
+    decrypt_bin: String,
+    drm_bin: String,
+    rights_bin: Option<String>,
+    chain_bin: Option<String>,
+    /// Durable working dir (key store + publish fixture + receipts). Default: a per-pid temp dir.
+    work_dir: Option<String>,
+    /// Keep the durable artifacts after a successful run (default: clean up).
+    keep_work_dir: bool,
+    mode: OpenMode,
+}
+
+impl OpenConfig {
+    fn from_json(v: &Value) -> Result<Self, String> {
+        let obj = v.as_object().ok_or("config must be a JSON object")?;
+        let req = |k: &str| {
+            obj.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("config is missing required string `{k}`"))
+        };
+        let opt = |k: &str| obj.get(k).and_then(Value::as_str).map(str::to_string);
+        let mode = match obj.get("mode").and_then(Value::as_str).unwrap_or("verify") {
+            "open" => OpenMode::Open,
+            "verify" => OpenMode::Verify,
+            other => return Err(format!("config `mode` must be \"open\" or \"verify\", got {other:?}")),
+        };
+        Ok(Self {
+            key_bin: req("key_bin")?,
+            decrypt_bin: req("decrypt_bin")?,
+            drm_bin: req("drm_bin")?,
+            rights_bin: opt("rights_bin"),
+            chain_bin: opt("chain_bin"),
+            work_dir: opt("work_dir"),
+            keep_work_dir: obj.get("keep_work_dir").and_then(Value::as_bool).unwrap_or(false),
+            mode,
+        })
+    }
+}
+
+fn run(cfg: &OpenConfig) -> Result<(), String> {
+    let key_bin = &cfg.key_bin;
+    let decrypt_bin = &cfg.decrypt_bin;
+    let drm_bin = &cfg.drm_bin;
+    let rights_bin = cfg.rights_bin.as_ref();
+    let chain_bin = cfg.chain_bin.as_ref();
+
+    println!("== dDRM runtime-core open (config-driven DrmHost::launch -> open; drm -> rights -> key -> decrypt) ==");
 
     // --- PUBLISH PHASE (the producer, run ONCE before any open). The authority is now
     // backed by a DURABLE KEY STORE, so its escrow recipient is STABLE across launches. The
@@ -987,7 +1050,10 @@ fn run(args: &[String]) -> Result<(), String> {
     // at encode time (`dashPackager.ts` `encryptMediaCEK`). The open path below NEVER escrows;
     // it READS this fixture, collapsing the Day-79/80 "launch → publish → escrow → bind" dance
     // into "escrow at publish; launch resolves the same recipient."
-    let work_dir = std::env::temp_dir().join(format!("ddrm-open-{}", std::process::id()));
+    let work_dir = match &cfg.work_dir {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::temp_dir().join(format!("ddrm-open-{}", std::process::id())),
+    };
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("create work dir: {e}"))?;
     let key_store_path = work_dir.join("authority-key-store.json").to_string_lossy().into_owned();
     let fixture_path = work_dir.join("publish-escrow.json");
@@ -1137,6 +1203,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     step(8, "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records; read back through a fresh DurableEventStore");
 
+    // In `open` mode (the operator path) we are done: a real open ran and a durable, CEK-free
+    // record persisted. `verify` mode (the consumer smoke) additionally drives the two
+    // adversarial fail-closed gates below before tearing the rail down.
+    if cfg.mode == OpenMode::Verify {
     // --- fail-closed #1 (crypto binding): a replayed/altered transcript must not open.
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
     // boundary rebuilds the original transcript and the seal cannot open.
@@ -1204,29 +1274,97 @@ fn run(args: &[String]) -> Result<(), String> {
     if DurableEventStore::load(&receipts_dir)?.len() != persisted_before {
         return Err("a failed open must persist no runtime-event record".to_string());
     }
+    } // end verify-only adversarial gates
 
     // The HOST owns the rail it was handed: shutting it down tears down every runtime-owned
     // transport (each shuts down the capsule it owns) — no manual per-capsule shutdown here.
     host.shutdown()?;
     step(11, "runtime-core host: shut down — every runtime-owned transport tore down its capsule");
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop
-    // them and clean up the durable artifacts the smoke wrote (key store + fixture + receipts).
+    // them and clean up the durable artifacts (key store + fixture + receipts) unless the
+    // config asks to keep them.
     drop(rights_cell);
     drop(key_cell);
     drop(decrypt_cell);
-    let _ = std::fs::remove_dir_all(&work_dir);
+    if !cfg.keep_work_dir {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
     Ok(())
 }
 
+/// Read the typed JSON config from argv[1] (a path) or `$DDRM_OPEN_CONFIG`. Fail-closed:
+/// no config path, an unreadable file, or malformed JSON is an error — the runtime never
+/// guesses its providers/dirs.
+fn load_config() -> Result<OpenConfig, String> {
+    let path = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("DDRM_OPEN_CONFIG").ok())
+        .ok_or("usage: ddrm-runtime-open <config.json>  (or set DDRM_OPEN_CONFIG)")?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read config {path}: {e}"))?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse config {path}: {e}"))?;
+    OpenConfig::from_json(&value)
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let result = load_config().and_then(|cfg| run(&cfg));
+    match result {
         Ok(()) => {
-            println!("\nconsumer-smoke: PASS — the consumer half runs end to end (key -> decrypt), fail-closed, no key/plaintext leak.");
+            println!("\nddrm-runtime-open: PASS — the runtime-core host opened end to end (key -> decrypt), fail-closed, no key/plaintext leak.");
         }
         Err(e) => {
-            eprintln!("\nconsumer-smoke: FAIL — {e}");
+            eprintln!("\nddrm-runtime-open: FAIL — {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_a_full_config_and_defaults_to_verify() {
+        let cfg = OpenConfig::from_json(&json!({
+            "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m",
+            "rights_bin": "/r", "work_dir": "/w"
+        }))
+        .expect("a config with the required provider binaries parses");
+        assert_eq!(cfg.key_bin, "/k");
+        assert_eq!(cfg.rights_bin.as_deref(), Some("/r"));
+        assert_eq!(cfg.chain_bin, None);
+        assert_eq!(cfg.work_dir.as_deref(), Some("/w"));
+        assert!(!cfg.keep_work_dir);
+        assert!(cfg.mode == OpenMode::Verify, "mode defaults to verify");
+    }
+
+    #[test]
+    fn open_mode_is_explicit() {
+        let cfg = OpenConfig::from_json(&json!({
+            "mode": "open", "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m"
+        }))
+        .expect("open mode parses");
+        assert!(cfg.mode == OpenMode::Open);
+    }
+
+    #[test]
+    fn fails_closed_on_a_missing_required_binary() {
+        let err = OpenConfig::from_json(&json!({ "decrypt_bin": "/d", "drm_bin": "/m" }))
+            .expect_err("a config without key_bin must fail closed");
+        assert!(err.contains("key_bin"), "the error names the missing field: {err}");
+    }
+
+    #[test]
+    fn fails_closed_on_an_unknown_mode() {
+        let err = OpenConfig::from_json(&json!({
+            "mode": "wide-open", "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m"
+        }))
+        .expect_err("an unknown mode must fail closed");
+        assert!(err.contains("mode"), "the error names the bad field: {err}");
+    }
+
+    #[test]
+    fn fails_closed_when_config_is_not_an_object() {
+        assert!(OpenConfig::from_json(&json!(["not", "an", "object"])).is_err());
     }
 }

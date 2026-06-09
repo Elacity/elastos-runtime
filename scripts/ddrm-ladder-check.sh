@@ -45,7 +45,7 @@ LADDER=(
   "ddrm-envelope (lib)|ddrm-envelope||16"
   "ddrm-plan-runner (lib)|ddrm-plan-runner||45"
   "key-provider (default)|key-provider||18"
-  "key-provider key-authority-ref|key-provider|key-authority-ref|35"
+  "key-provider key-authority-ref|key-provider|key-authority-ref|37"
   "decrypt-provider (default)|decrypt-provider||25"
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"
