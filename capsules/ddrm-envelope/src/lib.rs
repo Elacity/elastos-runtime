@@ -437,43 +437,59 @@ pub fn verify_session_token(
     verifier.verify(&session_token_message(challenge, caller_pub, expires_at), sig)
 }
 
-/// Canonical signed preimage of a recover possession proof: the session `challenge` plus the
-/// content/recipient binding of THIS recover (`content_id`, `kid_hex`, the decrypt session pubkey).
-/// Binding the recover identity means the proof authorizes recovering THIS content for THIS session,
-/// not just "some recover" — defined ONCE here so the node + client cannot drift.
+/// Canonical signed preimage of a recover possession proof: the session `challenge`, the
+/// content/recipient binding of THIS recover (`content_id`, `kid_hex`, the decrypt session pubkey),
+/// AND a per-recover FRESHNESS counter (`recover_seq`, Day 95–96). Binding the recover identity means
+/// the proof authorizes recovering THIS content for THIS session; binding a strictly-increasing
+/// `recover_seq` means a captured recover frame replayed verbatim carries a STALE counter the node
+/// has already consumed, so it is refused (anti-replay). The runtime-core analogue of PC2's
+/// per-delegation revocable `nonce` (`secureViewSession.ts:108`–`:112`). Defined ONCE here so the
+/// node + client cannot drift.
 pub fn recover_proof_message(
     challenge: &[u8],
     content_id: &[u8],
     kid_hex: &[u8],
     decrypt_session_pub: &[u8],
+    recover_seq: u64,
 ) -> Vec<u8> {
-    lp_concat(DKMS_RECOVER_DOMAIN, &[challenge, content_id, kid_hex, decrypt_session_pub])
+    lp_concat(
+        DKMS_RECOVER_DOMAIN,
+        &[challenge, content_id, kid_hex, decrypt_session_pub, &recover_seq.to_le_bytes()],
+    )
 }
 
 /// The CLIENT side: prove possession of the token-bound ephemeral private key by signing the recover
-/// binding. The node verifies this against the pubkey the session token committed to.
+/// binding + this recover's freshness counter. The node verifies this against the pubkey the session
+/// token committed to AND that `recover_seq` strictly advances (a replayed frame is refused).
 pub fn sign_recover_proof(
     signer: &impl seal::CekSealSigner,
     challenge: &[u8],
     content_id: &[u8],
     kid_hex: &[u8],
     decrypt_session_pub: &[u8],
+    recover_seq: u64,
 ) -> Vec<u8> {
-    signer.sign(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub))
+    signer.sign(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub, recover_seq))
 }
 
 /// The NODE side: verify the caller's possession proof against the token-bound pubkey. `true` only
 /// when `sig` is valid under `verifier` (built from the token's `caller_pub`) over the SAME binding
-/// — a missing/forged proof, a proof from a different key, or a tampered binding all return `false`.
+/// (including `recover_seq`) — a missing/forged proof, a proof from a different key, a tampered
+/// binding, or a swapped freshness counter all return `false`. Freshness (the strictly-increasing
+/// check) is enforced by the node against its per-session counter, not here.
 pub fn verify_recover_proof(
     verifier: &impl CekSealVerifier,
     challenge: &[u8],
     content_id: &[u8],
     kid_hex: &[u8],
     decrypt_session_pub: &[u8],
+    recover_seq: u64,
     sig: &[u8],
 ) -> bool {
-    verifier.verify(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub), sig)
+    verifier.verify(
+        &recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub, recover_seq),
+        sig,
+    )
 }
 
 /// Length-prefixed message FRAMING for the dKMS node's socket transport (Day 93–94): every message
@@ -1147,25 +1163,28 @@ mod tests {
         let caller_verifier = MlDsa65Verifier::from_encoded(&caller_vk).unwrap();
         let challenge = [0x12u8; 32];
         let (content, kid, sess_pub) = (b"bafContent".as_slice(), b"c5c5".as_slice(), b"sessionpub".as_slice());
-        let proof = crate::sign_recover_proof(&caller, &challenge, content, kid, sess_pub);
-        assert!(crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, &proof));
+        let seq = 1u64;
+        let proof = crate::sign_recover_proof(&caller, &challenge, content, kid, sess_pub, seq);
+        assert!(crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, &proof));
 
         // A proof from a DIFFERENT key (a captured-token replayer without the private key) fails.
         let (other, _ovk) = crate::seal::mldsa_seal_keypair([0x62u8; 32]);
-        let wrong = crate::sign_recover_proof(&other, &challenge, content, kid, sess_pub);
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, &wrong));
+        let wrong = crate::sign_recover_proof(&other, &challenge, content, kid, sess_pub, seq);
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, &wrong));
 
-        // A tampered binding (different content / kid / session pub / challenge) fails.
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, b"bafOTHER", kid, sess_pub, &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, b"ffff", sess_pub, &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, b"otherpub", &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, b"otherchal", content, kid, sess_pub, &proof));
+        // A tampered binding (different content / kid / session pub / challenge / freshness seq) fails.
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, b"bafOTHER", kid, sess_pub, seq, &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, b"ffff", sess_pub, seq, &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, b"otherpub", seq, &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, b"otherchal", content, kid, sess_pub, seq, &proof));
+        // A SWAPPED freshness counter invalidates the proof (the seq is authenticated, not free to alter).
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq + 1, &proof));
 
         // The possession proof is domain-separated from the session token (different domain prefix).
         assert!(!crate::verify_session_token(&caller_verifier, &challenge, content, 0, &proof));
 
         // A malformed signature fails closed.
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, b"nope"));
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, b"nope"));
     }
 
     /// The socket framing round-trips messages, recovers exact boundaries from a concatenated

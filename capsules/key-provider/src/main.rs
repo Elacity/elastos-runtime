@@ -326,6 +326,13 @@ struct DkmsClientAuthority {
     /// Where the secret-holding authority node lives (its capsule binary path) — the granted
     /// endpoint the client RPCs for `recover`. NOT a secret; an address (PC2's `pkpId` analogue).
     endpoint: String,
+    /// The runtime's OWN stable caller-identity seed (base64, Day 95–96), provisioned out-of-band so
+    /// the node's allow-list recognizes this caller. When present, the client derives a STABLE
+    /// caller keypair from it (a KNOWN identity the node serves); when absent, it mints an ephemeral
+    /// keypair (anonymous — dev/test only). This is the runtime's identity key, NOT the dKMS master
+    /// or any CEK — the runtime legitimately holds its own identity. The analogue of PC2's client
+    /// holding a registered owner/session key the node binds the secure-view session to.
+    caller_seed_b64: Option<String>,
 }
 
 /// A LONG-LIVED connection to the external dKMS node plus the live handshake SESSION (Day 91–94).
@@ -347,6 +354,10 @@ struct DkmsNodeConn {
     session_token: Value,
     /// The token's expiry (cached from the token) — the reuse-vs-re-establish decision.
     expires_at: u64,
+    /// The per-recover FRESHNESS counter (Day 95–96): a strictly-increasing sequence number the
+    /// client stamps + signs into each recover so the node refuses a replayed recover frame. Bumped
+    /// once per recover over this connection (resets when the connection is re-established).
+    recover_seq: u64,
 }
 
 #[cfg(all(feature = "key-authority-ref", unix))]
@@ -364,13 +375,21 @@ impl DkmsNodeConn {
         }
     }
 
-    /// Sign this recover's binding under the ephemeral key the session token committed to: the
-    /// node-issued challenge + the content/recipient identity of THIS recover. Returns base64.
+    /// Reserve the next per-recover FRESHNESS counter for this connection (strictly increasing).
+    fn next_recover_seq(&mut self) -> u64 {
+        self.recover_seq += 1;
+        self.recover_seq
+    }
+
+    /// Sign this recover's binding under the key the session token committed to: the node-issued
+    /// challenge + the content/recipient identity of THIS recover + the freshness counter. Returns
+    /// base64. Binding `recover_seq` is what makes a replayed recover frame non-reusable.
     fn recover_proof_b64(
         &self,
         content_id: &str,
         kid_hex: &str,
         decrypt_session_pub_b64: &str,
+        recover_seq: u64,
     ) -> Result<String, String> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -387,6 +406,7 @@ impl DkmsNodeConn {
             content_id.as_bytes(),
             kid_hex.as_bytes(),
             &session_pub,
+            recover_seq,
         );
         Ok(b64.encode(sig))
     }
@@ -441,15 +461,32 @@ fn establish_dkms_session(
     let reader = std::io::BufReader::new(
         stream.try_clone().map_err(|e| format!("dkms socket clone failed: {e}"))?,
     );
-    // Mint an EPHEMERAL keypair for THIS connection: its public half binds the session token, and we
-    // prove possession of the private half on every recover (non-replayable bearer token).
-    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
+    // The caller identity whose public half binds the session token + signs every recover. When the
+    // runtime was provisioned with its OWN stable caller seed (Day 95–96), derive a KNOWN identity
+    // from it so the node's allow-list recognizes us; otherwise mint an EPHEMERAL keypair (anonymous,
+    // dev/test). Either way we prove possession of the private half on every recover.
+    let caller_seed = match client.caller_seed_b64.as_ref() {
+        Some(seed_b64) => {
+            let bytes = b64
+                .decode(seed_b64)
+                .map_err(|e| format!("dkms caller seed is not base64: {e}"))?;
+            if bytes.len() != 32 {
+                return Err(format!("dkms caller seed must be 32 bytes, got {}", bytes.len()));
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            seed
+        }
+        None => ddrm_envelope::random_seed(),
+    };
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
     let mut conn = DkmsNodeConn {
         stream,
         reader,
         caller_signer,
         session_token: Value::Null,
         expires_at: 0,
+        recover_seq: 0,
     };
 
     // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
@@ -1084,11 +1121,20 @@ impl KeyProvider {
         // re-verifies the token + the proof under its own key + re-checks authorization in its boundary.
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
-            match conn.recover_proof_b64(&request.object_cid, &kid_hex, &session.decrypt_session_pub_b64) {
+            // Stamp a STRICTLY-INCREASING freshness counter and sign it into the possession proof, so
+            // the node refuses a replay of this recover frame (Day 95–96 anti-replay).
+            let recover_seq = conn.next_recover_seq();
+            match conn.recover_proof_b64(
+                &request.object_cid,
+                &kid_hex,
+                &session.decrypt_session_pub_b64,
+                recover_seq,
+            ) {
                 Ok(caller_sig_b64) => {
                     let mut req = recover_req;
                     req["session_token"] = conn.session_token.clone();
                     req["caller_sig_b64"] = json!(caller_sig_b64);
+                    req["recover_seq"] = json!(recover_seq);
                     req["now_unix"] = json!(now);
                     conn.call(&req)
                 }
@@ -1289,7 +1335,30 @@ fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, Stri
     let verifying_key_b64 = field("verifying_key_b64", "an external authority must publish its identity")?;
     let recipient_pub_b64 = field("recipient_pub_b64", "an external authority must publish its escrow recipient")?;
     let endpoint = field("authority_endpoint", "the runtime must know where to delegate recovery")?;
-    Ok(Some(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint }))
+    // THRESHOLD SEAM (Day 95–96, fail-closed stub): a multi-node threshold descriptor (`threshold`
+    // with t>1 or more than one node) is RECOGNIZED but not yet served — splitting the CEK across
+    // multiple secret-holding nodes so no single node holds the whole key is the next cycle. Until
+    // then we REFUSE rather than silently recover from one node and pretend it was a threshold (which
+    // would weaken the security guarantee the descriptor asks for). A single-node descriptor (no
+    // `threshold`, or `threshold.t == 1`) is the supported path.
+    if let Some(threshold) = desc.get("threshold") {
+        let t = threshold.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
+        let node_count = threshold.get("nodes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        if t > 1 || node_count > 1 {
+            return Err(format!(
+                "dkms authority descriptor {path} requests threshold recovery (t={t}, nodes={node_count}) — \
+                 threshold dKMS is not yet implemented; the runtime fails closed rather than recover from a single node"
+            ));
+        }
+    }
+    // The runtime's OWN stable caller-identity seed (provisioned out-of-band via init config, NOT the
+    // public descriptor) so the node's allow-list recognizes this caller. Optional: absent → anonymous.
+    let caller_seed_b64 = config
+        .get("dkms_caller_seed_b64")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    Ok(Some(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint, caller_seed_b64 }))
 }
 
 /// Verify a dKMS node's IDENTITY handshake response against the descriptor-PINNED verifying key.
@@ -1960,6 +2029,53 @@ mod tests {
             let path = unique_store_path(tag);
             std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
             path
+        }
+
+        /// THRESHOLD SEAM (Day 95–96, fail-closed stub): a descriptor requesting threshold recovery
+        /// (`threshold` with t>1 or more than one node) is REFUSED at `init` — splitting the CEK
+        /// across multiple secret-holding nodes is the next cycle, and until then the runtime fails
+        /// closed rather than silently recovering from a single node and pretending it was a
+        /// threshold. A single-node descriptor (no `threshold`, or `threshold.t == 1`) still resolves.
+        #[test]
+        fn dkms_fails_closed_on_a_threshold_descriptor() {
+            let master = [0x7cu8; 32];
+            let authority = reference_authority_from_master(&master);
+            // A descriptor asking for 2-of-2 threshold recovery.
+            let desc = json!({
+                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+                "verifying_key_b64": b64().encode(&authority.verifying_key),
+                "recipient_pub_b64": b64().encode(&authority.recipient_public),
+                "authority_endpoint": "/path/to/dkms-authority",
+                "threshold": { "t": 2, "nodes": ["/path/to/node-a", "/path/to/node-b"] },
+            });
+            let path = unique_store_path("dkms-threshold");
+            std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
+            let mut p = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &path }))),
+                "not_configured"
+            );
+            assert!(p.dkms.is_none(), "a threshold descriptor must not resolve a single-node client");
+
+            // A single-node descriptor (threshold.t == 1) still resolves the public client.
+            let single = json!({
+                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+                "verifying_key_b64": b64().encode(&authority.verifying_key),
+                "recipient_pub_b64": b64().encode(&authority.recipient_public),
+                "authority_endpoint": "/path/to/dkms-authority",
+                "threshold": { "t": 1, "nodes": ["/path/to/node-a"] },
+            });
+            let single_path = unique_store_path("dkms-threshold-1");
+            std::fs::write(&single_path, serde_json::to_vec(&single).unwrap()).unwrap();
+            let mut q = KeyProvider::default();
+            assert!(matches!(
+                q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &single_path })),
+                Response::Ok { .. }
+            ));
+            assert!(q.dkms.is_some(), "a single-node (t=1) descriptor resolves");
+
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&single_path);
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in

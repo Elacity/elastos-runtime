@@ -43,6 +43,16 @@ const NODE_KEYSTORE_SCHEMA: &str = "elastos.dkms_node.master_seed/v1";
 /// it (it only knows the node's endpoint + the node's PUBLIC identity).
 const KEY_STORE_ENV: &str = "DKMS_AUTHORITY_KEY_STORE";
 
+/// Env var carrying the node's ALLOW-LIST of KNOWN caller identities (Day 95–96): a comma-separated
+/// list of base64 ML-DSA verifying keys. The OPERATOR/PROVISIONER who launches the daemon sets it;
+/// the connecting CLIENT cannot override it (its `init {}` never clears it). When set + non-empty,
+/// `hello` REFUSES a caller whose ephemeral pubkey is not on the list — the node serves only KNOWN
+/// callers, the runtime-core analogue of PC2's session being OWNER-BOUND to a registered wallet
+/// (`secureViewSession.ts:87`–`:100`). When unset/empty the node accepts any well-formed caller key
+/// (anonymous enrollment — dev/test only; the production rail always provisions the allow-list).
+#[cfg(unix)]
+const ALLOWED_CALLERS_ENV: &str = "DKMS_AUTHORITY_ALLOWED_CALLERS";
+
 /// How long a session token the node mints at `hello` stays live (seconds). A long-lived node only
 /// recovers for a caller whose handshake session is still within this window — a short, bounded
 /// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
@@ -137,9 +147,16 @@ enum Request {
         session_token: SessionToken,
         /// The caller's POSSESSION PROOF — REQUIRED (Day 93–94). A signature under the ephemeral
         /// private key whose public half the token is bound to, over the session challenge + this
-        /// recover's content binding. The node verifies it against the token-bound pubkey, so a
-        /// captured token replayed without the private key (or signed by the wrong key) is refused.
+        /// recover's content binding + the freshness counter. The node verifies it against the
+        /// token-bound pubkey, so a captured token replayed without the private key (or signed by the
+        /// wrong key) is refused.
         caller_sig_b64: String,
+        /// The per-recover FRESHNESS counter — REQUIRED (Day 95–96). A strictly-increasing sequence
+        /// number bound INTO the possession proof. The node tracks the highest it has consumed in
+        /// THIS session and refuses any recover whose `recover_seq` does not advance — so a captured
+        /// recover frame replayed verbatim (same seq) is refused even by the legitimate caller. The
+        /// runtime-core analogue of PC2's revocable per-delegation `nonce` (`secureViewSession.ts:108`–`:112`).
+        recover_seq: u64,
         /// The caller's clock for the expiry check (absent → the node's own wall clock).
         #[serde(default)]
         now_unix: Option<u64>,
@@ -224,6 +241,17 @@ impl NodeAuthority {
 #[derive(Default)]
 struct DkmsAuthorityNode {
     authority: Option<NodeAuthority>,
+    /// The KNOWN-caller allow-list (Day 95–96): decoded ML-DSA verifying keys the node will serve.
+    /// `None` = anonymous enrollment (any well-formed caller key); `Some(list)` = `hello` refuses a
+    /// caller not on the list. Set by the OPERATOR (daemon env / direct construction), NOT by the
+    /// connecting client — so a client cannot widen who the node serves.
+    allowed_callers: Option<Vec<Vec<u8>>>,
+    /// The highest per-recover FRESHNESS counter consumed in this connection's session (Day 95–96).
+    /// `recover` requires a strictly-greater `recover_seq`, so a replayed recover frame is refused.
+    /// Per-connection state (a fresh connection = a fresh session = counter resets, but a fresh
+    /// session also requires a fresh `hello` + possession proof, so cross-connection replay is
+    /// already blocked by the caller-bound token).
+    last_recover_seq: u64,
 }
 
 impl DkmsAuthorityNode {
@@ -252,6 +280,7 @@ impl DkmsAuthorityNode {
                 right,
                 session_token,
                 caller_sig_b64,
+                recover_seq,
                 now_unix,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
@@ -271,6 +300,7 @@ impl DkmsAuthorityNode {
                 right,
                 session_token,
                 caller_sig_b64,
+                recover_seq,
                 now_unix,
             }),
             Request::Shutdown => Response::empty_ok(),
@@ -306,6 +336,18 @@ impl DkmsAuthorityNode {
         };
         if ddrm_envelope::MlDsa65Verifier::from_encoded(&caller_pub).is_none() {
             return Response::error("invalid_request", "caller_pub_b64 is not a valid verifying key");
+        }
+        // KNOWN-CALLER GATE (Day 95–96): when an allow-list is provisioned, the node serves ONLY a
+        // caller whose ephemeral identity key it recognizes — an unknown caller is refused at the
+        // handshake, BEFORE any session token is minted (the OWNER-BOUND analogue). When no allow-list
+        // is configured the node accepts any well-formed key (anonymous enrollment, dev/test only).
+        if let Some(allowed) = self.allowed_callers.as_ref() {
+            if !allowed.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
+                return Response::error(
+                    "caller_not_authorized",
+                    "caller identity is not on this node's allow-list (provision the caller's verifying key)",
+                );
+            }
         }
         let attestation = ddrm_envelope::attest_challenge(&authority.signer, &challenge);
         // Mint a node-signed SESSION TOKEN binding this challenge + the caller's pubkey to a bounded
@@ -372,10 +414,32 @@ impl DkmsAuthorityNode {
         }))
     }
 
-    /// DELEGATED recovery (the `key-provider` client RPCs this): recover the escrowed CEK in this
-    /// boundary, re-seal it to the decrypt session, and return ONLY the sealed material. The raw
-    /// CEK is held in `Zeroizing` and never echoed back; the master never leaves this process.
-    fn recover(&self, args: RecoverArgs) -> Response {
+    /// DELEGATED recovery with the per-recover FRESHNESS gate (Day 95–96). A `recover` is accepted
+    /// only when its `recover_seq` strictly advances this session's counter — so a captured recover
+    /// frame replayed verbatim (same seq) is refused even by the legitimate caller (anti-replay). The
+    /// counter is committed ONLY on a successful recover, so a transient failure does not burn a seq.
+    /// The freshness gate runs FIRST (cheap, before any key work); the possession proof binds the seq
+    /// (so a MITM cannot bump a stale frame's counter without invalidating the proof).
+    fn recover(&mut self, args: RecoverArgs) -> Response {
+        let recover_seq = args.recover_seq;
+        if recover_seq <= self.last_recover_seq {
+            return Response::error(
+                "session_invalid",
+                "stale or replayed recover_seq — the freshness counter must strictly advance (anti-replay)",
+            );
+        }
+        let resp = self.recover_inner(&args);
+        if matches!(resp, Response::Ok { .. }) {
+            self.last_recover_seq = recover_seq;
+        }
+        resp
+    }
+
+    /// The recovery body: recover the escrowed CEK in this boundary, re-seal it to the decrypt
+    /// session, and return ONLY the sealed material. The raw CEK is held in `Zeroizing` and never
+    /// echoed back; the master never leaves this process. Borrows `&self` only (the freshness counter
+    /// is committed by the `recover` wrapper after this returns Ok).
+    fn recover_inner(&self, args: &RecoverArgs) -> Response {
         let authority = match self.authority.as_ref() {
             Some(authority) => authority,
             None => {
@@ -387,12 +451,12 @@ impl DkmsAuthorityNode {
         };
         // SESSION GATE FIRST — refuse to recover without a live, node-verified handshake session
         // (the channel gate), before re-authorizing or touching any key material.
-        if let Err(err) = verify_session(authority, &args) {
+        if let Err(err) = verify_session(authority, args) {
             return Response::error("session_invalid", err);
         }
         // RE-AUTHORIZE in this boundary — refuse to recover for an unauthorized caller before
         // touching any key material (the node never trusts the client's claim).
-        if let Err(err) = reauthorize(&args) {
+        if let Err(err) = reauthorize(args) {
             return Response::error("access_denied", err);
         }
         let wrapped = match b64().decode(&args.wrapped_cek_b64) {
@@ -445,7 +509,7 @@ impl DkmsAuthorityNode {
             "nonce_b64": args.nonce_b64,
             "content_hash_b64": args.content_hash_b64,
         });
-        if let Some(init) = args.init_segment_b64 {
+        if let Some(init) = args.init_segment_b64.as_ref() {
             material["init_segment_b64"] = json!(init);
         }
         Response::ok(json!({
@@ -475,6 +539,7 @@ struct RecoverArgs {
     right: String,
     session_token: SessionToken,
     caller_sig_b64: String,
+    recover_seq: u64,
     now_unix: Option<u64>,
 }
 
@@ -527,10 +592,11 @@ fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), S
         args.content_id.as_bytes(),
         args.kid_hex.as_bytes(),
         &session_pub,
+        args.recover_seq,
         &caller_sig,
     ) {
         return Err(
-            "caller possession proof is missing, forged, or signed by the wrong key (captured token replay refused)"
+            "caller possession proof is missing, forged, signed by the wrong key, or carries a swapped freshness counter (captured token replay refused)"
                 .to_string(),
         );
     }
@@ -707,10 +773,16 @@ fn serve_socket(path: &str) {
             std::process::exit(1);
         }
     };
+    // The OPERATOR's KNOWN-caller allow-list (Day 95–96), resolved ONCE at daemon startup from the
+    // provisioner-set env. The connecting client cannot influence it. `None`/empty = anonymous.
+    let allowed_callers = allowed_callers_from_env();
+    if let Some(list) = allowed_callers.as_ref() {
+        eprintln!("dkms-authority: enforcing a {}-entry caller allow-list", list.len());
+    }
     eprintln!("dkms-authority: listening on {path}");
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => serve_connection(stream),
+            Ok(stream) => serve_connection(stream, &allowed_callers),
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
                 continue;
@@ -719,13 +791,39 @@ fn serve_socket(path: &str) {
     }
 }
 
+/// Parse the OPERATOR's KNOWN-caller allow-list from `ALLOWED_CALLERS_ENV`: a comma-separated list
+/// of base64 ML-DSA verifying keys. `None` when unset/empty (anonymous enrollment); a malformed or
+/// non-key entry is dropped (fail-closed: it simply will not match any caller). Provisioner-only.
+#[cfg(unix)]
+fn allowed_callers_from_env() -> Option<Vec<Vec<u8>>> {
+    let raw = std::env::var(ALLOWED_CALLERS_ENV).ok()?;
+    let list: Vec<Vec<u8>> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| b64().decode(s).ok())
+        .filter(|vk| ddrm_envelope::MlDsa65Verifier::from_encoded(vk).is_some())
+        .collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list)
+    }
+}
+
 /// Serve ONE connection: a fresh node + session, framed request/response until the client hangs up,
 /// sends `shutdown`, or trips a transport error. Any framing/parse error ends THIS connection only
 /// (fail-closed) — it never propagates to the listener.
 #[cfg(unix)]
-fn serve_connection(stream: std::os::unix::net::UnixStream) {
+fn serve_connection(
+    stream: std::os::unix::net::UnixStream,
+    allowed_callers: &Option<Vec<Vec<u8>>>,
+) {
     use ddrm_envelope::frame::{read_frame, write_frame};
-    let mut node = DkmsAuthorityNode::default();
+    let mut node = DkmsAuthorityNode {
+        allowed_callers: allowed_callers.clone(),
+        ..DkmsAuthorityNode::default()
+    };
     let mut reader = io::BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(err) => {
@@ -823,13 +921,15 @@ mod tests {
         }
     }
 
-    /// The caller's possession proof over a token's challenge + a recover's content binding.
+    /// The caller's possession proof over a token's challenge + a recover's content binding + the
+    /// per-recover freshness counter (Day 95–96).
     fn proof_for(
         signer: &ddrm_envelope::seal::MlDsaSealSigner,
         token: &SessionToken,
         content_id: &str,
         kid_hex: &str,
         session_pub_b64: &str,
+        recover_seq: u64,
     ) -> String {
         let challenge = b64().decode(&token.challenge_b64).unwrap();
         let session_pub = b64().decode(session_pub_b64).unwrap();
@@ -839,6 +939,7 @@ mod tests {
             content_id.as_bytes(),
             kid_hex.as_bytes(),
             &session_pub,
+            recover_seq,
         ))
     }
 
@@ -895,7 +996,7 @@ mod tests {
 
         let (caller, caller_vk) = caller_keypair();
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let resp = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -914,6 +1015,7 @@ mod tests {
             right: RIGHT.to_string(),
             session_token: token,
             caller_sig_b64,
+            recover_seq: 1,
             now_unix: Some(NOW),
         });
         let data = ok_data(resp);
@@ -971,7 +1073,7 @@ mod tests {
         // gate, so the producer check is what we're exercising).
         let (caller, caller_vk) = caller_keypair();
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let forged = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -990,13 +1092,14 @@ mod tests {
             right: RIGHT.to_string(),
             session_token: token,
             caller_sig_b64,
+            recover_seq: 1,
             now_unix: Some(NOW),
         });
         assert_eq!(error_code(&forged), "invalid_request");
 
         // Before init → not_configured (the authority check precedes the session gate, so a dummy
         // token is never reached).
-        let fresh = DkmsAuthorityNode::default();
+        let mut fresh = DkmsAuthorityNode::default();
         let pre = fresh.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -1015,6 +1118,7 @@ mod tests {
             right: RIGHT.to_string(),
             session_token: dummy_token(),
             caller_sig_b64: b64().encode([0u8; 8]),
+            recover_seq: 1,
             now_unix: Some(NOW),
         });
         assert_eq!(error_code(&pre), "not_configured");
@@ -1031,7 +1135,7 @@ mod tests {
 
     /// Build an initialized node plus a recover request whose escrow + transcript are valid, so a
     /// re-auth test can vary ONLY the receipt/binding and observe the node's independent decision.
-    fn setup_recover(store: &str) -> (DkmsAuthorityNode, RecoverArgs) {
+    fn setup_recover(store: &str) -> (DkmsAuthorityNode, RecoverArgs, ddrm_envelope::seal::MlDsaSealSigner) {
         let mut node = DkmsAuthorityNode::default();
         let init = ok_data(node.init(json!({ "authority_key_store": store })));
         let recipient_pub = b64().decode(init["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
@@ -1047,7 +1151,9 @@ mod tests {
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
         let (caller, caller_vk) = caller_keypair();
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
+        // Base case uses freshness seq 1; tests that drive multiple recovers re-sign with the
+        // returned caller signer at a higher seq.
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let args = RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -1066,9 +1172,10 @@ mod tests {
             right: RIGHT.to_string(),
             session_token: token,
             caller_sig_b64,
+            recover_seq: 1,
             now_unix: Some(NOW),
         };
-        (node, args)
+        (node, args, caller)
     }
 
     /// The node's IDENTITY handshake: a `hello` returns the published vk + an attestation that
@@ -1140,7 +1247,7 @@ mod tests {
     fn recover_fails_closed_on_unauthorized_or_mismatched_receipt() {
         let store = unique_store("reauth");
         // One node + one valid escrow; each case clones the base args and varies ONLY the receipt.
-        let (node, base) = setup_recover(&store);
+        let (mut node, base, _caller) = setup_recover(&store);
 
         // Denied receipt → access_denied.
         let mut denied = base.clone();
@@ -1213,7 +1320,7 @@ mod tests {
     #[test]
     fn recover_fails_closed_without_or_with_wrong_possession_proof() {
         let store = unique_store("possession");
-        let (node, base) = setup_recover(&store);
+        let (mut node, base, _caller) = setup_recover(&store);
 
         // Garbage proof (a token-replayer who cannot sign) → session_invalid.
         let mut garbage = base.clone();
@@ -1223,8 +1330,14 @@ mod tests {
         // Proof from a DIFFERENT key (right binding, wrong signer) → session_invalid.
         let (other, _ovk) = ddrm_envelope::seal::mldsa_seal_keypair([0x99u8; 32]);
         let mut wrong_key = base.clone();
-        wrong_key.caller_sig_b64 =
-            proof_for(&other, &base.session_token, CONTENT, &base.kid_hex, &base.decrypt_session_pub_b64);
+        wrong_key.caller_sig_b64 = proof_for(
+            &other,
+            &base.session_token,
+            CONTENT,
+            &base.kid_hex,
+            &base.decrypt_session_pub_b64,
+            base.recover_seq,
+        );
         assert_eq!(error_code(&node.recover(wrong_key)), "session_invalid");
 
         // Sanity: the unmodified base (correct possession proof) recovers.
@@ -1245,7 +1358,7 @@ mod tests {
 
         // ---- Happy path: a full framed session over one connection. ----
         let (mut client, server) = UnixStream::pair().unwrap();
-        let handle = std::thread::spawn(move || serve_connection(server));
+        let handle = std::thread::spawn(move || serve_connection(server, &None));
 
         let call = |client: &mut UnixStream, req: Value| -> Value {
             write_frame(client, &serde_json::to_vec(&req).unwrap()).unwrap();
@@ -1280,7 +1393,7 @@ mod tests {
         let proof = {
             let chal = b64().decode(challenge_str(token)).unwrap();
             let dp = b64().decode(&decrypt_pub_b64).unwrap();
-            b64().encode(ddrm_envelope::sign_recover_proof(&caller, &chal, CONTENT.as_bytes(), kid_hex.as_bytes(), &dp))
+            b64().encode(ddrm_envelope::sign_recover_proof(&caller, &chal, CONTENT.as_bytes(), kid_hex.as_bytes(), &dp, 1))
         };
         let recover = call(
             &mut client,
@@ -1298,6 +1411,7 @@ mod tests {
                 "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
                 "session_token": token,
                 "caller_sig_b64": proof,
+                "recover_seq": 1,
                 "now_unix": NOW,
             }),
         );
@@ -1310,7 +1424,7 @@ mod tests {
 
         // ---- Torn frame on a fresh connection: refused fail-closed, no panic. ----
         let (mut bad, server2) = UnixStream::pair().unwrap();
-        let handle2 = std::thread::spawn(move || serve_connection(server2));
+        let handle2 = std::thread::spawn(move || serve_connection(server2, &None));
         // A header promising 64 bytes followed by only 3, then half-close.
         use std::io::Write as _;
         bad.write_all(&64u32.to_be_bytes()).unwrap();
@@ -1335,7 +1449,7 @@ mod tests {
     #[test]
     fn recover_fails_closed_on_an_expired_or_forged_session() {
         let store = unique_store("session");
-        let (node, base) = setup_recover(&store);
+        let (mut node, base, _caller) = setup_recover(&store);
 
         // Expired: a clock past the token's expiry → session_invalid.
         let mut expired = base.clone();
@@ -1368,11 +1482,93 @@ mod tests {
     #[test]
     fn one_session_authorizes_many_recovers() {
         let store = unique_store("many");
-        let (node, base) = setup_recover(&store);
-        // Reuse the SAME session token across three recovers — all succeed.
-        for _ in 0..3 {
-            assert!(matches!(node.recover(base.clone()), Response::Ok { .. }));
+        let (mut node, base, caller) = setup_recover(&store);
+        // Reuse the SAME session token across three recovers — each carries a STRICTLY-ADVANCING
+        // freshness counter (re-signed under the caller key), and all succeed.
+        for seq in 1u64..=3 {
+            let mut args = base.clone();
+            args.recover_seq = seq;
+            args.caller_sig_b64 = proof_for(
+                &caller,
+                &base.session_token,
+                CONTENT,
+                &base.kid_hex,
+                &base.decrypt_session_pub_b64,
+                seq,
+            );
+            assert!(matches!(node.recover(args), Response::Ok { .. }), "recover seq {seq} should succeed");
         }
         let _ = std::fs::remove_file(&store);
+    }
+
+    /// The per-recover FRESHNESS gate (Day 95–96): a captured recover replayed VERBATIM (same
+    /// `recover_seq`, same proof) is refused, and a recover whose `recover_seq` does NOT strictly
+    /// advance the session counter is refused — so a replayed recover frame cannot re-drive recovery
+    /// even with an otherwise-valid token + possession proof. The OWNER-bound, anti-replay analogue
+    /// of PC2's revocable per-delegation nonce (`secureViewSession.ts:108`–`:112`).
+    #[test]
+    fn recover_fails_closed_on_a_replayed_or_stale_recover_seq() {
+        let store = unique_store("freshness");
+        let (mut node, base, caller) = setup_recover(&store);
+
+        // First recover at seq 1 succeeds and consumes the counter.
+        assert!(matches!(node.recover(base.clone()), Response::Ok { .. }));
+
+        // Replaying the SAME frame (seq 1) verbatim is refused (the counter no longer advances).
+        assert_eq!(error_code(&node.recover(base.clone())), "session_invalid");
+
+        // A NEW, correctly-signed recover at a HIGHER seq is accepted (the session is still live).
+        let mut next = base.clone();
+        next.recover_seq = 2;
+        next.caller_sig_b64 =
+            proof_for(&caller, &base.session_token, CONTENT, &base.kid_hex, &base.decrypt_session_pub_b64, 2);
+        assert!(matches!(node.recover(next), Response::Ok { .. }));
+
+        // After consuming seq 2, a recover that regresses to seq 1 (or repeats 2) is refused.
+        let mut stale = base.clone();
+        stale.recover_seq = 1;
+        assert_eq!(error_code(&node.recover(stale)), "session_invalid");
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// The KNOWN-caller allow-list (Day 95–96): when the node is provisioned with an allow-list, a
+    /// `hello` from a caller whose ephemeral identity key is NOT on the list is refused at the
+    /// handshake (`caller_not_authorized`), BEFORE any session token is minted — while a caller ON
+    /// the list completes the handshake. The OWNER-BOUND analogue of PC2's session being tied to a
+    /// registered wallet (`secureViewSession.ts:87`–`:100`). With no allow-list, any well-formed
+    /// caller is accepted (anonymous enrollment).
+    #[test]
+    fn hello_enforces_a_known_caller_allow_list() {
+        let store = unique_store("allowlist");
+        let (known, known_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x41u8; 32]);
+        let _ = &known;
+        let (_unknown, unknown_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x42u8; 32]);
+
+        // A node provisioned with ONLY `known` on its allow-list.
+        let mut node = DkmsAuthorityNode {
+            allowed_callers: Some(vec![known_vk.clone()]),
+            ..DkmsAuthorityNode::default()
+        };
+        ok_data(node.init(json!({ "authority_key_store": store })));
+
+        let challenge = b64().encode([0xA1u8; 32]);
+        // The KNOWN caller completes the handshake (and gets a session token).
+        let ok = ok_data(node.hello(&challenge, &b64().encode(&known_vk), Some(NOW)));
+        assert!(ok["session_token"].is_object());
+        // An UNKNOWN caller is refused at hello, before any token is minted.
+        assert_eq!(
+            error_code(&node.hello(&challenge, &b64().encode(&unknown_vk), Some(NOW))),
+            "caller_not_authorized"
+        );
+
+        // Sanity: a node with NO allow-list accepts the same unknown caller (anonymous enrollment).
+        let store2 = unique_store("allowlist-anon");
+        let mut anon = DkmsAuthorityNode::default();
+        ok_data(anon.init(json!({ "authority_key_store": store2 })));
+        assert!(ok_data(anon.hello(&challenge, &b64().encode(&unknown_vk), Some(NOW)))["session_token"].is_object());
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&store2);
     }
 }
