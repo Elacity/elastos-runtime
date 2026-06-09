@@ -54,6 +54,11 @@ enum Request {
     EnrichListing {
         request: Box<EnrichRequestV1>,
     },
+    /// Reconstruct a `ContentListingV1` from a real on-chain mint EVENT log (topics+data),
+    /// closing the gap between what we assemble and what the chain actually emits.
+    ListingFromEvent {
+        request: Box<EventRequestV1>,
+    },
     Shutdown,
 }
 
@@ -91,9 +96,28 @@ struct EnrichRequestV1 {
     metadata: Value,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EventRequestV1 {
+    /// `eth_getLogs` topics; `topics[0]` is the event signature hash. Indexed params follow.
+    topics: Vec<String>,
+    /// The non-indexed event params, ABI-encoded (`0x` hex) — handed in by `chain-provider`.
+    data: String,
+    /// The contract that emitted the log (the eventHub/centralStorage or channel).
+    address: String,
+    #[serde(default = "default_chain_id")]
+    chain_id: u64,
+}
+
 fn default_chain_id() -> u64 {
     8453 // Base mainnet (PC2 production)
 }
+
+// PC2 event topic hashes (keccak256 of the event signature) — ContentIndexerService.ts:59.
+const TOPIC_ASSET_CREATED: &str =
+    "0xc0a995e4052be044599af577ab2f3382d67bd34df95a76226e7c464e9d4dba46";
+const TOPIC_DIGITAL_ASSET_REGISTERED: &str =
+    "0x1b24f7763272894608506beba5887c374d345cd231bf52bd03f40bc2d0508d7b";
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -138,6 +162,7 @@ impl ContentMarket {
             Request::Status => self.status(),
             Request::ReconstructListing { request } => self.reconstruct_listing(*request),
             Request::EnrichListing { request } => self.enrich_listing(*request),
+            Request::ListingFromEvent { request } => self.listing_from_event(*request),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -147,7 +172,7 @@ impl ContentMarket {
             "provider": "content-market",
             "protocol_version": "1.0",
             "configured": false,
-            "supported_operations": ["status", "reconstruct_listing", "enrich_listing"],
+            "supported_operations": ["status", "reconstruct_listing", "enrich_listing", "listing_from_event"],
         }))
     }
 
@@ -156,8 +181,9 @@ impl ContentMarket {
             "provider": "content-market",
             "version": PROVIDER_VERSION,
             "configured": false,
-            "supported_operations": ["status", "reconstruct_listing", "enrich_listing"],
+            "supported_operations": ["status", "reconstruct_listing", "enrich_listing", "listing_from_event"],
             "decodes_function": MINT_FUNCTION,
+            "decodes_events": ["AssetCreated", "DigitalAssetRegistered"],
             "supported_op_types": ["free", "buy_once", "buy_and_resell"],
             // The listing's identity IS the KID (== bytes16 contentId), no hash/truncation.
             "content_id_rule": "bytes16 == 0x + lowercase(kid_hex[32])",
@@ -266,6 +292,167 @@ impl ContentMarket {
 
         Response::ok(listing)
     }
+
+    /// Reconstruct a listing from a real on-chain mint EVENT log. Proves the chain's own
+    /// emission agrees with what we assembled: `DigitalAssetRegistered` carries the
+    /// `bytes16 contentId` on-chain, so its listing has the SAME identity as the calldata
+    /// path; `AssetCreated` carries no contentId, so identity is DEFERRED
+    /// (`metadata_status:"needs_kid"`) to the `enrich_listing` kid-match rather than guessed.
+    /// Pure: the log bytes are handed in by `chain-provider`; this capsule fetches nothing.
+    fn listing_from_event(&self, request: EventRequestV1) -> Response {
+        if let Err(err) = validate_eth_address(&request.address, "address") {
+            return Response::error("invalid_request", err);
+        }
+        let topic0 = match request.topics.first() {
+            Some(t) => t.to_lowercase(),
+            None => return Response::error("invalid_request", "log has no topics"),
+        };
+
+        match topic0.as_str() {
+            t if t == TOPIC_DIGITAL_ASSET_REGISTERED => from_digital_asset_registered(&request),
+            t if t == TOPIC_ASSET_CREATED => from_asset_created(&request),
+            other => Response::error(
+                "invalid_request",
+                format!("unrecognized event topic {other} (not a known content mint)"),
+            ),
+        }
+    }
+}
+
+/// `DigitalAssetRegistered(address indexed channel, uint256 indexed tokenId,
+///   address creator, string tokenURI, uint16 opType, bytes16 contentId)`.
+/// topics[1] = channel; data = abi.encode(creator, tokenURI, opType, contentId).
+fn from_digital_asset_registered(request: &EventRequestV1) -> Response {
+        let channel = match request.topics.get(1).map(|t| unpad_topic_address(t)) {
+            Some(Ok(addr)) => addr,
+            _ => return Response::error("invalid_request", "DigitalAssetRegistered: missing/invalid channel topic"),
+        };
+        let body = match hex_to_bytes(&request.data) {
+            Ok(b) => b,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        if body.len() < 4 * 32 {
+            return Response::error("invalid_request", "DigitalAssetRegistered data truncated (expected 4 head words)");
+        }
+        let offset_uri = match word_to_usize(word(&body, 1)) {
+            Ok(o) => o,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let op_code = match word_to_u16(word(&body, 2)) {
+            Ok(c) => c,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let op_tag = match op_type_tag(op_code) {
+            Ok(t) => t,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        // bytes16 contentId is the first 16 bytes of the 4th head word (left-aligned).
+        let content_id = format!("0x{}", hex(&word(&body, 3)[0..16]));
+        let token_uri = match decode_abi_string(&body, offset_uri) {
+            Ok(u) => u,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+
+        Response::ok(event_listing(
+            Some(&content_id),
+            &channel,
+            request.chain_id,
+            &token_uri,
+            op_tag,
+            op_code,
+            "DigitalAssetRegistered",
+            &request.address,
+            "unresolved",
+        ))
+    }
+
+/// `AssetCreated(address indexed _to, address indexed _channel, uint256 _tokenId,
+///   string _tokenUri, uint16 _opType, address indexed opContract)`.
+/// topics[2] = channel; data = abi.encode(tokenId, tokenURI, opType). No contentId
+/// on-chain — identity is deferred to enrichment.
+fn from_asset_created(request: &EventRequestV1) -> Response {
+        let channel = match request.topics.get(2).map(|t| unpad_topic_address(t)) {
+            Some(Ok(addr)) => addr,
+            _ => return Response::error("invalid_request", "AssetCreated: missing/invalid channel topic"),
+        };
+        let body = match hex_to_bytes(&request.data) {
+            Ok(b) => b,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        if body.len() < 3 * 32 {
+            return Response::error("invalid_request", "AssetCreated data truncated (expected 3 head words)");
+        }
+        let offset_uri = match word_to_usize(word(&body, 1)) {
+            Ok(o) => o,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let op_code = match word_to_u16(word(&body, 2)) {
+            Ok(c) => c,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let op_tag = match op_type_tag(op_code) {
+            Ok(t) => t,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        let token_uri = match decode_abi_string(&body, offset_uri) {
+            Ok(u) => u,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+
+        Response::ok(event_listing(
+            None, // no contentId on-chain — defer to enrich_listing's kid-match
+            &channel,
+            request.chain_id,
+            &token_uri,
+            op_tag,
+            op_code,
+            "AssetCreated",
+            &request.address,
+            "needs_kid",
+        ))
+}
+
+/// Build a listing reconstructed from a chain event. `content_id` is `None` for events that
+/// carry no on-chain contentId (AssetCreated), which sets `metadata_status:"needs_kid"`.
+#[allow(clippy::too_many_arguments)]
+fn event_listing(
+    content_id: Option<&str>,
+    channel: &str,
+    chain_id: u64,
+    token_uri: &str,
+    op_tag: &str,
+    op_code: u16,
+    event: &str,
+    event_source: &str,
+    metadata_status: &str,
+) -> Value {
+    json!({
+        "schema": LISTING_SCHEMA,
+        "content_id": content_id,
+        "channel_address": channel,
+        "chain_id": chain_id,
+        "token_uri": token_uri,
+        "metadata_cid": extract_cid(token_uri),
+        "op_type": op_tag,
+        "op_type_code": op_code,
+        // Provenance: reconstructed from the chain's own emitted log (not the calldata, not
+        // a trusted index). For DigitalAssetRegistered this is a complete identity; for
+        // AssetCreated the identity is deferred to enrichment.
+        "source": "chain_event",
+        "event": event,
+        "event_source": event_source,
+        "metadata_status": metadata_status,
+        "enrich_requires": ["ipfs-provider", "chain-provider"],
+    })
+}
+
+/// A 32-byte indexed topic -> a `0x` 20-byte address (right-aligned, last 20 bytes).
+fn unpad_topic_address(topic: &str) -> Result<String, String> {
+    let clean = topic.strip_prefix("0x").unwrap_or(topic);
+    if clean.len() != 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("topic is not a 32-byte word".to_string());
+    }
+    Ok(format!("0x{}", &clean[24..].to_lowercase()))
 }
 
 /// Build the base (calldata-only) listing. `metadata_status` is `unresolved`; the
@@ -406,24 +593,23 @@ fn decode_mint_calldata(calldata: &str, expected_selector: Option<&str>) -> Resu
     // sellRawData: empty for FREE, else abi.encode(uint256 copies, uint256 price,
     // address payToken). Enforce the op_type/sell consistency PC2 relies on.
     let sell_raw = decode_abi_bytes(body, offset_sell)?;
-    let (op_type_tag, sell) = match op_type_code {
+    let op_type_tag = op_type_tag(op_type_code)?;
+    let sell = match op_type_code {
         0 => {
             if !sell_raw.is_empty() {
                 return Err("a FREE mint must carry empty sellRawData".to_string());
             }
-            ("free", None)
+            None
         }
-        1 | 2 => {
+        _ => {
             if sell_raw.len() < 96 {
                 return Err("a PAID mint must carry (copies, price, payToken)".to_string());
             }
             let copies = be_to_decimal(&sell_raw[0..32]);
             let price_wei = be_to_decimal(&sell_raw[32..64]);
             let pay_token = format!("0x{}", hex(&sell_raw[64 + 12..96]));
-            let tag = if op_type_code == 1 { "buy_once" } else { "buy_and_resell" };
-            (tag, Some(SellTerms { copies, price_wei, pay_token }))
+            Some(SellTerms { copies, price_wei, pay_token })
         }
-        other => return Err(format!("unknown opType {other} (expected 0, 1, or 2)")),
     };
 
     Ok(DecodedMint {
@@ -434,6 +620,16 @@ fn decode_mint_calldata(calldata: &str, expected_selector: Option<&str>) -> Resu
         content_id,
         sell,
     })
+}
+
+/// opType code -> tag. `mint`/event share this mapping; an unknown code fails closed.
+fn op_type_tag(code: u16) -> Result<&'static str, String> {
+    match code {
+        0 => Ok("free"),
+        1 => Ok("buy_once"),
+        2 => Ok("buy_and_resell"),
+        other => Err(format!("unknown opType {other} (expected 0, 1, or 2)")),
+    }
 }
 
 fn word(body: &[u8], index: usize) -> &[u8] {
@@ -916,6 +1112,136 @@ mod tests {
         assert_eq!(classify_asset_type(Some("application/parquet")), "dataset");
         assert_eq!(classify_asset_type(None), "unknown");
         assert_eq!(classify_asset_type(Some("application/zip")), "other");
+    }
+
+    // ── listing_from_event ────────────────────────────────────────────────────────
+
+    fn pad_topic_address(addr: &str) -> String {
+        format!("0x{}", hex(&address_word(addr)))
+    }
+
+    fn dyn_string(s: &str) -> Vec<u8> {
+        dyn_bytes(s.as_bytes())
+    }
+
+    /// DigitalAssetRegistered data = abi.encode(address creator, string tokenURI,
+    /// uint16 opType, bytes16 contentId). 4 head words; string in the tail (offset 128).
+    fn dar_data(creator: &str, uri: &str, op_code: u16, kid: &str) -> String {
+        let mut body = address_word(creator);
+        body.extend(pad_left_u64(4 * 32)); // offset to string
+        body.extend(pad_left_u16(op_code));
+        body.extend(bytes16_word(kid));
+        body.extend(dyn_string(uri));
+        format!("0x{}", hex(&body))
+    }
+
+    /// AssetCreated data = abi.encode(uint256 tokenId, string tokenURI, uint16 opType).
+    fn ac_data(token_id: u64, uri: &str, op_code: u16) -> String {
+        let mut body = pad_left_u64(token_id);
+        body.extend(pad_left_u64(3 * 32)); // offset to string
+        body.extend(pad_left_u16(op_code));
+        body.extend(dyn_string(uri));
+        format!("0x{}", hex(&body))
+    }
+
+    fn from_event(topics: Vec<String>, data: &str, address: &str) -> Response {
+        let req = EventRequestV1 {
+            topics,
+            data: data.to_string(),
+            address: address.to_string(),
+            chain_id: 8453,
+        };
+        ContentMarket.listing_from_event(req)
+    }
+
+    const EVENT_HUB: &str = "0x3333333333333333333333333333333333333333";
+
+    #[test]
+    fn digital_asset_registered_event_matches_calldata_identity() {
+        let uri = format!("{META_CID}/metadata.json");
+        let topics = vec![
+            TOPIC_DIGITAL_ASSET_REGISTERED.to_string(),
+            pad_topic_address(CHANNEL),
+            format!("0x{}", hex(&pad_left_u64(1))), // tokenId (indexed)
+        ];
+        let data = dar_data(CREATOR_PUB, &uri, 1, KID);
+        let listing = ok_data(from_event(topics, &data, EVENT_HUB));
+
+        // Same identity the calldata path produced.
+        assert_eq!(listing["content_id"], format!("0x{KID}"));
+        assert_eq!(listing["token_uri"], uri);
+        assert_eq!(listing["op_type"], "buy_once");
+        assert_eq!(listing["metadata_cid"], META_CID);
+        assert_eq!(listing["source"], "chain_event");
+        assert_eq!(listing["event"], "DigitalAssetRegistered");
+        assert_eq!(listing["metadata_status"], "unresolved");
+        // channel comes from the indexed topic, not the emitting contract.
+        assert_eq!(listing["channel_address"], CHANNEL.to_lowercase());
+
+        // Cross-check: the calldata path yields the SAME content_id/token_uri/op_type.
+        let from_calldata = ok_data(reconstruct(&paid_calldata(1), Some(SELECTOR)));
+        assert_eq!(listing["content_id"], from_calldata["content_id"]);
+        assert_eq!(listing["token_uri"], from_calldata["token_uri"]);
+        assert_eq!(listing["op_type"], from_calldata["op_type"]);
+    }
+
+    #[test]
+    fn asset_created_event_defers_identity_with_needs_kid() {
+        let uri = format!("{META_CID}/metadata.json");
+        let topics = vec![
+            TOPIC_ASSET_CREATED.to_string(),
+            pad_topic_address(CREATOR_PUB), // _to
+            pad_topic_address(CHANNEL),     // _channel
+            pad_topic_address(EVENT_HUB),   // opContract
+        ];
+        let data = ac_data(42, &uri, 2);
+        let listing = ok_data(from_event(topics, &data, EVENT_HUB));
+
+        // No contentId on-chain — identity deferred, not guessed.
+        assert!(listing["content_id"].is_null());
+        assert_eq!(listing["metadata_status"], "needs_kid");
+        assert_eq!(listing["op_type"], "buy_and_resell");
+        assert_eq!(listing["token_uri"], uri);
+        assert_eq!(listing["channel_address"], CHANNEL.to_lowercase());
+        assert_eq!(listing["event"], "AssetCreated");
+    }
+
+    #[test]
+    fn unknown_event_topic_fails_closed() {
+        let topics = vec!["0xdeadbeef".to_string(), pad_topic_address(CHANNEL)];
+        assert_eq!(error_code(from_event(topics, "0x", EVENT_HUB)), "invalid_request");
+    }
+
+    #[test]
+    fn event_with_no_topics_fails_closed() {
+        assert_eq!(error_code(from_event(vec![], "0x", EVENT_HUB)), "invalid_request");
+    }
+
+    #[test]
+    fn event_truncated_data_fails_closed() {
+        let topics = vec![
+            TOPIC_DIGITAL_ASSET_REGISTERED.to_string(),
+            pad_topic_address(CHANNEL),
+            format!("0x{}", hex(&pad_left_u64(1))),
+        ];
+        assert_eq!(error_code(from_event(topics, "0x0011", EVENT_HUB)), "invalid_request");
+    }
+
+    #[test]
+    fn event_bad_emitter_address_fails_closed() {
+        let topics = vec![TOPIC_DIGITAL_ASSET_REGISTERED.to_string(), pad_topic_address(CHANNEL)];
+        assert_eq!(error_code(from_event(topics, "0x", "not-an-address")), "invalid_request");
+    }
+
+    #[test]
+    fn event_unknown_op_type_fails_closed() {
+        let topics = vec![
+            TOPIC_DIGITAL_ASSET_REGISTERED.to_string(),
+            pad_topic_address(CHANNEL),
+            format!("0x{}", hex(&pad_left_u64(1))),
+        ];
+        let data = dar_data(CREATOR_PUB, &format!("{META_CID}/metadata.json"), 9, KID);
+        assert_eq!(error_code(from_event(topics, &data, EVENT_HUB)), "invalid_request");
     }
 
     #[test]

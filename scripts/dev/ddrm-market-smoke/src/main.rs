@@ -22,6 +22,9 @@ const CHANNEL: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
 const CREATOR: &str = "0x1111111111111111111111111111111111111111";
 const SELECTOR: &str = "0xaabbccdd";
 const META_CID: &str = "QmMetaFolderCidV0";
+const EVENT_HUB: &str = "0x3333333333333333333333333333333333333333";
+// keccak256("DigitalAssetRegistered(address,uint256,address,string,uint16,bytes16)").
+const TOPIC_DAR: &str = "0x1b24f7763272894608506beba5887c374d345cd231bf52bd03f40bc2d0508d7b";
 
 struct Capsule {
     name: String,
@@ -134,6 +137,77 @@ fn enrich_request(calldata: &str, kid: &str) -> Value {
     })
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn pad_left_u64(n: u64) -> Vec<u8> {
+    let mut w = vec![0u8; 32];
+    w[24..32].copy_from_slice(&n.to_be_bytes());
+    w
+}
+
+fn pad_left_u16(n: u16) -> Vec<u8> {
+    let mut w = vec![0u8; 32];
+    w[30..32].copy_from_slice(&n.to_be_bytes());
+    w
+}
+
+fn address_word(addr: &str) -> Vec<u8> {
+    let clean = addr.trim_start_matches("0x");
+    let raw: Vec<u8> = (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
+        .collect();
+    let mut w = vec![0u8; 32];
+    w[12..32].copy_from_slice(&raw);
+    w
+}
+
+fn bytes16_word(kid_hex: &str) -> Vec<u8> {
+    let raw: Vec<u8> = (0..kid_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&kid_hex[i..i + 2], 16).unwrap())
+        .collect();
+    let mut w = vec![0u8; 32];
+    w[0..16].copy_from_slice(&raw[0..16]);
+    w
+}
+
+fn dyn_string(s: &str) -> Vec<u8> {
+    let payload = s.as_bytes();
+    let mut out = pad_left_u64(payload.len() as u64);
+    out.extend_from_slice(payload);
+    let rem = payload.len() % 32;
+    if rem != 0 {
+        out.extend(std::iter::repeat(0u8).take(32 - rem));
+    }
+    out
+}
+
+/// Build a DigitalAssetRegistered log carrying our contentId: topics[1]=channel,
+/// data = abi.encode(creator, tokenURI, opType, contentId).
+fn dar_event_request(token_uri: &str, op_code: u16) -> Value {
+    let mut data = address_word(CREATOR);
+    data.extend(pad_left_u64(4 * 32)); // string offset
+    data.extend(pad_left_u16(op_code));
+    data.extend(bytes16_word(KID));
+    data.extend(dyn_string(token_uri));
+    json!({
+        "op": "listing_from_event",
+        "request": {
+            "topics": [
+                TOPIC_DAR,
+                format!("0x{}", hex(&address_word(CHANNEL))),
+                format!("0x{}", hex(&pad_left_u64(1))),
+            ],
+            "data": format!("0x{}", hex(&data)),
+            "address": EVENT_HUB,
+            "chain_id": 8453,
+        }
+    })
+}
+
 fn publish_request(op_type: &str, paid: bool) -> Value {
     let mut req = json!({
         "schema": "elastos.publish.request/v1",
@@ -224,10 +298,28 @@ fn flow_one(
         return Err(format!("tampered metadata.kid was not rejected: {tampered}"));
     }
 
+    // The chain's own emitted log agrees with what we assembled: a DigitalAssetRegistered
+    // event reconstructs the SAME identity as the calldata path.
+    let op_code = listing["op_type_code"].as_u64().ok_or("no op_type_code")? as u16;
+    let token_uri = listing["token_uri"].as_str().ok_or("no token_uri")?;
+    let from_event = ok_data(
+        &market.call(&dar_event_request(token_uri, op_code))?,
+        "content-market listing_from_event",
+    )?;
+    if from_event["content_id"].as_str() != Some(&content_id) {
+        return Err(format!("event path disagreed with calldata on identity: {from_event}"));
+    }
+    if from_event["token_uri"].as_str() != Some(token_uri)
+        || from_event["op_type"].as_str() != listing["op_type"].as_str()
+        || from_event["source"].as_str() != Some("chain_event")
+    {
+        return Err(format!("event listing did not match calldata listing: {from_event}"));
+    }
+
     step(
         if paid { 1 } else { 2 },
         &format!(
-            "{op_type}: KID -> contentId -> calldata -> listing -> enrich(resolved); tampered kid rejected; content_id={content_id} intact"
+            "{op_type}: KID -> calldata -> listing -> enrich(resolved); tampered kid rejected; chain event agrees; content_id={content_id} intact"
         ),
     );
     Ok(())

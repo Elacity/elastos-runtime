@@ -206,7 +206,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
 | Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
 | Channel/operative mint | `publish-provider` (intent) → `chain-provider::assemble_mint` (calldata) → wallet sign → broadcast | Intent DONE (Day 61); ABI calldata DONE (Day 62, decoded-to-spec); publish→chain wiring DONE cross-binary (Day 63, `ddrm-publish-smoke.sh`); live broadcast is the next step |
-| SQLite `content_catalog` indexer | `content-market` provider | Listing reconstructed from mint calldata + metadata.json enriched fail-closed (Days 64–65); live event-scan pending |
+| SQLite `content_catalog` indexer | `content-market` provider | Listing reconstructed from mint calldata + chain event log + metadata.json enriched fail-closed (Days 64–66); live `eth_getLogs` wiring pending |
 | secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
 | Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
 
@@ -343,10 +343,18 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   the JSON is handed in by `ipfs-provider` (named). `ddrm-market-smoke.sh` drives `publish →
   chain → reconstruct → enrich` so a matching kid resolves and a tampered kid is rejected
   (content-market=22, +9 tests).
+- **Status (Day 66 — the chain's own log reconstructs the same listing):** `content-market::
+  listing_from_event` decodes a PC2 `DigitalAssetRegistered` log (on-chain `bytes16
+  contentId` → SAME identity as the calldata path, `unresolved`) or an `AssetCreated` log
+  (no contentId → `needs_kid`, identity deferred to `enrich_listing`'s kid-match, not
+  guessed) into a `ContentListingV1`. Pure decode — the log bytes are handed in by
+  `chain-provider` (no RPC). `ddrm-market-smoke.sh` builds a `DigitalAssetRegistered` log
+  carrying our contentId and asserts the event path agrees with the calldata path
+  (content-market=29, +7 tests). Fail-closed on unknown topic, missing topics, truncated
+  data, bad emitter, unknown opType.
 - **Remaining:** a live broadcast path (`assemble_mint → prepare_transaction → wallet sign →
-  broadcast`), a live-Base event-scan path (real `AssetCreated`/`DigitalAssetRegistered`
-  logs → reconstruct), and real `plaintext_ref`→IPFS in the producer op (today inline bytes
-  for the smoke).
+  broadcast`), a live-Base read-only round trip (real `eth_getLogs` → reconstruct → enrich),
+  and real `plaintext_ref`→IPFS in the producer op (today inline bytes for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop
