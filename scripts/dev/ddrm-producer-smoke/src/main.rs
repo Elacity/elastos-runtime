@@ -98,6 +98,20 @@ impl Capsule {
     }
 }
 
+/// Independently recompute the IPFS CIDv1 (raw codec, sha2-256) of `bytes` using the
+/// canonical IPLD `cid` crate — the ecosystem oracle. encrypt-provider derives the same
+/// CID with a hand-rolled multibase/multihash assembly; if the two disagree, the
+/// producer's `payload_cid` is not a real content address and the smoke fails closed.
+fn recompute_payload_cid(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const SHA2_256: u64 = 0x12;
+    const RAW_CODEC: u64 = 0x55;
+    let digest = Sha256::digest(bytes);
+    let mh = cid::multihash::Multihash::<64>::wrap(SHA2_256, &digest)
+        .expect("sha2-256 digest fits a 64-byte multihash");
+    cid::Cid::new_v1(RAW_CODEC, mh).to_string()
+}
+
 fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
     if resp.get("status").and_then(Value::as_str) == Some("ok") {
         Ok(resp.get("data").cloned().unwrap_or(Value::Null))
@@ -253,6 +267,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let kid_hex = sealed["kid_hex"].as_str().ok_or("no kid_hex from encrypt")?.to_string();
     let scheme = sealed["scheme"].as_str().ok_or("no scheme from encrypt")?.to_string();
     let segment_b64 = sealed["segment_b64"].as_str().ok_or("no segment from encrypt")?.to_string();
+    let payload_cid = sealed["payload_cid"]
+        .as_str()
+        .ok_or("no payload_cid from encrypt (the producer must content-address the segment)")?
+        .to_string();
     let wrapped_cek_b64 = sealed["wrapped_cek_b64"]
         .as_str()
         .ok_or("no wrapped_cek from encrypt")?
@@ -265,7 +283,25 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("plaintext leaked in the encrypt-provider response".to_string());
     }
     encrypt.shutdown();
+
+    // payload_cid is REAL, not a placeholder: independently recompute the CIDv1 of the
+    // exact ciphertext bytes the producer emitted (via the canonical `cid` crate) and
+    // demand a byte-for-byte match. This is the point a human can verify the producer's
+    // content address resolves to the bytes it sealed — no "trust me".
+    let segment_bytes = B64.decode(&segment_b64).map_err(|e| e.to_string())?;
+    let expected_cid = recompute_payload_cid(&segment_bytes);
+    if payload_cid != expected_cid {
+        return Err(format!(
+            "producer payload_cid {payload_cid} != independently-recomputed CID {expected_cid} \
+             of the {}-byte ciphertext segment",
+            segment_bytes.len()
+        ));
+    }
+    if !payload_cid.starts_with("bafkrei") {
+        return Err(format!("payload_cid {payload_cid} is not a raw CIDv1/sha256 (bafkrei…)"));
+    }
     step(2, &format!("encrypt-provider: minted CEK + escrowed it; kid={kid_hex} (no plaintext on the wire)"));
+    step(3, &format!("encrypt-provider: payload_cid={payload_cid} — matches the independently-recomputed CID of the sealed segment"));
 
     // --- decrypt boundary: trust the authority, then MINT + PUBLISH a session key. ---
     let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
@@ -278,7 +314,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .ok_or("decrypt-provider did not publish a session key (build --features rail-material)")?
         .to_string();
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
-    step(3, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
+    step(4, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
 
     // --- authority: recover the escrowed CEK + re-seal it to the published key. ------
     let content_hash = b"producer-smoke-content-hash-0001".to_vec(); // 32 bytes
@@ -312,7 +348,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("the producer escrow blob was echoed by the key authority".to_string());
     }
     key.shutdown();
-    step(4, "key-provider: recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no escrow echo)");
+    step(5, "key-provider: recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no escrow echo)");
 
     // --- decrypt: push the sealed material in, unwrap in-VM, decrypt the fresh segment.
     let open = decrypt.call(&json!({
@@ -340,7 +376,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("plaintext leaked in the decrypt-provider response".to_string());
     }
     decrypt.shutdown();
-    step(5, "decrypt-provider: unwrapped the re-sealed CEK in-VM and decrypted the freshly-sealed segment");
+    step(6, "decrypt-provider: unwrapped the re-sealed CEK in-VM and decrypted the freshly-sealed segment");
 
     println!();
     println!("RESULT: a CEK minted, escrowed, recovered, re-sealed and used to decrypt — all in this run.");

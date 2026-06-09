@@ -206,6 +206,7 @@ green + clippy clean. Commits are on `feat/decrypt-provider-cenc`.
 | 64 | C | **`content-market::reconstruct_listing`**: a `ContentListingV1` PURELY from the self-describing mint calldata; `ddrm-market-smoke.sh`. |
 | 65 | C | **`content-market::enrich_listing`**: fuses `metadata.json` fail-closed — **rejects any metadata whose `kid != contentId`** (a hardening over PC2, which trusts `metadata.kid`). |
 | 66 | C | **`content-market::listing_from_event`**: decodes real `DigitalAssetRegistered`/`AssetCreated` logs; the event path agrees with the calldata path cross-binary. |
+| 68 | C | **`encrypt-provider` content-addresses the ciphertext → real `payload_cid`** (CIDv1 raw/sha2-256 of the sealed segment, derived in-boundary exactly as PC2's Helia `unixfs.addBytes`; pure, no `kubo_api`/network, fail-closed > 1 MiB). `seal_inline` emits it (no more `bafybeig…` placeholder); golden pins 3 inputs to the EXACT CIDs PC2's `ipfs-unixfs-importer` produces. `ddrm-producer-smoke.sh` recomputes via the canonical `cid` crate and demands a byte-for-byte cross-binary match. payload_cid ≠ KID/contentId. encrypt-provider 17→20 / 19→22. |
 | 67 | **A wiring** | **`drm-provider::open` → executable `DrmOpenPlanV1`** (status `planned`, never `opened`): the capsule-owned canonical `drm/open` sequence + inter-step **binding edges** (rights⇒`RightsDecisionReceiptV1`→`key.rights_receipt`; key⇒`ReleaseReceiptV1`→`decrypt.release_receipt`; content identity==KID under both `content_id`/`object_cid`), zero authority. Consumer smoke now FOLLOWS the plan instead of hardcoding the order (PRINCIPLES #10). drm-provider=15. |
 
 **Blocked / upstream-only:** fold `SealedDecryptMaterialV1` into the shared `elastos-common`
@@ -215,9 +216,11 @@ contract (needs push access); dKMS-direct sealing producer (needs Anders).
 
 ## 5. What's next (unblocked candidates, pick the highest-value)
 
-1. **Real `plaintext_ref`→IPFS in the producer op** — `encrypt-provider::seal_inline`
-   consumes a streamed content reference (handed-in bytes via `content`/`ipfs-provider`)
-   instead of inline base64, matching PC2's Creator; CEK stays contained.
+1. **Real `plaintext_ref`→bytes in the non-inline `seal`** — Day 68 made the producer
+   content-address its ciphertext (`payload_cid` is real, IPFS-faithful, verified
+   cross-binary). The remaining gap is resolving `seal`'s `plaintext_ref` to handed-in bytes
+   (via `content`/`ipfs-provider`) so the production `seal` path content-addresses too (and,
+   separately/later, the actual IPFS **pin** — a distinct capability from the CID).
 2. **Live-Base read-only round trip** — real `eth_getLogs` → `listing_from_event` →
    `enrich_listing`, behind an opt-in env flag (like the existing live `has_access` smoke).
 3. **Key authority backend** — make one `key-provider` backend *actually release* (the
@@ -305,7 +308,8 @@ scripts/ddrm-market-smoke.sh     # publish -> chain -> content-market (reconstru
 
 Current key ladder counts (update in lockstep when you add tests): `content-market`=29,
 `publish-provider`=16, `encrypt-provider [escrow]`=19, `key-provider [key-authority-ref]`=27,
-`decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10, `drm-provider`=15.
+`decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10, `drm-provider`=15,
+`encrypt-provider`=20 (default) / 22 (`escrow`).
 
 ---
 

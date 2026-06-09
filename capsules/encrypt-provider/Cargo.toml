@@ -33,6 +33,10 @@ getrandom = "0.2"
 # PQ-hybrid CEK-seal/unwrap + the shared escrow AAD encoder. Optional — only pulled
 # in by the `escrow` feature so the default build stays minimal and fail-closed.
 ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+# sha2-256 for content-addressing the ciphertext: the producer derives the IPFS
+# CIDv1 (raw codec) of the sealed segment in-boundary, exactly as PC2's Helia
+# `unixfs.addBytes` does (rawLeaves, 1 MiB chunk). Pure + wasm-clean; no network.
+sha2 = "0.10"
 
 [dev-dependencies]
 

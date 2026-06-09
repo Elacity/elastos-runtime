@@ -47,7 +47,7 @@ shared `protected_content` contracts.
 | PC2 stage | Runtime counterpart | Status | Evidence |
 |---|---|---|---|
 | 1 Creator upload | `library` + `object-provider` + `content` publish | 🟦 plain upload works; encrypted publish disabled | `capsules/library`, `elastos-server/src/content.rs` |
-| 1 Process/encrypt | `encrypt-provider` (`seal`) | 🟥 `seal`→`not_configured`; **CEK mint + CENC engine proven in tests** | `capsules/encrypt-provider` |
+| 1 Process/encrypt | `encrypt-provider` (`seal`/`seal_inline`) | 🟥 `seal`→`not_configured`; **CEK mint + CENC engine proven**; **`seal_inline` content-addresses the segment → real `payload_cid` (CIDv1 raw/sha256, IPFS-faithful, Day 68)** | `capsules/encrypt-provider` |
 | 2 Publish on-chain | `publish-provider` → `chain-provider::assemble_mint` | 🟩 mint assembled + ABI-encoded + wired cross-binary (Days 61–63); live broadcast pending | `capsules/publish-provider`, `chain-provider` |
 | 3 IPFS pin | `ipfs-provider` + `content` | ✅ Kubo-backed add/cat/pin; publish with pin | `capsules/ipfs-provider` |
 | 4 Market discovery | `content-market` (mint→listing + metadata enrich) + `marketplace` (app catalog) | 🟩 listing reconstructed from mint calldata + metadata.json fused fail-closed (Days 64–65); live event-scan pending | `capsules/content-market` |
@@ -131,7 +131,7 @@ flowchart TB
     WLT[wallet-provider ✅<br/>signing]
   end
   subgraph prod["PRODUCER + DISCOVERY — Phase C, built cross-binary (Days 58–66)"]
-    ENC[encrypt-provider 🟩<br/>seal_inline + CEK escrow]
+    ENC[encrypt-provider 🟩<br/>seal_inline + CEK escrow + real payload_cid]
     PUBP[publish-provider 🟩<br/>UnsignedMintV1 contentId=KID]
     MKT[content-market 🟩<br/>reconstruct / enrich / from_event]
   end
@@ -314,6 +314,16 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   `release_ref` (tampered/foreign blob fails closed). `scripts/ddrm-producer-smoke.sh`
   drives `encrypt → key[recover+re-seal] → decrypt` over the three REAL binaries — a video
   sealed *now* decrypts *now*, no golden, fail-closed, no key/plaintext leak on any wire.
+- **Status (Day 68 — the producer's `payload_cid` is REAL, not a placeholder):**
+  `encrypt-provider` now content-addresses the sealed ciphertext IN-BOUNDARY —
+  `payload_cid = CIDv1(raw 0x55, sha2-256)` of the segment, byte-for-byte what PC2's Helia
+  `unixfs.addBytes` produces for single-chunk content (`@helia/unixfs` `add.ts`: `cidVersion:1,
+  rawLeaves:true`, 1 MiB `fixedSize`). Pure function of the bytes, NO `kubo_api`/network (a CID
+  is not a pin), fail-closed above one chunk (multi-block dag-pb refused). `seal_inline` returns
+  it; the golden pins three inputs to the EXACT strings PC2's real `ipfs-unixfs-importer`
+  emits. `ddrm-producer-smoke.sh` independently recomputes the CID via the canonical `cid` crate
+  and demands a byte-for-byte cross-binary match. `payload_cid` (the IPFS address) stays a
+  SEPARATE identity from the KID/`contentId` (the chain ownership key).
 - **Status (Day 61 — `publish-provider` assembles the on-chain mint, fail-closed):** a new
   capsule that takes a sealed asset's KID + IPFS metadata folder and ASSEMBLES the content
   mint — but holds NO chain-RPC and NO wallet key. Audited PC2's real shapes
