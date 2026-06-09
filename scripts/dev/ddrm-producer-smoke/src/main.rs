@@ -217,6 +217,9 @@ fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<
         release_receipt_hash: receipt_hash,
         decrypt_session_pub: session_pub,
         nonce,
+        // Single-node producer rail — no threshold node-set to bind (the encoding stays
+        // byte-identical to the pre-threshold transcript).
+        node_set_id: None,
     }
     .to_aad()
 }

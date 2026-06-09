@@ -77,6 +77,15 @@ pub mod transcript {
         pub release_receipt_hash: [u8; 32],
         pub decrypt_session_pub: &'a [u8],
         pub nonce: &'a [u8],
+        /// 2-of-2 THRESHOLD (Day 103–104): the node-set identity backing this release
+        /// ([`crate::threshold_node_set_id`] over both nodes' vks + `t`). When present, it is
+        /// welded into the AAD so the sealed material is CRYPTOGRAPHICALLY bound to the EXACT
+        /// set of secret-holders — a release whose node-set was swapped fails the AEAD open at
+        /// the decrypt boundary itself, not only at descriptor parse. `None` on the single-node
+        /// rail, where the encoding stays byte-identical to the pre-threshold transcript (the
+        /// field is appended ONLY when present, after the final length-prefixed field, so no
+        /// existing AAD changes and no two distinct transcripts can collide).
+        pub node_set_id: Option<&'a [u8]>,
     }
 
     /// Bind a release receipt into the transcript by hashing its identifying fields
@@ -166,6 +175,13 @@ pub mod transcript {
             put(&self.release_receipt_hash);
             put(self.decrypt_session_pub);
             put(self.nonce);
+            // Appended ONLY when present: keeps the single-node encoding byte-identical while a
+            // threshold transcript can never be confused with a single-node one (the extra
+            // length-prefixed field strictly extends the AAD; every prior field is already
+            // length-prefixed, so the boundary between `nonce` and this field is unambiguous).
+            if let Some(node_set_id) = self.node_set_id {
+                put(node_set_id);
+            }
             v
         }
     }
@@ -1092,6 +1108,7 @@ mod tests {
             release_receipt_hash: [7u8; 32],
             decrypt_session_pub: b"published-session-pubkey-bytes",
             nonce: b"replay-nonce-1",
+            node_set_id: None,
         }
     }
 
@@ -1121,6 +1138,33 @@ mod tests {
         let mut t = sample_transcript();
         t.expires_at += 1;
         assert_ne!(base, t.to_aad(), "expiry change must change the AAD");
+    }
+
+    /// The 2-of-2 node-set identity is welded into the transcript AAD when present — a release
+    /// is cryptographically bound to the EXACT set of secret-holders — while the single-node
+    /// (`None`) encoding stays byte-identical to the pre-threshold transcript.
+    #[test]
+    fn transcript_aad_binds_the_node_set_and_keeps_single_node_byte_identical() {
+        let single = sample_transcript().to_aad();
+
+        let id_a = crate::threshold_node_set_id(2, b"vk-node-a", b"vk-node-b");
+        let mut t = sample_transcript();
+        t.node_set_id = Some(&id_a);
+        let with_set = t.to_aad();
+
+        // A threshold transcript is a STRICT extension of the single-node one: same prefix
+        // (no existing AAD changed), then the length-prefixed node-set id — so the two can
+        // never be equal and a single-node seal can never open as a threshold one.
+        assert_ne!(single, with_set, "binding a node-set must change the AAD");
+        assert_eq!(&with_set[..single.len()], single.as_slice(), "the single-node encoding is unchanged");
+        assert_eq!(with_set.len(), single.len() + 4 + id_a.len(), "exactly one length-prefixed field appended");
+
+        // A DIFFERENT node-set (one node swapped) yields a DIFFERENT AAD — the swapped-node
+        // release fails the AEAD open at the boundary, not just at descriptor parse.
+        let id_b = crate::threshold_node_set_id(2, b"vk-node-a", b"vk-node-ROGUE");
+        let mut t = sample_transcript();
+        t.node_set_id = Some(&id_b);
+        assert_ne!(with_set, t.to_aad(), "a swapped node-set must change the AAD");
     }
 
     /// The dKMS-node identity handshake: a node's attestation over a challenge verifies under its

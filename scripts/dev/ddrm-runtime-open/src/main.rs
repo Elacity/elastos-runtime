@@ -91,8 +91,8 @@ use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
 use ddrm_plan_runner::{
-    DrmHost, DurableEventStore, PersistingEventSink, PlanSource, ProviderHandle, ProviderLauncher,
-    ProviderTransport, StepInputs,
+    open_event_record, DrmHost, DurableEventStore, EventStore, ExecutionReport, OpenContext,
+    PlanSource, ProviderHandle, ProviderLauncher, ProviderTransport, RuntimeEventSink, StepInputs,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -406,7 +406,17 @@ fn drm_open_request() -> Value {
 
 /// Rebuild the canonical decrypt-transcript AAD exactly as the decrypt boundary will,
 /// using the SHARED `ddrm-envelope` encoder (no parallel definition).
-fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<u8> {
+///
+/// `node_set_id` (Day 103–104): on the 2-of-2 threshold rail, the node-set identity the
+/// boundary derives from its own pinned vks — welded into the AAD so the release is
+/// cryptographically bound to the exact secret-holders. `None` on the single-node rail
+/// (the encoding stays byte-identical).
+fn transcript_aad(
+    session_pub: &[u8],
+    content_hash: &[u8],
+    nonce: &[u8],
+    node_set_id: Option<&[u8]>,
+) -> Vec<u8> {
     let c = cid();
     let receipt_hash = release_receipt_hash(
         RR_SCHEMA,
@@ -434,8 +444,60 @@ fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<
         release_receipt_hash: receipt_hash,
         decrypt_session_pub: session_pub,
         nonce,
+        node_set_id,
     }
     .to_aad()
+}
+
+/// Day 103–104: the runtime's persisting event sink — writes each runtime event as the SAME
+/// durable, CEK-free record the lib's `PersistingEventSink` would (`open_event_record`, one
+/// canonical shape) and, on the 2-of-2 threshold rail, STAMPS the NODE-SET IDENTITY into it
+/// (`node_set_id_b64`). An auditor reading the durable record can prove WHICH set of
+/// secret-holders served a given open after the fact — a public hash over public vks, never
+/// key material, so the CEK-free invariant is untouched. `None` (single-node) persists the
+/// record byte-identically to the lib sink. PC2 cannot record this: its node-set lives inside
+/// Lit's opaque network, so its audit trail can never say which nodes served a decrypt.
+struct NodeSetStampingSink {
+    store: DurableEventStore,
+    node_set_id_b64: Option<String>,
+}
+
+impl RuntimeEventSink for NodeSetStampingSink {
+    fn emit(&mut self, event: &str, ctx: &OpenContext, report: &ExecutionReport) -> Result<(), String> {
+        let mut record = open_event_record(event, ctx, report);
+        if let Some(id) = &self.node_set_id_b64 {
+            record["node_set_id_b64"] = json!(id);
+        }
+        let key = format!("{}/{}", ctx.content_id, event);
+        self.store.persist(&key, &record)
+    }
+}
+
+/// Re-derive the 2-of-2 NODE-SET IDENTITY from a published dkms descriptor's `threshold`
+/// block (`threshold_node_set_id` over both listed nodes' vks + t=2). The ONE code path both
+/// the run() pin check and the rotation gate use — so "which node-set does this descriptor
+/// name?" can never be answered two different ways. Fail-closed on a malformed descriptor.
+fn derive_node_set_from_descriptor(descriptor_path: &std::path::Path) -> Result<[u8; 32], String> {
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("re-read dkms descriptor: {e}"))?,
+    )
+    .map_err(|e| format!("parse dkms descriptor: {e}"))?;
+    let nodes = desc
+        .get("threshold")
+        .and_then(|t| t.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or("threshold descriptor carries no node list to pin")?;
+    if nodes.len() != 2 {
+        return Err("threshold descriptor must list exactly two nodes for a 2-of-2 node-set".to_string());
+    }
+    let vk_of = |i: usize| -> Result<Vec<u8>, String> {
+        let s = nodes[i]
+            .get("verifying_key_b64")
+            .and_then(Value::as_str)
+            .ok_or("threshold descriptor node is missing verifying_key_b64")?;
+        B64.decode(s).map_err(|e| e.to_string())
+    };
+    Ok(ddrm_envelope::threshold_node_set_id(2, &vk_of(0)?, &vk_of(1)?))
 }
 
 fn step(n: u32, msg: &str) {
@@ -1168,6 +1230,9 @@ fn dkms_threshold_probe(node_bin: &str, work_dir: &std::path::Path) -> Result<()
         release_receipt_hash: [0u8; 32],
         decrypt_session_pub: &session_pub_bytes,
         nonce: &nonce,
+        // The probe is its OWN self-consistent boundary stand-in (it seals + unwraps under
+        // this AAD); the live run-path's node-set AAD binding is proven by the rail gates.
+        node_set_id: None,
     }
     .to_aad();
     let aad_b64 = B64.encode(&aad);
@@ -2039,7 +2104,12 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 chain_mode: chain_mode.clone(),
             }),
         ],
-        Box::new(PersistingEventSink::new(store)),
+        // Day 103–104: the sink stamps the threshold node-set identity into every durable open
+        // record (None on the single-node rail — the record is then byte-identical to the lib's).
+        Box::new(NodeSetStampingSink {
+            store,
+            node_set_id_b64: escrow.node_set_id_b64.clone(),
+        }),
     )?;
     step(2, &format!(
         "runtime-core host: LAUNCHED the rail via DrmHost::launch — key ({}), decrypt (per-open session key), rights",
@@ -2079,45 +2149,39 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // whose node-set was silently swapped (one node re-pointed at a DIFFERENT secret-holder than the
     // producer escrowed to) is DETECTED before the rail recovers anything. PC2 cannot do this: its
     // node-set lives inside Lit's opaque network, so a swapped member is uninspectable.
-    if cfg.threshold {
+    // Day 103–104: the verified node-set is then carried forward (`live_node_set`) and welded into
+    // the decrypt-transcript AAD below, so the binding is also CRYPTOGRAPHIC at the boundary.
+    let live_node_set: Option<[u8; 32]> = if cfg.threshold {
         let pinned = fixture
             .node_set_id_b64
             .as_ref()
             .ok_or("a threshold publish fixture must pin a node_set_id")?;
-        let desc: Value = serde_json::from_slice(
-            &std::fs::read(&descriptor_path).map_err(|e| format!("re-read dkms descriptor: {e}"))?,
-        )
-        .map_err(|e| format!("parse dkms descriptor: {e}"))?;
-        let nodes = desc
-            .get("threshold")
-            .and_then(|t| t.get("nodes"))
-            .and_then(Value::as_array)
-            .ok_or("threshold descriptor carries no node list to pin")?;
-        if nodes.len() != 2 {
-            return Err("threshold descriptor must list exactly two nodes for a 2-of-2 node-set".to_string());
-        }
-        let vk_of = |i: usize| -> Result<Vec<u8>, String> {
-            let s = nodes[i]
-                .get("verifying_key_b64")
-                .and_then(Value::as_str)
-                .ok_or("threshold descriptor node is missing verifying_key_b64")?;
-            B64.decode(s).map_err(|e| e.to_string())
-        };
-        let derived = ddrm_envelope::threshold_node_set_id(2, &vk_of(0)?, &vk_of(1)?);
+        let derived = derive_node_set_from_descriptor(&descriptor_path)?;
         if B64.encode(derived) != *pinned {
             return Err(
                 "the published descriptor's node-set does NOT match the producer-pinned node_set_id — a node was swapped"
                     .to_string(),
             );
         }
-    }
+        Some(derived)
+    } else {
+        None
+    };
     // The session binding is the ONLY per-open part: compute the transcript AAD over the
     // decrypt boundary's freshly-minted session key, then bind the key transport's material
     // (wrapped CEK + producer vk + content hash + nonce come from the publish fixture).
+    // On the threshold rail the AAD ALSO carries the verified node-set id (Day 103–104) —
+    // the boundary independently derives the same id from ITS pinned vks, so a node-set
+    // swap fails the AEAD open itself.
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
     let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
     let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
-    let aad = transcript_aad(&session_pub, &content_hash, &nonce);
+    let aad = transcript_aad(
+        &session_pub,
+        &content_hash,
+        &nonce,
+        live_node_set.as_ref().map(|i| i.as_slice()),
+    );
     let kid_hex = fixture.kid_hex.clone();
     let wrapped_cek_b64 = fixture.wrapped_cek_b64.clone();
     let producer_vk_b64 = fixture.producer_vk_b64.clone();
@@ -2186,8 +2250,28 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         if record["content_id"].as_str() != Some(cid().as_str()) {
             return Err(format!("durable record {name} has wrong content_id"));
         }
+        // Day 103–104: the threshold open's records are AUDITABLE — each durable record carries
+        // the node-set identity that served it, equal to the producer-pinned id; a single-node
+        // open's records carry no such field (byte-identical to the pre-threshold record).
+        match &fixture.node_set_id_b64 {
+            Some(pin) => {
+                if record["node_set_id_b64"].as_str() != Some(pin.as_str()) {
+                    return Err(format!(
+                        "durable record {name} does not carry the serving node-set identity (auditability)"
+                    ));
+                }
+            }
+            None => {
+                if record.get("node_set_id_b64").is_some() {
+                    return Err(format!("durable record {name} carries a node-set id on a single-node rail"));
+                }
+            }
+        }
     }
-    step(8, "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records; read back through a fresh DurableEventStore");
+    step(8, &format!(
+        "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records; read back through a fresh DurableEventStore{}",
+        if cfg.threshold { " — each record STAMPED with the serving node-set identity (auditable)" } else { "" },
+    ));
 
     // In `open` mode (the operator path) we are done: a real open ran and a durable, CEK-free
     // record persisted. `verify` mode (the consumer smoke) additionally drives the two
@@ -2197,7 +2281,12 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
     // boundary rebuilds the original transcript and the seal cannot open.
     let bad_nonce = b"consumer-smoke-nonce-9".to_vec();
-    let bad_aad = transcript_aad(&session_pub, &content_hash, &bad_nonce);
+    let bad_aad = transcript_aad(
+        &session_pub,
+        &content_hash,
+        &bad_nonce,
+        live_node_set.as_ref().map(|i| i.as_slice()),
+    );
     let mut bad_req = key_release_request_base(&kid_hex, &wrapped_cek_b64);
     bad_req
         .as_object_mut()
@@ -2364,9 +2453,10 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         if DurableEventStore::load(&receipts_dir)?.len() != persisted_threshold {
             return Err("a node-B-down open must persist no runtime-event record".to_string());
         }
-        // Node B stays down — it is not needed downstream (the post-shutdown probes spawn their own
-        // daemons), and `dkms_daemon_b` is now None so there is nothing left to tear down for it.
-        step(23, "key-provider (2-of-2): node B DOWN → the live rail failed closed (no partial CEK, no single-node fallback, no record persisted)");
+        // RESTART node B: the node-set AAD gate below (gate 26) drives a LIVE dual-recover, so both
+        // secret-holders must be reachable again.
+        dkms_daemon_b = Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64)?);
+        step(23, "key-provider (2-of-2): node B DOWN → the live rail failed closed (no partial CEK, no single-node fallback, no record persisted); node B restored");
 
         // #6: node A DOWN → the dual-recover fails at node A (recovered first); same fail-closed property.
         if let Some(mut g) = dkms_daemon.take() {
@@ -2406,6 +2496,101 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             return Err("a node-set with node B swapped to a rogue identity matched the pinned id — the pin is not binding".to_string());
         }
         step(25, "runtime-core host: a node-set with node B SWAPPED to a rogue secret-holder is DETECTED (node-set-id pin mismatch) — a silently swapped node never passes the open");
+
+        // --- fail-closed #8 (NODE-SET AAD BINDING, Day 103–104): the node-set is welded into the
+        // decrypt-transcript AAD itself, so a release bound to a DIFFERENT node-set fails the AEAD
+        // open AT THE BOUNDARY — live, cross-binary, even though both nodes re-sealed honestly and
+        // every per-share signature verifies. Drive the LIVE key capsule with a well-formed release
+        // whose AAD names a FORGED node-set (the nodes treat the AAD as opaque bytes, so the release
+        // SUCCEEDS), then prove the LIVE decrypt capsule — which derives the TRUE node-set from its
+        // own pinned vks — refuses to open it.
+        let forged_set = ddrm_envelope::threshold_node_set_id(2, &vk_a, &rogue_vk);
+        let forged_aad = transcript_aad(&session_pub, &content_hash, &nonce, Some(&forged_set));
+        let mut forged_req = key_release_request_base(&kid_hex, &wrapped_cek_b64);
+        forged_req
+            .as_object_mut()
+            .expect("key release request is an object")
+            .insert("rights_receipt".to_string(), fallback_rights_receipt());
+        let forged_release = ok_data(
+            &key_cell
+                .borrow_mut()
+                .as_mut()
+                .ok_or("key capsule torn down before the node-set AAD gate")?
+                .call(&json!({
+                    "op": "release",
+                    "request": forged_req,
+                    "session": {
+                        "decrypt_session_pub_b64": session_pub_b64,
+                        "producer_vk_b64": producer_vk_b64,
+                        "aad_b64": B64.encode(&forged_aad),
+                        "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                        "content_hash_b64": B64.encode(&content_hash),
+                        "nonce_b64": B64.encode(&nonce),
+                        "now_unix": NOW_UNIX,
+                        "wrapped_cek_share2_b64": escrow.wrapped_cek_share2_b64.clone()
+                            .ok_or("threshold fixture must carry share-2 for the node-set AAD gate")?,
+                    }
+                }))?,
+            "key release (forged node-set AAD)",
+        )?;
+        let mut forged_open_req = decrypt_request_base();
+        forged_open_req
+            .as_object_mut()
+            .expect("decrypt request is an object")
+            .insert("release_receipt".to_string(), release_receipt_json());
+        forged_open_req["object_cid"] = json!(cid());
+        forged_open_req["viewer_interface"] = json!(VIEWER);
+        let forged_open = decrypt_cell
+            .borrow_mut()
+            .as_mut()
+            .ok_or("decrypt capsule torn down before the node-set AAD gate")?
+            .call(&json!({
+                "op": "open_session_v1",
+                "request": forged_open_req,
+                "material": forged_release["material"].clone(),
+                "now_unix": NOW_UNIX,
+            }))?;
+        if forged_open.get("data").and_then(|d| d.get("decision")).and_then(Value::as_str) == Some("opened") {
+            return Err(format!("a release bound to a FORGED node-set must NOT open at the boundary: {forged_open}"));
+        }
+        step(26, "decrypt-provider (2-of-2): a release whose transcript names a FORGED node-set failed the AEAD open at the boundary — the node-set binding is cryptographic, not just descriptor parse");
+
+        // --- fail-closed #9 (ROTATION SAFETY, Day 103–104): a publish escrowed to node-set {A,B}
+        // can never be opened against a ROTATED node-set {A,B'} — provision a REAL fresh node B'
+        // (its own store → a genuinely distinct identity), publish a rotated descriptor naming it,
+        // and prove the OLD fixture's pin no longer matches via the SAME derivation `run()` enforces.
+        // A rotation is a NEW publish (new fixture + descriptor pair); a stale fixture fails closed.
+        let rotated_store = work_dir.join("dkms-node-b-rotated.json").to_string_lossy().into_owned();
+        let (vk_b_rotated, recipient_b_rotated) = provision_dkms_node(node_bin, &rotated_store)?;
+        let desc_now: Value = serde_json::from_slice(
+            &std::fs::read(&descriptor_path).map_err(|e| format!("re-read descriptor for rotation gate: {e}"))?,
+        )
+        .map_err(|e| format!("parse descriptor for rotation gate: {e}"))?;
+        if vk_b_rotated == desc_now["threshold"]["nodes"][1]["verifying_key_b64"].as_str().unwrap_or("") {
+            return Err("the rotated node B derived the SAME identity as the original — rotation produced no new secret-holder".to_string());
+        }
+        let rotated_desc_path = work_dir.join("dkms-authority-rotated.json");
+        let mut rotated_desc = desc_now.clone();
+        rotated_desc["threshold"]["nodes"][1] = json!({
+            "verifying_key_b64": vk_b_rotated,
+            "recipient_pub_b64": recipient_b_rotated,
+            "authority_endpoint": node2_sock_path,
+        });
+        std::fs::write(
+            &rotated_desc_path,
+            serde_json::to_vec_pretty(&rotated_desc).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("write rotated descriptor: {e}"))?;
+        let rotated_id = derive_node_set_from_descriptor(&rotated_desc_path)?;
+        if B64.encode(rotated_id) == *pinned {
+            return Err("a ROTATED node-set matched the old fixture's pin — rotation is not detectable".to_string());
+        }
+        // And the rotated descriptor IS self-consistent for a NEW publish: re-deriving from it is
+        // stable (a fresh fixture pinned to the rotated set would open — rotation is forward-safe).
+        if derive_node_set_from_descriptor(&rotated_desc_path)? != rotated_id {
+            return Err("the rotated node-set derivation is not deterministic".to_string());
+        }
+        step(27, "runtime-core host: ROTATION is fail-closed — a REAL freshly-provisioned node B' yields a node-set the old fixture's pin REFUSES (a stale publish can never open against a rotated node-set), while the rotated descriptor re-derives stably for a new publish");
     }
     } // end verify-only adversarial gates
 

@@ -482,7 +482,7 @@ impl DecryptProvider {
     /// signature before any plaintext exists.
     #[cfg(feature = "rail-bind")]
     fn open_session_bound(&self, request: DecryptSessionRequestV1, material: &BoundRailMaterial) -> Response {
-        let prepared = match self.prepare_bound_open(&request, material) {
+        let prepared = match self.prepare_bound_open(&request, material, None) {
             Ok(p) => p,
             Err(resp) => return resp,
         };
@@ -501,11 +501,17 @@ impl DecryptProvider {
     /// AAD from the AUTHENTICATED request + the boundary's own provisioned state.
     /// Shared by the bound and audited rails so the binding is identical. Returns a
     /// fail-closed `Response` on any malformed/unprovisioned input.
+    ///
+    /// `node_set_id` (Day 103–104): the 2-of-2 node-set identity the threshold path
+    /// derives from the boundary's OWN pinned vks — welded into the transcript AAD so
+    /// the unwrap is cryptographically bound to the exact secret-holders this boundary
+    /// trusts. `None` on the single-node paths (their AAD stays byte-identical).
     #[cfg(feature = "rail-bind")]
     fn prepare_bound_open(
         &self,
         request: &DecryptSessionRequestV1,
         material: &BoundRailMaterial,
+        node_set_id: Option<&[u8; 32]>,
     ) -> Result<PreparedBoundOpen<'_>, Response> {
         use base64::Engine as _;
 
@@ -554,6 +560,7 @@ impl DecryptProvider {
             release_receipt_hash: release_receipt_hash(&request.release_receipt),
             decrypt_session_pub: session_pub,
             nonce: &nonce,
+            node_set_id: node_set_id.map(|id| id.as_slice()),
         }
         .to_aad();
 
@@ -583,7 +590,7 @@ impl DecryptProvider {
         material: &BoundRailMaterial,
         now_unix: u64,
     ) -> Response {
-        let prepared = match self.prepare_bound_open(&request, material) {
+        let prepared = match self.prepare_bound_open(&request, material, None) {
             Ok(p) => p,
             // Pre-decision input/provisioning failures stay fail-closed errors
             // (no grant existed to audit yet).
@@ -658,6 +665,17 @@ impl DecryptProvider {
             return self.open_session_threshold(request, &material, &share2_b64, now_unix);
         }
 
+        // Day 103–104: a THRESHOLD-provisioned boundary (a second trusted node vk is pinned)
+        // must never open a SINGLE-share material — that would silently accept a release the
+        // key authority degraded to one node. Defense-in-depth over the key-provider's own
+        // refusal (it never emits a one-share material on the threshold rail).
+        if self.authority_vk2.is_some() {
+            return Response::error(
+                "invalid_request",
+                "this boundary is provisioned for a 2-of-2 threshold; a single-share material is refused",
+            );
+        }
+
         let bound = BoundRailMaterial {
             sealed_cek_b64: material.sealed_cek_b64,
             ciphertext_b64: material.ciphertext_b64,
@@ -690,20 +708,6 @@ impl DecryptProvider {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
-        // Reuse the single-share prepare to get the session, transcript AAD, and the
-        // first node's verifier + carrier (share-1 + the ciphertext segment).
-        let bound = BoundRailMaterial {
-            sealed_cek_b64: material.sealed_cek_b64.clone(),
-            ciphertext_b64: material.ciphertext_b64.clone(),
-            init_segment_b64: material.init_segment_b64.clone(),
-            nonce_b64: material.nonce_b64.clone(),
-            content_hash_b64: material.content_hash_b64.clone(),
-        };
-        let prepared = match self.prepare_bound_open(&request, &bound) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
         // The second node's trusted verifying key must be provisioned for a threshold
         // open — fail closed if a threshold material arrives at a single-node boundary.
         let authority_vk2 = match self.authority_vk2.as_ref() {
@@ -714,6 +718,33 @@ impl DecryptProvider {
                     "threshold material requires a second key-authority verifying key (authority_vk2)",
                 )
             }
+        };
+        // Day 103–104: derive the NODE-SET IDENTITY from the boundary's OWN pinned vks —
+        // never from the request/material — and weld it into the transcript AAD below. The
+        // sealed shares were bound to the node-set the AUTHORITY rail saw; this boundary
+        // rebuilds the AAD over the node-set IT trusts, so a release whose node-set was
+        // swapped (one node re-pointed at a different secret-holder) fails the AEAD open
+        // HERE, at the cryptographic boundary — not only at descriptor parse upstream.
+        let authority_vk = match self.authority_vk.as_ref() {
+            Some(vk) => vk,
+            None => {
+                return Response::error("not_configured", "trusted key-authority verifying key is not configured")
+            }
+        };
+        let node_set_id = ddrm_envelope::threshold_node_set_id(2, authority_vk, authority_vk2);
+
+        // Reuse the single-share prepare to get the session, transcript AAD (now node-set
+        // bound), and the first node's verifier + carrier (share-1 + the ciphertext segment).
+        let bound = BoundRailMaterial {
+            sealed_cek_b64: material.sealed_cek_b64.clone(),
+            ciphertext_b64: material.ciphertext_b64.clone(),
+            init_segment_b64: material.init_segment_b64.clone(),
+            nonce_b64: material.nonce_b64.clone(),
+            content_hash_b64: material.content_hash_b64.clone(),
+        };
+        let prepared = match self.prepare_bound_open(&request, &bound, Some(&node_set_id)) {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
         let verifier2 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk2) {
             Some(v) => v,
@@ -1704,6 +1735,7 @@ mod tests {
             release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
             decrypt_session_pub: &pub_bytes,
             nonce,
+            node_set_id: None,
         }
         .to_aad();
 
@@ -1868,6 +1900,7 @@ mod tests {
             release_receipt_hash: release_receipt_hash(&req.release_receipt),
             decrypt_session_pub: &pub_bytes,
             nonce,
+            node_set_id: None,
         }
         .to_aad();
         let segment = build_encrypted_segment(plaintext, &cek, &[0x77u8; 8]);
@@ -2088,6 +2121,7 @@ mod tests {
         plaintext: &[u8],
         nonce: &[u8],
         content_hash: &[u8],
+        bind_node_set: bool,
     ) -> (SealedDecryptMaterialV1, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>, Vec<u8>) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
         use crate::pq_envelope::session_public_bytes;
@@ -2099,7 +2133,10 @@ mod tests {
         let (signer_a, vk_a) = mldsa_seal_keypair(seed_a);
         let (signer_b, vk_b) = mldsa_seal_keypair(seed_b);
 
-        // Both nodes seal BOUND to the exact same decrypt transcript.
+        // Both nodes seal BOUND to the exact same decrypt transcript — which, on the
+        // threshold rail, carries the NODE-SET IDENTITY over both nodes' vks (Day 103–104),
+        // so the seal is welded to exactly this pair of secret-holders.
+        let node_set_id = ddrm_envelope::threshold_node_set_id(2, &vk_a, &vk_b);
         let aad = DecryptTranscriptV1 {
             suite_id: DECRYPT_SUITE_ID,
             provider_id: DECRYPT_PROVIDER_ID,
@@ -2114,6 +2151,7 @@ mod tests {
             release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
             decrypt_session_pub: &pub_bytes,
             nonce,
+            node_set_id: if bind_node_set { Some(&node_set_id) } else { None },
         }
         .to_aad();
 
@@ -2145,7 +2183,7 @@ mod tests {
         let mask = [0x3Cu8; 16];
         let plaintext = b"two-of-two threshold reconstructed payload!!";
         let (material, session, vk_a, vk_b, pub_bytes) = threshold_setup(
-            [0xC1u8; 32], [0xC2u8; 32], &mask, &req, &cek, plaintext, b"nonce-thr-1", &[0xABu8; 32],
+            [0xC1u8; 32], [0xC2u8; 32], &mask, &req, &cek, plaintext, b"nonce-thr-1", &[0xABu8; 32], true,
         );
         let mut provider = DecryptProvider {
             session: Some(session),
@@ -2178,7 +2216,7 @@ mod tests {
         let cek = [0x5Au8; 16];
         let mask = [0x3Cu8; 16];
         let (material, session, vk_a, _vk_b_real, pub_bytes) = threshold_setup(
-            [0xD1u8; 32], [0xD2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-2", &[0xABu8; 32],
+            [0xD1u8; 32], [0xD2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-2", &[0xABu8; 32], true,
         );
         // Provision a DIFFERENT node-B key than the one that actually sealed share-2,
         // i.e. the second share was not produced by the trusted node.
@@ -2210,7 +2248,7 @@ mod tests {
         let cek = [0x5Au8; 16];
         let mask = [0x3Cu8; 16];
         let (material, session, vk_a, _vk_b, pub_bytes) = threshold_setup(
-            [0xF1u8; 32], [0xF2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-3", &[0xABu8; 32],
+            [0xF1u8; 32], [0xF2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-3", &[0xABu8; 32], true,
         );
         let provider = DecryptProvider {
             session: Some(session),
@@ -2220,5 +2258,78 @@ mod tests {
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "not_configured", "threshold material requires a second node vk");
+    }
+
+    /// Day 103–104: the transcript AAD BINDS the node-set. Shares sealed by the GENUINE
+    /// trusted nodes (both signatures verify) but under a transcript that does NOT carry
+    /// the node-set identity fail closed at the AEAD open — the boundary always rebuilds
+    /// its threshold AAD over the node-set IT trusts, so a release not welded to that
+    /// exact set of secret-holders never opens, even with valid per-share signatures.
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_threshold_aad_without_node_set_fails_closed() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let mask = [0x3Cu8; 16];
+        // Genuine nodes, genuine shares — but the seal's AAD omits the node-set id.
+        let (material, session, vk_a, vk_b, pub_bytes) = threshold_setup(
+            [0xA7u8; 32], [0xA8u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-4", &[0xABu8; 32], false,
+        );
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(vk_a),
+            session_pub: Some(pub_bytes),
+            authority_vk2: Some(vk_b),
+        };
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req),
+            material,
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "a threshold seal NOT bound to the node-set must be denied: {v}"
+        );
+        assert_eq!(v["data"]["audit"]["reason"], json!("decrypt_failed"));
+    }
+
+    /// Day 103–104: a boundary PROVISIONED for a 2-of-2 threshold (second node vk pinned)
+    /// refuses a SINGLE-share material outright — it never silently accepts a release the
+    /// key authority degraded to one node (defense-in-depth over the key-provider's own
+    /// one-share refusal).
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_single_share_at_threshold_boundary_fails_closed() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        // A perfectly VALID single-node-sealed material (node A's seal, no second share).
+        let (bound, session, vk_a, pub_bytes) =
+            bound_setup([0xB9u8; 32], &req, &cek, b"payload", b"nonce-thr-5", &[0xABu8; 32]);
+        let material = SealedDecryptMaterialV1 {
+            suite: DECRYPT_SUITE_ID.to_string(),
+            sealed_cek_b64: bound.sealed_cek_b64,
+            sealed_cek_share2_b64: None,
+            ciphertext_b64: bound.ciphertext_b64,
+            init_segment_b64: None,
+            nonce_b64: bound.nonce_b64,
+            content_hash_b64: bound.content_hash_b64,
+        };
+        // ... arriving at a boundary provisioned for a 2-of-2 threshold.
+        use crate::pq_envelope::seal_support::mldsa_seal_keypair;
+        let (_signer_b, vk_b) = mldsa_seal_keypair([0xBAu8; 32]);
+        let provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(vk_a),
+            session_pub: Some(pub_bytes),
+            authority_vk2: Some(vk_b),
+        };
+        let resp = provider.open_session_v1(req, material, 1_850_000_000);
+        assert_eq!(
+            error_code(resp),
+            "invalid_request",
+            "a threshold-provisioned boundary must refuse a single-share material"
+        );
     }
 }

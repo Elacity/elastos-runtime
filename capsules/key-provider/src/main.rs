@@ -3059,6 +3059,7 @@ mod tests {
                 release_receipt_hash: [7u8; 32],
                 decrypt_session_pub: &pub_bytes,
                 nonce: b"replay-nonce-1",
+                node_set_id: None,
             };
             let aad = transcript.to_aad();
 

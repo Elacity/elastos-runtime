@@ -369,6 +369,32 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 103–104):** the threshold's identity is now CRYPTOGRAPHIC + AUDITABLE — the node-set is welded into
+  the decrypt-transcript AAD itself (a swapped node-set fails the AEAD open AT THE BOUNDARY, in the sandbox, even when
+  every per-share signature verifies — not just at descriptor parse), every durable open record is STAMPED with the
+  serving node-set identity (an auditor can prove WHICH secret-holders served an open after the fact), and ROTATION is
+  fail-closed (a stale publish can never open against a rotated node-set). Audited PC2 first: its decrypt-side binding
+  is `SHA-256(cek‖kid‖authority)` over a SINGLE authority address recomputed in the TEE
+  (`universal-decrypt-chipotle.js:577`–`:589`); it has NO key-authority rotation concept (`chipotle-client.ts:125`/
+  `:1043`/`:1064` — only manual provision-blob/CID redeploys); and its audit trail can never name the nodes that served
+  a decrypt (opaque inside Lit). The runtime is SUPERIOR on all three counts. (1) `DecryptTranscriptV1` gained an
+  OPTIONAL `node_set_id` appended to `to_aad()` only when present — the single-node encoding stays BYTE-IDENTICAL and
+  the threshold AAD is a strict extension (ddrm-envelope 24→25). The runtime seals the open under the
+  descriptor-derived node-set (new shared `derive_node_set_from_descriptor` — ONE derivation for the pin check, the
+  AAD, and the rotation gate); the dkms nodes seal to the AAD unchanged (opaque bytes — no node-protocol change).
+  (2) `decrypt-provider`'s threshold path derives the SAME id from its OWN pinned vks
+  (`threshold_node_set_id(2, authority_vk, authority_vk2)`) into `prepare_bound_open`, so the AAD it opens under names
+  exactly the secret-holders IT trusts; a threshold-provisioned boundary additionally REFUSES a single-share material
+  outright (never accepts a degraded release). rail-material 68→70. (3) a runtime-open `NodeSetStampingSink` persists
+  the SAME CEK-free `open_event_record` shape + stamps `node_set_id_b64` into every threshold open record (public hash
+  over public vks; single-node records byte-identical); the smoke reads them back fresh and asserts the stamp equals
+  the producer pin. (4) verify gate 26 (live, cross-binary): a release whose AAD names a FORGED node-set SUCCEEDS at
+  the key capsule (both nodes re-seal honestly — they cannot catch it) and is REFUSED by the live decrypt capsule.
+  (5) verify gate 27 (rotation): a REAL freshly-provisioned node B′ + a rotated descriptor is REFUSED by the old
+  fixture's pin via the same derivation `run()` enforces — a rotation is a NEW publish; the rotated descriptor
+  re-derives stably for fresh publishes. Drift untouched. Gate: ladder INTACT (ddrm-envelope=25,
+  key-provider[key-authority-ref]=43, decrypt-provider rail-material=70), drift PASS, all dDRM smokes green
+  (reference + dkms single-node + the dkms 2-of-2 with gates 26–27 + the stamped-record read-back), clippy clean.
 - **Status (Day 101–102):** the live 2-of-2 threshold is now RESILIENT + IDENTITY-BOUND — the production `DrmHost`
   rail provably FAILS CLOSED under a real node fault (either secret-holder down: no partial CEK, no single-node
   fallback, no record persisted), and a silently SWAPPED node-set is DETECTED before the rail recovers anything.
