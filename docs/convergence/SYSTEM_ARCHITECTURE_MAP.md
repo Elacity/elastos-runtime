@@ -47,7 +47,7 @@ shared `protected_content` contracts.
 | PC2 stage | Runtime counterpart | Status | Evidence |
 |---|---|---|---|
 | 1 Creator upload | `library` + `object-provider` + `content` publish | 🟦 plain upload works; encrypted publish disabled | `capsules/library`, `elastos-server/src/content.rs` |
-| 1 Process/encrypt | `encrypt-provider` (`seal`/`seal_inline`) | 🟥 `seal`→`not_configured`; **CEK mint + CENC engine proven**; **`seal_inline` content-addresses the segment → real `payload_cid` (CIDv1 raw/sha256, IPFS-faithful, Day 68)** | `capsules/encrypt-provider` |
+| 1 Process/encrypt | `encrypt-provider` (`seal`/`seal_inline`) | 🟩 **`seal` runs the full production pipeline on HANDED-IN bytes → complete `SealedObjectV1` (real `payload_cid`, bytes16-KID envelope, chain-validated suite; Day 69)**; CEK mint + CENC engine proven; `seal_inline` shares the same pipeline; both content-address the segment (CIDv1 raw/sha256, Day 68); fail-closed without handed-in bytes + recipient | `capsules/encrypt-provider` |
 | 2 Publish on-chain | `publish-provider` → `chain-provider::assemble_mint` | 🟩 mint assembled + ABI-encoded + wired cross-binary (Days 61–63); live broadcast pending | `capsules/publish-provider`, `chain-provider` |
 | 3 IPFS pin | `ipfs-provider` + `content` | ✅ Kubo-backed add/cat/pin; publish with pin | `capsules/ipfs-provider` |
 | 4 Market discovery | `content-market` (mint→listing + metadata enrich) + `marketplace` (app catalog) | 🟩 listing reconstructed from mint calldata + metadata.json fused fail-closed (Days 64–65); live event-scan pending | `capsules/content-market` |
@@ -131,7 +131,7 @@ flowchart TB
     WLT[wallet-provider ✅<br/>signing]
   end
   subgraph prod["PRODUCER + DISCOVERY — Phase C, built cross-binary (Days 58–66)"]
-    ENC[encrypt-provider 🟩<br/>seal_inline + CEK escrow + real payload_cid]
+    ENC[encrypt-provider 🟩<br/>seal/seal_inline → SealedObjectV1 + escrow + real payload_cid]
     PUBP[publish-provider 🟩<br/>UnsignedMintV1 contentId=KID]
     MKT[content-market 🟩<br/>reconstruct / enrich / from_event]
   end
@@ -314,6 +314,23 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   `release_ref` (tampered/foreign blob fails closed). `scripts/ddrm-producer-smoke.sh`
   drives `encrypt → key[recover+re-seal] → decrypt` over the three REAL binaries — a video
   sealed *now* decrypts *now*, no golden, fail-closed, no key/plaintext leak on any wire.
+- **Status (Day 69 — the production `seal` op is real → complete `SealedObjectV1`):**
+  `encrypt-provider::seal` (the non-inline op, fail-closed since Day 1) now runs the FULL
+  pipeline on HANDED-IN asset bytes and emits a complete shared-contract `SealedObjectV1`.
+  Audited PC2's producer input first (`dashPackager.ts`): the host reads each segment off disk
+  (`readFileSync` `:504`, `:571–572`) and HANDS the bytes to the CENC WASM
+  (`executeCENCEncrypt(.., seg.data)` `:432–434`) — the encoder fetches nothing. Mirrored: `seal`
+  gained `content_b64`/`recipient_pub_b64`/`availability_receipt_cid` (optional, `deny_unknown_fields`
+  preserved); given bytes + recipient it runs the ONE shared `run_seal_pipeline`
+  (mint→CENC→content-address→escrow; `seal_inline` now delegates to it too, PRINCIPLES #10) and
+  assembles a `SealedObjectV1` with the real Day-68 `payload_cid`, `key_envelope.kid` == bytes16
+  contentId, `policy_hash = sha256(rights_policy_cid)`, and the PQ-hybrid suite the chain validates.
+  NO fetch/IPFS/network authority. Fail-closed: no recipient/bytes → `not_configured`; missing
+  receipt / empty viewer-interface / empty content → `invalid_request` (encrypt escrow 22→25).
+  `ddrm-producer-smoke.sh` drives the REAL `seal`, deserializes the output into the SHARED
+  `SealedObjectV1` and runs the SAME `validate_protected_content_key_envelope_algorithms` the
+  `key-provider` runs — cross-binary proof the chain accepts the producer's object; no plaintext
+  on the wire (the production output carries the sealed object only — no segment).
 - **Status (Day 68 — the producer's `payload_cid` is REAL, not a placeholder):**
   `encrypt-provider` now content-addresses the sealed ciphertext IN-BOUNDARY —
   `payload_cid = CIDv1(raw 0x55, sha2-256)` of the segment, byte-for-byte what PC2's Helia

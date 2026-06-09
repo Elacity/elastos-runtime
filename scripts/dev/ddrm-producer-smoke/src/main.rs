@@ -282,7 +282,62 @@ fn run(args: &[String]) -> Result<(), String> {
     if sealed_str.contains(&B64.encode(PLAINTEXT)) {
         return Err("plaintext leaked in the encrypt-provider response".to_string());
     }
+
+    // --- production `seal`: drive the FULL pipeline on HANDED-IN bytes -> SealedObjectV1.
+    // Same boundary, same recipient — but now the production op assembles the complete,
+    // chain-shaped sealed object (Day 69). The capsule fetches nothing; it seals the bytes
+    // the orchestrator hands it, exactly as PC2's host hands segment bytes to the CENC WASM.
+    let prod = ok_data(
+        &encrypt.call(&json!({
+            "op": "seal",
+            "request": {
+                "schema": "elastos.encrypt.seal.request/v1",
+                "plaintext_ref": "producer-smoke-asset-handle",
+                "content_b64": B64.encode(PLAINTEXT),
+                "recipient_pub_b64": recipient_pub_b64,
+                "availability_receipt_cid": "bafyproducersmokeavail",
+                "rights_policy_cid": "bafyrightspolicy",
+                "scheme": "elastos-pq-hybrid-threshold-v0",
+                "viewer": { "required_interface": "media" }
+            }
+        }))?,
+        "encrypt seal (production)",
+    )?;
     encrypt.shutdown();
+
+    // The response must deserialize into the SHARED `SealedObjectV1` contract (so its full
+    // shape + `deny_unknown_fields` hold) and its algorithm suite must pass the SAME
+    // validator the downstream key-provider runs — cross-binary proof the chain accepts it.
+    let prod_str = serde_json::to_string(&prod).map_err(|e| e.to_string())?;
+    if prod_str.contains(&B64.encode(PLAINTEXT)) {
+        return Err("plaintext leaked in the production seal response".to_string());
+    }
+    let sealed_object: elastos_common::protected_content::SealedObjectV1 =
+        serde_json::from_value(prod["sealed_object"].clone())
+            .map_err(|e| format!("production seal did not emit a valid SealedObjectV1: {e}"))?;
+    elastos_common::protected_content::validate_protected_content_key_envelope_algorithms(
+        &sealed_object.key_envelope.algorithms,
+    )
+    .map_err(|e| format!("producer's SealedObjectV1 rejected by the shared chain validator: {e}"))?;
+    if !sealed_object.payload_cid.starts_with("bafkrei") {
+        return Err(format!(
+            "production seal payload_cid {} is not a raw CIDv1/sha256",
+            sealed_object.payload_cid
+        ));
+    }
+    // The envelope KID must be the on-chain bytes16 contentId (32 lowercase hex chars),
+    // a DIFFERENT identity from the payload CID — the two must never be conflated.
+    if sealed_object.key_envelope.kid.len() != 32
+        || !sealed_object.key_envelope.kid.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(format!("envelope kid {} is not a bytes16 contentId", sealed_object.key_envelope.kid));
+    }
+    if sealed_object.payload_cid == sealed_object.key_envelope.kid {
+        return Err("payload CID and contentId(KID) must be distinct identities".to_string());
+    }
+    if sealed_object.key_envelope.wrapped_cek.is_empty() {
+        return Err("production SealedObjectV1 carries no SEALED CEK".to_string());
+    }
 
     // payload_cid is REAL, not a placeholder: independently recompute the CIDv1 of the
     // exact ciphertext bytes the producer emitted (via the canonical `cid` crate) and
@@ -302,6 +357,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     step(2, &format!("encrypt-provider: minted CEK + escrowed it; kid={kid_hex} (no plaintext on the wire)"));
     step(3, &format!("encrypt-provider: payload_cid={payload_cid} — matches the independently-recomputed CID of the sealed segment"));
+    step(4, &format!(
+        "encrypt-provider: production `seal` emitted a complete SealedObjectV1 (payload_cid={}, kid={}) — accepted by the shared chain validator",
+        sealed_object.payload_cid, sealed_object.key_envelope.kid
+    ));
 
     // --- decrypt boundary: trust the authority, then MINT + PUBLISH a session key. ---
     let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
@@ -314,7 +373,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .ok_or("decrypt-provider did not publish a session key (build --features rail-material)")?
         .to_string();
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
-    step(4, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
+    step(5, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
 
     // --- authority: recover the escrowed CEK + re-seal it to the published key. ------
     let content_hash = b"producer-smoke-content-hash-0001".to_vec(); // 32 bytes
@@ -348,7 +407,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("the producer escrow blob was echoed by the key authority".to_string());
     }
     key.shutdown();
-    step(5, "key-provider: recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no escrow echo)");
+    step(6, "key-provider: recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no escrow echo)");
 
     // --- decrypt: push the sealed material in, unwrap in-VM, decrypt the fresh segment.
     let open = decrypt.call(&json!({
@@ -376,7 +435,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("plaintext leaked in the decrypt-provider response".to_string());
     }
     decrypt.shutdown();
-    step(6, "decrypt-provider: unwrapped the re-sealed CEK in-VM and decrypted the freshly-sealed segment");
+    step(7, "decrypt-provider: unwrapped the re-sealed CEK in-VM and decrypted the freshly-sealed segment");
 
     println!();
     println!("RESULT: a CEK minted, escrowed, recovered, re-sealed and used to decrypt — all in this run.");

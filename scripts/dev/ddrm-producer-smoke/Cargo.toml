@@ -27,3 +27,7 @@ base64 = "0.22"
 # ecosystem-standard library, not against a copy of its own code.
 cid = "0.11"
 sha2 = "0.10"
+# The SHARED chain contract: the smoke deserializes the production `seal` output into the
+# real `SealedObjectV1` and runs the SAME algorithm validator the downstream key-provider
+# runs — proving cross-binary that the producer emits an object the chain accepts.
+elastos-common = { path = "../../../elastos/crates/elastos-common" }

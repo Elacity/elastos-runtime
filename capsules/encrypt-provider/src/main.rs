@@ -24,6 +24,13 @@
 //! wired, every operation validates fully and then fails closed.
 
 use elastos_common::protected_content::SEALED_OBJECT_SCHEMA;
+#[cfg(feature = "escrow")]
+use elastos_common::protected_content::{
+    validate_protected_content_key_envelope_algorithms, KeyEnvelopeAlgorithmsV1, KeyEnvelopeV1,
+    SealedObjectV1, ViewerRequirementV1, DEFAULT_PROTECTED_CONTENT_CIPHER,
+    DEFAULT_PROTECTED_CONTENT_KEMS, DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME,
+    DEFAULT_PROTECTED_CONTENT_SIGNATURES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -56,16 +63,33 @@ const SUPPORTED_SCHEMES: &[&str] = &["elastos-pq-hybrid-threshold-v0"];
 #[serde(deny_unknown_fields)]
 struct SealRequest {
     schema: String,
-    /// Opaque reference to the plaintext asset to be encrypted (resolved and
-    /// consumed inside this boundary; the bytes never round-trip through the
-    /// caller).
+    /// Opaque reference/name of the plaintext asset (an audit handle). The bytes are
+    /// NOT fetched by this boundary — PC2's host reads the segment off disk and hands
+    /// the bytes to the CENC WASM (`dashPackager.ts` `readFileSync` :504 →
+    /// `executeCENCEncrypt(..., seg.data)` :432); we mirror that with `content_b64`,
+    /// so the producer never holds IPFS/network/fetch authority.
     plaintext_ref: String,
+    /// The asset bytes, handed in by the caller (resolved by a storage/content
+    /// capability, NOT by this boundary). When present alongside a recipient, the
+    /// production `seal` runs the full in-boundary pipeline; absent, `seal` is unchanged.
+    #[serde(default)]
+    #[allow(dead_code)]
+    content_b64: Option<String>,
+    /// The key authority's published escrow recipient key (handed in). Without it the
+    /// producer cannot escrow the CEK, so `seal` stays fail-closed (`not_configured`).
+    #[serde(default)]
+    #[allow(dead_code)]
+    recipient_pub_b64: Option<String>,
+    /// The availability/pin receipt CID for the stored ciphertext (handed in by the
+    /// storage step; the producer does not pin). Carried into the SealedObject.
+    #[serde(default)]
+    #[allow(dead_code)]
+    availability_receipt_cid: Option<String>,
     /// CID of the rights policy the sealed object will bind to.
     rights_policy_cid: String,
     /// Sealing scheme (PQ-hybrid threshold by default).
     scheme: String,
-    /// Viewer requirement carried through into the SealedObject by the engine
-    /// (not inspected by the fail-closed skeleton yet).
+    /// Viewer requirement carried through into the SealedObject (`{ "required_interface": ... }`).
     #[serde(default)]
     #[allow(dead_code)]
     viewer: Value,
@@ -218,22 +242,110 @@ impl EncryptProvider {
         }
         // Producer pipeline (invariant #1), in order:
         //   1. mint CEK + KID in-boundary (proven: `cek_and_kid_generated_inside_boundary`)
-        //   2. CENC-encrypt the asset with that CEK (proven: `seal_engine_emits_no_key_material`)
-        //   3. ESCROW the CEK to the key authority — SEALED, never raw — so the authority
-        //      can later re-seal it per decrypt session (Anders' rail; key-provider side)
-        //   4. assemble a `SealedObjectV1` (KID + wrapped_cek + payload CID)
-        //   5. zeroize the CEK.
-        // The keygen + cipher are proven; the step that is not yet configured is the CEK
-        // escrow to a key authority, so the pipeline FAILS CLOSED at the escrow seam
-        // (rather than minting a key it cannot safely hand off). Day 59 wires the real
-        // PQ-hybrid escrow seal (ddrm-envelope) to the authority's published recipient key.
-        match self.escrow {
-            CekEscrow::NotConfigured => Response::error(
-                "not_configured",
-                "encrypt/seal requires a configured key-authority escrow recipient \
-                 (the CEK is SEALED to the authority, never shipped raw)",
-            ),
+        //   2. CENC-encrypt the HANDED-IN asset bytes with that CEK
+        //   3. content-address the ciphertext (real `payload_cid`, Day 68)
+        //   4. ESCROW the CEK to the key authority — SEALED, never raw (Day 59)
+        //   5. assemble a `SealedObjectV1` (KID + wrapped_cek + payload CID), zeroize the CEK.
+        // When the caller hands in the asset bytes AND the authority's escrow recipient
+        // (escrow build), the production path runs end to end and emits a full
+        // `SealedObjectV1`. Absent either — or in a build with no escrow engine — `seal`
+        // FAILS CLOSED rather than minting a key it cannot safely hand off.
+        #[cfg(feature = "escrow")]
+        if let (Some(content_b64), Some(recipient_b64)) =
+            (request.content_b64.as_deref(), request.recipient_pub_b64.as_deref())
+        {
+            return self.seal_to_object(&request, content_b64, recipient_b64);
         }
+        Response::error(
+            "not_configured",
+            "encrypt/seal requires the handed-in asset bytes (`content_b64`) and the \
+             key-authority escrow recipient (`recipient_pub_b64`); the CEK is SEALED to the \
+             authority, never shipped raw, and this boundary fetches nothing",
+        )
+    }
+
+    /// The production seal path (feature `escrow`): run the in-boundary pipeline on the
+    /// HANDED-IN asset bytes and assemble a complete, shared-contract `SealedObjectV1` —
+    /// the real `payload_cid` (Day 68), the minted KID, the SEALED CEK, the rights policy
+    /// and availability receipt the caller handed in, and the PQ-hybrid algorithm suite
+    /// the whole chain validates. The CEK never leaves; only sealed/non-secret material does.
+    #[cfg(feature = "escrow")]
+    fn seal_to_object(&self, request: &SealRequest, content_b64: &str, recipient_b64: &str) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let availability_receipt_cid = match request.availability_receipt_cid.as_deref() {
+            Some(cid) if !cid.trim().is_empty() => cid.to_string(),
+            _ => {
+                return Response::error(
+                    "invalid_request",
+                    "availability_receipt_cid is required to seal (handed in by the storage step)",
+                )
+            }
+        };
+        let required_interface = match request.viewer.get("required_interface").and_then(Value::as_str) {
+            Some(i) if !i.trim().is_empty() => i.to_string(),
+            _ => {
+                return Response::error(
+                    "invalid_request",
+                    "viewer.required_interface is required to seal",
+                )
+            }
+        };
+        let plaintext = match b64.decode(content_b64) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => return Response::error("invalid_request", "content_b64 is empty"),
+            Err(_) => return Response::error("invalid_request", "content_b64 is not valid base64"),
+        };
+        let recipient_pub = match b64.decode(recipient_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "recipient_pub_b64 is not valid base64"),
+        };
+
+        let out = match self.run_seal_pipeline(&plaintext, &recipient_pub) {
+            Ok(out) => out,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+
+        // Bind the envelope to the handed-in rights policy by hashing its CID. (The policy
+        // doc itself is content-addressed by that CID; hashing it pins the envelope to the
+        // exact policy without this boundary fetching the document.)
+        let policy_hash = {
+            use sha2::{Digest, Sha256};
+            format!("sha256:{:x}", Sha256::digest(request.rights_policy_cid.as_bytes()))
+        };
+
+        let sealed = SealedObjectV1 {
+            schema: SEALED_OBJECT_SCHEMA.to_string(),
+            payload_cid: out.payload_cid,
+            rights_policy_cid: request.rights_policy_cid.clone(),
+            availability_receipt_cid,
+            key_envelope: KeyEnvelopeV1 {
+                scheme: SUPPORTED_SCHEMES[0].to_string(),
+                kid: out.kid_hex,
+                wrapped_cek: out.wrapped_cek_b64,
+                policy_hash,
+                algorithms: KeyEnvelopeAlgorithmsV1 {
+                    cipher: DEFAULT_PROTECTED_CONTENT_CIPHER.to_string(),
+                    signature: DEFAULT_PROTECTED_CONTENT_SIGNATURES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    kem: DEFAULT_PROTECTED_CONTENT_KEMS.iter().map(|s| s.to_string()).collect(),
+                    share_scheme: DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME.to_string(),
+                },
+            },
+            viewer: ViewerRequirementV1 { required_interface },
+        };
+        // The producer's algorithm set must satisfy the SHARED chain validator the
+        // downstream key-provider runs — refuse to emit an object the chain would reject.
+        if let Err(e) = validate_protected_content_key_envelope_algorithms(&sealed.key_envelope.algorithms) {
+            return Response::error("internal", e);
+        }
+        let sealed_object = match serde_json::to_value(&sealed) {
+            Ok(v) => v,
+            Err(e) => return Response::error("internal", e.to_string()),
+        };
+        Response::ok(json!({ "sealed_object": sealed_object }))
     }
 
     /// Dev-shaped producer pipeline (feature `escrow`): run the FULL invariant-#1 path
@@ -244,15 +356,6 @@ impl EncryptProvider {
     fn seal_inline(&self, plaintext_b64: &str, recipient_pub_b64: &str) -> Response {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
-        let producer = match self.producer.as_ref() {
-            Some(p) => p,
-            None => {
-                return Response::error(
-                    "not_configured",
-                    "seal_inline requires init to have minted the producer key (escrow build)",
-                )
-            }
-        };
         let plaintext = match b64.decode(plaintext_b64) {
             Ok(b) if !b.is_empty() => b,
             Ok(_) => return Response::error("invalid_request", "plaintext_b64 is empty"),
@@ -265,56 +368,69 @@ impl EncryptProvider {
             }
         };
 
-        // Mint in-boundary and CENC-encrypt one full sample.
-        let minted = match mint_cek_and_kid() {
-            Ok(m) => m,
-            Err(e) => return Response::error("internal", e),
-        };
-        let mut iv_seed = [0u8; 8];
-        if getrandom::getrandom(&mut iv_seed).is_err() {
-            return Response::error("internal", "csprng iv seed failed");
-        }
-        let sizes = [plaintext.len() as u32];
-        let (ciphertext, ivs, _subs) =
-            match cenc::encrypt_samples(&plaintext, &minted.cek, &sizes, &iv_seed, 0) {
-                Ok(out) => out,
-                Err(e) => return Response::error("internal", e),
-            };
-        let segment = mux_single_sample_segment(&ciphertext, &ivs[0]);
-
-        // Content-address the ciphertext: derive its real IPFS CIDv1 in-boundary,
-        // exactly as PC2's producer would by uploading the segment via Helia
-        // `unixfs.addBytes`. This is the sealed object's `payload_cid` — no longer a
-        // "trust me" placeholder, but the verifiable address of the bytes we sealed.
-        let payload_cid = match payload_cid_v1_raw(&segment) {
-            Ok(cid) => cid,
+        let out = match self.run_seal_pipeline(&plaintext, &recipient_pub) {
+            Ok(out) => out,
             Err(e) => return Response::error("invalid_request", e),
         };
 
-        // Escrow the CEK to the authority (SEALED; the raw CEK never leaves).
-        let kid16 = match kid_to_content_id_bytes16(&minted.kid_hex) {
-            Ok(k) => k,
-            Err(e) => return Response::error("internal", e),
-        };
-        let wrapped_cek_b64 =
-            match seal_cek_to_authority(&minted.cek[..], &kid16, &recipient_pub, &producer.signer) {
-                Ok(w) => w,
-                Err(e) => return Response::error("invalid_request", e),
-            };
-
-        // `minted` (Zeroizing CEK) drops here — CEK scrubbed before return.
         Response::ok(json!({
-            "kid_hex": minted.kid_hex,
+            "kid_hex": out.kid_hex,
             // The KID hex IS the on-chain bytes16 contentId (Day 58 identity join).
-            "content_id_hex": minted.kid_hex,
+            "content_id_hex": out.kid_hex,
             "scheme": SUPPORTED_SCHEMES[0],
-            "segment_b64": b64.encode(&segment),
+            "segment_b64": b64.encode(&out.segment),
             // The real content address of the sealed segment (== SealedObjectV1.payload_cid),
             // a separate identity from the KID/contentId.
-            "payload_cid": payload_cid,
-            "wrapped_cek_b64": wrapped_cek_b64,
+            "payload_cid": out.payload_cid,
+            "wrapped_cek_b64": out.wrapped_cek_b64,
         }))
     }
+
+    /// The one canonical in-boundary seal pipeline (feature `escrow`), shared by the
+    /// dev `seal_inline` and the production `seal`: mint a CEK+KID, CENC-encrypt the
+    /// handed-in bytes into a single-sample segment, content-address it (`payload_cid`,
+    /// Day 68), and escrow the CEK to the authority's recipient — SEALED, never raw. The
+    /// CEK lives in `Zeroizing` and is scrubbed when `minted` drops at function end.
+    #[cfg(feature = "escrow")]
+    fn run_seal_pipeline(
+        &self,
+        plaintext: &[u8],
+        recipient_pub: &[u8],
+    ) -> Result<SealPipelineOutput, String> {
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| "seal requires init to have minted the producer key".to_string())?;
+        let minted = mint_cek_and_kid()?;
+        let mut iv_seed = [0u8; 8];
+        getrandom::getrandom(&mut iv_seed).map_err(|_| "csprng iv seed failed".to_string())?;
+        let sizes = [plaintext.len() as u32];
+        let (ciphertext, ivs, _subs) =
+            cenc::encrypt_samples(plaintext, &minted.cek, &sizes, &iv_seed, 0)?;
+        let segment = mux_single_sample_segment(&ciphertext, &ivs[0]);
+        let payload_cid = payload_cid_v1_raw(&segment)?;
+        let kid16 = kid_to_content_id_bytes16(&minted.kid_hex)?;
+        let wrapped_cek_b64 =
+            seal_cek_to_authority(&minted.cek[..], &kid16, recipient_pub, &producer.signer)?;
+        Ok(SealPipelineOutput {
+            kid_hex: minted.kid_hex.clone(),
+            segment,
+            payload_cid,
+            wrapped_cek_b64,
+        })
+        // `minted` (Zeroizing CEK) drops here — the CEK is scrubbed before return.
+    }
+}
+
+/// The non-secret output of [`EncryptProvider::run_seal_pipeline`]. Carries only
+/// ciphertext + KID + content address + the SEALED CEK — there is no CEK field, so
+/// invariant #1's output half holds by construction.
+#[cfg(feature = "escrow")]
+struct SealPipelineOutput {
+    kid_hex: String,
+    segment: Vec<u8>,
+    payload_cid: String,
+    wrapped_cek_b64: String,
 }
 
 /// Minimal ISO-BMFF box: `size(u32 BE) ‖ type(4) ‖ content`.
@@ -1135,6 +1251,162 @@ mod tests {
             );
             // Sanity: the published session key the authority sealed to is the decrypt one.
             assert!(ddrm_envelope::session_public_from_bytes(&session_pub_bytes).is_some());
+        }
+    }
+
+    // --- production `seal` op (feature `escrow`, Day 69) -----------------------
+    //
+    // The non-inline `seal` op runs the FULL production pipeline on HANDED-IN bytes
+    // (mint -> CENC -> escrow -> content-address) and emits a complete, shared-contract
+    // `SealedObjectV1`. The capsule fetches nothing — it mirrors PC2's host handing
+    // segment bytes to the CENC WASM (`dashPackager.ts` readFileSync:504 ->
+    // executeCENCEncrypt(.., seg.data):432). Fail-closed unless bytes + recipient + the
+    // availability receipt + a viewer interface are all present.
+    #[cfg(feature = "escrow")]
+    mod production_seal {
+        use super::*;
+
+        fn inited_provider() -> EncryptProvider {
+            let mut p = EncryptProvider::default();
+            let _ = p.init(json!({}));
+            p
+        }
+
+        /// A published authority recipient (its KEM key) the producer escrows the CEK to.
+        fn recipient_b64() -> String {
+            let (_secret, public) = ddrm_envelope::mint_session();
+            base64::engine::general_purpose::STANDARD
+                .encode(ddrm_envelope::session_public_bytes(&public))
+        }
+
+        fn seal_request_full(content: &[u8], recipient_b64: &str) -> Value {
+            json!({
+                "op": "seal",
+                "request": {
+                    "schema": SEAL_REQUEST_SCHEMA,
+                    "plaintext_ref": "asset-handle-abc123",
+                    "content_b64": base64::engine::general_purpose::STANDARD.encode(content),
+                    "recipient_pub_b64": recipient_b64,
+                    "availability_receipt_cid": "bafyavailreceipt",
+                    "rights_policy_cid": "bafyrightspolicy",
+                    "scheme": "elastos-pq-hybrid-threshold-v0",
+                    "viewer": { "required_interface": "media" }
+                }
+            })
+        }
+
+        fn call(p: &mut EncryptProvider, v: Value) -> Response {
+            let req: Request = serde_json::from_value(v).expect("request parses");
+            p.handle(req)
+        }
+
+        /// Configured (bytes + recipient + receipt + viewer) -> the production `seal`
+        /// emits a COMPLETE `SealedObjectV1`: it round-trips into the shared type
+        /// (so `deny_unknown_fields` and the full shape hold), its algorithm suite is
+        /// accepted by the shared chain validator, its `payload_cid` is a real raw
+        /// CIDv1, and the envelope KID is the on-chain bytes16 contentId.
+        #[test]
+        fn configured_seal_emits_complete_sealed_object() {
+            let mut p = inited_provider();
+            let content = b"day69: full production seal on handed-in asset bytes".to_vec();
+            let resp = call(&mut p, seal_request_full(&content, &recipient_b64()));
+            let data = ok_data(resp);
+
+            // Parses back into the SHARED contract type (deny_unknown_fields + complete).
+            let sealed: SealedObjectV1 =
+                serde_json::from_value(data["sealed_object"].clone()).expect("SealedObjectV1");
+            assert_eq!(sealed.schema, SEALED_OBJECT_SCHEMA);
+            assert_eq!(sealed.rights_policy_cid, "bafyrightspolicy");
+            assert_eq!(sealed.availability_receipt_cid, "bafyavailreceipt");
+            assert_eq!(sealed.viewer.required_interface, "media");
+
+            // Real content address (Day 68 codec), distinct from the KID/contentId.
+            assert!(
+                sealed.payload_cid.starts_with("bafkrei"),
+                "payload_cid must be a raw CIDv1/sha256"
+            );
+            assert_ne!(
+                sealed.payload_cid, sealed.key_envelope.kid,
+                "payload CID and contentId(KID) are distinct identities"
+            );
+
+            // The producer's PQ-hybrid suite is accepted by the shared chain validator.
+            validate_protected_content_key_envelope_algorithms(&sealed.key_envelope.algorithms)
+                .expect("producer algorithm set must satisfy the shared chain validator");
+
+            // The envelope KID is the consumer chain's bytes16 contentId (lossless).
+            let content_id =
+                kid_to_content_id_bytes16(&sealed.key_envelope.kid).expect("kid -> bytes16");
+            assert_eq!(content_id.len(), 16);
+
+            // Containment: neither the plaintext nor a raw CEK appears in the output.
+            let wire = serde_json::to_string(&data).unwrap();
+            assert!(
+                !wire.contains(&base64::engine::general_purpose::STANDARD.encode(&content)),
+                "plaintext must never appear in the sealed output"
+            );
+            assert!(!wire.contains("\"cek\""), "no raw cek field");
+            assert!(!wire.contains("cek_b64"), "no cek_b64 field");
+            assert!(
+                !sealed.key_envelope.wrapped_cek.is_empty(),
+                "the CEK leaves only SEALED"
+            );
+        }
+
+        /// Two seals of the SAME bytes mint independent CEKs -> different `payload_cid`
+        /// (the segment carries a per-seal IV). Content-addressing reflects the exact
+        /// sealed bytes, not the plaintext identity.
+        #[test]
+        fn each_seal_freshly_mints_and_addresses() {
+            let mut p = inited_provider();
+            let content = b"same plaintext, two independent seals".to_vec();
+            let rcpt = recipient_b64();
+            let a: SealedObjectV1 = serde_json::from_value(
+                ok_data(call(&mut p, seal_request_full(&content, &rcpt)))["sealed_object"].clone(),
+            )
+            .unwrap();
+            let b: SealedObjectV1 = serde_json::from_value(
+                ok_data(call(&mut p, seal_request_full(&content, &rcpt)))["sealed_object"].clone(),
+            )
+            .unwrap();
+            assert_ne!(a.key_envelope.kid, b.key_envelope.kid, "fresh KID per seal");
+            assert_ne!(a.payload_cid, b.payload_cid, "fresh CEK/IV -> fresh sealed bytes");
+        }
+
+        /// Fail-closed matrix. `seal` must never emit a partial object:
+        ///   - no recipient -> not_configured (cannot escrow the CEK)
+        ///   - no content   -> not_configured (nothing handed in to seal)
+        ///   - no availability receipt / no viewer interface -> invalid_request
+        #[test]
+        fn seal_fails_closed_on_missing_inputs() {
+            let mut p = inited_provider();
+            let rcpt = recipient_b64();
+            let content = b"x".to_vec();
+
+            // Missing recipient.
+            let mut v = seal_request_full(&content, &rcpt);
+            v["request"].as_object_mut().unwrap().remove("recipient_pub_b64");
+            assert_eq!(error_code(call(&mut p, v)), "not_configured");
+
+            // Missing content bytes.
+            let mut v = seal_request_full(&content, &rcpt);
+            v["request"].as_object_mut().unwrap().remove("content_b64");
+            assert_eq!(error_code(call(&mut p, v)), "not_configured");
+
+            // Missing availability receipt.
+            let mut v = seal_request_full(&content, &rcpt);
+            v["request"].as_object_mut().unwrap().remove("availability_receipt_cid");
+            assert_eq!(error_code(call(&mut p, v)), "invalid_request");
+
+            // Empty viewer interface.
+            let mut v = seal_request_full(&content, &rcpt);
+            v["request"]["viewer"] = json!({ "required_interface": "" });
+            assert_eq!(error_code(call(&mut p, v)), "invalid_request");
+
+            // Empty content bytes (present but zero-length).
+            let mut v = seal_request_full(&content, &rcpt);
+            v["request"]["content_b64"] = json!("");
+            assert_eq!(error_code(call(&mut p, v)), "invalid_request");
         }
     }
 

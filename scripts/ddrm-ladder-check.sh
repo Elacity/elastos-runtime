@@ -36,7 +36,7 @@ rc=0
 # DDRM_STATUS.md / HANDOVER.md) when tests are intentionally added/removed.
 LADDER=(
   "encrypt-provider (default)|encrypt-provider||20"
-  "encrypt-provider escrow|encrypt-provider|escrow|22"
+  "encrypt-provider escrow|encrypt-provider|escrow|25"
   "drm-provider (default)|drm-provider||15"
   "publish-provider (default)|publish-provider||16"
   "content-market (default)|content-market||29"
