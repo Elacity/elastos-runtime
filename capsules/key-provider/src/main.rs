@@ -353,18 +353,47 @@ struct DkmsClientAuthority {
     caller_seed_b64: Option<String>,
 }
 
+/// NETWORK-FAULT SEMANTICS (Day 105–108): explicit, injected bounds on the TCP path — a connect
+/// that hangs (unroutable host, dropped SYN) and a read that stalls (node wedged mid-recover) each
+/// fail closed within a bounded window instead of hanging the release forever. The analogue of
+/// PC2's `httpsGet` timeout (`chipotle-client.ts:838`, 5000 ms default + `req.destroy()` on fire).
+#[cfg(all(feature = "key-authority-ref", unix))]
+const DKMS_TCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
+#[cfg(all(feature = "key-authority-ref", unix))]
+const DKMS_TCP_READ_TIMEOUT_MS: u64 = 5_000;
+
+/// The CLIENT side of an established encrypted channel (Day 105–108): after a network `hello`, every
+/// frame in BOTH directions is a sealed envelope — requests sealed to the node's ATTESTED channel
+/// KEM key (signed by this caller), responses sealed back to the client's ephemeral KEM key (signed
+/// by the node, verified under the descriptor-PINNED vk). The per-frame AAD binds
+/// `(channel_id, direction, seq)`, so frames are non-replayable + non-reflectable.
+#[cfg(all(feature = "key-authority-ref", unix))]
+struct ClientChannel {
+    channel_id: Vec<u8>,
+    node_channel_pub: ddrm_envelope::SessionKemPublic,
+    client_secret: ddrm_envelope::SessionKemSecret,
+    node_verifier: ddrm_envelope::MlDsa65Verifier,
+    send_seq: u64,
+    recv_seq: u64,
+}
+
 /// A LONG-LIVED connection to the external dKMS node plus the live handshake SESSION (Day 91–94).
-/// The client CONNECTS to the node's Unix-domain socket (it does NOT own the node's process), mints
-/// an EPHEMERAL keypair, `init`s + `hello`s ONCE (sending its public half), pins the node identity,
-/// and caches the node-signed session token; subsequent recovers reuse this connection + token (and
-/// SIGN each recover under the ephemeral private key) until the session expires. The wire is
-/// length-prefixed frames. The master never crosses into this process — only the public handshake +
-/// sealed results.
+/// The client CONNECTS to the node's granted endpoint — a Unix-domain socket path, or `tcp:HOST:PORT`
+/// for a node taken OFF localhost (Day 105–108) — it does NOT own the node's process. It mints an
+/// EPHEMERAL keypair, `init`s + `hello`s ONCE (sending its public half), pins the node identity, and
+/// caches the node-signed session token; subsequent recovers reuse this connection + token (and SIGN
+/// each recover under the ephemeral private key) until the session expires. The wire is
+/// length-prefixed frames; on TCP every post-hello frame is additionally SEALED on the encrypted
+/// channel. The master never crosses into this process — only the public handshake + sealed results.
 #[cfg(all(feature = "key-authority-ref", unix))]
 struct DkmsNodeConn {
-    /// The framed Unix-domain socket to the node (write half; a buffered read half is cloned).
-    stream: std::os::unix::net::UnixStream,
-    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// The framed transport to the node (write half + a buffered read half) — Unix or TCP behind
+    /// one seam; the protocol above it is byte-identical.
+    writer: Box<dyn std::io::Write>,
+    reader: Box<dyn std::io::Read>,
+    /// The ESTABLISHED encrypted channel (Day 105–108) — `Some` on the network transport (required
+    /// there: a TCP node refuses plaintext recovers), `None` on the host-local Unix socket.
+    channel: Option<ClientChannel>,
     /// The caller's EPHEMERAL signer — its public half is bound into the session token; we sign every
     /// recover with it so a captured token replayed by a different caller (no key) is refused.
     caller_signer: ddrm_envelope::seal::MlDsaSealSigner,
@@ -381,16 +410,45 @@ struct DkmsNodeConn {
 #[cfg(all(feature = "key-authority-ref", unix))]
 impl DkmsNodeConn {
     /// One framed request out, one framed response in (the node's length-prefixed socket protocol).
+    /// On an established channel both legs are SEALED: the request to the node's attested channel
+    /// key under this caller's signature, the response opened with the client's ephemeral secret and
+    /// verified under the PINNED node identity — a tampered, replayed, or plaintext-downgraded
+    /// response fails closed here (the AEAD/signature, not a heuristic, is the gate).
     fn call(&mut self, req: &Value) -> Result<Value, String> {
         let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-        ddrm_envelope::frame::write_frame(&mut self.stream, &payload)
+        let wire = match self.channel.as_mut() {
+            None => payload,
+            Some(ch) => {
+                ch.send_seq += 1;
+                let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
+                ddrm_envelope::seal::seal_bound(&ch.node_channel_pub, &payload, &aad, &self.caller_signer)
+                    .to_bytes()
+            }
+        };
+        ddrm_envelope::frame::write_frame(&mut self.writer, &wire)
             .map_err(|e| format!("write to dkms node: {e}"))?;
-        match ddrm_envelope::frame::read_frame(&mut self.reader) {
-            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
-                .map_err(|e| format!("dkms node sent non-JSON: {e}")),
-            Ok(None) => Err("dkms node closed its connection unexpectedly".to_string()),
-            Err(e) => Err(format!("read from dkms node: {e}")),
-        }
+        let bytes = match ddrm_envelope::frame::read_frame(&mut self.reader) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err("dkms node closed its connection unexpectedly".to_string()),
+            Err(e) => return Err(format!("read from dkms node: {e}")),
+        };
+        let plain = match self.channel.as_mut() {
+            None => bytes,
+            Some(ch) => {
+                let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&bytes).map_err(|_| {
+                    "dkms node sent a non-sealed frame on the encrypted channel (downgrade refused)"
+                        .to_string()
+                })?;
+                ch.recv_seq += 1;
+                let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.recv_seq);
+                ddrm_envelope::hybrid_unwrap_bound(&ch.client_secret, &env, &aad, &ch.node_verifier)
+                    .map_err(|_| {
+                        "dkms node response failed to authenticate on the encrypted channel".to_string()
+                    })?
+                    .to_vec()
+            }
+        };
+        serde_json::from_slice::<Value>(&plain).map_err(|e| format!("dkms node sent non-JSON: {e}"))
     }
 
     /// Reserve the next per-recover FRESHNESS counter for this connection (strictly increasing).
@@ -472,13 +530,43 @@ fn establish_dkms_session(
     use std::os::unix::net::UnixStream;
     let b64 = base64::engine::general_purpose::STANDARD;
 
-    // CONNECT to the node's granted endpoint (its listening Unix-domain socket). We do NOT spawn or
-    // own the node's process — a real remote authority is reached over a transport, not a child pipe.
-    let stream = UnixStream::connect(&client.endpoint)
-        .map_err(|e| format!("dkms authority node ({}) is unreachable: {e}", client.endpoint))?;
-    let reader = std::io::BufReader::new(
-        stream.try_clone().map_err(|e| format!("dkms socket clone failed: {e}"))?,
-    );
+    // CONNECT to the node's granted endpoint. We do NOT spawn or own the node's process — a real
+    // remote authority is reached over a transport, not a child pipe. `tcp:HOST:PORT` is a node
+    // taken OFF localhost (Day 105–108): connect under an explicit timeout, bound every read, and
+    // REQUIRE the encrypted channel before any recover travels. Anything else is a host-local
+    // Unix-domain socket path (the default).
+    let (writer, reader, network): (Box<dyn std::io::Write>, Box<dyn std::io::Read>, bool) =
+        if let Some(addr) = client.endpoint.strip_prefix("tcp:") {
+            use std::net::{TcpStream, ToSocketAddrs};
+            let resolved = addr
+                .to_socket_addrs()
+                .map_err(|e| format!("dkms authority endpoint tcp:{addr} does not resolve: {e}"))?
+                .next()
+                .ok_or_else(|| format!("dkms authority endpoint tcp:{addr} resolves to nothing"))?;
+            let stream = TcpStream::connect_timeout(
+                &resolved,
+                std::time::Duration::from_millis(DKMS_TCP_CONNECT_TIMEOUT_MS),
+            )
+            .map_err(|e| format!("dkms authority node (tcp:{addr}) is unreachable: {e}"))?;
+            // NETWORK-FAULT SEMANTICS: a node that stalls mid-recover (or a dropped connection that
+            // never delivers a frame) fails the read within a bounded window — fail-closed with no
+            // partial material, never a hung release.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(DKMS_TCP_READ_TIMEOUT_MS)))
+                .map_err(|e| format!("dkms tcp read timeout could not be set: {e}"))?;
+            let reader = std::io::BufReader::new(
+                stream.try_clone().map_err(|e| format!("dkms tcp clone failed: {e}"))?,
+            );
+            (Box::new(stream), Box::new(reader), true)
+        } else {
+            let stream = UnixStream::connect(&client.endpoint).map_err(|e| {
+                format!("dkms authority node ({}) is unreachable: {e}", client.endpoint)
+            })?;
+            let reader = std::io::BufReader::new(
+                stream.try_clone().map_err(|e| format!("dkms socket clone failed: {e}"))?,
+            );
+            (Box::new(stream), Box::new(reader), false)
+        };
     // The caller identity whose public half binds the session token + signs every recover. When the
     // runtime was provisioned with its OWN stable caller seed (Day 95–96), derive a KNOWN identity
     // from it so the node's allow-list recognizes us; otherwise mint an EPHEMERAL keypair (anonymous,
@@ -499,8 +587,9 @@ fn establish_dkms_session(
     };
     let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
     let mut conn = DkmsNodeConn {
-        stream,
+        writer,
         reader,
+        channel: None,
         caller_signer,
         session_token: Value::Null,
         expires_at: 0,
@@ -519,14 +608,21 @@ fn establish_dkms_session(
 
     // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything, send
     // our ephemeral pubkey so the token is bound to a key only WE hold, and capture the node-signed
-    // SESSION TOKEN that will gate every recover over this connection.
+    // SESSION TOKEN that will gate every recover over this connection. On the NETWORK transport, ALSO
+    // offer our ephemeral channel KEM key — the hello establishes the encrypted channel.
+    let channel_keys = if network { Some(ddrm_envelope::mint_session()) } else { None };
     let challenge = ddrm_envelope::random_seed();
-    let hello = conn.call(&json!({
+    let mut hello_req = json!({
         "op": "hello",
         "challenge_b64": b64.encode(challenge),
         "caller_pub_b64": b64.encode(&caller_vk),
         "now_unix": now,
-    }))?;
+    });
+    if let Some((_, client_pub)) = channel_keys.as_ref() {
+        hello_req["channel_pub_b64"] =
+            json!(b64.encode(ddrm_envelope::session_public_bytes(client_pub)));
+    }
+    let hello = conn.call(&hello_req)?;
     if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Err(format!(
             "dkms node hello failed: {}",
@@ -537,6 +633,34 @@ fn establish_dkms_session(
     let node_vk_b64 = data.get("verifying_key_b64").and_then(|v| v.as_str()).unwrap_or("");
     let attestation_b64 = data.get("attestation_b64").and_then(|v| v.as_str()).unwrap_or("");
     verify_hello_attestation(&client.verifying_key_b64, node_vk_b64, &challenge, attestation_b64)?;
+
+    // ESTABLISH the encrypted channel (network only): the node's channel KEM key must arrive
+    // ATTESTED under the descriptor-PINNED identity — an attacker terminating the TCP connection
+    // can relay the genuine hello but cannot attest its OWN KEM key, so a wrong-key channel fails
+    // here, fail-closed, before anything is delegated. A missing channel block on a network
+    // transport is equally fatal (no channel, no recover).
+    if let Some((client_secret, _client_pub)) = channel_keys {
+        let node_channel_pub_bytes = resolve_node_channel_key(
+            &client.verifying_key_b64,
+            &challenge,
+            data.get("channel"),
+        )?;
+        let node_channel_pub = ddrm_envelope::session_public_from_bytes(&node_channel_pub_bytes)
+            .ok_or("dkms node published a malformed channel KEM key")?;
+        let pinned = b64
+            .decode(&client.verifying_key_b64)
+            .map_err(|e| format!("pinned dkms verifying key is not base64: {e}"))?;
+        let node_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
+            .ok_or("pinned dkms verifying key is malformed")?;
+        conn.channel = Some(ClientChannel {
+            channel_id: challenge.to_vec(),
+            node_channel_pub,
+            client_secret,
+            node_verifier,
+            send_seq: 0,
+            recv_seq: 0,
+        });
+    }
 
     let token = data
         .get("session_token")
@@ -549,6 +673,42 @@ fn establish_dkms_session(
     conn.session_token = token;
     conn.expires_at = expires_at;
     Ok(conn)
+}
+
+/// Resolve + VERIFY the node's channel KEM key from a hello response's `channel` block (Day 105–108):
+/// the key must be present, well-formed, and its attestation must verify over `(challenge, key)`
+/// under the descriptor-PINNED node identity. Returns the raw key bytes. Pure (no I/O) so the
+/// fail-closed edges — missing block, malformed fields, and above all a SUBSTITUTED key under a
+/// relayed attestation (the MITM case) — are unit-testable without a socket.
+#[cfg(feature = "key-authority-ref")]
+fn resolve_node_channel_key(
+    pinned_vk_b64: &str,
+    challenge: &[u8],
+    channel: Option<&Value>,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let channel = channel.ok_or(
+        "dkms node hello established no encrypted channel — a network transport requires one (no channel, no recover)",
+    )?;
+    let node_channel_pub = b64
+        .decode(channel.get("node_channel_pub_b64").and_then(|v| v.as_str()).unwrap_or(""))
+        .map_err(|_| "dkms node channel key is not valid base64".to_string())?;
+    let sig = b64
+        .decode(channel.get("channel_sig_b64").and_then(|v| v.as_str()).unwrap_or(""))
+        .map_err(|_| "dkms node channel attestation is not valid base64".to_string())?;
+    let pinned = b64
+        .decode(pinned_vk_b64)
+        .map_err(|e| format!("pinned dkms verifying key is not base64: {e}"))?;
+    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
+        .ok_or("pinned dkms verifying key is malformed")?;
+    if !ddrm_envelope::verify_channel_key(&verifier, challenge, &node_channel_pub, &sig) {
+        return Err(
+            "dkms node channel key failed to verify under the pinned identity — refusing the channel (possible MITM termination)"
+                .to_string(),
+        );
+    }
+    Ok(node_channel_pub)
 }
 
 impl KeyProvider {
@@ -2474,6 +2634,48 @@ mod tests {
             // A malformed/empty attestation → rejected (no panic).
             assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "!!!not-base64").is_err());
             assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "").is_err());
+        }
+
+        /// ENCRYPTED CHANNEL (Day 105–108), client side: the node's channel KEM key is accepted ONLY
+        /// when its attestation verifies over `(challenge, key)` under the descriptor-PINNED node
+        /// identity — a MISSING channel block (a network hello must establish one), a SUBSTITUTED key
+        /// under a relayed attestation (the attacker terminating the TCP connection), and a replayed
+        /// challenge all fail closed BEFORE anything is delegated.
+        #[test]
+        fn node_channel_key_resolution_fails_closed_on_missing_or_substituted_keys() {
+            let (node_signer, node_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x66u8; 32]);
+            let pinned = b64().encode(&node_vk);
+            let challenge = [0x24u8; 32];
+            let (_secret, channel_pub) = ddrm_envelope::mint_session();
+            let channel_pub_bytes = ddrm_envelope::session_public_bytes(&channel_pub);
+            let sig = ddrm_envelope::attest_channel_key(&node_signer, &challenge, &channel_pub_bytes);
+            let block = |key: &[u8], sig: &[u8]| {
+                json!({
+                    "node_channel_pub_b64": b64().encode(key),
+                    "channel_sig_b64": b64().encode(sig),
+                })
+            };
+
+            // The genuine attested key resolves to its raw bytes.
+            let genuine = block(&channel_pub_bytes, &sig);
+            assert_eq!(
+                resolve_node_channel_key(&pinned, &challenge, Some(&genuine)).expect("genuine channel"),
+                channel_pub_bytes
+            );
+            // NO channel block on a network hello → fail closed (no channel, no recover).
+            assert!(resolve_node_channel_key(&pinned, &challenge, None).is_err());
+            // A SUBSTITUTED key under the relayed (genuine) attestation → fail closed (the MITM case).
+            let (_mitm_secret, mitm_pub) = ddrm_envelope::mint_session();
+            let mitm = block(&ddrm_envelope::session_public_bytes(&mitm_pub), &sig);
+            assert!(resolve_node_channel_key(&pinned, &challenge, Some(&mitm)).is_err());
+            // A replayed challenge → fail closed (the attestation is handshake-bound).
+            assert!(resolve_node_channel_key(&pinned, &[0x25u8; 32], Some(&genuine)).is_err());
+            // An attestation from a DIFFERENT node identity → fail closed under the pinned vk.
+            let (other_signer, _other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x67u8; 32]);
+            let other_sig =
+                ddrm_envelope::attest_channel_key(&other_signer, &challenge, &channel_pub_bytes);
+            let impostor = block(&channel_pub_bytes, &other_sig);
+            assert!(resolve_node_channel_key(&pinned, &challenge, Some(&impostor)).is_err());
         }
 
         /// The open-once/verify-once/REUSE decision: a cached session is reused only while it is

@@ -181,38 +181,165 @@ impl Capsule {
     }
 }
 
-/// A FRAMED client to the dKMS node's listening Unix-domain socket (Day 93–94) — the transport the
-/// real `key-provider` uses. Length-prefixed request/response; the probe connects to the running
-/// daemon rather than spawning a child, exercising the SAME wire as production.
+/// The probe's side of an ESTABLISHED encrypted channel to a network dKMS node (Day 105–108):
+/// requests sealed to the node's ATTESTED channel KEM key under the probe's caller identity,
+/// responses opened with the probe's ephemeral secret and verified under the PINNED node identity —
+/// the SAME channel discipline the production `key-provider` client enforces.
+struct ProbeChannel {
+    channel_id: Vec<u8>,
+    node_pub: ddrm_envelope::SessionKemPublic,
+    secret: ddrm_envelope::SessionKemSecret,
+    node_verifier: ddrm_envelope::MlDsa65Verifier,
+    signer: ddrm_envelope::seal::MlDsaSealSigner,
+    send_seq: u64,
+    recv_seq: u64,
+}
+
+/// A FRAMED client to the dKMS node's listening endpoint (Day 93–94) — the transport the real
+/// `key-provider` uses: a Unix-domain socket path, or `tcp:HOST:PORT` for a node off localhost
+/// (Day 105–108). Length-prefixed request/response; the probe connects to the running daemon rather
+/// than spawning a child, exercising the SAME wire as production. On TCP, `establish_channel`
+/// upgrades the connection to sealed frames (REQUIRED there for any recover).
 struct NodeSocket {
-    stream: std::os::unix::net::UnixStream,
-    reader: BufReader<std::os::unix::net::UnixStream>,
+    writer: Box<dyn Write>,
+    reader: Box<dyn std::io::Read>,
+    channel: Option<ProbeChannel>,
 }
 
 impl NodeSocket {
-    fn connect(path: &str) -> Result<Self, String> {
-        let stream = std::os::unix::net::UnixStream::connect(path)
-            .map_err(|e| format!("connect dkms socket {path}: {e}"))?;
-        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        Ok(Self { stream, reader })
+    fn connect(endpoint: &str) -> Result<Self, String> {
+        let (writer, reader): (Box<dyn Write>, Box<dyn std::io::Read>) =
+            match endpoint.strip_prefix("tcp:") {
+                Some(addr) => {
+                    let stream = std::net::TcpStream::connect(addr)
+                        .map_err(|e| format!("connect dkms tcp endpoint {addr}: {e}"))?;
+                    let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+                    (Box::new(stream), Box::new(reader))
+                }
+                None => {
+                    let stream = std::os::unix::net::UnixStream::connect(endpoint)
+                        .map_err(|e| format!("connect dkms socket {endpoint}: {e}"))?;
+                    let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+                    (Box::new(stream), Box::new(reader))
+                }
+            };
+        Ok(Self { writer, reader, channel: None })
     }
 
-    /// One framed request, one framed response.
+    /// One framed request, one framed response — sealed in both directions once a channel is
+    /// established (a tampered/plaintext-downgraded response fails the open here, fail-closed).
     fn call(&mut self, req: &Value) -> Result<Value, String> {
         let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
-        ddrm_envelope::frame::write_frame(&mut self.stream, &payload)
+        let wire = match self.channel.as_mut() {
+            None => payload,
+            Some(ch) => {
+                ch.send_seq += 1;
+                let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
+                ddrm_envelope::seal::seal_bound(&ch.node_pub, &payload, &aad, &ch.signer).to_bytes()
+            }
+        };
+        ddrm_envelope::frame::write_frame(&mut self.writer, &wire)
             .map_err(|e| format!("write framed request: {e}"))?;
-        match ddrm_envelope::frame::read_frame(&mut self.reader) {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes).map_err(|e| format!("non-JSON frame: {e}")),
-            Ok(None) => Err("dkms node closed the connection".to_string()),
-            Err(e) => Err(format!("read framed response: {e}")),
+        let bytes = match ddrm_envelope::frame::read_frame(&mut self.reader) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err("dkms node closed the connection".to_string()),
+            Err(e) => return Err(format!("read framed response: {e}")),
+        };
+        let plain = match self.channel.as_mut() {
+            None => bytes,
+            Some(ch) => {
+                let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&bytes)
+                    .map_err(|_| "node sent a non-sealed frame on the channel".to_string())?;
+                ch.recv_seq += 1;
+                let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.recv_seq);
+                ddrm_envelope::hybrid_unwrap_bound(&ch.secret, &env, &aad, &ch.node_verifier)
+                    .map_err(|_| "node response failed to authenticate on the channel".to_string())?
+                    .to_vec()
+            }
+        };
+        serde_json::from_slice(&plain).map_err(|e| format!("non-JSON frame: {e}"))
+    }
+
+    /// ESTABLISH the encrypted channel over this connection: drive a `hello` that offers a fresh
+    /// client channel KEM key, verify the node's attestation + its CHANNEL-KEY attestation under the
+    /// PINNED vk (a substituted key fails closed), and switch the connection to sealed frames.
+    /// Returns the hello response data (token etc.) for the caller's own assertions.
+    fn establish_channel(
+        &mut self,
+        pinned_vk_b64: &str,
+        caller_seed: [u8; 32],
+        challenge: [u8; 32],
+        now_unix: u64,
+    ) -> Result<Value, String> {
+        let (signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+        let (secret, client_pub) = ddrm_envelope::mint_session();
+        let hello = self.call(&json!({
+            "op": "hello",
+            "challenge_b64": B64.encode(challenge),
+            "caller_pub_b64": B64.encode(&caller_vk),
+            "now_unix": now_unix,
+            "channel_pub_b64": B64.encode(ddrm_envelope::session_public_bytes(&client_pub)),
+        }))?;
+        let data = ok_data(&hello, "dkms hello (channel establishment)")?;
+        let pinned = B64.decode(pinned_vk_b64).map_err(|e| e.to_string())?;
+        let node_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
+            .ok_or("pinned dkms vk is malformed")?;
+        let attestation = B64
+            .decode(data["attestation_b64"].as_str().unwrap_or(""))
+            .map_err(|e| format!("node attestation is not base64: {e}"))?;
+        if !ddrm_envelope::verify_attestation(&node_verifier, &challenge, &attestation) {
+            return Err("node identity attestation failed under the pinned vk".to_string());
         }
+        let node_channel_pub = B64
+            .decode(data["channel"]["node_channel_pub_b64"].as_str().unwrap_or(""))
+            .map_err(|_| "node returned no/invalid channel key".to_string())?;
+        let channel_sig = B64
+            .decode(data["channel"]["channel_sig_b64"].as_str().unwrap_or(""))
+            .map_err(|_| "node returned no/invalid channel attestation".to_string())?;
+        if !ddrm_envelope::verify_channel_key(&node_verifier, &challenge, &node_channel_pub, &channel_sig) {
+            return Err("node channel key failed to verify under the pinned identity".to_string());
+        }
+        let node_pub = ddrm_envelope::session_public_from_bytes(&node_channel_pub)
+            .ok_or("node channel key is malformed")?;
+        self.channel = Some(ProbeChannel {
+            channel_id: challenge.to_vec(),
+            node_pub,
+            secret,
+            node_verifier,
+            signer,
+            send_seq: 0,
+            recv_seq: 0,
+        });
+        Ok(data)
+    }
+
+    /// ADVERSARIAL: write one RAW frame (bypassing the channel sealing) and try to read a response.
+    /// Used by the downgrade/tamper gates — a fail-closed node DROPS the connection (`Ok(None)`/err).
+    fn raw_round_trip(&mut self, frame: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        ddrm_envelope::frame::write_frame(&mut self.writer, frame)
+            .map_err(|e| format!("write raw frame: {e}"))?;
+        ddrm_envelope::frame::read_frame(&mut self.reader).map_err(|e| format!("read raw: {e}"))
+    }
+
+    /// ADVERSARIAL: seal `req` correctly for the established channel, then FLIP one ciphertext byte
+    /// before framing — the MITM-tamper shape. Returns the raw wire bytes to send.
+    fn tampered_sealed_frame(&mut self, req: &Value) -> Result<Vec<u8>, String> {
+        let ch = self.channel.as_mut().ok_or("tamper gate needs an established channel")?;
+        let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        ch.send_seq += 1;
+        let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
+        let mut wire =
+            ddrm_envelope::seal::seal_bound(&ch.node_pub, &payload, &aad, &ch.signer).to_bytes();
+        let last = wire.len() - 1;
+        wire[last] ^= 0x01;
+        Ok(wire)
     }
 }
 
 /// A running dKMS NODE DAEMON: the node binary launched in LISTEN mode, bound to a Unix-domain
-/// socket. The runtime CONNECTS to it (it does not own the process the way it owns a child pipe), and
-/// this guard KILLS + reaps it on drop so the smoke leaves no orphan. The real-remote-authority shape.
+/// socket OR a TCP address (Day 105–108). The runtime CONNECTS to it (it does not own the process
+/// the way it owns a child pipe), and this guard KILLS + reaps it on drop so the smoke leaves no
+/// orphan. The real-remote-authority shape.
 struct DaemonGuard {
     child: Child,
     sock: String,
@@ -222,21 +349,48 @@ impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.sock);
+        // Only a Unix endpoint leaves a filesystem artifact to clean up.
+        if !self.sock.starts_with("tcp:") {
+            let _ = std::fs::remove_file(&self.sock);
+        }
     }
 }
 
-/// Start the dKMS node DAEMON listening on `sock` with its node-local master store + its KNOWN-caller
-/// allow-list (Day 95–96: the OPERATOR provisions the comma-separated b64 verifying keys the node
-/// will serve; an unknown caller's `hello` is refused), and wait for the socket to appear
-/// (fail-closed if it never binds). The daemon serves many sequential connections.
+/// Pick a fresh loopback TCP endpoint for a node daemon: bind port 0 (the OS assigns a free port),
+/// read it back, release it. (The tiny bind race against the daemon is acceptable for a smoke.)
+fn pick_tcp_endpoint() -> Result<String, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("pick tcp endpoint: {e}"))?;
+    let port = listener.local_addr().map_err(|e| format!("read picked port: {e}"))?.port();
+    drop(listener);
+    Ok(format!("tcp:127.0.0.1:{port}"))
+}
+
+/// Can `endpoint` (a Unix path or `tcp:HOST:PORT`) be connected to right now?
+fn endpoint_accepts(endpoint: &str) -> bool {
+    match endpoint.strip_prefix("tcp:") {
+        Some(addr) => std::net::TcpStream::connect(addr).is_ok(),
+        None => {
+            std::path::Path::new(endpoint).exists()
+                && std::os::unix::net::UnixStream::connect(endpoint).is_ok()
+        }
+    }
+}
+
+/// Start the dKMS node DAEMON listening on `sock` (a Unix path or a `tcp:HOST:PORT` endpoint) with
+/// its node-local master store + its KNOWN-caller allow-list (Day 95–96: the OPERATOR provisions the
+/// comma-separated b64 verifying keys the node will serve; an unknown caller's `hello` is refused),
+/// and wait for the listener to ACCEPT (fail-closed if it never binds). The daemon serves many
+/// sequential connections.
 fn start_dkms_daemon(
     node_bin: &str,
     sock: &str,
     node_store_path: &str,
     allowed_callers: &str,
 ) -> Result<DaemonGuard, String> {
-    let _ = std::fs::remove_file(sock);
+    if !sock.starts_with("tcp:") {
+        let _ = std::fs::remove_file(sock);
+    }
     let child = Command::new(node_bin)
         .env("DKMS_AUTHORITY_LISTEN", sock)
         .env("DKMS_AUTHORITY_KEY_STORE", node_store_path)
@@ -248,11 +402,9 @@ fn start_dkms_daemon(
         .map_err(|e| format!("spawn dkms daemon ({node_bin}): {e}"))?;
     let guard = DaemonGuard { child, sock: sock.to_string() };
     for _ in 0..400 {
-        if std::path::Path::new(sock).exists() {
-            // Confirm it actually ACCEPTS (bound + listening), not just that the file exists.
-            if std::os::unix::net::UnixStream::connect(sock).is_ok() {
-                return Ok(guard);
-            }
+        // Confirm it actually ACCEPTS (bound + listening), whichever transport.
+        if endpoint_accepts(sock) {
+            return Ok(guard);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -934,17 +1086,24 @@ fn dkms_node_adversarial_probe(
     }
 
     // (a) IDENTITY HANDSHAKE — the node proves possession of the master-derived signing key AND
-    // mints a node-signed SESSION TOKEN bound to this challenge + the probe's pubkey + a bounded expiry.
+    // mints a node-signed SESSION TOKEN bound to this challenge + the probe's pubkey + a bounded
+    // expiry. On the TCP transport (Day 105–108) this hello ALSO establishes the encrypted channel
+    // (the node refuses plaintext recovers there), verifying the node's ATTESTED channel key under
+    // the pinned identity — every subsequent probe call then travels sealed, like production.
     let challenge = ddrm_envelope::random_seed();
-    let hello = ok_data(
-        &node.call(&json!({
-            "op": "hello",
-            "challenge_b64": B64.encode(challenge),
-            "caller_pub_b64": B64.encode(&caller_vk),
-            "now_unix": NOW_UNIX,
-        }))?,
-        "dkms-authority hello (probe)",
-    )?;
+    let hello = if sock_path.starts_with("tcp:") {
+        node.establish_channel(pinned_vk_b64, caller_seed, challenge, NOW_UNIX)?
+    } else {
+        ok_data(
+            &node.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": B64.encode(&caller_vk),
+                "now_unix": NOW_UNIX,
+            }))?,
+            "dkms-authority hello (probe)",
+        )?
+    };
     if hello["verifying_key_b64"].as_str() != Some(pinned_vk_b64) {
         return Err("dkms node hello advertised a vk that does not match the pinned descriptor".to_string());
     }
@@ -1123,18 +1282,17 @@ fn dkms_node_adversarial_probe(
     Ok(())
 }
 
-/// Prove the daemon's framed transport fails closed: a torn frame and an oversized frame each get an
-/// `invalid_frame` refusal (or a dropped connection) WITHOUT wedging the daemon — a fresh connection
-/// afterwards still does a clean init/hello round-trip.
-fn dkms_malformed_frame_is_refused(sock_path: &str, caller_seed: [u8; 32]) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::net::UnixStream;
-
+/// Drive a torn + an oversized frame at the daemon over RAW connections of any stream type and
+/// assert each is refused (an error frame or a dropped connection — both fail-closed).
+fn raw_malformed_frames<S: std::io::Read + std::io::Write>(
+    connect: impl Fn() -> Result<S, String>,
+    shutdown_write: impl Fn(&S) -> Result<(), String>,
+) -> Result<(), String> {
     // Torn frame: a header promising 64 bytes followed by only 3, then half-close the write side.
-    let mut torn = UnixStream::connect(sock_path).map_err(|e| e.to_string())?;
+    let mut torn = connect()?;
     torn.write_all(&64u32.to_be_bytes()).map_err(|e| e.to_string())?;
     torn.write_all(b"abc").map_err(|e| e.to_string())?;
-    torn.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+    shutdown_write(&torn)?;
     let mut torn_reader = BufReader::new(torn);
     // Either an explicit error frame, or a dropped connection — both are fail-closed.
     if let Ok(Some(bytes)) = ddrm_envelope::frame::read_frame(&mut torn_reader) {
@@ -1145,16 +1303,33 @@ fn dkms_malformed_frame_is_refused(sock_path: &str, caller_seed: [u8; 32]) -> Re
     }
 
     // Oversized frame: a length header beyond MAX_FRAME_BYTES must be refused before allocating.
-    let mut huge = UnixStream::connect(sock_path).map_err(|e| e.to_string())?;
+    let mut huge = connect()?;
     let over = ddrm_envelope::frame::MAX_FRAME_BYTES + 1;
     huge.write_all(&over.to_be_bytes()).map_err(|e| e.to_string())?;
-    huge.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+    shutdown_write(&huge)?;
     let mut huge_reader = BufReader::new(huge);
     if let Ok(Some(bytes)) = ddrm_envelope::frame::read_frame(&mut huge_reader) {
         let resp: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         if resp["status"].as_str() == Some("ok") {
             return Err("the daemon accepted an oversized frame — framing is not fail-closed".to_string());
         }
+    }
+    Ok(())
+}
+
+/// Prove the daemon's framed transport fails closed: a torn frame and an oversized frame each get an
+/// `invalid_frame` refusal (or a dropped connection) WITHOUT wedging the daemon — a fresh connection
+/// afterwards still does a clean init/hello round-trip. Transport-generic (Unix path or `tcp:`).
+fn dkms_malformed_frame_is_refused(sock_path: &str, caller_seed: [u8; 32]) -> Result<(), String> {
+    match sock_path.strip_prefix("tcp:") {
+        Some(addr) => raw_malformed_frames(
+            || std::net::TcpStream::connect(addr).map_err(|e| e.to_string()),
+            |s| s.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string()),
+        )?,
+        None => raw_malformed_frames(
+            || std::os::unix::net::UnixStream::connect(sock_path).map_err(|e| e.to_string()),
+            |s| s.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string()),
+        )?,
     }
 
     // The daemon is NOT wedged: a fresh connection still completes a clean init/hello round-trip as
@@ -1171,6 +1346,145 @@ fn dkms_malformed_frame_is_refused(sock_path: &str, caller_seed: [u8; 32]) -> Re
         }))?,
         "post-malformed hello",
     )?;
+    Ok(())
+}
+
+/// NETWORK-CHANNEL adversarial gates (Day 105–108, verify mode, `tcp` transport only): prove, against
+/// the LIVE node daemon over its REAL TCP listener, that the hostile-network edges fail closed:
+/// **(28)** a PLAINTEXT recover with NO channel is refused (`channel_required`) — the network never
+/// carries an unencrypted recover; **(29)** a connection that DOWNGRADES to plaintext after the
+/// channel is established is dropped without service (and the daemon is not wedged); **(30)** a
+/// MITM-TAMPERED sealed frame (one ciphertext byte flipped) is dropped without service; **(31)** a
+/// WRONG-NODE channel KEM key (an attacker terminating the TCP connection and substituting its own
+/// key under the relayed attestation) fails verification under the descriptor-PINNED identity, so
+/// the client refuses the channel before delegating anything. PC2 has no analogue of any of these:
+/// its dDRM network boundary is HTTPS with `rejectUnauthorized: false` (`chipotle-client.ts:840`) —
+/// the channel authenticates nothing and tampering is only caught (for provisioning) by the payload
+/// signature (`chipotle-client.ts:737`–`:795`), never for the decrypt path.
+fn dkms_tcp_channel_adversarial_gates(
+    endpoint: &str,
+    pinned_vk_b64: &str,
+    caller_seed: [u8; 32],
+) -> Result<(), String> {
+    let (_caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+
+    // --- (28) PLAINTEXT RECOVER, NO CHANNEL → refused at the transport gate. The recover body is
+    // well-formed (it parses), so the refusal is provably the channel gate, not a parse error.
+    let mut plain = NodeSocket::connect(endpoint)?;
+    ok_data(&plain.call(&json!({ "op": "init", "config": {} }))?, "tcp plaintext init")?;
+    ok_data(
+        &plain.call(&json!({
+            "op": "hello",
+            "challenge_b64": B64.encode(ddrm_envelope::random_seed()),
+            "caller_pub_b64": B64.encode(&caller_vk),
+            "now_unix": NOW_UNIX,
+        }))?,
+        "tcp plaintext hello (no channel offered)",
+    )?;
+    let refused = plain.call(&json!({
+        "op": "recover",
+        "wrapped_cek_b64": "AAAA", "scheme": SUITE_PQ_HYBRID,
+        "kid_hex": "00", "producer_vk_b64": "AAAA", "decrypt_session_pub_b64": "AAAA",
+        "ciphertext_b64": "AAAA", "content_hash_b64": "AAAA", "nonce_b64": "AAAA",
+        "rights_receipt": probe_receipt(true, "bafContent", "did:key:zViewer", "view"),
+        "content_id": "bafContent", "principal_id": "did:key:zViewer",
+        "session_id": "probe-session", "right": "view",
+        "session_token": { "challenge_b64": "AAAA", "caller_pub_b64": "AAAA", "expires_at": 1, "sig_b64": "AAAA" },
+        "caller_sig_b64": "AAAA", "recover_seq": 1, "now_unix": NOW_UNIX,
+    }))?;
+    if refused["code"].as_str() != Some("channel_required") {
+        return Err(format!(
+            "a PLAINTEXT recover over TCP must be refused with channel_required, got: {refused}"
+        ));
+    }
+    drop(plain);
+    step(28, "dkms node over TCP: a PLAINTEXT recover (no encrypted channel) is refused at the transport gate (`channel_required`) — the hostile network never carries an unencrypted recover");
+
+    // --- (29) PLAINTEXT DOWNGRADE after establishment → the connection is dropped without service.
+    let mut down = NodeSocket::connect(endpoint)?;
+    ok_data(&down.call(&json!({ "op": "init", "config": {} }))?, "downgrade init")?;
+    down.establish_channel(pinned_vk_b64, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX)?;
+    let plaintext_status = serde_json::to_vec(&json!({ "op": "status" })).map_err(|e| e.to_string())?;
+    match down.raw_round_trip(&plaintext_status) {
+        Ok(None) | Err(_) => {} // dropped — fail-closed
+        Ok(Some(bytes)) => {
+            return Err(format!(
+                "the node answered a PLAINTEXT frame on an established channel (downgrade served): {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        }
+    }
+    drop(down);
+    // The daemon is NOT wedged: a fresh, honest channel still serves.
+    let mut after_down = NodeSocket::connect(endpoint)?;
+    ok_data(&after_down.call(&json!({ "op": "init", "config": {} }))?, "post-downgrade init")?;
+    after_down.establish_channel(pinned_vk_b64, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX)?;
+    ok_data(&after_down.call(&json!({ "op": "status" }))?, "post-downgrade sealed status")?;
+    drop(after_down);
+    step(29, "dkms node over TCP: a connection that DOWNGRADES to plaintext after the channel is established is DROPPED without service (and the daemon serves the next honest channel)");
+
+    // --- (30) MITM TAMPER: a correctly-sealed frame with ONE ciphertext byte flipped → dropped.
+    let mut mitm = NodeSocket::connect(endpoint)?;
+    ok_data(&mitm.call(&json!({ "op": "init", "config": {} }))?, "tamper init")?;
+    mitm.establish_channel(pinned_vk_b64, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX)?;
+    let tampered = mitm.tampered_sealed_frame(&json!({ "op": "status" }))?;
+    match mitm.raw_round_trip(&tampered) {
+        Ok(None) | Err(_) => {} // dropped — the AEAD/signature, not a heuristic, is the gate
+        Ok(Some(bytes)) => {
+            return Err(format!(
+                "the node served a TAMPERED sealed frame (MITM not detected): {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        }
+    }
+    drop(mitm);
+    // Not wedged: a fresh honest channel still serves.
+    let mut after_mitm = NodeSocket::connect(endpoint)?;
+    ok_data(&after_mitm.call(&json!({ "op": "init", "config": {} }))?, "post-tamper init")?;
+    after_mitm.establish_channel(pinned_vk_b64, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX)?;
+    ok_data(&after_mitm.call(&json!({ "op": "status" }))?, "post-tamper sealed status")?;
+    drop(after_mitm);
+    step(30, "dkms node over TCP: a MITM-TAMPERED sealed frame (one ciphertext byte flipped) is DROPPED fail-closed — channel integrity is cryptographic, per frame");
+
+    // --- (31) WRONG-NODE CHANNEL KEY under the pinned identity: relay the node's GENUINE hello but
+    // substitute the attacker's own KEM key (the attacker-terminates-TCP shape) — the channel-key
+    // attestation no longer verifies under the descriptor-PINNED vk, so the client refuses the
+    // channel. (The genuine pair verifies; ONLY the substitution is what breaks it.)
+    let mut probe = NodeSocket::connect(endpoint)?;
+    ok_data(&probe.call(&json!({ "op": "init", "config": {} }))?, "wrong-key init")?;
+    let challenge = ddrm_envelope::random_seed();
+    let hello = ok_data(
+        &probe.call(&json!({
+            "op": "hello",
+            "challenge_b64": B64.encode(challenge),
+            "caller_pub_b64": B64.encode(&caller_vk),
+            "now_unix": NOW_UNIX,
+            "channel_pub_b64": B64.encode(ddrm_envelope::session_public_bytes(&ddrm_envelope::mint_session().1)),
+        }))?,
+        "wrong-key hello",
+    )?;
+    let pinned = B64.decode(pinned_vk_b64).map_err(|e| e.to_string())?;
+    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned).ok_or("pinned vk malformed")?;
+    let node_channel_pub = B64
+        .decode(hello["channel"]["node_channel_pub_b64"].as_str().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    let channel_sig = B64
+        .decode(hello["channel"]["channel_sig_b64"].as_str().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    if !ddrm_envelope::verify_channel_key(&verifier, &challenge, &node_channel_pub, &channel_sig) {
+        return Err("the GENUINE node channel key failed to verify — the happy path is broken".to_string());
+    }
+    let (_attacker_secret, attacker_pub) = ddrm_envelope::mint_session();
+    let attacker_pub = ddrm_envelope::session_public_bytes(&attacker_pub);
+    if ddrm_envelope::verify_channel_key(&verifier, &challenge, &attacker_pub, &channel_sig) {
+        return Err(
+            "an attacker-substituted channel KEM key VERIFIED under the pinned identity — the channel binding is broken"
+                .to_string(),
+        );
+    }
+    drop(probe);
+    step(31, "dkms node over TCP: an attacker terminating the connection CANNOT substitute its own channel KEM key — the channel-key attestation verifies ONLY for the genuine (challenge, key) pair under the descriptor-pinned identity");
+
     Ok(())
 }
 
@@ -1820,6 +2134,17 @@ impl AuthorityBackend {
     }
 }
 
+/// Which TRANSPORT the dKMS node daemons listen on (Day 105–108). `Unix` (default): host-local
+/// Unix-domain sockets, permissioned by the filesystem. `Tcp`: the node taken OFF localhost — a real
+/// network listener; the rail then REQUIRES the app-layer encrypted, mutually-authenticated channel
+/// (a `tcp:` node refuses plaintext recovers), and the network-fault semantics (connect/read
+/// timeouts, drop-fails-closed) are live.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DkmsTransport {
+    Unix,
+    Tcp,
+}
+
 /// The TYPED runtime-open config — the SINGLE input to this binary, read from a JSON file
 /// (argv[1]) or `DDRM_OPEN_CONFIG`. The runtime bootstrap is config-driven: NO caller assembles
 /// the host. Mirrors PC2 booting `sessionService` ONCE from config (`BackendSessionService.ts:495`),
@@ -1851,6 +2176,11 @@ struct OpenConfig {
     /// than a handed-in node-B descriptor path: the descriptor's `threshold` block is what the
     /// key-provider consumes, and the runtime owns producing it.
     threshold: bool,
+    /// The dKMS node TRANSPORT (`authority.transport`, Day 105–108): `"unix"` (default) or `"tcp"`.
+    /// `tcp` provisions the node daemon(s) on real network listeners (`tcp:127.0.0.1:PORT`
+    /// endpoints in the published descriptor) and drives the whole rail — including the encrypted
+    /// channel + the network adversarial gates — over TCP. Requires `backend == dkms`.
+    dkms_transport: DkmsTransport,
 }
 
 impl OpenConfig {
@@ -1869,10 +2199,11 @@ impl OpenConfig {
             other => return Err(format!("config `mode` must be \"open\" or \"verify\", got {other:?}")),
         };
         // `authority` is an OBJECT (room to carry per-backend descriptors later); today its
-        // `backend` tag + (for dkms) the node binary + an optional `threshold` flag are read.
-        // Absent → reference (back-compat). Fail-closed on an unknown tag or a non-object `authority`.
-        let (authority, dkms_authority_bin, threshold) = match obj.get("authority") {
-            None => (AuthorityBackend::Reference, None, false),
+        // `backend` tag + (for dkms) the node binary + optional `threshold`/`transport` knobs are
+        // read. Absent → reference (back-compat). Fail-closed on an unknown tag or a non-object
+        // `authority`.
+        let (authority, dkms_authority_bin, threshold, dkms_transport) = match obj.get("authority") {
+            None => (AuthorityBackend::Reference, None, false, DkmsTransport::Unix),
             Some(Value::Object(auth)) => {
                 let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
                     "reference" => AuthorityBackend::Reference,
@@ -1894,7 +2225,23 @@ impl OpenConfig {
                 if threshold && backend != AuthorityBackend::Dkms {
                     return Err("config `authority.threshold` requires `authority.backend` == \"dkms\" (an external secret-holding authority)".to_string());
                 }
-                (backend, node_bin, threshold)
+                // The TRANSPORT knob (Day 105–108): `"unix"` (default) or `"tcp"`. It addresses the
+                // dKMS node daemons, so it is meaningless for the in-runtime reference authority —
+                // fail closed rather than silently ignore.
+                let dkms_transport = match auth.get("transport").and_then(Value::as_str) {
+                    None => DkmsTransport::Unix,
+                    Some("unix") => DkmsTransport::Unix,
+                    Some("tcp") => DkmsTransport::Tcp,
+                    Some(other) => {
+                        return Err(format!(
+                            "config `authority.transport` must be \"unix\" or \"tcp\", got {other:?}"
+                        ))
+                    }
+                };
+                if dkms_transport == DkmsTransport::Tcp && backend != AuthorityBackend::Dkms {
+                    return Err("config `authority.transport` == \"tcp\" requires `authority.backend` == \"dkms\" (it addresses the external node daemons)".to_string());
+                }
+                (backend, node_bin, threshold, dkms_transport)
             }
             Some(_) => return Err("config `authority` must be an object".to_string()),
         };
@@ -1910,6 +2257,7 @@ impl OpenConfig {
             authority,
             dkms_authority_bin,
             threshold,
+            dkms_transport,
         })
     }
 }
@@ -1945,13 +2293,21 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // The dKMS NODE's master store — node-local, the SECRET stays here. The runtime creates it via
     // the node at provision time + names it in the env the node reads, but NEVER reads it itself.
     let node_store_path = work_dir.join("dkms-node-master.json").to_string_lossy().into_owned();
-    // The node's listening SOCKET PATH — the runtime CONNECTS here (it does not own the node's
-    // process). Published as the descriptor `authority_endpoint`.
-    let node_sock_path = work_dir.join("dkms-authority.sock").to_string_lossy().into_owned();
-    // 2-of-2 THRESHOLD (Day 99–100): node B's OWN node-local master store + listening socket (distinct
-    // from node A's). Used only when `cfg.threshold` — each node holds ONLY its own share.
+    // The node's listening ENDPOINT — the runtime CONNECTS here (it does not own the node's
+    // process). Published as the descriptor `authority_endpoint`. Day 105–108: on the `tcp`
+    // transport this is a REAL loopback network address (`tcp:127.0.0.1:PORT`) instead of a
+    // Unix-domain socket path — the node taken off localhost's filesystem boundary.
+    let node_sock_path = match cfg.dkms_transport {
+        DkmsTransport::Unix => work_dir.join("dkms-authority.sock").to_string_lossy().into_owned(),
+        DkmsTransport::Tcp => pick_tcp_endpoint()?,
+    };
+    // 2-of-2 THRESHOLD (Day 99–100): node B's OWN node-local master store + listening endpoint
+    // (distinct from node A's). Used only when `cfg.threshold` — each node holds ONLY its own share.
     let node2_store_path = work_dir.join("dkms-node-b-master.json").to_string_lossy().into_owned();
-    let node2_sock_path = work_dir.join("dkms-authority-b.sock").to_string_lossy().into_owned();
+    let node2_sock_path = match cfg.dkms_transport {
+        DkmsTransport::Unix => work_dir.join("dkms-authority-b.sock").to_string_lossy().into_owned(),
+        DkmsTransport::Tcp => pick_tcp_endpoint()?,
+    };
     // The runtime's OWN stable caller identity (Day 95–96): a per-run seed → a KNOWN ML-DSA identity
     // the node's allow-list recognizes. The same seed is handed to the key-provider (so the RAIL
     // connects as this known caller) AND to the adversarial probe (so its happy path is allow-listed);
@@ -2630,6 +2986,13 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 .ok_or("dkms verify probe needs the bound key material from the open")?;
             dkms_node_adversarial_probe(endpoint, pinned_vk, &probe_material, caller_seed)?;
 
+            // NETWORK CHANNEL (Day 105–108): on the TCP transport, ALSO drive the hostile-network
+            // gates against the live daemon — plaintext recover refused, downgrade dropped,
+            // MITM-tampered frame dropped, wrong-node channel key refused under the pinned identity.
+            if cfg.dkms_transport == DkmsTransport::Tcp {
+                dkms_tcp_channel_adversarial_gates(endpoint, pinned_vk, caller_seed)?;
+            }
+
             // 2-of-2 THRESHOLD (Day 97–98): prove, across TWO real node daemons, that the CEK is split
             // so no single node holds the whole key, the boundary reconstructs it only in-boundary, and
             // a single/forged share fails closed. Self-contained (its own two daemons).
@@ -2805,6 +3168,41 @@ mod config_tests {
         assert!(OpenConfig::from_json(&bad)
             .expect_err("a non-boolean threshold must fail closed")
             .contains("threshold"));
+    }
+
+    #[test]
+    fn transport_parses_for_dkms_and_defaults_to_unix() {
+        let base = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        // Default: unix (host-local sockets).
+        assert!(OpenConfig::from_json(&base).unwrap().dkms_transport == DkmsTransport::Unix);
+
+        // dkms + transport:"tcp" parses (the node off localhost).
+        let mut tcp = base.clone();
+        tcp.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node", "transport": "tcp" }),
+        );
+        assert!(OpenConfig::from_json(&tcp).unwrap().dkms_transport == DkmsTransport::Tcp);
+
+        // transport:"tcp" on the reference backend fails closed (there is no node daemon to address).
+        let mut ref_tcp = base.clone();
+        ref_tcp.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "reference", "transport": "tcp" }),
+        );
+        assert!(OpenConfig::from_json(&ref_tcp)
+            .expect_err("tcp transport needs the dkms backend")
+            .contains("transport"));
+
+        // An unknown transport fails closed.
+        let mut bad = base.clone();
+        bad.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node", "transport": "carrier-pigeon" }),
+        );
+        assert!(OpenConfig::from_json(&bad)
+            .expect_err("an unknown transport must fail closed")
+            .contains("transport"));
     }
 
     #[test]

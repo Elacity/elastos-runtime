@@ -369,6 +369,40 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 105–108):** the dKMS node is OFF LOCALHOST — a REAL network transport (TCP) with an app-layer
+  ENCRYPTED, MUTUALLY-AUTHENTICATED channel built from our OWN primitives; the FULL 2-of-2 threshold rail passes over
+  TCP (all 31 verify gates) and every hostile-network edge fails closed. Audited PC2 first: its dDRM network boundary
+  is `https.get(url, { rejectUnauthorized: false, timeout: 5000 })` (`chipotle-client.ts:838`–`:851`) — TLS
+  certificate verification DISABLED, the channel authenticates NOTHING; only the supernode provisioning payload
+  carries an app-side signed envelope (`:737`–`:795`). Its Boson proxy does app-layer NaCl crypto_box encryption
+  (`ProxyProtocol.ts:9`/`:21`/`:24`/`:251`) but never carries dDRM and authenticates the network peer, never the
+  key-holding NODE. The runtime is SUPERIOR: the channel itself authenticates the node, frame by frame.
+  (1) PRIMITIVES (ddrm-envelope 25→27): `attest_channel_key`/`verify_channel_key` — at `hello` the node signs its
+  master-derived channel KEM key under its descriptor-pinned ML-DSA identity, so an attacker terminating the TCP
+  connection can relay the genuine hello but CANNOT substitute its own KEM key; `channel_frame_aad(channel_id,
+  direction, seq)` — every sealed frame is AAD-bound to its channel (the hello challenge), direction (no reflection),
+  and strictly-advancing seq (no replay). (2) NODE (dkms-authority 13→15): `DKMS_AUTHORITY_LISTEN=tcp:HOST:PORT`
+  binds a real `TcpListener` (same framed protocol; transport-generic `serve_connection_io`; 30 s server-side read
+  timeout so a stalled peer can't wedge the sequential daemon); on TCP a plaintext `recover` is refused
+  (`channel_required`) and ANY violation on an established channel — plaintext downgrade, tampered envelope, stale
+  seq — DROPS the connection with no response (no oracle); `NodeAuthority` gained the channel keypair
+  (domain-separated from the escrow recipient) and moved to the heap (boxed — dev-profile PQ stack pressure tipped
+  2 MiB test threads). (3) CLIENT (key-provider 43→44): `tcp:` endpoints connect under EXPLICIT timeouts (connect
+  5 s + read 5 s — the `httpsGet` analogue done right: a node that stalls mid-recover fails the release closed
+  within a bounded window, no partial material, never a hang); the channel is REQUIRED on the network path — pure
+  `resolve_node_channel_key` fails closed on a missing block / malformed key / SUBSTITUTED key / replayed challenge /
+  impostor identity (unit-tested without a socket); `DkmsNodeConn` is transport-generic and seals/unseals every frame.
+  (4) RUNTIME (+1 config test 10→11): `authority.transport` (`"unix"` default | `"tcp"`, requires dkms, unknown fails
+  closed); OS-picked loopback ports published as `tcp:127.0.0.1:PORT` descriptor endpoints; daemon/probe/
+  malformed-frame plumbing transport-generic; the adversarial probe establishes the channel on TCP so gates 13–17 run
+  SEALED, like production. (5) GATES 28–31 (live daemon over real TCP): plaintext recover → `channel_required`;
+  plaintext downgrade after establishment → dropped (daemon not wedged); a sealed frame with ONE flipped ciphertext
+  byte → dropped; an attacker-substituted channel KEM key fails `verify_channel_key` under the pinned identity.
+  (6) NEW `ddrm-consumer-dkms-tcp-smoke.sh` (`--threshold --transport tcp`) drives the ENTIRE 2-of-2 rail over TCP —
+  all 31 steps, incl. node-fault gates 23–24 which over TCP are exactly the mid-rail network-drop semantics (a dead
+  connection → fail closed, no partial CEK, no record). Drift untouched. Gate: ladder INTACT (ddrm-envelope=27,
+  dkms-authority=15, key-provider[key-authority-ref]=44), drift PASS, all dDRM smokes green (reference + dkms +
+  2-of-2 + the NEW tcp 2-of-2), clippy clean.
 - **Status (Day 103–104):** the threshold's identity is now CRYPTOGRAPHIC + AUDITABLE — the node-set is welded into
   the decrypt-transcript AAD itself (a swapped node-set fails the AEAD open AT THE BOUNDARY, in the sandbox, even when
   every per-share signature verifies — not just at descriptor parse), every durable open record is STAMPED with the

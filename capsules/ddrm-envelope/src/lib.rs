@@ -577,6 +577,57 @@ pub fn verify_recover_proof(
     )
 }
 
+/// Domain label for the dKMS ENCRYPTED-CHANNEL key attestation (Day 105–108). When the node is
+/// reached over a NETWORK transport (TCP), the client and node establish an app-layer encrypted,
+/// mutually-authenticated channel: at `hello` the node publishes a master-derived CHANNEL KEM key
+/// and signs `(challenge ‖ channel_pub)` under its pinned identity. Binding the channel key INTO the
+/// identity attestation is what defeats an attacker terminating the TCP connection: it could relay
+/// the node's genuine hello, but substituting its OWN KEM key breaks this signature under the
+/// descriptor-pinned vk, so the client refuses the channel. (PC2 has no analogue — its dDRM fetch
+/// runs HTTPS with `rejectUnauthorized: false`, `chipotle-client.ts:840`: the TLS layer authenticates
+/// NOTHING and only the payload signature saves it.) Domain-separated from the hello attestation so
+/// neither signature can stand in for the other. Defined ONCE here so node + client cannot drift.
+pub const DKMS_CHANNEL_DOMAIN: &[u8] = b"elastos.dkms.authority/channel-key/v1";
+
+/// The NODE side: attest the channel KEM key for THIS handshake — sign
+/// `DKMS_CHANNEL_DOMAIN ‖ lp(challenge) ‖ lp(channel_pub)` with the node's master-derived signing key.
+pub fn attest_channel_key(
+    signer: &impl seal::CekSealSigner,
+    challenge: &[u8],
+    channel_pub: &[u8],
+) -> Vec<u8> {
+    signer.sign(&lp_concat(DKMS_CHANNEL_DOMAIN, &[challenge, channel_pub]))
+}
+
+/// The CLIENT side: verify the node's channel-key attestation under the PINNED identity. `true`
+/// only for a valid signature over the SAME `(challenge, channel_pub)` — a substituted KEM key
+/// (a MITM terminating the TCP connection), a replayed challenge, or a forged signature all return
+/// `false` and the client refuses to establish the channel (fail-closed: no channel, no recover).
+pub fn verify_channel_key(
+    verifier: &impl CekSealVerifier,
+    challenge: &[u8],
+    channel_pub: &[u8],
+    sig: &[u8],
+) -> bool {
+    verifier.verify(&lp_concat(DKMS_CHANNEL_DOMAIN, &[challenge, channel_pub]), sig)
+}
+
+/// Domain label for the per-FRAME AAD of an established dKMS encrypted channel (Day 105–108).
+/// Every frame body on the channel is a sealed envelope whose AEAD is bound to
+/// `(channel_id, direction, seq)`: `channel_id` scopes the frame to THIS handshake (the hello
+/// challenge), `direction` (0 = client→node, 1 = node→client) makes a frame non-REFLECTABLE back at
+/// its sender, and the strictly-advancing `seq` makes a captured frame non-REPLAYABLE on the same
+/// channel (the receiver's counter has moved on, so the AAD no longer matches and the AEAD open
+/// fails). Domain-separated from every other AAD in the system.
+pub const DKMS_CHANNEL_FRAME_DOMAIN: &[u8] = b"elastos.dkms.authority/channel-frame/v1";
+
+/// Canonical per-frame channel AAD: `DKMS_CHANNEL_FRAME_DOMAIN ‖ lp(channel_id) ‖ lp(direction) ‖
+/// lp(seq_le)`. Defined ONCE here so the node + every client compute byte-identical AADs (a drifted
+/// encoder would fail every AEAD open, fail-closed).
+pub fn channel_frame_aad(channel_id: &[u8], direction: u8, seq: u64) -> Vec<u8> {
+    lp_concat(DKMS_CHANNEL_FRAME_DOMAIN, &[channel_id, &[direction], &seq.to_le_bytes()])
+}
+
 /// Length-prefixed message FRAMING for the dKMS node's socket transport (Day 93–94): every message
 /// is `[4-byte length (BE)][payload]`, so a reader recovers exact message boundaries instead of
 /// trusting a raw byte stream. The runtime-core analogue of PC2's Boson proxy framing —
@@ -1398,6 +1449,51 @@ mod tests {
             crate::threshold_node_set_id(2, &vk_a, &pre_b),
             "the length prefix must prevent a boundary-shift collision"
         );
+    }
+
+    /// Day 105–108: the encrypted-channel KEY ATTESTATION pins both the handshake challenge AND the
+    /// node's channel KEM key under the node identity — the property that defeats a MITM terminating
+    /// the TCP connection (it can relay the genuine hello but cannot substitute its own KEM key).
+    #[test]
+    fn channel_key_attestation_binds_challenge_and_key() {
+        let (signer, vk) = mldsa_seal_keypair([0x61u8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).expect("vk decodes");
+        let challenge = [0x10u8; 32];
+        let channel_pub = vec![0x42u8; 64];
+        let sig = crate::attest_channel_key(&signer, &challenge, &channel_pub);
+
+        // The genuine (challenge, channel_pub) verifies under the pinned identity.
+        assert!(crate::verify_channel_key(&verifier, &challenge, &channel_pub, &sig));
+        // A SUBSTITUTED channel key (the MITM's own KEM key) fails under the pinned identity.
+        let mitm_pub = vec![0x43u8; 64];
+        assert!(!crate::verify_channel_key(&verifier, &challenge, &mitm_pub, &sig));
+        // A different challenge (replayed attestation) fails.
+        assert!(!crate::verify_channel_key(&verifier, &[0x11u8; 32], &channel_pub, &sig));
+        // A different node identity fails (the attestation is identity-pinned).
+        let (_other, other_vk) = mldsa_seal_keypair([0x62u8; 32]);
+        let other_verifier = MlDsa65Verifier::from_encoded(&other_vk).expect("vk decodes");
+        assert!(!crate::verify_channel_key(&other_verifier, &challenge, &channel_pub, &sig));
+        // Domain separation: a hello attestation over the same challenge is NOT a channel attestation.
+        let hello_sig = crate::attest_challenge(&signer, &challenge);
+        assert!(!crate::verify_channel_key(&verifier, &challenge, &channel_pub, &hello_sig));
+    }
+
+    /// Day 105–108: the per-frame channel AAD separates channel, direction and sequence — a frame
+    /// can be neither REFLECTED back at its sender nor REPLAYED once the receiver's counter advances.
+    #[test]
+    fn channel_frame_aad_separates_channel_direction_and_seq() {
+        let id = [0x77u8; 32];
+        let aad = crate::channel_frame_aad(&id, 0, 1);
+        // Deterministic (node + client must compute byte-identical AADs).
+        assert_eq!(aad, crate::channel_frame_aad(&id, 0, 1));
+        // Direction-separated: a client→node frame cannot be reflected as a node→client frame.
+        assert_ne!(aad, crate::channel_frame_aad(&id, 1, 1));
+        // Sequence-separated: a captured frame replayed after the counter advanced fails.
+        assert_ne!(aad, crate::channel_frame_aad(&id, 0, 2));
+        // Channel-separated: a frame from one handshake cannot cross to another channel.
+        assert_ne!(aad, crate::channel_frame_aad(&[0x78u8; 32], 0, 1));
+        // Domain-labelled (never collides with another AAD family).
+        assert!(aad.starts_with(crate::DKMS_CHANNEL_FRAME_DOMAIN));
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.
