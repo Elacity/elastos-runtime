@@ -297,6 +297,15 @@ pub trait ProviderTransport {
     fn provider(&self) -> &str;
     /// Open a fresh handle over this transport for ONE plan execution.
     fn open(&self) -> Box<dyn ProviderHandle>;
+    /// Tear down the connection this transport OWNS (the analogue of PC2's
+    /// `ISessionView.dispose()` releasing the per-view WASM L2 handle via `requestDrop`,
+    /// `src/api/chipotle-client.ts:231`/`:694`). Called by [`RuntimeCapabilityTable::shutdown`]
+    /// when the host shuts down, so the runtime that OWNS the transport also owns its
+    /// teardown. Default no-op for transports that own no releasable resource; fail-closed
+    /// (an error here surfaces to the host's shutdown).
+    fn shutdown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The runtime-core capability table: a registry of runtime-OWNED provider transports.
@@ -338,6 +347,23 @@ impl RuntimeCapabilityTable {
     pub fn registered_providers(&self) -> Vec<&str> {
         self.transports.keys().map(String::as_str).collect()
     }
+
+    /// Tear down every registered transport (the runtime owns the transports, so it owns
+    /// their teardown). Attempts ALL transports even if one fails, then returns the first
+    /// error — fail-closed: a transport that cannot release its connection surfaces to the
+    /// caller rather than being silently dropped.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        for (provider, transport) in self.transports.iter_mut() {
+            if let Err(e) = transport.shutdown() {
+                first_err.get_or_insert_with(|| format!("transport `{provider}` shutdown failed: {e}"));
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl CapabilityTable for RuntimeCapabilityTable {
@@ -357,15 +383,104 @@ pub trait PlanSource {
     fn fetch(&mut self, content_id: &str, viewer_interface: &str) -> Result<Value, String>;
 }
 
+/// The identity of the open being recorded — handed to the [`RuntimeEventSink`] so the
+/// persisted receipt / audit record names WHAT was opened (the runtime-core analogue of
+/// the content identity PC2's `/init` logs + stores on the session, `media.ts:489`).
+#[derive(Debug, Clone, Copy)]
+pub struct OpenContext<'a> {
+    pub content_id: &'a str,
+    pub viewer_interface: &'a str,
+}
+
 /// A runtime-owned sink for the plan's runtime-EVENT steps — the steps the plan declares
 /// with `owner: runtime` (e.g. `release_receipt`, `protected_content.open.audit`) that no
 /// provider performs. The host emits each, in plan order, after the provider chain runs,
-/// handing the sink the finished [`ExecutionReport`] so it can persist the receipt / write
-/// the audit record. The runtime-core analogue of PC2's `/init` creating the playback
-/// session + logging the open (`media.ts:489` `mediaSessionManager.create`, `:483`/`:518`).
-/// Fail-closed: if a declared runtime event cannot be emitted, the open fails.
+/// handing the sink the open identity ([`OpenContext`]) + the finished [`ExecutionReport`]
+/// so it can persist the receipt / write the audit record. The runtime-core analogue of
+/// PC2's `/init` creating the playback session + logging the open (`media.ts:489`
+/// `mediaSessionManager.create`, `:483`/`:518`). Fail-closed: if a declared runtime event
+/// cannot be emitted (e.g. persistence fails), the open fails.
 pub trait RuntimeEventSink {
-    fn emit(&mut self, event: &str, report: &ExecutionReport) -> Result<(), String>;
+    fn emit(
+        &mut self,
+        event: &str,
+        ctx: &OpenContext,
+        report: &ExecutionReport,
+    ) -> Result<(), String>;
+}
+
+/// A durable store the runtime persists open records into — the I/O-free seam the
+/// [`PersistingEventSink`] writes through, so the lib owns the (CEK-free) record SHAPE +
+/// fail-closed logic while the concrete durability (filesystem, DB, …) is injected. The
+/// runtime-core analogue of `mediaSessionManager`'s in-process session store
+/// (`src/services/media/sessionManager.ts:78`); a real runtime injects a durable impl.
+pub trait EventStore {
+    /// Persist `record` under `key`. Fail-closed: an error fails the emit (and the open).
+    fn persist(&mut self, key: &str, record: &Value) -> Result<(), String>;
+}
+
+/// Build the CEK-free record the runtime persists for a runtime event. It carries ONLY
+/// open METADATA — the event, the open identity, the steps that ran, whether a decrypt
+/// session was opened, and the NAMES of the artifacts produced — and NEVER the artifact
+/// VALUES (which can carry sealed CEK material). This is the audit/receipt invariant: the
+/// durable record describes the open without ever holding key material, mirroring PC2
+/// keeping the CEK server-side and out of the session record it returns
+/// (`sessionManager.ts:5`–`:6`, `:18`).
+pub fn open_event_record(event: &str, ctx: &OpenContext, report: &ExecutionReport) -> Value {
+    let artifact_names: Vec<&str> = report.artifacts.keys().map(String::as_str).collect();
+    serde_json::json!({
+        "schema": "elastos.drm.open_event_record/v1",
+        "event": event,
+        "content_id": ctx.content_id,
+        "viewer_interface": ctx.viewer_interface,
+        "steps_run": report.steps_run,
+        "decrypt_session_opened": report.artifact("decrypt_session").is_some(),
+        "artifact_names": artifact_names,
+    })
+}
+
+/// A [`RuntimeEventSink`] that PERSISTS each runtime event as a durable, CEK-free record
+/// into an injected [`EventStore`]. The runtime-core analogue of PC2's `/init` persisting
+/// the open (creating the lifetime session via `mediaSessionManager.create`) + writing the
+/// audit log — except the persisted record holds NO key material (see [`open_event_record`]).
+/// Fail-closed: a store that cannot persist a declared runtime event fails the open.
+pub struct PersistingEventSink<S: EventStore> {
+    store: S,
+    persisted: Vec<String>,
+}
+
+impl<S: EventStore> PersistingEventSink<S> {
+    pub fn new(store: S) -> Self {
+        Self {
+            store,
+            persisted: Vec::new(),
+        }
+    }
+
+    /// The events persisted so far, in order (for assertions / introspection).
+    pub fn persisted(&self) -> &[String] {
+        &self.persisted
+    }
+
+    /// Borrow the underlying store (e.g. to inspect what was written).
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+}
+
+impl<S: EventStore> RuntimeEventSink for PersistingEventSink<S> {
+    fn emit(
+        &mut self,
+        event: &str,
+        ctx: &OpenContext,
+        report: &ExecutionReport,
+    ) -> Result<(), String> {
+        let record = open_event_record(event, ctx, report);
+        let key = format!("{}/{}", ctx.content_id, event);
+        self.store.persist(&key, &record)?;
+        self.persisted.push(event.to_string());
+        Ok(())
+    }
 }
 
 /// What a host open produced: the steps that ran, the artifacts, and the runtime events
@@ -429,13 +544,17 @@ impl DrmHost {
 
         // Runtime-owned post-steps: the plan declares them (owner: runtime), no provider
         // performs them — the HOST emits each, in plan order, after the provider chain.
+        let ctx = OpenContext {
+            content_id,
+            viewer_interface,
+        };
         let mut events_emitted = Vec::new();
         for step in plan.steps.iter().filter(|s| s.is_runtime_event()) {
             let event = step
                 .event
                 .as_deref()
                 .expect("is_runtime_event guarantees an event name");
-            self.events.emit(event, &execution)?;
+            self.events.emit(event, &ctx, &execution)?;
             events_emitted.push(event.to_string());
         }
 
@@ -448,6 +567,14 @@ impl DrmHost {
     /// The providers this host can drive (one per registered transport).
     pub fn registered_providers(&self) -> Vec<&str> {
         self.table.registered_providers()
+    }
+
+    /// Shut the host down: tear down every transport the runtime owns (each releases its
+    /// own connection — the analogue of disposing every per-view WASM handle). Consumes
+    /// the host so its capabilities cannot be used after teardown. Fail-closed: a transport
+    /// that cannot release its connection surfaces here.
+    pub fn shutdown(mut self) -> Result<(), String> {
+        self.table.shutdown()
     }
 }
 
@@ -1031,6 +1158,10 @@ mod tests {
 
     /// A capability handle for one provider, backed by a recorder rather than a real
     /// capsule. Emits whatever artifacts the plan says its step produces.
+    /// A recognizable "sealed material" value the `decrypt_session` artifact carries, so a
+    /// persisted open record can be proven to record the artifact NAME but never this VALUE.
+    const SENTINEL_SEALED_VALUE: &str = "SEALED-CEK-DO-NOT-LEAK";
+
     struct FakeHandle {
         provider: String,
         invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -1062,7 +1193,12 @@ mod tests {
                 }
                 "decrypt_session" => {
                     inputs.require_threaded("release_receipt")?;
-                    out.insert("decrypt_session".to_string(), json!({ "decision": "opened" }));
+                    // The artifact VALUE carries a sentinel "sealed" blob — a persisted
+                    // open record must record the artifact NAME but never this VALUE.
+                    out.insert(
+                        "decrypt_session".to_string(),
+                        json!({ "decision": "opened", "sealed_blob": SENTINEL_SEALED_VALUE }),
+                    );
                 }
                 _ => {}
             }
@@ -1359,7 +1495,12 @@ mod tests {
     }
 
     impl RuntimeEventSink for RecordingSink {
-        fn emit(&mut self, event: &str, _report: &ExecutionReport) -> Result<(), String> {
+        fn emit(
+            &mut self,
+            event: &str,
+            _ctx: &OpenContext,
+            _report: &ExecutionReport,
+        ) -> Result<(), String> {
             if self.refuse.as_deref() == Some(event) {
                 return Err(format!("sink refused to emit `{event}`"));
             }
@@ -1445,5 +1586,170 @@ mod tests {
         assert!(err.contains("holds no handle for required provider `key`"), "{err}");
         assert!(invoked.borrow().is_empty());
         assert!(emitted.borrow().is_empty());
+    }
+
+    // ── Day 77–78: the host OWNS transport teardown + a persisting (CEK-free) event sink ──
+
+    /// A transport that records when it is opened and torn down; `fail_shutdown` models a
+    /// transport whose connection cannot be released (teardown must surface fail-closed).
+    struct OwningTransport {
+        provider: String,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_shutdown: bool,
+    }
+
+    impl ProviderTransport for OwningTransport {
+        fn provider(&self) -> &str {
+            &self.provider
+        }
+        fn open(&self) -> Box<dyn ProviderHandle> {
+            self.log.borrow_mut().push(format!("open:{}", self.provider));
+            FakeHandle::boxed(&self.provider, &self.invoked)
+        }
+        fn shutdown(&mut self) -> Result<(), String> {
+            self.log.borrow_mut().push(format!("shutdown:{}", self.provider));
+            if self.fail_shutdown {
+                return Err("connection still in use".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    fn owning(
+        provider: &str,
+        log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        invoked: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_shutdown: bool,
+    ) -> Box<dyn ProviderTransport> {
+        Box::new(OwningTransport {
+            provider: provider.to_string(),
+            log: log.clone(),
+            invoked: invoked.clone(),
+            fail_shutdown,
+        })
+    }
+
+    #[test]
+    fn host_shutdown_tears_down_every_owned_transport() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(owning("rights", &log, &invoked, false)).unwrap();
+        table.register(owning("key", &log, &invoked, false)).unwrap();
+        table.register(owning("decrypt", &log, &invoked, false)).unwrap();
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            table,
+            Box::new(RecordingSink { emitted, refuse: None }),
+        );
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open");
+        host.shutdown().expect("host tears down its owned transports");
+        // Every registered transport was opened AND torn down (the runtime owns teardown).
+        let log = log.borrow();
+        for p in ["rights", "key", "decrypt"] {
+            assert!(log.contains(&format!("open:{p}")), "{p} opened");
+            assert!(log.contains(&format!("shutdown:{p}")), "{p} torn down");
+        }
+    }
+
+    #[test]
+    fn host_shutdown_fails_closed_when_a_transport_cannot_release() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(owning("rights", &log, &invoked, false)).unwrap();
+        table.register(owning("key", &log, &invoked, true)).unwrap(); // key cannot release
+        table.register(owning("decrypt", &log, &invoked, false)).unwrap();
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            table,
+            Box::new(RecordingSink { emitted, refuse: None }),
+        );
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open");
+        let err = host.shutdown().unwrap_err();
+        assert!(err.contains("transport `key` shutdown failed"), "{err}");
+        // It still attempted to tear down the OTHER transports (best-effort, then surfaces).
+        let log = log.borrow();
+        assert!(log.contains(&"shutdown:rights".to_string()));
+        assert!(log.contains(&"shutdown:decrypt".to_string()));
+    }
+
+    /// A store that records persisted records; `fail_on` models a durable store that
+    /// cannot write a given event (the open must fail closed).
+    struct FakeStore {
+        records: std::rc::Rc<std::cell::RefCell<Vec<(String, Value)>>>,
+        fail_on: Option<String>,
+    }
+
+    impl EventStore for FakeStore {
+        fn persist(&mut self, key: &str, record: &Value) -> Result<(), String> {
+            if self.fail_on.as_deref() == Some(record["event"].as_str().unwrap_or("")) {
+                return Err(format!("store could not persist `{key}`"));
+            }
+            self.records.borrow_mut().push((key.to_string(), record.clone()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persisting_sink_writes_cek_free_records_for_every_runtime_event() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let records = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            full_table(&invoked),
+            Box::new(PersistingEventSink::new(FakeStore {
+                records: records.clone(),
+                fail_on: None,
+            })),
+        );
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open + persist");
+        let records = records.borrow();
+        // Both runtime events were persisted, keyed by content + event, in order.
+        let keys: Vec<&str> = records.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["bafycontent/release_receipt", "bafycontent/protected_content.open.audit"]
+        );
+        // Every persisted record is CEK-free: it carries open METADATA (identity, decision,
+        // artifact NAMES) but never an artifact VALUE / key material.
+        // The record carries artifact NAMES (safe) but never an artifact VALUE / key
+        // material. Assert structurally (no `artifacts` map) below; here, a sealed-blob
+        // value placed in an artifact must NOT have leaked into the persisted record.
+        let blob = serde_json::to_string(&*records).unwrap();
+        assert!(!blob.contains(SENTINEL_SEALED_VALUE), "persisted audit leaked an artifact value: {blob}");
+        for (_, rec) in records.iter() {
+            assert_eq!(rec["content_id"], serde_json::json!("bafycontent"));
+            assert_eq!(rec["decrypt_session_opened"], serde_json::json!(true));
+            assert!(rec["artifact_names"].is_array(), "names only, not values");
+            // The artifact NAMES are recorded, but never the VALUES under those names.
+            assert!(rec.get("artifacts").is_none(), "must persist names, not the artifact map");
+        }
+    }
+
+    #[test]
+    fn host_fails_closed_when_the_store_cannot_persist() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let records = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            full_table(&invoked),
+            // The durable store cannot write the audit record — the open must fail closed.
+            Box::new(PersistingEventSink::new(FakeStore {
+                records: records.clone(),
+                fail_on: Some("protected_content.open.audit".to_string()),
+            })),
+        );
+        let err = host.open("bafycontent", "elastos.viewer/document@1").unwrap_err();
+        assert!(err.contains("store could not persist"), "{err}");
+        // The receipt persisted first; the audit failed — the open did not silently succeed.
+        assert_eq!(records.borrow().len(), 1);
     }
 }

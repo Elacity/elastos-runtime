@@ -37,11 +37,17 @@
 //! fetching the MPD, driving recovery, creating the session, and logging, all in one
 //! place (`pc2-node/src/api/media.ts:133` route → `:481`/`:482` recover → `:489` session).
 //! The smoke REGISTERS three runtime-owned transports (`RightsTransport`/`KeyTransport`/
-//! `DecryptTransport`, each wrapping one real capsule binary) into the host's table — the
+//! `DecryptTransport`, each OWNING one real capsule binary) into the host's table — the
 //! same registry type the trusted core uses; each transport opens a fresh per-provider
-//! handle on demand. No second code path. The host fails closed unless every provider the
+//! handle on demand and TEARS DOWN its capsule on `shutdown`. The HOST owns the transports,
+//! so `host.shutdown()` tears down the whole rail (the analogue of disposing every per-view
+//! handle) — the smoke performs no manual per-capsule shutdown. The event sink is the lib's
+//! `PersistingEventSink` over a `FileEventStore`: each runtime-event step is written as a
+//! durable, CEK-FREE record (open identity + decision + artifact NAMES, never key material)
+//! to a temp dir, which the smoke reads back to prove the receipt + audit persisted without
+//! leaking the CEK. No second code path. The host fails closed unless every provider the
 //! plan's `next_required_providers` names has a registered transport, and unless every
-//! runtime event it declares can be emitted. Two more fail-closed gates ride along: a
+//! runtime event it declares can be PERSISTED. Two more fail-closed gates ride along: a
 //! transcript-mismatched seal must not open, and a TAMPERED plan FROM THE SOURCE (driven
 //! back through the SAME host) must be rejected by the real key-provider.
 //!
@@ -51,13 +57,14 @@ use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
 use ddrm_plan_runner::{
-    DrmHost, ExecutionReport, PlanSource, ProviderHandle, ProviderTransport,
-    RuntimeCapabilityTable, RuntimeEventSink, StepInputs,
+    DrmHost, EventStore, PersistingEventSink, PlanSource, ProviderHandle, ProviderTransport,
+    RuntimeCapabilityTable, StepInputs,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 
@@ -605,6 +612,13 @@ impl ProviderTransport for RightsTransport {
             chain_mode: self.chain_mode.clone(),
         })
     }
+    fn shutdown(&mut self) -> Result<(), String> {
+        // The host owns this transport, so it owns the capsule's teardown.
+        if let Some(rights) = self.rights.borrow_mut().as_mut() {
+            rights.shutdown();
+        }
+        Ok(())
+    }
 }
 
 /// Runtime-owned `key` transport: opens a `KeyHandle` over the key-provider capsule,
@@ -636,6 +650,10 @@ impl ProviderTransport for KeyTransport {
             nonce_b64: self.nonce_b64.clone(),
         })
     }
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.key.borrow_mut().shutdown();
+        Ok(())
+    }
 }
 
 /// Runtime-owned `decrypt` transport: opens a `DecryptHandle` over the decrypt boundary.
@@ -651,6 +669,10 @@ impl ProviderTransport for DecryptTransport {
         Box::new(DecryptHandle {
             decrypt: self.decrypt.clone(),
         })
+    }
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.decrypt.borrow_mut().shutdown();
+        Ok(())
     }
 }
 
@@ -693,22 +715,23 @@ impl PlanSource for SmokePlanSource {
     }
 }
 
-/// The host's runtime-owned EVENT SINK: records the plan's runtime-event steps
-/// (`release_receipt`, `protected_content.open.audit`) the host emits after the provider
-/// chain runs. The runtime analogue of PC2's `/init` creating the session + logging the
-/// open. Records into a shared vec so `run` can assert both events were emitted.
-struct SmokeEventSink {
-    emitted: Rc<RefCell<Vec<String>>>,
+/// The host's runtime-owned, PERSISTING event store: writes each runtime-event record the
+/// host emits (`release_receipt`, `protected_content.open.audit`) as a durable JSON file in
+/// `dir`. The `ddrm_plan_runner::PersistingEventSink` builds the CEK-free record (open
+/// identity + decision + artifact NAMES, never key material) and hands it here. The runtime
+/// analogue of PC2's `/init` persisting the open (the lifetime session + audit log,
+/// `sessionManager.ts:78`) — except the durable record holds no CEK. Fail-closed: an I/O
+/// error fails the emit, and so the open.
+struct FileEventStore {
+    dir: PathBuf,
 }
 
-impl RuntimeEventSink for SmokeEventSink {
-    fn emit(&mut self, event: &str, report: &ExecutionReport) -> Result<(), String> {
-        // Fail closed: the runtime only records the open's receipt/audit once the chain
-        // actually opened a decrypt session.
-        if report.artifact("decrypt_session").is_none() {
-            return Err(format!("refusing to emit `{event}`: no decrypt session was opened"));
-        }
-        self.emitted.borrow_mut().push(event.to_string());
+impl EventStore for FileEventStore {
+    fn persist(&mut self, key: &str, record: &Value) -> Result<(), String> {
+        let fname = format!("{}.json", key.replace(['/', ':'], "_"));
+        let path = self.dir.join(fname);
+        let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+        std::fs::write(&path, bytes).map_err(|e| format!("persist {}: {e}", path.display()))?;
         Ok(())
     }
 }
@@ -776,15 +799,18 @@ fn run(args: &[String]) -> Result<(), String> {
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
-    // --- build the trusted runtime-core HOST and let it own the WHOLE open. The runtime
-    // REGISTERS three runtime-owned transports into the lib's `RuntimeCapabilityTable`,
-    // wires a `SmokePlanSource` (asks the REAL drm-provider for the plan) and a
-    // `SmokeEventSink` (records the plan's runtime-owned post-steps), and hands all three
-    // to `DrmHost`. `host.open(content_id, viewer)` then fetches the plan, drives it
-    // through the registry (`open_drm_plan`'s parse→resolve→execute), and emits the
+    // --- build the trusted runtime-core HOST and let it OWN the WHOLE open + the rail.
+    // The runtime hands its three capsules to runtime-OWNED transports (the transports own
+    // the capsules; the HOST owns the transports, so `host.shutdown()` tears down the rail
+    // — the analogue of disposing every per-view handle), registers them into the lib's
+    // `RuntimeCapabilityTable`, wires a `SmokePlanSource` (asks the REAL drm-provider for
+    // the plan) and a PERSISTING event sink (`ddrm_plan_runner::PersistingEventSink` over a
+    // `FileEventStore` writing durable, CEK-free open records to a temp dir), and hands all
+    // three to `DrmHost`. `host.open(content_id, viewer)` then fetches the plan, drives it
+    // through the registry (`open_drm_plan`'s parse→resolve→execute), and PERSISTS the
     // runtime-event steps — the SAME host entrypoint the trusted core will call, no second
-    // code path. The capsules are shared (`Rc<RefCell>`) so the post-open fail-closed
-    // checks + shutdown can still reach them after the transports moved into the host.
+    // code path. The cells are kept ONLY for the raw transcript-mismatch gate below; the
+    // host owns teardown (no manual capsule shutdown in `run`).
     let rights_cell = Rc::new(RefCell::new(rights));
     let key_cell = Rc::new(RefCell::new(key));
     let decrypt_cell = Rc::new(RefCell::new(decrypt));
@@ -807,17 +833,22 @@ fn run(args: &[String]) -> Result<(), String> {
     table.register(Box::new(DecryptTransport {
         decrypt: decrypt_cell.clone(),
     }))?;
+
+    // The host's durable event store: a fresh temp dir the runtime persists open records
+    // into. The `PersistingEventSink` builds the CEK-free record and writes it here.
+    let receipts_dir = std::env::temp_dir().join(format!("ddrm-open-{}", std::process::id()));
+    std::fs::create_dir_all(&receipts_dir).map_err(|e| format!("create receipts dir: {e}"))?;
+
     let tamper = Rc::new(std::cell::Cell::new(false));
-    let emitted = Rc::new(RefCell::new(Vec::new()));
     let mut host = DrmHost::new(
         Box::new(SmokePlanSource {
             drm_bin: drm_bin.clone(),
             tamper: tamper.clone(),
         }),
         table,
-        Box::new(SmokeEventSink {
-            emitted: emitted.clone(),
-        }),
+        Box::new(PersistingEventSink::new(FileEventStore {
+            dir: receipts_dir.clone(),
+        })),
     );
 
     // --- the trusted host owns the open end to end ---
@@ -836,7 +867,37 @@ fn run(args: &[String]) -> Result<(), String> {
             report.events_emitted
         ));
     }
-    step(7, "runtime-core host: emitted the runtime-owned post-steps (release_receipt + audit)");
+    // The host PERSISTED a durable record per runtime event — and every record is CEK-free.
+    let receipt_files = read_persisted_records(&receipts_dir)?;
+    if receipt_files.len() != 2 {
+        return Err(format!("expected 2 persisted open records, found {}", receipt_files.len()));
+    }
+    // The record may carry artifact NAMES (safe — PC2 logs step names) but NEVER any secret
+    // VALUE. Forbid the concrete secret bytes that flowed through this open: the CEK, the
+    // sealed/escrowed material, the ciphertext, and the session/producer keys.
+    for (path, record) in &receipt_files {
+        let blob = serde_json::to_string(record).map_err(|e| e.to_string())?;
+        let secrets = [
+            ("CEK", GOLDEN_CEK_B64),
+            ("ciphertext", GOLDEN_CIPHERTEXT_B64),
+            ("wrapped/escrowed CEK", wrapped_cek_b64.as_str()),
+            ("producer vk", producer_vk_b64.as_str()),
+            ("decrypt session key", session_pub_b64.as_str()),
+        ];
+        for (what, secret) in secrets {
+            if blob.contains(secret) {
+                return Err(format!("persisted open record {} leaks the {what}", path.display()));
+            }
+        }
+        // It records artifact NAMES, never the artifact map (values).
+        if record.get("artifacts").is_some() {
+            return Err(format!("persisted record {} embeds artifact values", path.display()));
+        }
+        if record["content_id"].as_str() != Some(cid().as_str()) {
+            return Err(format!("persisted record {} has wrong content_id", path.display()));
+        }
+    }
+    step(7, "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records");
 
     // --- fail-closed #1 (crypto binding): a replayed/altered transcript must not open.
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
@@ -888,25 +949,43 @@ fn run(args: &[String]) -> Result<(), String> {
     // and the real key-provider (deny_unknown_fields over a required `rights_receipt`)
     // rejects it — proving the host only proceeds when the plan's edges are intact, and
     // that a bad plan FROM THE SOURCE fails closed, cross-binary, with no event emitted.
-    let emitted_before = emitted.borrow().len();
+    let persisted_before = read_persisted_records(&receipts_dir)?.len();
     tamper.set(true);
     match host.open(&cid(), VIEWER) {
         Ok(_) => return Err("a tampered plan edge must NOT drive a successful open".to_string()),
         Err(_) => step(9, "runtime-core host: a tampered binding edge from the plan source failed closed at the real key-provider"),
     }
-    if emitted.borrow().len() != emitted_before {
-        return Err("a failed open must emit no runtime events".to_string());
+    if read_persisted_records(&receipts_dir)?.len() != persisted_before {
+        return Err("a failed open must persist no runtime-event record".to_string());
     }
 
-    // Drop the host (releasing the transports' capsule references + the plan source), then
-    // shut down the capsules (still held by this scope's shared cells).
-    drop(host);
-    if let Some(rights) = rights_cell.borrow_mut().as_mut() {
-        rights.shutdown();
-    }
-    key_cell.borrow_mut().shutdown();
-    decrypt_cell.borrow_mut().shutdown();
+    // The HOST owns the rail it was handed: shutting it down tears down every runtime-owned
+    // transport (each shuts down the capsule it owns) — no manual per-capsule shutdown here.
+    host.shutdown()?;
+    step(10, "runtime-core host: shut down — every runtime-owned transport tore down its capsule");
+    // The cells kept for the raw gate are now stale (the host tore the processes down); drop
+    // them and clean up the durable records the smoke wrote.
+    drop(rights_cell);
+    drop(key_cell);
+    drop(decrypt_cell);
+    let _ = std::fs::remove_dir_all(&receipts_dir);
     Ok(())
+}
+
+/// Read every persisted open record the host wrote into `dir` (as `(path, json)`), so the
+/// smoke can assert the durable receipt/audit were written and are CEK-free.
+fn read_persisted_records(dir: &std::path::Path) -> Result<Vec<(PathBuf, Value)>, String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read receipts dir: {e}"))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let record: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        out.push((path, record));
+    }
+    Ok(out)
 }
 
 fn main() {
