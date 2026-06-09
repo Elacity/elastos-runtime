@@ -89,6 +89,14 @@ rail-mint = ["rail-bind", "dep:rand_core", "dep:getrandom"]
 # (opened|denied) — carrying no CEK and no plaintext. The clock is an injected
 # capability input, never ambient. OFF by default. See DDRM_DECRYPT_RAIL.md.
 rail-audit = ["rail-bind"]
+# rail-material: the consolidated, backend-neutral `SealedDecryptMaterialV1`
+# envelope Anders named — a single suite-TAGGED type (dKMS-native PQ-hybrid vs
+# P-256/Lit compat is a field, not a fork) that is the exact drop-in shape to fold
+# into the shared `DecryptSessionRequestV1` when the contract opens. `OpenSessionV1`
+# routes it through the audited/expiry-enforcing bound path; an unknown suite, and
+# the compat suite on the product path, both fail closed. OFF by default. See
+# DDRM_DECRYPT_RAIL.md §Consolidated envelope.
+rail-material = ["rail-audit"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

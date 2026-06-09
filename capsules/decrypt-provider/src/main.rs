@@ -80,6 +80,15 @@ enum Request {
         material: BoundRailMaterial,
         now_unix: u64,
     },
+    // Canonical open over the consolidated, suite-tagged `SealedDecryptMaterialV1`
+    // (feature `rail-material`) — the exact shape that folds into the shared
+    // contract. Routes through the audited/expiry-enforcing bound path.
+    #[cfg(feature = "rail-material")]
+    OpenSessionV1 {
+        request: Box<DecryptSessionRequestV1>,
+        material: SealedDecryptMaterialV1,
+        now_unix: u64,
+    },
     Shutdown,
 }
 
@@ -118,6 +127,50 @@ struct BoundRailMaterial {
     /// Object content hash (binds the CEK to THIS content; Anders' "object CID/
     /// content hash"), base64.
     content_hash_b64: String,
+}
+
+/// Consolidated, backend-neutral sealed decrypt material (feature `rail-material`)
+/// — the single envelope Anders named, and the exact drop-in shape to fold into the
+/// shared `DecryptSessionRequestV1` when the contract opens. The `suite` tag makes
+/// the backend a FIELD, not a fork: dKMS-native PQ-hybrid vs P-256/Lit compat are
+/// the same wire type. Carries only sealed/public bytes — never a raw CEK; the VM
+/// session secret stays in-VM. The remaining transcript fields come from the
+/// authenticated request + the boundary's provisioned state.
+#[cfg(feature = "rail-material")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedDecryptMaterialV1 {
+    /// Algorithm-suite tag: `elastos-pq-hybrid-threshold-v0` (product target) or
+    /// `p256-classical-compat` (PC2/Lit migration only).
+    suite: String,
+    sealed_cek_b64: String,
+    ciphertext_b64: String,
+    #[serde(default)]
+    init_segment_b64: Option<String>,
+    nonce_b64: String,
+    content_hash_b64: String,
+}
+
+/// The algorithm suite a `SealedDecryptMaterialV1` declares.
+#[cfg(feature = "rail-material")]
+enum DecryptSuite {
+    /// Product target: x25519+ML-KEM-768 KEM, ML-DSA-65 signature, transcript-bound.
+    PqHybridThreshold,
+    /// PC2/Lit compatibility (P-256 ECDH + AES-CBC) — migration only, not the
+    /// transcript-bound product path.
+    P256ClassicalCompat,
+}
+
+#[cfg(feature = "rail-material")]
+const DECRYPT_SUITE_CLASSICAL_COMPAT: &str = "p256-classical-compat";
+
+#[cfg(feature = "rail-material")]
+fn parse_decrypt_suite(suite: &str) -> Option<DecryptSuite> {
+    match suite {
+        DECRYPT_SUITE_ID => Some(DecryptSuite::PqHybridThreshold),
+        DECRYPT_SUITE_CLASSICAL_COMPAT => Some(DecryptSuite::P256ClassicalCompat),
+        _ => None,
+    }
 }
 
 /// Canonical decrypt transcript (feature `rail-bind`) — the exact field set Anders
@@ -270,6 +323,10 @@ impl DecryptProvider {
             #[cfg(feature = "rail-audit")]
             Request::OpenSessionAudited { request, material, now_unix } => {
                 self.open_session_audited(*request, &material, now_unix)
+            }
+            #[cfg(feature = "rail-material")]
+            Request::OpenSessionV1 { request, material, now_unix } => {
+                self.open_session_v1(*request, material, now_unix)
             }
             Request::Shutdown => Response::empty_ok(),
         }
@@ -593,6 +650,40 @@ impl DecryptProvider {
             }
             Err(_) => audited_response(&request, &transcript_hash, now_unix, "denied", "decrypt_failed", None),
         }
+    }
+
+    /// Canonical open over the consolidated `SealedDecryptMaterialV1` (feature
+    /// `rail-material`). The `suite` tag drives profile selection: the product
+    /// PQ-hybrid suite routes through the audited/expiry-enforcing transcript-bound
+    /// path; the P-256/Lit compat suite is recognised but **rejected** on this
+    /// (product, transcript-bound) path — it is migration-only; an unknown suite
+    /// fails closed. This is the single op the shared contract will expose.
+    #[cfg(feature = "rail-material")]
+    fn open_session_v1(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: SealedDecryptMaterialV1,
+        now_unix: u64,
+    ) -> Response {
+        match parse_decrypt_suite(&material.suite) {
+            Some(DecryptSuite::PqHybridThreshold) => {}
+            Some(DecryptSuite::P256ClassicalCompat) => {
+                return Response::error(
+                    "invalid_request",
+                    "the p256-classical-compat suite is migration-only; the transcript-bound open requires the PQ-hybrid suite",
+                )
+            }
+            None => return Response::error("invalid_request", "unsupported decrypt suite"),
+        }
+
+        let bound = BoundRailMaterial {
+            sealed_cek_b64: material.sealed_cek_b64,
+            ciphertext_b64: material.ciphertext_b64,
+            init_segment_b64: material.init_segment_b64,
+            nonce_b64: material.nonce_b64,
+            content_hash_b64: material.content_hash_b64,
+        };
+        self.open_session_audited(request, &bound, now_unix)
     }
 }
 
@@ -1806,5 +1897,87 @@ mod tests {
         let s = serde_json::to_string(&resp).unwrap();
         assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+    }
+
+    // --- consolidated suite-tagged SealedDecryptMaterialV1 (feature `rail-material`)
+    //
+    // The single backend-neutral envelope that folds into the shared contract: the
+    // `suite` tag drives profile selection. The product PQ-hybrid suite opens
+    // through the audited bound path; the compat suite is rejected on the product
+    // path; an unknown suite fails closed.
+
+    #[cfg(feature = "rail-material")]
+    fn material_v1(suite: &str, bound: &BoundRailMaterial) -> SealedDecryptMaterialV1 {
+        SealedDecryptMaterialV1 {
+            suite: suite.to_string(),
+            sealed_cek_b64: bound.sealed_cek_b64.clone(),
+            ciphertext_b64: bound.ciphertext_b64.clone(),
+            init_segment_b64: bound.init_segment_b64.clone(),
+            nonce_b64: bound.nonce_b64.clone(),
+            content_hash_b64: bound.content_hash_b64.clone(),
+        }
+    }
+
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_pq_suite_opens_through_audited_path() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let plaintext = b"consolidated envelope payload";
+        let (bound, session, authority_vk, pub_bytes) =
+            bound_setup([0xB1u8; 32], &req, &cek, plaintext, b"nonce-v1-1", &[0xABu8; 32]);
+        let material = material_v1(DECRYPT_SUITE_ID, &bound);
+
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req),
+            material,
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("opened"), "PQ suite opens: {v}");
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+    }
+
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_unknown_suite_fails_closed() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let (bound, session, authority_vk, pub_bytes) =
+            bound_setup([0xB2u8; 32], &req, &cek, b"payload", b"nonce-v1-2", &[0xABu8; 32]);
+        let material = material_v1("totally-unknown-suite-v9", &bound);
+        let provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.open_session_v1(req, material, 1_850_000_000);
+        assert_eq!(error_code(resp), "invalid_request", "an unknown suite must fail closed before any crypto");
+    }
+
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_classical_compat_suite_rejected_on_product_path() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let (bound, session, authority_vk, pub_bytes) =
+            bound_setup([0xB3u8; 32], &req, &cek, b"payload", b"nonce-v1-3", &[0xABu8; 32]);
+        let material = material_v1(DECRYPT_SUITE_CLASSICAL_COMPAT, &bound);
+        let provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let resp = provider.open_session_v1(req, material, 1_850_000_000);
+        assert_eq!(error_code(resp), "invalid_request", "compat suite is migration-only on the bound product path");
     }
 }

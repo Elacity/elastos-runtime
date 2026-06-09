@@ -1,6 +1,17 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~52 commits**, tip Day-48 expiry+audit). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry enforcement + scoped CEK-free audit (`rail-audit`).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~53 commits**, tip Day-49 consolidated envelope). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+
+> **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
+> The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
+> PQ-hybrid vs P-256/Lit compat is a FIELD, not a fork. The canonical op
+> `OpenSessionV1` routes by `suite` into the audited/expiry-enforcing transcript-bound
+> path; the compat suite is rejected on the product path and an unknown suite fails
+> closed (`rail-material`=65). `DDRM_DECRYPT_RAIL.md` now carries the **verbatim
+> additive `DecryptSessionRequestV1` delta** so Anders can lift it directly. This is
+> the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
+> remains is upstream — fold the envelope into the shared `elastos-common` contract
+> (needs push access) and the dKMS-direct sealing producer (needs Anders).
 
 > **🧾 Day 48 — short-expiry enforcement + scoped audit (Anders' "short expiry, audit", LANDED).**
 > `rail-audit`=62: new `OpenSessionAudited` op takes an injected capability clock

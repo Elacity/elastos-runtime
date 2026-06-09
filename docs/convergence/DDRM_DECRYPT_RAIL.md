@@ -219,6 +219,49 @@ fails closed and audits `denied`/`expired` with no session; the audit envelope i
 CEK/plaintext-free on both paths. (The shared bound-open path was refactored into
 `prepare_bound_open`; `rail-bind`/`rail-mint` counts unchanged.)
 
+### Consolidated envelope `SealedDecryptMaterialV1` — LANDED (`rail-material`, Day 49)
+
+The carrier is now a single backend-neutral, **suite-tagged** type — the exact
+drop-in shape to fold into the shared contract. The `suite` tag makes the backend a
+FIELD, not a fork (dKMS-native PQ-hybrid vs P-256/Lit compat). The canonical op
+`OpenSessionV1` routes by suite into the audited/expiry-enforcing bound path;
+the compat suite is recognised but rejected on the (product, transcript-bound)
+path, and an unknown suite fails closed (`rail-material`=65).
+
+**Verbatim additive contract delta** (lift into `elastos-common::protected_content`
+when the contract opens — `DecryptSessionRequestV1` gains exactly this field):
+
+```rust
+/// Backend-neutral, suite-tagged sealed decrypt material (Option A push-in).
+/// Carries only sealed/public bytes — never a raw CEK.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SealedDecryptMaterialV1 {
+    /// "elastos-pq-hybrid-threshold-v0" (product) | "p256-classical-compat" (migration).
+    pub suite: String,
+    /// CEK sealed to the decrypt VM's published session key (suite-specific wire form), base64.
+    pub sealed_cek_b64: String,
+    /// Ciphertext fMP4 segment (or a ContentHandleV1), base64.
+    pub ciphertext_b64: String,
+    /// Optional init segment (tenc IV defaults), base64.
+    pub init_segment_b64: Option<String>,
+    /// Per-release replay nonce (key-authority chosen), base64.
+    pub nonce_b64: String,
+    /// Object content hash binding the CEK to THIS content, base64.
+    pub content_hash_b64: String,
+}
+
+// on DecryptSessionRequestV1, additive:
+//   pub sealed_decrypt_material: Option<SealedDecryptMaterialV1>,
+// (Option<> keeps it additive: unset == today's fail-closed not_configured path;
+//  set == the live transcript-bound open. The decrypt-session public key the CEK
+//  is sealed to is published by the boundary at init, never a request field.)
+```
+
+When this lands, `OpenSessionV1` becomes the body of the normal `OpenSession` and
+all the `Open*Live/Bound/Audited/V1` capsule-local variants are deleted — the
+binding, expiry, audit, and in-sandbox key behaviour are already proven here.
+
 **Status of Anders' decrypt-side spec:** all four requirements are now implemented
 as fail-closed references — Option A push-in (`rail-live`), full-transcript binding
 (`rail-bind`), in-sandbox session key (`rail-mint`), short-expiry + audit
