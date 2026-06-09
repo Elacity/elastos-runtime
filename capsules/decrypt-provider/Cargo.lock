@@ -211,6 +211,7 @@ dependencies = [
  "getrandom",
  "ml-dsa",
  "ml-kem",
+ "p256",
  "rand_core",
  "sha2",
  "x25519-dalek",
@@ -222,7 +223,6 @@ name = "decrypt-provider"
 version = "0.1.0"
 dependencies = [
  "aes",
- "aes-gcm",
  "base64",
  "cbc",
  "cipher",
@@ -238,7 +238,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "x25519-dalek",
  "zeroize",
 ]
 

@@ -21,7 +21,11 @@ rail-prep = []
 # abstraction). The PQ analogue of the classical src/envelope.rs, proven to
 # recover a CEK in Zeroizing and build to wasm32-wasip1. OFF by default; pulls the
 # PQ crates only when enabled. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
-pq-envelope = ["dep:ml-kem", "dep:x25519-dalek", "dep:aes-gcm", "dep:sha2"]
+# The PQ-hybrid crypto now lives ONCE in the shared `ddrm-envelope` crate (the key
+# authority seals with it, this boundary unwraps with it). `pq_envelope.rs` re-exports
+# it, so x25519/aes-gcm are gone from here entirely; ml-kem + sha2 remain only because
+# the golden-vector helpers + stub signer still name those crates directly.
+pq-envelope = ["dep:ddrm-envelope", "dep:ml-kem", "dep:sha2"]
 # pq-rail-prep: the full pre-rail dDRM data path proven end to end — PQ-hybrid
 # unwrap (pq-envelope) -> cenc decrypt -> scoped output, CEK in Zeroizing
 # throughout. Unifies the rail-prep composition (Day 18), in-boundary keygen
@@ -45,7 +49,7 @@ pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
 # migration). Slots into the SAME CekSealVerifier the rail uses, so once both Q2
 # answers are pre-proven the rail landing is a pure policy pick. Enables the ecdsa
 # feature on the (already-present) p256 dep only when active; OFF by default.
-pq-mldsa-hybrid = ["pq-mldsa", "p256/ecdsa"]
+pq-mldsa-hybrid = ["pq-mldsa", "ddrm-envelope/hybrid", "p256/ecdsa"]
 # rail-shim-mldsa: the rail-shim carrier path driven by the REAL ML-DSA-65
 # verifier (not the stub) on a committed golden — the strongest pre-rail proof:
 # the real PQ signature verified through the exact `decrypt_from_carrier`
@@ -105,12 +109,12 @@ vectors = ["pq-rail-prep"]
 # gen-vectors: regenerate the committed golden vectors (writes tests/vectors/).
 # Run manually: `cargo test --features gen-vectors emit_`. OFF by default.
 gen-vectors = ["vectors"]
-# envelope-conformance: cross-capsule equivalence guard (Phase A.3). Proves the
-# shared `ddrm-envelope` crate (the key authority's seal) and this provider's
-# in-tree PQ-hybrid unwrap are wire- AND crypto-interoperable in BOTH directions —
-# so the two cannot silently drift while the full dedup migration is pending. Adds
-# one test under `pq-mldsa`; pulls `ddrm-envelope` (dev-dep) only for the guard.
-# OFF by default — the shipped build never links the shared crate here.
+# envelope-conformance: end-to-end key->decrypt handoff guard. Has the key authority
+# (shared `ddrm-envelope`) seal a CEK to a published decrypt-session key and this
+# provider open it via its `pq_envelope` unwrap — pinning the published-key round-trip,
+# the ML-DSA-65 vk encoding, and the wire decode across the boundary. Since Day-53 the
+# unwrap re-exports the shared crate, so this also confirms the dedup stays coherent.
+# Adds one test under `pq-mldsa`. OFF by default.
 envelope-conformance = ["pq-mldsa"]
 
 [dependencies]
@@ -128,12 +132,15 @@ elliptic-curve = { version = "0.13", default-features = false, features = ["sec1
 cbc = { version = "0.1", features = ["alloc"] }
 cipher = { version = "0.4", features = ["block-padding", "alloc"] }
 zeroize = "1"
-# PQ-hybrid CEK-seal profile (feature `pq-envelope`, optional). ml-kem (FIPS 203
-# ML-KEM-768) + x25519 form the hybrid KEM; aes-gcm wraps the CEK; sha2 is the KDF
-# that binds both shared secrets. Versions match the Day-15 wasm-viability proof.
+# Single source of truth for the PQ-hybrid seal/unwrap + wire format + ML-DSA-65
+# signer/verifier (feature `pq-envelope`). `src/pq_envelope.rs` re-exports it so the
+# crypto (x25519 + ML-KEM-768 KEM, AES-256-GCM wrap, SHA-256 KDF) exists ONCE and the
+# key authority + decrypt boundary cannot drift. Versions match the Day-15 proof.
+ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+# ml-kem + sha2 stay only for the test-side golden-vector helpers (ML-KEM key
+# (de)serialization) and the deterministic stub signer; the live crypto is in
+# ddrm-envelope.
 ml-kem = { version = "0.2.3", optional = true }
-x25519-dalek = { version = "2", features = ["static_secrets"], optional = true }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"], optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
 # ML-DSA-65 (FIPS 204) signature — the shipped PQ-rail seal-signature primitive
 # behind CekSealVerifier (feature `pq-mldsa`). Same RustCrypto family as ml-kem
@@ -149,10 +156,6 @@ getrandom = { version = "0.2", optional = true }
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
 getrandom = "0.2"
-# Cross-capsule equivalence guard only (feature `envelope-conformance`). The shared
-# PQ-hybrid crate the key authority seals with — proven here to interoperate with
-# this provider's in-tree unwrap. Dev-only: never linked into the shipped capsule.
-ddrm-envelope = { path = "../ddrm-envelope" }
 
 [profile.release]
 opt-level = "s"

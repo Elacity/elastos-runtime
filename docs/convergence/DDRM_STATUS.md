@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~58 commits**, tip Day-52 cross-capsule equivalence guard — `ddrm-envelope` seal proven interoperable with `decrypt-provider`'s in-tree unwrap). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~59 commits**, tip Day-53 dedup COMPLETE — `decrypt-provider` re-exports the shared `ddrm-envelope`; the PQ crypto now lives in exactly one place). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,26 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **♻️ Day 53 — dedup COMPLETE: `decrypt-provider` re-exports `ddrm-envelope` (Phase A.3b, LANDED).**
+> The PQ-hybrid crypto now lives in **exactly one place**. `decrypt-provider::pq_envelope`
+> deleted its in-tree copy (seal/unwrap/wire/verifiers/KDF, ~370 lines) and re-exports the
+> shared crate under the historical `crate::pq_envelope::*` paths, so dispatch, the rail
+> shim, the golden vectors and every test suite are **byte-for-byte unchanged**. The CENC
+> glue (`decrypt_pq_sealed_segment*`, which calls `crate::decrypt_session_segment`) and the
+> test-only `seal_support` stubs stay local; the seal engine itself is re-exported. To
+> enable this the shared crate widened its surface (`pub signed_payload`, re-exported raw
+> `Ciphertext`/`MlKem768`/`MlKemDk`/`MlKemEk`/`XStaticSecret`). The now-redundant
+> `x25519-dalek` + `aes-gcm` deps were **pruned** from `decrypt-provider` (they live solely
+> in `ddrm-envelope`); `ml-kem` + `sha2` remain only for the test-side golden helpers + stub
+> signer. **Gate (pure refactor, zero behaviour change):** all **22** ladder combos keep
+> their EXACT counts, the committed goldens replay byte-identically (vectors=42, rail-shim=45,
+> harden=65 unchanged), wasm clean, drift PASS, no new warnings. The Day-52 equivalence
+> guard (`envelope-conformance`=35) still passes — now confirming the dedup stays coherent.
+> **Next (Phase A.4):** a shared decrypt-transcript `to_aad` (so the key authority and the
+> decrypt boundary agree on the binding) + the dev orchestration smoke
+> `drm/open → rights → key (reference) → decrypt`, proving the consumer half runs end to end
+> without Lit/dKMS.
 
 > **🔗 Day 52 — cross-capsule equivalence guard: `ddrm-envelope` ⇄ `decrypt-provider` (Phase A.3, LANDED).**
 > The shared crate (what the key authority seals with) is now **provably wire- AND

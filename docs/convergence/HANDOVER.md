@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 52).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-52 cross-capsule equivalence guard — `ddrm-envelope` seal proven interoperable with `decrypt-provider`'s in-tree unwrap, ~58 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 53).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-53 dedup COMPLETE — `decrypt-provider` re-exports the shared `ddrm-envelope`; PQ crypto lives in one place, ~59 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -513,19 +513,18 @@ a pluggable multi-backend authority (A.1); Day 51 landed the **reference seal en
 + the shared **`ddrm-envelope`** crate (A.2) — the reference authority now seals a CEK
 to a decrypt session's published key and the decrypt boundary's exact unwrap opens it
 (cross-boundary proof). Day 52 landed the **cross-capsule equivalence guard** (A.3,
-feature `envelope-conformance`): the shared crate's seal is proven wire- AND
-crypto-interoperable with `decrypt-provider`'s OWN in-tree unwrap (real key→decrypt
-direction, transcript-bound, no CEK on the wire) — so the two impls **cannot silently
-drift** while the duplication remains. Next, in order:
-- **Phase A.3b** — complete the dedup *behind that guard*: re-export the shared impl from
-  `decrypt-provider::pq_envelope` and widen `ddrm-envelope`'s surface where the existing
-  tests need it (`pub signed_payload`, raw-type re-exports). Deferred from a single
-  rip-out because the decrypt PQ tests are bound to the concrete crypto types (they build
-  `PqSealedEnvelope` literals, touch raw `ml-kem`/`x25519`, call private `signed_payload`);
-  the guard now makes that migration safe — it must keep passing.
-- **Phase A.4** — wire the orchestration `drm/open → rights → key (reference) → decrypt`
-  for a dev profile so the consumer half runs end-to-end without Lit/dKMS (needs a shared
-  decrypt-transcript `to_aad` so the authority and decrypt agree on the binding).
+feature `envelope-conformance`): the shared crate's seal proven wire- AND
+crypto-interoperable with `decrypt-provider`'s unwrap. Day 53 then **completed the dedup**
+(A.3b): `decrypt-provider::pq_envelope` deleted its in-tree PQ crypto (~370 lines) and now
+re-exports `ddrm-envelope` under the historical `crate::pq_envelope::*` paths — so the PQ
+crypto lives in **exactly one place** and cannot drift. Pure refactor: all 22 ladder combos
+kept their exact counts, goldens replayed byte-identically, wasm clean, drift PASS; the
+shared crate widened its surface (`pub signed_payload`, raw-type re-exports) and the
+redundant `x25519-dalek`/`aes-gcm` deps were pruned from `decrypt-provider`. Next, in order:
+- **Phase A.4** — a shared decrypt-transcript `to_aad` (so the key authority and the decrypt
+  boundary agree on the transcript binding), then wire the orchestration
+  `drm/open → rights → key (reference) → decrypt` for a dev profile so the consumer half
+  runs end-to-end without Lit/dKMS. This is the first point a human can drive the chain.
 - **Phase B** — point `rights-provider` at `chain-provider::has_access_by_content_id`
   for real Base validation with the wallet.
 

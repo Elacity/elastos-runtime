@@ -25,377 +25,51 @@
 //! `pq-envelope` feature (Parallel Change). It pulls the PQ crates only when the
 //! feature is enabled, leaving the default build/test surface unchanged.
 
-#![allow(dead_code)] // rail-candidate: tested island, not yet wired into dispatch
+// `unused_imports`: this is a binary crate, so the path-preserving `pub use`
+// re-exports below have no external consumers — in feature-combos that don't
+// reference a given item internally the compiler reads it as unused. They exist to
+// keep `crate::pq_envelope::*` stable for dispatch / rail shim / tests.
+// `module_inception`: the `mldsa`/`hybrid` re-export modules mirror the shared
+// crate's module names on purpose, to preserve the historical paths.
+#![allow(dead_code, unused_imports, clippy::module_inception)]
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
-use ml_kem::kem::Decapsulate;
-use ml_kem::{Ciphertext, KemCore, MlKem768};
-use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
-use zeroize::Zeroizing;
+// ---------------------------------------------------------------------------
+// Adapter onto the shared `ddrm-envelope` crate (Phase A.3b dedup).
+//
+// The PQ-hybrid crypto now has ONE home: `ddrm-envelope`. The key authority
+// (`key-provider`) seals with it; this boundary unwraps with it. We re-export it
+// under the historical `crate::pq_envelope::*` paths so dispatch, the rail shim,
+// the golden vectors and the test suites are byte-for-byte unchanged, while the
+// implementation can no longer drift. The ONLY code that stays local is the CENC
+// glue below (it calls `crate::decrypt_session_segment`) and the test-only
+// `seal_support` helpers.
+// ---------------------------------------------------------------------------
+pub use ddrm_envelope::{
+    hybrid_unwrap, hybrid_unwrap_bound, session_public_bytes, session_public_from_bytes,
+    CekSealVerifier, Ciphertext, MlKem768, MlKemDk, MlKemEk, PqEnvelopeError, PqSealedEnvelope,
+    SessionKemPublic, SessionKemSecret, XStaticSecret,
+};
 
-type MlKemDk = <MlKem768 as KemCore>::DecapsulationKey;
-type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
-
-/// Domain separation + profile binding for the wrap-key KDF.
-const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
-
-/// Fail-closed error surface. Messages are coarse so a forged envelope cannot
-/// probe internal state (which half failed).
-#[derive(Debug, PartialEq, Eq)]
-pub enum PqEnvelopeError {
-    BadSignature,
-    DecapFailed,
-    UnsealFailed,
-}
-
-/// The decrypt VM's per-session hybrid KEM secret. Mirrors PC2 `ddrm-decrypt`'s
-/// per-session keypair (`session.rs`), upgraded x25519 → x25519+ML-KEM-768. The
-/// secret never leaves the VM; `x25519` is zeroized on drop and the ML-KEM
-/// decapsulation key holds its secret internally.
-pub struct SessionKemSecret {
-    pub x25519: XStaticSecret,
-    pub mlkem_dk: MlKemDk,
-}
-
-/// The published session public key the key authority seals the CEK to.
-pub struct SessionKemPublic {
-    pub x25519: XPublicKey,
-    pub mlkem_ek: MlKemEk,
-}
-
-/// Canonical published-pubkey encoding (`x25519(32) ‖ ML-KEM-768 ek`) — the exact
-/// bytes the key authority seals to and that the decrypt boundary binds into the
-/// transcript as `decrypt_session_pub`. Both sides must agree byte-for-byte.
-pub fn session_public_bytes(public: &SessionKemPublic) -> Vec<u8> {
-    use ml_kem::EncodedSizeUser;
-    let mut v = Vec::new();
-    v.extend_from_slice(public.x25519.as_bytes());
-    v.extend_from_slice(public.mlkem_ek.as_bytes().as_slice());
-    v
-}
-
-/// Parse a published session public key back from `session_public_bytes`. `None` on
-/// any wrong-size/malformed encoding (fail-closed). The counterpart the key
-/// authority uses to seal to a boundary's freshly-minted, published key.
-pub fn session_public_from_bytes(bytes: &[u8]) -> Option<SessionKemPublic> {
-    use ml_kem::{Encoded, EncodedSizeUser};
-    if bytes.len() < 32 {
-        return None;
-    }
-    let (x, ek) = bytes.split_at(32);
-    let xarr: [u8; 32] = x.try_into().ok()?;
-    let x25519 = XPublicKey::from(xarr);
-    let enc = Encoded::<MlKemEk>::try_from(ek).ok()?;
-    let mlkem_ek = MlKemEk::from_bytes(&enc);
-    Some(SessionKemPublic { x25519, mlkem_ek })
-}
-
-/// Mint a fresh per-session hybrid KEM keypair INSIDE the decrypt sandbox (feature
-/// `rail-mint`, Anders' Day-45 requirement). The secret never leaves the boundary;
-/// the caller publishes `session_public_bytes(&public)` for the key authority to
-/// seal to. This is the ONE place the decrypt boundary needs entropy — keygen —
-/// and it uses `OsRng` (WASI `random_get` on wasm32-wasip1). The unwrap path stays
-/// RNG-free.
+/// In-sandbox session-key mint (feature `rail-mint`, Anders' Day-45 requirement) —
+/// re-exported so the boundary mints + publishes with the same keygen the key
+/// authority seals to.
 #[cfg(feature = "rail-mint")]
-pub fn mint_session() -> (SessionKemSecret, SessionKemPublic) {
-    use rand_core::OsRng;
-    let mut rng = OsRng;
-    let x_sk = XStaticSecret::random_from_rng(&mut rng);
-    let x_pk = XPublicKey::from(&x_sk);
-    let (dk, ek) = MlKem768::generate(&mut rng);
-    (
-        SessionKemSecret { x25519: x_sk, mlkem_dk: dk },
-        SessionKemPublic { x25519: x_pk, mlkem_ek: ek },
-    )
-}
+pub use ddrm_envelope::mint_session;
 
-/// Verifier behind which the signature scheme is swapped (ml-dsa-65 / hybrid).
-pub trait CekSealVerifier {
-    fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;
-}
-
-/// Real ML-DSA-65 (FIPS 204) seal-signature verifier — the shipped PQ-rail
-/// signature primitive plugged into the `CekSealVerifier` slot in place of the
-/// test stub. The decrypt boundary only ever *verifies* (the key authority signs
-/// the CEK-seal), so construction + verify need NO RNG and pull no `getrandom`,
-/// keeping this compilable to `wasm32-wasip1`. Fail-closed: a wrong-size key
-/// encoding yields no verifier (`from_encoded` → `None`) and a malformed or
-/// non-matching signature verifies `false` — no panic, no which-half state probe.
+/// Real ML-DSA-65 (FIPS 204) seal-signature verifier, preserved at the historical
+/// `crate::pq_envelope::mldsa::MlDsa65Verifier` path (now sourced once from the
+/// shared crate).
 #[cfg(feature = "pq-mldsa")]
 pub mod mldsa {
-    use super::CekSealVerifier;
-    use ml_dsa::{KeyInit, MlDsa65, Signature, Verifier, VerifyingKey};
-
-    pub struct MlDsa65Verifier {
-        vk: VerifyingKey<MlDsa65>,
-    }
-
-    impl MlDsa65Verifier {
-        /// Build from the FIPS 204 verifying-key encoding (Algorithm 22 `pkEncode`)
-        /// the key authority publishes. `None` on a wrong-size/malformed encoding.
-        pub fn from_encoded(bytes: &[u8]) -> Option<Self> {
-            VerifyingKey::<MlDsa65>::new_from_slice(bytes)
-                .ok()
-                .map(|vk| Self { vk })
-        }
-    }
-
-    impl CekSealVerifier for MlDsa65Verifier {
-        fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
-            match Signature::<MlDsa65>::try_from(sig) {
-                Ok(s) => self.vk.verify(msg, &s).is_ok(),
-                Err(_) => false,
-            }
-        }
-    }
+    pub use ddrm_envelope::MlDsa65Verifier;
 }
 
-/// Hybrid (classical + post-quantum) seal-signature verifier — the OTHER answer to
-/// Anders' open Q2 (`DDRM_DECRYPT_RAIL.md`). A classical **ECDSA-P256** signature
-/// AND a PQ **ML-DSA-65** signature over the same payload must **both** verify;
-/// either failing fails closed. This is the migration-period profile: during PC2's
-/// classical→PQ transition the key authority can dual-sign, so a verifier that
-/// trusts neither algorithm alone still accepts the seal — defense-in-depth without
-/// a flag day. It plugs into the exact same `CekSealVerifier` slot as the straight
-/// `MlDsa65Verifier`, so with both pre-proven the rail landing is a pure policy
-/// pick (which verifier `OpenSession` constructs), never a build gap.
-///
-/// Wire layout of the hybrid signature: `u32 ecdsa_len ‖ ecdsa(DER) ‖ u32 mldsa_len
-/// ‖ mldsa`. Verify-only + RNG-free → `wasm32-wasip1`-clean. Fail-closed: a wrong
-/// key, malformed half, or trailing bytes verify `false` with no which-half probe.
+/// Hybrid (ECDSA-P256 + ML-DSA-65) seal-signature verifier, preserved at the
+/// historical `crate::pq_envelope::hybrid::HybridVerifier` path (now sourced once
+/// from the shared crate).
 #[cfg(feature = "pq-mldsa-hybrid")]
 pub mod hybrid {
-    use super::mldsa::MlDsa65Verifier;
-    use super::CekSealVerifier;
-    use p256::ecdsa::{signature::Verifier as _, Signature as EcdsaSig, VerifyingKey as EcdsaVk};
-
-    pub struct HybridVerifier {
-        ecdsa: EcdsaVk,
-        mldsa: MlDsa65Verifier,
-    }
-
-    impl HybridVerifier {
-        /// Build from the key authority's published keys: the ECDSA verifying key
-        /// (SEC1 point, compressed or uncompressed) + the ML-DSA-65 verifying-key
-        /// encoding. `None` if either is malformed (fail-closed construction).
-        pub fn from_encoded(ecdsa_sec1: &[u8], mldsa_vk: &[u8]) -> Option<Self> {
-            let ecdsa = EcdsaVk::from_sec1_bytes(ecdsa_sec1).ok()?;
-            let mldsa = MlDsa65Verifier::from_encoded(mldsa_vk)?;
-            Some(Self { ecdsa, mldsa })
-        }
-
-        /// Split a hybrid signature into (ecdsa_der, mldsa) halves; `None` on any
-        /// malformed/truncated framing or trailing bytes.
-        fn split(sig: &[u8]) -> Option<(&[u8], &[u8])> {
-            fn rd<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Option<&'a [u8]> {
-                let end = off.checked_add(n)?;
-                if end > b.len() {
-                    return None;
-                }
-                let s = &b[*off..end];
-                *off = end;
-                Some(s)
-            }
-            let mut off = 0usize;
-            let l0 = u32::from_be_bytes(rd(sig, &mut off, 4)?.try_into().ok()?) as usize;
-            let ecdsa = rd(sig, &mut off, l0)?;
-            let l1 = u32::from_be_bytes(rd(sig, &mut off, 4)?.try_into().ok()?) as usize;
-            let mldsa = rd(sig, &mut off, l1)?;
-            if off != sig.len() {
-                return None; // no trailing bytes — exact framing only
-            }
-            Some((ecdsa, mldsa))
-        }
-
-        /// Encode a hybrid signature from its two halves (key-authority/test side).
-        #[allow(dead_code)] // the decrypt boundary only verifies; encode is signer-side
-        pub fn encode_signature(ecdsa_der: &[u8], mldsa: &[u8]) -> Vec<u8> {
-            let mut v = Vec::with_capacity(8 + ecdsa_der.len() + mldsa.len());
-            v.extend_from_slice(&(ecdsa_der.len() as u32).to_be_bytes());
-            v.extend_from_slice(ecdsa_der);
-            v.extend_from_slice(&(mldsa.len() as u32).to_be_bytes());
-            v.extend_from_slice(mldsa);
-            v
-        }
-    }
-
-    impl CekSealVerifier for HybridVerifier {
-        fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
-            let (ecdsa_sig, mldsa_sig) = match Self::split(sig) {
-                Some(halves) => halves,
-                None => return false,
-            };
-            let es = match EcdsaSig::from_der(ecdsa_sig) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            // BOTH halves must verify — classical AND post-quantum.
-            self.ecdsa.verify(msg, &es).is_ok() && self.mldsa.verify(msg, mldsa_sig)
-        }
-    }
-}
-
-/// A PQ-hybrid sealed CEK envelope. Carries only public/sealed material; the CEK
-/// exists only after a correct in-VM unwrap.
-pub struct PqSealedEnvelope {
-    /// Ephemeral x25519 public key (sender side of the DH half).
-    pub eph_x25519_pub: [u8; 32],
-    /// ML-KEM-768 encapsulation ciphertext (the PQ half).
-    pub kem_ct: Ciphertext<MlKem768>,
-    /// AES-256-GCM nonce.
-    pub nonce: [u8; 12],
-    /// AEAD-wrapped CEK (ciphertext ‖ tag).
-    pub wrapped_cek: Vec<u8>,
-    /// Signature over `signed_payload()` (scheme behind `CekSealVerifier`).
-    pub signature: Vec<u8>,
-}
-
-impl PqSealedEnvelope {
-    /// Flatten to a length-prefixed wire blob — used for transport and for the
-    /// containment check that the raw CEK never appears in the sealed bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(&self.eph_x25519_pub);
-        let ct = self.kem_ct.as_slice();
-        v.extend_from_slice(&(ct.len() as u32).to_be_bytes());
-        v.extend_from_slice(ct);
-        v.extend_from_slice(&self.nonce);
-        v.extend_from_slice(&(self.wrapped_cek.len() as u32).to_be_bytes());
-        v.extend_from_slice(&self.wrapped_cek);
-        v.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
-        v.extend_from_slice(&self.signature);
-        v
-    }
-
-    /// Decode a sealed envelope from its `to_bytes()` wire form — the wire-decode
-    /// the live rail performs on the carrier it receives (Option A,
-    /// `DDRM_DECRYPT_RAIL.md`). Coarse `UnsealFailed` on any malformed/truncated
-    /// input so a forged carrier cannot probe which field failed.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqEnvelopeError> {
-        fn read<'a>(b: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], PqEnvelopeError> {
-            let end = off.checked_add(n).ok_or(PqEnvelopeError::UnsealFailed)?;
-            if end > b.len() {
-                return Err(PqEnvelopeError::UnsealFailed);
-            }
-            let s = &b[*off..end];
-            *off = end;
-            Ok(s)
-        }
-        fn read_u32(b: &[u8], off: &mut usize) -> Result<usize, PqEnvelopeError> {
-            let s = read(b, off, 4)?;
-            Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)
-        }
-
-        let mut off = 0usize;
-        let eph: [u8; 32] = read(bytes, &mut off, 32)?
-            .try_into()
-            .map_err(|_| PqEnvelopeError::UnsealFailed)?;
-        let ct_len = read_u32(bytes, &mut off)?;
-        let ct_bytes = read(bytes, &mut off, ct_len)?;
-        let kem_ct =
-            Ciphertext::<MlKem768>::try_from(ct_bytes).map_err(|_| PqEnvelopeError::UnsealFailed)?;
-        let nonce: [u8; 12] = read(bytes, &mut off, 12)?
-            .try_into()
-            .map_err(|_| PqEnvelopeError::UnsealFailed)?;
-        let wrapped_len = read_u32(bytes, &mut off)?;
-        let wrapped_cek = read(bytes, &mut off, wrapped_len)?.to_vec();
-        let sig_len = read_u32(bytes, &mut off)?;
-        let signature = read(bytes, &mut off, sig_len)?.to_vec();
-
-        Ok(PqSealedEnvelope {
-            eph_x25519_pub: eph,
-            kem_ct,
-            nonce,
-            wrapped_cek,
-            signature,
-        })
-    }
-
-    /// The bytes the signature covers (everything except the signature itself).
-    fn signed_payload(&self) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend_from_slice(&self.eph_x25519_pub);
-        v.extend_from_slice(self.kem_ct.as_slice());
-        v.extend_from_slice(&self.nonce);
-        v.extend_from_slice(&self.wrapped_cek);
-        v
-    }
-}
-
-/// Derive the 32-byte AEAD wrap key from BOTH KEM shared secrets. Length-prefixed
-/// + labelled so the two halves cannot be confused or truncated.
-fn derive_wrap_key(x_ss: &[u8], pq_ss: &[u8]) -> Zeroizing<[u8; 32]> {
-    let mut h = Sha256::new();
-    h.update(KDF_LABEL);
-    h.update((x_ss.len() as u32).to_be_bytes());
-    h.update(x_ss);
-    h.update((pq_ss.len() as u32).to_be_bytes());
-    h.update(pq_ss);
-    let digest = h.finalize();
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&digest);
-    key
-}
-
-/// Unwrap the CEK INSIDE the decrypt boundary: verify the signature, run the
-/// hybrid KEM (x25519 DH + ML-KEM-768 decapsulate), derive the AEAD wrap key, and
-/// AEAD-open the wrapped CEK. Returns the CEK in `Zeroizing`.
-///
-/// This is the PQ analogue of `envelope::ecdh_unwrap`; the rail wires it in place
-/// of the classical P-256 path under the PQ profile. No RNG, no outbound
-/// authority — a pure in-VM transform.
-pub fn hybrid_unwrap(
-    session: &SessionKemSecret,
-    envelope: &PqSealedEnvelope,
-    verifier: &impl CekSealVerifier,
-) -> Result<Zeroizing<Vec<u8>>, PqEnvelopeError> {
-    hybrid_unwrap_bound(session, envelope, b"", verifier)
-}
-
-/// Transcript-bound unwrap (Anders, Day 45 decision): identical to `hybrid_unwrap`
-/// but BINDS the sealed CEK to an external `aad` transcript. The signature must
-/// cover `signed_payload() ‖ aad` AND the AES-256-GCM open uses `aad` as
-/// additional authenticated data — so the same sealed CEK is cryptographically
-/// welded to exactly one (principal, session, object, receipt, session pubkey,
-/// suite, provider, nonce) transcript. ANY transcript mismatch (replay against a
-/// different session/object/receipt, a swapped output kind, an expired window)
-/// fails closed at the GCM tag or the signature, before any plaintext exists.
-///
-/// `aad == b""` is exactly the legacy behaviour (GCM with zero-length AAD), so the
-/// committed unbound goldens are byte-for-byte unchanged.
-pub fn hybrid_unwrap_bound(
-    session: &SessionKemSecret,
-    envelope: &PqSealedEnvelope,
-    aad: &[u8],
-    verifier: &impl CekSealVerifier,
-) -> Result<Zeroizing<Vec<u8>>, PqEnvelopeError> {
-    let mut signed = envelope.signed_payload();
-    signed.extend_from_slice(aad);
-    if !verifier.verify(&signed, &envelope.signature) {
-        return Err(PqEnvelopeError::BadSignature);
-    }
-
-    // x25519 DH half.
-    let eph_pub = XPublicKey::from(envelope.eph_x25519_pub);
-    let x_ss = session.x25519.diffie_hellman(&eph_pub);
-
-    // ML-KEM-768 decapsulate half.
-    let pq_ss = session
-        .mlkem_dk
-        .decapsulate(&envelope.kem_ct)
-        .map_err(|_| PqEnvelopeError::DecapFailed)?;
-
-    let wrap_key = derive_wrap_key(x_ss.as_bytes(), pq_ss.as_slice());
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key[..]));
-    let cek = cipher
-        .decrypt(
-            Nonce::from_slice(&envelope.nonce),
-            Payload { msg: envelope.wrapped_cek.as_ref(), aad },
-        )
-        .map_err(|_| PqEnvelopeError::UnsealFailed)?;
-    Ok(Zeroizing::new(cek))
+    pub use ddrm_envelope::hybrid::HybridVerifier;
 }
 
 /// Full pre-rail dDRM data path (PREP — feature `pq-rail-prep`, not wired into
@@ -444,6 +118,7 @@ pub fn decrypt_pq_sealed_segment_bound(
     init_segment: Option<&[u8]>,
 ) -> Result<(Vec<u8>, serde_json::Value), String> {
     use base64::Engine as _;
+    use zeroize::Zeroizing;
 
     let cek =
         hybrid_unwrap_bound(session, sealed_envelope, aad, verifier).map_err(|err| format!("{err:?}"))?;
@@ -454,23 +129,26 @@ pub fn decrypt_pq_sealed_segment_bound(
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
-/// Key-authority-side seal helpers — the counterpart of the in-VM unwrap. Shared
-/// by the unit tests and the rail-shim tests (so the carrier path is exercised
-/// with the same sealing the round-trip pins). Test-only — never compiled into a
-/// shipped build, so it carries no production dependency weight.
+/// Key-authority-side seal helpers — the counterpart of the in-VM unwrap. The seal
+/// ENGINE itself now lives once in the shared `ddrm-envelope` crate (the same code
+/// the real key authority seals with), re-exported here under the historical
+/// `seal_support::*` paths; this module only adds the deterministic test signer
+/// stubs + the session helpers the suites use. Test-only — never in a shipped build.
 #[cfg(test)]
 pub(crate) mod seal_support {
-    use super::*;
-    use ml_kem::kem::Encapsulate;
-    use rand_core::{OsRng, RngCore};
-    use x25519_dalek::EphemeralSecret;
+    use super::{CekSealVerifier, SessionKemPublic, SessionKemSecret};
+    use sha2::{Digest, Sha256};
 
-    /// Signer behind the same abstraction as the verifier. A deterministic stub
-    /// stands in for ml-dsa-65 — the round-trip proves the abstraction binds the
-    /// envelope, not the specific signature primitive.
-    pub trait CekSealSigner {
-        fn sign(&self, msg: &[u8]) -> Vec<u8>;
-    }
+    // The seal engine + signer abstraction + real ML-DSA-65 signer/keypair live once
+    // in the shared crate. Re-exported so the round-trip + rail-shim suites keep
+    // sealing with the exact bytes the key authority produces.
+    pub use ddrm_envelope::seal::{
+        mldsa_seal_keypair, seal, seal_bound, CekSealSigner, MlDsaSealSigner,
+    };
+
+    /// Deterministic stub standing in for ml-dsa-65 — the round-trip proves the
+    /// abstraction binds the envelope, not the specific signature primitive. Kept
+    /// byte-identical so the committed stub-signed goldens still replay.
     pub struct StubSigner;
     impl CekSealSigner for StubSigner {
         fn sign(&self, msg: &[u8]) -> Vec<u8> {
@@ -487,99 +165,22 @@ pub(crate) mod seal_support {
         }
     }
 
-    /// Real ML-DSA-65 key-authority signer (shared with the rail-live provider test
-    /// so the carrier it seals is verified by the production `MlDsa65Verifier`).
-    /// Deterministic from seed — no RNG.
-    #[cfg(feature = "pq-mldsa")]
-    pub struct MlDsaSealSigner {
-        sk: ml_dsa::SigningKey<ml_dsa::MlDsa65>,
-    }
-    #[cfg(feature = "pq-mldsa")]
-    impl CekSealSigner for MlDsaSealSigner {
-        fn sign(&self, msg: &[u8]) -> Vec<u8> {
-            use ml_dsa::{SignatureEncoding, Signer};
-            self.sk.sign(msg).to_bytes().to_vec()
-        }
-    }
-    /// `(signer, verifying_key_encoding)` — the vk is what the decrypt provider is
-    /// configured to trust.
-    #[cfg(feature = "pq-mldsa")]
-    pub fn mldsa_seal_keypair(seed: [u8; 32]) -> (MlDsaSealSigner, Vec<u8>) {
-        use ml_dsa::{Keypair, MlDsa65, SigningKey};
-        let s: ml_dsa::B32 = seed.into();
-        let sk = SigningKey::<MlDsa65>::from_seed(&s);
-        let vk = sk.verifying_key().encode().to_vec();
-        (MlDsaSealSigner { sk }, vk)
-    }
-
+    /// Mint a fresh session keypair (test side) — the shared keygen the boundary
+    /// uses, so a sealed-then-unwrapped round-trip exercises the production path.
     pub fn gen_session() -> (SessionKemSecret, SessionKemPublic) {
-        let mut rng = OsRng;
-        let x_sk = XStaticSecret::random_from_rng(&mut rng);
-        let x_pk = XPublicKey::from(&x_sk);
-        let (dk, ek) = MlKem768::generate(&mut rng);
-        (
-            SessionKemSecret { x25519: x_sk, mlkem_dk: dk },
-            SessionKemPublic { x25519: x_pk, mlkem_ek: ek },
-        )
+        ddrm_envelope::mint_session()
     }
 
-    /// Reconstruct the VM session secret from its serialized parts (the x25519
-    /// static secret + the ML-KEM-768 decapsulation key) — deterministic, no RNG.
-    /// Mirrors how the live VM would restore its session key, and how the PQ golden
-    /// vectors are replayed.
-    pub fn session_secret_from_parts(x25519_secret: &[u8; 32], mlkem_dk_bytes: &[u8]) -> SessionKemSecret {
-        use ml_kem::{Encoded, EncodedSizeUser};
-        let x25519 = XStaticSecret::from(*x25519_secret);
-        let enc = Encoded::<MlKemDk>::try_from(mlkem_dk_bytes).expect("ML-KEM dk size");
-        let mlkem_dk = MlKemDk::from_bytes(&enc);
-        SessionKemSecret { x25519, mlkem_dk }
-    }
-
-    /// Seal a CEK to a published session public key exactly as the key authority
-    /// would (independently constructing the wire shape), so the round-trip pins
-    /// the rail contract end to end.
-    pub fn seal(public: &SessionKemPublic, cek: &[u8], signer: &impl CekSealSigner) -> PqSealedEnvelope {
-        seal_bound(public, cek, b"", signer)
-    }
-
-    /// Transcript-bound seal — the key-authority counterpart of
-    /// `hybrid_unwrap_bound`. Wraps the CEK with `aad` as AES-256-GCM additional
-    /// authenticated data and signs `signed_payload() ‖ aad`, so the produced
-    /// envelope only opens under the identical transcript. `aad == b""` reproduces
-    /// `seal` exactly (committed goldens unchanged).
-    pub fn seal_bound(
-        public: &SessionKemPublic,
-        cek: &[u8],
-        aad: &[u8],
-        signer: &impl CekSealSigner,
-    ) -> PqSealedEnvelope {
-        let mut rng = OsRng;
-        // x25519 ephemeral DH half.
-        let eph = EphemeralSecret::random_from_rng(&mut rng);
-        let eph_pub = XPublicKey::from(&eph);
-        let x_ss = eph.diffie_hellman(&public.x25519);
-        // ML-KEM-768 encapsulate half.
-        let (kem_ct, pq_ss) = public.mlkem_ek.encapsulate(&mut rng).expect("encapsulate");
-
-        let wrap_key = derive_wrap_key(x_ss.as_bytes(), pq_ss.as_slice());
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&wrap_key[..]));
-        let mut nonce = [0u8; 12];
-        rng.fill_bytes(&mut nonce);
-        let wrapped_cek = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: cek, aad })
-            .expect("aead wrap");
-
-        let mut env = PqSealedEnvelope {
-            eph_x25519_pub: eph_pub.to_bytes(),
-            kem_ct,
-            nonce,
-            wrapped_cek,
-            signature: Vec::new(),
-        };
-        let mut signed = env.signed_payload();
-        signed.extend_from_slice(aad);
-        env.signature = signer.sign(&signed);
-        env
+    /// Reconstruct the VM session secret from its serialized parts — deterministic,
+    /// no RNG. Mirrors how the live VM restores its session key + how the PQ golden
+    /// vectors replay. Panics on a malformed dk encoding (test helper; the shared
+    /// crate's production parse is fallible).
+    pub fn session_secret_from_parts(
+        x25519_secret: &[u8; 32],
+        mlkem_dk_bytes: &[u8],
+    ) -> SessionKemSecret {
+        ddrm_envelope::session_secret_from_parts(x25519_secret, mlkem_dk_bytes)
+            .expect("ML-KEM dk size")
     }
 }
 

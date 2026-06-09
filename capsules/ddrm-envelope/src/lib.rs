@@ -28,13 +28,18 @@
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use ml_kem::kem::Decapsulate;
-use ml_kem::{Ciphertext, KemCore, MlKem768};
+use ml_kem::KemCore;
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
+use x25519_dalek::PublicKey as XPublicKey;
 use zeroize::Zeroizing;
 
-type MlKemDk = <MlKem768 as KemCore>::DecapsulationKey;
-type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
+// Re-exported so the decrypt boundary can name the exact KEM / x25519 types this
+// crate's envelope is built from — one provenance, no parallel type definitions.
+pub use ml_kem::{Ciphertext, MlKem768};
+pub use x25519_dalek::StaticSecret as XStaticSecret;
+
+pub type MlKemDk = <MlKem768 as KemCore>::DecapsulationKey;
+pub type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
 
 /// Domain separation + profile binding for the wrap-key KDF.
 const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
@@ -305,7 +310,9 @@ impl PqSealedEnvelope {
     }
 
     /// The bytes the signature covers (everything except the signature itself).
-    fn signed_payload(&self) -> Vec<u8> {
+    /// Public so the decrypt boundary (which re-exports this type) can pin the
+    /// signed transcript directly in its hardening tests.
+    pub fn signed_payload(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&self.eph_x25519_pub);
         v.extend_from_slice(self.kem_ct.as_slice());
