@@ -183,8 +183,8 @@ flowchart TB
     DRM[drm-provider<br/>orchestrate drm/open]
     RTS[rights-provider]
     CHN[chain-provider<br/>has_access_by_content_id]
-    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, PINS node vk<br/>CONNECTS node socket ONCE framed, derives STABLE KNOWN caller identity, SIGNS each recover with a strictly-advancing recover_seq<br/>refuses a THRESHOLD descriptor fail-closed until 2-of-N lands]
-    NODE[dkms-authority node 🟩<br/>SECRET-HOLDING: owns master, BINDS+LISTENS framed Unix socket<br/>hello ENFORCES a KNOWN-caller ALLOW-LIST + binds SESSION TOKEN to caller pubkey<br/>recover REQUIRES possession proof + a FRESH recover_seq (anti-replay) + re-authorizes, re-seals in-boundary, never CEK/master]
+    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, PINS node vk<br/>CONNECTS node socket ONCE framed, derives STABLE KNOWN caller identity, SIGNS each recover with a strictly-advancing recover_seq<br/>2-of-2 THRESHOLD: resolves TWO nodes, dual-recovers BOTH, WELDS two sealed shares — NEVER XOR-combines the CEK]
+    NODE[dkms-authority nodes A+B 🟩<br/>SECRET-HOLDING (TWO daemons, distinct stores/sockets/allow-lists): each owns ONE share, BINDS+LISTENS framed Unix socket<br/>hello ENFORCES a KNOWN-caller ALLOW-LIST + binds SESSION TOKEN to caller pubkey<br/>recover REQUIRES possession proof + a FRESH recover_seq (anti-replay) + re-authorizes, re-seals its share in-boundary, never CEK/master/whole-key]
     DEC[decrypt-provider<br/>OpenSessionV1 — DONE]
     VIEW[viewer capsule<br/>scoped render]
   end
@@ -201,9 +201,9 @@ flowchart TB
   RTS -->|RightsDecisionReceiptV1| KEY
   KEY -->|1. CONNECT ONCE over framed socket: hello challenge + KNOWN caller pubkey — verify attestation vs pinned vk<br/>node checks the caller is ALLOW-LISTED, then binds SESSION TOKEN to caller pubkey| NODE
   KEY -->|2. recover MANY over the live socket+session: escrow + session key + rights receipt + SESSION TOKEN + POSSESSION PROOF + fresh recover_seq<br/>persistent conn, NO master| NODE
-  NODE -->|verifies allow-list + token + possession proof + strictly-advancing recover_seq + re-authorizes receipt, then SealedDecryptMaterialV1<br/>re-sealed in the node; replayed recover / torn frame fails closed| KEY
-  KEY -->|SealedDecryptMaterialV1<br/>CEK sealed to session pubkey| DEC
-  DEC -->|scoped output| VIEW
+  NODE -->|EACH node verifies allow-list + token + possession proof + strictly-advancing recover_seq + re-authorizes receipt, then re-seals ITS share<br/>replayed recover / torn frame / forged share fails closed| KEY
+  KEY -->|SealedDecryptMaterialV1 carrying TWO sealed shares (share1 + share2)<br/>each share sealed to session pubkey; the whole CEK is NEVER assembled here| DEC
+  DEC -->|unwraps BOTH shares in-VM + XOR-combines to recover CEK ONLY in the sandbox, then scoped output| VIEW
   DEC -->|publishes session pubkey at init| KEY
 ```
 
@@ -369,6 +369,27 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 97–98):** the threshold is REAL — the CEK is XOR-split 2-of-2 across TWO secret-holding dKMS nodes,
+  so no single node ever holds the whole content key, and the runtime reconstructs it ONLY inside the decrypt boundary.
+  Day 95–96 left a fail-closed threshold STUB; this cycle makes 2-of-2 real end to end. Audited PC2 first: PC2's
+  threshold is the OPAQUE Lit `decryptAndCombine` (`non-media-decrypt.js:76`) — the share set, node membership, and
+  combine all live INSIDE Lit's proprietary network, uninspectable. The runtime is SUPERIOR: an EXPLICIT, owned,
+  inspectable 2-node split with the combine in our OWN sandbox. (1) `ddrm-envelope` gained pure `split_cek_xor(cek, mask)`
+  (producer: `share1=mask`, `share2=cek⊕mask`) + `combine_cek_xor → Zeroizing` (decrypt boundary; fail-closed on a
+  length mismatch); 22→23. (2) `decrypt-provider` reconstructs IN-VM — `SealedDecryptMaterialV1` gained an optional
+  `sealed_cek_share2_b64`, the boundary an optional `authority_vk2_b64`; `rail_shim::decrypt_from_carrier_threshold`
+  unwraps BOTH sealed shares (each under ITS node's vk, same transcript), XOR-combines in `Zeroizing`, then decrypts —
+  the whole CEK exists ONLY in the sandbox, never in `key-provider`; single-share path unchanged; rail-material 65→68.
+  (3) `key-provider` REPLACED the stub: `build_dkms_client` resolves a 2-of-2 `threshold` descriptor into TWO public
+  clients (3-of-N/identical/malformed fail closed); `release` dual-recovers BOTH nodes (per-node connection, known-caller,
+  fresh `recover_seq`, possession proof) and `merge_threshold_material` welds two re-sealed shares into one material
+  WITHOUT XOR-combining (the second escrow rides in `wrapped_cek_share2_b64`); 42→43. `ddrm-runtime-open` verify mode
+  adds a 2-of-2 probe (steps 18–20): TWO real daemons (distinct stores/sockets/allow-lists), share-1→node A +
+  share-2→node B, recover from EACH, reconstruct the EXACT CEK in-boundary — a single share is USELESS and a FORGED
+  second share fails closed under node B's vk. Drift untouched (the second share + second vk are capsule-local). Escape
+  hatch (2-day prompt): the production `DrmHost` run-path dual-recover wiring + its dedicated smoke is the Day 99–100
+  finisher. Gate: ladder INTACT (ddrm-envelope=23, key-provider[key-authority-ref]=43, decrypt-provider rail-material=68),
+  drift PASS, all dDRM smokes green (incl. the dkms 2-of-2 probe), clippy clean.
 - **Status (Day 95–96):** the dkms node now serves only a KNOWN, ALLOW-LISTED caller, every recover is FRESH
   (anti-replay), and a THRESHOLD descriptor fails closed. Audited PC2 first: the secure-view session is OWNER-BOUND
   to a registered wallet (`ownerAddress` == authenticated wallet, re-checked in the TEE via `ecrecover(delegationSig)`,

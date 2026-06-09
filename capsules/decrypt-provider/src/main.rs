@@ -144,6 +144,14 @@ struct SealedDecryptMaterialV1 {
     /// `p256-classical-compat` (PC2/Lit migration only).
     suite: String,
     sealed_cek_b64: String,
+    /// 2-of-2 threshold (Day 97–98): the SECOND sealed CEK share, re-sealed by the
+    /// second dKMS node to THIS session and bound to the SAME transcript. When
+    /// present, `sealed_cek_b64` is share-1 (node A) and this is share-2 (node B);
+    /// the boundary unwraps BOTH and reconstructs `cek = share1 ⊕ share2` in-VM. When
+    /// absent, the legacy single-CEK path runs unchanged. Verified under the second
+    /// trusted node verifying key provisioned at `init` (`authority_vk2_b64`).
+    #[serde(default)]
+    sealed_cek_share2_b64: Option<String>,
     ciphertext_b64: String,
     #[serde(default)]
     init_segment_b64: Option<String>,
@@ -249,6 +257,11 @@ struct DecryptProvider {
     session: Option<rail_shim::SessionSecret>,
     #[cfg(feature = "rail-live")]
     authority_vk: Option<Vec<u8>>,
+    // The SECOND trusted dKMS-node ML-DSA-65 verifying key (2-of-2 threshold,
+    // `rail-material`). Provisioned at `init` (`authority_vk2_b64`); verifies the
+    // second sealed share. Absent for the single-node rail (threshold off).
+    #[cfg(feature = "rail-live")]
+    authority_vk2: Option<Vec<u8>>,
     // The published decrypt-session public key (transcript binding, `rail-bind`).
     // It is minted in-sandbox and is what the key authority seals the CEK to; it
     // is bound into the transcript so a carrier cannot be replayed against a
@@ -313,6 +326,15 @@ impl DecryptProvider {
             match b64.decode(vk_b64) {
                 Ok(vk) => self.authority_vk = Some(vk),
                 Err(_) => return Response::error("invalid_request", "authority_vk_b64 is not valid base64"),
+            }
+        }
+
+        // The second node verifying key for 2-of-2 threshold reconstruction. Optional:
+        // present only when this boundary is provisioned against a threshold publish.
+        if let Some(vk_b64) = config.get("authority_vk2_b64").and_then(Value::as_str) {
+            match b64.decode(vk_b64) {
+                Ok(vk) => self.authority_vk2 = Some(vk),
+                Err(_) => return Response::error("invalid_request", "authority_vk2_b64 is not valid base64"),
             }
         }
 
@@ -628,6 +650,14 @@ impl DecryptProvider {
             None => return Response::error("invalid_request", "unsupported decrypt suite"),
         }
 
+        // 2-of-2 threshold (Day 97–98): a SECOND sealed share present means the CEK
+        // was split across two dKMS nodes at publish. Route through the reconstruction
+        // path that unwraps BOTH shares and XORs them INSIDE the boundary — the whole
+        // CEK never exists in `key-provider`. Absent → the legacy single-CEK path.
+        if let Some(share2_b64) = material.sealed_cek_share2_b64.clone() {
+            return self.open_session_threshold(request, &material, &share2_b64, now_unix);
+        }
+
         let bound = BoundRailMaterial {
             sealed_cek_b64: material.sealed_cek_b64,
             ciphertext_b64: material.ciphertext_b64,
@@ -636,6 +666,101 @@ impl DecryptProvider {
             content_hash_b64: material.content_hash_b64,
         };
         self.open_session_audited(request, &bound, now_unix)
+    }
+
+    /// 2-of-2 threshold open (Day 97–98): the CEK was XOR-split across two dKMS nodes
+    /// at publish, so no single node ever held the whole content key. Each node
+    /// re-sealed ITS share to THIS boundary's session key, bound to the SAME decrypt
+    /// transcript (only the node verifying key differs). Here, INSIDE the boundary, we
+    /// unwrap BOTH sealed shares and reconstruct `cek = share1 ⊕ share2` in `Zeroizing`
+    /// before decrypting — so the whole CEK materializes ONLY in the sandbox, never in
+    /// `key-provider`. Enforces grant expiry before any crypto and emits the same
+    /// scoped audit record as the single-node audited path. Share-1 is verified under
+    /// the primary node vk, share-2 under the second (`authority_vk2`); a missing
+    /// second vk, a wrong/forged share, or a share sealed for another session/
+    /// transcript all fail closed.
+    #[cfg(feature = "rail-material")]
+    fn open_session_threshold(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: &SealedDecryptMaterialV1,
+        share2_b64: &str,
+        now_unix: u64,
+    ) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // Reuse the single-share prepare to get the session, transcript AAD, and the
+        // first node's verifier + carrier (share-1 + the ciphertext segment).
+        let bound = BoundRailMaterial {
+            sealed_cek_b64: material.sealed_cek_b64.clone(),
+            ciphertext_b64: material.ciphertext_b64.clone(),
+            init_segment_b64: material.init_segment_b64.clone(),
+            nonce_b64: material.nonce_b64.clone(),
+            content_hash_b64: material.content_hash_b64.clone(),
+        };
+        let prepared = match self.prepare_bound_open(&request, &bound) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        // The second node's trusted verifying key must be provisioned for a threshold
+        // open — fail closed if a threshold material arrives at a single-node boundary.
+        let authority_vk2 = match self.authority_vk2.as_ref() {
+            Some(vk) => vk,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "threshold material requires a second key-authority verifying key (authority_vk2)",
+                )
+            }
+        };
+        let verifier2 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk2) {
+            Some(v) => v,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "configured second key-authority verifying key is malformed",
+                )
+            }
+        };
+        let sealed_share2 = match b64.decode(share2_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "sealed_cek_share2_b64 is not valid base64"),
+        };
+
+        let transcript_hash = {
+            use sha2::{Digest, Sha256};
+            let h: [u8; 32] = Sha256::digest(&prepared.aad).into();
+            h
+        };
+
+        // Short-expiry enforcement — before any crypto (mirrors the audited path).
+        let expired =
+            now_unix > request.expires_at || now_unix > request.release_receipt.expires_at;
+        if expired {
+            return audited_response(&request, &transcript_hash, now_unix, "denied", "expired", None);
+        }
+
+        match rail_shim::decrypt_from_carrier_threshold(
+            prepared.session,
+            &prepared.carrier.sealed_cek,
+            &sealed_share2,
+            &prepared.aad,
+            &prepared.verifier,
+            &verifier2,
+            &prepared.carrier.ciphertext_segment,
+            prepared.carrier.init_segment.as_deref(),
+        ) {
+            Ok((_plaintext, meta)) => {
+                let scoped = match scoped_session_response(&request, &meta) {
+                    Response::Ok { data: Some(data) } => data,
+                    other => return other,
+                };
+                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
+            }
+            Err(_) => audited_response(&request, &transcript_hash, now_unix, "denied", "decrypt_failed", None),
+        }
     }
 }
 
@@ -1609,6 +1734,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(req),
@@ -1639,6 +1765,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(replay_req),
@@ -1663,6 +1790,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(decrypt_request()),
@@ -1680,6 +1808,7 @@ mod tests {
             session: Some(session2),
             authority_vk: Some(authority_vk2),
             session_pub: Some(pub_bytes2),
+            authority_vk2: None,
         };
         let resp2 = provider2.handle(Request::OpenSessionBound {
             request: Box::new(decrypt_request()),
@@ -1802,6 +1931,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let now = 1_850_000_000u64; // before expiry (1_900_000_000)
         let resp = provider.handle(Request::OpenSessionAudited {
@@ -1834,6 +1964,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let now = 2_000_000_000u64; // past expiry (1_900_000_000)
         let resp = provider.handle(Request::OpenSessionAudited {
@@ -1863,6 +1994,7 @@ mod tests {
         SealedDecryptMaterialV1 {
             suite: suite.to_string(),
             sealed_cek_b64: bound.sealed_cek_b64.clone(),
+            sealed_cek_share2_b64: None,
             ciphertext_b64: bound.ciphertext_b64.clone(),
             init_segment_b64: bound.init_segment_b64.clone(),
             nonce_b64: bound.nonce_b64.clone(),
@@ -1886,6 +2018,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(req),
@@ -1911,6 +2044,7 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "invalid_request", "an unknown suite must fail closed before any crypto");
@@ -1928,8 +2062,163 @@ mod tests {
             session: Some(session),
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
+            authority_vk2: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "invalid_request", "compat suite is migration-only on the bound product path");
+    }
+
+    // --- 2-of-2 threshold reconstruction (feature `rail-material`, Day 97–98) -----
+    //
+    // The CEK is XOR-split across two dKMS nodes at publish; each node re-seals ITS
+    // share to this boundary's session, bound to the SAME transcript. The boundary
+    // unwraps BOTH and reconstructs `cek = share1 ⊕ share2` IN-VM — the whole key
+    // never exists in `key-provider`. These pin: the happy 2-of-2 decrypts; an
+    // attacker who cannot mint the second node's seal fails closed; and a threshold
+    // material at a single-node boundary fails closed.
+
+    #[cfg(feature = "rail-material")]
+    #[allow(clippy::too_many_arguments)]
+    fn threshold_setup(
+        seed_a: [u8; 32],
+        seed_b: [u8; 32],
+        mask: &[u8; 16],
+        seal_req: &DecryptSessionRequestV1,
+        cek: &[u8; 16],
+        plaintext: &[u8],
+        nonce: &[u8],
+        content_hash: &[u8],
+    ) -> (SealedDecryptMaterialV1, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>, Vec<u8>) {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let (signer_a, vk_a) = mldsa_seal_keypair(seed_a);
+        let (signer_b, vk_b) = mldsa_seal_keypair(seed_b);
+
+        // Both nodes seal BOUND to the exact same decrypt transcript.
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &seal_req.principal_id,
+            session_id: &seal_req.session_id,
+            object_cid: &seal_req.object_cid,
+            content_hash,
+            action: &seal_req.action,
+            viewer_interface: &seal_req.viewer_interface,
+            output_kind: &seal_req.output_kind,
+            expires_at: seal_req.expires_at,
+            release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+        }
+        .to_aad();
+
+        // Producer-side split: node A escrows/re-seals share-1, node B share-2.
+        let (share1, share2) = ddrm_envelope::split_cek_xor(cek, mask).expect("split");
+        let sealed1 = seal_bound(&public, &share1, &aad, &signer_a).to_bytes();
+        let sealed2 = seal_bound(&public, &share2, &aad, &signer_b).to_bytes();
+        let segment = build_encrypted_segment(plaintext, cek, &[0x77u8; 8]);
+
+        let material = SealedDecryptMaterialV1 {
+            suite: DECRYPT_SUITE_ID.to_string(),
+            sealed_cek_b64: b64.encode(&sealed1),
+            sealed_cek_share2_b64: Some(b64.encode(&sealed2)),
+            ciphertext_b64: b64.encode(&segment),
+            init_segment_b64: None,
+            nonce_b64: b64.encode(nonce),
+            content_hash_b64: b64.encode(content_hash),
+        };
+        (material, crate::rail_shim::SessionSecret::PqHybrid(secret), vk_a, vk_b, pub_bytes)
+    }
+
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_threshold_2of2_reconstructs_in_vm_and_opens() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let mask = [0x3Cu8; 16];
+        let plaintext = b"two-of-two threshold reconstructed payload!!";
+        let (material, session, vk_a, vk_b, pub_bytes) = threshold_setup(
+            [0xC1u8; 32], [0xC2u8; 32], &mask, &req, &cek, plaintext, b"nonce-thr-1", &[0xABu8; 32],
+        );
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(vk_a),
+            session_pub: Some(pub_bytes),
+            authority_vk2: Some(vk_b),
+        };
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req),
+            material,
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("opened"), "2-of-2 must open: {v}");
+        // Neither the CEK nor either raw share crosses the boundary.
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+        assert!(!s.contains(&b64.encode(mask)), "share-1 (the mask) must not leak");
+    }
+
+    /// An attacker who controls only one node cannot mint the SECOND node's seal: a
+    /// second share NOT sealed by the trusted node-B verifying key fails closed at the
+    /// signature, before any CEK is reconstructed. (The provisioned `authority_vk2` is
+    /// node B's real key; the supplied second share was signed by an unrelated key.)
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_threshold_unauthorized_second_share_fails_closed() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let mask = [0x3Cu8; 16];
+        let (material, session, vk_a, _vk_b_real, pub_bytes) = threshold_setup(
+            [0xD1u8; 32], [0xD2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-2", &[0xABu8; 32],
+        );
+        // Provision a DIFFERENT node-B key than the one that actually sealed share-2,
+        // i.e. the second share was not produced by the trusted node.
+        use crate::pq_envelope::seal_support::mldsa_seal_keypair;
+        let (_attacker_signer, unrelated_vk) = mldsa_seal_keypair([0xEEu8; 32]);
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(vk_a),
+            session_pub: Some(pub_bytes),
+            authority_vk2: Some(unrelated_vk),
+        };
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req),
+            material,
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("denied"), "an unauthorized second share must be denied: {v}");
+        assert_eq!(v["data"]["audit"]["reason"], json!("decrypt_failed"));
+    }
+
+    /// A threshold material (second share present) arriving at a boundary provisioned
+    /// for a SINGLE node (no `authority_vk2`) fails closed — never silently degrading
+    /// to a one-share open.
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_threshold_without_second_vk_fails_closed() {
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let mask = [0x3Cu8; 16];
+        let (material, session, vk_a, _vk_b, pub_bytes) = threshold_setup(
+            [0xF1u8; 32], [0xF2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-3", &[0xABu8; 32],
+        );
+        let provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(vk_a),
+            session_pub: Some(pub_bytes),
+            authority_vk2: None,
+        };
+        let resp = provider.open_session_v1(req, material, 1_850_000_000);
+        assert_eq!(error_code(resp), "not_configured", "threshold material requires a second node vk");
     }
 }

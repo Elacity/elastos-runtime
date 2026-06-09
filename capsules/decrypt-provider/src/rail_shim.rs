@@ -115,6 +115,57 @@ pub fn decrypt_from_carrier_bound(
     }
 }
 
+/// Transcript-bound **2-of-2 threshold** carrier open (Day 97–98): the CEK was
+/// XOR-split across two dKMS nodes at publish, so NO single node ever held the whole
+/// content key. This is the runtime's explicit, owned analogue of Lit's opaque
+/// `decryptAndCombine` (PC2 `non-media-decrypt.js:76`) — except the share set, the
+/// nodes, and the combine are all ours and inspectable.
+///
+/// Each node re-sealed ITS share to THIS VM's session key, bound to the SAME decrypt
+/// transcript `aad` (only the node verifying key differs). Here, INSIDE the boundary,
+/// we unwrap BOTH sealed shares to their plaintext share bytes, reconstruct
+/// `cek = share1 ⊕ share2` (in `Zeroizing`), and only then decrypt — so the whole CEK
+/// materializes ONLY in the sandbox, never in `key-provider`. Fails closed if either
+/// share is malformed, sealed for a different session/transcript, signed by the wrong
+/// node, or the shares are length-mismatched. PQ-hybrid only (threshold is a product-
+/// path guarantee); a classical session is rejected.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_from_carrier_threshold(
+    session: &SessionSecret,
+    sealed_share1: &[u8],
+    sealed_share2: &[u8],
+    aad: &[u8],
+    verifier1: &impl CekSealVerifier,
+    verifier2: &impl CekSealVerifier,
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+
+    // Unwrap each sealed share to its plaintext share bytes (each is a node-sealed
+    // `PqSealedEnvelope` bound to this transcript; only the verifying key differs).
+    let env1 = PqSealedEnvelope::from_bytes(sealed_share1).map_err(|e| format!("{e:?}"))?;
+    let share1 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env1, aad, verifier1)
+        .map_err(|e| format!("{e:?}"))?;
+    let env2 = PqSealedEnvelope::from_bytes(sealed_share2).map_err(|e| format!("{e:?}"))?;
+    let share2 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env2, aad, verifier2)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Reconstruct the CEK INSIDE the boundary; held in `Zeroizing`, scrubbed on drop.
+    let cek = ddrm_envelope::combine_cek_xor(share1.as_slice(), share2.as_slice())
+        .map_err(|e| e.to_string())?;
+    let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cek.as_slice(),
+    ));
+    crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

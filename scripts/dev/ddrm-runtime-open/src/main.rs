@@ -1003,6 +1003,181 @@ fn dkms_malformed_frame_is_refused(sock_path: &str, caller_seed: [u8; 32]) -> Re
     Ok(())
 }
 
+/// 2-of-2 THRESHOLD probe (Day 97–98, verify mode): prove END TO END, across TWO REAL dKMS node
+/// daemons, that the CEK is split so NO SINGLE NODE ever holds the whole content key, and the runtime
+/// reconstructs it ONLY in the decrypt boundary. This probe plays BOTH the producer (it XOR-splits the
+/// CEK and escrows share-1 to node A, share-2 to node B) and the decrypt boundary (it mints a session
+/// key, recovers a re-sealed share from EACH node over the full session/possession/freshness gates,
+/// and reconstructs `cek = share1 ⊕ share2` in-boundary). It asserts: (a) the happy 2-of-2 reconstructs
+/// the exact CEK; (b) ONE share alone is useless (it is NOT the CEK); (c) a forged second share — one
+/// NOT sealed by the trusted node — fails closed. This is the runtime's explicit, owned analogue of
+/// Lit's opaque `decryptAndCombine` threshold (PC2 `non-media-decrypt.js:76`), where PC2 cannot inspect
+/// the share set. The two daemons are this probe's OWN (distinct stores/sockets/allow-lists); they are
+/// torn down on return.
+fn dkms_threshold_probe(node_bin: &str, work_dir: &std::path::Path) -> Result<(), String> {
+    // Two distinct secret-holding nodes: separate master stores, sockets, and the SAME known caller
+    // allow-listed on both (one runtime identity, two nodes).
+    let caller_seed = ddrm_envelope::random_seed();
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+
+    let store_a = work_dir.join("thr-node-a.json").to_string_lossy().into_owned();
+    let store_b = work_dir.join("thr-node-b.json").to_string_lossy().into_owned();
+    let sock_a = work_dir.join("thr-node-a.sock").to_string_lossy().into_owned();
+    let sock_b = work_dir.join("thr-node-b.sock").to_string_lossy().into_owned();
+    let _daemon_a = start_dkms_daemon(node_bin, &sock_a, &store_a, &caller_vk_b64)?;
+    let _daemon_b = start_dkms_daemon(node_bin, &sock_b, &store_b, &caller_vk_b64)?;
+
+    // The producer's identity (escrows both shares) + the content split.
+    let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x9au8; 32]);
+    let producer_vk_b64 = B64.encode(&producer_vk);
+    let cek = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
+    let mask: Vec<u8> = (0u8..cek.len() as u8).map(|b| b ^ 0x5A).collect();
+    let (share1, share2) = ddrm_envelope::split_cek_xor(&cek, &mask)?;
+    let kid16 = [0xC5u8; 16];
+    let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+
+    // The decrypt-boundary stand-in: mint an in-boundary session key (the nodes re-seal their shares to
+    // it) and bind everything to ONE decrypt transcript AAD (same for both nodes; only the node vk
+    // differs). Content-binding fields mirror the rail's transcript.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = [0xABu8; 32];
+    let nonce = [0xCDu8; 12];
+    let aad = DecryptTranscriptV1 {
+        suite_id: SUITE_PQ_HYBRID,
+        provider_id: "decrypt",
+        principal_id: "did:key:zViewer",
+        session_id: "probe-session",
+        object_cid: "bafThreshold",
+        content_hash: &content_hash,
+        action: "view",
+        viewer_interface: "reader",
+        output_kind: "page-image",
+        expires_at: EXPIRES_AT,
+        release_receipt_hash: [0u8; 32],
+        decrypt_session_pub: &session_pub_bytes,
+        nonce: &nonce,
+    }
+    .to_aad();
+    let aad_b64 = B64.encode(&aad);
+    let content_hash_b64 = B64.encode(content_hash);
+    let nonce_b64 = B64.encode(nonce);
+
+    // Recover a re-sealed share from one node: escrow the share to ITS recipient, connect, run the full
+    // identity + session + possession + freshness gates, and return the node's re-sealed share bytes.
+    let recover_share = |sock: &str, share: &[u8]| -> Result<(Vec<u8>, Vec<u8>), String> {
+        let mut node = NodeSocket::connect(sock)?;
+        let init = ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "threshold node init")?;
+        let node_vk_b64 = init["seal_verifying_key_b64"].as_str().ok_or("node published no vk")?.to_string();
+        let recipient_b64 = init["seal_recipient_pub_b64"].as_str().ok_or("node published no recipient")?;
+        let recipient_bytes = B64.decode(recipient_b64).map_err(|e| e.to_string())?;
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_bytes)
+            .ok_or("node published a malformed recipient")?;
+
+        // Producer escrows THIS share to THIS node's recipient (so node A only ever sees share-1, etc).
+        let escrow = escrow_aad(SUITE_PQ_HYBRID, &kid16, &recipient_bytes);
+        let wrapped = B64.encode(
+            ddrm_envelope::seal::seal_bound(&recipient_public, share, &escrow, &producer_signer).to_bytes(),
+        );
+
+        let challenge = ddrm_envelope::random_seed();
+        let hello = ok_data(
+            &node.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": B64.encode(&caller_vk),
+                "now_unix": NOW_UNIX,
+            }))?,
+            "threshold node hello",
+        )?;
+        let token = hello["session_token"].clone();
+        let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
+        let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
+            &caller_signer,
+            &chal,
+            b"bafThreshold",
+            kid_hex.as_bytes(),
+            &session_pub_bytes,
+            1,
+        ));
+        let recover = ok_data(
+            &node.call(&json!({
+                "op": "recover",
+                "wrapped_cek_b64": wrapped,
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": kid_hex,
+                "producer_vk_b64": producer_vk_b64,
+                "decrypt_session_pub_b64": session_pub_b64,
+                "aad_b64": aad_b64,
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": content_hash_b64,
+                "nonce_b64": nonce_b64,
+                "rights_receipt": probe_receipt(true, "bafThreshold", "did:key:zViewer", "view"),
+                "content_id": "bafThreshold",
+                "principal_id": "did:key:zViewer",
+                "session_id": "probe-session",
+                "right": "view",
+                "session_token": token,
+                "caller_sig_b64": caller_sig_b64,
+                "recover_seq": 1u64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "threshold node recover",
+        )?;
+        let sealed_b64 = recover["material"]["sealed_cek_b64"].as_str().ok_or("node returned no sealed share")?;
+        // The raw CEK / either raw share must NEVER appear on the wire.
+        if serde_json::to_string(&recover).unwrap_or_default().contains(GOLDEN_CEK_B64) {
+            return Err("the raw CEK leaked from a threshold node recover".to_string());
+        }
+        let sealed = B64.decode(sealed_b64).map_err(|e| e.to_string())?;
+        let node_vk = B64.decode(&node_vk_b64).map_err(|e| e.to_string())?;
+        Ok((sealed, node_vk))
+    };
+
+    // Recover a re-sealed share from EACH node — each node independently holds + recovers ONLY its share.
+    let (sealed1, vk_a) = recover_share(&sock_a, &share1)?;
+    let (sealed2, vk_b) = recover_share(&sock_b, &share2)?;
+    if vk_a == vk_b {
+        return Err("the two threshold daemons derived the SAME identity — not two distinct nodes".to_string());
+    }
+    if sealed1 == sealed2 {
+        return Err("the two nodes returned identical sealed shares — not a real 2-of-2 split".to_string());
+    }
+    step(18, "dkms 2-of-2: TWO distinct node daemons each escrowed + recovered ONLY their OWN share over the full session/possession/freshness gates — neither node ever saw the whole CEK");
+
+    // DECRYPT-BOUNDARY ROLE: unwrap BOTH re-sealed shares in-boundary (each verified under ITS node's
+    // vk, bound to the SAME transcript) and reconstruct the CEK. The combine happens ONLY here.
+    let verifier_a = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk_a).ok_or("node A vk malformed")?;
+    let verifier_b = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk_b).ok_or("node B vk malformed")?;
+    let env1 = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed1).map_err(|e| format!("{e:?}"))?;
+    let env2 = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed2).map_err(|e| format!("{e:?}"))?;
+    let rec1 = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env1, &aad, &verifier_a)
+        .map_err(|e| format!("share-1 unwrap failed: {e:?}"))?;
+    let rec2 = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env2, &aad, &verifier_b)
+        .map_err(|e| format!("share-2 unwrap failed: {e:?}"))?;
+    let reconstructed = ddrm_envelope::combine_cek_xor(rec1.as_slice(), rec2.as_slice())?;
+    if reconstructed.as_slice() != cek.as_slice() {
+        return Err("2-of-2 reconstruction did not recover the CEK".to_string());
+    }
+    // (b) ONE share alone is useless — it is NOT the CEK.
+    if rec1.as_slice() == cek.as_slice() || rec2.as_slice() == cek.as_slice() {
+        return Err("a single node's share equals the CEK — the split is not secure".to_string());
+    }
+    step(19, "dkms 2-of-2: the decrypt boundary unwrapped BOTH node-sealed shares (each under ITS node's vk) and reconstructed the CEK in-boundary — while neither share alone is the key");
+
+    // (c) A FORGED second share — sealed by a key that is NOT node B — fails closed under node B's vk,
+    // even bound to the right transcript: an attacker who controls one node cannot mint the other's seal.
+    let (forger, _fvk) = ddrm_envelope::seal::mldsa_seal_keypair([0x77u8; 32]);
+    let forged = ddrm_envelope::seal::seal_bound(&session_public, rec2.as_slice(), &aad, &forger);
+    if ddrm_envelope::hybrid_unwrap_bound(&session_secret, &forged, &aad, &verifier_b).is_ok() {
+        return Err("a forged second share verified under node B's vk — the threshold is forgeable".to_string());
+    }
+    step(20, "dkms 2-of-2: a FORGED second share (not sealed by node B) fails closed under node B's vk — a single-node attacker cannot fabricate the missing share");
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -1891,6 +2066,13 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 .clone()
                 .ok_or("dkms verify probe needs the bound key material from the open")?;
             dkms_node_adversarial_probe(endpoint, pinned_vk, &probe_material, caller_seed)?;
+
+            // 2-of-2 THRESHOLD (Day 97–98): prove, across TWO real node daemons, that the CEK is split
+            // so no single node holds the whole key, the boundary reconstructs it only in-boundary, and
+            // a single/forged share fails closed. Self-contained (its own two daemons).
+            if let Some(node_bin) = cfg.dkms_authority_bin.as_deref() {
+                dkms_threshold_probe(node_bin, &work_dir)?;
+            }
         }
     }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop

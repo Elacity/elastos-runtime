@@ -207,6 +207,13 @@ struct ReleaseSessionContext {
     nonce_b64: String,
     #[serde(default)]
     init_segment_b64: Option<String>,
+    /// 2-of-2 THRESHOLD (Day 97–98): the SECOND node's escrow blob (base64) — the producer escrowed
+    /// `share2` to node B's recipient at publish. Node A's escrow rides in the rights-bound
+    /// `key_envelope.wrapped_cek` (share1). When this is present AND a second node is provisioned,
+    /// `release` recovers a re-sealed share from EACH node and returns BOTH; the decrypt boundary
+    /// reconstructs the CEK in-VM. Absent → single-node rail.
+    #[serde(default)]
+    wrapped_cek_share2_b64: Option<String>,
     /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
     /// authority refuses to release (fail-closed), never sealing a CEK past its window.
     #[serde(default)]
@@ -299,6 +306,13 @@ struct KeyProvider {
     /// `key-authority-ref`).
     #[cfg(feature = "key-authority-ref")]
     dkms: Option<DkmsClientAuthority>,
+    /// The SECOND secret-holding dKMS node for 2-of-2 THRESHOLD recovery (Day 97–98). Resolved at
+    /// `init` from the descriptor's `threshold` block (PUBLIC-ONLY, like `dkms`). When present, the CEK
+    /// was XOR-split at publish and escrowed as TWO shares — one per node — so NO single node ever holds
+    /// the whole content key. `release` recovers a re-sealed share from EACH node and passes BOTH to the
+    /// decrypt boundary, which reconstructs `cek = share1 ⊕ share2` IN-VM. `None` = single-node rail.
+    #[cfg(feature = "key-authority-ref")]
+    dkms2: Option<DkmsClientAuthority>,
     /// The LONG-LIVED connection to the external dKMS node + the live handshake session (Day 91–92).
     /// The client opens the node ONCE, proves its pinned identity ONCE, and then drives MANY
     /// authorized recovers over the same connection + session — re-establishing fail-closed only when
@@ -309,6 +323,10 @@ struct KeyProvider {
     /// wasm32-wasip1 ladder build) the dkms socket transport is unavailable and `release` fails closed.
     #[cfg(all(feature = "key-authority-ref", unix))]
     dkms_conn: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
+    /// The long-lived connection to the SECOND threshold node (Day 97–98), same lifecycle as
+    /// `dkms_conn`. `None` until the first threshold release establishes it.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    dkms_conn2: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
 }
 
 /// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
@@ -627,8 +645,11 @@ impl KeyProvider {
                 // reaches the runtime. No descriptor → unconfigured (release fails closed); a
                 // present-but-bad (or secret-bearing) descriptor fails closed here.
                 Some(KeyAuthorityBackend::Dkms) => {
-                    self.dkms = match build_dkms_client(&config) {
-                        Ok(client) => client,
+                    match build_dkms_client(&config) {
+                        Ok((node_a, node_b)) => {
+                            self.dkms = node_a;
+                            self.dkms2 = node_b;
+                        }
                         Err(err) => return Response::error("not_configured", err),
                     };
                 }
@@ -1098,40 +1119,102 @@ impl KeyProvider {
             "right": request.action,
         });
         let now = session.now_unix;
-        // OPEN-ONCE / VERIFY-ONCE / REUSE: drive recover over the LONG-LIVED node connection + the
-        // live handshake session. We re-establish (spawn + init + identity handshake) ONLY when there
-        // is no connection yet or the cached session has expired — not per release. Re-establishment
-        // fails closed; the master never crosses into this process.
-        let mut guard = self.dkms_conn.borrow_mut();
+        // Recover a re-sealed share from node A. Node A's escrow (share-1 in the threshold case, or the
+        // whole CEK in the single-node case) rides in the rights-bound `key_envelope.wrapped_cek`.
+        let material_a = match self.delegate_recover(
+            client,
+            &self.dkms_conn,
+            &recover_req,
+            &kid_hex,
+            &session.decrypt_session_pub_b64,
+            &request.object_cid,
+            now,
+        ) {
+            Ok(data) => data,
+            Err(resp) => return resp,
+        };
+
+        // SINGLE-NODE RAIL: no second node provisioned → return node A's material verbatim (unchanged).
+        let node_b = match self.dkms2.as_ref() {
+            Some(node) => node,
+            None => return Response::ok(material_a),
+        };
+
+        // 2-of-2 THRESHOLD (Day 97–98): a second secret-holding node is provisioned, so the CEK was
+        // XOR-split and escrowed as two shares. The second share's escrow must be supplied (the runtime
+        // injects it alongside the session); fail closed rather than degrade to a one-share recover.
+        let share2_escrow = match session.wrapped_cek_share2_b64.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "threshold dkms is provisioned (two nodes) but the second share escrow \
+                     (wrapped_cek_share2_b64) was not supplied — refusing to recover from one node",
+                )
+            }
+        };
+        // Recover a re-sealed share from node B over its OWN connection + session + fresh freshness
+        // counter + possession proof. Only the escrow blob differs from node A's recover.
+        let mut recover_req2 = recover_req.clone();
+        recover_req2["wrapped_cek_b64"] = json!(share2_escrow);
+        let material_b = match self.delegate_recover(
+            node_b,
+            &self.dkms_conn2,
+            &recover_req2,
+            &kid_hex,
+            &session.decrypt_session_pub_b64,
+            &request.object_cid,
+            now,
+        ) {
+            Ok(data) => data,
+            Err(resp) => return resp,
+        };
+
+        // Merge the two re-sealed shares into ONE threshold material WITHOUT combining them — the CEK is
+        // reconstructed only inside the decrypt boundary. The key-provider never holds the whole key.
+        match merge_threshold_material(material_a, &material_b) {
+            Ok(merged) => Response::ok(merged),
+            Err(err) => Response::error("not_configured", err),
+        }
+    }
+
+    /// Drive ONE delegated recover over a long-lived node connection (OPEN-ONCE / VERIFY-ONCE / REUSE).
+    /// Re-establishes (connect + init + identity handshake) ONLY when there is no live session yet, then
+    /// attaches the live session token, a strictly-increasing freshness counter, and a POSSESSION PROOF
+    /// signed under the key the token committed to — proving WE are the caller the session was issued
+    /// for. The node re-verifies the token + proof + re-checks authorization in its own boundary. Shared
+    /// by the single-node rail and BOTH threshold nodes so the security gates are identical per node.
+    /// Returns the node's re-sealed material `data`, or a fail-closed `Response`.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_recover(
+        &self,
+        client: &DkmsClientAuthority,
+        conn_cell: &std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
+        recover_req: &Value,
+        kid_hex: &str,
+        decrypt_session_pub_b64: &str,
+        content_id: &str,
+        now: Option<u64>,
+    ) -> Result<Value, Response> {
+        let mut guard = conn_cell.borrow_mut();
         let need_new = match guard.as_ref() {
             Some(conn) => !conn.session_live(now),
             None => true,
         };
         if need_new {
-            // Discard any stale connection (Drop shuts the old node down) before opening a fresh one.
             *guard = None;
             match establish_dkms_session(client, now) {
                 Ok(conn) => *guard = Some(Box::new(conn)),
-                Err(err) => return Response::error("not_configured", err),
+                Err(err) => return Err(Response::error("not_configured", err)),
             }
         }
-        // Attach the LIVE session token + clock + a POSSESSION PROOF, then delegate recover over the
-        // reused connection. We SIGN the recover binding under the ephemeral key whose public half the
-        // token committed to at `hello`, proving WE are the caller the session was issued for; the node
-        // re-verifies the token + the proof under its own key + re-checks authorization in its boundary.
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
-            // Stamp a STRICTLY-INCREASING freshness counter and sign it into the possession proof, so
-            // the node refuses a replay of this recover frame (Day 95–96 anti-replay).
             let recover_seq = conn.next_recover_seq();
-            match conn.recover_proof_b64(
-                &request.object_cid,
-                &kid_hex,
-                &session.decrypt_session_pub_b64,
-                recover_seq,
-            ) {
+            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq) {
                 Ok(caller_sig_b64) => {
-                    let mut req = recover_req;
+                    let mut req = recover_req.clone();
                     req["session_token"] = conn.session_token.clone();
                     req["caller_sig_b64"] = json!(caller_sig_b64);
                     req["recover_seq"] = json!(recover_seq);
@@ -1146,22 +1229,21 @@ impl KeyProvider {
             Err(err) => {
                 // A broken connection is discarded so the next release re-establishes; fail closed now.
                 *guard = None;
-                return Response::error("not_configured", format!("dkms node transport failed: {err}"));
+                return Err(Response::error("not_configured", format!("dkms node transport failed: {err}")));
             }
         };
         if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Response::error(
+            return Err(Response::error(
                 "not_configured",
                 format!(
                     "dkms node recover failed: {}",
                     recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
                 ),
-            );
+            ));
         }
         match recover.get("data") {
-            // The node returns the suite-tagged material verbatim — pass it through unchanged.
-            Some(data) => Response::ok(data.clone()),
-            None => Response::error("not_configured", "dkms node recover returned no material"),
+            Some(data) => Ok(data.clone()),
+            None => Err(Response::error("not_configured", "dkms node recover returned no material")),
         }
     }
 
@@ -1305,10 +1387,13 @@ fn build_reference_authority(config: &Value) -> Result<ReferenceAuthority, Strin
 /// PUBLIC `pkpId`/`authority` and delegating recovery to the Lit network (`recoverCEKEnvelope`,
 /// `chipotle-client.ts:1438`), never the PKP secret.
 #[cfg(feature = "key-authority-ref")]
-fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, String> {
+#[allow(clippy::type_complexity)]
+fn build_dkms_client(
+    config: &Value,
+) -> Result<(Option<DkmsClientAuthority>, Option<DkmsClientAuthority>), String> {
     let path = match config.get("dkms_authority_descriptor").and_then(|v| v.as_str()) {
         Some(path) => path,
-        None => return Ok(None),
+        None => return Ok((None, None)),
     };
     let bytes = std::fs::read(path).map_err(|e| format!("dkms authority descriptor {path}: {e}"))?;
     let desc: Value = serde_json::from_slice(&bytes)
@@ -1318,15 +1403,118 @@ fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, Stri
             "dkms authority descriptor {path} has an unexpected schema (expected {DKMS_AUTHORITY_DESCRIPTOR_SCHEMA}, the PUBLIC-ONLY shape)"
         ));
     }
-    // HARD BOUNDARY: a secret-bearing descriptor is rejected. The runtime must NEVER be handed the
-    // master — it holds only the node's PUBLIC identity + endpoint and delegates recovery.
-    if desc.get("authority_master_seed_b64").is_some() {
+    // The runtime's OWN stable caller-identity seed (provisioned out-of-band via init config, NOT the
+    // public descriptor) so the node's allow-list recognizes this caller. Optional: absent → anonymous.
+    // The SAME identity is allow-listed on every node, so both threshold nodes serve this caller.
+    let caller_seed_b64 = config
+        .get("dkms_caller_seed_b64")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+
+    // Node A is the descriptor's top-level published identity (the single-node rail's node, and the
+    // FIRST threshold node). It MUST NOT carry any secret (HARD BOUNDARY enforced in the parser).
+    let node_a = parse_public_authority(path, &desc, caller_seed_b64.clone())?;
+
+    // THRESHOLD (Day 97–98): a `threshold` block promotes the rail to 2-of-2. The CEK was XOR-split
+    // and escrowed as TWO shares — one per node — so no single node ever holds the whole key. We
+    // support EXACTLY 2-of-2: `t == 2` AND exactly two PUBLIC-ONLY node entries. Node A = `nodes[0]`'s
+    // identity (which must match the top-level pins), node B = `nodes[1]`. Any other shape (t != 2,
+    // != 2 nodes, 3-of-N, …) fails closed rather than silently degrading the guarantee the descriptor
+    // asks for. A single-node descriptor (no `threshold`, or `threshold.t == 1`) keeps the legacy rail.
+    let node_b = match desc.get("threshold") {
+        None => None,
+        Some(threshold) => {
+            let t = threshold.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
+            let nodes = threshold.get("nodes").and_then(|v| v.as_array());
+            let node_count = nodes.map(|a| a.len()).unwrap_or(0);
+            if t == 1 && node_count <= 1 {
+                // Degenerate single-node threshold — same as no threshold.
+                None
+            } else if t == 2 && node_count == 2 {
+                let nodes = nodes.expect("node_count == 2 implies an array");
+                // Node A's threshold entry must match the top-level pins (one coherent identity).
+                let entry_a = parse_public_authority(path, &nodes[0], caller_seed_b64.clone())?;
+                if entry_a.verifying_key_b64 != node_a.verifying_key_b64
+                    || entry_a.recipient_pub_b64 != node_a.recipient_pub_b64
+                {
+                    return Err(format!(
+                        "dkms authority descriptor {path} threshold.nodes[0] does not match the top-level node identity"
+                    ));
+                }
+                let node_b = parse_public_authority(path, &nodes[1], caller_seed_b64.clone())?;
+                if node_b.verifying_key_b64 == node_a.verifying_key_b64 {
+                    return Err(format!(
+                        "dkms authority descriptor {path} threshold nodes share an identity — \
+                         a 2-of-2 split needs two DISTINCT secret-holding nodes"
+                    ));
+                }
+                Some(node_b)
+            } else {
+                return Err(format!(
+                    "dkms authority descriptor {path} requests threshold recovery (t={t}, nodes={node_count}) — \
+                     only 2-of-2 (t=2, two distinct nodes) is implemented; the runtime fails closed otherwise"
+                ));
+            }
+        }
+    };
+    Ok((Some(node_a), node_b))
+}
+
+/// Merge two node-recovered materials into ONE 2-of-2 threshold `SealedDecryptMaterialV1` WITHOUT
+/// combining the shares — the CEK is reconstructed ONLY inside the decrypt boundary, never here. Node
+/// A's material is the base (suite, ciphertext, nonce, content hash, init, and its re-sealed share-1 as
+/// `sealed_cek_b64`); node B contributes ONLY its re-sealed share-2, welded in as
+/// `sealed_cek_share2_b64`. Fails closed if either side is missing its sealed share, the two shares are
+/// identical (not a real split), or the two nodes disagree on the content/transcript binding (a sign
+/// one node sealed for a different object). NO XOR happens here — `key-provider` never holds the CEK.
+#[cfg(all(feature = "key-authority-ref", unix))]
+fn merge_threshold_material(material_a: Value, material_b: &Value) -> Result<Value, String> {
+    let share1 = material_a
+        .get("sealed_cek_b64")
+        .and_then(|v| v.as_str())
+        .ok_or("first dkms node returned material without a sealed share")?;
+    let share2 = material_b
+        .get("sealed_cek_b64")
+        .and_then(|v| v.as_str())
+        .ok_or("second dkms node returned material without a sealed share")?;
+    if share1 == share2 {
+        return Err(
+            "the two dkms nodes returned identical sealed shares — not a real 2-of-2 split".to_string(),
+        );
+    }
+    // Both nodes must bind the SAME content/transcript, or one sealed for a different object — fail
+    // closed rather than ship an incoherent pair the decrypt boundary would XOR into garbage.
+    for k in ["content_hash_b64", "nonce_b64", "ciphertext_b64"] {
+        if material_a.get(k) != material_b.get(k) {
+            return Err(format!(
+                "threshold dkms nodes disagree on `{k}` — the two shares are not for the same content"
+            ));
+        }
+    }
+    let share2 = share2.to_string();
+    let mut merged = material_a;
+    merged["sealed_cek_share2_b64"] = json!(share2);
+    Ok(merged)
+}
+
+/// Parse ONE PUBLIC-ONLY dKMS authority identity (the node's published vk + escrow recipient +
+/// endpoint) from a descriptor value, sharing the runtime's caller-identity seed. Enforces the HARD
+/// BOUNDARY: a secret-bearing entry (any `authority_master_seed_b64`) is rejected — the recovery
+/// secret must NEVER reach the runtime. Used for both the single node and each threshold node.
+#[cfg(feature = "key-authority-ref")]
+fn parse_public_authority(
+    path: &str,
+    src: &Value,
+    caller_seed_b64: Option<String>,
+) -> Result<DkmsClientAuthority, String> {
+    if src.get("authority_master_seed_b64").is_some() {
         return Err(format!(
             "dkms authority descriptor {path} carries a master seed — the runtime must hold the PUBLIC identity ONLY (the secret stays in the node)"
         ));
     }
     let field = |key: &str, what: &str| {
-        desc.get(key)
+        src.get(key)
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty())
@@ -1335,30 +1523,7 @@ fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, Stri
     let verifying_key_b64 = field("verifying_key_b64", "an external authority must publish its identity")?;
     let recipient_pub_b64 = field("recipient_pub_b64", "an external authority must publish its escrow recipient")?;
     let endpoint = field("authority_endpoint", "the runtime must know where to delegate recovery")?;
-    // THRESHOLD SEAM (Day 95–96, fail-closed stub): a multi-node threshold descriptor (`threshold`
-    // with t>1 or more than one node) is RECOGNIZED but not yet served — splitting the CEK across
-    // multiple secret-holding nodes so no single node holds the whole key is the next cycle. Until
-    // then we REFUSE rather than silently recover from one node and pretend it was a threshold (which
-    // would weaken the security guarantee the descriptor asks for). A single-node descriptor (no
-    // `threshold`, or `threshold.t == 1`) is the supported path.
-    if let Some(threshold) = desc.get("threshold") {
-        let t = threshold.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
-        let node_count = threshold.get("nodes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-        if t > 1 || node_count > 1 {
-            return Err(format!(
-                "dkms authority descriptor {path} requests threshold recovery (t={t}, nodes={node_count}) — \
-                 threshold dKMS is not yet implemented; the runtime fails closed rather than recover from a single node"
-            ));
-        }
-    }
-    // The runtime's OWN stable caller-identity seed (provisioned out-of-band via init config, NOT the
-    // public descriptor) so the node's allow-list recognizes this caller. Optional: absent → anonymous.
-    let caller_seed_b64 = config
-        .get("dkms_caller_seed_b64")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty());
-    Ok(Some(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint, caller_seed_b64 }))
+    Ok(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint, caller_seed_b64 })
 }
 
 /// Verify a dKMS node's IDENTITY handshake response against the descriptor-PINNED verifying key.
@@ -2031,51 +2196,118 @@ mod tests {
             path
         }
 
-        /// THRESHOLD SEAM (Day 95–96, fail-closed stub): a descriptor requesting threshold recovery
-        /// (`threshold` with t>1 or more than one node) is REFUSED at `init` — splitting the CEK
-        /// across multiple secret-holding nodes is the next cycle, and until then the runtime fails
-        /// closed rather than silently recovering from a single node and pretending it was a
-        /// threshold. A single-node descriptor (no `threshold`, or `threshold.t == 1`) still resolves.
-        #[test]
-        fn dkms_fails_closed_on_a_threshold_descriptor() {
-            let master = [0x7cu8; 32];
-            let authority = reference_authority_from_master(&master);
-            // A descriptor asking for 2-of-2 threshold recovery.
-            let desc = json!({
-                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+        /// Build a node-entry value (PUBLIC-ONLY published identity) for a threshold descriptor.
+        fn dkms_node_entry(master: &[u8; 32], endpoint: &str) -> Value {
+            let authority = reference_authority_from_master(master);
+            json!({
                 "verifying_key_b64": b64().encode(&authority.verifying_key),
                 "recipient_pub_b64": b64().encode(&authority.recipient_public),
-                "authority_endpoint": "/path/to/dkms-authority",
-                "threshold": { "t": 2, "nodes": ["/path/to/node-a", "/path/to/node-b"] },
-            });
-            let path = unique_store_path("dkms-threshold");
+                "authority_endpoint": endpoint,
+            })
+        }
+
+        /// THRESHOLD RESOLUTION (Day 97–98): a PROPER 2-of-2 descriptor (`t == 2`, two distinct
+        /// PUBLIC-ONLY node entries) now RESOLVES both nodes — the CEK is split across two secret-
+        /// holding nodes so no single node holds the whole key. Anything that is NOT 2-of-2 (t=3,
+        /// three nodes, identical nodes, string node entries) fails closed rather than degrade the
+        /// guarantee. A single-node descriptor (no `threshold`, or `t == 1`) keeps the legacy rail.
+        #[test]
+        fn dkms_resolves_a_real_2of2_threshold_and_fails_closed_otherwise() {
+            let node_a = dkms_node_entry(&[0x7au8; 32], "/path/to/node-a");
+            let node_b = dkms_node_entry(&[0x7bu8; 32], "/path/to/node-b");
+
+            // A real 2-of-2 descriptor: top-level = node A, threshold.nodes = [node A, node B].
+            let mut desc = node_a.clone();
+            desc["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            desc["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone()] });
+            let path = unique_store_path("dkms-2of2");
             std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
             let mut p = KeyProvider::default();
-            assert_eq!(
-                error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &path }))),
-                "not_configured"
-            );
-            assert!(p.dkms.is_none(), "a threshold descriptor must not resolve a single-node client");
-
-            // A single-node descriptor (threshold.t == 1) still resolves the public client.
-            let single = json!({
-                "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
-                "verifying_key_b64": b64().encode(&authority.verifying_key),
-                "recipient_pub_b64": b64().encode(&authority.recipient_public),
-                "authority_endpoint": "/path/to/dkms-authority",
-                "threshold": { "t": 1, "nodes": ["/path/to/node-a"] },
-            });
-            let single_path = unique_store_path("dkms-threshold-1");
-            std::fs::write(&single_path, serde_json::to_vec(&single).unwrap()).unwrap();
-            let mut q = KeyProvider::default();
             assert!(matches!(
-                q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &single_path })),
+                p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &path })),
                 Response::Ok { .. }
             ));
-            assert!(q.dkms.is_some(), "a single-node (t=1) descriptor resolves");
+            assert!(p.dkms.is_some(), "node A resolves");
+            assert!(p.dkms2.is_some(), "node B resolves for a real 2-of-2");
+            assert_ne!(
+                p.dkms.as_ref().unwrap().verifying_key_b64,
+                p.dkms2.as_ref().unwrap().verifying_key_b64,
+                "the two threshold nodes are DISTINCT secret-holders"
+            );
 
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(&single_path);
+            // 3-of-N (t=3 / three nodes) is not implemented → fail closed.
+            let node_c = dkms_node_entry(&[0x7cu8; 32], "/path/to/node-c");
+            let mut three = node_a.clone();
+            three["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            three["threshold"] = json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c] });
+            let three_path = unique_store_path("dkms-3ofn");
+            std::fs::write(&three_path, serde_json::to_vec(&three).unwrap()).unwrap();
+            let mut q = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &three_path }))),
+                "not_configured", "3-of-N is not implemented and must fail closed"
+            );
+            assert!(q.dkms2.is_none());
+
+            // Two IDENTICAL nodes is not a real split → fail closed.
+            let mut dup = node_a.clone();
+            dup["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            dup["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_a.clone()] });
+            let dup_path = unique_store_path("dkms-dup");
+            std::fs::write(&dup_path, serde_json::to_vec(&dup).unwrap()).unwrap();
+            let mut r = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))),
+                "not_configured", "identical threshold nodes must fail closed"
+            );
+
+            // A single-node descriptor (threshold.t == 1) still resolves only node A.
+            let mut single = node_a.clone();
+            single["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            single["threshold"] = json!({ "t": 1, "nodes": [node_a.clone()] });
+            let single_path = unique_store_path("dkms-threshold-1");
+            std::fs::write(&single_path, serde_json::to_vec(&single).unwrap()).unwrap();
+            let mut s = KeyProvider::default();
+            assert!(matches!(
+                s.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &single_path })),
+                Response::Ok { .. }
+            ));
+            assert!(s.dkms.is_some() && s.dkms2.is_none(), "a single-node (t=1) descriptor resolves one node");
+
+            for p in [&path, &three_path, &dup_path, &single_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        /// `merge_threshold_material` welds node B's re-sealed share into node A's material as the
+        /// second share — WITHOUT combining (no XOR; `key-provider` never holds the CEK) — and fails
+        /// closed on a missing share, identical shares, or a content/transcript mismatch.
+        #[cfg(unix)]
+        #[test]
+        fn merge_threshold_material_welds_second_share_and_fails_closed() {
+            let base = |sealed: &str| {
+                json!({
+                    "suite": "elastos-pq-hybrid-threshold-v0",
+                    "sealed_cek_b64": sealed,
+                    "ciphertext_b64": "CIPHER",
+                    "content_hash_b64": "HASH",
+                    "nonce_b64": "NONCE",
+                })
+            };
+            // Happy: two distinct shares for the same content merge into a two-share material.
+            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2")).expect("merge");
+            assert_eq!(merged["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
+            assert_eq!(merged["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
+            assert_eq!(merged["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
+
+            // Identical shares → not a real split → fail closed.
+            assert!(merge_threshold_material(base("SAME"), &base("SAME")).is_err());
+            // A content/transcript mismatch between nodes → fail closed.
+            let mut other = base("SHARE2");
+            other["content_hash_b64"] = json!("DIFFERENT");
+            assert!(merge_threshold_material(base("SHARE1"), &other).is_err());
+            // A node missing its sealed share → fail closed.
+            assert!(merge_threshold_material(json!({"ciphertext_b64":"C"}), &base("S2")).is_err());
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in

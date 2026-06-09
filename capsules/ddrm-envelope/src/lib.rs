@@ -171,6 +171,53 @@ pub mod transcript {
     }
 }
 
+/// Threshold CEK share-split (2-of-2 XOR secret-sharing) — the PRODUCER side.
+///
+/// Splits a content key into two shares such that `cek == share1 ⊕ share2` and
+/// neither share alone reveals anything about the CEK (information-theoretically
+/// perfect for a uniform mask). The producer escrows EACH share to a DIFFERENT
+/// dKMS node's recipient, so no single node ever holds the whole content key — the
+/// runtime's explicit, owned analogue of Lit's opaque `decryptAndCombine` threshold
+/// (PC2 `non-media-decrypt.js:76`), where PC2 cannot inspect the share set.
+///
+/// `mask` is the fresh random share (`share1`); it MUST be uniformly random and the
+/// SAME length as the CEK, drawn from a CSPRNG by the caller. The RNG is kept OUT of
+/// this crate so the split stays deterministic + replayable in tests and the entropy
+/// lives at the boundary that owns it (the producer). Returns `(share1, share2)`.
+pub fn split_cek_xor(cek: &[u8], mask: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
+    if cek.is_empty() {
+        return Err("cek must be non-empty");
+    }
+    if cek.len() != mask.len() {
+        return Err("mask length must equal cek length");
+    }
+    let share1 = mask.to_vec();
+    let share2: Vec<u8> = cek.iter().zip(mask.iter()).map(|(c, m)| c ^ m).collect();
+    Ok((share1, share2))
+}
+
+/// Reconstruct the CEK from its two XOR shares — the DECRYPT-BOUNDARY side.
+///
+/// `cek == share1 ⊕ share2`. Fails closed on a length mismatch so a wrong/forged
+/// share of the wrong size can never silently yield a truncated key. The combine
+/// MUST run ONLY inside the decrypt sandbox — never in `key-provider` — so the whole
+/// CEK materializes only where the plaintext is produced. The result rides in
+/// `Zeroizing` so the reconstructed key is scrubbed when the caller drops it.
+pub fn combine_cek_xor(
+    share1: &[u8],
+    share2: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if share1.is_empty() {
+        return Err("shares must be non-empty");
+    }
+    if share1.len() != share2.len() {
+        return Err("share length mismatch");
+    }
+    Ok(zeroize::Zeroizing::new(
+        share1.iter().zip(share2.iter()).map(|(a, b)| a ^ b).collect(),
+    ))
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -1220,6 +1267,40 @@ mod tests {
         let mut sink = Vec::new();
         let too_big = vec![0u8; (MAX_FRAME_BYTES + 1) as usize];
         assert!(write_frame(&mut sink, &too_big).is_err());
+    }
+
+    /// The 2-of-2 XOR share-split round-trips, hides the CEK in each share alone, and
+    /// fails closed on a length mismatch (a wrong/forged share can never yield a key).
+    #[test]
+    fn cek_xor_split_round_trips_and_fails_closed() {
+        let cek: Vec<u8> = (0u8..16).collect();
+        let mask: Vec<u8> = (0u8..16).map(|b| b ^ 0xA5).collect();
+
+        let (share1, share2) = crate::split_cek_xor(&cek, &mask).expect("split");
+        // No single share equals (or reveals) the CEK.
+        assert_ne!(share1.as_slice(), cek.as_slice(), "share1 alone must not be the CEK");
+        assert_ne!(share2.as_slice(), cek.as_slice(), "share2 alone must not be the CEK");
+        assert_eq!(share1.as_slice(), mask.as_slice(), "share1 is the random mask");
+
+        // Combining the two shares reconstructs the CEK exactly.
+        let recovered = crate::combine_cek_xor(&share1, &share2).expect("combine");
+        assert_eq!(recovered.as_slice(), cek.as_slice(), "share1 ^ share2 == CEK");
+
+        // Order does not matter (XOR is commutative).
+        let recovered_swapped = crate::combine_cek_xor(&share2, &share1).expect("combine swapped");
+        assert_eq!(recovered_swapped.as_slice(), cek.as_slice());
+
+        // ONE share alone is useless: combining a share with itself (the single-node
+        // attacker who only ever sees one share) yields zeros, never the CEK.
+        let single = crate::combine_cek_xor(&share1, &share1).expect("combine self");
+        assert!(single.iter().all(|&b| b == 0));
+        assert_ne!(single.as_slice(), cek.as_slice());
+
+        // A wrong-length mask or share fails closed (no silent truncation).
+        assert!(crate::split_cek_xor(&cek, &mask[..15]).is_err());
+        assert!(crate::split_cek_xor(&[], &[]).is_err());
+        assert!(crate::combine_cek_xor(&share1, &share2[..15]).is_err());
+        assert!(crate::combine_cek_xor(&[], &[]).is_err());
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.
