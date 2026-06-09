@@ -111,6 +111,29 @@ fn reconstruct_request(calldata: &str) -> Value {
     })
 }
 
+fn enrich_request(calldata: &str, kid: &str) -> Value {
+    json!({
+        "op": "enrich_listing",
+        "request": {
+            "calldata": calldata,
+            "channel_address": CHANNEL,
+            "chain_id": 8453,
+            "expected_selector": SELECTOR,
+            "metadata": {
+                "schema": "elacity-asset-envelope-v1",
+                "name": "Market Smoke Film",
+                "description": "Sealed now, discoverable now.",
+                "image": "ipfs://QmPoster/poster.png",
+                "kid": kid,
+                "media": {
+                    "uri": "ipfs://QmContent/video.mp4",
+                    "contentType": "video/mp4"
+                }
+            }
+        }
+    })
+}
+
 fn publish_request(op_type: &str, paid: bool) -> Value {
     let mut req = json!({
         "schema": "elastos.publish.request/v1",
@@ -176,10 +199,35 @@ fn flow_one(
         return Err("listing provenance is not the mint calldata".to_string());
     }
 
+    // Enrich with a matching metadata.json -> resolved card; identity unchanged.
+    let resolved = ok_data(
+        &market.call(&enrich_request(&calldata, KID))?,
+        "content-market enrich_listing",
+    )?;
+    if resolved["content_id"].as_str() != Some(&content_id) {
+        return Err("enrichment changed the listing identity".to_string());
+    }
+    if resolved["metadata_status"].as_str() != Some("resolved") {
+        return Err(format!("enrichment did not resolve: {resolved}"));
+    }
+    if resolved["name"].as_str() != Some("Market Smoke Film")
+        || resolved["asset_type"].as_str() != Some("video")
+    {
+        return Err(format!("descriptive fields not fused: {resolved}"));
+    }
+
+    // A tampered kid must NEVER re-point the listing.
+    let tampered = market.call(&enrich_request(&calldata, "ffffffffffffffffffffffffffffffff"))?;
+    if tampered.get("status").and_then(Value::as_str) != Some("error")
+        || tampered.get("code").and_then(Value::as_str) != Some("identity_mismatch")
+    {
+        return Err(format!("tampered metadata.kid was not rejected: {tampered}"));
+    }
+
     step(
         if paid { 1 } else { 2 },
         &format!(
-            "{op_type}: KID -> contentId -> calldata -> listing, content_id={content_id} intact"
+            "{op_type}: KID -> contentId -> calldata -> listing -> enrich(resolved); tampered kid rejected; content_id={content_id} intact"
         ),
     );
     Ok(())

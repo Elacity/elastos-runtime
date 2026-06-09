@@ -50,7 +50,7 @@ shared `protected_content` contracts.
 | 1 Process/encrypt | `encrypt-provider` (`seal`) | 🟥 `seal`→`not_configured`; **CEK mint + CENC engine proven in tests** | `capsules/encrypt-provider` |
 | 2 Publish on-chain | `publish-provider` → `chain-provider::assemble_mint` | 🟩 mint assembled + ABI-encoded + wired cross-binary (Days 61–63); live broadcast pending | `capsules/publish-provider`, `chain-provider` |
 | 3 IPFS pin | `ipfs-provider` + `content` | ✅ Kubo-backed add/cat/pin; publish with pin | `capsules/ipfs-provider` |
-| 4 Market discovery | `content-market` (mint→listing) + `marketplace` (app catalog) | 🟩 listing reconstructed from mint calldata, fail-closed (Day 64); live event-scan + metadata enrich pending | `capsules/content-market` |
+| 4 Market discovery | `content-market` (mint→listing + metadata enrich) + `marketplace` (app catalog) | 🟩 listing reconstructed from mint calldata + metadata.json fused fail-closed (Days 64–65); live event-scan pending | `capsules/content-market` |
 | 5 Purchase | `wallet-provider` + `chain-provider` | 🟦 signing + tx exist; **buyAccess not orchestrated by a content flow** | `capsules/wallet-provider`, `chain-provider` |
 | 6 Download | `content` fetch + `ipfs-provider` + `availability-provider` | 🟦 fetch/pin work | `elastos-server/src/content.rs` |
 | 7 Validate ownership | `rights-provider` → `chain-provider::has_access_by_content_id` | 🟦 **chain read is typed + tested**; rights-provider not yet calling it | `capsules/chain-provider`, `capsules/rights-provider` |
@@ -206,7 +206,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
 | Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
 | Channel/operative mint | `publish-provider` (intent) → `chain-provider::assemble_mint` (calldata) → wallet sign → broadcast | Intent DONE (Day 61); ABI calldata DONE (Day 62, decoded-to-spec); publish→chain wiring DONE cross-binary (Day 63, `ddrm-publish-smoke.sh`); live broadcast is the next step |
-| SQLite `content_catalog` indexer | `content-market` provider | Listing reconstructed from mint calldata (Day 64); live event-scan + IPFS metadata enrich pending |
+| SQLite `content_catalog` indexer | `content-market` provider | Listing reconstructed from mint calldata + metadata.json enriched fail-closed (Days 64–65); live event-scan pending |
 | secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
 | Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
 
@@ -332,12 +332,21 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   (`ipfs-provider` + `chain-provider`) but delegated. Runtime-superior vs PC2's 4-source
   `ContentIndexerService` (event + tokenURI eth_call + `metadata.kid` + AuthorityGateway
   price). `ddrm-market-smoke.sh` drives the REAL `publish → chain → content-market` so the
-  listing's `content_id` IS the producer's KID (content-market=13). Fail-closed on foreign
-  selector, bad offsets, non-`bytes16`, op_type/sell mismatch, unknown opType, bad channel.
+  listing's `content_id` IS the producer's KID. Fail-closed on foreign selector, bad
+  offsets, non-`bytes16`, op_type/sell mismatch, unknown opType, bad channel.
+- **Status (Day 65 — the listing gets its card, fail-closed):** `content-market::
+  enrich_listing` fuses a resolved `metadata.json` (name/description/`image`‖`previewURL`
+  poster/`media.uri`→contentCID/`contentType`→mime/`classifyAssetType`) onto the
+  calldata-derived identity — but re-derives the contentId from the calldata and REJECTS any
+  metadata whose `kid != content_id` (`identity_mismatch`), so metadata describes but never
+  re-identifies (a hardening over PC2, which trusts `metadata.kid`). Still fetches nothing —
+  the JSON is handed in by `ipfs-provider` (named). `ddrm-market-smoke.sh` drives `publish →
+  chain → reconstruct → enrich` so a matching kid resolves and a tampered kid is rejected
+  (content-market=22, +9 tests).
 - **Remaining:** a live broadcast path (`assemble_mint → prepare_transaction → wallet sign →
-  broadcast`), `metadata.json` enrichment via `ipfs-provider` (title/poster/mime), a
-  live-Base event-scan path, and real `plaintext_ref`→IPFS in the producer op (today inline
-  bytes for the smoke).
+  broadcast`), a live-Base event-scan path (real `AssetCreated`/`DigitalAssetRegistered`
+  logs → reconstruct), and real `plaintext_ref`→IPFS in the producer op (today inline bytes
+  for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

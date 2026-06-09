@@ -49,6 +49,11 @@ enum Request {
     ReconstructListing {
         request: Box<ReconstructRequestV1>,
     },
+    /// Fuse a resolved `metadata.json` onto the calldata-derived identity. The calldata is
+    /// authoritative: metadata can only DESCRIBE, never re-identify.
+    EnrichListing {
+        request: Box<EnrichRequestV1>,
+    },
     Shutdown,
 }
 
@@ -66,6 +71,24 @@ struct ReconstructRequestV1 {
     /// fails closed (it isn't the mint we know how to read).
     #[serde(default)]
     expected_selector: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrichRequestV1 {
+    /// The authoritative identity source — the same self-describing mint calldata
+    /// `reconstruct_listing` consumes. The contentId derived here, NOT the metadata, fixes
+    /// the listing's identity.
+    calldata: String,
+    channel_address: String,
+    #[serde(default = "default_chain_id")]
+    chain_id: u64,
+    #[serde(default)]
+    expected_selector: Option<String>,
+    /// The parsed `metadata.json` (handed in by `ipfs-provider`; this capsule fetches
+    /// nothing). It may only DESCRIBE the asset; its `kid` MUST match the calldata
+    /// contentId or the enrichment is rejected.
+    metadata: Value,
 }
 
 fn default_chain_id() -> u64 {
@@ -114,6 +137,7 @@ impl ContentMarket {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
             Request::ReconstructListing { request } => self.reconstruct_listing(*request),
+            Request::EnrichListing { request } => self.enrich_listing(*request),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -123,7 +147,7 @@ impl ContentMarket {
             "provider": "content-market",
             "protocol_version": "1.0",
             "configured": false,
-            "supported_operations": ["status", "reconstruct_listing"],
+            "supported_operations": ["status", "reconstruct_listing", "enrich_listing"],
         }))
     }
 
@@ -132,7 +156,7 @@ impl ContentMarket {
             "provider": "content-market",
             "version": PROVIDER_VERSION,
             "configured": false,
-            "supported_operations": ["status", "reconstruct_listing"],
+            "supported_operations": ["status", "reconstruct_listing", "enrich_listing"],
             "decodes_function": MINT_FUNCTION,
             "supported_op_types": ["free", "buy_once", "buy_and_resell"],
             // The listing's identity IS the KID (== bytes16 contentId), no hash/truncation.
@@ -160,40 +184,167 @@ impl ContentMarket {
         if let Err(err) = validate_eth_address(&request.channel_address, "channel_address") {
             return Response::error("invalid_request", err);
         }
+        let decoded = match decode_mint_calldata(&request.calldata, request.expected_selector.as_deref()) {
+            Ok(d) => d,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        Response::ok(build_listing(&decoded, &request.channel_address, request.chain_id))
+    }
 
+    /// Fuse a resolved `metadata.json` onto the calldata-derived identity. The calldata is
+    /// authoritative: we re-derive the contentId from the calldata (NOT from the metadata),
+    /// then REQUIRE `metadata.kid == content_id` before attaching any descriptive field. A
+    /// mismatched, missing, or malformed kid is rejected — metadata can describe an asset
+    /// but can never re-point a listing at a different identity.
+    fn enrich_listing(&self, request: EnrichRequestV1) -> Response {
+        if let Err(err) = validate_eth_address(&request.channel_address, "channel_address") {
+            return Response::error("invalid_request", err);
+        }
         let decoded = match decode_mint_calldata(&request.calldata, request.expected_selector.as_deref()) {
             Ok(d) => d,
             Err(err) => return Response::error("invalid_request", err),
         };
 
-        let metadata_cid = extract_cid(&decoded.token_uri);
-
-        let mut listing = json!({
-            "schema": LISTING_SCHEMA,
-            // The producer's KID, carried on-chain as the bytes16 contentId.
-            "content_id": decoded.content_id,
-            "channel_address": request.channel_address,
-            "chain_id": request.chain_id,
-            "token_uri": decoded.token_uri,
-            "metadata_cid": metadata_cid,
-            "op_type": decoded.op_type_tag,
-            "op_type_code": decoded.op_type_code,
-            // Provenance: this listing was reconstructed from the mint calldata itself, not
-            // a trusted index — anyone holding the calldata can verify it.
-            "source": "mint_calldata",
-            "selector": decoded.selector,
-            // The crypto/identity fields are complete; the human-facing fields are not.
-            "metadata_status": "unresolved",
-            "enrich_requires": ["ipfs-provider", "chain-provider"],
-        });
-
-        if let Some(sell) = decoded.sell {
-            listing["copies"] = json!(sell.copies);
-            listing["price_wei"] = json!(sell.price_wei);
-            listing["pay_token"] = json!(sell.pay_token);
+        // CARDINAL RULE: metadata.kid (kid || properties.kid) MUST equal the calldata
+        // contentId. The calldata identity wins; metadata only describes.
+        let meta = &request.metadata;
+        let kid_field = meta
+            .get("kid")
+            .and_then(Value::as_str)
+            .or_else(|| meta.get("properties").and_then(|p| p.get("kid")).and_then(Value::as_str));
+        let kid = match kid_field {
+            Some(k) => k,
+            None => return Response::error("invalid_request", "metadata has no kid (kid | properties.kid)"),
+        };
+        let normalized_kid = match normalize_kid(kid) {
+            Ok(id) => id,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+        if normalized_kid != decoded.content_id {
+            return Response::error(
+                "identity_mismatch",
+                format!(
+                    "metadata.kid ({normalized_kid}) does not match the calldata contentId ({}) — refusing to re-identify the listing",
+                    decoded.content_id
+                ),
+            );
         }
 
+        let mut listing = build_listing(&decoded, &request.channel_address, request.chain_id);
+
+        // Descriptive fields only (PC2 ContentIndexerService.ts:1102–1128).
+        let content_cid = meta
+            .get("media")
+            .and_then(|m| m.get("uri"))
+            .and_then(Value::as_str)
+            .and_then(extract_cid);
+        let mime_type = meta
+            .get("media")
+            .and_then(|m| m.get("contentType"))
+            .and_then(Value::as_str);
+        // image, else media.previewURL (poster fallback).
+        let thumbnail = meta
+            .get("image")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| meta.get("media").and_then(|m| m.get("previewURL")).and_then(Value::as_str));
+        let publisher = meta
+            .get("properties")
+            .and_then(|p| p.get("publisher"))
+            .and_then(Value::as_str);
+
+        listing["name"] = json!(meta.get("name").and_then(Value::as_str));
+        listing["description"] = json!(meta.get("description").and_then(Value::as_str));
+        listing["image_url"] = json!(thumbnail);
+        listing["content_cid"] = json!(content_cid);
+        listing["mime_type"] = json!(mime_type);
+        listing["asset_type"] = json!(classify_asset_type(mime_type));
+        if let Some(p) = publisher {
+            listing["creator_address"] = json!(p);
+        }
+        listing["metadata_status"] = json!("resolved");
+
         Response::ok(listing)
+    }
+}
+
+/// Build the base (calldata-only) listing. `metadata_status` is `unresolved`; the
+/// identity/sell fields are complete and verifiable from the calldata alone.
+fn build_listing(decoded: &DecodedMint, channel: &str, chain_id: u64) -> Value {
+    let mut listing = json!({
+        "schema": LISTING_SCHEMA,
+        // The producer's KID, carried on-chain as the bytes16 contentId.
+        "content_id": decoded.content_id,
+        "channel_address": channel,
+        "chain_id": chain_id,
+        "token_uri": decoded.token_uri,
+        "metadata_cid": extract_cid(&decoded.token_uri),
+        "op_type": decoded.op_type_tag,
+        "op_type_code": decoded.op_type_code,
+        // Provenance: reconstructed from the mint calldata itself, not a trusted index —
+        // anyone holding the calldata can verify it.
+        "source": "mint_calldata",
+        "selector": decoded.selector,
+        // The crypto/identity fields are complete; the human-facing fields are not (yet).
+        "metadata_status": "unresolved",
+        "enrich_requires": ["ipfs-provider", "chain-provider"],
+    });
+    if let Some(sell) = &decoded.sell {
+        listing["copies"] = json!(sell.copies);
+        listing["price_wei"] = json!(sell.price_wei);
+        listing["pay_token"] = json!(sell.pay_token);
+    }
+    listing
+}
+
+/// A metadata `kid` -> the `0x` + 32-lowercase-hex contentId form. Accepts an optional
+/// `0x` prefix; rejects anything that is not exactly 16 bytes (32 hex chars) — the same
+/// bytes16 rule the producer/publish/chain path enforces (no hash, no truncation).
+fn normalize_kid(kid: &str) -> Result<String, String> {
+    let clean = kid.strip_prefix("0x").unwrap_or(kid);
+    if clean.len() != 32 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("metadata.kid must be 32 hex chars (the 16-byte contentId)".to_string());
+    }
+    Ok(format!("0x{}", clean.to_lowercase()))
+}
+
+/// MIME -> asset class. Mirrors PC2 `classifyAssetType` (ContentIndexerService.ts:114).
+fn classify_asset_type(mime: Option<&str>) -> &'static str {
+    let m = match mime {
+        Some(m) if !m.is_empty() => m,
+        _ => return "unknown",
+    };
+    if m.starts_with("image/") {
+        "image"
+    } else if m.starts_with("video/") {
+        "video"
+    } else if m.starts_with("audio/") {
+        "audio"
+    } else if m.starts_with("text/") {
+        "text"
+    } else if m == "application/pdf" {
+        "document"
+    } else if [
+        "application/javascript",
+        "application/json",
+        "application/xml",
+        "application/x-yaml",
+        "application/toml",
+        "application/x-sh",
+    ]
+    .contains(&m)
+    {
+        "code"
+    } else if m.contains("model") || m.contains("gguf") || m.contains("safetensors") || m.contains("onnx") {
+        "ai-model"
+    } else if m.contains("font") {
+        "font"
+    } else if m.contains("gltf") || m.contains("fbx") || m.contains("obj") {
+        "3d"
+    } else if m.contains("csv") || m.contains("parquet") || m.contains("jsonl") {
+        "dataset"
+    } else {
+        "other"
     }
 }
 
@@ -652,6 +803,119 @@ mod tests {
         assert_eq!(extract_cid("ipfs://bafyXYZ/metadata.json").as_deref(), Some("bafyXYZ"));
         assert_eq!(extract_cid("https://gw/ipfs/QmAbc/metadata.json").as_deref(), Some("QmAbc"));
         assert_eq!(extract_cid("https://example.com/x"), None);
+    }
+
+    // ── enrich_listing ────────────────────────────────────────────────────────────
+
+    fn metadata(kid: &str) -> Value {
+        json!({
+            "schema": "elacity-asset-envelope-v1",
+            "name": "My Film",
+            "description": "A short film.",
+            "image": "ipfs://QmPoster/poster.png",
+            "kid": kid,
+            "media": {
+                "uri": "ipfs://QmContent/video.mp4",
+                "contentType": "video/mp4",
+                "previewURL": "ipfs://QmPreview/preview.jpg"
+            },
+            "properties": { "publisher": CREATOR_PUB }
+        })
+    }
+
+    const CREATOR_PUB: &str = "0x2222222222222222222222222222222222222222";
+
+    fn enrich(calldata: &str, meta: Value) -> Response {
+        let req = EnrichRequestV1 {
+            calldata: calldata.to_string(),
+            channel_address: CHANNEL.to_string(),
+            chain_id: 8453,
+            expected_selector: Some(SELECTOR.to_string()),
+            metadata: meta,
+        };
+        ContentMarket.enrich_listing(req)
+    }
+
+    #[test]
+    fn enrich_fuses_metadata_onto_the_calldata_identity() {
+        let data = ok_data(enrich(&paid_calldata(1), metadata(KID)));
+        // Identity is unchanged (calldata is authoritative) and now resolved.
+        assert_eq!(data["content_id"], format!("0x{KID}"));
+        assert_eq!(data["metadata_status"], "resolved");
+        // Descriptive fields fused from metadata.json.
+        assert_eq!(data["name"], "My Film");
+        assert_eq!(data["description"], "A short film.");
+        assert_eq!(data["image_url"], "ipfs://QmPoster/poster.png");
+        assert_eq!(data["content_cid"], "QmContent");
+        assert_eq!(data["mime_type"], "video/mp4");
+        assert_eq!(data["asset_type"], "video");
+        assert_eq!(data["creator_address"], CREATOR_PUB);
+        // Sell terms still present from the calldata.
+        assert_eq!(data["price_wei"], "1000000000000000000");
+    }
+
+    #[test]
+    fn enrich_accepts_0x_prefixed_and_uppercase_kid() {
+        let data = ok_data(enrich(&free_calldata(), metadata(&format!("0x{}", KID.to_uppercase()))));
+        assert_eq!(data["content_id"], format!("0x{KID}"));
+        assert_eq!(data["metadata_status"], "resolved");
+    }
+
+    #[test]
+    fn enrich_reads_kid_from_properties_when_top_level_absent() {
+        let mut meta = metadata(KID);
+        meta.as_object_mut().unwrap().remove("kid");
+        meta["properties"]["kid"] = json!(KID);
+        let data = ok_data(enrich(&free_calldata(), meta));
+        assert_eq!(data["content_id"], format!("0x{KID}"));
+    }
+
+    #[test]
+    fn enrich_falls_back_to_preview_url_when_image_empty() {
+        let mut meta = metadata(KID);
+        meta["image"] = json!("");
+        let data = ok_data(enrich(&free_calldata(), meta));
+        assert_eq!(data["image_url"], "ipfs://QmPreview/preview.jpg");
+    }
+
+    #[test]
+    fn enrich_rejects_a_kid_that_does_not_match_the_calldata() {
+        // The attack: metadata tries to re-point the listing at a different identity.
+        let other = "ffffffffffffffffffffffffffffffff";
+        match enrich(&paid_calldata(1), metadata(other)) {
+            Response::Error { code, .. } => assert_eq!(code, "identity_mismatch"),
+            other => panic!("expected identity_mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrich_rejects_missing_kid() {
+        let mut meta = metadata(KID);
+        meta.as_object_mut().unwrap().remove("kid");
+        assert_eq!(error_code(enrich(&free_calldata(), meta)), "invalid_request");
+    }
+
+    #[test]
+    fn enrich_rejects_malformed_kid() {
+        assert_eq!(error_code(enrich(&free_calldata(), metadata("not-a-kid"))), "invalid_request");
+    }
+
+    #[test]
+    fn enrich_fails_closed_on_foreign_calldata() {
+        // The identity source must be a valid mint even when enriching.
+        assert_eq!(error_code(enrich("0xaabbccdd0011", metadata(KID))), "invalid_request");
+    }
+
+    #[test]
+    fn classify_asset_type_matches_pc2() {
+        assert_eq!(classify_asset_type(Some("image/png")), "image");
+        assert_eq!(classify_asset_type(Some("application/pdf")), "document");
+        assert_eq!(classify_asset_type(Some("application/json")), "code");
+        assert_eq!(classify_asset_type(Some("model/gguf")), "ai-model");
+        assert_eq!(classify_asset_type(Some("text/csv")), "text"); // text/ wins first
+        assert_eq!(classify_asset_type(Some("application/parquet")), "dataset");
+        assert_eq!(classify_asset_type(None), "unknown");
+        assert_eq!(classify_asset_type(Some("application/zip")), "other");
     }
 
     #[test]
