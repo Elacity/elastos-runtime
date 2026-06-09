@@ -2169,10 +2169,7 @@ async fn test_library_gateway_lists_webspaces_through_runtime_provider() {
     assert_eq!(cloud["kind"], "directory");
     assert_eq!(cloud["metadata"]["target_uri"], "cloud://drive");
     assert_eq!(cloud["metadata"]["resolver"], "cloud-drive");
-    assert_eq!(
-        cloud["metadata"]["cache_policy"],
-        "metadata-and-thumbnails"
-    );
+    assert_eq!(cloud["metadata"]["cache_policy"], "metadata-and-thumbnails");
     assert_eq!(cloud["metadata"]["webspace_kind"], "mounted-webspace");
 
     let (elastos_status, elastos) = post_library(

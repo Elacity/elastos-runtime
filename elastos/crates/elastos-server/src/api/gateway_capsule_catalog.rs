@@ -1002,10 +1002,7 @@ mod tests {
             .iter()
             .find(|capsule| capsule.name == "marketplace")
             .unwrap();
-        assert_eq!(
-            marketplace.interfaces[0].id,
-            "elastos.marketplace.catalog"
-        );
+        assert_eq!(marketplace.interfaces[0].id, "elastos.marketplace.catalog");
 
         let registry = capsule_interface_registry_summary(data_dir.path());
         assert_eq!(registry.schema, CAPSULE_INTERFACE_REGISTRY_SCHEMA);
