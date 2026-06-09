@@ -178,7 +178,62 @@ pub(super) enum Request {
         network: String,
         action: NodeLifecycleAction,
     },
+    /// Assemble the dDRM content-mint calldata (PURE: no RPC, no keys). Turns a
+    /// publish-provider `UnsignedMintV1` into the `{ to, data, value }` an external
+    /// signer (wallet-provider) signs and `broadcast_transaction` sends.
+    AssembleMint {
+        mint: Box<MintAssembly>,
+    },
     Shutdown,
+}
+
+/// The structured mint the chain capability ABI-encodes (publish-provider's
+/// `UnsignedMintV1`, plus the configured selector + the fee value the runtime read).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintAssembly {
+    /// The configured 4-byte mint selector (`keccak256("mint(string,uint16,bytes,bytes)")
+    /// [..4]`) — supplied, not computed, mirroring the `has_access` selector.
+    pub selector: String,
+    /// The creator's Channel contract (mint `to`).
+    pub to: String,
+    /// `_uri` = `{metadataCid}/metadata.json`.
+    pub token_uri: String,
+    /// 0=FREE, 1=BUY_ONCE, 2=BUY_AND_RESELL.
+    pub op_type_code: u16,
+    /// On-chain `bytes16 contentId` (`0x` + 32 hex == KID).
+    pub content_id: String,
+    /// The payable mint fee (hex quantity) the runtime read from CENTRAL_STORAGE; the
+    /// pure assembler never reads chain state. Defaults to `0x0`.
+    #[serde(default)]
+    pub value_wei: Option<String>,
+    /// Paid listings only: the `opRawData` payee/royalty arrays + metadata URI.
+    #[serde(default)]
+    pub op_raw: Option<MintOpRaw>,
+    /// Paid listings only: the `sellRawData` sale terms.
+    #[serde(default)]
+    pub sell: Option<MintSell>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintOpRaw {
+    /// `ipfs://{metadataCid}` (the folder root, app.js:1593).
+    pub metadata_uri: String,
+    pub addresses: Vec<String>,
+    pub role_types: Vec<u64>,
+    pub amounts: Vec<String>,
+    /// Present (and encoded as a trailing `uint16`) only for BUY_AND_RESELL.
+    #[serde(default)]
+    pub reseller_cut: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintSell {
+    pub copies: String,
+    pub price_wei: String,
+    pub pay_token: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

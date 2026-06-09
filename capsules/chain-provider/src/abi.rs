@@ -85,6 +85,170 @@ pub(super) fn abi_word_address(address: &str) -> Result<Vec<u8>, String> {
     Ok(word)
 }
 
+// --- content-mint calldata assembly (PC2 elacity-creator/app.js fidelity) -----------
+//
+// Reproduces `mint(string _uri, uint16 opType, bytes opRawData, bytes sellRawData)` and
+// its `opRawData`/`sellRawData` payloads byte-for-byte against the Solidity ABI spec.
+// PURE: no chain RPC, no keys. The selector is supplied (configured) exactly like the
+// `has_access_by_content_id` selector — keccak is not computed in-capsule.
+
+/// The canonical mint signature (selector = `keccak256(MINT_SIGNATURE)[..4]`, supplied
+/// by config — not computed here).
+pub(super) const MINT_SIGNATURE: &str = "mint(string,uint16,bytes,bytes)";
+
+/// A `uintN` (N<=128) right-aligned in a 32-byte word.
+pub(super) fn abi_word_u128(value: u128) -> Vec<u8> {
+    let mut word = vec![0u8; 32];
+    word[16..32].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+/// A `bytes16` left-aligned in a 32-byte word (data in the high 16 bytes, zero-padded
+/// right) — the on-chain `contentId == KID`. `content_id` is `0x` + 32 hex.
+pub(super) fn abi_word_bytes16(content_id: &str) -> Result<Vec<u8>, String> {
+    let bytes = decode_hex(content_id, Some(16), "bytes16 contentId")?;
+    let mut word = vec![0u8; 32];
+    word[0..16].copy_from_slice(&bytes);
+    Ok(word)
+}
+
+/// A full `uint256` from a base-10 string (prices/copies can exceed u64).
+pub(super) fn abi_word_uint256_decimal(dec: &str) -> Result<Vec<u8>, String> {
+    if dec.is_empty() || !dec.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("expected a base-10 integer, got {dec:?}"));
+    }
+    let mut word = [0u8; 32];
+    for ch in dec.bytes() {
+        let mut carry = (ch - b'0') as u32;
+        for byte in word.iter_mut().rev() {
+            let v = (*byte as u32) * 10 + carry;
+            *byte = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        if carry != 0 {
+            return Err("uint256 overflow".to_string());
+        }
+    }
+    Ok(word.to_vec())
+}
+
+fn abi_encode_address_array(addrs: &[String]) -> Result<Vec<u8>, String> {
+    let mut out = abi_word_usize(addrs.len());
+    for a in addrs {
+        out.extend_from_slice(&abi_word_address(a)?);
+    }
+    Ok(out)
+}
+
+fn abi_encode_uint_array_u64(vals: &[u64]) -> Vec<u8> {
+    let mut out = abi_word_usize(vals.len());
+    for v in vals {
+        out.extend_from_slice(&abi_word_u128(*v as u128));
+    }
+    out
+}
+
+fn abi_encode_uint_array_decimal(vals: &[String]) -> Result<Vec<u8>, String> {
+    let mut out = abi_word_usize(vals.len());
+    for v in vals {
+        out.extend_from_slice(&abi_word_uint256_decimal(v)?);
+    }
+    Ok(out)
+}
+
+/// FREE-case `opRawData = abi.encode(bytes16 contentId)` (app.js:4941).
+pub(super) fn encode_op_raw_free(content_id: &str) -> Result<Vec<u8>, String> {
+    abi_word_bytes16(content_id)
+}
+
+/// PAID-case `opRawData = abi.encode(bytes16, string metadataUri, address[], uint256[]
+/// roleTypes, uint256[] amounts[, uint16 resellerCut])` (app.js:1620/1627). The trailing
+/// `uint16` is present iff `reseller_cut` is set (BUY_AND_RESELL).
+pub(super) fn encode_op_raw_paid(
+    content_id: &str,
+    metadata_uri: &str,
+    addresses: &[String],
+    role_types: &[u64],
+    amounts: &[String],
+    reseller_cut: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    if addresses.len() != role_types.len() || addresses.len() != amounts.len() {
+        return Err("opRawData addresses/roleTypes/amounts must be equal length".to_string());
+    }
+    if addresses.is_empty() {
+        return Err("opRawData requires at least one payee".to_string());
+    }
+    let num_head_words = if reseller_cut.is_some() { 6 } else { 5 };
+    let head_size = num_head_words * 32;
+
+    let enc_uri = abi_encode_string(metadata_uri.as_bytes());
+    let enc_addr = abi_encode_address_array(addresses)?;
+    let enc_roles = abi_encode_uint_array_u64(role_types);
+    let enc_amts = abi_encode_uint_array_decimal(amounts)?;
+
+    let uri_off = head_size;
+    let addr_off = uri_off + enc_uri.len();
+    let role_off = addr_off + enc_addr.len();
+    let amt_off = role_off + enc_roles.len();
+
+    let mut out = abi_word_bytes16(content_id)?; // [0] static bytes16
+    out.extend_from_slice(&abi_word_usize(uri_off)); // [1] string offset
+    out.extend_from_slice(&abi_word_usize(addr_off)); // [2] address[] offset
+    out.extend_from_slice(&abi_word_usize(role_off)); // [3] uint256[] offset
+    out.extend_from_slice(&abi_word_usize(amt_off)); // [4] uint256[] offset
+    if let Some(cut) = reseller_cut {
+        out.extend_from_slice(&abi_word_u128(cut as u128)); // [5] static uint16
+    }
+    out.extend_from_slice(&enc_uri);
+    out.extend_from_slice(&enc_addr);
+    out.extend_from_slice(&enc_roles);
+    out.extend_from_slice(&enc_amts);
+    Ok(out)
+}
+
+/// `sellRawData = abi.encode(uint256 copies, uint256 priceWei, address payToken)`
+/// (encodeSellRawData, app.js:1633).
+pub(super) fn encode_sell_raw_data(
+    copies: &str,
+    price_wei: &str,
+    pay_token: &str,
+) -> Result<Vec<u8>, String> {
+    let mut out = abi_word_uint256_decimal(copies)?;
+    out.extend_from_slice(&abi_word_uint256_decimal(price_wei)?);
+    out.extend_from_slice(&abi_word_address(pay_token)?);
+    Ok(out)
+}
+
+/// Outer `mint(string,uint16,bytes,bytes)` calldata: `selector ‖ head ‖ tail`. `_uri`,
+/// `opRawData` and `sellRawData` are dynamic (offset words); `opType` is the one static
+/// head word.
+pub(super) fn encode_mint_calldata(
+    selector: &str,
+    uri: &str,
+    op_type: u16,
+    op_raw: &[u8],
+    sell_raw: &[u8],
+) -> Result<String, String> {
+    let mut bytes = decode_hex(selector, Some(4), "mint function selector")?;
+    let enc_uri = abi_encode_string(uri.as_bytes());
+    let enc_op = abi_encode_bytes(op_raw);
+    let enc_sell = abi_encode_bytes(sell_raw);
+
+    let head = 4 * 32;
+    let uri_off = head;
+    let op_off = uri_off + enc_uri.len();
+    let sell_off = op_off + enc_op.len();
+
+    bytes.extend_from_slice(&abi_word_usize(uri_off));
+    bytes.extend_from_slice(&abi_word_u128(op_type as u128));
+    bytes.extend_from_slice(&abi_word_usize(op_off));
+    bytes.extend_from_slice(&abi_word_usize(sell_off));
+    bytes.extend_from_slice(&enc_uri);
+    bytes.extend_from_slice(&enc_op);
+    bytes.extend_from_slice(&enc_sell);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
 pub(super) fn decode_evm_bool(value: &Value) -> Result<bool, String> {
     let value = value
         .as_str()

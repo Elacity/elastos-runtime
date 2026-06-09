@@ -152,6 +152,7 @@ impl ChainProvider {
                 signed_transaction,
             } => self.broadcast_transaction(&network, &signed_transaction),
             Request::NodeLifecycle { network, action } => self.node_lifecycle(&network, action),
+            Request::AssembleMint { mint } => self.assemble_mint(*mint),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -913,6 +914,104 @@ impl ChainProvider {
             "gas_limit": gas_limit,
             "requires_wallet_approval": true,
             "wallet_intent": "transaction_intent",
+        }))
+    }
+
+    /// Assemble the dDRM content-mint calldata from a structured `MintAssembly`. PURE:
+    /// no RPC and no keys — it ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call
+    /// (opRawData leading with the `bytes16` contentId; sellRawData = copies/price/token)
+    /// and returns the `{ to, data, value }` an external signer signs and
+    /// `broadcast_transaction` sends. Fail-closed on a malformed mint.
+    fn assemble_mint(&self, mint: MintAssembly) -> Response {
+        if let Err(err) = validate_evm_address(&mint.to) {
+            return Response::error("invalid_to", &err);
+        }
+        if mint.token_uri.trim().is_empty() {
+            return Response::error("invalid_mint", "token_uri must not be empty");
+        }
+        let value = mint.value_wei.as_deref().unwrap_or("0x0");
+        if let Err(err) = validate_hex_quantity(value, "value") {
+            return Response::error("invalid_value", &err);
+        }
+
+        // FREE: opRawData = abi.encode(bytes16); sellRawData = empty. PAID: full op/sell.
+        let (op_raw, sell_raw) = if mint.op_type_code == 0 {
+            if mint.op_raw.is_some() || mint.sell.is_some() {
+                return Response::error(
+                    "invalid_mint",
+                    "a free mint (op_type_code 0) must not carry op_raw/sell terms",
+                );
+            }
+            match encode_op_raw_free(&mint.content_id) {
+                Ok(op) => (op, Vec::new()),
+                Err(err) => return Response::error("invalid_mint", &err),
+            }
+        } else {
+            let (Some(op_raw), Some(sell)) = (mint.op_raw.as_ref(), mint.sell.as_ref()) else {
+                return Response::error(
+                    "invalid_mint",
+                    "a paid mint requires both op_raw and sell terms",
+                );
+            };
+            // BUY_AND_RESELL (2) carries the trailing uint16 resellerCut; BUY_ONCE (1)
+            // must not (it would shift the ABI layout).
+            let reseller_cut = match (mint.op_type_code, op_raw.reseller_cut) {
+                (2, Some(cut)) => Some(cut),
+                (2, None) => {
+                    return Response::error(
+                        "invalid_mint",
+                        "buy_and_resell (op_type_code 2) requires op_raw.reseller_cut",
+                    )
+                }
+                (1, None) => None,
+                (1, Some(_)) => {
+                    return Response::error(
+                        "invalid_mint",
+                        "buy_once (op_type_code 1) must not carry op_raw.reseller_cut",
+                    )
+                }
+                _ => return Response::error("invalid_mint", "unsupported op_type_code"),
+            };
+            let op = match encode_op_raw_paid(
+                &mint.content_id,
+                &op_raw.metadata_uri,
+                &op_raw.addresses,
+                &op_raw.role_types,
+                &op_raw.amounts,
+                reseller_cut,
+            ) {
+                Ok(op) => op,
+                Err(err) => return Response::error("invalid_mint", &err),
+            };
+            let sell = match encode_sell_raw_data(&sell.copies, &sell.price_wei, &sell.pay_token) {
+                Ok(sell) => sell,
+                Err(err) => return Response::error("invalid_mint", &err),
+            };
+            (op, sell)
+        };
+
+        let data = match encode_mint_calldata(
+            &mint.selector,
+            &mint.token_uri,
+            mint.op_type_code,
+            &op_raw,
+            &sell_raw,
+        ) {
+            Ok(data) => data,
+            Err(err) => return Response::error("invalid_mint", &err),
+        };
+
+        Response::ok(json!({
+            "schema": "elastos.chain.mint_assembly/v1",
+            "function": MINT_SIGNATURE,
+            "to": mint.to,
+            "data": data,
+            "value": value,
+            "op_type_code": mint.op_type_code,
+            "content_id": mint.content_id,
+            // Pure assembly: never signed, never broadcast here.
+            "signed": false,
+            "next_required_providers": ["wallet-provider", "chain-provider"],
         }))
     }
 

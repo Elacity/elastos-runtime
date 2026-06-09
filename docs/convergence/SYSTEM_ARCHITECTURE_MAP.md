@@ -205,7 +205,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
 | Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
-| Channel/operative mint | `publish-provider` over `chain-provider`+`wallet-provider` | Assembly DONE (Day 61, fail-closed, unsigned mint); ABI-encode + broadcast is the next wire |
+| Channel/operative mint | `publish-provider` (intent) → `chain-provider::assemble_mint` (calldata) → wallet sign → broadcast | Intent DONE (Day 61); ABI calldata DONE (Day 62, decoded-to-spec); end-to-end publish→chain wiring + live broadcast are the next step |
 | SQLite `content_catalog` indexer | a `content-market` provider | Missing; index chain events + IPFS metadata |
 | secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
 | Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
@@ -305,9 +305,19 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   must finish the loop — the "core injects capabilities" pattern. Fail-closed on a
   non-`bytes16` KID, a paid listing without a price, a free listing with sale terms, or a bad
   channel address (publish=13).
-- **Remaining:** wire `chain-provider` to ABI-encode + broadcast the `UnsignedMintV1` (turn
-  `prepared` into a real on-chain asset), a `content-market` index that scans the mint event,
-  and real `plaintext_ref`→IPFS in the producer op (today inline bytes for the smoke).
+- **Status (Day 62 — the mint becomes real EVM calldata):** `chain-provider::assemble_mint`
+  (pure, no RPC/keys) ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call byte-faithfully
+  (FREE `opRawData=abi.encode(bytes16 contentId)` + empty `sellRawData`; PAID payee/royalty
+  tuple + `sellRawData=(copies,price,payToken)`, trailing `uint16 resellerCut` iff
+  BUY_AND_RESELL). It returns `{to,data,value}` that feeds the EXISTING
+  `prepare_transaction → wallet-provider sign → broadcast_transaction (eth_sendRawTransaction)`
+  seam — capability split intact. 10 tests DECODE the calldata back against the Solidity ABI
+  spec (no ethers); fail-closed on a non-`bytes16` id, bad selector/channel, free-with-terms,
+  paid-without-terms, or a mismatched reseller_cut.
+- **Remaining:** wire `publish-provider`→`chain-provider` end to end (feed `UnsignedMintV1`
+  into `assemble_mint`, paid payee arrays included) + a live broadcast path, a `content-market`
+  index that scans the mint event, and real `plaintext_ref`→IPFS in the producer op (today
+  inline bytes for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

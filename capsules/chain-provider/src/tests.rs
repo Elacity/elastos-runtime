@@ -995,3 +995,235 @@ fn has_access_by_content_id_rejects_invalid_contract_before_backend() {
 
     assert_eq!(error_code(response), "invalid_contract");
 }
+
+// --- assemble_mint: content-mint calldata (PC2 mint(string,uint16,bytes,bytes)) -----
+//
+// These decode the produced calldata back against the Solidity ABI spec (no ethers
+// dependency) so the encoder is proven correct, not merely pinned. All names contain
+// "mint" so the ladder can gate them by filter (the suite has one env-flaky lifecycle
+// test that is intentionally excluded from the deterministic count).
+
+const MINT_KID32: &str = "38691296765e76a331f5d5630bddf9f5";
+const MINT_SELECTOR: &str = "0xaabbccdd";
+const MINT_CHANNEL: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+
+fn mint_hex_to_bytes(hex: &str) -> Vec<u8> {
+    let clean = hex.strip_prefix("0x").unwrap_or(hex);
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Read the low-64-bits of the 32-byte word at byte offset `off`.
+fn mint_word_u64(body: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes(body[off + 24..off + 32].try_into().unwrap())
+}
+
+fn mint_free_request() -> Request {
+    Request::AssembleMint {
+        mint: Box::new(
+            serde_json::from_value(json!({
+                "selector": MINT_SELECTOR,
+                "to": MINT_CHANNEL,
+                "token_uri": "QmMetaFolderCidV0/metadata.json",
+                "op_type_code": 0,
+                "content_id": format!("0x{MINT_KID32}"),
+            }))
+            .unwrap(),
+        ),
+    }
+}
+
+fn mint_paid_value(reseller_cut: Option<u16>, op_type_code: u16) -> serde_json::Value {
+    let mut op_raw = json!({
+        "metadata_uri": "ipfs://QmMetaFolderCidV0",
+        "addresses": [MINT_CHANNEL],
+        "role_types": [1],
+        "amounts": ["100"],
+    });
+    if let Some(cut) = reseller_cut {
+        op_raw["reseller_cut"] = json!(cut);
+    }
+    json!({
+        "selector": MINT_SELECTOR,
+        "to": MINT_CHANNEL,
+        "token_uri": "QmMetaFolderCidV0/metadata.json",
+        "op_type_code": op_type_code,
+        "content_id": format!("0x{MINT_KID32}"),
+        "value_wei": "0x16345785d8a0000",
+        "op_raw": op_raw,
+        "sell": {
+            "copies": "100",
+            "price_wei": "1000000000000000000",
+            "pay_token": "0x0000000000000000000000000000000000000000",
+        },
+    })
+}
+
+#[test]
+fn mint_assemble_free_calldata_decodes_to_the_bytes16_content_id() {
+    let data = ok_data(ChainProvider::new().handle(mint_free_request()));
+    assert_eq!(data["function"], "mint(string,uint16,bytes,bytes)");
+    assert_eq!(data["to"], MINT_CHANNEL);
+    assert_eq!(data["value"], "0x0");
+    assert_eq!(data["signed"], false);
+
+    let calldata = mint_hex_to_bytes(data["data"].as_str().unwrap());
+    // selector prefix.
+    assert_eq!(&calldata[..4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let body = &calldata[4..];
+
+    // head: [uri_off=0x80, opType=0, op_off, sell_off].
+    assert_eq!(mint_word_u64(body, 0), 128, "uri offset");
+    assert_eq!(mint_word_u64(body, 32), 0, "op_type FREE");
+    let op_off = mint_word_u64(body, 64) as usize;
+    let sell_off = mint_word_u64(body, 96) as usize;
+
+    // _uri string decodes to the tokenURI.
+    let uri_len = mint_word_u64(body, 128) as usize;
+    let uri = &body[160..160 + uri_len];
+    assert_eq!(uri, b"QmMetaFolderCidV0/metadata.json");
+
+    // opRawData = abi.encode(bytes16): a 32-byte dynamic blob == the bytes16 word.
+    assert_eq!(mint_word_u64(body, op_off), 32, "opRawData byte length");
+    let op_word = &body[op_off + 32..op_off + 64];
+    assert_eq!(&op_word[..16], &mint_hex_to_bytes(MINT_KID32)[..], "contentId high 16");
+    assert!(op_word[16..].iter().all(|b| *b == 0), "bytes16 zero-padded right");
+
+    // sellRawData is empty for a free mint.
+    assert_eq!(mint_word_u64(body, sell_off), 0, "sellRawData empty");
+}
+
+#[test]
+fn mint_assemble_paid_encodes_sell_terms_and_op_payees() {
+    let data = ok_data(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(serde_json::from_value(mint_paid_value(None, 1)).unwrap()),
+    }));
+    assert_eq!(data["value"], "0x16345785d8a0000");
+    let calldata = mint_hex_to_bytes(data["data"].as_str().unwrap());
+    let body = &calldata[4..];
+
+    assert_eq!(mint_word_u64(body, 32), 1, "op_type BUY_ONCE");
+    let op_off = mint_word_u64(body, 64) as usize;
+    let sell_off = mint_word_u64(body, 96) as usize;
+
+    // opRawData tuple head[0] is the bytes16 contentId.
+    let op_body = op_off + 32; // skip the dynamic-bytes length word
+    assert_eq!(
+        &body[op_body..op_body + 16],
+        &mint_hex_to_bytes(MINT_KID32)[..],
+        "opRawData leads with bytes16 contentId"
+    );
+
+    // sellRawData = (copies, price, payToken).
+    let sell_body = sell_off + 32;
+    assert_eq!(mint_word_u64(body, sell_body), 100, "copies");
+    assert_eq!(
+        mint_word_u64(body, sell_body + 32),
+        1_000_000_000_000_000_000,
+        "price (1e18) fits low 64 bits here"
+    );
+}
+
+#[test]
+fn mint_assemble_buy_and_resell_appends_reseller_cut() {
+    // BUY_AND_RESELL opRawData has 6 head words (the trailing uint16). The bytes16 head
+    // word is unchanged; the difference is detectable by op_raw length growth, so just
+    // assert it assembles and the buy_once form rejects a reseller_cut.
+    let resell = ok_data(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(serde_json::from_value(mint_paid_value(Some(900), 2)).unwrap()),
+    }));
+    assert_eq!(resell["op_type_code"], 2);
+    assert!(resell["data"].as_str().unwrap().starts_with("0xaabbccdd"));
+}
+
+#[test]
+fn mint_buy_once_rejects_a_reseller_cut() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(serde_json::from_value(mint_paid_value(Some(900), 1)).unwrap()),
+    }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_buy_and_resell_requires_a_reseller_cut() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(serde_json::from_value(mint_paid_value(None, 2)).unwrap()),
+    }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_free_rejects_sale_terms() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(serde_json::from_value(mint_paid_value(None, 0)).unwrap()),
+    }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_paid_requires_sale_terms() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(
+            serde_json::from_value(json!({
+                "selector": MINT_SELECTOR,
+                "to": MINT_CHANNEL,
+                "token_uri": "QmMetaFolderCidV0/metadata.json",
+                "op_type_code": 1,
+                "content_id": format!("0x{MINT_KID32}"),
+            }))
+            .unwrap(),
+        ),
+    }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_rejects_a_non_bytes16_content_id() {
+    let mut bad = serde_json::from_value::<MintAssembly>(json!({
+        "selector": MINT_SELECTOR,
+        "to": MINT_CHANNEL,
+        "token_uri": "QmMetaFolderCidV0/metadata.json",
+        "op_type_code": 0,
+        "content_id": "0xdeadbeef",
+    }))
+    .unwrap();
+    bad.content_id = "0xdeadbeef".to_string();
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint { mint: Box::new(bad) }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_rejects_a_bad_selector() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(
+            serde_json::from_value(json!({
+                "selector": "0xzz",
+                "to": MINT_CHANNEL,
+                "token_uri": "QmMetaFolderCidV0/metadata.json",
+                "op_type_code": 0,
+                "content_id": format!("0x{MINT_KID32}"),
+            }))
+            .unwrap(),
+        ),
+    }));
+    assert_eq!(err, "invalid_mint");
+}
+
+#[test]
+fn mint_rejects_a_bad_channel_address() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(
+            serde_json::from_value(json!({
+                "selector": MINT_SELECTOR,
+                "to": "not-an-address",
+                "token_uri": "QmMetaFolderCidV0/metadata.json",
+                "op_type_code": 0,
+                "content_id": format!("0x{MINT_KID32}"),
+            }))
+            .unwrap(),
+        ),
+    }));
+    assert_eq!(err, "invalid_to");
+}

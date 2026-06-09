@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~67 commits**, tip Day-61 Phase C — the on-chain producer step now has a home: a new fail-closed `publish-provider` capsule ASSEMBLES the content mint — binding `contentId == bytes16 KID` (PC2 `kidToContentId`, no hash), deriving `tokenURI = {metadataCid}/metadata.json`, and emitting a typed *unsigned* `UnsignedMintV1` (`mint(string,uint16,bytes,bytes)`) for `chain-provider` to ABI-encode+broadcast and `wallet-provider` to sign — holding NO chain-RPC and NO wallet key itself (publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire, no golden). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~68 commits**, tip Day-62 Phase C — the prepared mint is now real CALLDATA: `chain-provider` gained a pure `assemble_mint` op that ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call (FREE `opRawData=abi.encode(bytes16 contentId)`, PAID opRawData payee/royalty arrays + `sellRawData=(copies,price,payToken)`) and returns the `{to,data,value}` an external signer signs and the existing `broadcast_transaction` (`eth_sendRawTransaction`) sends — no RPC/keys in the encoder, calldata decoded back to spec in 10 tests. Day 61 added the fail-closed `publish-provider` that ASSEMBLES the mint intent (binds `contentId == bytes16 KID`, derives `tokenURI = {metadataCid}/metadata.json`, emits the unsigned `UnsignedMintV1`; publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire, no golden). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,33 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🧱 Day 62 — `chain-provider assemble_mint`: the mint becomes real EVM calldata (Phase C, LANDED).**
+> Day 61's `publish-provider` produced an *intent*; Day 62 turns it into byte-faithful
+> Solidity calldata the chain can execute. Audited PC2's exact encoders first
+> (`elacity-creator/app.js`): `encodeOpRawData` (app.js:1583 — `bytes16, string, address[],
+> uint256[] roleTypes, uint256[] amounts[, uint16 resellerCut]`), `encodeSellRawData`
+> (app.js:1633 — `uint256 copies, uint256 price, address payToken`), the FREE case
+> `abi.encode(['bytes16'],[contentId])` (app.js:4941), and the outer
+> `iface.encodeFunctionData('mint',[uri,opType,opRawData,sellRawData])` (app.js:4950) sent as
+> `{to: channel, data, value: mediaCreationFee}`. New **pure** `chain-provider::assemble_mint`
+> (no RPC, no keys) reproduces all of it: FREE → `opRawData = bytes16` + empty `sellRawData`;
+> PAID → full payee/royalty tuple + sale terms, with the trailing `uint16 resellerCut`
+> present iff BUY_AND_RESELL (op_type 2) and rejected for BUY_ONCE (op_type 1) — because the
+> uint16 shifts the ABI layout. The selector is configured (same pattern as the `has_access`
+> selector; keccak is not computed in-capsule). It returns `{to,data,value}` that feeds the
+> EXISTING `prepare_transaction` → wallet-provider sign → `broadcast_transaction`
+> (`eth_sendRawTransaction`) seam — so the capability split holds: `chain-provider` owns
+> EVM/ABI+RPC, `wallet-provider` owns keys, `publish-provider` touches neither. **Proof:** 10
+> tests DECODE the produced calldata back against the Solidity ABI spec (selector, offsets,
+> `_uri` string, the `bytes16` contentId in `opRawData`, the `(copies,price,token)` sell
+> tuple) — correctness vs the spec, not a self-pinned blob, and no ethers dependency.
+> Fail-closed on a non-`bytes16` contentId, a bad selector/channel, free-with-sale-terms,
+> paid-without-terms, or a mismatched reseller_cut. **Gate:** ladder INTACT (+ deterministic
+> `mint*` rung = 10, filtered around chain-provider's one env-flaky lifecycle test), drift
+> PASS, both smokes green, clippy clean. **Next:** wire `publish-provider`→`chain-provider`
+> end to end (feed the `UnsignedMintV1` straight into `assemble_mint`, paid payee arrays
+> included), or the `content-market` index that scans the mint event into a listing.
 
 > **⛓️ Day 61 — `publish-provider`: the on-chain content mint, assembled fail-closed (Phase C, LANDED).**
 > Days 58–60 built the producer's *crypto* half (mint→escrow→recover→re-seal→decrypt);

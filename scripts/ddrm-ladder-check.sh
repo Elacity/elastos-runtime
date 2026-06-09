@@ -103,6 +103,25 @@ else
   rc=1
 fi
 
+# --- 1c. chain-provider mint calldata assembly (filtered, deterministic) -----------
+#
+# chain-provider's full suite carries one env-dependent loopback-supervisor test, so it
+# is NOT laddered as a whole. The content-mint ABI encoder (Day 62) IS pinned here by
+# running ONLY the `mint`-named tests, which decode the produced calldata back against
+# the Solidity ABI spec (PC2 mint(string,uint16,bytes,bytes) fidelity).
+MINT_EXPECTED=10
+echo
+bold "== dDRM ladder (1c/2): chain-provider mint calldata assembly =="
+mint_out="$(cd "$CAPSULES/chain-provider" && cargo test mint 2>/dev/null)"
+mint_passed="$(printf '%s\n' "$mint_out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
+mint_failed="$(printf '%s\n' "$mint_out" | sed -n 's/.*ok\. [0-9]* passed; \([0-9]*\) failed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
+if [ "$mint_passed" -eq "$MINT_EXPECTED" ] && [ "$mint_failed" -eq 0 ]; then
+  green "  ok    mint* — $mint_passed passed (mint calldata decodes to spec)"
+else
+  red "  FAIL  mint* — expected $MINT_EXPECTED passed / 0 failed, got $mint_passed/$mint_failed"
+  rc=1
+fi
+
 # --- 2. wasm32-wasip1 builds (dir | features) -------------------------------
 echo
 bold "== dDRM ladder (2/2): wasm32-wasip1 builds =="

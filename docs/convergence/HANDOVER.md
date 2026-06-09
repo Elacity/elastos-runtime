@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 61).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-61 Phase C — the on-chain producer step now has a home: a new fail-closed `publish-provider` capsule ASSEMBLES the content mint — binding `contentId == bytes16 KID` (PC2 `kidToContentId`, no hash), deriving `tokenURI = {metadataCid}/metadata.json`, and emitting a typed *unsigned* `UnsignedMintV1` (`mint(string,uint16,bytes,bytes)`) for `chain-provider` to ABI-encode+broadcast and `wallet-provider` to sign — holding NO chain-RPC and NO wallet key (publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `scripts/ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire (key-authority-ref=27, encrypt escrow=19). Defaults fail-closed; consumer half still runs via `scripts/ddrm-consumer-smoke.sh`; ~67 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 62).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-62 Phase C — the prepared mint is now real CALLDATA: `chain-provider` gained a pure `assemble_mint` op that ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call (FREE `opRawData=abi.encode(bytes16)`, PAID payee/royalty tuple + `sellRawData=(copies,price,token)`) and returns the `{to,data,value}` the existing `prepare_transaction` → wallet sign → `broadcast_transaction` seam executes — no RPC/keys in the encoder, calldata decoded back to spec in 10 deterministic tests. Day 61 added the fail-closed `publish-provider` that ASSEMBLES the mint intent (binds `contentId == bytes16 KID`, derives `tokenURI = {metadataCid}/metadata.json`, emits the unsigned `UnsignedMintV1`; publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `scripts/ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire (key-authority-ref=27, encrypt escrow=19). Defaults fail-closed; consumer half still runs via `scripts/ddrm-consumer-smoke.sh`; ~67 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -548,9 +548,13 @@ receipt to gate the key release, proving `rights(allowed) → key → decrypt`
   `scripts/ddrm-producer-smoke.sh`). Day 61 started the on-chain half: a fail-closed
   `publish-provider` capsule ASSEMBLES the mint (binds `contentId == bytes16 KID`, derives
   `tokenURI = {metadataCid}/metadata.json`, emits an unsigned `UnsignedMintV1` for
-  `chain-provider`+`wallet-provider`; holds no RPC/keys; publish=13). Next: wire
-  `chain-provider` to ABI-encode + broadcast the `UnsignedMintV1`, a `content-market` index
-  that scans the mint event, then real `plaintext_ref`→IPFS in the producer op.
+  `chain-provider`+`wallet-provider`; holds no RPC/keys; publish=13). Day 62 made the mint
+  REAL CALLDATA: `chain-provider::assemble_mint` (pure, no RPC/keys) ABI-encodes the PC2
+  `mint(string,uint16,bytes,bytes)` call and returns `{to,data,value}` for the existing
+  `prepare_transaction`→wallet-sign→`broadcast_transaction` seam (calldata decoded back to
+  spec, `mint*` rung=10). Next: wire `publish-provider`→`chain-provider` end to end (feed
+  `UnsignedMintV1` into `assemble_mint`, paid payee arrays included), a `content-market`
+  index that scans the mint event, then real `plaintext_ref`→IPFS in the producer op.
 - **Phase A follow-ups** — a `wasm32-wasip1` variant of the smoke (today native).
 
 Still **blocked on others** (parallel): fold `SealedDecryptMaterialV1` into the shared
