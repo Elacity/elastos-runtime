@@ -26,30 +26,37 @@
 //! end through the op drm-provider's plan actually names.
 //!
 //! The chain is no longer hand-walked here, and the smoke no longer drives the open
-//! itself: it builds the trusted runtime-core HOST `ddrm_plan_runner::DrmHost` and calls
-//! `host.open(content_id, viewer)`. The HOST owns the whole open — it (1) asks its
-//! `PlanSource` (a `SmokePlanSource` wrapping the REAL `drm-provider`) for the canonical
-//! plan, (2) drives it through the runtime `RuntimeCapabilityTable` of registered
-//! transports (`open_drm_plan`'s parse → resolve each required provider → execute), and
-//! (3) emits the plan's runtime-OWNED post-steps (`release_receipt` + the open audit)
-//! through a `RuntimeEventSink` (a `SmokeEventSink`). This is the runtime-core analogue of
-//! PC2's server-owned `/init` route, which — once the capability is resolved — owns
-//! fetching the MPD, driving recovery, creating the session, and logging, all in one
-//! place (`pc2-node/src/api/media.ts:133` route → `:481`/`:482` recover → `:489` session).
-//! The smoke REGISTERS three runtime-owned transports (`RightsTransport`/`KeyTransport`/
-//! `DecryptTransport`, each OWNING one real capsule binary) into the host's table — the
-//! same registry type the trusted core uses; each transport opens a fresh per-provider
-//! handle on demand and TEARS DOWN its capsule on `shutdown`. The HOST owns the transports,
-//! so `host.shutdown()` tears down the whole rail (the analogue of disposing every per-view
-//! handle) — the smoke performs no manual per-capsule shutdown. The event sink is the lib's
-//! `PersistingEventSink` over a `FileEventStore`: each runtime-event step is written as a
-//! durable, CEK-FREE record (open identity + decision + artifact NAMES, never key material)
-//! to a temp dir, which the smoke reads back to prove the receipt + audit persisted without
-//! leaking the CEK. No second code path. The host fails closed unless every provider the
-//! plan's `next_required_providers` names has a registered transport, and unless every
-//! runtime event it declares can be PERSISTED. Two more fail-closed gates ride along: a
-//! transcript-mismatched seal must not open, and a TAMPERED plan FROM THE SOURCE (driven
-//! back through the SAME host) must be rejected by the real key-provider.
+//! itself — nor does it pre-spawn the providers: it builds the trusted runtime-core HOST
+//! `ddrm_plan_runner::DrmHost` and the HOST LAUNCHES the rail. The smoke hands the host
+//! three `ProviderLauncher`s (`RightsLauncher`/`KeyLauncher`/`DecryptLauncher`, each owning
+//! one real capsule BINARY), and `RuntimeCapabilityTable::from_launchers` brings each
+//! provider up — spawn → init → the provider PUBLISHES its material (the key authority its
+//! verifying + escrow-recipient keys; the decrypt boundary its in-sandbox session key) —
+//! returning a transport that owns the spawned connection. This is the runtime-core
+//! analogue of PC2's `BackendSessionService.createSession` launching a backend view
+//! (`WasmSessionView.createNew()` mints + publishes the session key inside the runtime —
+//! `src/api/chipotle-client.ts:603`, `BackendSessionService.ts:307`); the HOST, not this
+//! harness, brings the rail up. Once the rail is up the runtime binds the cross-provider
+//! open material (the producer escrows the CEK to the authority's published recipient; the
+//! canonical transcript AAD is computed over the decrypt boundary's published session key),
+//! then `host.open(content_id, viewer)` (1) asks its `PlanSource` (a `SmokePlanSource`
+//! wrapping the REAL `drm-provider`) for the canonical plan, (2) drives it through the
+//! launched `RuntimeCapabilityTable` (`open_drm_plan`'s parse → resolve each required
+//! provider → execute), and (3) PERSISTS the plan's runtime-OWNED post-steps
+//! (`release_receipt` + the open audit) through a `RuntimeEventSink`. This mirrors PC2's
+//! server-owned `/init` route owning fetch → recover → session → log in one place
+//! (`pc2-node/src/api/media.ts:133`/`:481`/`:489`). The event sink is the lib's
+//! `PersistingEventSink` over the production-shaped `DurableEventStore` — each runtime
+//! event is written as a durable, CEK-FREE record (open identity + decision + artifact
+//! NAMES, never key material) via atomic write into a stable on-disk layout, mirroring
+//! PC2's `FileSessionStore` (`BackendSessionService.ts:107`). The smoke proves durability
+//! by reading the records back through a FRESH `DurableEventStore::load` (a fresh reader,
+//! as if a new process) and asserting no CEK/secret leaked. The HOST owns the transports,
+//! so `host.shutdown()` tears the whole rail down — no manual per-capsule shutdown. The
+//! host fails closed unless every required provider is registered and every runtime event
+//! can be PERSISTED. Two more fail-closed gates ride along: a transcript-mismatched seal
+//! must not open, and a TAMPERED plan FROM THE SOURCE (driven back through the SAME host)
+//! must be rejected by the real key-provider.
 //!
 //! Usage: ddrm-consumer-smoke <key-provider-bin> <decrypt-provider-bin> <drm-bin> [rights-bin]
 
@@ -57,14 +64,13 @@ use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
 use ddrm_plan_runner::{
-    DrmHost, EventStore, PersistingEventSink, PlanSource, ProviderHandle, ProviderTransport,
-    RuntimeCapabilityTable, StepInputs,
+    DrmHost, DurableEventStore, PersistingEventSink, PlanSource, ProviderHandle, ProviderLauncher,
+    ProviderTransport, RuntimeCapabilityTable, StepInputs,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
 
@@ -418,6 +424,32 @@ fn thread_into(base: &mut Value, inputs: &StepInputs) {
     }
 }
 
+/// The material the providers PUBLISH as the host LAUNCHES the rail: the key authority's
+/// verifying + escrow-recipient keys, the decrypt boundary's in-sandbox session key. The
+/// launchers fill this during `from_launchers`; once the rail is up the runtime reads it
+/// to perform the producer escrow + compute the canonical transcript AAD. (No secret lands
+/// here — only PUBLISHED public material, the analogue of `createNew()`'s `publicKeyHex`.)
+#[derive(Default)]
+struct RailMaterial {
+    vk_b64: Option<String>,
+    recipient_pub_b64: Option<String>,
+    session_pub_b64: Option<String>,
+}
+
+/// The key transport's per-open material, BOUND by the runtime after the rail is launched
+/// and the producer escrow is done. The `KeyHandle` reads it at open and fails closed if
+/// the runtime opened the key transport before binding it.
+#[derive(Clone)]
+struct KeyOpenMaterial {
+    kid_hex: String,
+    wrapped_cek_b64: String,
+    producer_vk_b64: String,
+    session_pub_b64: String,
+    aad_b64: String,
+    content_hash_b64: String,
+    nonce_b64: String,
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -478,14 +510,8 @@ impl ProviderHandle for RightsHandle {
 /// published session key — no raw CEK ever handed in. Produces the release receipt
 /// (threaded onward into decrypt) and the sealed material (carried in the context).
 struct KeyHandle {
-    key: Rc<RefCell<Capsule>>,
-    kid_hex: String,
-    wrapped_cek_b64: String,
-    producer_vk_b64: String,
-    session_pub_b64: String,
-    aad_b64: String,
-    content_hash_b64: String,
-    nonce_b64: String,
+    key: Rc<RefCell<Option<Capsule>>>,
+    material: Rc<RefCell<Option<KeyOpenMaterial>>>,
 }
 
 impl ProviderHandle for KeyHandle {
@@ -493,19 +519,28 @@ impl ProviderHandle for KeyHandle {
         "key"
     }
     fn run(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
-        let mut request = key_release_request_base(&self.kid_hex, &self.wrapped_cek_b64);
+        // Fail closed if the runtime opened the key transport before binding the session
+        // material it provisions once the rail is up (escrow + transcript AAD).
+        let m = self
+            .material
+            .borrow()
+            .clone()
+            .ok_or("key transport opened before the runtime bound its session material")?;
+        let mut request = key_release_request_base(&m.kid_hex, &m.wrapped_cek_b64);
         thread_into(&mut request, inputs);
+        let mut guard = self.key.borrow_mut();
+        let key = guard.as_mut().ok_or("key capsule was already torn down")?;
         let release = ok_data(
-            &self.key.borrow_mut().call(&json!({
+            &key.call(&json!({
                 "op": "release",
                 "request": request,
                 "session": {
-                    "decrypt_session_pub_b64": self.session_pub_b64,
-                    "producer_vk_b64": self.producer_vk_b64,
-                    "aad_b64": self.aad_b64,
+                    "decrypt_session_pub_b64": m.session_pub_b64,
+                    "producer_vk_b64": m.producer_vk_b64,
+                    "aad_b64": m.aad_b64,
                     "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-                    "content_hash_b64": self.content_hash_b64,
-                    "nonce_b64": self.nonce_b64,
+                    "content_hash_b64": m.content_hash_b64,
+                    "nonce_b64": m.nonce_b64,
                     "now_unix": NOW_UNIX,
                 }
             }))?,
@@ -520,7 +555,7 @@ impl ProviderHandle for KeyHandle {
         if release_str.contains(GOLDEN_CEK_B64) {
             return Err("raw CEK leaked in the key-provider response".to_string());
         }
-        if release_str.contains(&self.wrapped_cek_b64) {
+        if release_str.contains(&m.wrapped_cek_b64) {
             return Err("the producer escrow blob was echoed by the key authority".to_string());
         }
         Ok(BTreeMap::from([
@@ -536,7 +571,7 @@ impl ProviderHandle for KeyHandle {
 /// crosses the boundary. The `render` step is also a decrypt-provider step but is a
 /// no-op here (the smoke drives the open, not playback).
 struct DecryptHandle {
-    decrypt: Rc<RefCell<Capsule>>,
+    decrypt: Rc<RefCell<Option<Capsule>>>,
 }
 
 impl ProviderHandle for DecryptHandle {
@@ -555,7 +590,9 @@ impl ProviderHandle for DecryptHandle {
             .clone();
         let mut request = decrypt_request_base();
         thread_into(&mut request, inputs);
-        let open = self.decrypt.borrow_mut().call(&json!({
+        let mut guard = self.decrypt.borrow_mut();
+        let decrypt = guard.as_mut().ok_or("decrypt capsule was already torn down")?;
+        let open = decrypt.call(&json!({
             "op": "open_session_v1",
             "request": request,
             "material": material,
@@ -586,13 +623,14 @@ impl ProviderHandle for DecryptHandle {
     }
 }
 
-// The smoke registers three runtime-OWNED transports into the lib's
-// `RuntimeCapabilityTable` — the same registry type the trusted core will use. Each
-// transport holds a shared capsule cell (so the post-walk fail-closed checks + shutdown
-// can still reach the binaries) plus the per-session material the runtime provisioned up
-// front, and OPENS a fresh per-provider `ProviderHandle` (bound to the same capsule) on
-// each open — mirroring PC2's `sessionService` singleton owning the per-backend view
-// constructors and minting a fresh view per request.
+// The host LAUNCHES three runtime-OWNED transports through three `ProviderLauncher`s. Each
+// launcher owns a real capsule BINARY; `from_launchers` brings the provider up (spawn →
+// init → the provider PUBLISHES its material) and hands back a transport that owns the
+// spawned connection — the same registry type the trusted core uses. Each transport holds
+// a shared capsule cell (so `host.shutdown()` tears it down, and the raw transcript-mismatch
+// gate can reach the live capsules), and OPENS a fresh per-provider `ProviderHandle` on each
+// open — mirroring PC2's `BackendSessionService` launching a backend view per session and
+// minting a fresh view per request.
 
 /// Runtime-owned `rights` transport: opens a `RightsHandle` over the rights capsule.
 struct RightsTransport {
@@ -621,17 +659,12 @@ impl ProviderTransport for RightsTransport {
     }
 }
 
-/// Runtime-owned `key` transport: opens a `KeyHandle` over the key-provider capsule,
-/// carrying the provisioned escrow + session material.
+/// Runtime-owned `key` transport: opens a `KeyHandle` over the key-provider capsule. The
+/// per-open escrow + session material is BOUND by the runtime (`material`) once the rail is
+/// up, so a clone of that shared cell reaches the handle.
 struct KeyTransport {
-    key: Rc<RefCell<Capsule>>,
-    kid_hex: String,
-    wrapped_cek_b64: String,
-    producer_vk_b64: String,
-    session_pub_b64: String,
-    aad_b64: String,
-    content_hash_b64: String,
-    nonce_b64: String,
+    key: Rc<RefCell<Option<Capsule>>>,
+    material: Rc<RefCell<Option<KeyOpenMaterial>>>,
 }
 
 impl ProviderTransport for KeyTransport {
@@ -641,24 +674,20 @@ impl ProviderTransport for KeyTransport {
     fn open(&self) -> Box<dyn ProviderHandle> {
         Box::new(KeyHandle {
             key: self.key.clone(),
-            kid_hex: self.kid_hex.clone(),
-            wrapped_cek_b64: self.wrapped_cek_b64.clone(),
-            producer_vk_b64: self.producer_vk_b64.clone(),
-            session_pub_b64: self.session_pub_b64.clone(),
-            aad_b64: self.aad_b64.clone(),
-            content_hash_b64: self.content_hash_b64.clone(),
-            nonce_b64: self.nonce_b64.clone(),
+            material: self.material.clone(),
         })
     }
     fn shutdown(&mut self) -> Result<(), String> {
-        self.key.borrow_mut().shutdown();
+        if let Some(key) = self.key.borrow_mut().as_mut() {
+            key.shutdown();
+        }
         Ok(())
     }
 }
 
 /// Runtime-owned `decrypt` transport: opens a `DecryptHandle` over the decrypt boundary.
 struct DecryptTransport {
-    decrypt: Rc<RefCell<Capsule>>,
+    decrypt: Rc<RefCell<Option<Capsule>>>,
 }
 
 impl ProviderTransport for DecryptTransport {
@@ -671,8 +700,122 @@ impl ProviderTransport for DecryptTransport {
         })
     }
     fn shutdown(&mut self) -> Result<(), String> {
-        self.decrypt.borrow_mut().shutdown();
+        if let Some(decrypt) = self.decrypt.borrow_mut().as_mut() {
+            decrypt.shutdown();
+        }
         Ok(())
+    }
+}
+
+// ── the launchers the host brings the rail up through ──
+//
+// Each launcher owns a capsule BINARY (not a pre-spawned process). `launch()` spawns the
+// capsule, drives its init, and captures the material the provider PUBLISHES into the shared
+// `RailMaterial` — the runtime-core analogue of `createSession` launching a backend view
+// (`BackendSessionService.ts:307`) whose `createNew()` mints + publishes its session key.
+// The spawned capsule lands in a shared cell the launcher's transport (and the raw gate)
+// reads, so the HOST owns the live process from launch through `shutdown`.
+
+/// Launches the `rights` provider: spawns the rights capsule (if a binary was supplied) and
+/// returns a transport that renders the (live or mocked) on-chain ownership answer.
+struct RightsLauncher {
+    rights_bin: Option<String>,
+    cell: Rc<RefCell<Option<Capsule>>>,
+    chain_attestation: Value,
+    chain_mode: String,
+}
+
+impl ProviderLauncher for RightsLauncher {
+    fn provider(&self) -> &str {
+        "rights"
+    }
+    fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String> {
+        if let Some(bin) = &self.rights_bin {
+            *self.cell.borrow_mut() = Some(Capsule::spawn("rights-provider", bin)?);
+        }
+        Ok(Box::new(RightsTransport {
+            rights: self.cell.clone(),
+            chain_attestation: self.chain_attestation,
+            chain_mode: self.chain_mode,
+        }))
+    }
+}
+
+/// Launches the `key` provider: spawns the reference authority, drives `init`, and PUBLISHES
+/// its verifying + escrow-recipient keys into the shared rail material. The escrow + session
+/// binding the key transport needs is bound by the runtime AFTER the whole rail is up.
+struct KeyLauncher {
+    key_bin: String,
+    cell: Rc<RefCell<Option<Capsule>>>,
+    rail: Rc<RefCell<RailMaterial>>,
+    material: Rc<RefCell<Option<KeyOpenMaterial>>>,
+}
+
+impl ProviderLauncher for KeyLauncher {
+    fn provider(&self) -> &str {
+        "key"
+    }
+    fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String> {
+        let mut key = Capsule::spawn("key-provider", &self.key_bin)?;
+        let init = ok_data(
+            &key.call(&json!({ "op": "init", "config": { "backend": "reference" } }))?,
+            "key init",
+        )?;
+        let vk_b64 = init["seal_verifying_key_b64"]
+            .as_str()
+            .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
+            .to_string();
+        let recipient_pub_b64 = init["seal_recipient_pub_b64"]
+            .as_str()
+            .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
+            .to_string();
+        {
+            let mut rail = self.rail.borrow_mut();
+            rail.vk_b64 = Some(vk_b64);
+            rail.recipient_pub_b64 = Some(recipient_pub_b64);
+        }
+        *self.cell.borrow_mut() = Some(key);
+        Ok(Box::new(KeyTransport {
+            key: self.cell.clone(),
+            material: self.material.clone(),
+        }))
+    }
+}
+
+/// Launches the `decrypt` provider: spawns the boundary, configures it to TRUST the
+/// authority's published verifying key (read from the rail — so `key` must launch first),
+/// and PUBLISHES the boundary's in-sandbox session key into the rail.
+struct DecryptLauncher {
+    decrypt_bin: String,
+    cell: Rc<RefCell<Option<Capsule>>>,
+    rail: Rc<RefCell<RailMaterial>>,
+}
+
+impl ProviderLauncher for DecryptLauncher {
+    fn provider(&self) -> &str {
+        "decrypt"
+    }
+    fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String> {
+        let vk_b64 = self
+            .rail
+            .borrow()
+            .vk_b64
+            .clone()
+            .ok_or("decrypt launched before the key authority published its verifying key")?;
+        let mut decrypt = Capsule::spawn("decrypt-provider", &self.decrypt_bin)?;
+        let init = ok_data(
+            &decrypt.call(&json!({ "op": "init", "config": { "authority_vk_b64": vk_b64 } }))?,
+            "decrypt init",
+        )?;
+        let session_pub_b64 = init["decrypt_session_public_key_b64"]
+            .as_str()
+            .ok_or("decrypt-provider did not publish a session key (build with --features rail-material)")?
+            .to_string();
+        self.rail.borrow_mut().session_pub_b64 = Some(session_pub_b64);
+        *self.cell.borrow_mut() = Some(decrypt);
+        Ok(Box::new(DecryptTransport {
+            decrypt: self.cell.clone(),
+        }))
     }
 }
 
@@ -715,27 +858,6 @@ impl PlanSource for SmokePlanSource {
     }
 }
 
-/// The host's runtime-owned, PERSISTING event store: writes each runtime-event record the
-/// host emits (`release_receipt`, `protected_content.open.audit`) as a durable JSON file in
-/// `dir`. The `ddrm_plan_runner::PersistingEventSink` builds the CEK-free record (open
-/// identity + decision + artifact NAMES, never key material) and hands it here. The runtime
-/// analogue of PC2's `/init` persisting the open (the lifetime session + audit log,
-/// `sessionManager.ts:78`) — except the durable record holds no CEK. Fail-closed: an I/O
-/// error fails the emit, and so the open.
-struct FileEventStore {
-    dir: PathBuf,
-}
-
-impl EventStore for FileEventStore {
-    fn persist(&mut self, key: &str, record: &Value) -> Result<(), String> {
-        let fname = format!("{}.json", key.replace(['/', ':'], "_"));
-        let path = self.dir.join(fname);
-        let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
-        std::fs::write(&path, bytes).map_err(|e| format!("persist {}: {e}", path.display()))?;
-        Ok(())
-    }
-}
-
 fn run(args: &[String]) -> Result<(), String> {
     let key_bin = args.first().ok_or("missing <key-provider-bin>")?;
     let decrypt_bin = args.get(1).ok_or("missing <decrypt-provider-bin>")?;
@@ -745,30 +867,52 @@ fn run(args: &[String]) -> Result<(), String> {
 
     println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt, via the runtime-core host DrmHost::open) ==");
 
-    // --- runtime capability provisioning (BEFORE the open): the authority + decrypt
-    // boundary come up, the content CEK is ESCROWED to the authority's recipient, and
-    // the canonical transcript AAD is computed. These are the capabilities/material the
-    // runtime registers as transports — none of it is authority the host holds.
+    // --- the HOST LAUNCHES the rail. The smoke hands the host three launchers (each owning
+    // a capsule BINARY) and `from_launchers` brings each provider up in dependency order:
+    // `key` first (publishes its verifying + escrow-recipient keys), then `decrypt` (trusts
+    // the published vk; mints + publishes its in-sandbox session key), then `rights`. The
+    // shared cells receive the spawned capsules so the host owns them through `shutdown` (and
+    // the raw transcript gate can still reach them). The runtime-core analogue of
+    // `BackendSessionService.createSession` launching a backend view (`:307`).
     let (attestation, chain_mode) = chain_attestation(chain_bin)?;
-    let rights = match rights_bin {
-        Some(bin) => Some(Capsule::spawn("rights-provider", bin)?),
-        None => None,
+    let rail = Rc::new(RefCell::new(RailMaterial::default()));
+    let key_material: Rc<RefCell<Option<KeyOpenMaterial>>> = Rc::new(RefCell::new(None));
+    let rights_cell: Rc<RefCell<Option<Capsule>>> = Rc::new(RefCell::new(None));
+    let key_cell: Rc<RefCell<Option<Capsule>>> = Rc::new(RefCell::new(None));
+    let decrypt_cell: Rc<RefCell<Option<Capsule>>> = Rc::new(RefCell::new(None));
+
+    let table = RuntimeCapabilityTable::from_launchers(vec![
+        Box::new(KeyLauncher {
+            key_bin: key_bin.clone(),
+            cell: key_cell.clone(),
+            rail: rail.clone(),
+            material: key_material.clone(),
+        }),
+        Box::new(DecryptLauncher {
+            decrypt_bin: decrypt_bin.clone(),
+            cell: decrypt_cell.clone(),
+            rail: rail.clone(),
+        }),
+        Box::new(RightsLauncher {
+            rights_bin: rights_bin.cloned(),
+            cell: rights_cell.clone(),
+            chain_attestation: attestation,
+            chain_mode: chain_mode.clone(),
+        }),
+    ])?;
+    step(1, "runtime-core host: LAUNCHED the rail — key (published vk + escrow recipient), decrypt (trusts vk; published session key), rights");
+
+    // --- the rail is up: the runtime now binds the cross-provider open material. The
+    // producer ESCROWS the content CEK to the authority's published recipient (so the CEK
+    // reaches the authority SEALED, recovered in-boundary, never handed in raw), and the
+    // canonical transcript AAD is computed over the decrypt boundary's published session key.
+    let (recipient_pub_b64, session_pub_b64) = {
+        let rail = rail.borrow();
+        (
+            rail.recipient_pub_b64.clone().ok_or("the key authority published no escrow recipient")?,
+            rail.session_pub_b64.clone().ok_or("the decrypt boundary published no session key")?,
+        )
     };
-
-    let mut key = Capsule::spawn("key-provider", key_bin)?;
-    let key_init = ok_data(&key.call(&json!({ "op": "init", "config": { "backend": "reference" } }))?, "key init")?;
-    let vk_b64 = key_init["seal_verifying_key_b64"]
-        .as_str()
-        .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
-        .to_string();
-    let recipient_pub_b64 = key_init["seal_recipient_pub_b64"]
-        .as_str()
-        .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
-        .to_string();
-    step(1, "key-provider: reference authority up; verifying + escrow-recipient keys published");
-
-    // ESCROW the content CEK to the authority's recipient — so the CEK reaches the
-    // authority SEALED, recovered in-boundary, never handed in raw (no dev shim).
     let recipient_pub_bytes = B64.decode(&recipient_pub_b64).map_err(|e| e.to_string())?;
     let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub_bytes)
         .ok_or("key-provider published a malformed escrow recipient key")?;
@@ -782,46 +926,12 @@ fn run(args: &[String]) -> Result<(), String> {
         ddrm_envelope::seal::seal_bound(&recipient_public, &cek_bytes, &escrow, &producer_signer)
             .to_bytes(),
     );
-
-    let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
-    let dec_init = ok_data(
-        &decrypt.call(&json!({ "op": "init", "config": { "authority_vk_b64": vk_b64 } }))?,
-        "decrypt init",
-    )?;
-    let session_pub_b64 = dec_init["decrypt_session_public_key_b64"]
-        .as_str()
-        .ok_or("decrypt-provider did not publish a session key (build with --features rail-material)")?
-        .to_string();
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
-    step(2, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
-
     let content_hash = b"consumer-smoke-content-hash-0001".to_vec(); // 32 bytes
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
-
-    // --- build the trusted runtime-core HOST and let it OWN the WHOLE open + the rail.
-    // The runtime hands its three capsules to runtime-OWNED transports (the transports own
-    // the capsules; the HOST owns the transports, so `host.shutdown()` tears down the rail
-    // — the analogue of disposing every per-view handle), registers them into the lib's
-    // `RuntimeCapabilityTable`, wires a `SmokePlanSource` (asks the REAL drm-provider for
-    // the plan) and a PERSISTING event sink (`ddrm_plan_runner::PersistingEventSink` over a
-    // `FileEventStore` writing durable, CEK-free open records to a temp dir), and hands all
-    // three to `DrmHost`. `host.open(content_id, viewer)` then fetches the plan, drives it
-    // through the registry (`open_drm_plan`'s parse→resolve→execute), and PERSISTS the
-    // runtime-event steps — the SAME host entrypoint the trusted core will call, no second
-    // code path. The cells are kept ONLY for the raw transcript-mismatch gate below; the
-    // host owns teardown (no manual capsule shutdown in `run`).
-    let rights_cell = Rc::new(RefCell::new(rights));
-    let key_cell = Rc::new(RefCell::new(key));
-    let decrypt_cell = Rc::new(RefCell::new(decrypt));
-    let mut table = RuntimeCapabilityTable::new();
-    table.register(Box::new(RightsTransport {
-        rights: rights_cell.clone(),
-        chain_attestation: attestation,
-        chain_mode: chain_mode.clone(),
-    }))?;
-    table.register(Box::new(KeyTransport {
-        key: key_cell.clone(),
+    // Bind the key transport's per-open material — the key handle fails closed without it.
+    *key_material.borrow_mut() = Some(KeyOpenMaterial {
         kid_hex: kid_hex.clone(),
         wrapped_cek_b64: wrapped_cek_b64.clone(),
         producer_vk_b64: producer_vk_b64.clone(),
@@ -829,15 +939,19 @@ fn run(args: &[String]) -> Result<(), String> {
         aad_b64: B64.encode(&aad),
         content_hash_b64: B64.encode(&content_hash),
         nonce_b64: B64.encode(&nonce),
-    }))?;
-    table.register(Box::new(DecryptTransport {
-        decrypt: decrypt_cell.clone(),
-    }))?;
+    });
+    step(2, "runtime-core host: bound cross-provider open material (CEK escrowed to the published recipient; transcript AAD over the published session key)");
 
-    // The host's durable event store: a fresh temp dir the runtime persists open records
-    // into. The `PersistingEventSink` builds the CEK-free record and writes it here.
+    // --- build the trusted runtime-core HOST over the LAUNCHED rail. The host gets the
+    // launched `RuntimeCapabilityTable`, a `SmokePlanSource` (asks the REAL drm-provider for
+    // the plan), and a PERSISTING event sink over the production-shaped `DurableEventStore`
+    // (atomic writes into a stable on-disk layout). `host.open(content_id, viewer)` fetches
+    // the plan, drives it through the registry (`open_drm_plan`'s parse→resolve→execute), and
+    // PERSISTS the runtime-event steps — the SAME host entrypoint the trusted core will call.
+    // The cells are kept ONLY for the raw transcript-mismatch gate below; the host owns
+    // teardown (no manual capsule shutdown in `run`).
     let receipts_dir = std::env::temp_dir().join(format!("ddrm-open-{}", std::process::id()));
-    std::fs::create_dir_all(&receipts_dir).map_err(|e| format!("create receipts dir: {e}"))?;
+    let store = DurableEventStore::open(&receipts_dir)?;
 
     let tamper = Rc::new(std::cell::Cell::new(false));
     let mut host = DrmHost::new(
@@ -846,9 +960,7 @@ fn run(args: &[String]) -> Result<(), String> {
             tamper: tamper.clone(),
         }),
         table,
-        Box::new(PersistingEventSink::new(FileEventStore {
-            dir: receipts_dir.clone(),
-        })),
+        Box::new(PersistingEventSink::new(store)),
     );
 
     // --- the trusted host owns the open end to end ---
@@ -867,15 +979,18 @@ fn run(args: &[String]) -> Result<(), String> {
             report.events_emitted
         ));
     }
-    // The host PERSISTED a durable record per runtime event — and every record is CEK-free.
-    let receipt_files = read_persisted_records(&receipts_dir)?;
+    // The host PERSISTED a durable record per runtime event. Read them back through a FRESH
+    // `DurableEventStore::load` (a brand-new reader, as if a separate process had opened the
+    // store) — proving the receipt + audit are durable across process boundaries, not just
+    // live in memory. The analogue of `FileSessionStore::loadAll` restoring on startup.
+    let receipt_files = DurableEventStore::load(&receipts_dir)?;
     if receipt_files.len() != 2 {
-        return Err(format!("expected 2 persisted open records, found {}", receipt_files.len()));
+        return Err(format!("expected 2 durable open records, found {}", receipt_files.len()));
     }
     // The record may carry artifact NAMES (safe — PC2 logs step names) but NEVER any secret
     // VALUE. Forbid the concrete secret bytes that flowed through this open: the CEK, the
     // sealed/escrowed material, the ciphertext, and the session/producer keys.
-    for (path, record) in &receipt_files {
+    for (name, record) in &receipt_files {
         let blob = serde_json::to_string(record).map_err(|e| e.to_string())?;
         let secrets = [
             ("CEK", GOLDEN_CEK_B64),
@@ -886,18 +1001,18 @@ fn run(args: &[String]) -> Result<(), String> {
         ];
         for (what, secret) in secrets {
             if blob.contains(secret) {
-                return Err(format!("persisted open record {} leaks the {what}", path.display()));
+                return Err(format!("durable open record {name} leaks the {what}"));
             }
         }
         // It records artifact NAMES, never the artifact map (values).
         if record.get("artifacts").is_some() {
-            return Err(format!("persisted record {} embeds artifact values", path.display()));
+            return Err(format!("durable record {name} embeds artifact values"));
         }
         if record["content_id"].as_str() != Some(cid().as_str()) {
-            return Err(format!("persisted record {} has wrong content_id", path.display()));
+            return Err(format!("durable record {name} has wrong content_id"));
         }
     }
-    step(7, "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records");
+    step(7, "runtime-core host: PERSISTED the runtime-owned post-steps (release_receipt + audit) as durable CEK-free records; read back through a fresh DurableEventStore");
 
     // --- fail-closed #1 (crypto binding): a replayed/altered transcript must not open.
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
@@ -910,19 +1025,23 @@ fn run(args: &[String]) -> Result<(), String> {
         .expect("key release request is an object")
         .insert("rights_receipt".to_string(), fallback_rights_receipt());
     let bad_release = ok_data(
-        &key_cell.borrow_mut().call(&json!({
-            "op": "release",
-            "request": bad_req,
-            "session": {
-                "decrypt_session_pub_b64": session_pub_b64,
-                "producer_vk_b64": producer_vk_b64,
-                "aad_b64": B64.encode(&bad_aad),
-                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-                "content_hash_b64": B64.encode(&content_hash),
-                "nonce_b64": B64.encode(&nonce),
-                "now_unix": NOW_UNIX,
-            }
-        }))?,
+        &key_cell
+            .borrow_mut()
+            .as_mut()
+            .ok_or("key capsule torn down before the raw transcript gate")?
+            .call(&json!({
+                "op": "release",
+                "request": bad_req,
+                "session": {
+                    "decrypt_session_pub_b64": session_pub_b64,
+                    "producer_vk_b64": producer_vk_b64,
+                    "aad_b64": B64.encode(&bad_aad),
+                    "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                    "content_hash_b64": B64.encode(&content_hash),
+                    "nonce_b64": B64.encode(&nonce),
+                    "now_unix": NOW_UNIX,
+                }
+            }))?,
         "key release (mismatch)",
     )?;
     let mut bad_open_req = decrypt_request_base();
@@ -932,12 +1051,16 @@ fn run(args: &[String]) -> Result<(), String> {
         .insert("release_receipt".to_string(), release_receipt_json());
     bad_open_req["object_cid"] = json!(cid());
     bad_open_req["viewer_interface"] = json!(VIEWER);
-    let bad_open = decrypt_cell.borrow_mut().call(&json!({
-        "op": "open_session_v1",
-        "request": bad_open_req,
-        "material": bad_release["material"].clone(),
-        "now_unix": NOW_UNIX,
-    }))?;
+    let bad_open = decrypt_cell
+        .borrow_mut()
+        .as_mut()
+        .ok_or("decrypt capsule torn down before the raw transcript gate")?
+        .call(&json!({
+            "op": "open_session_v1",
+            "request": bad_open_req,
+            "material": bad_release["material"].clone(),
+            "now_unix": NOW_UNIX,
+        }))?;
     if bad_open.get("data").and_then(|d| d.get("decision")).and_then(Value::as_str) == Some("opened") {
         return Err(format!("a transcript-mismatched seal must NOT open: {bad_open}"));
     }
@@ -949,13 +1072,13 @@ fn run(args: &[String]) -> Result<(), String> {
     // and the real key-provider (deny_unknown_fields over a required `rights_receipt`)
     // rejects it — proving the host only proceeds when the plan's edges are intact, and
     // that a bad plan FROM THE SOURCE fails closed, cross-binary, with no event emitted.
-    let persisted_before = read_persisted_records(&receipts_dir)?.len();
+    let persisted_before = DurableEventStore::load(&receipts_dir)?.len();
     tamper.set(true);
     match host.open(&cid(), VIEWER) {
         Ok(_) => return Err("a tampered plan edge must NOT drive a successful open".to_string()),
         Err(_) => step(9, "runtime-core host: a tampered binding edge from the plan source failed closed at the real key-provider"),
     }
-    if read_persisted_records(&receipts_dir)?.len() != persisted_before {
+    if DurableEventStore::load(&receipts_dir)?.len() != persisted_before {
         return Err("a failed open must persist no runtime-event record".to_string());
     }
 
@@ -970,22 +1093,6 @@ fn run(args: &[String]) -> Result<(), String> {
     drop(decrypt_cell);
     let _ = std::fs::remove_dir_all(&receipts_dir);
     Ok(())
-}
-
-/// Read every persisted open record the host wrote into `dir` (as `(path, json)`), so the
-/// smoke can assert the durable receipt/audit were written and are CEK-free.
-fn read_persisted_records(dir: &std::path::Path) -> Result<Vec<(PathBuf, Value)>, String> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("read receipts dir: {e}"))? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let record: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        out.push((path, record));
-    }
-    Ok(out)
 }
 
 fn main() {

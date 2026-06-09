@@ -308,6 +308,24 @@ pub trait ProviderTransport {
     }
 }
 
+/// How the runtime BRINGS UP a provider transport: the host LAUNCHES each launcher, which
+/// connects to / spawns its provider, drives its init (the provider publishes the material
+/// the rail needs — a key authority's verifying/recipient keys, a decrypt boundary's
+/// session key), and hands back a [`ProviderTransport`] that OWNS that connection's
+/// lifecycle (open handles → `shutdown`). The runtime-core analogue of PC2's
+/// `BackendSessionService.createSession` launching a backend view —
+/// `WasmSessionView.createNew()` mints + PUBLISHES the session key inside the runtime
+/// (`src/api/chipotle-client.ts:603`–`:613`, `BackendSessionService.ts:307`) — so the
+/// HOST, not a dev harness, brings the rail up. Fail-closed: a launch that cannot bring its
+/// provider up surfaces, and the host tears down whatever already launched.
+pub trait ProviderLauncher {
+    /// The provider role this launcher brings up — matches a plan step's `provider`.
+    fn provider(&self) -> &str;
+    /// Launch the provider and hand back the transport that owns its connection. Consumes
+    /// the launcher (a launcher brings up its provider exactly once).
+    fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String>;
+}
+
 /// The runtime-core capability table: a registry of runtime-OWNED provider transports.
 /// The runtime `register`s one transport per provider it can drive (at startup); on a
 /// dDRM open, [`open_drm_plan`] → `resolve(provider)` opens a fresh handle over the
@@ -341,6 +359,33 @@ impl RuntimeCapabilityTable {
         }
         self.transports.insert(key, transport);
         Ok(())
+    }
+
+    /// Bring up the rail: LAUNCH each launcher in the given order (the caller supplies the
+    /// dependency order — e.g. the key authority before the decrypt boundary that trusts
+    /// it) and register the resulting transport. Fail-closed: if any launch fails, the
+    /// transports already brought up are TORN DOWN before the error surfaces — a partially
+    /// launched rail never lingers. This is the runtime-core analogue of the host launching
+    /// each backend view via `createSession`/`createNew` (`BackendSessionService.ts:307`).
+    pub fn from_launchers(launchers: Vec<Box<dyn ProviderLauncher>>) -> Result<Self, String> {
+        let mut table = Self::new();
+        for launcher in launchers {
+            let provider = launcher.provider().to_string();
+            match launcher.launch() {
+                Ok(transport) => {
+                    if let Err(e) = table.register(transport) {
+                        let _ = table.shutdown();
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    // Tear down whatever already came up, then surface the launch failure.
+                    let _ = table.shutdown();
+                    return Err(format!("launching provider `{provider}` failed: {e}"));
+                }
+            }
+        }
+        Ok(table)
     }
 
     /// The providers the runtime has registered a transport for.
@@ -479,6 +524,105 @@ impl<S: EventStore> RuntimeEventSink for PersistingEventSink<S> {
         let key = format!("{}/{}", ctx.content_id, event);
         self.store.persist(&key, &record)?;
         self.persisted.push(event.to_string());
+        Ok(())
+    }
+}
+
+/// Turn an open-record key (`content_id/event`) into a single stable, collision-resistant
+/// filename — the on-disk layout the [`DurableEventStore`] writes. Mirrors `FileSessionStore`
+/// keying a file by the session id (`BackendSessionService.ts:140`–`:143`).
+fn durable_record_filename(key: &str) -> String {
+    let safe: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    format!("{safe}.json")
+}
+
+/// A production-shaped DURABLE [`EventStore`]: writes each open record as a JSON file under
+/// a directory, keyed by `content_id/event`, and reads them back on a fresh instance/process.
+/// Mirrors PC2's `FileSessionStore` — one file per record id, restored by `loadAll` across a
+/// process restart, corrupt files skipped (`src/services/session/BackendSessionService.ts:107`,
+/// `:140`–`:196`). Durability + integrity properties:
+///   * **atomic**: writes to a `*.tmp` sibling then `rename`s into place, so a reader never
+///     sees a half-written record (a crash mid-write leaves the old record or none, never a
+///     torn one); the temp file is cleaned up on a failed write.
+///   * **idempotent**: re-persisting the same key atomically replaces the record.
+///   * **fail-closed**: any I/O error (create dir, write, rename) surfaces to the caller, so
+///     a runtime event that cannot be durably recorded fails the open.
+///   * **read-back**: [`DurableEventStore::load`] returns every persisted record from a
+///     directory (skipping non-record / corrupt files), proving durability across a fresh
+///     reader — the analogue of `FileSessionStore::loadAll`.
+pub struct DurableEventStore {
+    dir: std::path::PathBuf,
+}
+
+impl DurableEventStore {
+    /// Open (creating if absent) a durable store rooted at `dir`. Fail-closed if the
+    /// directory cannot be created.
+    pub fn open(dir: impl Into<std::path::PathBuf>) -> Result<Self, String> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("durable store dir {}: {e}", dir.display()))?;
+        Ok(Self { dir })
+    }
+
+    /// The directory this store persists into.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Read every persisted open record back from `dir`, as `(filename, record)` — skipping
+    /// non-`.json` and corrupt files (a corrupt record is never served as if intact). The
+    /// analogue of `FileSessionStore::loadAll` restoring sessions across a fresh process.
+    pub fn load(dir: impl AsRef<std::path::Path>) -> Result<Vec<(String, Value)>, String> {
+        let dir = dir.as_ref();
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            // A never-written store reads back as empty, not an error.
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(format!("read durable store {}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            // Skip a corrupt record rather than serving it as intact (fail-closed read).
+            if let Ok(record) = serde_json::from_slice::<Value>(&bytes) {
+                out.push((name, record));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+}
+
+impl EventStore for DurableEventStore {
+    fn persist(&mut self, key: &str, record: &Value) -> Result<(), String> {
+        let fname = durable_record_filename(key);
+        let final_path = self.dir.join(&fname);
+        let tmp_path = self.dir.join(format!("{fname}.tmp"));
+        let bytes = serde_json::to_vec_pretty(record).map_err(|e| e.to_string())?;
+        // Atomic publish: write the temp file fully, then rename over the final path. On any
+        // failure, best-effort remove the temp file so no torn `*.tmp` lingers.
+        if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("write durable record {}: {e}", tmp_path.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("publish durable record {}: {e}", final_path.display()));
+        }
         Ok(())
     }
 }
@@ -1751,5 +1895,160 @@ mod tests {
         assert!(err.contains("store could not persist"), "{err}");
         // The receipt persisted first; the audit failed — the open did not silently succeed.
         assert_eq!(records.borrow().len(), 1);
+    }
+
+    // ── Day 79–80: the host LAUNCHES the rail + a production-shaped DURABLE store ──
+
+    /// A launcher that brings up a `FakeTransport`; `fail` models a provider that cannot be
+    /// brought up (the host must tear down whatever already launched and fail closed). The
+    /// shared `log` records launch + (via the transport) teardown order.
+    struct FakeLauncher {
+        provider: String,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl ProviderLauncher for FakeLauncher {
+        fn provider(&self) -> &str {
+            &self.provider
+        }
+        fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String> {
+            self.log.borrow_mut().push(format!("launch:{}", self.provider));
+            if self.fail {
+                return Err("provider would not come up".to_string());
+            }
+            Ok(owning(&self.provider, &self.log, &self.invoked, false))
+        }
+    }
+
+    fn launcher(
+        provider: &str,
+        log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        invoked: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail: bool,
+    ) -> Box<dyn ProviderLauncher> {
+        Box::new(FakeLauncher {
+            provider: provider.to_string(),
+            log: log.clone(),
+            invoked: invoked.clone(),
+            fail,
+        })
+    }
+
+    #[test]
+    fn host_launches_the_rail_then_drives_and_tears_it_down() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // The host brings up the rail by LAUNCHING each provider (caller-supplied order).
+        let table = RuntimeCapabilityTable::from_launchers(vec![
+            launcher("rights", &log, &invoked, false),
+            launcher("key", &log, &invoked, false),
+            launcher("decrypt", &log, &invoked, false),
+        ])
+        .expect("the host launches the whole rail");
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            table,
+            Box::new(RecordingSink { emitted, refuse: None }),
+        );
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open over the launched rail");
+        host.shutdown().expect("teardown");
+        let log = log.borrow();
+        // Launched in the given order, then every transport torn down.
+        assert_eq!(log[0], "launch:rights");
+        assert_eq!(log[1], "launch:key");
+        assert_eq!(log[2], "launch:decrypt");
+        for p in ["rights", "key", "decrypt"] {
+            assert!(log.contains(&format!("shutdown:{p}")), "{p} torn down");
+        }
+    }
+
+    #[test]
+    fn from_launchers_fails_closed_and_tears_down_the_partial_rail() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // `key` comes up, then `decrypt` refuses — the partial rail must be torn down.
+        let err = match RuntimeCapabilityTable::from_launchers(vec![
+            launcher("key", &log, &invoked, false),
+            launcher("decrypt", &log, &invoked, true),
+        ]) {
+            Ok(_) => panic!("the rail should have failed to come up"),
+            Err(e) => e,
+        };
+        assert!(err.contains("launching provider `decrypt` failed"), "{err}");
+        let log = log.borrow();
+        // `key` launched, then was torn down when the rail failed to come up fully.
+        assert!(log.contains(&"launch:key".to_string()));
+        assert!(log.contains(&"shutdown:key".to_string()), "the partial rail was torn down");
+    }
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ddrm-durable-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn durable_store_persists_and_reads_back_across_a_fresh_instance() {
+        let dir = unique_tmp_dir("rt");
+        {
+            let mut store = DurableEventStore::open(&dir).unwrap();
+            store.persist("bafy/release_receipt", &json!({ "event": "release_receipt", "n": 1 })).unwrap();
+            store.persist("bafy/audit", &json!({ "event": "audit", "n": 2 })).unwrap();
+        } // the writer goes away — durability must survive it.
+        let loaded = DurableEventStore::load(&dir).unwrap();
+        assert_eq!(loaded.len(), 2, "both records survived a fresh reader");
+        // No torn `*.tmp` lingers — the atomic publish cleaned up after itself.
+        let any_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .any(|e| e.unwrap().path().extension().and_then(|x| x.to_str()) == Some("tmp"));
+        assert!(!any_tmp, "no temp file left behind");
+        // Idempotent: re-persisting the same key atomically replaces the record.
+        {
+            let mut store = DurableEventStore::open(&dir).unwrap();
+            store.persist("bafy/audit", &json!({ "event": "audit", "n": 99 })).unwrap();
+        }
+        let reloaded = DurableEventStore::load(&dir).unwrap();
+        assert_eq!(reloaded.len(), 2, "idempotent overwrite, not a duplicate");
+        let audit = reloaded.iter().find(|(_, r)| r["event"] == json!("audit")).unwrap();
+        assert_eq!(audit.1["n"], json!(99), "the record was replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_store_load_skips_a_corrupt_record() {
+        let dir = unique_tmp_dir("corrupt");
+        let mut store = DurableEventStore::open(&dir).unwrap();
+        store.persist("bafy/release_receipt", &json!({ "event": "release_receipt" })).unwrap();
+        // A corrupt file must be skipped on read-back, never served as if intact.
+        std::fs::write(dir.join("bafy_audit.json"), b"{not json").unwrap();
+        let loaded = DurableEventStore::load(&dir).unwrap();
+        assert_eq!(loaded.len(), 1, "the corrupt record is skipped, the intact one survives");
+        assert_eq!(loaded[0].1["event"], json!("release_receipt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_persists_durably_through_the_real_store() {
+        let dir = unique_tmp_dir("host");
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            full_table(&invoked),
+            Box::new(PersistingEventSink::new(DurableEventStore::open(&dir).unwrap())),
+        );
+        host.open("bafycontent", "elastos.viewer/document@1").expect("open + durable persist");
+        // A FRESH reader sees both durable records — the host persisted across the store.
+        let loaded = DurableEventStore::load(&dir).unwrap();
+        let events: Vec<&str> = loaded.iter().map(|(_, r)| r["event"].as_str().unwrap()).collect();
+        assert!(events.contains(&"release_receipt"));
+        assert!(events.contains(&"protected_content.open.audit"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
