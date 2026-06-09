@@ -57,6 +57,14 @@ rail-shim-mldsa = ["rail-shim", "pq-mldsa"]
 # panic; error/response surfaces must leak no CEK/plaintext. Test-only gate (pulls
 # all engines + the real verifier); OFF by default, base ladder stays byte-stable.
 harden = ["rail-shim-mldsa"]
+# rail-live: the recommended rail (DDRM_DECRYPT_RAIL.md Option A) WIRED INTO the
+# provider dispatch — `OpenSessionLive` receives VM-sealed material, recovers the CEK
+# INSIDE the boundary via the proven `decrypt_from_carrier`, decrypts, and returns a
+# scoped response that carries neither CEK nor plaintext. This is the reference the
+# live path becomes once Anders blesses the carrier delivery on the public contract
+# (today it rides a capsule-local request variant so `elastos-common` stays
+# byte-identical). OFF by default — the default build/dispatch stay fail-closed.
+rail-live = ["rail-shim", "pq-mldsa"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

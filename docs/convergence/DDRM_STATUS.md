@@ -1,6 +1,21 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~48 commits**, tip `6b0ba1e67` + Day-44 v0.4.0 alignment). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~49 commits**, tip Day-45 live rail). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Recommended rail (Option A) is now WIRED into the provider dispatch as a fail-closed reference (`rail-live`).**
+
+> **🔌 Day 45 — recommended rail WIRED (reference).** The recommended split
+> (Option A at the decrypt boundary: the VM *receives* sealed material) is no
+> longer just a tested island — it is wired into the provider dispatch behind the
+> `rail-live` feature. A new `OpenSessionLive` op runs the proven
+> `decrypt_from_carrier` in-boundary and returns a **scoped** response; a real
+> ML-DSA-65-signed PQ-hybrid carrier decrypts through the **actual dispatch** with
+> **no CEK/plaintext leak**, while a tampered carrier and an unprovisioned boundary
+> both **fail closed** (`rail-live`: 57 passed, wasm-clean). Crucially the shared
+> contract is **untouched** (VM-sealed material rides a capsule-local variant), so
+> drift stays green and the default build is byte-identical + fully fail-closed.
+> The exact additive `DecryptSessionRequestV1` delta for when Anders blesses Option
+> A is written out in `DDRM_DECRYPT_RAIL.md` (§Reference rail LANDED). Net: the only
+> remaining step to default-on live decrypt is Anders' thumbs-up on the contract
+> field — the code path is already proven end-to-end.
 **State:** the full Elacity dDRM provider chain is **fail-closed**, **compiles to
 `wasm32-wasip1`**, **executes under WASI**, and has **verified inter-provider
 contract handoffs**. Both chain ends are now pinned by tests: the **upstream rail

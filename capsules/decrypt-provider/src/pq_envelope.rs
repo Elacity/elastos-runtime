@@ -391,6 +391,31 @@ pub(crate) mod seal_support {
         }
     }
 
+    /// Real ML-DSA-65 key-authority signer (shared with the rail-live provider test
+    /// so the carrier it seals is verified by the production `MlDsa65Verifier`).
+    /// Deterministic from seed — no RNG.
+    #[cfg(feature = "pq-mldsa")]
+    pub struct MlDsaSealSigner {
+        sk: ml_dsa::SigningKey<ml_dsa::MlDsa65>,
+    }
+    #[cfg(feature = "pq-mldsa")]
+    impl CekSealSigner for MlDsaSealSigner {
+        fn sign(&self, msg: &[u8]) -> Vec<u8> {
+            use ml_dsa::{SignatureEncoding, Signer};
+            self.sk.sign(msg).to_bytes().to_vec()
+        }
+    }
+    /// `(signer, verifying_key_encoding)` — the vk is what the decrypt provider is
+    /// configured to trust.
+    #[cfg(feature = "pq-mldsa")]
+    pub fn mldsa_seal_keypair(seed: [u8; 32]) -> (MlDsaSealSigner, Vec<u8>) {
+        use ml_dsa::{Keypair, MlDsa65, SigningKey};
+        let s: ml_dsa::B32 = seed.into();
+        let sk = SigningKey::<MlDsa65>::from_seed(&s);
+        let vk = sk.verifying_key().encode().to_vec();
+        (MlDsaSealSigner { sk }, vk)
+    }
+
     pub fn gen_session() -> (SessionKemSecret, SessionKemPublic) {
         let mut rng = OsRng;
         let x_sk = XStaticSecret::random_from_rng(&mut rng);

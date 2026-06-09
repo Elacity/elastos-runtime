@@ -1,6 +1,9 @@
 # dDRM Decrypt Rail — design decision (open)
 
-**Status:** Decision required (architecture + security). Routes to Anders.
+**Status:** Recommended rail (Option A) **WIRED as a fail-closed reference** behind
+`rail-live` (Day 45); shared contract untouched. The remaining decision is Anders'
+thumbs-up on the additive `DecryptSessionRequestV1` field (see §Reference rail
+LANDED). Routes to Anders.
 **Context:** Day 3 of the dDRM convergence. The PC2 `cenc-decrypt` engine is
 vendored and tested inside `decrypt-provider` (Day 1). This note records *why
 end-to-end wiring is blocked on a contract/architecture decision* and lays out
@@ -90,6 +93,56 @@ logged, or surfaced (already enforced in the vendored engine).
    we should target, so decrypt-provider and key-provider agree?
 3. Does the provider-invocation rail expose an in-capsule `carrier_invoke`
    client today that a microvm provider may use, or is that still landing?
+
+## Reference rail LANDED — `rail-live` (Day 45)
+
+The recommended split (**Option A at the decrypt boundary**) is now **wired into
+the provider dispatch** behind the `rail-live` feature — no longer just a tested
+island. This is the working reference Anders can read and bless; flipping it to
+the default is a one-line move once the public contract carries the material.
+
+What landed (`capsules/decrypt-provider/src/main.rs`):
+- A new op `OpenSessionLive { request, material }` that performs the single
+  in-boundary operation: `rail_shim::decrypt_from_carrier(session, carrier,
+  verifier)` → map `(bytes, meta)` into the existing **scoped** response.
+- The CEK materializes only inside the engine (in `Zeroizing`), is zeroized
+  there, and the plaintext is dropped at the boundary — the response carries
+  session/output metadata only. Proven by `open_session_live_*` tests (decrypt
+  through dispatch with **no CEK/plaintext leak**; tampered carrier and
+  unprovisioned boundary both **fail closed**).
+- Default build is **byte-identical and fully fail-closed** — `OpenSessionLive`,
+  the material struct, and the session state are all `#[cfg(feature="rail-live")]`.
+- Builds to `wasm32-wasip1`; pinned in the ladder gate at **57 passed**.
+
+### Why it does NOT touch the shared contract yet (and the exact delta when it can)
+
+To keep `elastos-common::protected_content` **byte-identical to v0.4.0** (drift
+gate stays green), the VM-sealed material rides a *capsule-local* request variant,
+not the shared `DecryptSessionRequestV1`. The moment Option A is blessed, the
+proposed public-contract delta is precisely:
+
+```rust
+// elastos-common::protected_content — additive, Option A
+pub struct DecryptSessionRequestV1 {
+    // ... all existing authority/intent fields UNCHANGED ...
+    /// CEK sealed to the decrypt VM's ephemeral in-VM public key
+    /// (PqSealedEnvelope wire form). Only this microVM can unwrap it.
+    pub sealed_cek: Vec<u8>,        // or base64 String for JSON parity
+    /// The ciphertext fMP4 segment (or a content handle) to decrypt.
+    pub ciphertext: Vec<u8>,        // or a ContentHandleV1
+    /// Optional init segment (tenc IV defaults).
+    pub init_segment: Option<Vec<u8>>,
+    // profile (pq_hybrid|classical_p256) can be implied by deployment or a small enum.
+}
+```
+
+When that lands, `OpenSessionLive` folds back into the normal `OpenSession`
+(the body is already written) and the local variant is deleted. The VM session
+secret stays VM-minted/off-wire either way (it is provisioned in the boundary,
+never a request field). Q1 (dKMS-direct vs key-provider re-seal) and Q2
+(ML-DSA-65 vs hybrid ECDSA+ML-DSA signature) do **not** change this shape — Q2
+plugs into the `CekSealVerifier` slot the rail already uses, and both answers are
+pre-proven.
 
 ## Isolation tier — wasm now, microVM as hardening (recommendation)
 

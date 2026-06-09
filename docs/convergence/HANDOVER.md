@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 44).
-**Active branch:** `feat/decrypt-provider-cenc` (tip `6b0ba1e67` + Day-44 v0.4.0 alignment, ~48 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`.**
+**Last updated:** 2026-06-09 (end of Day 45).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-45 live rail, ~49 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Recommended rail (Option A) now WIRED into provider dispatch as a fail-closed reference (`rail-live`), shared contract untouched.**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -49,9 +49,15 @@ transport rail — `DDRM_DECRYPT_RAIL.md`). Everything that depended on it has b
 pinned, de-risked, or proven pre-rail — *including the transport shim itself and the real
 PQ signature primitive*, both built and fully tested. The remaining PQ items are now pure
 **policy** (Anders' Q2: straight `ml-dsa-65` vs hybrid during PC2's migration), not build
-gaps. The only work left behind the blocker is the **one-line `OpenSession` wire-up**
-(`rail_shim::decrypt_from_carrier(...)`, passing a `MlDsa65Verifier`) once Anders confirms
-who mints the carrier. Everything that *can* be done ahead of that answer, *is* done.
+gaps. **As of Day 45 the `OpenSession` wire-up itself is also done** — the recommended
+rail (Option A) is wired into the provider dispatch behind `rail-live` as a fail-closed
+reference: `OpenSessionLive` runs `rail_shim::decrypt_from_carrier(...)` with a real
+`MlDsa65Verifier` and returns a scoped response (proven: real PQ carrier decrypts through
+dispatch with no CEK/plaintext leak; tampered/unprovisioned fail closed; wasm-clean). The
+shared contract is deliberately **untouched** (material rides a capsule-local variant), so
+the only thing left to flip live decrypt on by default is **Anders' thumbs-up on the
+additive `DecryptSessionRequestV1` field** (exact delta in `DDRM_DECRYPT_RAIL.md`).
+Everything that *can* be done ahead of that answer, *is* done.
 
 ---
 
@@ -134,6 +140,7 @@ counts per feature:
 | `pq-mldsa-hybrid` | 37 | hybrid ECDSA-P256 + ML-DSA-65 verifier (BOTH must verify) — the other Q2 answer (Day 41) |
 | `rail-shim-mldsa` | 54 | the real ML-DSA-65 verified through `decrypt_from_carrier` on a committed carrier golden (Day 33) |
 | `harden` | 65 | adversarial negative-space + containment sweep over the wire-decoders (Day 34) |
+| `rail-live` | 57 | **recommended rail (Option A) WIRED into dispatch** — `OpenSessionLive` runs `decrypt_from_carrier` in-boundary, real PQ carrier decrypts through dispatch with no CEK/plaintext leak; tampered/unprovisioned fail closed (Day 45) |
 | `gen-vectors` | — | regenerate the committed vectors (writes `tests/vectors/`) |
 
 The standing gate `scripts/ddrm-verify.sh` now asserts **all** of these counts +
@@ -354,9 +361,9 @@ for p in encrypt drm rights key decrypt; do (cd capsules/$p-provider && cargo te
 
 # decrypt-provider feature ladder (tested islands; counts in §3)
 # default 25 / rail-prep 27 / pq-envelope 29 / pq-rail-prep 31 / vectors 42 /
-# rail-shim 45 / pq-mldsa 34 / pq-mldsa-hybrid 37 / rail-shim-mldsa 54 / harden 65
+# rail-shim 45 / pq-mldsa 34 / pq-mldsa-hybrid 37 / rail-shim-mldsa 54 / harden 65 / rail-live 57
 ( cd capsules/decrypt-provider && \
-  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa pq-mldsa-hybrid rail-shim-mldsa harden; do \
+  for f in rail-prep pq-envelope pq-rail-prep vectors rail-shim pq-mldsa pq-mldsa-hybrid rail-shim-mldsa harden rail-live; do \
     cargo test --features $f; done )
 
 # regenerate the committed golden vectors (only when intentionally changing them)
@@ -465,6 +472,7 @@ next context can continue cold.
 - **D42** build-hygiene (sibling branch, off the dDRM critical path): verified `fix/crosvm-darwin-build` is **green on this macOS** — `elastos-crosvm` 18 tests pass + warning-free, `elastos-server` builds clean; recorded in `PUSH_PLAN.md` (#1 now build-verified, not just authored). dDRM gate untouched (still 4/4).
 - **D43** build-verify push queue #3 + #2 on macOS: `chore/bincode-2x` **311 passed / 0 failed** incl. the capability-token byte-identity golden (`token_wire_format_is_bincode_1x_legacy`) — wire format provably unchanged; `fix/home-summary-resilience` builds clean + its `home_browser_state_*` tests pass (4 `home_launch`/`runtime_ensure` failures are **no-KVM env limits, identical on the crosvm branch → not a regression**, pass on Linux CI). Recorded in `PUSH_PLAN.md` with a Linux-test-gating follow-up. dDRM gate still 4/4.
 - **D44** **0.4.0 RELEASED** (tag `v0.4.0`=`cae83c3c3`) — alignment audit: `protected_content.rs` **byte-identical** to the release; `ddrm-drift-check.sh` **passes against the released base**; crypto core validated green ON `v0.4.0` (overlay worktree: drift PASS, harden=65, pq-mldsa-hybrid=37, encrypt=13, pc2-conformance byte-compatible). Released providers are still fail-closed skeletons (no rail). Rebase surface MEASURED (`PUSH_PLAN.md`): decrypt/encrypt clean, **key+drm 3-way (needs Anders)**. Rail decision remains the one blocker.
+- **D45** **recommended rail WIRED into dispatch** (Option A, decision taken with the team): new `OpenSessionLive` op runs the proven `rail_shim::decrypt_from_carrier` in-boundary with a real `MlDsa65Verifier` and returns a scoped response. Feature `rail-live`=57: a real ML-DSA-65-signed PQ-hybrid carrier decrypts through the **actual provider dispatch** with **no CEK/plaintext leak**; tampered carrier + unprovisioned boundary both fail closed; `wasm32-wasip1`-clean. Shared `DecryptSessionRequestV1` **untouched** (material rides a capsule-local variant) → drift still PASS, default build byte-identical + fail-closed. The exact additive contract delta for default-on is written in `DDRM_DECRYPT_RAIL.md` (§Reference rail LANDED). Ladder gate now pins `rail-live`=57 + its wasm build. Only remaining step to live decrypt: Anders' thumbs-up on the contract field.
 
 ---
 

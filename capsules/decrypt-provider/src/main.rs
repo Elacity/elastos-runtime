@@ -31,7 +31,8 @@ mod pq_envelope;
 #[cfg(any(feature = "vectors", feature = "rail-shim", feature = "pq-mldsa"))]
 mod vector_format;
 // Rail transport shim (feature `rail-shim`): adapter from a sealed-CEK carrier to
-// the proven unwrap->cenc engines. Tested island, not wired into dispatch.
+// the proven unwrap->cenc engines. Tested island; wired into dispatch only under
+// `rail-live` (via OpenSessionLive below).
 #[cfg(feature = "rail-shim")]
 mod rail_shim;
 
@@ -54,7 +55,35 @@ enum Request {
     Render {
         request: Box<DecryptSessionRequestV1>,
     },
+    // Live decrypt rail (feature `rail-live`, DDRM_DECRYPT_RAIL.md Option A): the
+    // VM-sealed material rides a capsule-LOCAL variant so the shared
+    // `DecryptSessionRequestV1` contract stays byte-identical. When Anders blesses a
+    // `material`/`sealed_cek` field on the public contract, this folds into the
+    // normal `OpenSession` and this variant is removed.
+    #[cfg(feature = "rail-live")]
+    OpenSessionLive {
+        request: Box<DecryptSessionRequestV1>,
+        material: RailMaterial,
+    },
     Shutdown,
+}
+
+/// The VM-sealed decrypt material delivered on the live rail (Option A). Carries
+/// only sealed/public bytes — never a raw CEK. The VM's session secret is held
+/// in-VM (provisioned, never on the wire), mirroring PC2's `unwrap_envelope`.
+#[cfg(feature = "rail-live")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RailMaterial {
+    /// "pq_hybrid" (shipped target) or "classical_p256" (PC2-migration parity).
+    profile: String,
+    /// CEK sealed to the VM session key (PqSealedEnvelope wire form / classical blob), base64.
+    sealed_cek_b64: String,
+    /// The ciphertext fMP4 segment to decrypt, base64.
+    ciphertext_b64: String,
+    /// Optional init segment (e.g. `tenc` IV defaults), base64.
+    #[serde(default)]
+    init_segment_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,8 +116,16 @@ impl Response {
     }
 }
 
-#[derive(Debug, Default)]
-struct DecryptProvider;
+#[derive(Default)]
+struct DecryptProvider {
+    // Live-rail state (feature `rail-live`). The session secret is VM-minted/
+    // provisioned and never leaves the boundary; `authority_vk` is the trusted
+    // key-authority ML-DSA-65 verifying key the seal signature is checked against.
+    #[cfg(feature = "rail-live")]
+    session: Option<rail_shim::SessionSecret>,
+    #[cfg(feature = "rail-live")]
+    authority_vk: Option<Vec<u8>>,
+}
 
 impl DecryptProvider {
     fn handle(&mut self, request: Request) -> Response {
@@ -97,6 +134,10 @@ impl DecryptProvider {
             Request::Status => self.status(),
             Request::OpenSession { request } => self.open_session(*request),
             Request::Render { request } => self.render(*request),
+            #[cfg(feature = "rail-live")]
+            Request::OpenSessionLive { request, material } => {
+                self.open_session_live(*request, &material)
+            }
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -151,6 +192,84 @@ impl DecryptProvider {
             "not_configured",
             "rendering requires a configured key release and decrypt/render backend",
         )
+    }
+
+    /// Live decrypt rail (feature `rail-live`, DDRM_DECRYPT_RAIL.md Option A): the
+    /// single in-boundary operation the recommended rail performs. Recovers the CEK
+    /// from the VM-sealed carrier via the proven `rail_shim::decrypt_from_carrier`,
+    /// decrypts the segment, and returns the SCOPED response — which carries session/
+    /// output metadata only. The recovered CEK lives in `Zeroizing` inside the engine
+    /// and the plaintext is dropped here; neither ever reaches the caller-facing
+    /// `Response`. Fails closed (coarse `decrypt_failed`) on any unprovisioned state,
+    /// profile/secret mismatch, malformed carrier, wrong session, or bad signature.
+    #[cfg(feature = "rail-live")]
+    fn open_session_live(&self, request: DecryptSessionRequestV1, material: &RailMaterial) -> Response {
+        use base64::Engine as _;
+
+        if let Err(err) = validate_decrypt_session_request(&request) {
+            return Response::error("invalid_request", err);
+        }
+
+        // Trust + key state must be provisioned (the VM minted its session; the
+        // operator configured the trusted key-authority verifying key).
+        let session = match self.session.as_ref() {
+            Some(s) => s,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "decrypt session key is not provisioned in this boundary",
+                )
+            }
+        };
+        let authority_vk = match self.authority_vk.as_ref() {
+            Some(vk) => vk,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "trusted key-authority verifying key is not configured",
+                )
+            }
+        };
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let profile = match material.profile.as_str() {
+            "pq_hybrid" => rail_shim::SealProfile::PqHybrid,
+            "classical_p256" => rail_shim::SealProfile::ClassicalP256,
+            other => return Response::error("invalid_request", format!("unsupported seal profile: {other}")),
+        };
+        let sealed_cek = match b64.decode(&material.sealed_cek_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "sealed_cek_b64 is not valid base64"),
+        };
+        let ciphertext_segment = match b64.decode(&material.ciphertext_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "ciphertext_b64 is not valid base64"),
+        };
+        let init_segment = match material.init_segment_b64.as_deref().map(|s| b64.decode(s)) {
+            None => None,
+            Some(Ok(bytes)) => Some(bytes),
+            Some(Err(_)) => return Response::error("invalid_request", "init_segment_b64 is not valid base64"),
+        };
+
+        let verifier = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
+            Some(v) => v,
+            None => return Response::error("not_configured", "configured key-authority verifying key is malformed"),
+        };
+
+        let carrier = rail_shim::SealedDecryptCarrier {
+            profile,
+            sealed_cek,
+            ciphertext_segment,
+            init_segment,
+        };
+
+        // The CEK materializes only inside this call (Zeroizing) and is zeroized by
+        // the cenc engine; `_plaintext` is dropped here and never surfaced.
+        match rail_shim::decrypt_from_carrier(session, &carrier, &verifier) {
+            Ok((_plaintext, meta)) => scoped_session_response(&request, &meta),
+            // Coarse, uniform failure — never reveal which step failed (no oracle).
+            Err(_) => Response::error("decrypt_failed", "decrypt session could not be opened"),
+        }
     }
 }
 
@@ -323,7 +442,7 @@ fn main() {
         PROVIDER_VERSION
     );
 
-    let mut provider = DecryptProvider;
+    let mut provider = DecryptProvider::default();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -407,7 +526,7 @@ mod tests {
 
     #[test]
     fn status_advertises_blocked_raw_authority() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         let data = ok_data(provider.status());
 
         assert_eq!(data["provider"], "decrypt");
@@ -424,7 +543,7 @@ mod tests {
 
     #[test]
     fn open_session_fails_closed_until_backend_exists() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         assert_eq!(
             error_code(provider.open_session(decrypt_request())),
             "not_configured"
@@ -433,7 +552,7 @@ mod tests {
 
     #[test]
     fn render_fails_closed_until_backend_exists() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         assert_eq!(
             error_code(provider.render(decrypt_request())),
             "not_configured"
@@ -442,7 +561,7 @@ mod tests {
 
     #[test]
     fn open_session_rejects_unsupported_output_kind() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         let mut request = decrypt_request();
         request.output_kind = "raw_plaintext".to_string();
 
@@ -454,7 +573,7 @@ mod tests {
 
     #[test]
     fn open_session_rejects_path_like_object_ids() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         let mut request = decrypt_request();
         request.object_cid = "../secret".to_string();
 
@@ -466,7 +585,7 @@ mod tests {
 
     #[test]
     fn open_session_rejects_dot_segment_object_ids() {
-        let provider = DecryptProvider;
+        let provider = DecryptProvider::default();
         let mut request = decrypt_request();
         request.object_cid = "..".to_string();
 
@@ -912,5 +1031,97 @@ mod tests {
         // A wrong session key cannot unwrap the envelope -> the whole step fails
         // closed before any segment decryption is attempted.
         assert!(decrypt_sealed_segment(&wrong_sk, &sealed, &segment, None).is_err());
+    }
+
+    // --- live decrypt rail through the provider dispatch (feature `rail-live`) ----
+    //
+    // The recommended rail (Option A) wired into OpenSessionLive: a real ML-DSA-65-
+    // signed PQ-hybrid carrier is opened through the ACTUAL provider entrypoint, the
+    // CEK is recovered + the segment decrypted in-boundary, and the scoped response
+    // proves containment (neither CEK nor plaintext crosses to the caller).
+
+    #[cfg(feature = "rail-live")]
+    fn pq_rail_material(seed: [u8; 32], cek: &[u8; 16], plaintext: &[u8]) -> (RailMaterial, Vec<u8>, crate::rail_shim::SessionSecret, Vec<u8>) {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal};
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (secret, public) = gen_session();
+        let (signer, authority_vk) = mldsa_seal_keypair(seed);
+        let segment = build_encrypted_segment(plaintext, cek, &[0x77u8; 8]);
+        let sealed = seal(&public, cek, &signer).to_bytes();
+        let material = RailMaterial {
+            profile: "pq_hybrid".to_string(),
+            sealed_cek_b64: b64.encode(&sealed),
+            ciphertext_b64: b64.encode(&segment),
+            init_segment_b64: None,
+        };
+        (material, sealed, crate::rail_shim::SessionSecret::PqHybrid(secret), authority_vk)
+    }
+
+    #[cfg(feature = "rail-live")]
+    #[test]
+    fn open_session_live_decrypts_pq_carrier_through_dispatch_without_leaking() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cek = [0x5Au8; 16];
+        let plaintext = b"rail-live: protected payload through the provider";
+        let (material, _sealed, session, authority_vk) = pq_rail_material([0x33u8; 32], &cek, plaintext);
+
+        // Provision the boundary (VM-minted session + trusted authority vk), then
+        // drive the REAL dispatch through `handle`.
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+        };
+        let resp = provider.handle(Request::OpenSessionLive {
+            request: Box::new(decrypt_request()),
+            material,
+        });
+
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(serialized.contains("\"status\":\"ok\""), "live rail must open the session: {serialized}");
+        assert!(serialized.contains("session:test"), "scoped response carries the session id");
+        // Containment through the full provider path: neither plaintext nor CEK leak.
+        assert!(
+            !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
+            "decrypted plaintext must never cross the provider boundary to the caller"
+        );
+        assert!(!serialized.contains(&b64.encode(cek)), "raw CEK must never cross the boundary");
+    }
+
+    #[cfg(feature = "rail-live")]
+    #[test]
+    fn open_session_live_fails_closed_on_tampered_carrier() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cek = [0x5Au8; 16];
+        let (mut material, mut sealed, session, authority_vk) =
+            pq_rail_material([0x44u8; 32], &cek, b"payload");
+        sealed[0] ^= 0xFF; // tamper the sealed carrier
+        material.sealed_cek_b64 = b64.encode(&sealed);
+
+        let provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+        };
+        let resp = provider.open_session_live(decrypt_request(), &material);
+        assert_eq!(error_code(resp), "decrypt_failed", "a tampered carrier must fail closed");
+    }
+
+    #[cfg(feature = "rail-live")]
+    #[test]
+    fn open_session_live_fails_closed_when_unprovisioned() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let material = RailMaterial {
+            profile: "pq_hybrid".to_string(),
+            sealed_cek_b64: b64.encode([0u8; 64]),
+            ciphertext_b64: b64.encode([0u8; 32]),
+            init_segment_b64: None,
+        };
+        // No session / vk provisioned -> fail closed (default boundary state).
+        let provider = DecryptProvider::default();
+        let resp = provider.open_session_live(decrypt_request(), &material);
+        assert_eq!(error_code(resp), "not_configured");
     }
 }
