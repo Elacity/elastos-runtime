@@ -18,6 +18,73 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 };
 const SUPPORTED_SCHEMES: &[&str] = &["elastos-pq-hybrid-threshold-v0"];
 
+/// Decrypt-material suite tags the hosted backends emit. These match the
+/// `SealedDecryptMaterialV1.suite` values the decrypt boundary already routes on
+/// (`capsules/decrypt-provider`): the PQ-hybrid product target vs the PC2/Lit
+/// classical-compat migration path.
+const SUITE_PQ_HYBRID: &str = "elastos-pq-hybrid-threshold-v0";
+const SUITE_CLASSICAL_COMPAT: &str = "p256-classical-compat";
+
+/// A key-delivery backend hosted *inside* the key-provider authority boundary.
+///
+/// `key-provider` is the authority boundary, not a single key system. Anders'
+/// model (confirmed): interchangeable backends sit inside it and all produce the
+/// same suite-tagged `SealedDecryptMaterialV1` handoff that the decrypt sandbox
+/// consumes. This mirrors the PC2 Lit authority role (`src/api/chipotle-client.ts`
+/// `recoverCEKEnvelope`/`envelopeCEK`, `data/lit-actions/universal-decrypt-chipotle.js`):
+/// validate access, recover the CEK in a trusted boundary, and re-seal it to the
+/// viewer's session — never returning a raw CEK.
+///
+/// Selection is operator/runtime config at `init`, never an app input, so the
+/// shared `KeyReleaseRequestV1` contract stays byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAuthorityBackend {
+    /// In-runtime native dev/reference authority (PQ-hybrid). Lets the whole dDRM
+    /// loop be tested with no external dependency. Seal engine = Phase A.2.
+    Reference,
+    /// Production ElastOS PQ-hybrid threshold dKMS (external authority node).
+    Dkms,
+    /// PC2 / Lit-Chipotle compatibility backend (migration only, classical suite).
+    Lit,
+}
+
+impl KeyAuthorityBackend {
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "reference" => Some(Self::Reference),
+            "dkms" => Some(Self::Dkms),
+            "lit" => Some(Self::Lit),
+            _ => None,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Dkms => "dkms",
+            Self::Lit => "lit",
+        }
+    }
+
+    /// The `SealedDecryptMaterialV1.suite` this backend emits.
+    fn suite(self) -> &'static str {
+        match self {
+            Self::Reference | Self::Dkms => SUITE_PQ_HYBRID,
+            Self::Lit => SUITE_CLASSICAL_COMPAT,
+        }
+    }
+
+    /// Coarse provenance, surfaced in `status` so operators can see which backends
+    /// are native vs compat without reading the source.
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Reference => "native-dev",
+            Self::Dkms => "native-production",
+            Self::Lit => "compat-migration",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -63,7 +130,11 @@ impl Response {
 }
 
 #[derive(Debug, Default)]
-struct KeyProvider;
+struct KeyProvider {
+    /// Active key-delivery backend, selected by operator/runtime config at `init`.
+    /// `None` = no authority configured = `release` fails closed.
+    backend: Option<KeyAuthorityBackend>,
+}
 
 impl KeyProvider {
     fn handle(&mut self, request: Request) -> Response {
@@ -75,11 +146,28 @@ impl KeyProvider {
         }
     }
 
-    fn init(&mut self, _config: Value) -> Response {
+    fn init(&mut self, config: Value) -> Response {
+        match config.get("backend") {
+            None | Some(Value::Null) => self.backend = None,
+            Some(Value::String(tag)) => match KeyAuthorityBackend::from_tag(tag) {
+                Some(backend) => self.backend = Some(backend),
+                None => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("unknown key authority backend: {tag}"),
+                    );
+                }
+            },
+            Some(_) => {
+                return Response::error("invalid_request", "backend must be a string");
+            }
+        }
+
         Response::ok(json!({
             "provider": "key",
             "protocol_version": "1.0",
             "configured": false,
+            "active_backend": self.backend.map(KeyAuthorityBackend::tag),
             "supported_operations": ["status", "release"],
         }))
     }
@@ -89,8 +177,10 @@ impl KeyProvider {
             "provider": "key",
             "version": PROVIDER_VERSION,
             "configured": false,
+            "active_backend": self.backend.map(KeyAuthorityBackend::tag),
             "supported_operations": ["status", "release"],
             "supported_schemes": SUPPORTED_SCHEMES,
+            "supported_backends": supported_backends_descriptor(),
             "blocked_authority": [
                 "raw_cek",
                 "kms_node_credentials",
@@ -106,14 +196,75 @@ impl KeyProvider {
     }
 
     fn release(&self, request: KeyReleaseRequestV1) -> Response {
+        // Validation (schema, rights-receipt binding, scheme, PQ-hybrid algorithms)
+        // always runs *before* any backend is consulted: a malformed or
+        // unauthorized request must never reach a key-delivery backend.
         if let Err(err) = validate_key_release_request(&request) {
             return Response::error("invalid_request", err);
         }
-        Response::error(
-            "not_configured",
-            "key release requires a configured ElastOS PQ-hybrid dKMS backend",
-        )
+
+        match self.backend {
+            None => Response::error(
+                "not_configured",
+                "key release requires a configured key authority backend (reference | dkms | lit)",
+            ),
+            Some(backend) => self.release_via_backend(backend, &request),
+        }
     }
+
+    /// Route an already-validated, authorized request to the selected backend.
+    ///
+    /// Phase A.1 lands the routing + fail-closed surface only: every backend
+    /// reports the precise capability it still needs before it can seal a CEK.
+    /// The in-runtime `reference` seal engine (CEK sealed to the decrypt session's
+    /// published key as a `SealedDecryptMaterialV1`) lands in Phase A.2; no backend
+    /// returns a raw CEK at any point.
+    fn release_via_backend(
+        &self,
+        backend: KeyAuthorityBackend,
+        _request: &KeyReleaseRequestV1,
+    ) -> Response {
+        match backend {
+            KeyAuthorityBackend::Reference => Response::error(
+                "not_configured",
+                "reference key authority is selected; the in-runtime seal engine lands in Phase A.2",
+            ),
+            KeyAuthorityBackend::Dkms => Response::error(
+                "not_configured",
+                "ElastOS PQ-hybrid dKMS backend is selected but no dKMS node is provisioned",
+            ),
+            KeyAuthorityBackend::Lit => Response::error(
+                "not_configured",
+                "Lit/Chipotle compat backend is selected but no Lit proxy is provisioned",
+            ),
+        }
+    }
+}
+
+/// Describe the hosted backends for `status`, so operators (and the runtime) can
+/// see which key authorities are available, the decrypt-material suite each emits,
+/// and what each still needs — without reading the source.
+fn supported_backends_descriptor() -> Value {
+    json!([
+        {
+            "backend": KeyAuthorityBackend::Reference.tag(),
+            "suite": KeyAuthorityBackend::Reference.suite(),
+            "kind": KeyAuthorityBackend::Reference.kind(),
+            "state": "pending_seal_engine",
+        },
+        {
+            "backend": KeyAuthorityBackend::Dkms.tag(),
+            "suite": KeyAuthorityBackend::Dkms.suite(),
+            "kind": KeyAuthorityBackend::Dkms.kind(),
+            "state": "not_configured",
+        },
+        {
+            "backend": KeyAuthorityBackend::Lit.tag(),
+            "suite": KeyAuthorityBackend::Lit.suite(),
+            "kind": KeyAuthorityBackend::Lit.kind(),
+            "state": "not_configured",
+        }
+    ])
 }
 
 fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), String> {
@@ -218,7 +369,7 @@ fn main() {
         PROVIDER_VERSION
     );
 
-    let mut provider = KeyProvider;
+    let mut provider = KeyProvider::default();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -321,9 +472,22 @@ mod tests {
         }
     }
 
+    fn error_message(response: Response) -> String {
+        match response {
+            Response::Error { message, .. } => message,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    fn configured(backend: KeyAuthorityBackend) -> KeyProvider {
+        KeyProvider {
+            backend: Some(backend),
+        }
+    }
+
     #[test]
     fn status_advertises_blocked_raw_authority() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let data = ok_data(provider.status());
 
         assert_eq!(data["provider"], "key");
@@ -336,7 +500,7 @@ mod tests {
 
     #[test]
     fn release_fails_closed_until_backend_exists() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         assert_eq!(
             error_code(provider.release(key_release_request())),
             "not_configured"
@@ -345,7 +509,7 @@ mod tests {
 
     #[test]
     fn release_rejects_unsupported_scheme() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.key_envelope.scheme = "frost-only".to_string();
 
@@ -354,7 +518,7 @@ mod tests {
 
     #[test]
     fn release_rejects_weak_cipher() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.key_envelope.algorithms.cipher = "aes-128-gcm".to_string();
 
@@ -363,7 +527,7 @@ mod tests {
 
     #[test]
     fn release_rejects_missing_pq_hybrid_kem() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.key_envelope.algorithms.kem = vec!["x25519".to_string()];
 
@@ -372,7 +536,7 @@ mod tests {
 
     #[test]
     fn release_rejects_denied_rights_receipt() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.rights_receipt.allowed = false;
 
@@ -381,7 +545,7 @@ mod tests {
 
     #[test]
     fn release_rejects_rights_receipt_bound_to_other_principal() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.rights_receipt.principal_id = "person:local:attacker".to_string();
 
@@ -390,7 +554,7 @@ mod tests {
 
     #[test]
     fn release_rejects_rights_receipt_for_other_object() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.rights_receipt.content_id = "bafybeigsomethingelse".to_string();
 
@@ -399,11 +563,125 @@ mod tests {
 
     #[test]
     fn release_rejects_rights_receipt_for_other_action() {
-        let provider = KeyProvider;
+        let provider = KeyProvider::default();
         let mut request = key_release_request();
         request.action = "download".to_string();
         // receipt still authorizes only "view"
 
         assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    // --- pluggable key authority backends (Phase A.1) -----------------------
+
+    #[test]
+    fn status_advertises_the_hosted_backends_with_suites() {
+        let provider = KeyProvider::default();
+        let data = ok_data(provider.status());
+
+        // No backend configured by default; the surface is honest about it.
+        assert!(data["active_backend"].is_null());
+
+        let backends = data["supported_backends"].as_array().unwrap();
+        let tags: Vec<&str> = backends
+            .iter()
+            .map(|b| b["backend"].as_str().unwrap())
+            .collect();
+        assert_eq!(tags, vec!["reference", "dkms", "lit"]);
+
+        // Native backends emit the PQ-hybrid product suite; Lit is classical-compat.
+        let by_tag = |tag: &str| {
+            backends
+                .iter()
+                .find(|b| b["backend"] == tag)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_tag("reference")["suite"], SUITE_PQ_HYBRID);
+        assert_eq!(by_tag("dkms")["suite"], SUITE_PQ_HYBRID);
+        assert_eq!(by_tag("lit")["suite"], SUITE_CLASSICAL_COMPAT);
+        assert_eq!(by_tag("lit")["kind"], "compat-migration");
+    }
+
+    #[test]
+    fn init_selects_a_known_backend() {
+        let mut provider = KeyProvider::default();
+        let data = ok_data(provider.init(json!({ "backend": "reference" })));
+        assert_eq!(data["active_backend"], "reference");
+        assert_eq!(provider.backend, Some(KeyAuthorityBackend::Reference));
+
+        // status reflects the active backend after init.
+        let status = ok_data(provider.status());
+        assert_eq!(status["active_backend"], "reference");
+    }
+
+    #[test]
+    fn init_without_backend_leaves_authority_unconfigured() {
+        let mut provider = KeyProvider::default();
+        let data = ok_data(provider.init(json!({})));
+        assert!(data["active_backend"].is_null());
+        assert_eq!(provider.backend, None);
+    }
+
+    #[test]
+    fn init_rejects_unknown_backend() {
+        let mut provider = KeyProvider::default();
+        assert_eq!(
+            error_code(provider.init(json!({ "backend": "frost-cloud" }))),
+            "invalid_request"
+        );
+        // A bad config must not silently configure an authority.
+        assert_eq!(provider.backend, None);
+    }
+
+    #[test]
+    fn init_rejects_non_string_backend() {
+        let mut provider = KeyProvider::default();
+        assert_eq!(
+            error_code(provider.init(json!({ "backend": 7 }))),
+            "invalid_request"
+        );
+        assert_eq!(provider.backend, None);
+    }
+
+    #[test]
+    fn release_routes_to_reference_backend_fail_closed_until_seal_engine() {
+        let response = configured(KeyAuthorityBackend::Reference).release(key_release_request());
+        assert_eq!(error_code_ref(&response), "not_configured");
+        assert!(error_message(response).contains("reference"));
+    }
+
+    #[test]
+    fn release_routes_to_dkms_backend_fail_closed_until_node() {
+        let response = configured(KeyAuthorityBackend::Dkms).release(key_release_request());
+        assert_eq!(error_code_ref(&response), "not_configured");
+        assert!(error_message(response).contains("dKMS"));
+    }
+
+    #[test]
+    fn release_routes_to_lit_backend_fail_closed_until_proxy() {
+        let response = configured(KeyAuthorityBackend::Lit).release(key_release_request());
+        assert_eq!(error_code_ref(&response), "not_configured");
+        assert!(error_message(response).contains("Lit"));
+    }
+
+    #[test]
+    fn validation_precedes_backend_routing() {
+        // Even with a backend selected, an unauthorized request must be rejected
+        // as invalid *before* any backend is consulted — never reaching the
+        // key-delivery path with a denied receipt.
+        let mut request = key_release_request();
+        request.rights_receipt.allowed = false;
+
+        assert_eq!(
+            error_code(configured(KeyAuthorityBackend::Reference).release(request)),
+            "invalid_request"
+        );
+    }
+
+    fn error_code_ref(response: &Response) -> &str {
+        match response {
+            Response::Error { code, .. } => code,
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 }

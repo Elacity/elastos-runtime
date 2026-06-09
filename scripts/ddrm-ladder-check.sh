@@ -38,7 +38,7 @@ LADDER=(
   "encrypt-provider (default)|encrypt-provider||13"
   "drm-provider (default)|drm-provider||12"
   "rights-provider (default)|rights-provider||9"
-  "key-provider (default)|key-provider||9"
+  "key-provider (default)|key-provider||18"
   "decrypt-provider (default)|decrypt-provider||25"
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"

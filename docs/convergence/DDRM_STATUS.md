@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~53 commits**, tip Day-49 consolidated envelope). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~55 commits**, tip Day-50 pluggable key authority). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,22 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🔌 Day 50 — `key-provider` is a pluggable multi-backend authority (Phase A.1, LANDED).**
+> Confirmed Anders' model in code: `key-provider` is the *authority boundary*, hosting
+> interchangeable **key-delivery backends** — `reference` (native dev, PQ-hybrid suite),
+> `dkms` (native production, PQ-hybrid), `lit` (PC2/Chipotle compat, classical suite) —
+> all destined to emit the same suite-tagged `SealedDecryptMaterialV1` the decrypt
+> sandbox already consumes. Backend selection is **operator/runtime config at `init`**
+> (never an app input), so the shared `KeyReleaseRequestV1` stays byte-identical.
+> `status` now advertises `supported_backends` (suite/kind/state) + `active_backend`;
+> `release` runs **all existing validation first**, then routes to the active backend,
+> each returning a precise backend-specific `not_configured` (the in-runtime `reference`
+> seal engine is Phase A.2). Default (no backend) stays fail-closed. Pinned by 18
+> characterization tests (was 9): routing, unknown/non-string backend rejection, and
+> the property that **validation precedes backend routing** (a denied receipt never
+> reaches a backend). Mirrors the PC2 Lit authority role (`chipotle-client.ts`
+> `recoverCEKEnvelope`/`envelopeCEK`, `universal-decrypt-chipotle.js`).
 
 > **🗺️ WHOLE-SYSTEM MAP (Day 49).** For the full PC2 journey (creator → publish →
 > market → purchase → download → validate → key → decrypt → playback) mapped against

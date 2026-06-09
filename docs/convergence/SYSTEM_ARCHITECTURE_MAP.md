@@ -69,6 +69,51 @@ PQ-hybrid dKMS, or a Lit-compat backend), and a **viewer**.
 
 ---
 
+## 2.1 Where to verify against PC2 (check-against index)
+
+Every runtime stage must be validated against the **real** PC2 behaviour, not a guess.
+PC2 repo root: `/Users/sash/Documents/Cursor/pc2.net/pc2-node`. When building a stage,
+read the corresponding PC2 path(s) first and mirror the *pattern* (not the
+web/Lit-specific plumbing — see §5).
+
+| Stage | Runtime path | PC2 check-against path(s) |
+|---|---|---|
+| Creator upload | `capsules/library`, `elastos-server/src/content.rs` | `data/test-apps/elacity-creator/app.js`, `src/api/media.ts` |
+| Process / encrypt (CENC) | `capsules/encrypt-provider` | `src/services/media/dashPackager.ts` (`generateCEK`), `crates/cenc-encrypt/`, `src/api/storage.ts` (`/lit/encrypt`) |
+| Publish on-chain | `capsules/chain-provider`, (future `publish-provider`) | `data/test-apps/elacity-creator/app.js` (`mint`, `encodeOpRawData`), `src/api/drafts.ts` |
+| IPFS pin/serve | `capsules/ipfs-provider`, `elastos-server/src/content.rs` | `src/storage/ipfs.ts`, `src/services/clusterPin.ts`, `src/services/ContentSeedingService.ts` |
+| Market discovery | `capsules/marketplace`, (future `content-market`) | `src/services/ContentIndexerService.ts`, `src/api/index.ts` (catalog), `data/test-apps/elacity-market/` |
+| Purchase access token | `capsules/wallet-provider`, `capsules/chain-provider` | `data/test-apps/elacity-market/wallet.js` (`buyAccess`), `app.js` (`handleBuy`) |
+| Validate ownership | `capsules/rights-provider` → `chain-provider::has_access_by_content_id` | `data/lit-actions/universal-decrypt-chipotle.js` (`hasAccessByContentId`), `src/services/ContentIndexerService.ts` |
+| **Key release** | `capsules/key-provider` | `src/api/chipotle-client.ts` (`recoverCEKEnvelope`, `envelopeCEK`), `data/lit-actions/universal-decrypt-chipotle.js` |
+| Decrypt | `capsules/decrypt-provider` | `crates/ddrm-decrypt/src/{lib,envelope}.rs`, `crates/cenc-encrypt/src/cenc.rs` |
+| Playback / viewer | (future `viewer`) | `wasm-renderer/src/lib.rs`, `data/test-apps/ddrm-viewer/viewer.js`, `data/test-apps/pc2-media-runtime/player.js` |
+
+**Binding to mirror everywhere:** PC2 binds `SHA256(cek ‖ kid ‖ authority)` at encrypt
+and decrypt (`universal-decrypt-chipotle.js` step 8 + `dashPackager.ts`). Our
+`DecryptTranscriptV1` binds a *superset* (principal/session/object/receipt/pubkey/
+suite/nonce) via AEAD AAD + ML-DSA-65 — so any runtime key authority must produce
+material bound to at least that transcript.
+
+## 2.2 The key authority is pluggable (confirmed — Anders)
+
+`key-provider` is the **authority boundary**, not a single key system. Inside it sit
+interchangeable **key-delivery backends**, all producing the *same* suite-tagged
+`SealedDecryptMaterialV1` the decrypt sandbox already consumes:
+
+| Backend | Suite tag | Role |
+|---|---|---|
+| **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps |
+| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team) |
+| **Lit / Chipotle** (compat) | `p256-classical-compat` | Migration backend for existing PC2 content; **not** the product root |
+| Third parties (future) | (declared per backend) | Same `release → SealedDecryptMaterialV1` contract |
+
+The selected backend is **operator/runtime config** (set at `init`), never an app
+input — the shared `KeyReleaseRequestV1` stays byte-identical. Default = no backend
+configured = `release` fails closed. This is the structural model Day 50 lands.
+
+---
+
 ## 3. Architecture map — current state
 
 ```mermaid
