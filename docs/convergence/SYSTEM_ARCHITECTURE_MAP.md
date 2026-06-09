@@ -275,9 +275,17 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   **CEK-escrow seam** (CEK → key authority, SEALED) is in place and **fail-closed** by
   default (`escrow: not_configured`); the producer never ships a raw CEK. In-boundary
   keygen + CENC are already proven (Days 19/31).
-- **Remaining:** the escrow ENGINE (Day 59 — authority publishes a recipient key, producer
-  seals the CEK via `ddrm-envelope`), a producer→consumer smoke on a FRESH CEK, then
-  `publish-provider` (mint KID + tokenURI) and the `content-market` index.
+- **Status (Day 59 — escrow ENGINE real):** the reference `key-provider` now publishes a
+  PQ-hybrid KEM **recipient key** (`seal_recipient_pub_b64`, distinct from its ML-DSA vk)
+  and recovers a CEK escrowed to it (`recover_escrowed_cek`, fail-closed on KID-swap /
+  forged producer). `encrypt-provider` (feature `escrow`) seals a freshly-minted CEK to
+  that recipient via `ddrm-envelope` under the SHARED `escrow_aad`. The FULL spine is
+  proven on a fresh CEK (no golden): producer mint → escrow → authority recover →
+  re-seal to a decrypt session → decrypt opens the SAME CEK, no raw CEK across any
+  boundary.
+- **Remaining:** the *cross-binary* `ddrm-producer-smoke.sh` (Day 60 — new wire ops:
+  encrypt emits the escrow blob, key-provider recovers + re-seals), then `publish-provider`
+  (mint contentId=KID + tokenURI) and the `content-market` index.
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

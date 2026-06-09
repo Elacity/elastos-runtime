@@ -164,6 +164,38 @@ impl Response {
 struct ReferenceAuthority {
     signer: ddrm_envelope::seal::MlDsaSealSigner,
     verifying_key: Vec<u8>,
+    /// The authority's PQ-hybrid KEM **recipient** keypair. The producer
+    /// (`encrypt-provider`) escrows a freshly-minted CEK by sealing it to the
+    /// published `recipient_public` (Phase C); the authority holds the secret and
+    /// recovers the CEK to re-seal it per decrypt session. Distinct from the ML-DSA
+    /// `signer` (which signs seals) — this is the encryption recipient.
+    recipient_secret: ddrm_envelope::SessionKemSecret,
+    recipient_public: Vec<u8>,
+}
+
+#[cfg(feature = "key-authority-ref")]
+impl ReferenceAuthority {
+    /// Recover a CEK the producer escrowed to THIS authority's recipient key. The
+    /// producer sealed it under `escrow_aad(scheme, kid16, recipient_public)` and
+    /// signed with its ML-DSA key; we recompute the IDENTICAL AAD (shared encoder)
+    /// and verify the producer's published verifying key, then hybrid-unwrap with our
+    /// recipient secret. Fails closed on any mismatch — wrong producer, wrong KID,
+    /// wrong scheme, or a re-targeted envelope. The CEK stays in `Zeroizing`.
+    fn recover_escrowed_cek(
+        &self,
+        wrapped_cek: &[u8],
+        scheme: &str,
+        kid_bytes16: &[u8; 16],
+        producer_vk: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(wrapped_cek)
+            .map_err(|e| format!("malformed escrow envelope: {e:?}"))?;
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(producer_vk)
+            .ok_or_else(|| "malformed producer verifying key".to_string())?;
+        let aad = ddrm_envelope::transcript::escrow_aad(scheme, kid_bytes16, &self.recipient_public);
+        ddrm_envelope::hybrid_unwrap_bound(&self.recipient_secret, &env, &aad, &verifier)
+            .map_err(|e| format!("escrow recover failed: {e:?}"))
+    }
 }
 
 #[derive(Default)]
@@ -231,9 +263,12 @@ impl KeyProvider {
                 Some(KeyAuthorityBackend::Reference) => {
                     let (signer, verifying_key) =
                         ddrm_envelope::seal::mldsa_seal_keypair(ref_seal_seed(&config));
+                    let (recipient_secret, recipient_public) = ddrm_envelope::mint_session();
                     Some(ReferenceAuthority {
                         signer,
                         verifying_key,
+                        recipient_public: ddrm_envelope::session_public_bytes(&recipient_public),
+                        recipient_secret,
                     })
                 }
                 _ => None,
@@ -257,6 +292,10 @@ impl KeyProvider {
             use base64::Engine as _;
             data["seal_verifying_key_b64"] = json!(base64::engine::general_purpose::STANDARD
                 .encode(&authority.verifying_key));
+            // The authority also publishes its KEM RECIPIENT key so the producer
+            // (encrypt-provider) can escrow a freshly-minted CEK to it (Phase C).
+            data["seal_recipient_pub_b64"] = json!(base64::engine::general_purpose::STANDARD
+                .encode(&authority.recipient_public));
         }
         Response::ok(data)
     }
@@ -925,6 +964,86 @@ mod tests {
             let mut other = KeyProvider::default();
             let other_data = ok_data(other.init(json!({ "backend": "lit" })));
             assert!(other_data.get("seal_verifying_key_b64").is_none());
+        }
+
+        /// Phase C escrow destination: the authority publishes a KEM RECIPIENT key
+        /// (distinct from its ML-DSA verifying key), and recovers a CEK the producer
+        /// escrowed to it under the SHARED escrow AAD. Wrong KID or a forged producer
+        /// fail closed — proving the producer→authority half of the fresh-CEK path.
+        #[test]
+        fn reference_recovers_a_cek_escrowed_to_its_recipient_key() {
+            let b64 = b64();
+            let mut provider = KeyProvider::default();
+            let data = ok_data(provider.init(json!({ "backend": "reference" })));
+
+            // (1) recipient key published, distinct from the verifying key.
+            let recip_b64 = data["seal_recipient_pub_b64"]
+                .as_str()
+                .expect("recipient pub published");
+            assert_ne!(
+                recip_b64,
+                data["seal_verifying_key_b64"].as_str().unwrap(),
+                "recipient (KEM) key is distinct from the (ML-DSA) verifying key"
+            );
+            let recip_bytes = b64.decode(recip_b64).expect("recipient b64");
+            let recipient_public = ddrm_envelope::session_public_from_bytes(&recip_bytes)
+                .expect("recipient pub parses");
+
+            // (2) a producer mints a CEK + KID and escrows it to that recipient under
+            // the shared escrow AAD, signed by the producer's ML-DSA key.
+            let (producer_signer, producer_vk) =
+                ddrm_envelope::seal::mldsa_seal_keypair([7u8; 32]);
+            let cek: Vec<u8> = (0u8..16).collect();
+            let kid = [0xABu8; 16];
+            let aad = ddrm_envelope::transcript::escrow_aad(
+                ddrm_envelope::SUITE_PQ_HYBRID,
+                &kid,
+                &recip_bytes,
+            );
+            let env =
+                ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &aad, &producer_signer);
+            let wrapped = env.to_bytes();
+
+            // (3) the authority recovers the EXACT CEK.
+            let authority = provider.reference.as_ref().unwrap();
+            let recovered = authority
+                .recover_escrowed_cek(
+                    &wrapped,
+                    ddrm_envelope::SUITE_PQ_HYBRID,
+                    &kid,
+                    &producer_vk,
+                )
+                .expect("authority recovers the escrowed CEK");
+            assert_eq!(&recovered[..], &cek[..], "recovered CEK matches the escrowed CEK");
+
+            // (4) wrong KID fails closed (AAD mismatch at the GCM tag).
+            let mut bad_kid = kid;
+            bad_kid[0] ^= 1;
+            assert!(
+                authority
+                    .recover_escrowed_cek(
+                        &wrapped,
+                        ddrm_envelope::SUITE_PQ_HYBRID,
+                        &bad_kid,
+                        &producer_vk,
+                    )
+                    .is_err(),
+                "a KID-swap must fail closed"
+            );
+
+            // (5) a forged producer (different signer) fails closed at the signature.
+            let (_other_signer, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([9u8; 32]);
+            assert!(
+                authority
+                    .recover_escrowed_cek(
+                        &wrapped,
+                        ddrm_envelope::SUITE_PQ_HYBRID,
+                        &kid,
+                        &other_vk,
+                    )
+                    .is_err(),
+                "a forged producer signature must fail closed"
+            );
         }
 
         #[test]

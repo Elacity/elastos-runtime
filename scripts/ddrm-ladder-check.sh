@@ -36,12 +36,13 @@ rc=0
 # DDRM_STATUS.md / HANDOVER.md) when tests are intentionally added/removed.
 LADDER=(
   "encrypt-provider (default)|encrypt-provider||17"
+  "encrypt-provider escrow|encrypt-provider|escrow|19"
   "drm-provider (default)|drm-provider||12"
   "rights-provider (default)|rights-provider||9"
   "rights-provider chain-rights|rights-provider|chain-rights|18"
-  "ddrm-envelope (lib)|ddrm-envelope||12"
+  "ddrm-envelope (lib)|ddrm-envelope||14"
   "key-provider (default)|key-provider||18"
-  "key-provider key-authority-ref|key-provider|key-authority-ref|25"
+  "key-provider key-authority-ref|key-provider|key-authority-ref|26"
   "decrypt-provider (default)|decrypt-provider||25"
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"
@@ -107,6 +108,7 @@ bold "== dDRM ladder (2/2): wasm32-wasip1 builds =="
 if rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then
   WASM=(
     "encrypt-provider|"
+    "encrypt-provider|escrow"
     "drm-provider|"
     "rights-provider|"
     "rights-provider|chain-rights"

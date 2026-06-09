@@ -118,6 +118,30 @@ pub mod transcript {
         h.finalize().into()
     }
 
+    /// Domain separation + version for the **producer→authority CEK-escrow** AAD. The
+    /// producer (`encrypt-provider`) seals a freshly-minted CEK to the key authority's
+    /// published recipient key with this AAD; the authority recomputes the SAME AAD to
+    /// recover it. Living here (not in either capsule) is the same anti-drift discipline
+    /// as the decrypt transcript — one encoder both sides bind.
+    pub const ESCROW_AAD_LABEL: &[u8] = b"elastos-ddrm/cek-escrow/v1";
+
+    /// Deterministic AAD welding an escrowed CEK to its identity + destination:
+    /// `label ‖ scheme ‖ kid(bytes16) ‖ recipient_pub`. So a CEK escrowed for one
+    /// `{scheme, KID}` to one authority recipient cannot be opened as another — a
+    /// re-target or KID-swap changes the AAD and fails closed at the GCM tag.
+    pub fn escrow_aad(scheme: &str, kid_bytes16: &[u8; 16], recipient_pub: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut put = |bytes: &[u8]| {
+            v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            v.extend_from_slice(bytes);
+        };
+        put(ESCROW_AAD_LABEL);
+        put(scheme.as_bytes());
+        put(kid_bytes16);
+        put(recipient_pub);
+        v
+    }
+
     impl DecryptTranscriptV1<'_> {
         /// Deterministic, unambiguous AAD: a domain label then every field
         /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
@@ -716,6 +740,34 @@ mod tests {
         let mut t = sample_transcript();
         t.expires_at += 1;
         assert_ne!(base, t.to_aad(), "expiry change must change the AAD");
+    }
+
+    /// The escrow AAD both producer and authority bind is deterministic + labelled.
+    #[test]
+    fn escrow_aad_is_deterministic_and_labelled() {
+        let kid = [0x11u8; 16];
+        let recip = [0x22u8; 64];
+        let a = crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip);
+        assert_eq!(a, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip));
+        let label = crate::transcript::ESCROW_AAD_LABEL;
+        assert_eq!(&a[..4], &(label.len() as u32).to_be_bytes());
+        assert_eq!(&a[4..4 + label.len()], label);
+    }
+
+    /// Any escrow field change yields a different AAD — a CEK escrowed for one
+    /// {scheme, KID, recipient} cannot be opened as another (re-target / KID-swap defense).
+    #[test]
+    fn escrow_aad_changes_with_every_field() {
+        let kid = [0x11u8; 16];
+        let recip = [0x22u8; 64];
+        let base = crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip);
+        assert_ne!(base, crate::transcript::escrow_aad("other-suite", &kid, &recip));
+        let mut kid2 = kid;
+        kid2[0] ^= 1;
+        assert_ne!(base, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid2, &recip));
+        let mut recip2 = recip;
+        recip2[0] ^= 1;
+        assert_ne!(base, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip2));
     }
 
     /// The seal/unwrap path is welded to the shared transcript: a CEK sealed to one

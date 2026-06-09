@@ -231,6 +231,31 @@ fn escrow_cek(_cek: &[u8], _kid_hex: &str, escrow: &CekEscrow) -> Result<String,
     }
 }
 
+/// The real CEK-escrow engine (feature `escrow`, Day 59): seal a freshly-minted CEK to
+/// the key authority's published KEM recipient key via the shared `ddrm-envelope` crate,
+/// bound to the shared escrow AAD (`scheme ‖ kid(bytes16) ‖ recipient_pub`) and signed
+/// by the producer. Returns ONLY the wrapped (sealed) CEK as base64 — the raw CEK never
+/// leaves; it is the caller's `Zeroizing` buffer, scrubbed on drop. The authority opens
+/// this with `hybrid_unwrap_bound` (see `key-provider::ReferenceAuthority`). A wrong
+/// recipient / KID / scheme cannot open it (AAD-bound), and only this producer's
+/// signature verifies.
+#[cfg(feature = "escrow")]
+#[allow(dead_code)]
+fn seal_cek_to_authority(
+    cek: &[u8],
+    kid_bytes16: &[u8; 16],
+    recipient_pub: &[u8],
+    signer: &ddrm_envelope::seal::MlDsaSealSigner,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let recipient = ddrm_envelope::session_public_from_bytes(recipient_pub)
+        .ok_or_else(|| "malformed key-authority recipient key".to_string())?;
+    // SUPPORTED_SCHEMES[0] is the PQ-hybrid suite both halves agree on.
+    let aad = ddrm_envelope::transcript::escrow_aad(SUPPORTED_SCHEMES[0], kid_bytes16, recipient_pub);
+    let envelope = ddrm_envelope::seal::seal_bound(&recipient, cek, &aad, signer);
+    Ok(base64::engine::general_purpose::STANDARD.encode(envelope.to_bytes()))
+}
+
 /// Convert the in-boundary KID (32 lowercase-hex chars / 16 bytes) into the on-chain
 /// `bytes16 contentId` the consumer chain keys on.
 ///
@@ -725,6 +750,129 @@ mod tests {
         assert_eq!(kid_bytes.len(), 16);
         for iv in &sealed.ivs {
             assert_eq!(iv.len(), 8, "CENC IVs are 8 bytes, never a 16-byte CEK");
+        }
+    }
+
+    // --- escrow engine (feature `escrow`, Day 59) -----------------------------
+    //
+    // Prove the producer→authority CEK escrow, and the FULL fresh-CEK crypto path
+    // producer → authority recover → re-seal per decrypt session → decrypt open —
+    // no committed golden, all on a CEK minted in THIS run.
+    #[cfg(feature = "escrow")]
+    mod escrow_engine {
+        use super::*;
+
+        /// The producer seals a freshly-minted CEK to the authority's recipient key;
+        /// the authority opens it with the SHARED escrow AAD + the producer's vk and
+        /// recovers the exact CEK. A wrong recipient cannot open it.
+        #[test]
+        fn escrow_seals_to_authority_and_recovers() {
+            let minted = mint_cek_and_kid().expect("mint");
+            let kid16 = kid_to_content_id_bytes16(&minted.kid_hex).expect("kid16");
+
+            // Authority recipient (its published KEM key) + producer signing key.
+            let (auth_secret, auth_public) = ddrm_envelope::mint_session();
+            let recipient_pub = ddrm_envelope::session_public_bytes(&auth_public);
+            let (producer_signer, producer_vk) =
+                ddrm_envelope::seal::mldsa_seal_keypair([5u8; 32]);
+
+            let wrapped_b64 =
+                seal_cek_to_authority(&minted.cek[..], &kid16, &recipient_pub, &producer_signer)
+                    .expect("escrow seal");
+
+            // The sealed blob carries no raw CEK.
+            let cek_b64 = base64::engine::general_purpose::STANDARD.encode(&minted.cek[..]);
+            assert!(!wrapped_b64.contains(&cek_b64), "raw CEK must not appear in the escrow blob");
+
+            // Authority recovers (recompute the identical AAD, verify producer vk).
+            let wrapped = base64::engine::general_purpose::STANDARD
+                .decode(&wrapped_b64)
+                .unwrap();
+            let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&wrapped).unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&producer_vk).unwrap();
+            let aad = ddrm_envelope::transcript::escrow_aad(
+                SUPPORTED_SCHEMES[0],
+                &kid16,
+                &recipient_pub,
+            );
+            let recovered =
+                ddrm_envelope::hybrid_unwrap_bound(&auth_secret, &env, &aad, &verifier).unwrap();
+            assert_eq!(&recovered[..], &minted.cek[..], "authority recovers the exact CEK");
+
+            // A DIFFERENT authority recipient cannot open it (fail closed).
+            let (other_secret, _other_public) = ddrm_envelope::mint_session();
+            assert!(
+                ddrm_envelope::hybrid_unwrap_bound(&other_secret, &env, &aad, &verifier).is_err(),
+                "wrong recipient must fail closed"
+            );
+        }
+
+        /// The whole producer→consumer key path on a FRESH CEK (no golden):
+        ///   producer mints CEK -> escrows to authority -> authority recovers ->
+        ///   authority RE-SEALS to a decrypt session -> decrypt opens the SAME CEK.
+        /// This is the crypto spine of the producer half meeting the (already-built)
+        /// consumer half, end to end, with no raw CEK ever leaving a boundary.
+        #[test]
+        fn fresh_cek_flows_producer_to_decrypt() {
+            // (1) producer mints a CEK + KID in-boundary.
+            let minted = mint_cek_and_kid().expect("mint");
+            let kid16 = kid_to_content_id_bytes16(&minted.kid_hex).expect("kid16");
+            let (producer_signer, producer_vk) =
+                ddrm_envelope::seal::mldsa_seal_keypair([1u8; 32]);
+
+            // (2) producer escrows the CEK to the authority's recipient key.
+            let (auth_secret, auth_public) = ddrm_envelope::mint_session();
+            let recipient_pub = ddrm_envelope::session_public_bytes(&auth_public);
+            let wrapped_b64 =
+                seal_cek_to_authority(&minted.cek[..], &kid16, &recipient_pub, &producer_signer)
+                    .expect("escrow seal");
+
+            // (3) authority recovers the CEK (its boundary, never on the wire raw).
+            let wrapped = base64::engine::general_purpose::STANDARD
+                .decode(&wrapped_b64)
+                .unwrap();
+            let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&wrapped).unwrap();
+            let producer_verifier =
+                ddrm_envelope::MlDsa65Verifier::from_encoded(&producer_vk).unwrap();
+            let escrow_aad = ddrm_envelope::transcript::escrow_aad(
+                SUPPORTED_SCHEMES[0],
+                &kid16,
+                &recipient_pub,
+            );
+            let recovered =
+                ddrm_envelope::hybrid_unwrap_bound(&auth_secret, &env, &escrow_aad, &producer_verifier)
+                    .unwrap();
+
+            // (4) authority RE-SEALS the recovered CEK to a decrypt session's published
+            // key (its own ML-DSA seal key), bound to a decrypt-session AAD.
+            let (auth_signer, auth_vk) = ddrm_envelope::seal::mldsa_seal_keypair([2u8; 32]);
+            let (decrypt_secret, decrypt_public) = ddrm_envelope::mint_session();
+            let session_pub_bytes = ddrm_envelope::session_public_bytes(&decrypt_public);
+            let session_aad = b"decrypt-session-aad:smoke".to_vec();
+            let resealed = ddrm_envelope::seal::seal_bound(
+                &decrypt_public,
+                &recovered[..],
+                &session_aad,
+                &auth_signer,
+            );
+
+            // (5) the decrypt boundary opens it with its session secret + the authority vk.
+            let auth_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&auth_vk).unwrap();
+            let at_decrypt = ddrm_envelope::hybrid_unwrap_bound(
+                &decrypt_secret,
+                &resealed,
+                &session_aad,
+                &auth_verifier,
+            )
+            .unwrap();
+
+            assert_eq!(
+                &at_decrypt[..],
+                &minted.cek[..],
+                "the CEK minted by the producer arrives intact at the decrypt boundary"
+            );
+            // Sanity: the published session key the authority sealed to is the decrypt one.
+            assert!(ddrm_envelope::session_public_from_bytes(&session_pub_bytes).is_some());
         }
     }
 
