@@ -15,17 +15,35 @@
 #
 # This is the first point a human can drive the consumer half and SEE it run.
 #
-# Usage:  scripts/ddrm-consumer-smoke.sh
+# Usage:  scripts/ddrm-consumer-smoke.sh [--backend reference|dkms]
+#   --backend reference  (default) the in-runtime durable-key-store authority
+#   --backend dkms       the EXTERNAL authority: the publish phase provisions an immutable
+#                        descriptor, the open RESOLVES its identity from it (zero code change —
+#                        only OpenConfig.authority.backend differs, proving the open is
+#                        backend-agnostic, like PC2's getSessionView dispatch).
 # Exit:   0 on PASS, 1 on FAIL.
 
 set -uo pipefail
+
+BACKEND="reference"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend) BACKEND="${2:-}"; shift 2 ;;
+    --backend=*) BACKEND="${1#*=}"; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+if [[ "$BACKEND" != "reference" && "$BACKEND" != "dkms" ]]; then
+  echo "FAIL: --backend must be reference|dkms (got '${BACKEND}')" >&2
+  exit 2
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CAPSULES="${REPO_ROOT}/capsules"
 ORCH="${REPO_ROOT}/scripts/dev/ddrm-runtime-open"
 
 echo "=============================================================="
-echo " dDRM consumer-half smoke — building real capsule binaries"
+echo " dDRM consumer-half smoke (authority=${BACKEND}) — building real capsule binaries"
 echo "=============================================================="
 
 build() {
@@ -87,15 +105,17 @@ echo "=============================================================="
 # The smoke no longer assembles the host: it writes a TYPED CONFIG and INVOKES the
 # default-on runtime-core entrypoint `ddrm-runtime-open` (mode=verify, which also drives the
 # adversarial fail-closed gates). The runtime bin owns publish -> DrmHost::launch -> open ->
-# persist. We pass the provider binaries + a per-run work dir through the config file.
+# persist. We pass the provider binaries + a per-run work dir + the selected authority backend
+# through the config file. Switching backends changes ONLY `authority.backend` — same binary,
+# same flow — proving the open is backend-agnostic.
 CHAIN_BIN_JSON=""
 if [[ ${#CHAIN_ARG[@]} -gt 0 ]]; then
   CHAIN_BIN_JSON=",\n  \"chain_bin\": \"${CHAIN_ARG[0]}\""
 fi
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddrm-runtime-open.XXXXXX")"
 CONFIG_JSON="${WORK_DIR}/open-config.json"
-printf '{\n  "mode": "verify",\n  "key_bin": "%s",\n  "decrypt_bin": "%s",\n  "drm_bin": "%s",\n  "rights_bin": "%s",\n  "work_dir": "%s"%b\n}\n' \
-  "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" "${WORK_DIR}/run" "$CHAIN_BIN_JSON" > "$CONFIG_JSON"
+printf '{\n  "mode": "verify",\n  "authority": { "backend": "%s" },\n  "key_bin": "%s",\n  "decrypt_bin": "%s",\n  "drm_bin": "%s",\n  "rights_bin": "%s",\n  "work_dir": "%s"%b\n}\n' \
+  "$BACKEND" "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" "${WORK_DIR}/run" "$CHAIN_BIN_JSON" > "$CONFIG_JSON"
 echo "config: ${CONFIG_JSON}"
 
 cargo run --quiet --manifest-path "${ORCH}/Cargo.toml" -- "$CONFIG_JSON"
@@ -104,8 +124,8 @@ rm -rf "$WORK_DIR"
 
 echo
 if [[ $status -eq 0 ]]; then
-  echo "ddrm-consumer-smoke: PASS"
+  echo "ddrm-consumer-smoke (authority=${BACKEND}): PASS"
   exit 0
 fi
-echo "ddrm-consumer-smoke: FAIL" >&2
+echo "ddrm-consumer-smoke (authority=${BACKEND}): FAIL" >&2
 exit 1

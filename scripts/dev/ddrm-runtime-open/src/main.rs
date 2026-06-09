@@ -1,17 +1,24 @@
 //! `ddrm-runtime-open` — the default-on runtime-core OPEN entrypoint (Phase A wiring).
 //!
 //! This is the runtime bootstrap a non-smoke caller runs: it reads a TYPED JSON CONFIG
-//! (`OpenConfig`: provider binaries, work dir, viewer, content id, `mode`) and constructs the
-//! trusted `ddrm_plan_runner::DrmHost` from `ProviderLauncher`s + a `DurableEventStore` via
-//! `DrmHost::launch`, then drives the open. NO caller assembles the host — the binary owns the
-//! bootstrap (the analogue of PC2 booting `sessionService` ONCE from config,
+//! (`OpenConfig`: provider binaries, work dir, viewer, content id, `mode`, `authority`) and
+//! constructs the trusted `ddrm_plan_runner::DrmHost` from `ProviderLauncher`s + a
+//! `DurableEventStore` via `DrmHost::launch`, then drives the open. NO caller assembles the host —
+//! the binary owns the bootstrap (the analogue of PC2 booting `sessionService` ONCE from config,
 //! `BackendSessionService.ts:495`). The producer's escrow is a publish-time fixture this binary
 //! reads, not inline code. `mode:"open"` is the operator path (publish → launch → open →
 //! persist → durable CEK-free readback); `mode:"verify"` (what `ddrm-consumer-smoke.sh` runs)
-//! ALSO drives the two adversarial fail-closed gates. It drives the REAL capsule binaries over
-//! their newline-delimited JSON stdin/stdout protocol, proving the consumer half runs end to end:
+//! ALSO drives the two adversarial fail-closed gates.
 //!
-//!   drm/open  ->  rights  ->  key (reference authority)  ->  decrypt (OpenSessionV1)
+//! `authority.backend` selects the key authority — `reference` (a durable key store the runtime
+//! generates) or `dkms` (an EXTERNAL authority the publish phase provisions as an immutable
+//! descriptor, which the open then RESOLVES). The OPEN PATH is BACKEND-AGNOSTIC: only the key
+//! provider's `init` config differs — the analogue of PC2's `getSessionView(token)` dispatching on
+//! `stored.backend` (`BackendSessionService.ts:368`–`:377`) while the downstream open is identical.
+//! It drives the REAL capsule binaries over their newline-delimited JSON stdin/stdout protocol,
+//! proving the consumer half runs end to end:
+//!
+//!   drm/open  ->  rights  ->  key (reference | dkms authority)  ->  decrypt (OpenSessionV1)
 //!
 //! with NO Lit, NO dKMS and NO chain. The novel, previously-unproven step is the
 //! cross-process `key -> decrypt` handoff:
@@ -522,7 +529,15 @@ fn publish_escrow(
     key_bin: &str,
     key_store_path: &str,
     fixture_path: &std::path::Path,
+    backend: AuthorityBackend,
+    descriptor_path: &std::path::Path,
 ) -> Result<PublishEscrow, String> {
+    // The producer/provisioner ALWAYS generates the authority's key material via the reference
+    // authority on a durable store (one master seed; STABLE vk + recipient). For `dkms`, this is the
+    // dKMS NODE PROVISIONING step: from that generated material we publish an immutable descriptor
+    // (master + the published-identity pins) the runtime later RESOLVES — the analogue of a dKMS
+    // node's provisioned shares + its published authority pubkey (PC2 caches the provisioned
+    // descriptor once, `chipotle-client.ts:935`, then only reads it).
     let mut key = Capsule::spawn("key-provider(publish)", key_bin)?;
     let init = ok_data(
         &key.call(&json!({
@@ -531,11 +546,38 @@ fn publish_escrow(
         }))?,
         "key init (publish)",
     )?;
+    let verifying_key_b64 = init["seal_verifying_key_b64"]
+        .as_str()
+        .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
+        .to_string();
     let recipient_pub_b64 = init["seal_recipient_pub_b64"]
         .as_str()
         .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
         .to_string();
     key.shutdown();
+
+    // `dkms`: publish the immutable external-authority descriptor from the generated material. The
+    // master seed comes from the store the reference authority just persisted (the provisioner OWNS
+    // the key material), and the pins are EXACTLY what the authority published — so a later `dkms`
+    // launch re-derives the SAME identity and the pin check passes.
+    if backend == AuthorityBackend::Dkms {
+        let store: Value = serde_json::from_slice(
+            &std::fs::read(key_store_path).map_err(|e| format!("read key store for dkms provisioning: {e}"))?,
+        )
+        .map_err(|e| format!("parse key store for dkms provisioning: {e}"))?;
+        let master_seed_b64 = store["authority_seed_b64"]
+            .as_str()
+            .ok_or("key store is missing authority_seed_b64 (cannot provision a dkms descriptor)")?;
+        let descriptor = json!({
+            "schema": "elastos.dkms.authority/v1",
+            "authority_master_seed_b64": master_seed_b64,
+            "verifying_key_b64": verifying_key_b64,
+            "recipient_pub_b64": recipient_pub_b64,
+        });
+        let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| e.to_string())?;
+        std::fs::write(descriptor_path, bytes)
+            .map_err(|e| format!("write dkms authority descriptor: {e}"))?;
+    }
 
     let recipient_pub_bytes = B64.decode(&recipient_pub_b64).map_err(|e| e.to_string())?;
     let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub_bytes)
@@ -855,15 +897,16 @@ impl ProviderLauncher for RightsLauncher {
     }
 }
 
-/// Launches the `key` provider: spawns the reference authority pinned to the durable
-/// `key_store_path` (so its verifying + escrow-recipient keys are STABLE across launches),
-/// drives `init`, and PUBLISHES those keys into the shared rail material. Because the
-/// recipient is stable, the CEK was already escrowed to it at PUBLISH time; this launch only
-/// re-derives the same recipient. The per-open session binding is computed after the rail
-/// is up (the session key is the only per-open part).
+/// Launches the `key` provider with the runtime-selected authority `init_config` (a durable
+/// key-store path for `reference`, or an external descriptor path for `dkms`), drives `init`, and
+/// PUBLISHES the authority's verifying + escrow-recipient keys into the shared rail material.
+/// Whichever backend, those keys are STABLE across launches (reference re-derives from its persisted
+/// master; dkms re-derives from the provisioned descriptor), so the CEK escrowed at PUBLISH time
+/// recovers; this launch only re-resolves the same recipient. The OPEN PATH is backend-agnostic —
+/// only `init_config` differs (PC2's `getSessionView` dispatch, `BackendSessionService.ts:368`).
 struct KeyLauncher {
     key_bin: String,
-    key_store_path: String,
+    init_config: Value,
     cell: Rc<RefCell<Option<Capsule>>>,
     rail: Rc<RefCell<RailMaterial>>,
     material: Rc<RefCell<Option<KeyOpenMaterial>>>,
@@ -876,10 +919,7 @@ impl ProviderLauncher for KeyLauncher {
     fn launch(self: Box<Self>) -> Result<Box<dyn ProviderTransport>, String> {
         let mut key = Capsule::spawn("key-provider", &self.key_bin)?;
         let init = ok_data(
-            &key.call(&json!({
-                "op": "init",
-                "config": { "backend": "reference", "authority_key_store": self.key_store_path }
-            }))?,
+            &key.call(&json!({ "op": "init", "config": self.init_config }))?,
             "key init",
         )?;
         let vk_b64 = init["seal_verifying_key_b64"]
@@ -988,6 +1028,29 @@ enum OpenMode {
     Verify,
 }
 
+/// Which `key-provider` authority backend the open binds to. The OPEN PATH is backend-agnostic:
+/// only the backend's `init` config differs (a durable key-store path vs an external descriptor
+/// path); the publish → launch → open → recover/re-seal flow is byte-identical. Mirrors PC2's
+/// `getSessionView(token)` dispatching on `stored.backend` to construct the per-backend view
+/// (`BackendSessionService.ts:368`–`:377`) while the downstream open is the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthorityBackend {
+    /// In-runtime dev authority: the runtime GENERATES + persists its own master seed (durable key store).
+    Reference,
+    /// External authority: the runtime is HANDED a descriptor (the dKMS-provisioned key material +
+    /// published-identity pins) and RESOLVES its identity from it — never minting.
+    Dkms,
+}
+
+impl AuthorityBackend {
+    fn tag(self) -> &'static str {
+        match self {
+            AuthorityBackend::Reference => "reference",
+            AuthorityBackend::Dkms => "dkms",
+        }
+    }
+}
+
 /// The TYPED runtime-open config — the SINGLE input to this binary, read from a JSON file
 /// (argv[1]) or `DDRM_OPEN_CONFIG`. The runtime bootstrap is config-driven: NO caller assembles
 /// the host. Mirrors PC2 booting `sessionService` ONCE from config (`BackendSessionService.ts:495`),
@@ -1004,6 +1067,8 @@ struct OpenConfig {
     /// Keep the durable artifacts after a successful run (default: clean up).
     keep_work_dir: bool,
     mode: OpenMode,
+    /// Which key authority backend the open binds to (`authority.backend`, default `reference`).
+    authority: AuthorityBackend,
 }
 
 impl OpenConfig {
@@ -1021,6 +1086,18 @@ impl OpenConfig {
             "verify" => OpenMode::Verify,
             other => return Err(format!("config `mode` must be \"open\" or \"verify\", got {other:?}")),
         };
+        // `authority` is an OBJECT (room to carry per-backend descriptors later); today only its
+        // `backend` tag is read. Absent → reference (back-compat). Fail-closed on an unknown tag or
+        // a non-object `authority`.
+        let authority = match obj.get("authority") {
+            None => AuthorityBackend::Reference,
+            Some(Value::Object(auth)) => match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
+                "reference" => AuthorityBackend::Reference,
+                "dkms" => AuthorityBackend::Dkms,
+                other => return Err(format!("config `authority.backend` must be \"reference\" or \"dkms\", got {other:?}")),
+            },
+            Some(_) => return Err("config `authority` must be an object".to_string()),
+        };
         Ok(Self {
             key_bin: req("key_bin")?,
             decrypt_bin: req("decrypt_bin")?,
@@ -1030,6 +1107,7 @@ impl OpenConfig {
             work_dir: opt("work_dir"),
             keep_work_dir: obj.get("keep_work_dir").and_then(Value::as_bool).unwrap_or(false),
             mode,
+            authority,
         })
     }
 }
@@ -1041,7 +1119,10 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let rights_bin = cfg.rights_bin.as_ref();
     let chain_bin = cfg.chain_bin.as_ref();
 
-    println!("== dDRM runtime-core open (config-driven DrmHost::launch -> open; drm -> rights -> key -> decrypt) ==");
+    println!(
+        "== dDRM runtime-core open (config-driven DrmHost::launch -> open; authority={}; drm -> rights -> key -> decrypt) ==",
+        cfg.authority.tag()
+    );
 
     // --- PUBLISH PHASE (the producer, run ONCE before any open). The authority is now
     // backed by a DURABLE KEY STORE, so its escrow recipient is STABLE across launches. The
@@ -1049,16 +1130,37 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // durable publish fixture — exactly as PC2 escrows the CEK to the stable DEFAULT_AUTHORITY
     // at encode time (`dashPackager.ts` `encryptMediaCEK`). The open path below NEVER escrows;
     // it READS this fixture, collapsing the Day-79/80 "launch → publish → escrow → bind" dance
-    // into "escrow at publish; launch resolves the same recipient."
+    // into "escrow at publish; launch resolves the same recipient." For `dkms`, the publish
+    // phase ALSO provisions the immutable external-authority descriptor the open then resolves.
     let work_dir = match &cfg.work_dir {
         Some(dir) => std::path::PathBuf::from(dir),
         None => std::env::temp_dir().join(format!("ddrm-open-{}", std::process::id())),
     };
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("create work dir: {e}"))?;
     let key_store_path = work_dir.join("authority-key-store.json").to_string_lossy().into_owned();
+    let descriptor_path = work_dir.join("dkms-authority.json");
     let fixture_path = work_dir.join("publish-escrow.json");
-    let escrow = publish_escrow(key_bin, &key_store_path, &fixture_path)?;
-    step(1, "producer (publish-time): escrowed the CEK to the authority's STABLE recipient + wrote a durable publish fixture");
+    let escrow = publish_escrow(key_bin, &key_store_path, &fixture_path, cfg.authority, &descriptor_path)?;
+    // The open path binds to the selected backend via its `init` config ONLY — the publish →
+    // launch → open → recover/re-seal flow below is byte-identical across backends.
+    let key_init_config = match cfg.authority {
+        AuthorityBackend::Reference => json!({ "backend": "reference", "authority_key_store": key_store_path }),
+        AuthorityBackend::Dkms => json!({
+            "backend": "dkms",
+            "dkms_authority_descriptor": descriptor_path.to_string_lossy(),
+        }),
+    };
+    // For `dkms`, snapshot the descriptor so we can PROVE the runtime treated it as immutable
+    // published data (read-only) across the whole open — the key-provider only ever READS it.
+    let descriptor_before = match cfg.authority {
+        AuthorityBackend::Dkms => Some(std::fs::read(&descriptor_path).map_err(|e| format!("read dkms descriptor: {e}"))?),
+        AuthorityBackend::Reference => None,
+    };
+    step(1, &format!(
+        "producer (publish-time): escrowed the CEK to the {} authority's STABLE recipient + wrote a durable publish fixture{}",
+        cfg.authority.tag(),
+        if cfg.authority == AuthorityBackend::Dkms { " + provisioned the external dkms descriptor" } else { "" },
+    ));
 
     // --- the HOST LAUNCHES the rail. The smoke hands the host three launchers (each owning a
     // capsule BINARY); `DrmHost::launch` (the trusted core's composition helper) brings each
@@ -1086,7 +1188,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         vec![
             Box::new(KeyLauncher {
                 key_bin: key_bin.clone(),
-                key_store_path: key_store_path.clone(),
+                init_config: key_init_config.clone(),
                 cell: key_cell.clone(),
                 rail: rail.clone(),
                 material: key_material.clone(),
@@ -1105,7 +1207,13 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         ],
         Box::new(PersistingEventSink::new(store)),
     )?;
-    step(2, "runtime-core host: LAUNCHED the rail via DrmHost::launch — key (relaunched from the durable store), decrypt (per-open session key), rights");
+    step(2, &format!(
+        "runtime-core host: LAUNCHED the rail via DrmHost::launch — key ({}), decrypt (per-open session key), rights",
+        match cfg.authority {
+            AuthorityBackend::Reference => "reference, relaunched from the durable store",
+            AuthorityBackend::Dkms => "dkms, resolved from the external descriptor",
+        }
+    ));
 
     // --- the rail is up: the runtime binds the key transport's per-open material from the
     // PUBLISH FIXTURE (no inline escrow). First prove the authority identity is STABLE: the
@@ -1280,6 +1388,17 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // transport (each shuts down the capsule it owns) — no manual per-capsule shutdown here.
     host.shutdown()?;
     step(11, "runtime-core host: shut down — every runtime-owned transport tore down its capsule");
+
+    // --- dkms: PROVE the external-authority descriptor was IMMUTABLE published data — the
+    // key-provider RESOLVED its identity from it and NEVER wrote it back (PC2 caches the
+    // provisioned descriptor once + only reads it, `chipotle-client.ts:935`/`:950`).
+    if let Some(before) = descriptor_before {
+        let after = std::fs::read(&descriptor_path).map_err(|e| format!("re-read dkms descriptor: {e}"))?;
+        if after != before {
+            return Err("the dkms authority descriptor was mutated across the open — it must be read-only published data".to_string());
+        }
+        step(12, "runtime-core host: the external dkms descriptor was read-only across the open (immutable published identity)");
+    }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop
     // them and clean up the durable artifacts (key store + fixture + receipts) unless the
     // config asks to keep them.
@@ -1366,5 +1485,32 @@ mod config_tests {
     #[test]
     fn fails_closed_when_config_is_not_an_object() {
         assert!(OpenConfig::from_json(&json!(["not", "an", "object"])).is_err());
+    }
+
+    #[test]
+    fn authority_defaults_to_reference_and_parses_dkms() {
+        let base = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        assert!(OpenConfig::from_json(&base).unwrap().authority == AuthorityBackend::Reference);
+
+        let mut dkms = base.clone();
+        dkms.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "dkms" }));
+        assert!(OpenConfig::from_json(&dkms).unwrap().authority == AuthorityBackend::Dkms);
+
+        let mut explicit_ref = base.clone();
+        explicit_ref.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "reference" }));
+        assert!(OpenConfig::from_json(&explicit_ref).unwrap().authority == AuthorityBackend::Reference);
+    }
+
+    #[test]
+    fn fails_closed_on_an_unknown_or_malformed_authority() {
+        let mut bad_backend = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        bad_backend.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "lit-please" }));
+        assert!(OpenConfig::from_json(&bad_backend)
+            .expect_err("an unknown authority backend must fail closed")
+            .contains("authority.backend"));
+
+        let mut not_object = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        not_object.as_object_mut().unwrap().insert("authority".into(), json!("dkms"));
+        assert!(OpenConfig::from_json(&not_object).is_err());
     }
 }

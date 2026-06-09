@@ -890,11 +890,14 @@ fn build_reference_authority(config: &Value) -> Result<ReferenceAuthority, Strin
 /// Resolve the `dkms` EXTERNAL authority from a handed-in descriptor (the dKMS-provisioned key
 /// material), NEVER minting. `None` when no descriptor is configured (the backend is selected but
 /// unconfigured → `release` fails closed, the PC2 "backend selected, no node provisioned" shape).
-/// A present descriptor is read (never written), its provisioned master material resolved into the
-/// stable authority, and — if the descriptor PINS the published external identity (`verifying_key_b64`
-/// / `recipient_pub_b64`, what the producer escrowed to) — the resolved keys are VERIFIED against it,
-/// failing closed on any mismatch. Mirrors PC2 resolving the authority key from config
-/// (`resolvePkpId(config)`, `chipotle-client.ts:963`–`:967`) rather than generating it.
+/// A present descriptor is READ (never written), its provisioned master material resolved into the
+/// stable authority. The descriptor MUST PIN the published external identity (`verifying_key_b64`
+/// AND `recipient_pub_b64`, what the producer escrowed to + the decrypt boundary trusts) and the
+/// resolved keys are VERIFIED against the pins — a pinless descriptor fails closed (a real external
+/// authority always publishes its identity), and a mismatch fails closed. Mirrors PC2 resolving the
+/// authority key from config (`resolvePkpId(config)`, `chipotle-client.ts:963`–`:967`) rather than
+/// generating it, and treating that descriptor as immutable published data (provisioned once + cached,
+/// `chipotle-client.ts:935`/`:950`, never rewritten on the read path).
 #[cfg(feature = "key-authority-ref")]
 fn build_dkms_authority(config: &Value) -> Result<Option<ReferenceAuthority>, String> {
     use base64::Engine as _;
@@ -928,21 +931,32 @@ fn build_dkms_authority(config: &Value) -> Result<Option<ReferenceAuthority>, St
     master.copy_from_slice(&seed_bytes);
     let authority = reference_authority_from_master(&master);
 
-    // If the descriptor PUBLISHES its external identity, the resolved keys MUST match it
-    // (fail-closed) — proof the runtime resolved the exact authority it was provisioned for.
-    if let Some(expected_vk) = desc.get("verifying_key_b64").and_then(|v| v.as_str()) {
-        if b64.encode(&authority.verifying_key) != expected_vk {
-            return Err(format!(
-                "dkms authority descriptor {path} verifying_key_b64 does not match the provisioned key material"
-            ));
-        }
+    // The descriptor MUST PUBLISH its external identity, and the resolved keys MUST match it
+    // (fail-closed). A real external authority ALWAYS publishes its identity (the producer
+    // escrows to it; the decrypt boundary trusts it) — a pinless descriptor is rejected, never
+    // silently trusted, and a mismatch proves the runtime would have resolved a DIFFERENT
+    // authority than the one provisioned, which would strand every CEK escrowed to the published one.
+    let expected_vk = desc
+        .get("verifying_key_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!(
+            "dkms authority descriptor {path} is missing verifying_key_b64 (an external authority must publish its identity)"
+        ))?;
+    if b64.encode(&authority.verifying_key) != expected_vk {
+        return Err(format!(
+            "dkms authority descriptor {path} verifying_key_b64 does not match the provisioned key material"
+        ));
     }
-    if let Some(expected_recip) = desc.get("recipient_pub_b64").and_then(|v| v.as_str()) {
-        if b64.encode(&authority.recipient_public) != expected_recip {
-            return Err(format!(
-                "dkms authority descriptor {path} recipient_pub_b64 does not match the provisioned key material"
-            ));
-        }
+    let expected_recip = desc
+        .get("recipient_pub_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!(
+            "dkms authority descriptor {path} is missing recipient_pub_b64 (an external authority must publish its escrow recipient)"
+        ))?;
+    if b64.encode(&authority.recipient_public) != expected_recip {
+        return Err(format!(
+            "dkms authority descriptor {path} recipient_pub_b64 does not match the provisioned key material"
+        ));
     }
     Ok(Some(authority))
 }
@@ -1655,6 +1669,7 @@ mod tests {
             let desc = json!({
                 "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
                 "authority_master_seed_b64": b64().encode(master),
+                "verifying_key_b64": b64().encode(reference_authority_from_master(&master).verifying_key),
                 "recipient_pub_b64": b64().encode([0u8; 8]), // not the derived recipient
             });
             std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
@@ -1664,6 +1679,50 @@ mod tests {
                 "not_configured"
             );
             let _ = std::fs::remove_file(&path);
+        }
+
+        /// A real external authority ALWAYS publishes its identity, so a PINLESS descriptor (no
+        /// `verifying_key_b64` / `recipient_pub_b64`) is rejected — the runtime never silently trusts
+        /// a master seed it cannot cross-check against a published identity (Day 85–86).
+        #[test]
+        fn dkms_fails_closed_on_a_pinless_descriptor() {
+            let master = [0x33u8; 32];
+            // No pins at all.
+            let bare = unique_store_path("dkms-pinless");
+            std::fs::write(
+                &bare,
+                serde_json::to_vec(&json!({
+                    "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+                    "authority_master_seed_b64": b64().encode(master),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut p = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": bare }))),
+                "not_configured"
+            );
+            let _ = std::fs::remove_file(&bare);
+
+            // Verifying key pinned but recipient pin missing — still fails closed (BOTH required).
+            let half = unique_store_path("dkms-halfpin");
+            std::fs::write(
+                &half,
+                serde_json::to_vec(&json!({
+                    "schema": DKMS_AUTHORITY_DESCRIPTOR_SCHEMA,
+                    "authority_master_seed_b64": b64().encode(master),
+                    "verifying_key_b64": b64().encode(reference_authority_from_master(&master).verifying_key),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let mut q = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": half }))),
+                "not_configured"
+            );
+            let _ = std::fs::remove_file(&half);
         }
 
         fn reference_provider() -> KeyProvider {
