@@ -4,6 +4,10 @@ All notable changes to the public ElastOS Runtime repository.
 
 ## [Next]
 
+No changes yet.
+
+## [0.4.0] - 2026-06-09
+
 ### Added
 - Added a provider-backed Library release slice: desktop-familiar
   places, breadcrumbs, grid/list views, inline create/rename, drag/drop,
