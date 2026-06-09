@@ -58,7 +58,7 @@ shared `protected_content` contracts.
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
-| — Plan executor | `ddrm-plan-runner` (runtime core) | 🟩 **fail-closed core that WALKS the `DrmOpenPlanV1`** — validates order + binding edges, threads each edge into the next step, fails closed on a broken/out-of-order edge; holds no authority (only the injected `StepRunner` touches a provider). `RuntimeStepRunner` resolves each step through INJECTED per-provider `ProviderHandle`s, refusing to build without a handle for every `next_required_providers` entry and rejecting a stray handle. **`open_drm_plan(plan, &mut CapabilityTable)`** is the single composition root: parse → resolve each handle from the runtime table → build → execute. **`RuntimeCapabilityTable`** is the runtime-owned registry: `register` a `ProviderTransport` per provider, `resolve` opens a fresh handle over it (`None` → fail-closed) (Day 71→74) | `capsules/ddrm-plan-runner` |
+| — Plan executor | `ddrm-plan-runner` (runtime core) | 🟩 **fail-closed core that WALKS the `DrmOpenPlanV1`** — validates order + binding edges, threads each edge into the next step, fails closed on a broken/out-of-order edge; holds no authority (only the injected `StepRunner` touches a provider). `RuntimeStepRunner` resolves each step through INJECTED per-provider `ProviderHandle`s, refusing to build without a handle for every `next_required_providers` entry and rejecting a stray handle. **`open_drm_plan(plan, &mut CapabilityTable)`** is the single composition root: parse → resolve each handle from the runtime table → build → execute. **`RuntimeCapabilityTable`** is the runtime-owned registry: `register` a `ProviderTransport` per provider, `resolve` opens a fresh handle over it (`None` → fail-closed). **`DrmHost::open(content_id, viewer)`** is the single trusted host entrypoint that owns the WHOLE open: a `PlanSource` fetches the plan, the registry drives it (`open_drm_plan`), and a `RuntimeEventSink` emits the plan's runtime-OWNED post-steps (`release_receipt` + `audit`) — fail-closed at every seam (Day 71→76) | `capsules/ddrm-plan-runner` |
 
 **Headline:** the **hardest, most security-critical boundary — decrypt — is done**
 (transcript-bound, in-sandbox minted key, expiry+audit, suite-tagged material, all
@@ -138,7 +138,7 @@ flowchart TB
   end
   subgraph cons["CONSUMER — decrypt DONE, core executor landed, rail-wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
-    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider]
+    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute<br/>RuntimeCapabilityTable = runtime-owned registry: register ProviderTransport per provider<br/>DrmHost::open = trusted host: PlanSource fetch -> drive registry -> RuntimeEventSink emits receipt+audit]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -315,14 +315,24 @@ decrypt-provider OpenSessionV1`.
   per-backend transport it owns the means to build (`:368`–`:377`), `null` for an unknown token. New
   `ProviderTransport` (owned, registered once) vs `ProviderHandle` (fresh per-open) mirrors that.
   ddrm-plan-runner 25→29; drift untouched.
+- **Status (Day 75–76):** the runtime CORE now has a single TRUSTED HOST. New `DrmHost` owns a
+  `PlanSource` (the seam to ask `drm-provider` for the plan), the Day-74 `RuntimeCapabilityTable`, and a
+  `RuntimeEventSink`. `host.open(content_id, viewer)` fetches the plan, drives it through the registry
+  (`open_drm_plan`), then emits the plan's runtime-OWNED post-steps (`release_receipt` + the open
+  `audit`) in order. New `PlanStep.event` + `is_runtime_event()` lets the host emit the steps the
+  executor only walks for ordering. Fail-closed: a bad plan never resolves a capability, a missing
+  transport fails closed, a runtime event the sink cannot emit fails the open. Audited PC2's server-owned
+  composition first: the `/init` route owns the whole open (`media.ts:133` route → `:481`/`:482` recover
+  → `:489` `mediaSessionManager.create` → `:528` catch). The consumer smoke is now a THIN caller of
+  `host.open`. ddrm-plan-runner 29→34; drift untouched.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
-- **Still dev-shaped:** the `RuntimeCapabilityTable` is populated today with transports wrapping the
-  smoke's spawned binaries; constructing the registry INSIDE a trusted runtime-core caller whose
-  transports drive the runtime's REAL provider→provider rail (the smoke proves the registry; the core
-  owns the real transports) so the open runs default-on inside the core is the next step. The
-  `reference` backend is dev-only (production uses the `dkms`/`lit` backends, still `not_configured`);
-  smoke is native (a `wasm32-wasip1` variant is a follow-up).
+- **Still dev-shaped:** the `DrmHost`'s `PlanSource` + `ProviderTransport`s wrap the smoke's spawned
+  binaries and its `RuntimeEventSink` only records in-memory; giving the host REAL owned transports (the
+  host spawns/connects to the runtime's provider→provider rail) and a PERSISTING event sink (durable
+  receipt + audit) so it runs from capabilities + a sink the core itself owns end to end is the next
+  step. The `reference` backend is dev-only (production uses the `dkms`/`lit` backends, still
+  `not_configured`); smoke is native (a `wasm32-wasip1` variant is a follow-up).
 
 ### Phase B — Real chain validation (Base) via `chain-provider` 🟦 UNDERWAY
 Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real

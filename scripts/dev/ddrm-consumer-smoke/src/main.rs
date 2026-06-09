@@ -25,27 +25,35 @@
 //! dev raw-CEK shim — and the boundary recovers it and decrypts, proving the rail end to
 //! end through the op drm-provider's plan actually names.
 //!
-//! The chain is no longer hand-walked here: the REAL `drm-provider` emits the plan and
-//! the smoke calls the runtime-core composition root `ddrm_plan_runner::open_drm_plan`,
-//! which parses the plan, RESOLVES each provider the plan requires from a runtime
-//! capability table, builds the `RuntimeStepRunner`, and executes — the SAME entrypoint
-//! the trusted core will call. The smoke REGISTERS three runtime-owned transports
-//! (`RightsTransport`/`KeyTransport`/`DecryptTransport`, each wrapping one real capsule
-//! binary) into the lib's `RuntimeCapabilityTable` — the same registry type the trusted
-//! core uses (the analogue of PC2's `sessionService` singleton owning the per-backend
-//! view constructors); each transport opens a fresh per-provider handle on demand. No
-//! second code path. The core fails closed unless the table has a transport registered
-//! for every provider the plan's `next_required_providers` names. Two
-//! fail-closed gates ride along: a transcript-mismatched seal must not open, and a
-//! TAMPERED plan edge (driven back through the SAME entrypoint) must be rejected by the
-//! real key-provider.
+//! The chain is no longer hand-walked here, and the smoke no longer drives the open
+//! itself: it builds the trusted runtime-core HOST `ddrm_plan_runner::DrmHost` and calls
+//! `host.open(content_id, viewer)`. The HOST owns the whole open — it (1) asks its
+//! `PlanSource` (a `SmokePlanSource` wrapping the REAL `drm-provider`) for the canonical
+//! plan, (2) drives it through the runtime `RuntimeCapabilityTable` of registered
+//! transports (`open_drm_plan`'s parse → resolve each required provider → execute), and
+//! (3) emits the plan's runtime-OWNED post-steps (`release_receipt` + the open audit)
+//! through a `RuntimeEventSink` (a `SmokeEventSink`). This is the runtime-core analogue of
+//! PC2's server-owned `/init` route, which — once the capability is resolved — owns
+//! fetching the MPD, driving recovery, creating the session, and logging, all in one
+//! place (`pc2-node/src/api/media.ts:133` route → `:481`/`:482` recover → `:489` session).
+//! The smoke REGISTERS three runtime-owned transports (`RightsTransport`/`KeyTransport`/
+//! `DecryptTransport`, each wrapping one real capsule binary) into the host's table — the
+//! same registry type the trusted core uses; each transport opens a fresh per-provider
+//! handle on demand. No second code path. The host fails closed unless every provider the
+//! plan's `next_required_providers` names has a registered transport, and unless every
+//! runtime event it declares can be emitted. Two more fail-closed gates ride along: a
+//! transcript-mismatched seal must not open, and a TAMPERED plan FROM THE SOURCE (driven
+//! back through the SAME host) must be rejected by the real key-provider.
 //!
 //! Usage: ddrm-consumer-smoke <key-provider-bin> <decrypt-provider-bin> <drm-bin> [rights-bin]
 
 use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
-use ddrm_plan_runner::{open_drm_plan, ProviderHandle, ProviderTransport, RuntimeCapabilityTable, StepInputs};
+use ddrm_plan_runner::{
+    DrmHost, ExecutionReport, PlanSource, ProviderHandle, ProviderTransport,
+    RuntimeCapabilityTable, RuntimeEventSink, StepInputs,
+};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -646,25 +654,63 @@ impl ProviderTransport for DecryptTransport {
     }
 }
 
-/// Ask the REAL drm-provider for the canonical open plan, and validate it carries the
-/// content identity flowing through the chain. The drm-provider holds no authority and
-/// decrypts nothing — it only emits the plan (`planned`).
-fn fetch_plan(drm_bin: &str) -> Result<Value, String> {
-    let mut drm = Capsule::spawn("drm-provider", drm_bin)?;
-    ok_data(&drm.call(&json!({ "op": "status" }))?, "drm status")?;
-    let plan = ok_data(&drm.call(&drm_open_request())?, "drm open")?;
-    drm.shutdown();
-    if plan["content_id"].as_str() != Some(cid().as_str()) {
-        return Err(format!(
-            "plan content_id {} != the content identity flowing through the chain {}",
-            plan["content_id"],
-            cid()
-        ));
+/// The host's runtime-owned PLAN SOURCE: asks the REAL drm-provider for the canonical
+/// open plan (the drm-provider holds no authority and decrypts nothing — it only emits
+/// the `planned` plan). Spawns + shuts down the drm capsule per fetch and validates the
+/// plan carries the content identity flowing through the chain. `tamper` (shared with
+/// `run`) models a source that yields a corrupted plan so the host must fail closed.
+struct SmokePlanSource {
+    drm_bin: String,
+    tamper: Rc<std::cell::Cell<bool>>,
+}
+
+impl PlanSource for SmokePlanSource {
+    fn fetch(&mut self, _content_id: &str, _viewer_interface: &str) -> Result<Value, String> {
+        let mut drm = Capsule::spawn("drm-provider", &self.drm_bin)?;
+        ok_data(&drm.call(&json!({ "op": "status" }))?, "drm status")?;
+        let mut plan = ok_data(&drm.call(&drm_open_request())?, "drm open")?;
+        drm.shutdown();
+        if plan["content_id"].as_str() != Some(cid().as_str()) {
+            return Err(format!(
+                "plan content_id {} != the content identity flowing through the chain {}",
+                plan["content_id"],
+                cid()
+            ));
+        }
+        if plan["action"].as_str() != Some(ACTION) {
+            return Err(format!("plan action {} != {ACTION}", plan["action"]));
+        }
+        if self.tamper.get() {
+            // Relabel the key_release input edge — the real key-provider
+            // (deny_unknown_fields over a required `rights_receipt`) must reject it.
+            for b in plan["bindings"].as_array_mut().ok_or("plan has no bindings")? {
+                if b["into_step"] == json!("key_release") {
+                    b["into_field"] = json!("bogus_edge");
+                }
+            }
+        }
+        Ok(plan)
     }
-    if plan["action"].as_str() != Some(ACTION) {
-        return Err(format!("plan action {} != {ACTION}", plan["action"]));
+}
+
+/// The host's runtime-owned EVENT SINK: records the plan's runtime-event steps
+/// (`release_receipt`, `protected_content.open.audit`) the host emits after the provider
+/// chain runs. The runtime analogue of PC2's `/init` creating the session + logging the
+/// open. Records into a shared vec so `run` can assert both events were emitted.
+struct SmokeEventSink {
+    emitted: Rc<RefCell<Vec<String>>>,
+}
+
+impl RuntimeEventSink for SmokeEventSink {
+    fn emit(&mut self, event: &str, report: &ExecutionReport) -> Result<(), String> {
+        // Fail closed: the runtime only records the open's receipt/audit once the chain
+        // actually opened a decrypt session.
+        if report.artifact("decrypt_session").is_none() {
+            return Err(format!("refusing to emit `{event}`: no decrypt session was opened"));
+        }
+        self.emitted.borrow_mut().push(event.to_string());
+        Ok(())
     }
-    Ok(plan)
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -674,18 +720,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let rights_bin = args.get(3);
     let chain_bin = args.get(4);
 
-    println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt, via the runtime-core plan executor) ==");
+    println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt, via the runtime-core host DrmHost::open) ==");
 
-    // --- front of chain: the REAL drm-provider emits the canonical open PLAN, which
-    // the runtime-core executor (ddrm-plan-runner) parses + validates: schema,
-    // `planned` status, the rights<key<decrypt canonical order, and every binding edge.
-    let plan_json = fetch_plan(drm_bin)?;
-    step(1, "drm-provider: emitted the canonical open plan (planned) — the core composition root will parse + validate it");
-
-    // --- runtime capability provisioning (BEFORE the walk): the authority + decrypt
+    // --- runtime capability provisioning (BEFORE the open): the authority + decrypt
     // boundary come up, the content CEK is ESCROWED to the authority's recipient, and
     // the canonical transcript AAD is computed. These are the capabilities/material the
-    // executor injects into the plan steps — none of it is authority the core holds.
+    // runtime registers as transports — none of it is authority the host holds.
     let (attestation, chain_mode) = chain_attestation(chain_bin)?;
     let rights = match rights_bin {
         Some(bin) => Some(Capsule::spawn("rights-provider", bin)?),
@@ -702,7 +742,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .as_str()
         .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
         .to_string();
-    step(2, "key-provider: reference authority up; verifying + escrow-recipient keys published");
+    step(1, "key-provider: reference authority up; verifying + escrow-recipient keys published");
 
     // ESCROW the content CEK to the authority's recipient — so the CEK reaches the
     // authority SEALED, recovered in-boundary, never handed in raw (no dev shim).
@@ -730,21 +770,21 @@ fn run(args: &[String]) -> Result<(), String> {
         .ok_or("decrypt-provider did not publish a session key (build with --features rail-material)")?
         .to_string();
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
-    step(3, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
+    step(2, "decrypt-provider: trusts authority; minted + published an in-sandbox session key");
 
     let content_hash = b"consumer-smoke-content-hash-0001".to_vec(); // 32 bytes
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
-    // --- drive the chain THROUGH the runtime-core COMPOSITION ROOT: REGISTER three
-    // runtime-owned transports into the lib's `RuntimeCapabilityTable` (the same registry
-    // the trusted core uses), then hand it + the plan to `open_drm_plan`, which parses the
-    // plan, RESOLVES each required provider's handle from the registered transports at ONE
-    // point, builds the RuntimeStepRunner, and executes. The smoke OWNS the transports the
-    // table hands out (the analogue of PC2's `sessionService` singleton owning the
-    // per-backend view constructors) — the SAME entrypoint + table the trusted core will
-    // use, no second code path. The capsules are shared so the post-walk fail-closed
-    // checks + shutdown can still reach them after the transports have been registered.
+    // --- build the trusted runtime-core HOST and let it own the WHOLE open. The runtime
+    // REGISTERS three runtime-owned transports into the lib's `RuntimeCapabilityTable`,
+    // wires a `SmokePlanSource` (asks the REAL drm-provider for the plan) and a
+    // `SmokeEventSink` (records the plan's runtime-owned post-steps), and hands all three
+    // to `DrmHost`. `host.open(content_id, viewer)` then fetches the plan, drives it
+    // through the registry (`open_drm_plan`'s parse→resolve→execute), and emits the
+    // runtime-event steps — the SAME host entrypoint the trusted core will call, no second
+    // code path. The capsules are shared (`Rc<RefCell>`) so the post-open fail-closed
+    // checks + shutdown can still reach them after the transports moved into the host.
     let rights_cell = Rc::new(RefCell::new(rights));
     let key_cell = Rc::new(RefCell::new(key));
     let decrypt_cell = Rc::new(RefCell::new(decrypt));
@@ -767,14 +807,36 @@ fn run(args: &[String]) -> Result<(), String> {
     table.register(Box::new(DecryptTransport {
         decrypt: decrypt_cell.clone(),
     }))?;
-    let report = open_drm_plan(&plan_json, &mut table)?;
+    let tamper = Rc::new(std::cell::Cell::new(false));
+    let emitted = Rc::new(RefCell::new(Vec::new()));
+    let mut host = DrmHost::new(
+        Box::new(SmokePlanSource {
+            drm_bin: drm_bin.clone(),
+            tamper: tamper.clone(),
+        }),
+        table,
+        Box::new(SmokeEventSink {
+            emitted: emitted.clone(),
+        }),
+    );
+
+    // --- the trusted host owns the open end to end ---
+    let report = host.open(&cid(), VIEWER)?;
     if report.artifact("decrypt_session").is_none() {
-        return Err("the core entrypoint finished without opening a decrypt session".to_string());
+        return Err("the host finished without opening a decrypt session".to_string());
     }
-    // The open succeeded — narrate the steps the core drove through the resolved handles.
+    step(3, "drm-provider (host plan source): emitted the canonical plan (planned); host parsed + validated its order + edges");
     step(4, &format!("rights-provider: on-chain ownership ({chain_mode}) -> allowed; typed receipt issued"));
     step(5, "key-provider: canonical `release` recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no shim)");
     step(6, "decrypt-provider: unwrapped in-VM + decrypted the segment; only a scoped session returned");
+    // The host emitted the plan's runtime-OWNED post-steps (no provider performs these).
+    if report.events_emitted != ["release_receipt", "protected_content.open.audit"] {
+        return Err(format!(
+            "host did not emit the plan's runtime events in order: {:?}",
+            report.events_emitted
+        ));
+    }
+    step(7, "runtime-core host: emitted the runtime-owned post-steps (release_receipt + audit)");
 
     // --- fail-closed #1 (crypto binding): a replayed/altered transcript must not open.
     // Re-seal to a DIFFERENT nonce while the material still names the original — the
@@ -818,27 +880,27 @@ fn run(args: &[String]) -> Result<(), String> {
     if bad_open.get("data").and_then(|d| d.get("decision")).and_then(Value::as_str) == Some("opened") {
         return Err(format!("a transcript-mismatched seal must NOT open: {bad_open}"));
     }
-    step(7, "decrypt-provider: a transcript-mismatched seal failed closed");
+    step(8, "decrypt-provider: a transcript-mismatched seal failed closed");
 
-    // --- fail-closed #2 (plan integrity): TAMPER a binding edge and re-run through the
-    // SAME core entrypoint with the SAME capability table. The executor threads the
-    // rights receipt into the wrong field, so the real key-provider (deny_unknown_fields
-    // over a required `rights_receipt`) rejects it — proving the composition root only
-    // proceeds when the plan's edges are intact, cross-binary.
-    let mut tampered = plan_json.clone();
-    for b in tampered["bindings"].as_array_mut().ok_or("plan has no bindings")? {
-        if b["into_step"] == json!("key_release") {
-            b["into_field"] = json!("bogus_edge");
-        }
-    }
-    match open_drm_plan(&tampered, &mut table) {
+    // --- fail-closed #2 (plan integrity): flip the host's plan source into TAMPER mode
+    // (it relabels the key_release input edge) and re-open through the SAME host. The
+    // host fetches the corrupted plan, threads the rights receipt into the wrong field,
+    // and the real key-provider (deny_unknown_fields over a required `rights_receipt`)
+    // rejects it — proving the host only proceeds when the plan's edges are intact, and
+    // that a bad plan FROM THE SOURCE fails closed, cross-binary, with no event emitted.
+    let emitted_before = emitted.borrow().len();
+    tamper.set(true);
+    match host.open(&cid(), VIEWER) {
         Ok(_) => return Err("a tampered plan edge must NOT drive a successful open".to_string()),
-        Err(_) => step(8, "runtime-core: a tampered binding edge failed closed at the real key-provider"),
+        Err(_) => step(9, "runtime-core host: a tampered binding edge from the plan source failed closed at the real key-provider"),
+    }
+    if emitted.borrow().len() != emitted_before {
+        return Err("a failed open must emit no runtime events".to_string());
     }
 
-    // Drop the table so the handles it would hand out release nothing extra, then shut
-    // down the capsules (still held by this scope's shared cells).
-    drop(table);
+    // Drop the host (releasing the transports' capsule references + the plan source), then
+    // shut down the capsules (still held by this scope's shared cells).
+    drop(host);
     if let Some(rights) = rights_cell.borrow_mut().as_mut() {
         rights.shutdown();
     }

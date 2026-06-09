@@ -56,12 +56,16 @@ const KEY_STEP: &str = "key_release";
 const DECRYPT_STEP: &str = "decrypt_session";
 
 /// One step of the plan as the runtime sees it. Provider/operation are `None` for
-/// runtime-owned events (e.g. `release_receipt`, `audit`) the executor never invokes.
+/// runtime-owned events (e.g. `release_receipt`, `audit`) the executor never invokes —
+/// those carry an `event` name the runtime HOST emits after the provider steps run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {
     pub name: String,
     pub provider: Option<String>,
     pub operation: Option<String>,
+    /// The runtime-event this step emits (e.g. `release_receipt`,
+    /// `protected_content.open.audit`), for `owner: runtime` steps with no provider.
+    pub event: Option<String>,
 }
 
 impl PlanStep {
@@ -69,6 +73,12 @@ impl PlanStep {
     /// operation). Runtime-event steps are walked for ordering but never invoked.
     pub fn is_provider_call(&self) -> bool {
         self.provider.is_some() && self.operation.is_some()
+    }
+
+    /// A runtime-owned event step (no provider, carries an `event`) — the host emits it
+    /// after the provider chain runs; the executor only walks it for ordering.
+    pub fn is_runtime_event(&self) -> bool {
+        self.provider.is_none() && self.event.is_some()
     }
 }
 
@@ -336,6 +346,111 @@ impl CapabilityTable for RuntimeCapabilityTable {
     }
 }
 
+/// The runtime's capability to obtain the open PLAN for a piece of content — the
+/// runtime-owned source the host asks "what is the canonical sequence to open this?".
+/// The plan itself is emitted by `drm-provider` (which holds no authority); this trait
+/// is the host's seam to that provider. The runtime-core analogue of PC2's `/init`
+/// route fetching + parsing the MPD before driving recovery (`src/api/media.ts:162`–`:208`):
+/// the host first resolves WHAT to open, then drives the open.
+pub trait PlanSource {
+    /// Fetch the `DrmOpenPlanV1` JSON for `content_id` under `viewer_interface`.
+    fn fetch(&mut self, content_id: &str, viewer_interface: &str) -> Result<Value, String>;
+}
+
+/// A runtime-owned sink for the plan's runtime-EVENT steps — the steps the plan declares
+/// with `owner: runtime` (e.g. `release_receipt`, `protected_content.open.audit`) that no
+/// provider performs. The host emits each, in plan order, after the provider chain runs,
+/// handing the sink the finished [`ExecutionReport`] so it can persist the receipt / write
+/// the audit record. The runtime-core analogue of PC2's `/init` creating the playback
+/// session + logging the open (`media.ts:489` `mediaSessionManager.create`, `:483`/`:518`).
+/// Fail-closed: if a declared runtime event cannot be emitted, the open fails.
+pub trait RuntimeEventSink {
+    fn emit(&mut self, event: &str, report: &ExecutionReport) -> Result<(), String>;
+}
+
+/// What a host open produced: the steps that ran, the artifacts, and the runtime events
+/// the host emitted (in order).
+#[derive(Debug, Clone)]
+pub struct HostOpenReport {
+    pub execution: ExecutionReport,
+    pub events_emitted: Vec<String>,
+}
+
+impl HostOpenReport {
+    pub fn artifact(&self, produces: &str) -> Option<&Value> {
+        self.execution.artifact(produces)
+    }
+}
+
+/// The trusted runtime-core HOST for a dDRM open: the single owned entrypoint that
+/// composes the WHOLE open. It owns (1) a [`PlanSource`] to obtain the plan, (2) the
+/// runtime [`RuntimeCapabilityTable`] of provider transports, and (3) a
+/// [`RuntimeEventSink`] for the plan's runtime-owned post-steps. This is the runtime-core
+/// analogue of PC2's `/init` route, which — once the middleware has resolved the
+/// capability — owns fetching the plan-equivalent (MPD), driving recovery over that
+/// capability, creating the session, and logging, all in one place, fail-closed
+/// (`src/api/media.ts:133` route → `:481`/`:482` recover → `:489` session → `:528` catch).
+/// The consumer smoke calls THIS entrypoint (its capsule binaries become the host's
+/// registered transports + plan source) — no second code path.
+pub struct DrmHost {
+    plan_source: Box<dyn PlanSource>,
+    table: RuntimeCapabilityTable,
+    events: Box<dyn RuntimeEventSink>,
+}
+
+impl DrmHost {
+    pub fn new(
+        plan_source: Box<dyn PlanSource>,
+        table: RuntimeCapabilityTable,
+        events: Box<dyn RuntimeEventSink>,
+    ) -> Self {
+        Self {
+            plan_source,
+            table,
+            events,
+        }
+    }
+
+    /// Open `content_id` under `viewer_interface`: fetch the plan, drive it through the
+    /// runtime capability registry (parse → resolve each required transport → execute —
+    /// exactly [`open_drm_plan`]'s core), then emit the plan's runtime-event steps in
+    /// order through the host's sink. Fail-closed at every seam: a bad plan never resolves
+    /// a capability, a missing transport fails closed, and a runtime event that cannot be
+    /// emitted fails the open.
+    pub fn open(
+        &mut self,
+        content_id: &str,
+        viewer_interface: &str,
+    ) -> Result<HostOpenReport, String> {
+        let plan_json = self.plan_source.fetch(content_id, viewer_interface)?;
+        let plan = DrmOpenPlan::parse(&plan_json)?;
+        let mut runner = RuntimeStepRunner::resolve_from(&plan, &mut self.table)?;
+        let execution = plan.execute(&mut runner)?;
+
+        // Runtime-owned post-steps: the plan declares them (owner: runtime), no provider
+        // performs them — the HOST emits each, in plan order, after the provider chain.
+        let mut events_emitted = Vec::new();
+        for step in plan.steps.iter().filter(|s| s.is_runtime_event()) {
+            let event = step
+                .event
+                .as_deref()
+                .expect("is_runtime_event guarantees an event name");
+            self.events.emit(event, &execution)?;
+            events_emitted.push(event.to_string());
+        }
+
+        Ok(HostOpenReport {
+            execution,
+            events_emitted,
+        })
+    }
+
+    /// The providers this host can drive (one per registered transport).
+    pub fn registered_providers(&self) -> Vec<&str> {
+        self.table.registered_providers()
+    }
+}
+
 impl StepRunner for RuntimeStepRunner {
     fn run_step(&mut self, inputs: &StepInputs) -> Result<BTreeMap<String, Value>, String> {
         let provider = match &inputs.step.provider {
@@ -591,6 +706,7 @@ fn parse_steps(plan: &Value) -> Result<Vec<PlanStep>, String> {
             name,
             provider: s["provider"].as_str().map(str::to_string),
             operation: s["operation"].as_str().map(str::to_string),
+            event: s["event"].as_str().map(str::to_string),
         });
     }
     Ok(steps)
@@ -1195,5 +1311,139 @@ mod tests {
         open_drm_plan(&canonical_plan(), &mut table).expect("second open over the same transports");
         // Both opens drove the full chain (rights,key,decrypt,decrypt) ×2.
         assert_eq!(invoked.borrow().len(), 8);
+    }
+
+    // ── DrmHost: the trusted runtime-core host that owns plan source + registry + sink ──
+
+    #[test]
+    fn plan_steps_parse_runtime_events() {
+        let plan = DrmOpenPlan::parse(&canonical_plan()).unwrap();
+        let events: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter(|s| s.is_runtime_event())
+            .map(|s| s.event.as_deref().unwrap())
+            .collect();
+        assert_eq!(events, vec!["release_receipt", "protected_content.open.audit"]);
+        // The provider-call steps are NOT runtime events.
+        assert!(!plan.steps.iter().find(|s| s.name == "key_release").unwrap().is_runtime_event());
+    }
+
+    /// A plan source backed by the canonical plan; `tamper` models a source that yields a
+    /// corrupted plan (renamed key edge) so the host must fail closed.
+    struct FakePlanSource {
+        tamper: bool,
+        fetched: std::rc::Rc<std::cell::RefCell<u32>>,
+    }
+
+    impl PlanSource for FakePlanSource {
+        fn fetch(&mut self, _content_id: &str, _viewer: &str) -> Result<Value, String> {
+            *self.fetched.borrow_mut() += 1;
+            let mut p = canonical_plan();
+            if self.tamper {
+                for b in p["bindings"].as_array_mut().unwrap() {
+                    if b["into_step"] == json!("key_release") {
+                        b["into_field"] = json!("bogus_edge");
+                    }
+                }
+            }
+            Ok(p)
+        }
+    }
+
+    /// A sink that records emitted events; `refuse` models a sink that cannot persist the
+    /// named event (e.g. the audit write fails) so the host fails closed.
+    struct RecordingSink {
+        emitted: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        refuse: Option<String>,
+    }
+
+    impl RuntimeEventSink for RecordingSink {
+        fn emit(&mut self, event: &str, _report: &ExecutionReport) -> Result<(), String> {
+            if self.refuse.as_deref() == Some(event) {
+                return Err(format!("sink refused to emit `{event}`"));
+            }
+            self.emitted.borrow_mut().push(event.to_string());
+            Ok(())
+        }
+    }
+
+    fn full_table(invoked: &std::rc::Rc<std::cell::RefCell<Vec<String>>>) -> RuntimeCapabilityTable {
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(FakeTransport::boxed("rights", invoked)).unwrap();
+        table.register(FakeTransport::boxed("key", invoked)).unwrap();
+        table.register(FakeTransport::boxed("decrypt", invoked)).unwrap();
+        table
+    }
+
+    #[test]
+    fn drm_host_opens_via_plan_source_registry_and_emits_runtime_events() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched: fetched.clone() }),
+            full_table(&invoked),
+            Box::new(RecordingSink { emitted: emitted.clone(), refuse: None }),
+        );
+        let report = host.open("bafycontent", "elastos.viewer/document@1").expect("host drives the open");
+        assert!(report.artifact("decrypt_session").is_some());
+        assert_eq!(*fetched.borrow(), 1, "the host fetched the plan from its source");
+        // The host emitted BOTH runtime-event steps the plan declares, in order, after the chain.
+        assert_eq!(report.events_emitted, vec!["release_receipt", "protected_content.open.audit"]);
+        assert_eq!(*emitted.borrow(), vec!["release_receipt", "protected_content.open.audit"]);
+    }
+
+    #[test]
+    fn drm_host_fails_closed_on_a_tampered_plan_from_the_source() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: true, fetched }),
+            full_table(&invoked),
+            Box::new(RecordingSink { emitted: emitted.clone(), refuse: None }),
+        );
+        // The tampered edge mislabels the key_release input; the fake key handle requires
+        // the rights_receipt threaded edge, so execution fails closed — BEFORE any event.
+        assert!(host.open("bafycontent", "elastos.viewer/document@1").is_err());
+        assert!(emitted.borrow().is_empty(), "no runtime event is emitted when the open fails");
+    }
+
+    #[test]
+    fn drm_host_fails_closed_when_the_event_sink_refuses() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            full_table(&invoked),
+            // The audit write fails — a declared runtime event that cannot be emitted
+            // must fail the open (the receipt was emitted first, then audit refuses).
+            Box::new(RecordingSink { emitted: emitted.clone(), refuse: Some("protected_content.open.audit".to_string()) }),
+        );
+        let err = host.open("bafycontent", "elastos.viewer/document@1").unwrap_err();
+        assert!(err.contains("sink refused to emit `protected_content.open.audit`"), "{err}");
+        assert_eq!(*emitted.borrow(), vec!["release_receipt"], "the receipt emitted before audit refused");
+    }
+
+    #[test]
+    fn drm_host_fails_closed_when_a_required_transport_is_unregistered() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let fetched = std::rc::Rc::new(std::cell::RefCell::new(0u32));
+        let emitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // The host's table registers rights + decrypt but NOT key.
+        let mut table = RuntimeCapabilityTable::new();
+        table.register(FakeTransport::boxed("rights", &invoked)).unwrap();
+        table.register(FakeTransport::boxed("decrypt", &invoked)).unwrap();
+        let mut host = DrmHost::new(
+            Box::new(FakePlanSource { tamper: false, fetched }),
+            table,
+            Box::new(RecordingSink { emitted: emitted.clone(), refuse: None }),
+        );
+        let err = host.open("bafycontent", "elastos.viewer/document@1").unwrap_err();
+        assert!(err.contains("holds no handle for required provider `key`"), "{err}");
+        assert!(invoked.borrow().is_empty());
+        assert!(emitted.borrow().is_empty());
     }
 }
