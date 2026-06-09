@@ -204,6 +204,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ddrm-envelope"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "getrandom",
+ "ml-dsa",
+ "ml-kem",
+ "rand_core",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "decrypt-provider"
 version = "0.1.0"
 dependencies = [
@@ -213,6 +227,7 @@ dependencies = [
  "cbc",
  "cipher",
  "ctr",
+ "ddrm-envelope",
  "elastos-common",
  "elliptic-curve",
  "getrandom",

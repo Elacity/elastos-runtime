@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~57 commits**, tip Day-51 reference key-authority seal + shared `ddrm-envelope`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~58 commits**, tip Day-52 cross-capsule equivalence guard — `ddrm-envelope` seal proven interoperable with `decrypt-provider`'s in-tree unwrap). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,30 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🔗 Day 52 — cross-capsule equivalence guard: `ddrm-envelope` ⇄ `decrypt-provider` (Phase A.3, LANDED).**
+> The shared crate (what the key authority seals with) is now **provably wire- AND
+> crypto-interoperable** with `decrypt-provider`'s own in-tree PQ-hybrid unwrap — in the
+> real key→decrypt direction. A new guard (feature `envelope-conformance`, dev-dep on
+> `ddrm-envelope`) has the provider mint+publish a decrypt-session key, the **shared
+> crate seal** a CEK to it (transcript-bound, real ML-DSA-65), and this provider's OWN
+> `PqSealedEnvelope::from_bytes` + `hybrid_unwrap_bound` recover the exact CEK; a
+> mismatched transcript fails closed and no raw CEK appears on the wire. This pins the
+> only thing the temporary duplication risks — **silent drift** — so the two
+> implementations cannot diverge while the full dedup is pending. Additive and
+> reversible: `pq-mldsa` stays exactly 34; the guard is the single new combo
+> (`envelope-conformance`=35); the shipped capsule never links the shared crate (dev-dep).
+> Ladder pins `envelope-conformance`=35; all other counts + wasm builds unchanged; drift
+> guard PASS.
+> **Why a guard and not the full rip-out yet:** the decrypt-provider PQ test suite is
+> tightly bound to the *concrete* crypto types (it constructs `PqSealedEnvelope` literals,
+> touches raw `ml-kem`/`x25519` types, calls the private `signed_payload`), so a faithful
+> in-place migration is a broader API+visibility refactor than is wise to land in one
+> increment on the crown-jewel capsule. The guard captures the value (no drift) now and
+> **de-risks** that migration: it is the proof the rip-out must keep passing.
+> **Next (Phase A.3b / A.4):** complete the dedup behind this guard (re-export the shared
+> impl + widen `ddrm-envelope`'s surface: `pub signed_payload`, raw-type re-exports), then
+> wire the dev orchestration smoke (`drm/open → rights → key (reference) → decrypt`).
 
 > **🔑 Day 51 — reference key-authority seal engine + shared `ddrm-envelope` crate (Phase A.2, LANDED).**
 > The first backend that produces real sealed material. New shared crate

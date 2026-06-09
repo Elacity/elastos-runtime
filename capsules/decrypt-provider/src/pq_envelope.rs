@@ -1328,4 +1328,61 @@ mod tests {
             }
         }
     }
+
+    // --- cross-capsule equivalence guard (feature = "envelope-conformance") ----
+    //
+    // Phase A.3 drift guard. The key authority seals CEKs with the shared
+    // `ddrm-envelope` crate; THIS provider opens them with its own in-tree
+    // PQ-hybrid unwrap. The two impls are byte-for-byte siblings today, but nothing
+    // structural stops them drifting until the full dedup lands — so pin the actual
+    // contract that matters: the shared seal must remain wire- AND crypto-decodable
+    // by this provider's unwrap, transcript-bound, with no CEK on the wire.
+    // `ddrm-envelope` is a dev-only dependency here; the shipped capsule never links
+    // it. This is also the literal key->decrypt cross-capsule handoff proof.
+
+    /// `ddrm-envelope` (key authority) SEALS -> decrypt-provider OPENS. Sealed bytes
+    /// from the shared crate decode through THIS provider's `PqSealedEnvelope::from_bytes`
+    /// and unwrap (transcript-bound) to the exact CEK; a mismatched transcript fails
+    /// closed; the raw CEK never appears on the shared wire form.
+    #[cfg(feature = "envelope-conformance")]
+    #[test]
+    fn ddrm_envelope_seal_interops_with_decrypt_unwrap() {
+        // This provider mints + publishes the decrypt-session public key.
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+
+        // The key authority (shared crate) reconstructs that published key and seals
+        // a CEK to it, transcript-bound, signed by a real ML-DSA-65 seal key.
+        let auth_public = ddrm_envelope::session_public_from_bytes(&pub_bytes)
+            .expect("decrypt-session public key crosses the capsule boundary");
+        let (signer, vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x5Au8; 32]);
+        let cek = [0x42u8; 16];
+        let aad = b"elastos-ddrm/conformance/transcript-v1";
+        let sealed = ddrm_envelope::seal::seal_bound(&auth_public, &cek, aad, &signer);
+        let wire = sealed.to_bytes();
+
+        // This provider opens it with its OWN decode + verifier + unwrap.
+        let env = PqSealedEnvelope::from_bytes(&wire).expect("shared wire form decodes here");
+        let verifier =
+            mldsa::MlDsa65Verifier::from_encoded(&vk).expect("authority vk builds a verifier");
+        let recovered = hybrid_unwrap_bound(&secret, &env, aad, &verifier)
+            .expect("the shared seal opens under this provider's unwrap");
+        assert_eq!(
+            recovered.as_slice(),
+            &cek,
+            "the shared crate and this provider must agree on the recovered CEK"
+        );
+
+        // Transcript binding holds across the boundary: a different AAD fails closed.
+        assert!(
+            hybrid_unwrap_bound(&secret, &env, b"different-transcript", &verifier).is_err(),
+            "a mismatched transcript must fail closed across the capsule boundary"
+        );
+
+        // Containment survives the boundary: no raw CEK on the shared wire form.
+        assert!(
+            !wire.windows(cek.len()).any(|w| w == cek),
+            "the shared seal must not leak the raw CEK on the wire"
+        );
+    }
 }

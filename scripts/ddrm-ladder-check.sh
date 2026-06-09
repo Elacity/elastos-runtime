@@ -48,6 +48,7 @@ LADDER=(
   "decrypt-provider vectors|decrypt-provider|vectors|42"
   "decrypt-provider rail-shim|decrypt-provider|rail-shim|45"
   "decrypt-provider pq-mldsa|decrypt-provider|pq-mldsa|34"
+  "decrypt-provider envelope-conformance|decrypt-provider|envelope-conformance|35"
   "decrypt-provider pq-mldsa-hybrid|decrypt-provider|pq-mldsa-hybrid|37"
   "decrypt-provider rail-shim-mldsa|decrypt-provider|rail-shim-mldsa|54"
   "decrypt-provider harden|decrypt-provider|harden|65"

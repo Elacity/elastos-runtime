@@ -105,6 +105,13 @@ vectors = ["pq-rail-prep"]
 # gen-vectors: regenerate the committed golden vectors (writes tests/vectors/).
 # Run manually: `cargo test --features gen-vectors emit_`. OFF by default.
 gen-vectors = ["vectors"]
+# envelope-conformance: cross-capsule equivalence guard (Phase A.3). Proves the
+# shared `ddrm-envelope` crate (the key authority's seal) and this provider's
+# in-tree PQ-hybrid unwrap are wire- AND crypto-interoperable in BOTH directions —
+# so the two cannot silently drift while the full dedup migration is pending. Adds
+# one test under `pq-mldsa`; pulls `ddrm-envelope` (dev-dep) only for the guard.
+# OFF by default — the shipped build never links the shared crate here.
+envelope-conformance = ["pq-mldsa"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
@@ -142,6 +149,10 @@ getrandom = { version = "0.2", optional = true }
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
 getrandom = "0.2"
+# Cross-capsule equivalence guard only (feature `envelope-conformance`). The shared
+# PQ-hybrid crate the key authority seals with — proven here to interoperate with
+# this provider's in-tree unwrap. Dev-only: never linked into the shipped capsule.
+ddrm-envelope = { path = "../ddrm-envelope" }
 
 [profile.release]
 opt-level = "s"

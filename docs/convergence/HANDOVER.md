@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 51).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-51 reference key-authority seal + shared `ddrm-envelope`, ~57 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 52).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-52 cross-capsule equivalence guard — `ddrm-envelope` seal proven interoperable with `decrypt-provider`'s in-tree unwrap, ~58 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -512,11 +512,20 @@ current/target architecture map and the phased road to a testable end-to-end —
 a pluggable multi-backend authority (A.1); Day 51 landed the **reference seal engine**
 + the shared **`ddrm-envelope`** crate (A.2) — the reference authority now seals a CEK
 to a decrypt session's published key and the decrypt boundary's exact unwrap opens it
-(cross-boundary proof). Next, in order:
-- **Phase A.3** — migrate `decrypt-provider` onto `ddrm-envelope` (pure refactor, gated
-  by the committed goldens) to delete the duplicated crypto and yield the literal
-  cross-capsule golden; then wire the orchestration `drm/open → rights → key → decrypt`
-  default-on for a dev profile so the consumer half runs end-to-end without Lit/dKMS.
+(cross-boundary proof). Day 52 landed the **cross-capsule equivalence guard** (A.3,
+feature `envelope-conformance`): the shared crate's seal is proven wire- AND
+crypto-interoperable with `decrypt-provider`'s OWN in-tree unwrap (real key→decrypt
+direction, transcript-bound, no CEK on the wire) — so the two impls **cannot silently
+drift** while the duplication remains. Next, in order:
+- **Phase A.3b** — complete the dedup *behind that guard*: re-export the shared impl from
+  `decrypt-provider::pq_envelope` and widen `ddrm-envelope`'s surface where the existing
+  tests need it (`pub signed_payload`, raw-type re-exports). Deferred from a single
+  rip-out because the decrypt PQ tests are bound to the concrete crypto types (they build
+  `PqSealedEnvelope` literals, touch raw `ml-kem`/`x25519`, call private `signed_payload`);
+  the guard now makes that migration safe — it must keep passing.
+- **Phase A.4** — wire the orchestration `drm/open → rights → key (reference) → decrypt`
+  for a dev profile so the consumer half runs end-to-end without Lit/dKMS (needs a shared
+  decrypt-transcript `to_aad` so the authority and decrypt agree on the binding).
 - **Phase B** — point `rights-provider` at `chain-provider::has_access_by_content_id`
   for real Base validation with the wallet.
 
