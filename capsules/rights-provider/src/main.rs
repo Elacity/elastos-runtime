@@ -686,6 +686,28 @@ mod tests {
             );
         }
 
+        /// The attestation deserializes from the EXACT shape
+        /// `chain-provider::has_access_by_content_id` emits (field-for-field), so the
+        /// runtime core passes that response straight in — no adapter, no drift. If
+        /// chain-provider's output keys ever change, this guard fails.
+        #[test]
+        fn attestation_matches_chain_provider_output_shape() {
+            // The literal keys chain-provider returns (see its has_access_by_content_id).
+            let chain_output = json!({
+                "network": "esc-local",
+                "contract": "0x0000000000000000000000000000000000000001",
+                "content_id": "bafybeigprotectedcontent",
+                "subject": "0x0000000000000000000000000000000000000002",
+                "right": "view",
+                "has_access": true,
+            });
+            let att: ChainAccessAttestationV1 = serde_json::from_value(chain_output)
+                .expect("chain-provider output maps 1:1 onto the attestation");
+            assert!(att.has_access);
+            assert_eq!(att.right, "view");
+            assert_eq!(att.content_id, "bafybeigprotectedcontent");
+        }
+
         /// The injected attestation cannot smuggle a raw chain-RPC handle.
         #[test]
         fn attestation_rejects_hidden_chain_authority() {

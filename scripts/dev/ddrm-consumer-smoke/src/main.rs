@@ -56,6 +56,17 @@ const GOLDEN_CEK_B64: &str = "EREREREREREREREREREREQ==";
 const GOLDEN_CIPHERTEXT_B64: &str = "AAAAPG1vb2YAAAA0dHJhZgAAABR0cnVuAAACAAAAAAEAAAAgAAAAGHNlbmMAAAAAAAAAASIiIiIiIiIiAAAAKG1kYXScNDPiT64BF0MfL13dprDn+6eX7LyGcmlu1lMPPiQQpA==";
 const EXPECTED_SAMPLE_COUNT: u64 = 1;
 
+/// The content identity carried across the WHOLE chain (the chain ownership query,
+/// the rights binding, and the decrypt transcript). Defaults to the golden's CID for
+/// the offline smoke; a live run overrides it with the on-chain contentId/KID the
+/// AuthorityGateway actually answers for (`DDRM_SMOKE_CONTENT_ID`).
+fn cid() -> String {
+    std::env::var("DDRM_SMOKE_CONTENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| OBJECT_CID.to_string())
+}
+
 /// A live capsule process driven over its stdin/stdout JSON line protocol.
 struct Capsule {
     name: String,
@@ -114,13 +125,13 @@ fn decrypt_request() -> Value {
         "request_id": "decrypt:consumer-smoke",
         "principal_id": PRINCIPAL,
         "session_id": SESSION,
-        "object_cid": OBJECT_CID,
+        "object_cid": cid(),
         "action": ACTION,
         "viewer_interface": VIEWER,
         "release_receipt": {
             "schema": RR_SCHEMA,
             "request_id": RR_REQUEST_ID,
-            "object_cid": OBJECT_CID,
+            "object_cid": cid(),
             "principal_id": PRINCIPAL,
             "session_id": SESSION,
             "action": ACTION,
@@ -139,19 +150,19 @@ fn rights_access_request() -> Value {
     json!({
         "principal_id": PRINCIPAL,
         "session_id": SESSION,
-        "content_id": OBJECT_CID,
+        "content_id": cid(),
         "right": ACTION,
         "reason": "open protected document",
     })
 }
 
 /// A mocked on-chain ownership answer (stands in for `chain-provider::has_access_by_
-/// content_id`; no live RPC in the smoke). `has_access: true` => owned.
+/// content_id`; used on the offline path). `has_access: true` => owned.
 fn owned_chain_attestation() -> Value {
     json!({
         "network": "base",
         "contract": "0x00000000000000000000000000000000000000aa",
-        "content_id": OBJECT_CID,
+        "content_id": cid(),
         "subject": "0x00000000000000000000000000000000000000bb",
         "right": ACTION,
         "has_access": true,
@@ -163,7 +174,7 @@ fn fallback_rights_receipt() -> Value {
     json!({
         "schema": "elastos.rights.decision.receipt/v1",
         "request_id": "rights:smoke",
-        "content_id": OBJECT_CID,
+        "content_id": cid(),
         "principal_id": PRINCIPAL,
         "session_id": SESSION,
         "right": ACTION,
@@ -180,7 +191,7 @@ fn key_release_request(rights_receipt: Value) -> Value {
         "request_id": RR_REQUEST_ID,
         "principal_id": PRINCIPAL,
         "session_id": SESSION,
-        "object_cid": OBJECT_CID,
+        "object_cid": cid(),
         "action": ACTION,
         "rights_receipt": rights_receipt,
         "key_envelope": {
@@ -203,10 +214,11 @@ fn key_release_request(rights_receipt: Value) -> Value {
 /// Rebuild the canonical decrypt-transcript AAD exactly as the decrypt boundary will,
 /// using the SHARED `ddrm-envelope` encoder (no parallel definition).
 fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<u8> {
+    let c = cid();
     let receipt_hash = release_receipt_hash(
         RR_SCHEMA,
         RR_REQUEST_ID,
-        OBJECT_CID,
+        &c,
         PRINCIPAL,
         SESSION,
         ACTION,
@@ -220,7 +232,7 @@ fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<
         provider_id: "decrypt-provider",
         principal_id: PRINCIPAL,
         session_id: SESSION,
-        object_cid: OBJECT_CID,
+        object_cid: &c,
         content_hash,
         action: ACTION,
         viewer_interface: VIEWER,
@@ -237,11 +249,87 @@ fn step(n: u32, msg: &str) {
     println!("  [{n}] {msg}");
 }
 
+/// Resolve the on-chain ownership answer. Live (`DDRM_SMOKE_CHAIN_RPC` set + a
+/// chain-provider binary supplied) drives the REAL `chain-provider` against Base;
+/// otherwise a mocked-owned attestation keeps the offline smoke deterministic.
+/// Returns `(attestation, mode_label)`.
+fn chain_attestation(chain_bin: Option<&String>) -> Result<(Value, String), String> {
+    let rpc = std::env::var("DDRM_SMOKE_CHAIN_RPC").ok().filter(|s| !s.is_empty());
+    match (rpc, chain_bin) {
+        (Some(rpc_url), Some(bin)) => Ok((live_chain_attestation(bin, &rpc_url)?, "live chain".to_string())),
+        (Some(_), None) => Err("DDRM_SMOKE_CHAIN_RPC is set but no chain-provider binary was supplied".to_string()),
+        _ => Ok((owned_chain_attestation(), "mocked owned".to_string())),
+    }
+}
+
+/// Drive the real `chain-provider` for a live `has_access_by_content_id` query, and
+/// return its response shaped as the rights attestation (1:1 by field name). All the
+/// network/contract/subject inputs come from the environment so nothing is hard-coded.
+fn live_chain_attestation(bin: &str, rpc_url: &str) -> Result<Value, String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let network = env("DDRM_SMOKE_CHAIN_NETWORK").unwrap_or_else(|| "base".to_string());
+    let contract = env("DDRM_SMOKE_CHAIN_CONTRACT")
+        .ok_or("DDRM_SMOKE_CHAIN_CONTRACT (AuthorityGateway address) is required for a live chain check")?;
+    let selector = env("DDRM_SMOKE_CHAIN_SELECTOR")
+        .ok_or("DDRM_SMOKE_CHAIN_SELECTOR (has_access selector, e.g. 0x........) is required for a live chain check")?;
+    let subject = env("DDRM_SMOKE_CHAIN_SUBJECT")
+        .ok_or("DDRM_SMOKE_CHAIN_SUBJECT (your wallet address) is required for a live chain check")?;
+    let chain_id: i64 = env("DDRM_SMOKE_CHAIN_ID").and_then(|s| s.parse().ok()).unwrap_or(8453);
+
+    let mut chain = Capsule::spawn("chain-provider", bin)?;
+    ok_data(
+        &chain.call(&json!({
+            "op": "init",
+            "config": { "networks": [{
+                "id": network,
+                "display_name": network,
+                "kind": "evm_json_rpc",
+                "chain_id": chain_id,
+                "native_symbol": "ETH",
+                "provider": "ddrm-consumer-smoke",
+                "mainnet": true,
+                "explorer_url": null,
+                "rpc_url": rpc_url,
+                "rights_methods": [{
+                    "id": "has_access_by_content_id",
+                    "contract": contract,
+                    "abi": "has_access_by_content_id_string_address_string",
+                    "selector": selector,
+                }]
+            }]}
+        }))?,
+        "chain init",
+    )?;
+    let resp = ok_data(
+        &chain.call(&json!({
+            "op": "has_access_by_content_id",
+            "network": network,
+            "contract": contract,
+            "content_id": cid(),
+            "subject": subject,
+            "right": ACTION,
+        }))?,
+        "chain has_access_by_content_id",
+    )?;
+    chain.shutdown();
+
+    // chain-provider's response IS the attestation shape rights-provider consumes.
+    Ok(json!({
+        "network": resp["network"],
+        "contract": resp["contract"],
+        "content_id": resp["content_id"],
+        "subject": resp["subject"],
+        "right": resp["right"],
+        "has_access": resp["has_access"],
+    }))
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let key_bin = args.first().ok_or("missing <key-provider-bin>")?;
     let decrypt_bin = args.get(1).ok_or("missing <decrypt-provider-bin>")?;
     let drm_bin = args.get(2);
     let rights_bin = args.get(3);
+    let chain_bin = args.get(4);
 
     println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt) ==");
 
@@ -257,6 +345,11 @@ fn run(args: &[String]) -> Result<(), String> {
     // RightsDecisionReceiptV1 via the REAL rights-provider (feature `chain-rights`).
     // The receipt then gates the key release. Falls back to a hardcoded receipt only
     // when no rights binary is supplied.
+    // Resolve the on-chain ownership answer: a live `chain-provider` call when the
+    // DDRM_SMOKE_CHAIN_* env is set (your wallet vs the AuthorityGateway on Base),
+    // otherwise a mocked-owned attestation so the offline smoke is deterministic.
+    let (attestation, chain_mode) = chain_attestation(chain_bin)?;
+
     let rights_receipt = if let Some(bin) = rights_bin {
         let mut rights = Capsule::spawn("rights-provider", bin)?;
         ok_data(&rights.call(&json!({ "op": "status" }))?, "rights status")?;
@@ -265,17 +358,19 @@ fn run(args: &[String]) -> Result<(), String> {
                 "op": "decide_access_from_chain",
                 "request_id": RR_REQUEST_ID,
                 "request": rights_access_request(),
-                "chain_access": owned_chain_attestation(),
+                "chain_access": attestation,
                 "now_unix": RR_ISSUED_AT,
                 "ttl_secs": EXPIRES_AT - RR_ISSUED_AT,
             }))?,
             "rights decide_access_from_chain",
         )?;
         if decision["decision"].as_str() != Some("allowed") {
-            return Err(format!("rights did not allow owned content: {decision}"));
+            return Err(format!(
+                "rights did not allow this content ({chain_mode}); the chain says you do not own it: {decision}"
+            ));
         }
         rights.shutdown();
-        step(2, "rights-provider: on-chain ownership -> allowed; typed receipt issued");
+        step(2, &format!("rights-provider: on-chain ownership ({chain_mode}) -> allowed; typed receipt issued"));
         decision["receipt"].clone()
     } else {
         fallback_rights_receipt()

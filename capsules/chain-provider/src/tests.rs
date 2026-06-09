@@ -870,6 +870,63 @@ fn has_access_by_content_id_calls_configured_typed_rights_abi() {
 }
 
 #[test]
+fn has_access_by_content_id_decodes_unowned_as_false() {
+    // The AuthorityGateway returns ABI-encoded `false` for content the subject does
+    // NOT own — the rights step must surface that as a real `has_access: false`
+    // (which downstream becomes a `denied` rights receipt), not an error.
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        "bafybeigprotectedcontent",
+        "0x0000000000000000000000000000000000000002",
+        "view",
+    )
+    .unwrap();
+    let rpc_url = spawn_eth_call_server(
+        expected_data,
+        json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+    );
+    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+
+    let data = ok_data(provider.handle(Request::HasAccessByContentId {
+        network: "esc-local".to_string(),
+        contract: "0x0000000000000000000000000000000000000001".to_string(),
+        content_id: "bafybeigprotectedcontent".to_string(),
+        subject: "0x0000000000000000000000000000000000000002".to_string(),
+        right: "view".to_string(),
+    }));
+
+    assert_eq!(data["has_access"], false);
+}
+
+#[test]
+fn has_access_by_content_id_fails_closed_on_malformed_bool() {
+    // A non-boolean ABI word (here the high bytes are non-zero) must fail closed —
+    // never silently coerced to true/false. The decrypt chain depends on this answer.
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        "bafybeigprotectedcontent",
+        "0x0000000000000000000000000000000000000002",
+        "view",
+    )
+    .unwrap();
+    let rpc_url = spawn_eth_call_server(
+        expected_data,
+        json!("0x00000000000000000000000000000000000000000000000000000000000000ff"),
+    );
+    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+
+    let response = provider.handle(Request::HasAccessByContentId {
+        network: "esc-local".to_string(),
+        contract: "0x0000000000000000000000000000000000000001".to_string(),
+        content_id: "bafybeigprotectedcontent".to_string(),
+        subject: "0x0000000000000000000000000000000000000002".to_string(),
+        right: "view".to_string(),
+    });
+
+    assert_eq!(error_code(response), "upstream_invalid_bool");
+}
+
+#[test]
 fn has_access_by_content_id_rejects_unconfigured_contract_before_backend() {
     let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
     let response = provider.handle(Request::HasAccessByContentId {

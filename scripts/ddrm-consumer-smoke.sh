@@ -42,7 +42,7 @@ build key-provider --features key-authority-ref
 # session mint + publish at init. The consumer half needs both.
 build decrypt-provider --features rail-material,rail-mint
 build drm-provider
-# chain-rights: render the (mocked) on-chain ownership answer into a typed receipt.
+# chain-rights: render the on-chain ownership answer into a typed receipt.
 build rights-provider --features chain-rights
 
 KEY_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
@@ -57,13 +57,35 @@ for bin in "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN"; do
   fi
 done
 
+# Optional live wallet-ownership check: when DDRM_SMOKE_CHAIN_RPC is set we build and
+# pass the REAL chain-provider so the rights step queries the AuthorityGateway on Base
+# (your wallet vs the content's contentId). Offline (default) the orchestrator uses a
+# deterministic mocked-owned attestation and chain-provider is never built/spawned.
+#   DDRM_SMOKE_CHAIN_RPC=https://...   (required to enable live mode)
+#   DDRM_SMOKE_CHAIN_CONTRACT=0x...    AuthorityGateway address
+#   DDRM_SMOKE_CHAIN_SELECTOR=0x...    has_access selector
+#   DDRM_SMOKE_CHAIN_SUBJECT=0x...     your wallet address
+#   DDRM_SMOKE_CONTENT_ID=...          on-chain contentId/KID (defaults to golden CID)
+#   DDRM_SMOKE_CHAIN_NETWORK=base  DDRM_SMOKE_CHAIN_ID=8453   (optional)
+CHAIN_ARG=()
+if [[ -n "${DDRM_SMOKE_CHAIN_RPC:-}" ]]; then
+  build chain-provider
+  CHAIN_BIN="${CAPSULES}/chain-provider/target/debug/chain-provider"
+  if [[ ! -x "$CHAIN_BIN" ]]; then
+    echo "FAIL: missing built binary ${CHAIN_BIN}" >&2
+    exit 1
+  fi
+  CHAIN_ARG=("$CHAIN_BIN")
+  echo "live chain mode: querying ${DDRM_SMOKE_CHAIN_RPC}"
+fi
+
 echo
 echo "=============================================================="
 echo " Orchestrating the chain"
 echo "=============================================================="
 
 cargo run --quiet --manifest-path "${ORCH}/Cargo.toml" -- \
-  "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN"
+  "$KEY_BIN" "$DECRYPT_BIN" "$DRM_BIN" "$RIGHTS_BIN" ${CHAIN_ARG[@]+"${CHAIN_ARG[@]}"}
 status=$?
 
 echo

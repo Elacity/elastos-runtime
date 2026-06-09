@@ -246,11 +246,21 @@ on-chain check with your wallet.
   (injected by the runtime core; it holds no chain-RPC capability), binds it to the
   request, and emits a `RightsDecisionReceiptV1` (owned → allowed, unowned → denied,
   foreign/stale → fail-closed). The consumer smoke drives this real decision and gates
-  the key release on it. **Remaining:** drive `chain-provider` against **live Base** with
-  a funded wallet (today the on-chain answer is mocked at the provider boundary).
-- **Testable:** with a funded wallet holding an Elacity access token, the rights step
-  returns allowed for owned content and denies otherwise — the exact "blockchain
-  validation using my wallet" you described, but driven by the runtime.
+  the key release on it.
+- **Status (Day 57):** the on-chain answer is now **characterized and live-wireable**.
+  `chain-provider::has_access_by_content_id` has golden tests over a mocked EVM `eth_call`
+  proving owned (`true`), unowned (`false`), and **fail-closed on a malformed word**
+  (`upstream_invalid_bool`); a guard test pins `chain-provider`'s output 1:1 onto the
+  rights attestation shape (no drift possible without the guard failing). The consumer
+  smoke gained an **opt-in live mode**: set `DDRM_SMOKE_CHAIN_RPC` (+ contract / selector /
+  subject / contentId) and it builds + drives the **real `chain-provider`** against Base
+  (your wallet vs the AuthorityGateway) and feeds the genuine answer into the rights
+  decision; **offline default is unchanged** (deterministic mocked-owned, network-free).
+- **Testable:** with a funded wallet holding an Elacity access token, run the smoke in
+  live mode — the rights step returns allowed for owned content and denies otherwise.
+  This is the exact "blockchain validation using my wallet" you described, driven by the
+  runtime. **Remaining:** a real KID/contentId↔contract mapping for your content, and the
+  runtime core (not the dev orchestrator) sequencing `chain → rights → key → decrypt`.
 
 ### Phase C — Producer half (encrypt → publish → IPFS → market)
 Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a

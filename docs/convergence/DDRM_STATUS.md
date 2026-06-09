@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~62 commits**, tip Day-56 Phase B — `rights-provider` now renders a real on-chain ownership answer (`chain-provider::has_access_by_content_id`) into a typed `RightsDecisionReceiptV1`, and the consumer smoke is gated by it: `rights(allowed) → key → decrypt`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~63 commits**, tip Day-57 Phase B cont. — the on-chain ownership answer is now characterized at the RPC boundary (`chain-provider::has_access_by_content_id` decodes owned/unowned/malformed via a mocked `eth_call`), its output shape is pinned 1:1 to `rights-provider`'s attestation, and the consumer smoke gained an **opt-in live mode** that drives the real `chain-provider` against Base for a true wallet-ownership check). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,27 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🔗 Day 57 — the on-chain ownership answer is real & verifiable end to end (Phase B cont., LANDED).**
+> Day 56 made `rights` consume a typed attestation; Day 57 makes that attestation
+> trustworthy and wires the live wallet check. (1) **Characterized the chain-provider
+> RPC boundary:** `has_access_by_content_id` now has golden tests that mock the EVM
+> `eth_call` and prove it decodes the AuthorityGateway word into `has_access: true`
+> (owned) **and** `has_access: false` (unowned), and **fails closed** (`upstream_invalid_bool`)
+> on a malformed/non-boolean word — never silently coerced. (2) **Pinned the shape
+> end to end:** a guard test proves `chain-provider`'s exact output keys deserialize
+> 1:1 into `rights-provider`'s `ChainAccessAttestationV1` (rights `chain-rights`=18) —
+> if chain-provider's output drifts, the guard fails (no shared-crate change needed, so
+> the frozen contract surface + drift gate stay untouched). (3) **Opt-in live smoke:**
+> with `DDRM_SMOKE_CHAIN_RPC` (+ contract/selector/subject/contentId) set, the consumer
+> smoke builds and drives the **real `chain-provider`** against Base — your wallet vs the
+> AuthorityGateway — and feeds the genuine answer into the rights decision; **offline
+> (default) is unchanged**, deterministic mocked-owned, network-free. The smoke's content
+> identity (`cid()`) now flows consistently through the chain query, the rights binding,
+> and the decrypt transcript. **Gate:** smoke PASS (offline), full ladder INTACT, drift PASS,
+> no new warnings. **What's still dev-shaped:** the runtime core that sequences
+> `chain → rights → key → decrypt` is still the orchestrator; the producer half does not
+> exist yet. **Next (Phase C):** the producer half — `encrypt → publish → IPFS → market`.
 
 > **⛓️ Day 56 — real on-chain ownership gates the rights step (Phase B, LANDED).**
 > The `rights` step is no longer a stub: behind a `chain-rights` dev profile,

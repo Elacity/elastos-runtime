@@ -38,7 +38,7 @@ LADDER=(
   "encrypt-provider (default)|encrypt-provider||13"
   "drm-provider (default)|drm-provider||12"
   "rights-provider (default)|rights-provider||9"
-  "rights-provider chain-rights|rights-provider|chain-rights|17"
+  "rights-provider chain-rights|rights-provider|chain-rights|18"
   "ddrm-envelope (lib)|ddrm-envelope||12"
   "key-provider (default)|key-provider||18"
   "key-provider key-authority-ref|key-provider|key-authority-ref|25"
