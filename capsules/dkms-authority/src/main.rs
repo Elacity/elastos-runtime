@@ -53,6 +53,15 @@ const KEY_STORE_ENV: &str = "DKMS_AUTHORITY_KEY_STORE";
 #[cfg(unix)]
 const ALLOWED_CALLERS_ENV: &str = "DKMS_AUTHORITY_ALLOWED_CALLERS";
 
+/// Env var carrying the node's pinned OPERATOR identity (Day 109–112): the base64 ML-DSA verifying
+/// key whose signatures authorize the node's LIFECYCLE operations — a share-wise `rotate_share`
+/// (re-escrow this node's share to a successor, refreshed) and a live `revoke_caller`. The
+/// OPERATOR/PROVISIONER who launches the daemon sets it; the connecting client cannot override it.
+/// When unset, BOTH lifecycle ops fail closed (`not_configured`) — a node with no pinned operator
+/// can never be rotated or instructed to revoke by anyone.
+#[cfg(unix)]
+const OPERATOR_VK_ENV: &str = "DKMS_AUTHORITY_OPERATOR_VK";
+
 /// How long a session token the node mints at `hello` stays live (seconds). A long-lived node only
 /// recovers for a caller whose handshake session is still within this window — a short, bounded
 /// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
@@ -168,6 +177,37 @@ enum Request {
         #[serde(default)]
         now_unix: Option<u64>,
     },
+    /// SHARE-WISE ROTATION (Day 109–112): re-escrow THIS node's current share to a SUCCESSOR node,
+    /// refreshed by an operator-sealed XOR delta — the whole CEK is NEVER reassembled anywhere
+    /// during rotation (each node rotates only ITS OWN share). The delta envelope is sealed to this
+    /// node's escrow recipient, SIGNED by the pinned operator identity, and AEAD-bound to
+    /// `rotation_aad(kid16, this_node_recipient, successor_recipient)` — so a forged/tampered
+    /// delta, a non-operator instruction, or a successor-redirect all fail the unwrap fail-closed.
+    /// PC2 has no analogue: its "rotation" is a manual constant redeploy that can never migrate
+    /// existing content (`chipotle-client.ts:125`/`:1043`/`:1064`).
+    RotateShare {
+        /// This node's CURRENT escrowed share (the producer's — or a prior rotation's — envelope).
+        wrapped_cek_b64: String,
+        scheme: String,
+        kid_hex: String,
+        /// The key that signed the CURRENT escrow (the producer at first publish; the PREVIOUS
+        /// node after an earlier rotation).
+        producer_vk_b64: String,
+        /// The successor node's published escrow recipient — the rotated share is sealed to it.
+        successor_recipient_pub_b64: String,
+        /// The operator-sealed refresh delta (a `PqSealedEnvelope`, base64).
+        delta_envelope_b64: String,
+    },
+    /// LIVE CALLER REVOCATION (Day 109–112): remove a caller from service at runtime, no restart.
+    /// Requires an operator signature over the caller's verifying key (`sign_revocation`); once
+    /// revoked, the caller's next `hello` AND any `recover` under a still-live session token are
+    /// refused — revocation outranks a live session. The runtime-core analogue of PC2's revoked
+    /// delegation nonce read back per request (`secureViewSession.ts:108`–`:112`), except the
+    /// signed instruction reaches the KEY-HOLDING NODE itself, not just an HTTP middleware.
+    RevokeCaller {
+        caller_pub_b64: String,
+        operator_sig_b64: String,
+    },
     Shutdown,
 }
 
@@ -275,6 +315,16 @@ struct DkmsAuthorityNode {
     /// session also requires a fresh `hello` + possession proof, so cross-connection replay is
     /// already blocked by the caller-bound token).
     last_recover_seq: u64,
+    /// The pinned OPERATOR identity (Day 109–112): the decoded ML-DSA verifying key whose
+    /// signatures authorize `rotate_share` + `revoke_caller`. Set by the OPERATOR at daemon start
+    /// (env), never by the connecting client. `None` = lifecycle ops fail closed.
+    operator_vk: Option<Vec<u8>>,
+    /// Callers REVOKED at runtime (Day 109–112): their `hello` is refused and a `recover` under a
+    /// still-live session token is refused (revocation outranks a live session). Daemon-lifetime
+    /// state shared across connections (a revoked caller stays revoked on the next connection).
+    /// In-memory like PC2's `revokedDelegations` map (`utils/secureViewSession.ts:374`) — a node
+    /// restart clears it, at which point the operator's allow-list is the standing gate.
+    revoked_callers: Vec<Vec<u8>>,
 }
 
 impl DkmsAuthorityNode {
@@ -326,6 +376,24 @@ impl DkmsAuthorityNode {
                 recover_seq,
                 now_unix,
             }),
+            Request::RotateShare {
+                wrapped_cek_b64,
+                scheme,
+                kid_hex,
+                producer_vk_b64,
+                successor_recipient_pub_b64,
+                delta_envelope_b64,
+            } => self.rotate_share(
+                &wrapped_cek_b64,
+                &scheme,
+                &kid_hex,
+                &producer_vk_b64,
+                &successor_recipient_pub_b64,
+                &delta_envelope_b64,
+            ),
+            Request::RevokeCaller { caller_pub_b64, operator_sig_b64 } => {
+                self.revoke_caller(&caller_pub_b64, &operator_sig_b64)
+            }
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -377,6 +445,14 @@ impl DkmsAuthorityNode {
                     "caller identity is not on this node's allow-list (provision the caller's verifying key)",
                 );
             }
+        }
+        // REVOCATION GATE (Day 109–112): a caller the operator revoked at runtime is refused at the
+        // handshake even though it is still on the allow-list — no new session is ever minted for it.
+        if self.revoked_callers.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
+            return Response::error(
+                "caller_revoked",
+                "caller identity has been revoked by the operator — this node no longer serves it",
+            );
         }
         // ENCRYPTED CHANNEL (Day 105–108): when the caller offers a channel KEM key, validate it
         // up-front (fail-closed: a malformed key never half-establishes a channel) and ATTEST the
@@ -475,7 +551,7 @@ impl DkmsAuthorityNode {
             "provider": "dkms-authority",
             "version": PROVIDER_VERSION,
             "configured": self.authority.is_some(),
-            "supported_operations": ["status", "init", "hello", "recover"],
+            "supported_operations": ["status", "init", "hello", "recover", "rotate_share", "revoke_caller"],
             // The node NEVER returns these — the master + raw CEK stay inside this boundary.
             "blocked_authority": ["raw_cek", "master_seed", "recipient_secret"],
         }))
@@ -516,7 +592,20 @@ impl DkmsAuthorityNode {
                 )
             }
         };
-        // SESSION GATE FIRST — refuse to recover without a live, node-verified handshake session
+        // REVOCATION OUTRANKS A LIVE SESSION (Day 109–112): a caller the operator revoked is refused
+        // even when its session token is valid + unexpired — the cutoff is immediate, not "at the
+        // next handshake". Checked FIRST, before any signature work. (PC2's analogue: the revoked
+        // delegation nonce is read back per request BEFORE the session view is resurrected,
+        // `secureViewSession.ts:104`–`:112`.)
+        if let Ok(token_caller) = b64().decode(&args.session_token.caller_pub_b64) {
+            if self.revoked_callers.iter().any(|vk| vk.as_slice() == token_caller.as_slice()) {
+                return Response::error(
+                    "caller_revoked",
+                    "caller identity has been revoked by the operator — a live session does not outrank a revocation",
+                );
+            }
+        }
+        // SESSION GATE — refuse to recover without a live, node-verified handshake session
         // (the channel gate), before re-authorizing or touching any key material.
         if let Err(err) = verify_session(authority, args) {
             return Response::error("session_invalid", err);
@@ -584,6 +673,191 @@ impl DkmsAuthorityNode {
             "material": material,
             "seal_verifying_key_b64": b64().encode(&authority.verifying_key),
         }))
+    }
+
+    /// SHARE-WISE ROTATION (Day 109–112): unwrap THIS node's escrowed share, XOR it with the
+    /// operator-sealed refresh delta, and re-escrow the REFRESHED share to the successor node —
+    /// all inside this boundary. The share, the delta and the refreshed share live only in
+    /// `Zeroizing`; the response carries ONLY the new sealed envelope (+ this node's vk, which is
+    /// the rotated escrow's producer identity the successor will verify at recover time).
+    ///
+    /// Authorization is the OPERATOR SEAL, checked FIRST: the delta envelope must open under this
+    /// node's recipient secret, VERIFY under the pinned operator identity, and be AEAD-bound to
+    /// `rotation_aad(kid16, this_node_recipient, successor_recipient)` — so a non-operator
+    /// instruction, a tampered delta, a kid-swap, or a successor-redirect all fail closed BEFORE
+    /// any share material is touched. No pinned operator → rotation is impossible on this node.
+    fn rotate_share(
+        &self,
+        wrapped_cek_b64: &str,
+        scheme: &str,
+        kid_hex: &str,
+        producer_vk_b64: &str,
+        successor_recipient_pub_b64: &str,
+        delta_envelope_b64: &str,
+    ) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "dkms-authority node is not initialized (send `init` first)",
+                )
+            }
+        };
+        let operator_vk = match self.operator_vk.as_ref() {
+            Some(vk) => vk,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "this node has no pinned operator identity — rotation is refused (provision DKMS_AUTHORITY_OPERATOR_VK)",
+                )
+            }
+        };
+        let operator_verifier = match ddrm_envelope::MlDsa65Verifier::from_encoded(operator_vk) {
+            Some(v) => v,
+            None => return Response::error("not_configured", "pinned operator identity is malformed"),
+        };
+        let kid16 = match decode_kid_bytes16(kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        let successor_bytes = match b64().decode(successor_recipient_pub_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Response::error(
+                    "invalid_request",
+                    "successor_recipient_pub_b64 is not valid base64",
+                )
+            }
+        };
+        let successor_public = match ddrm_envelope::session_public_from_bytes(&successor_bytes) {
+            Some(public) => public,
+            None => {
+                return Response::error(
+                    "invalid_request",
+                    "successor_recipient_pub_b64 is not a valid escrow recipient key",
+                )
+            }
+        };
+        // OPERATOR AUTHORIZATION FIRST: open the delta under this node's recipient secret, verified
+        // under the pinned operator identity, AEAD-bound to the full rotation context. Any mismatch
+        // (forged signer / tampered bytes / wrong kid / wrong source node / redirected successor)
+        // fails here, before the share is unwrapped.
+        let delta = {
+            let env = match b64()
+                .decode(delta_envelope_b64)
+                .ok()
+                .and_then(|bytes| ddrm_envelope::PqSealedEnvelope::from_bytes(&bytes).ok())
+            {
+                Some(env) => env,
+                None => {
+                    return Response::error(
+                        "invalid_request",
+                        "delta_envelope_b64 is not a valid sealed envelope",
+                    )
+                }
+            };
+            let aad =
+                ddrm_envelope::rotation_aad(&kid16, &authority.recipient_public, &successor_bytes);
+            match ddrm_envelope::hybrid_unwrap_bound(
+                &authority.recipient_secret,
+                &env,
+                &aad,
+                &operator_verifier,
+            ) {
+                Ok(delta) => delta,
+                Err(_) => {
+                    return Response::error(
+                        "access_denied",
+                        "rotation refused: the refresh delta does not open under the pinned operator identity for THIS (kid, node, successor) — forged, tampered, or redirected",
+                    )
+                }
+            }
+        };
+        // Unwrap this node's CURRENT share (the same authenticated path `recover` uses).
+        let wrapped = match b64().decode(wrapped_cek_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "wrapped_cek_b64 is not valid base64"),
+        };
+        let producer_vk = match b64().decode(producer_vk_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "producer_vk_b64 is not valid base64"),
+        };
+        let share = match authority.recover_escrowed_cek(&wrapped, scheme, &kid16, &producer_vk) {
+            Ok(share) => share,
+            Err(_) => {
+                return Response::error(
+                    "invalid_request",
+                    "escrowed share could not be recovered (foreign/tampered escrow, wrong KID/scheme, or bad producer key)",
+                )
+            }
+        };
+        if share.len() != delta.len() {
+            return Response::error(
+                "invalid_request",
+                "refresh delta length does not match the escrowed share — rotation refused",
+            );
+        }
+        // REFRESH: share' = share ⊕ delta. Both nodes of a 2-of-2 rotate with the SAME delta, so the
+        // CEK is invariant (share1' ⊕ share2' = share1 ⊕ share2) while an OLD captured share is now
+        // USELESS next to a NEW share (old ⊕ new' = delta-masked garbage). The whole CEK never
+        // exists here — this node only ever sees ITS share.
+        let refreshed = zeroize::Zeroizing::new(
+            share.iter().zip(delta.iter()).map(|(a, b)| a ^ b).collect::<Vec<u8>>(),
+        );
+        // Re-escrow to the SUCCESSOR under the shared escrow AAD, signed by THIS node — the rotated
+        // escrow's producer identity. The successor verifies it at recover exactly as it would a
+        // producer's.
+        let new_aad = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &successor_bytes);
+        let rotated = ddrm_envelope::seal::seal_bound(
+            &successor_public,
+            refreshed.as_slice(),
+            &new_aad,
+            &authority.signer,
+        );
+        Response::ok(json!({
+            "rotated_wrapped_cek_b64": b64().encode(rotated.to_bytes()),
+            "escrow_producer_vk_b64": b64().encode(&authority.verifying_key),
+        }))
+    }
+
+    /// LIVE CALLER REVOCATION (Day 109–112): verify the operator's signature over the caller key
+    /// and add it to the revoked set — the caller's next `hello` and any `recover` under a
+    /// still-live session token are refused from this moment. Idempotent. Requires the pinned
+    /// operator identity; a node with no operator can never be instructed to revoke (fail-closed:
+    /// the allow-list remains the standing gate).
+    fn revoke_caller(&mut self, caller_pub_b64: &str, operator_sig_b64: &str) -> Response {
+        let operator_vk = match self.operator_vk.as_ref() {
+            Some(vk) => vk,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "this node has no pinned operator identity — revocation is refused (provision DKMS_AUTHORITY_OPERATOR_VK)",
+                )
+            }
+        };
+        let operator_verifier = match ddrm_envelope::MlDsa65Verifier::from_encoded(operator_vk) {
+            Some(v) => v,
+            None => return Response::error("not_configured", "pinned operator identity is malformed"),
+        };
+        let caller_pub = match b64().decode(caller_pub_b64) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => return Response::error("invalid_request", "caller_pub_b64 is not valid non-empty base64"),
+        };
+        let sig = match b64().decode(operator_sig_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "operator_sig_b64 is not valid base64"),
+        };
+        if !ddrm_envelope::verify_revocation(&operator_verifier, &caller_pub, &sig) {
+            return Response::error(
+                "access_denied",
+                "revocation refused: the signature does not verify under the pinned operator identity",
+            );
+        }
+        if !self.revoked_callers.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
+            self.revoked_callers.push(caller_pub);
+        }
+        Response::ok(json!({ "revoked": true }))
     }
 }
 
@@ -848,6 +1122,14 @@ fn serve_socket(path: &str) {
     if let Some(list) = allowed_callers.as_ref() {
         eprintln!("dkms-authority: enforcing a {}-entry caller allow-list", list.len());
     }
+    // The pinned OPERATOR identity (Day 109–112), resolved ONCE at daemon startup. Lifecycle ops
+    // (rotate_share / revoke_caller) are refused without it. REVOCATIONS are daemon-lifetime state
+    // shared across connections — a caller revoked on one connection stays revoked on the next.
+    let operator_vk = operator_vk_from_env();
+    if operator_vk.is_some() {
+        eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
+    }
+    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on {path}");
     for stream in listener.incoming() {
         match stream {
@@ -861,7 +1143,7 @@ fn serve_socket(path: &str) {
                 };
                 // The Unix transport is host-local (filesystem-permissioned), so the encrypted
                 // channel is OPTIONAL here — a client that offers a channel key still gets one.
-                serve_connection_io(reader, stream, &allowed_callers, false);
+                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, false);
             }
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
@@ -892,6 +1174,11 @@ fn serve_tcp(addr: &str) {
     if let Some(list) = allowed_callers.as_ref() {
         eprintln!("dkms-authority: enforcing a {}-entry caller allow-list", list.len());
     }
+    let operator_vk = operator_vk_from_env();
+    if operator_vk.is_some() {
+        eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
+    }
+    let mut revoked_callers: Vec<Vec<u8>> = Vec::new();
     eprintln!("dkms-authority: listening on tcp:{addr}");
     for stream in listener.incoming() {
         match stream {
@@ -906,7 +1193,7 @@ fn serve_tcp(addr: &str) {
                         continue;
                     }
                 };
-                serve_connection_io(reader, stream, &allowed_callers, true);
+                serve_connection_io(reader, stream, &allowed_callers, &operator_vk, &mut revoked_callers, true);
             }
             Err(err) => {
                 eprintln!("dkms-authority: accept error: {err}");
@@ -934,6 +1221,16 @@ fn allowed_callers_from_env() -> Option<Vec<Vec<u8>>> {
     } else {
         Some(list)
     }
+}
+
+/// Parse the pinned OPERATOR identity from `OPERATOR_VK_ENV` (base64 ML-DSA verifying key).
+/// `None` when unset/empty/malformed — the lifecycle ops then fail closed (`not_configured`).
+#[cfg(unix)]
+fn operator_vk_from_env() -> Option<Vec<u8>> {
+    let raw = std::env::var(OPERATOR_VK_ENV).ok()?;
+    let vk = b64().decode(raw.trim()).ok()?;
+    ddrm_envelope::MlDsa65Verifier::from_encoded(&vk)?;
+    Some(vk)
 }
 
 /// The per-connection state of an ESTABLISHED encrypted channel (Day 105–108): the handshake
@@ -965,11 +1262,17 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
     mut reader: R,
     mut writer: W,
     allowed_callers: &Option<Vec<Vec<u8>>>,
+    operator_vk: &Option<Vec<u8>>,
+    revoked_callers: &mut Vec<Vec<u8>>,
     require_channel: bool,
 ) {
     use ddrm_envelope::frame::{read_frame, write_frame};
     let mut node = DkmsAuthorityNode {
         allowed_callers: allowed_callers.clone(),
+        operator_vk: operator_vk.clone(),
+        // Seed this connection with the daemon-lifetime revoked set (a caller revoked on an
+        // earlier connection stays revoked here); write any additions back when we're done.
+        revoked_callers: revoked_callers.clone(),
         ..DkmsAuthorityNode::default()
     };
     let mut channel: Option<ServerChannel> = None;
@@ -1030,13 +1333,20 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 continue;
             }
         };
-        // FAIL-CLOSED TRANSPORT GATE: on a network transport, a recover NEVER travels in plaintext —
-        // no channel, no recover. (init/hello/status are public-protocol messages; the secrets a
-        // recover moves — the sealed result, the rights context — get channel confidentiality.)
-        if require_channel && channel.is_none() && matches!(request, Request::Recover { .. }) {
+        // FAIL-CLOSED TRANSPORT GATE: on a network transport, a recover — and the lifecycle ops,
+        // which move rotated share escrows + operator instructions (Day 109–112) — NEVER travel in
+        // plaintext: no channel, no service. (init/hello/status are public-protocol messages; the
+        // secrets these ops move get channel confidentiality.)
+        if require_channel
+            && channel.is_none()
+            && matches!(
+                request,
+                Request::Recover { .. } | Request::RotateShare { .. } | Request::RevokeCaller { .. }
+            )
+        {
             let resp = Response::error(
                 "channel_required",
-                "this transport requires the encrypted channel: re-run `hello` with a channel_pub_b64 before `recover`",
+                "this transport requires the encrypted channel: re-run `hello` with a channel_pub_b64 first",
             );
             if respond(&mut writer, &mut channel, &node, &resp).is_err() {
                 break;
@@ -1080,6 +1390,9 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             break;
         }
     }
+    // Persist any revocations this connection performed into the daemon-lifetime set, so they bind
+    // every FUTURE connection too (a revoked caller cannot just reconnect).
+    *revoked_callers = node.revoked_callers;
 }
 
 /// Write one response frame: SEALED to the client's channel key (+ signed by the node, AAD-bound to
@@ -1603,7 +1916,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let reader = io::BufReader::new(server.try_clone().unwrap());
-            serve_connection_io(reader, server, &None, false)
+            serve_connection_io(reader, server, &None, &None, &mut Vec::new(), false)
         });
 
         let call = |client: &mut UnixStream, req: Value| -> Value {
@@ -1672,7 +1985,7 @@ mod tests {
         let (mut bad, server2) = UnixStream::pair().unwrap();
         let handle2 = std::thread::spawn(move || {
             let reader = io::BufReader::new(server2.try_clone().unwrap());
-            serve_connection_io(reader, server2, &None, false)
+            serve_connection_io(reader, server2, &None, &None, &mut Vec::new(), false)
         });
         // A header promising 64 bytes followed by only 3, then half-close.
         use std::io::Write as _;
@@ -1760,7 +2073,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let reader = io::BufReader::new(server.try_clone().unwrap());
-            serve_connection_io(reader, server, &None, true)
+            serve_connection_io(reader, server, &None, &None, &mut Vec::new(), true)
         });
         let call_plain = |client: &mut UnixStream, req: Value| -> Value {
             write_frame(client, &serde_json::to_vec(&req).unwrap()).unwrap();
@@ -1840,6 +2153,189 @@ mod tests {
             ),
         }
         handle.join().unwrap();
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// SHARE-WISE ROTATION (Day 109–112), happy path: with the operator identity pinned, the node
+    /// re-escrows its share to a SUCCESSOR node, refreshed by the operator-sealed XOR delta — the
+    /// successor (and only the successor) recovers `share ⊕ delta` under the ROTATING node's
+    /// signature, and the whole CEK never existed anywhere in the exchange.
+    #[test]
+    fn rotate_share_re_escrows_a_refreshed_share_to_the_successor() {
+        let store = unique_store("rotate");
+        let mut node = DkmsAuthorityNode::default();
+        let init = ok_data(node.init(json!({ "authority_key_store": store })));
+        let node_vk_b64 = init["seal_verifying_key_b64"].as_str().unwrap().to_string();
+        let recipient_pub = b64().decode(init["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub).unwrap();
+        // The OPERATOR identity, pinned exactly as the daemon pins it (env at start, never client-set).
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        node.operator_vk = Some(operator_vk);
+        // The SUCCESSOR node — its own master, so a genuinely distinct identity + recipient.
+        let successor = NodeAuthority::from_master(&[0xA2u8; 32]);
+
+        // The producer's CURRENT escrow of this node's share.
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+        let share: Vec<u8> = (0u8..32).collect();
+        let kid16 = [0xC5u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let escrow = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_pub);
+        let wrapped =
+            ddrm_envelope::seal::seal_bound(&recipient_public, &share, &escrow, &producer_signer);
+
+        // The operator seals the refresh delta TO THE ROTATING NODE, bound to (kid, source, successor).
+        let delta: Vec<u8> = (100u8..132).collect();
+        let rot_aad = ddrm_envelope::rotation_aad(&kid16, &recipient_pub, &successor.recipient_public);
+        let delta_env =
+            ddrm_envelope::seal::seal_bound(&recipient_public, &delta, &rot_aad, &operator);
+
+        let resp = node.rotate_share(
+            &b64().encode(wrapped.to_bytes()),
+            scheme,
+            &kid_hex,
+            &b64().encode(&producer_vk),
+            &b64().encode(&successor.recipient_public),
+            &b64().encode(delta_env.to_bytes()),
+        );
+        let data = ok_data(resp);
+        // The rotated escrow names THIS node as its producer (the successor verifies it at recover).
+        assert_eq!(data["escrow_producer_vk_b64"].as_str().unwrap(), node_vk_b64);
+        // The SUCCESSOR recovers exactly the REFRESHED share — share ⊕ delta — under the rotating
+        // node's identity, through the SAME authenticated escrow path a recover uses.
+        let rotated = b64().decode(data["rotated_wrapped_cek_b64"].as_str().unwrap()).unwrap();
+        let node_vk = b64().decode(&node_vk_b64).unwrap();
+        let recovered = successor
+            .recover_escrowed_cek(&rotated, scheme, &kid16, &node_vk)
+            .expect("the successor recovers the rotated share");
+        let refreshed: Vec<u8> = share.iter().zip(delta.iter()).map(|(a, b)| a ^ b).collect();
+        assert_eq!(recovered.as_slice(), refreshed.as_slice());
+        assert_ne!(recovered.as_slice(), share.as_slice(), "the rotated share must be REFRESHED, not copied");
+        // And the OLD node itself can NOT recover the rotated escrow (it is sealed to the successor).
+        assert!(node
+            .authority
+            .as_ref()
+            .unwrap()
+            .recover_escrowed_cek(&rotated, scheme, &kid16, &node_vk)
+            .is_err());
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// SHARE-WISE ROTATION (Day 109–112), fail-closed edges: no pinned operator, a non-operator
+    /// delta, a tampered delta, a successor-REDIRECTED delta, and a length-mismatched delta are all
+    /// refused — BEFORE any share material is re-escrowed anywhere.
+    #[test]
+    fn rotate_share_fails_closed_on_missing_operator_forged_or_redirected_delta() {
+        let store = unique_store("rotate-adversarial");
+        let mut node = DkmsAuthorityNode::default();
+        let init = ok_data(node.init(json!({ "authority_key_store": store })));
+        let recipient_pub = b64().decode(init["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub).unwrap();
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        let successor = NodeAuthority::from_master(&[0xA2u8; 32]);
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+        let share: Vec<u8> = (0u8..32).collect();
+        let kid16 = [0xC5u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let escrow = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_pub);
+        let wrapped =
+            ddrm_envelope::seal::seal_bound(&recipient_public, &share, &escrow, &producer_signer);
+        let wrapped_b64 = b64().encode(wrapped.to_bytes());
+        let delta: Vec<u8> = (100u8..132).collect();
+        let rot_aad = ddrm_envelope::rotation_aad(&kid16, &recipient_pub, &successor.recipient_public);
+        let good_delta = b64().encode(
+            ddrm_envelope::seal::seal_bound(&recipient_public, &delta, &rot_aad, &operator).to_bytes(),
+        );
+        let successor_b64 = b64().encode(&successor.recipient_public);
+        let producer_vk_b64 = b64().encode(&producer_vk);
+
+        // NO PINNED OPERATOR: rotation is impossible on this node, even with a well-formed delta.
+        let resp = node.rotate_share(&wrapped_b64, scheme, &kid_hex, &producer_vk_b64, &successor_b64, &good_delta);
+        assert_eq!(error_code(&resp), "not_configured");
+
+        node.operator_vk = Some(operator_vk);
+        // A NON-OPERATOR delta (an impostor's signature) fails the operator verification.
+        let (impostor, _impostor_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+        let impostor_delta = b64().encode(
+            ddrm_envelope::seal::seal_bound(&recipient_public, &delta, &rot_aad, &impostor).to_bytes(),
+        );
+        let resp = node.rotate_share(&wrapped_b64, scheme, &kid_hex, &producer_vk_b64, &successor_b64, &impostor_delta);
+        assert_eq!(error_code(&resp), "access_denied");
+
+        // A TAMPERED delta envelope (one flipped byte) fails the AEAD/signature open.
+        let mut torn = b64().decode(&good_delta).unwrap();
+        let last = torn.len() - 1;
+        torn[last] ^= 0x01;
+        let resp = node.rotate_share(&wrapped_b64, scheme, &kid_hex, &producer_vk_b64, &successor_b64, &b64().encode(torn));
+        assert_eq!(error_code(&resp), "access_denied");
+
+        // A REDIRECTED rotation: the delta was authorized for THIS successor, but the request names
+        // the ATTACKER's recipient — the AAD no longer matches, so the share cannot be re-routed.
+        let attacker = NodeAuthority::from_master(&[0xEEu8; 32]);
+        let resp = node.rotate_share(
+            &wrapped_b64,
+            scheme,
+            &kid_hex,
+            &producer_vk_b64,
+            &b64().encode(&attacker.recipient_public),
+            &good_delta,
+        );
+        assert_eq!(error_code(&resp), "access_denied");
+
+        // A LENGTH-MISMATCHED delta (16 bytes vs the 32-byte share) is refused — never a partial XOR.
+        let short_aad = ddrm_envelope::rotation_aad(&kid16, &recipient_pub, &successor.recipient_public);
+        let short_delta = b64().encode(
+            ddrm_envelope::seal::seal_bound(&recipient_public, &delta[..16], &short_aad, &operator).to_bytes(),
+        );
+        let resp = node.rotate_share(&wrapped_b64, scheme, &kid_hex, &producer_vk_b64, &successor_b64, &short_delta);
+        assert_eq!(error_code(&resp), "invalid_request");
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// LIVE CALLER REVOCATION (Day 109–112): only the pinned operator can revoke; once revoked, the
+    /// caller's `hello` is refused AND a recover under its STILL-LIVE session token is refused —
+    /// revocation outranks a live session (the immediate-cutoff property, the node-side analogue of
+    /// PC2 reading the revoked delegation nonce back per request, `secureViewSession.ts:108`–`:112`).
+    #[test]
+    fn revocation_outranks_a_live_session_and_requires_the_operator() {
+        let store = unique_store("revoke");
+        let (mut node, base, caller) = setup_recover(&store);
+        let caller_vk_b64 = base.session_token.caller_pub_b64.clone();
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        let caller_pub = b64().decode(&caller_vk_b64).unwrap();
+        let genuine_sig = b64().encode(ddrm_envelope::sign_revocation(&operator, &caller_pub));
+
+        // NO PINNED OPERATOR: revocation is refused outright.
+        assert_eq!(error_code(&node.revoke_caller(&caller_vk_b64, &genuine_sig)), "not_configured");
+        node.operator_vk = Some(operator_vk);
+
+        // A FORGED revocation (impostor signature) is refused — and the caller is still served.
+        let (impostor, _vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+        let forged = b64().encode(ddrm_envelope::sign_revocation(&impostor, &caller_pub));
+        assert_eq!(error_code(&node.revoke_caller(&caller_vk_b64, &forged)), "access_denied");
+        assert!(matches!(node.recover(base.clone()), Response::Ok { .. }), "not revoked: still served");
+
+        // The GENUINE operator revocation lands…
+        assert!(matches!(node.revoke_caller(&caller_vk_b64, &genuine_sig), Response::Ok { .. }));
+        // …the caller's next hello is refused (no new session is ever minted)…
+        let hello = node.hello(&b64().encode([0xB9u8; 32]), &caller_vk_b64, Some(NOW), None);
+        assert_eq!(error_code(&hello), "caller_revoked");
+        // …and a recover under the STILL-LIVE token (valid signature, unexpired, fresh seq, valid
+        // possession proof) is refused too — a live session does not outrank a revocation.
+        let mut live = base.clone();
+        live.recover_seq = 2;
+        live.caller_sig_b64 = proof_for(
+            &caller,
+            &base.session_token,
+            CONTENT,
+            &base.kid_hex,
+            &base.decrypt_session_pub_b64,
+            2,
+        );
+        assert_eq!(error_code(&node.recover(live)), "caller_revoked");
+
         let _ = std::fs::remove_file(&store);
     }
 

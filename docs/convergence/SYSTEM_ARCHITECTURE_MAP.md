@@ -369,6 +369,41 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 109–112):** the secret-holders have a LIFECYCLE — live share-wise ROTATION to successor nodes with a
+  proactive REFRESH, OPERATOR-ONLY authorization, and LIVE CALLER REVOCATION that outranks a live session. Audited PC2
+  first: PC2 has NO key-authority rotation concept (a constant redeploy, `chipotle-client.ts:125`, or a supernode
+  payload CID swap, `:1043`–`:1064` — nothing migrates content, nothing refreshes standing key material), and its
+  revocation is an in-memory `revokedDelegations` Map capped at 10 000 entries (`utils/secureViewSession.ts:374`–`:399`)
+  checked by HTTP middleware (`secureViewSession.ts:104`–`:112`) — the key-holding network never learns. The runtime is
+  SUPERIOR on both counts: operator-SIGNED instructions land on the key-holding NODES themselves, and a rotation
+  REFRESHES the shares so captured-then material is useless now. (1) PRIMITIVES (ddrm-envelope 27→29):
+  `DKMS_ROTATE_DOMAIN` + `rotation_aad(kid16, source_recipient_pub, successor_recipient_pub)` — the operator seals the
+  refresh delta TO the rotating node's escrow recipient, AEAD-bound to the exact rotation context (a delta for one kid
+  cannot rotate another; a delta sealed for node A cannot drive node B; the rotated share cannot be REDIRECTED to an
+  attacker's recipient); `DKMS_REVOKE_DOMAIN` + `sign_revocation`/`verify_revocation` over the caller's verifying key
+  (operator-only; sibling-domain signatures refused). (2) NODE (dkms-authority 15→18): a pinned OPERATOR identity
+  (`DKMS_AUTHORITY_OPERATOR_VK`, resolved once at daemon start, never client-settable; absent → lifecycle ops
+  `not_configured`); NEW `rotate_share` — operator-seal verified FIRST, the current share unwrapped via the SAME
+  authenticated path `recover` uses, `share' = share ⊕ delta` in `Zeroizing` (length-checked), re-escrowed to the
+  SUCCESSOR under the shared escrow AAD signed by the rotating node's OWN identity; both nodes of the 2-of-2 rotate
+  with the SAME delta so the CEK is invariant (share1′⊕share2′ = share1⊕share2) while an OLD captured share next to a
+  NEW share is delta-masked garbage — and the whole CEK NEVER exists during rotation; NEW `revoke_caller`
+  (operator-signed, idempotent) — the revoked set is DAEMON-LIFETIME state threaded through every connection, a revoked
+  caller's `hello` is `caller_revoked` AND a `recover` under a still-LIVE session token is refused BEFORE signature
+  work (revocation outranks a live session, enforced at the key-holder). On TCP, `rotate_share` + `revoke_caller` join
+  `recover` behind the encrypted-channel gate. (3) CLIENT (key-provider 44→45): the release session context gained
+  optional `producer_vk2_b64` — after a rotation each share's escrow is signed by the node that rotated it, so share-2
+  recovers under the RIGHT producer identity. (4) RUNTIME + GATES 32–35 (live daemons, real successors, BOTH
+  transports): a per-run operator ML-DSA keypair pinned into every daemon; (32) the FULL rotated rail — provision
+  successors A′/B′, rotate BOTH old nodes with ONE operator-sealed delta, publish the rotated descriptor, and a FRESH
+  key-provider opens the ROTATED 2-of-2 → the EXACT original CEK; (33) the refresh kills old material — old-share ⊕
+  rotated-share ≠ CEK, a successor refuses its predecessor's escrow, the old fixture's node-set pin refuses the rotated
+  descriptor; (34) rotation is OPERATOR-ONLY at the live daemon — impostor delta / tampered delta / redirected
+  successor / no-operator node / plaintext-rotate-on-tcp ALL refused; (35) LIVE revocation — a forged revocation is
+  refused (the caller stays served), the genuine operator revocation cuts the SAME live session off MID-STREAM and a
+  fresh reconnect by the revoked caller is refused (the revoked set survives the connection). Drift untouched. Gate:
+  ladder INTACT (ddrm-envelope=29, dkms-authority=18, key-provider[key-authority-ref]=45), drift PASS, all dDRM smokes
+  green (both threshold smokes drive all 35 gates), clippy clean.
 - **Status (Day 105–108):** the dKMS node is OFF LOCALHOST — a REAL network transport (TCP) with an app-layer
   ENCRYPTED, MUTUALLY-AUTHENTICATED channel built from our OWN primitives; the FULL 2-of-2 threshold rail passes over
   TCP (all 31 verify gates) and every hostile-network edge fails closed. Audited PC2 first: its dDRM network boundary

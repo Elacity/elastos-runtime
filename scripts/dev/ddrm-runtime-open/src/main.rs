@@ -379,14 +379,17 @@ fn endpoint_accepts(endpoint: &str) -> bool {
 
 /// Start the dKMS node DAEMON listening on `sock` (a Unix path or a `tcp:HOST:PORT` endpoint) with
 /// its node-local master store + its KNOWN-caller allow-list (Day 95–96: the OPERATOR provisions the
-/// comma-separated b64 verifying keys the node will serve; an unknown caller's `hello` is refused),
-/// and wait for the listener to ACCEPT (fail-closed if it never binds). The daemon serves many
-/// sequential connections.
+/// comma-separated b64 verifying keys the node will serve; an unknown caller's `hello` is refused)
+/// and the pinned OPERATOR identity (Day 109–112: the b64 verifying key whose signatures authorize
+/// `rotate_share`/`revoke_caller`; empty = lifecycle ops fail closed on this node), and wait for
+/// the listener to ACCEPT (fail-closed if it never binds). The daemon serves many sequential
+/// connections.
 fn start_dkms_daemon(
     node_bin: &str,
     sock: &str,
     node_store_path: &str,
     allowed_callers: &str,
+    operator_vk_b64: &str,
 ) -> Result<DaemonGuard, String> {
     if !sock.starts_with("tcp:") {
         let _ = std::fs::remove_file(sock);
@@ -395,6 +398,7 @@ fn start_dkms_daemon(
         .env("DKMS_AUTHORITY_LISTEN", sock)
         .env("DKMS_AUTHORITY_KEY_STORE", node_store_path)
         .env("DKMS_AUTHORITY_ALLOWED_CALLERS", allowed_callers)
+        .env("DKMS_AUTHORITY_OPERATOR_VK", operator_vk_b64)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -1510,8 +1514,8 @@ fn dkms_threshold_probe(node_bin: &str, work_dir: &std::path::Path) -> Result<()
     let store_b = work_dir.join("thr-node-b.json").to_string_lossy().into_owned();
     let sock_a = work_dir.join("thr-node-a.sock").to_string_lossy().into_owned();
     let sock_b = work_dir.join("thr-node-b.sock").to_string_lossy().into_owned();
-    let _daemon_a = start_dkms_daemon(node_bin, &sock_a, &store_a, &caller_vk_b64)?;
-    let _daemon_b = start_dkms_daemon(node_bin, &sock_b, &store_b, &caller_vk_b64)?;
+    let _daemon_a = start_dkms_daemon(node_bin, &sock_a, &store_a, &caller_vk_b64, "")?;
+    let _daemon_b = start_dkms_daemon(node_bin, &sock_b, &store_b, &caller_vk_b64, "")?;
 
     // The producer's identity (escrows both shares) + the content split.
     let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x9au8; 32]);
@@ -1663,6 +1667,464 @@ fn dkms_threshold_probe(node_bin: &str, work_dir: &std::path::Path) -> Result<()
         return Err("a forged second share verified under node B's vk — the threshold is forgeable".to_string());
     }
     step(20, "dkms 2-of-2: a FORGED second share (not sealed by node B) fails closed under node B's vk — a single-node attacker cannot fabricate the missing share");
+    Ok(())
+}
+
+/// SECRET-HOLDER LIFECYCLE gates (Day 109–112), driven against the LIVE production daemons + REAL
+/// successor daemons: (32) a live SHARE-WISE ROTATION — each old node re-escrows its share to a
+/// freshly-provisioned successor, refreshed by ONE operator-sealed XOR delta, and the ROTATED 2-of-2
+/// rail releases + reconstructs the EXACT CEK through a fresh key-provider, while the whole CEK never
+/// existed anywhere during the rotation; (33) the refresh makes OLD material DEAD — an old share
+/// mixed with a rotated share reconstructs garbage, a successor cannot open an old escrow, and the
+/// old fixture's node-set pin refuses the rotated descriptor; (34) rotation is OPERATOR-ONLY — a
+/// forged, tampered, or successor-REDIRECTED delta is refused, and a node with no pinned operator
+/// can never rotate; (35) LIVE CALLER REVOCATION — an operator-signed revocation cuts a caller off
+/// IMMEDIATELY (a still-live session token is refused mid-session) and persists across connections.
+/// PC2 has no analogue for 32–34 (its "rotation" is a constant redeploy with NO migration,
+/// `chipotle-client.ts:125`/`:1043`/`:1064`); 35 is its revoked-nonce check
+/// (`secureViewSession.ts:108`–`:112`) — except OUR signed instruction reaches the key-holding node.
+#[allow(clippy::too_many_arguments)]
+fn dkms_rotation_and_revocation_gates(
+    node_bin: &str,
+    key_bin: &str,
+    work_dir: &std::path::Path,
+    fixture: &PublishEscrow,
+    descriptor_path: &std::path::Path,
+    transport: DkmsTransport,
+    caller_seed: [u8; 32],
+    caller_seed_b64: &str,
+    operator_signer: &ddrm_envelope::seal::MlDsaSealSigner,
+    operator_vk_b64: &str,
+) -> Result<(), String> {
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+
+    // The CURRENT (pre-rotation) node-set, from the published descriptor: endpoints, identities,
+    // and escrow recipients of old node A + old node B.
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("read descriptor for rotation: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor for rotation: {e}"))?;
+    let nodes = desc["threshold"]["nodes"].as_array().ok_or("descriptor has no threshold nodes")?;
+    let node_field = |i: usize, k: &str| -> Result<String, String> {
+        nodes[i][k].as_str().map(str::to_string).ok_or_else(|| format!("descriptor node {i} missing {k}"))
+    };
+    let (vk_a_old, recipient_a_old, endpoint_a) = (
+        node_field(0, "verifying_key_b64")?,
+        node_field(0, "recipient_pub_b64")?,
+        node_field(0, "authority_endpoint")?,
+    );
+    let (vk_b_old, recipient_b_old, endpoint_b) = (
+        node_field(1, "verifying_key_b64")?,
+        node_field(1, "recipient_pub_b64")?,
+        node_field(1, "authority_endpoint")?,
+    );
+    let kid16 = {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&fixture.kid_hex[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("fixture kid hex: {e}"))?;
+        }
+        out
+    };
+    let cek = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
+
+    // PROVISION the two SUCCESSOR secret-holders — fresh node-local masters, genuinely new identities.
+    let store_a2 = work_dir.join("dkms-node-a-successor.json").to_string_lossy().into_owned();
+    let store_b2 = work_dir.join("dkms-node-b-successor.json").to_string_lossy().into_owned();
+    let (vk_a2, recipient_a2) = provision_dkms_node(node_bin, &store_a2)?;
+    let (vk_b2, recipient_b2) = provision_dkms_node(node_bin, &store_b2)?;
+    if vk_a2 == vk_a_old || vk_b2 == vk_b_old || vk_a2 == vk_b2 {
+        return Err("successor provisioning did not produce two NEW distinct identities".to_string());
+    }
+
+    // ONE refresh delta for BOTH nodes (share1' = share1 ⊕ r, share2' = share2 ⊕ r — the CEK is
+    // invariant, while any OLD share next to a NEW share is delta-masked garbage). The delta is
+    // OPERATOR-SEALED per node, bound to (kid, that node, its successor) — it never travels bare.
+    let delta: Vec<u8> = ddrm_envelope::random_seed().iter().copied().take(cek.len()).collect();
+    let seal_delta = |source_recipient_b64: &str, successor_recipient_b64: &str| -> Result<String, String> {
+        let source_bytes = B64.decode(source_recipient_b64).map_err(|e| e.to_string())?;
+        let source_public = ddrm_envelope::session_public_from_bytes(&source_bytes)
+            .ok_or("source recipient key is malformed")?;
+        let successor_bytes = B64.decode(successor_recipient_b64).map_err(|e| e.to_string())?;
+        let aad = ddrm_envelope::rotation_aad(&kid16, &source_bytes, &successor_bytes);
+        Ok(B64.encode(
+            ddrm_envelope::seal::seal_bound(&source_public, &delta, &aad, operator_signer).to_bytes(),
+        ))
+    };
+
+    // Drive ONE live rotation: connect to the OLD node (over the configured transport — sealed
+    // channel on TCP), and instruct it to re-escrow its CURRENT share to its successor.
+    let rotate = |endpoint: &str,
+                  pinned_vk_b64: &str,
+                  wrapped_b64: &str,
+                  producer_vk_b64: &str,
+                  successor_recipient_b64: &str,
+                  delta_env_b64: &str|
+     -> Result<Value, String> {
+        let mut node = NodeSocket::connect(endpoint)?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "rotation node init")?;
+        if transport == DkmsTransport::Tcp {
+            node.establish_channel(pinned_vk_b64, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX)?;
+        }
+        node.call(&json!({
+            "op": "rotate_share",
+            "wrapped_cek_b64": wrapped_b64,
+            "scheme": SUITE_PQ_HYBRID,
+            "kid_hex": fixture.kid_hex,
+            "producer_vk_b64": producer_vk_b64,
+            "successor_recipient_pub_b64": successor_recipient_b64,
+            "delta_envelope_b64": delta_env_b64,
+        }))
+    };
+
+    // --- Gate 32: the LIVE rotation, share-wise, then the ROTATED rail opens. ---
+    let delta_a = seal_delta(&recipient_a_old, &recipient_a2)?;
+    let delta_b = seal_delta(&recipient_b_old, &recipient_b2)?;
+    let rot_a = ok_data(
+        &rotate(&endpoint_a, &vk_a_old, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &recipient_a2, &delta_a)?,
+        "node A rotate_share",
+    )?;
+    let share2_old = fixture
+        .wrapped_cek_share2_b64
+        .as_ref()
+        .ok_or("rotation gates need a threshold fixture (share-2 escrow)")?;
+    let rot_b = ok_data(
+        &rotate(&endpoint_b, &vk_b_old, share2_old, &fixture.producer_vk_b64, &recipient_b2, &delta_b)?,
+        "node B rotate_share",
+    )?;
+    let rotated_share1_b64 = rot_a["rotated_wrapped_cek_b64"].as_str().ok_or("no rotated share-1")?.to_string();
+    let rotated_share2_b64 = rot_b["rotated_wrapped_cek_b64"].as_str().ok_or("no rotated share-2")?.to_string();
+    // The rotated escrows' PRODUCER identities are the OLD nodes (each signed its own re-escrow).
+    if rot_a["escrow_producer_vk_b64"].as_str() != Some(vk_a_old.as_str())
+        || rot_b["escrow_producer_vk_b64"].as_str() != Some(vk_b_old.as_str())
+    {
+        return Err("a rotated escrow does not name the rotating node as its producer".to_string());
+    }
+
+    // Bring the SUCCESSOR daemons up (operator pinned, same known caller) + publish the rotated
+    // descriptor — the rotation's NEW public truth.
+    let (endpoint_a2, endpoint_b2) = match transport {
+        DkmsTransport::Unix => (
+            work_dir.join("dkms-authority-a2.sock").to_string_lossy().into_owned(),
+            work_dir.join("dkms-authority-b2.sock").to_string_lossy().into_owned(),
+        ),
+        DkmsTransport::Tcp => (pick_tcp_endpoint()?, pick_tcp_endpoint()?),
+    };
+    let _daemon_a2 = start_dkms_daemon(node_bin, &endpoint_a2, &store_a2, &caller_vk_b64, operator_vk_b64)?;
+    let _daemon_b2 = start_dkms_daemon(node_bin, &endpoint_b2, &store_b2, &caller_vk_b64, operator_vk_b64)?;
+    let rotated_desc_path = work_dir.join("dkms-authority-post-rotation.json");
+    let rotated_desc = json!({
+        "schema": "elastos.dkms.authority/v2",
+        "verifying_key_b64": vk_a2,
+        "recipient_pub_b64": recipient_a2,
+        "authority_endpoint": endpoint_a2,
+        "threshold": {
+            "t": 2,
+            "nodes": [
+                { "verifying_key_b64": vk_a2, "recipient_pub_b64": recipient_a2, "authority_endpoint": endpoint_a2 },
+                { "verifying_key_b64": vk_b2, "recipient_pub_b64": recipient_b2, "authority_endpoint": endpoint_b2 },
+            ],
+        },
+    });
+    std::fs::write(&rotated_desc_path, serde_json::to_vec_pretty(&rotated_desc).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write rotated descriptor: {e}"))?;
+    let rotated_set = derive_node_set_from_descriptor(&rotated_desc_path)?;
+
+    // The decrypt-boundary stand-in for the rotated rail: a fresh session + a transcript AAD that
+    // names the ROTATED node-set.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
+    let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
+    let rotated_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&rotated_set));
+
+    // A FRESH key-provider bound to the ROTATED descriptor releases over BOTH successor daemons —
+    // with the per-share producer identities a rotated fixture carries (share-1 signed by old A,
+    // share-2 by old B).
+    let release = |descriptor: &std::path::Path,
+                   wrapped_b64: &str,
+                   share2_b64: &str,
+                   producer_vk_b64: &str,
+                   producer_vk2_b64: Option<&str>,
+                   aad: &[u8]|
+     -> Result<Value, String> {
+        let mut key = Capsule::spawn("key-provider(rotation gate)", key_bin)?;
+        ok_data(
+            &key.call(&json!({
+                "op": "init",
+                "config": {
+                    "backend": "dkms",
+                    "dkms_authority_descriptor": descriptor.to_string_lossy(),
+                    "dkms_caller_seed_b64": caller_seed_b64,
+                }
+            }))?,
+            "rotated key init",
+        )?;
+        let mut req = key_release_request_base(&fixture.kid_hex, wrapped_b64);
+        req.as_object_mut()
+            .expect("key release request is an object")
+            .insert("rights_receipt".to_string(), fallback_rights_receipt());
+        let mut session = json!({
+            "decrypt_session_pub_b64": session_pub_b64,
+            "producer_vk_b64": producer_vk_b64,
+            "aad_b64": B64.encode(aad),
+            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            "content_hash_b64": fixture.content_hash_b64,
+            "nonce_b64": fixture.nonce_b64,
+            "wrapped_cek_share2_b64": share2_b64,
+            "now_unix": NOW_UNIX,
+        });
+        if let Some(vk2) = producer_vk2_b64 {
+            session["producer_vk2_b64"] = json!(vk2);
+        }
+        let resp = key.call(&json!({ "op": "release", "request": req, "session": session }))?;
+        key.shutdown();
+        Ok(resp)
+    };
+    let rotated_release = ok_data(
+        &release(
+            &rotated_desc_path,
+            &rotated_share1_b64,
+            &rotated_share2_b64,
+            &vk_a_old,
+            Some(&vk_b_old),
+            &rotated_aad,
+        )?,
+        "rotated 2-of-2 release",
+    )?;
+    // Unwrap BOTH successor-sealed shares in-boundary (each under ITS successor's vk) and prove the
+    // rotated rail reconstructs the EXACT original CEK — the rotation moved + refreshed the shares
+    // without the key ever changing or existing whole.
+    let unwrap_share = |sealed_b64: &str, vk_b64: &str, aad: &[u8]| -> Result<Vec<u8>, String> {
+        let sealed = B64.decode(sealed_b64).map_err(|e| e.to_string())?;
+        let vk = B64.decode(vk_b64).map_err(|e| e.to_string())?;
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).ok_or("node vk malformed")?;
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).map_err(|e| format!("{e:?}"))?;
+        Ok(ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, aad, &verifier)
+            .map_err(|e| format!("share unwrap failed: {e:?}"))?
+            .to_vec())
+    };
+    let new_share1 = unwrap_share(
+        rotated_release["material"]["sealed_cek_b64"].as_str().ok_or("no rotated sealed share-1")?,
+        &vk_a2,
+        &rotated_aad,
+    )?;
+    let new_share2 = unwrap_share(
+        rotated_release["material"]["sealed_cek_share2_b64"].as_str().ok_or("no rotated sealed share-2")?,
+        &vk_b2,
+        &rotated_aad,
+    )?;
+    let reconstructed = ddrm_envelope::combine_cek_xor(&new_share1, &new_share2)?;
+    if reconstructed.as_slice() != cek.as_slice() {
+        return Err("the ROTATED 2-of-2 rail did not reconstruct the original CEK".to_string());
+    }
+    step(32, "dkms lifecycle: LIVE SHARE-WISE ROTATION — each old node re-escrowed its share to a REAL successor daemon (operator-sealed refresh delta, whole CEK never assembled), and the ROTATED 2-of-2 rail released + reconstructed the EXACT CEK through a fresh key-provider");
+
+    // --- Gate 33: the refresh makes OLD material DEAD next to NEW material. ---
+    // An OLD share next to a ROTATED share reconstructs delta-masked garbage — a node compromised
+    // BEFORE the rotation holds nothing useful AFTER it.
+    let old_set = B64
+        .decode(fixture.node_set_id_b64.as_ref().ok_or("threshold fixture must pin a node-set")?)
+        .map_err(|e| e.to_string())?;
+    let old_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&old_set));
+    let old_release = ok_data(
+        &release(descriptor_path, &fixture.wrapped_cek_b64, share2_old, &fixture.producer_vk_b64, None, &old_aad)?,
+        "old-rail release (for the mixed-set proof)",
+    )?;
+    let old_share1 = unwrap_share(
+        old_release["material"]["sealed_cek_b64"].as_str().ok_or("no old sealed share-1")?,
+        &vk_a_old,
+        &old_aad,
+    )?;
+    let mixed = ddrm_envelope::combine_cek_xor(&old_share1, &new_share2)?;
+    if mixed.as_slice() == cek.as_slice() {
+        return Err("an OLD share combined with a ROTATED share reconstructed the CEK — the refresh is not a refresh".to_string());
+    }
+    // A SUCCESSOR cannot open an OLD escrow (it was sealed to the OLD node's recipient): even an
+    // operator-authorized rotate on the successor refuses it at the unwrap.
+    let stale_delta = seal_delta(&recipient_a2, &recipient_b2)?;
+    let stale = rotate(&endpoint_a2, &vk_a2, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &recipient_b2, &stale_delta)?;
+    if stale.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a successor node opened an escrow sealed to its PREDECESSOR — old escrows must be dead".to_string());
+    }
+    // And the OLD fixture's pin REFUSES the rotated descriptor (the stale-publish fail-closed path,
+    // now against the REAL rotated artifacts).
+    if B64.encode(rotated_set) == *fixture.node_set_id_b64.as_ref().unwrap() {
+        return Err("the rotated descriptor matches the old fixture's node-set pin — rotation is invisible".to_string());
+    }
+    step(33, "dkms lifecycle: the refresh makes OLD material DEAD — an old share next to a rotated share reconstructs garbage, a successor refuses an old escrow, and the old fixture's node-set pin refuses the rotated descriptor");
+
+    // --- Gate 34: rotation is OPERATOR-ONLY, live against the old node A daemon. ---
+    // A delta sealed by a NON-operator (the operator-verification edge).
+    let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
+    let recipient_a_bytes = B64.decode(&recipient_a_old).map_err(|e| e.to_string())?;
+    let recipient_a_public = ddrm_envelope::session_public_from_bytes(&recipient_a_bytes)
+        .ok_or("old node A recipient malformed")?;
+    let recipient_a2_bytes = B64.decode(&recipient_a2).map_err(|e| e.to_string())?;
+    let aad_a = ddrm_envelope::rotation_aad(&kid16, &recipient_a_bytes, &recipient_a2_bytes);
+    let impostor_delta =
+        B64.encode(ddrm_envelope::seal::seal_bound(&recipient_a_public, &delta, &aad_a, &impostor).to_bytes());
+    let refused = rotate(&endpoint_a, &vk_a_old, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &recipient_a2, &impostor_delta)?;
+    if refused.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a NON-OPERATOR rotation instruction was honoured — rotation must be operator-only".to_string());
+    }
+    // A TAMPERED operator delta (one flipped byte).
+    let mut torn = B64.decode(&delta_a).map_err(|e| e.to_string())?;
+    let last = torn.len() - 1;
+    torn[last] ^= 0x01;
+    let refused = rotate(&endpoint_a, &vk_a_old, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &recipient_a2, &B64.encode(torn))?;
+    if refused.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a TAMPERED rotation delta was honoured".to_string());
+    }
+    // A REDIRECTED rotation: the operator authorized successor A2, the request names the ATTACKER's
+    // recipient — the AAD binding refuses the re-route of the share.
+    let (_, attacker_recipient) = ddrm_envelope::mint_session();
+    let attacker_recipient_b64 = B64.encode(ddrm_envelope::session_public_bytes(&attacker_recipient));
+    let refused = rotate(&endpoint_a, &vk_a_old, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &attacker_recipient_b64, &delta_a)?;
+    if refused.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a REDIRECTED rotation (attacker successor) was honoured — the AAD must bind the successor".to_string());
+    }
+    // A node with NO pinned operator can never rotate (the stdio provisioning shape has none).
+    let no_op_store = work_dir.join("dkms-node-no-operator.json").to_string_lossy().into_owned();
+    let mut bare = Capsule::spawn("dkms-authority(no-operator)", node_bin)?;
+    ok_data(
+        &bare.call(&json!({ "op": "init", "config": { "authority_key_store": no_op_store } }))?,
+        "no-operator node init",
+    )?;
+    let refused = bare.call(&json!({
+        "op": "rotate_share",
+        "wrapped_cek_b64": fixture.wrapped_cek_b64,
+        "scheme": SUITE_PQ_HYBRID,
+        "kid_hex": fixture.kid_hex,
+        "producer_vk_b64": fixture.producer_vk_b64,
+        "successor_recipient_pub_b64": recipient_a2,
+        "delta_envelope_b64": delta_a,
+    }))?;
+    bare.shutdown();
+    if refused.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a node with NO pinned operator accepted a rotation — it must fail closed".to_string());
+    }
+    // On the NETWORK transport, a PLAINTEXT rotation (no encrypted channel) is refused outright —
+    // a rotated share escrow and an operator instruction never travel unencrypted (Day 105–108's
+    // channel gate extended to the lifecycle ops).
+    if transport == DkmsTransport::Tcp {
+        let mut plain = NodeSocket::connect(&endpoint_a)?;
+        ok_data(&plain.call(&json!({ "op": "init", "config": {} }))?, "plaintext rotate init")?;
+        let refused = plain.call(&json!({
+            "op": "rotate_share",
+            "wrapped_cek_b64": fixture.wrapped_cek_b64,
+            "scheme": SUITE_PQ_HYBRID,
+            "kid_hex": fixture.kid_hex,
+            "producer_vk_b64": fixture.producer_vk_b64,
+            "successor_recipient_pub_b64": recipient_a2,
+            "delta_envelope_b64": delta_a,
+        }))?;
+        if refused.get("data").is_some()
+            || refused.get("code").and_then(Value::as_str) != Some("channel_required")
+        {
+            return Err(format!("a PLAINTEXT rotate_share on the network transport must be refused with channel_required: {refused}"));
+        }
+    }
+    step(34, "dkms lifecycle: rotation is OPERATOR-ONLY — a non-operator delta, a tampered delta, a successor-REDIRECTED delta, a node with no pinned operator, and (tcp) a plaintext rotate without the channel all fail closed at the live daemon");
+
+    // --- Gate 35: LIVE CALLER REVOCATION — immediate cutoff, outranking a live session. ---
+    // (Last gate: it revokes the runtime's caller on OLD node A, which nothing uses afterwards.)
+    let mut conn = NodeSocket::connect(&endpoint_a)?;
+    ok_data(&conn.call(&json!({ "op": "init", "config": {} }))?, "revocation node init")?;
+    let challenge = ddrm_envelope::random_seed();
+    let hello = match transport {
+        DkmsTransport::Tcp => conn.establish_channel(&vk_a_old, caller_seed, challenge, NOW_UNIX)?,
+        DkmsTransport::Unix => ok_data(
+            &conn.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": caller_vk_b64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "revocation hello",
+        )?,
+    };
+    let token = hello["session_token"].clone();
+    // One recover bundle under the LIVE token (proves the session works before + is refused after).
+    let recover_with_seq = |conn: &mut NodeSocket, seq: u64| -> Result<Value, String> {
+        let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
+            &caller_signer,
+            &challenge,
+            cid().as_bytes(),
+            fixture.kid_hex.as_bytes(),
+            &session_pub_bytes,
+            seq,
+        ));
+        conn.call(&json!({
+            "op": "recover",
+            "wrapped_cek_b64": fixture.wrapped_cek_b64,
+            "scheme": SUITE_PQ_HYBRID,
+            "kid_hex": fixture.kid_hex,
+            "producer_vk_b64": fixture.producer_vk_b64,
+            "decrypt_session_pub_b64": session_pub_b64,
+            "aad_b64": B64.encode(&old_aad),
+            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            "content_hash_b64": fixture.content_hash_b64,
+            "nonce_b64": fixture.nonce_b64,
+            "rights_receipt": fallback_rights_receipt(),
+            "content_id": cid(),
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "right": ACTION,
+            "session_token": token,
+            "caller_sig_b64": caller_sig_b64,
+            "recover_seq": seq,
+            "now_unix": NOW_UNIX,
+        }))
+    };
+    // Sanity: the live session serves a recover.
+    let served = recover_with_seq(&mut conn, 1)?;
+    if served.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(format!("the pre-revocation recover should serve: {served}"));
+    }
+    // A FORGED revocation (non-operator signature) is refused — the caller stays served.
+    let caller_pub = B64.decode(&caller_vk_b64).map_err(|e| e.to_string())?;
+    let forged_sig = B64.encode(ddrm_envelope::sign_revocation(&impostor, &caller_pub));
+    let refused = conn.call(&json!({ "op": "revoke_caller", "caller_pub_b64": caller_vk_b64, "operator_sig_b64": forged_sig }))?;
+    if refused.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a FORGED revocation was honoured — revocation must be operator-only".to_string());
+    }
+    // The GENUINE operator revocation lands…
+    let genuine_sig = B64.encode(ddrm_envelope::sign_revocation(operator_signer, &caller_pub));
+    ok_data(
+        &conn.call(&json!({ "op": "revoke_caller", "caller_pub_b64": caller_vk_b64, "operator_sig_b64": genuine_sig }))?,
+        "operator revocation",
+    )?;
+    // …and the SAME live, unexpired session is refused MID-SESSION (immediate cutoff).
+    let cut = recover_with_seq(&mut conn, 2)?;
+    if cut.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a recover under a STILL-LIVE token served after revocation — revocation must outrank a live session".to_string());
+    }
+    drop(conn);
+    // The revocation PERSISTS across connections: a fresh handshake by the revoked caller is refused.
+    let mut again = NodeSocket::connect(&endpoint_a)?;
+    ok_data(&again.call(&json!({ "op": "init", "config": {} }))?, "post-revocation init")?;
+    match transport {
+        DkmsTransport::Tcp => {
+            if again.establish_channel(&vk_a_old, caller_seed, ddrm_envelope::random_seed(), NOW_UNIX).is_ok() {
+                return Err("a REVOKED caller re-established a session on a fresh connection".to_string());
+            }
+        }
+        DkmsTransport::Unix => {
+            let hello = again.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(ddrm_envelope::random_seed()),
+                "caller_pub_b64": caller_vk_b64,
+                "now_unix": NOW_UNIX,
+            }))?;
+            if hello.get("status").and_then(Value::as_str) != Some("error") {
+                return Err("a REVOKED caller's fresh hello was served on a new connection".to_string());
+            }
+        }
+    }
+    step(35, "dkms lifecycle: LIVE CALLER REVOCATION — only the operator's signature revokes; the cutoff is IMMEDIATE (a still-live session token is refused mid-session) and PERSISTS across connections");
     Ok(())
 }
 
@@ -2317,6 +2779,12 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let caller_seed_b64 = B64.encode(caller_seed);
     let (_caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
     let caller_vk_b64 = B64.encode(&caller_vk);
+    // The OPERATOR identity (Day 109–112): a per-run ML-DSA keypair PINNED into every node daemon at
+    // start (env). Its signatures — and ONLY its signatures — authorize the node lifecycle ops
+    // (share-wise rotation, live caller revocation). The runtime holds the operator's signing key the
+    // way a real deployment's operator console would; the NODES hold only the public identity.
+    let (operator_signer, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
+    let operator_vk_b64 = B64.encode(&operator_vk);
     if cfg.authority == AuthorityBackend::Dkms {
         // Grant the node DAEMON its store via the env it resolves — the key-provider client that
         // connects to the node never passes or sees this path; it's the node's own concern.
@@ -2348,7 +2816,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             .ok_or("dkms backend requires a dkms_authority_bin in the config")?;
         // Provision the daemon's KNOWN-caller allow-list with the runtime's caller identity, so only
         // this runtime (the key-provider rail + the probe, both deriving the same identity) is served.
-        Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64)?)
+        Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64, &operator_vk_b64)?)
     } else {
         None
     };
@@ -2359,7 +2827,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             .dkms_authority_bin
             .as_deref()
             .ok_or("dkms threshold requires a dkms_authority_bin in the config")?;
-        Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64)?)
+        Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64, &operator_vk_b64)?)
     } else {
         None
     };
@@ -2811,7 +3279,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         }
         // RESTART node B: the node-set AAD gate below (gate 26) drives a LIVE dual-recover, so both
         // secret-holders must be reachable again.
-        dkms_daemon_b = Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64)?);
+        dkms_daemon_b = Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64, &operator_vk_b64)?);
         step(23, "key-provider (2-of-2): node B DOWN → the live rail failed closed (no partial CEK, no single-node fallback, no record persisted); node B restored");
 
         // #6: node A DOWN → the dual-recover fails at node A (recovered first); same fail-closed property.
@@ -2826,7 +3294,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             return Err("a node-A-down open must persist no runtime-event record".to_string());
         }
         // RESTART node A: the post-shutdown adversarial probe (steps 13–17) connects to node A's socket.
-        dkms_daemon = Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64)?);
+        dkms_daemon = Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64, &operator_vk_b64)?);
         step(24, "key-provider (2-of-2): node A DOWN → the live rail failed closed; the runtime never degrades a 2-of-2 to a single node");
 
         // --- fail-closed #7 (NODE-SET SWAP, Day 101–102): the producer durably PINNED the identity of
@@ -2998,6 +3466,24 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             // a single/forged share fails closed. Self-contained (its own two daemons).
             if let Some(node_bin) = cfg.dkms_authority_bin.as_deref() {
                 dkms_threshold_probe(node_bin, &work_dir)?;
+
+                // SECRET-HOLDER LIFECYCLE (Day 109–112): live share-wise rotation to REAL successor
+                // daemons, refresh-dead old material, operator-only authorization, and live caller
+                // revocation. LAST (it revokes the runtime's caller on old node A).
+                if cfg.threshold {
+                    dkms_rotation_and_revocation_gates(
+                        node_bin,
+                        key_bin,
+                        &work_dir,
+                        &fixture,
+                        &descriptor_path,
+                        cfg.dkms_transport,
+                        caller_seed,
+                        &caller_seed_b64,
+                        &operator_signer,
+                        &operator_vk_b64,
+                    )?;
+                }
             }
         }
     }

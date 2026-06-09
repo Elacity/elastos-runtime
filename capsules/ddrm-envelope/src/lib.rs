@@ -628,6 +628,52 @@ pub fn channel_frame_aad(channel_id: &[u8], direction: u8, seq: u64) -> Vec<u8> 
     lp_concat(DKMS_CHANNEL_FRAME_DOMAIN, &[channel_id, &[direction], &seq.to_le_bytes()])
 }
 
+/// Domain label for a SHARE-WISE node-set ROTATION (Day 109–112): the operator instructs a
+/// secret-holding node to re-escrow ITS share to a successor node, refreshed by an XOR delta — the
+/// whole CEK is NEVER reassembled anywhere during rotation. The refresh delta travels as a sealed
+/// envelope to the rotating node, AEAD-bound to THIS AAD: the kid being rotated, the SOURCE node's
+/// escrow recipient (only that node can open it) and the SUCCESSOR's recipient (a MITM cannot
+/// redirect the rotated share to its own recipient — the AAD would not match). Signed by the
+/// OPERATOR identity the node pins at daemon start, so only the operator can authorize a rotation.
+/// (PC2 has no analogue at all: its "rotation" is a manual constant redeploy with NO migration of
+/// existing content — `chipotle-client.ts:125`/`:1043`/`:1064`.) Defined ONCE here so the runtime
+/// and the node cannot drift.
+pub const DKMS_ROTATE_DOMAIN: &[u8] = b"elastos.dkms.authority/rotate-share/v1";
+
+/// Canonical rotation AAD: `DKMS_ROTATE_DOMAIN ‖ lp(kid16) ‖ lp(source_recipient_pub) ‖
+/// lp(successor_recipient_pub)`. The operator seals the refresh delta under it; the rotating node
+/// recomputes it from its OWN recipient key + the request's successor — a delta sealed for a
+/// different kid, a different source node, or a different successor fails the AEAD open.
+pub fn rotation_aad(
+    kid_bytes16: &[u8; 16],
+    source_recipient_pub: &[u8],
+    successor_recipient_pub: &[u8],
+) -> Vec<u8> {
+    lp_concat(DKMS_ROTATE_DOMAIN, &[kid_bytes16, source_recipient_pub, successor_recipient_pub])
+}
+
+/// Domain label for an OPERATOR-signed caller REVOCATION (Day 109–112): the node removes a caller
+/// from service at runtime — its next `hello` AND any `recover` under a still-live session token are
+/// refused (revocation outranks a live session). The runtime-core analogue of PC2 revoking a
+/// delegation nonce that the TEE reads back per request (`secureViewSession.ts:108`–`:112`,
+/// `revokeDelegation`/`isDelegationRevoked` in `utils/secureViewSession.ts:382`–`:399`) — except
+/// here the SIGNED instruction reaches the key-holding node itself, not just an HTTP middleware.
+/// Domain-separated from every other signature in the system.
+pub const DKMS_REVOKE_DOMAIN: &[u8] = b"elastos.dkms.authority/revoke-caller/v1";
+
+/// The OPERATOR side: sign a revocation of `caller_pub` (the caller's ML-DSA verifying key).
+pub fn sign_revocation(signer: &impl seal::CekSealSigner, caller_pub: &[u8]) -> Vec<u8> {
+    signer.sign(&lp_concat(DKMS_REVOKE_DOMAIN, &[caller_pub]))
+}
+
+/// The NODE side: verify a revocation under the operator identity pinned at daemon start. `true`
+/// only for a valid operator signature over the SAME caller key — a forged signature or a
+/// signature lifted from another domain (hello attestation, channel attestation, session token)
+/// returns `false` and the revocation is refused.
+pub fn verify_revocation(verifier: &impl CekSealVerifier, caller_pub: &[u8], sig: &[u8]) -> bool {
+    verifier.verify(&lp_concat(DKMS_REVOKE_DOMAIN, &[caller_pub]), sig)
+}
+
 /// Length-prefixed message FRAMING for the dKMS node's socket transport (Day 93–94): every message
 /// is `[4-byte length (BE)][payload]`, so a reader recovers exact message boundaries instead of
 /// trusting a raw byte stream. The runtime-core analogue of PC2's Boson proxy framing —
@@ -1494,6 +1540,56 @@ mod tests {
         assert_ne!(aad, crate::channel_frame_aad(&[0x78u8; 32], 0, 1));
         // Domain-labelled (never collides with another AAD family).
         assert!(aad.starts_with(crate::DKMS_CHANNEL_FRAME_DOMAIN));
+    }
+
+    /// Day 109–112: the ROTATION AAD binds the kid, the SOURCE node and the SUCCESSOR node — a
+    /// refresh delta sealed for one rotation cannot authorize another (no kid-swap, no source-swap,
+    /// no successor-redirect), and the domain never collides with the escrow AAD family.
+    #[test]
+    fn rotation_aad_binds_kid_source_and_successor() {
+        let kid = [0x11u8; 16];
+        let source = [0x22u8; 64];
+        let successor = [0x33u8; 64];
+        let aad = crate::rotation_aad(&kid, &source, &successor);
+        // Deterministic (operator + node must compute byte-identical AADs).
+        assert_eq!(aad, crate::rotation_aad(&kid, &source, &successor));
+        // Kid-separated: a delta minted to rotate one content cannot rotate another.
+        assert_ne!(aad, crate::rotation_aad(&[0x12u8; 16], &source, &successor));
+        // Source-separated: a delta sealed for node A cannot drive node B's rotation.
+        assert_ne!(aad, crate::rotation_aad(&kid, &[0x23u8; 64], &successor));
+        // Successor-separated: an attacker cannot REDIRECT the rotated share to its own recipient.
+        assert_ne!(aad, crate::rotation_aad(&kid, &source, &[0x34u8; 64]));
+        // Domain-labelled, and NEVER the escrow AAD (a rotation delta is not an escrowed share).
+        assert!(aad.starts_with(crate::DKMS_ROTATE_DOMAIN));
+        assert_ne!(aad, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &successor));
+    }
+
+    /// Day 109–112: a caller REVOCATION verifies only under the operator identity over the exact
+    /// caller key — forged signatures, other callers, other identities, and signatures lifted from
+    /// every sibling domain are all refused.
+    #[test]
+    fn revocation_signature_is_operator_and_caller_bound() {
+        let (operator, operator_vk) = mldsa_seal_keypair([0x6Fu8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&operator_vk).expect("vk decodes");
+        let caller_pub = vec![0x55u8; 96];
+        let sig = crate::sign_revocation(&operator, &caller_pub);
+
+        // The genuine revocation verifies under the pinned operator identity.
+        assert!(crate::verify_revocation(&verifier, &caller_pub, &sig));
+        // A DIFFERENT caller is not revoked by this signature.
+        assert!(!crate::verify_revocation(&verifier, &[0x56u8; 96], &sig));
+        // A non-operator signer cannot revoke (the node pins the operator identity).
+        let (impostor, impostor_vk) = mldsa_seal_keypair([0x70u8; 32]);
+        let impostor_sig = crate::sign_revocation(&impostor, &caller_pub);
+        assert!(!crate::verify_revocation(&verifier, &caller_pub, &impostor_sig));
+        let impostor_verifier = MlDsa65Verifier::from_encoded(&impostor_vk).expect("vk decodes");
+        assert!(impostor_vk != operator_vk && crate::verify_revocation(&impostor_verifier, &caller_pub, &impostor_sig));
+        // Domain separation: a hello attestation / channel attestation over the same bytes is NOT
+        // a revocation — no signature from a sibling domain can stand in for one.
+        let hello_sig = crate::attest_challenge(&operator, &caller_pub);
+        assert!(!crate::verify_revocation(&verifier, &caller_pub, &hello_sig));
+        let channel_sig = crate::attest_channel_key(&operator, &caller_pub, &caller_pub);
+        assert!(!crate::verify_revocation(&verifier, &caller_pub, &channel_sig));
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.

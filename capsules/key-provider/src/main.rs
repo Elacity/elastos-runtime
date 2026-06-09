@@ -214,6 +214,14 @@ struct ReleaseSessionContext {
     /// reconstructs the CEK in-VM. Absent → single-node rail.
     #[serde(default)]
     wrapped_cek_share2_b64: Option<String>,
+    /// SHARE-WISE ROTATION (Day 109–112): the key that signed share-2's CURRENT escrow, when it
+    /// differs from share-1's. At first publish ONE producer signed both escrows (`producer_vk_b64`
+    /// covers both, this is `None`). After a rotation each share's new escrow is signed by the NODE
+    /// that rotated it — so the runtime supplies the per-share producer identity and the share-2
+    /// recover authenticates under it. Absent → falls back to `producer_vk_b64` (the non-rotated
+    /// rail is byte-identical).
+    #[serde(default)]
+    producer_vk2_b64: Option<String>,
     /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
     /// authority refuses to release (fail-closed), never sealing a CEK past its window.
     #[serde(default)]
@@ -1314,9 +1322,13 @@ impl KeyProvider {
             }
         };
         // Recover a re-sealed share from node B over its OWN connection + session + fresh freshness
-        // counter + possession proof. Only the escrow blob differs from node A's recover.
+        // counter + possession proof. Only the escrow blob — and, after a rotation, the per-share
+        // escrow producer identity (Day 109–112) — differs from node A's recover.
         let mut recover_req2 = recover_req.clone();
         recover_req2["wrapped_cek_b64"] = json!(share2_escrow);
+        if let Some(vk2) = session.producer_vk2_b64.as_ref() {
+            recover_req2["producer_vk_b64"] = json!(vk2);
+        }
         let material_b = match self.delegate_recover(
             node_b,
             &self.dkms_conn2,
@@ -3043,6 +3055,33 @@ mod tests {
                 !serde_json::to_string(&out).unwrap().contains(&b64.encode(&s.cek)),
                 "no raw CEK may appear in the release response"
             );
+        }
+
+        /// SHARE-WISE ROTATION (Day 109–112): the session context carries an OPTIONAL per-share
+        /// escrow producer identity. A first publish has ONE producer for both shares (the field
+        /// is absent and the rail is byte-identical to before); after a rotation, share-2's escrow
+        /// is signed by the node that rotated it, and the runtime supplies that identity here so
+        /// node B authenticates the rotated escrow under the RIGHT key.
+        #[test]
+        fn session_context_carries_an_optional_per_share_producer_identity() {
+            let s = escrow_scenario();
+            // Absent → None (the non-rotated fixture parses unchanged; share-2 reuses producer_vk).
+            let base = session_ctx(&s, &s.producer_vk, None).expect("session context");
+            assert!(base.producer_vk2_b64.is_none());
+            // Present → carried (deny_unknown_fields would refuse a typo'd field name).
+            let b64 = b64();
+            let v = json!({
+                "decrypt_session_pub_b64": s.session_pub_b64,
+                "producer_vk_b64": b64.encode(&s.producer_vk),
+                "aad_b64": b64.encode(&s.transcript),
+                "ciphertext_b64": b64.encode(b"ciphertext"),
+                "content_hash_b64": b64.encode(b"content-hash"),
+                "nonce_b64": b64.encode(b"nonce"),
+                "producer_vk2_b64": "Uk9UQVRFRC1OT0RFLVZL",
+            });
+            let ctx: ReleaseSessionContext =
+                serde_json::from_value(v).expect("rotated session context parses");
+            assert_eq!(ctx.producer_vk2_b64.as_deref(), Some("Uk9UQVRFRC1OT0RFLVZL"));
         }
 
         /// A denied rights receipt is rejected BEFORE the escrow is ever touched
