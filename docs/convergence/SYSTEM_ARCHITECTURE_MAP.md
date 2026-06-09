@@ -200,7 +200,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | KID as `bytes16` content id | shared `protected_content` + `chain-provider` | Already the rights-read key (`has_access_by_content_id`) |
 | `SHA256(cek‖kid‖authority)` binding | `DecryptTranscriptV1` (extended: principal/session/object/receipt/pubkey/suite/nonce) | We bind **more** than PC2 — full transcript, AEAD + ML-DSA-65 sig |
 | Lit PKP threshold custody | `key-provider` + **ElastOS-native PQ-hybrid dKMS** | Anders: Lit is a *compat backend behind key-provider*, not the product root |
-| Lit ECDH-seal to viewer session | `key-provider` → `SealedDecryptMaterialV1` → `decrypt-provider` | Done on our side; **producer side is the gap** |
+| Lit ECDH-seal to viewer session | `key-provider` → `SealedDecryptMaterialV1` → `decrypt-provider` | Done both sides (dev-shaped): producer escrows the CEK, authority recovers + re-seals (Day 60 producer smoke) |
 | `ddrm-decrypt` WASM unwrap + CENC | `decrypt-provider` rail-* | **Complete** (transcript-bound, in-sandbox key, expiry, audit) |
 | AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
@@ -283,9 +283,19 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   proven on a fresh CEK (no golden): producer mint → escrow → authority recover →
   re-seal to a decrypt session → decrypt opens the SAME CEK, no raw CEK across any
   boundary.
-- **Remaining:** the *cross-binary* `ddrm-producer-smoke.sh` (Day 60 — new wire ops:
-  encrypt emits the escrow blob, key-provider recovers + re-seals), then `publish-provider`
-  (mint contentId=KID + tokenURI) and the `content-market` index.
+- **Status (Day 60 — producer half runs ACROSS REAL PROCESSES):** `encrypt-provider`
+  (feature `escrow`) publishes a producer verifying key at `init` and gained a `seal_inline`
+  wire op — mint a CEK *now*, CENC-encrypt fresh bytes into a decrypt-ready single-sample
+  segment, escrow the CEK to the authority's recipient, zeroize, and return only
+  `{kid, content_id, segment, wrapped_cek}` (no raw CEK / no plaintext). `key-provider`
+  gained `release_from_escrow_ref` — recover the CEK from the escrow blob (+ producer vk +
+  KID + scheme) and re-seal it to the decrypt session through the SAME sealing path as
+  `release_ref` (tampered/foreign blob fails closed). `scripts/ddrm-producer-smoke.sh`
+  drives `encrypt → key[recover+re-seal] → decrypt` over the three REAL binaries — a video
+  sealed *now* decrypts *now*, no golden, fail-closed, no key/plaintext leak on any wire.
+- **Remaining:** `publish-provider` (mint contentId=KID + tokenURI via chain+wallet — the
+  on-chain producer step), the `content-market` index, and real `plaintext_ref`→IPFS in the
+  producer op (today it takes inline bytes for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop

@@ -82,6 +82,16 @@ enum Request {
     Seal {
         request: Box<SealRequest>,
     },
+    /// Dev-shaped producer op (feature `escrow`): mint a CEK+KID in-boundary,
+    /// CENC-encrypt the inline plaintext into a single-sample fMP4 segment, escrow the
+    /// CEK to the key authority's published recipient key, and return only ciphertext +
+    /// KID + the SEALED CEK. Production resolves `plaintext_ref` and uploads to IPFS;
+    /// this makes the bytes drivable for the producer smoke. Never ships a raw CEK.
+    #[cfg(feature = "escrow")]
+    SealInline {
+        plaintext_b64: String,
+        recipient_pub_b64: String,
+    },
     Shutdown,
 }
 
@@ -115,11 +125,25 @@ impl Response {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct EncryptProvider {
     /// Where the in-boundary CEK is escrowed (sealed) so the key authority can later
     /// re-seal it per decrypt session. Fail-closed by default — see [`CekEscrow`].
     escrow: CekEscrow,
+    /// The producer's ML-DSA seal key (feature `escrow`), minted at `init`. The
+    /// authority trusts its published verifying key to accept an escrowed CEK.
+    #[cfg(feature = "escrow")]
+    producer: Option<ProducerKey>,
+}
+
+/// The producer's escrow signing identity (feature `escrow`). Its verifying key is
+/// published at `init` so the key authority can verify the escrow seal.
+#[cfg(feature = "escrow")]
+struct ProducerKey {
+    signer: ddrm_envelope::seal::MlDsaSealSigner,
+    /// Published at `init`; retained for symmetry/diagnostics.
+    #[allow(dead_code)]
+    verifying_key: Vec<u8>,
 }
 
 impl EncryptProvider {
@@ -128,17 +152,41 @@ impl EncryptProvider {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
             Request::Seal { request } => self.seal(*request),
+            #[cfg(feature = "escrow")]
+            Request::SealInline {
+                plaintext_b64,
+                recipient_pub_b64,
+            } => self.seal_inline(&plaintext_b64, &recipient_pub_b64),
             Request::Shutdown => Response::empty_ok(),
         }
     }
 
     fn init(&mut self, _config: Value) -> Response {
-        Response::ok(json!({
+        #[allow(unused_mut)]
+        let mut data = json!({
             "provider": "encrypt",
             "protocol_version": "1.0",
             "configured": false,
             "supported_operations": ["status", "seal"],
-        }))
+        });
+        // A producer that escrows CEKs PUBLISHES its verifying key so the authority can
+        // verify the escrow seal (the mirror of the authority publishing its recipient
+        // key). Minted fresh per process; the secret never leaves this boundary.
+        #[cfg(feature = "escrow")]
+        {
+            use base64::Engine as _;
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed).expect("csprng producer seed");
+            let (signer, verifying_key) = ddrm_envelope::seal::mldsa_seal_keypair(seed);
+            data["producer_verifying_key_b64"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(&verifying_key));
+            data["supported_operations"] = json!(["status", "seal", "seal_inline"]);
+            self.producer = Some(ProducerKey {
+                signer,
+                verifying_key,
+            });
+        }
+        Response::ok(data)
     }
 
     fn status(&self) -> Response {
@@ -187,6 +235,106 @@ impl EncryptProvider {
             ),
         }
     }
+
+    /// Dev-shaped producer pipeline (feature `escrow`): run the FULL invariant-#1 path
+    /// on inline bytes — mint CEK+KID, CENC-encrypt into a single-sample fMP4 segment,
+    /// escrow the CEK to the authority's recipient key — and emit only ciphertext + KID
+    /// + the SEALED CEK. The raw CEK lives in `Zeroizing` and is scrubbed on drop.
+    #[cfg(feature = "escrow")]
+    fn seal_inline(&self, plaintext_b64: &str, recipient_pub_b64: &str) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let producer = match self.producer.as_ref() {
+            Some(p) => p,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "seal_inline requires init to have minted the producer key (escrow build)",
+                )
+            }
+        };
+        let plaintext = match b64.decode(plaintext_b64) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => return Response::error("invalid_request", "plaintext_b64 is empty"),
+            Err(_) => return Response::error("invalid_request", "plaintext_b64 is not valid base64"),
+        };
+        let recipient_pub = match b64.decode(recipient_pub_b64) {
+            Ok(b) => b,
+            Err(_) => {
+                return Response::error("invalid_request", "recipient_pub_b64 is not valid base64")
+            }
+        };
+
+        // Mint in-boundary and CENC-encrypt one full sample.
+        let minted = match mint_cek_and_kid() {
+            Ok(m) => m,
+            Err(e) => return Response::error("internal", e),
+        };
+        let mut iv_seed = [0u8; 8];
+        if getrandom::getrandom(&mut iv_seed).is_err() {
+            return Response::error("internal", "csprng iv seed failed");
+        }
+        let sizes = [plaintext.len() as u32];
+        let (ciphertext, ivs, _subs) =
+            match cenc::encrypt_samples(&plaintext, &minted.cek, &sizes, &iv_seed, 0) {
+                Ok(out) => out,
+                Err(e) => return Response::error("internal", e),
+            };
+        let segment = mux_single_sample_segment(&ciphertext, &ivs[0]);
+
+        // Escrow the CEK to the authority (SEALED; the raw CEK never leaves).
+        let kid16 = match kid_to_content_id_bytes16(&minted.kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("internal", e),
+        };
+        let wrapped_cek_b64 =
+            match seal_cek_to_authority(&minted.cek[..], &kid16, &recipient_pub, &producer.signer) {
+                Ok(w) => w,
+                Err(e) => return Response::error("invalid_request", e),
+            };
+
+        // `minted` (Zeroizing CEK) drops here — CEK scrubbed before return.
+        Response::ok(json!({
+            "kid_hex": minted.kid_hex,
+            // The KID hex IS the on-chain bytes16 contentId (Day 58 identity join).
+            "content_id_hex": minted.kid_hex,
+            "scheme": SUPPORTED_SCHEMES[0],
+            "segment_b64": b64.encode(&segment),
+            "wrapped_cek_b64": wrapped_cek_b64,
+        }))
+    }
+}
+
+/// Minimal ISO-BMFF box: `size(u32 BE) ‖ type(4) ‖ content`.
+#[cfg(feature = "escrow")]
+fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+    let size = (8 + content.len()) as u32;
+    let mut b = size.to_be_bytes().to_vec();
+    b.extend_from_slice(box_type);
+    b.extend_from_slice(content);
+    b
+}
+
+/// Mux one encrypted full sample + its 8-byte IV into the minimal
+/// `moof{traf{trun,senc}} + mdat` segment the decrypt engine consumes — the same box
+/// shape as the committed round-trip goldens (trun sample-size-present, senc flags=0).
+/// In production a real muxer (a later boundary) does this; here it is colocated so the
+/// producer op emits a decrypt-ready segment.
+#[cfg(feature = "escrow")]
+fn mux_single_sample_segment(ciphertext: &[u8], iv8: &[u8; 8]) -> Vec<u8> {
+    let mut trun_content = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+    trun_content.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+    let trun = make_box(b"trun", &trun_content);
+    let mut senc_content = vec![0u8, 0, 0, 0, 0, 0, 0, 1];
+    senc_content.extend_from_slice(iv8);
+    let senc = make_box(b"senc", &senc_content);
+    let mut traf_content = trun;
+    traf_content.extend_from_slice(&senc);
+    let traf = make_box(b"traf", &traf_content);
+    let moof = make_box(b"moof", &traf);
+    let mut segment = moof;
+    segment.extend_from_slice(&make_box(b"mdat", ciphertext));
+    segment
 }
 
 /// The CEK-escrow seam — invariant #1's "seal the CEK to the authority" half.

@@ -5,8 +5,8 @@ ElastOS Runtime ⇄ PC2 convergence work in a fresh context window. Read this to
 bottom once; it tells you exactly what we're doing, why, what's done, what to read,
 and how to continue at the same quality bar — with no loss of insight.
 
-**Last updated:** 2026-06-09 (end of Day 59).
-**Active branch:** `feat/decrypt-provider-cenc` (tip Day-59 Phase C — the CEK-escrow ENGINE is real: the reference `key-provider` publishes a PQ-hybrid KEM recipient key, `encrypt-provider` (feature `escrow`) seals a freshly-minted CEK to it via `ddrm-envelope` under a shared escrow AAD, and the full producer→authority→re-seal→decrypt path is proven on a FRESH CEK (envelope=14, key-authority-ref=26, encrypt escrow=19). Defaults fail-closed; consumer half still runs via `scripts/ddrm-consumer-smoke.sh`; ~65 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Last updated:** 2026-06-09 (end of Day 60).
+**Active branch:** `feat/decrypt-provider-cenc` (tip Day-60 Phase C — the producer half now runs ACROSS REAL PROCESSES: `encrypt-provider` (feature `escrow`) has a `seal_inline` wire op that mints a CEK *now*, CENC-encrypts fresh bytes into a decrypt-ready segment, and emits the SEALED escrow blob (publishing its producer verifying key at `init`); `key-provider` (`release_from_escrow_ref`) recovers that CEK from the blob and re-seals it to the decrypt session; and `scripts/ddrm-producer-smoke.sh` drives `encrypt → key[recover+re-seal] → decrypt` so a video sealed *now* decrypts *now* — no raw CEK and no plaintext on any wire, no golden (key-authority-ref=27, encrypt escrow=19). Defaults fail-closed; consumer half still runs via `scripts/ddrm-consumer-smoke.sh`; ~66 commits). **0.4.0 released (tag `v0.4.0`); contract byte-identical, crypto core verified green on the released base; rebase surface measured in `PUSH_PLAN.md`. Anders confirmed the rail (Day 45) and the decrypt boundary now implements his ENTIRE decrypt-side spec, consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`), consolidated envelope (`rail-material`). Decrypt boundary is COMPLETE; remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 **Repo:** `/Users/sash/code/elastos-runtime` (this repo).
 **PC2 reference repo (stable source of truth):** `/Users/sash/Documents/Cursor/pc2.net/pc2-node`.
 
@@ -541,7 +541,13 @@ receipt to gate the key release, proving `rights(allowed) → key → decrypt`
 (`rights-provider`=9 default unchanged, `chain-rights`=17). Next, in order:
 - **Phase B (cont.)** — drive `chain-provider` against live Base (funded wallet holding an
   Elacity access token) so the ownership answer is real, not mocked.
-- **Phase C** — the producer half (encrypt → publish on-chain → IPFS pin → content market).
+- **Phase C (underway)** — the producer half. Days 58–60 landed the identity join
+  (KID == on-chain `bytes16` contentId), the fail-closed CEK-escrow seam, the real escrow
+  ENGINE, and now the **cross-binary producer smoke**: `encrypt(seal_inline) → key(release_
+  from_escrow_ref) → decrypt` runs over real processes, a CEK sealed *now* decrypts *now*,
+  no raw CEK / no plaintext on any wire (`scripts/ddrm-producer-smoke.sh`). Next product rung:
+  `publish-provider` (mint contentId=KID + tokenURI — the step that puts content on-chain
+  toward the market), then real `plaintext_ref`→IPFS in the producer op.
 - **Phase A follow-ups** — a `wasm32-wasip1` variant of the smoke (today native).
 
 Still **blocked on others** (parallel): fold `SealedDecryptMaterialV1` into the shared

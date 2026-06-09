@@ -42,7 +42,7 @@ LADDER=(
   "rights-provider chain-rights|rights-provider|chain-rights|18"
   "ddrm-envelope (lib)|ddrm-envelope||14"
   "key-provider (default)|key-provider||18"
-  "key-provider key-authority-ref|key-provider|key-authority-ref|26"
+  "key-provider key-authority-ref|key-provider|key-authority-ref|27"
   "decrypt-provider (default)|decrypt-provider||25"
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"

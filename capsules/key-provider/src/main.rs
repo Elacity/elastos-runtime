@@ -124,6 +124,34 @@ enum Request {
         #[serde(default)]
         init_segment_b64: Option<String>,
     },
+    /// Phase C (Day 60): release a CEK the PRODUCER escrowed to this authority, rather
+    /// than a raw CEK. The authority recovers the CEK from the escrow blob (verifying
+    /// the producer + binding the KID via the shared escrow AAD), then re-seals it to
+    /// the decrypt session — closing producer→authority→decrypt with no raw CEK on any
+    /// wire. Requires the `reference` backend.
+    #[cfg(feature = "key-authority-ref")]
+    ReleaseFromEscrowRef {
+        request: Box<KeyReleaseRequestV1>,
+        decrypt_session_pub_b64: String,
+        /// The producer's escrow blob (`ddrm-envelope` sealed envelope, base64) — the
+        /// CEK sealed to THIS authority's recipient key. Never a raw CEK.
+        wrapped_cek_b64: String,
+        /// The producer's published verifying key (base64) to authenticate the escrow.
+        producer_vk_b64: String,
+        /// Content identity (32-hex KID == on-chain bytes16 contentId) the escrow AAD
+        /// is bound to; a mismatch fails closed.
+        kid_hex: String,
+        /// Sealing suite the escrow AAD is bound to (must match the producer).
+        scheme: String,
+        /// Decrypt-transcript AAD the re-seal binds to (same as `release_ref`).
+        #[serde(default)]
+        aad_b64: String,
+        ciphertext_b64: String,
+        content_hash_b64: String,
+        nonce_b64: String,
+        #[serde(default)]
+        init_segment_b64: Option<String>,
+    },
     Shutdown,
 }
 
@@ -229,6 +257,32 @@ impl KeyProvider {
                 *request,
                 &decrypt_session_pub_b64,
                 &cek_b64,
+                &aad_b64,
+                ciphertext_b64,
+                content_hash_b64,
+                nonce_b64,
+                init_segment_b64,
+            ),
+            #[cfg(feature = "key-authority-ref")]
+            Request::ReleaseFromEscrowRef {
+                request,
+                decrypt_session_pub_b64,
+                wrapped_cek_b64,
+                producer_vk_b64,
+                kid_hex,
+                scheme,
+                aad_b64,
+                ciphertext_b64,
+                content_hash_b64,
+                nonce_b64,
+                init_segment_b64,
+            } => self.release_from_escrow_ref(
+                *request,
+                &decrypt_session_pub_b64,
+                &wrapped_cek_b64,
+                &producer_vk_b64,
+                &kid_hex,
+                &scheme,
                 &aad_b64,
                 ciphertext_b64,
                 content_hash_b64,
@@ -364,28 +418,110 @@ impl KeyProvider {
             Err(_) => return Response::error("invalid_request", "cek_b64 is not valid base64"),
         };
 
-        // Seal — the CEK leaves this boundary only as sealed material.
-        let envelope =
-            ddrm_envelope::seal::seal_bound(&public, cek.as_slice(), &aad, &authority.signer);
-        let sealed_cek_b64 = b64.encode(envelope.to_bytes());
+        seal_recovered_cek_into_material(
+            authority,
+            &public,
+            cek.as_slice(),
+            &aad,
+            ciphertext_b64,
+            content_hash_b64,
+            nonce_b64,
+            init_segment_b64,
+        )
+    }
 
-        let mut material = json!({
-            "suite": ddrm_envelope::SUITE_PQ_HYBRID,
-            "sealed_cek_b64": sealed_cek_b64,
-            "ciphertext_b64": ciphertext_b64,
-            "nonce_b64": nonce_b64,
-            "content_hash_b64": content_hash_b64,
-        });
-        if let Some(init) = init_segment_b64 {
-            material["init_segment_b64"] = json!(init);
+    /// Phase C: recover a producer-escrowed CEK and re-seal it to the decrypt session.
+    /// Same fail-closed validation + reference-backend requirement as `release_ref`,
+    /// but the CEK source is the escrow blob (recovered in-boundary) rather than a raw
+    /// `cek_b64` — so no raw CEK ever crosses a wire into this authority either.
+    #[cfg(feature = "key-authority-ref")]
+    #[allow(clippy::too_many_arguments)]
+    fn release_from_escrow_ref(
+        &self,
+        request: KeyReleaseRequestV1,
+        decrypt_session_pub_b64: &str,
+        wrapped_cek_b64: &str,
+        producer_vk_b64: &str,
+        kid_hex: &str,
+        scheme: &str,
+        aad_b64: &str,
+        ciphertext_b64: String,
+        content_hash_b64: String,
+        nonce_b64: String,
+        init_segment_b64: Option<String>,
+    ) -> Response {
+        use base64::Engine as _;
+
+        if let Err(err) = validate_key_release_request(&request) {
+            return Response::error("invalid_request", err);
         }
+        let authority = match (self.backend, self.reference.as_ref()) {
+            (Some(KeyAuthorityBackend::Reference), Some(authority)) => authority,
+            _ => {
+                return Response::error(
+                    "not_configured",
+                    "release_from_escrow_ref requires the reference key authority backend",
+                )
+            }
+        };
 
-        Response::ok(json!({
-            "suite": ddrm_envelope::SUITE_PQ_HYBRID,
-            "material": material,
-            // The vk the decrypt boundary must be configured to trust for this seal.
-            "seal_verifying_key_b64": b64.encode(&authority.verifying_key),
-        }))
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let public = match b64
+            .decode(decrypt_session_pub_b64)
+            .ok()
+            .and_then(|bytes| ddrm_envelope::session_public_from_bytes(&bytes))
+        {
+            Some(public) => public,
+            None => {
+                return Response::error(
+                    "invalid_request",
+                    "decrypt_session_pub_b64 is not a valid session public key",
+                )
+            }
+        };
+        let aad = match b64.decode(aad_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "aad_b64 is not valid base64"),
+        };
+        let wrapped = match b64.decode(wrapped_cek_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Response::error("invalid_request", "wrapped_cek_b64 is not valid base64")
+            }
+        };
+        let producer_vk = match b64.decode(producer_vk_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Response::error("invalid_request", "producer_vk_b64 is not valid base64")
+            }
+        };
+        let kid16 = match decode_kid_bytes16(kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+
+        // Recover the escrowed CEK in this boundary (fail-closed on a foreign/tampered
+        // blob, a KID-swap, or a forged producer); re-seal to the decrypt session.
+        let cek = match authority.recover_escrowed_cek(&wrapped, scheme, &kid16, &producer_vk) {
+            Ok(cek) => cek,
+            Err(_) => {
+                return Response::error(
+                    "invalid_request",
+                    "escrowed CEK could not be recovered (foreign/tampered escrow, wrong KID, or bad producer key)",
+                )
+            }
+        };
+
+        seal_recovered_cek_into_material(
+            authority,
+            &public,
+            cek.as_slice(),
+            &aad,
+            ciphertext_b64,
+            content_hash_b64,
+            nonce_b64,
+            init_segment_b64,
+        )
     }
 
     fn status(&self) -> Response {
@@ -486,6 +622,56 @@ fn supported_backends_descriptor() -> Value {
 /// The 32-byte ML-DSA-65 seed for the dev reference seal authority. Operator may
 /// pin it via `config.ref_seal_seed_b64` (32 bytes); otherwise a fixed dev seed is
 /// used (the reference backend is dev-only — production uses the `dkms` backend).
+/// Seal a recovered CEK (raw or escrow-recovered) to the decrypt session and render
+/// the suite-tagged material response. The CEK leaves this boundary ONLY as sealed
+/// material; the response carries no raw CEK. Shared by `release_ref` (raw dev CEK) and
+/// `release_from_escrow_ref` (producer-escrowed CEK), so both seal identically.
+#[cfg(feature = "key-authority-ref")]
+#[allow(clippy::too_many_arguments)]
+fn seal_recovered_cek_into_material(
+    authority: &ReferenceAuthority,
+    public: &ddrm_envelope::SessionKemPublic,
+    cek: &[u8],
+    aad: &[u8],
+    ciphertext_b64: String,
+    content_hash_b64: String,
+    nonce_b64: String,
+    init_segment_b64: Option<String>,
+) -> Response {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let envelope = ddrm_envelope::seal::seal_bound(public, cek, aad, &authority.signer);
+    let mut material = json!({
+        "suite": ddrm_envelope::SUITE_PQ_HYBRID,
+        "sealed_cek_b64": b64.encode(envelope.to_bytes()),
+        "ciphertext_b64": ciphertext_b64,
+        "nonce_b64": nonce_b64,
+        "content_hash_b64": content_hash_b64,
+    });
+    if let Some(init) = init_segment_b64 {
+        material["init_segment_b64"] = json!(init);
+    }
+    Response::ok(json!({
+        "suite": ddrm_envelope::SUITE_PQ_HYBRID,
+        "material": material,
+        "seal_verifying_key_b64": b64.encode(&authority.verifying_key),
+    }))
+}
+
+/// Decode a 32-hex KID into the on-chain `bytes16` contentId the escrow AAD binds.
+#[cfg(feature = "key-authority-ref")]
+fn decode_kid_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
+    if kid_hex.len() != 32 || !kid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("kid_hex must be 32 lowercase-hex chars (bytes16 contentId)".to_string());
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&kid_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("kid hex: {e}"))?;
+    }
+    Ok(out)
+}
+
 #[cfg(feature = "key-authority-ref")]
 fn ref_seal_seed(config: &Value) -> [u8; 32] {
     use base64::Engine as _;
@@ -1043,6 +1229,117 @@ mod tests {
                     )
                     .is_err(),
                 "a forged producer signature must fail closed"
+            );
+        }
+
+        /// Day 60 wire op: `release_from_escrow_ref` recovers a producer-escrowed CEK
+        /// and re-seals it to the decrypt session — closing producer→authority→decrypt
+        /// with no raw CEK on any wire. A foreign/tampered escrow blob fails closed.
+        #[test]
+        fn release_from_escrow_re_seals_to_the_session_and_fails_closed_on_tamper() {
+            let b64 = b64();
+            let mut provider = KeyProvider::default();
+            let data = ok_data(provider.init(json!({ "backend": "reference" })));
+            let recip_b64 = data["seal_recipient_pub_b64"].as_str().unwrap();
+            let recip_bytes = b64.decode(recip_b64).unwrap();
+            let recipient_public =
+                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+
+            // Producer mints a CEK + KID and escrows it to the authority's recipient.
+            let (producer_signer, producer_vk) =
+                ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
+            let cek: Vec<u8> = (10u8..26).collect();
+            let kid = [0x5Cu8; 16];
+            let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
+            let escrow_aad = ddrm_envelope::transcript::escrow_aad(
+                ddrm_envelope::SUITE_PQ_HYBRID,
+                &kid,
+                &recip_bytes,
+            );
+            let wrapped = ddrm_envelope::seal::seal_bound(
+                &recipient_public,
+                &cek,
+                &escrow_aad,
+                &producer_signer,
+            )
+            .to_bytes();
+            let wrapped_b64 = b64.encode(&wrapped);
+
+            // Decrypt session + transcript AAD the authority re-seals to.
+            let (session_secret, session_public) = ddrm_envelope::mint_session();
+            let session_pub_b64 = b64.encode(ddrm_envelope::session_public_bytes(&session_public));
+            let transcript = b"transcript:producer-smoke";
+
+            let resp = provider.release_from_escrow_ref(
+                key_release_request(),
+                &session_pub_b64,
+                &wrapped_b64,
+                &b64.encode(&producer_vk),
+                &kid_hex,
+                ddrm_envelope::SUITE_PQ_HYBRID,
+                &b64.encode(transcript),
+                b64.encode(b"ciphertext"),
+                b64.encode(b"content-hash"),
+                b64.encode(b"nonce"),
+                None,
+            );
+            let out = ok_data(resp);
+
+            // The re-sealed material opens with the SAME unwrap the decrypt boundary
+            // uses, yielding the EXACT CEK the producer escrowed — no raw CEK anywhere.
+            let sealed = b64
+                .decode(out["material"]["sealed_cek_b64"].as_str().unwrap())
+                .unwrap();
+            let envelope = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).unwrap();
+            let vk = b64
+                .decode(out["seal_verifying_key_b64"].as_str().unwrap())
+                .unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
+            let recovered =
+                ddrm_envelope::hybrid_unwrap_bound(&session_secret, &envelope, transcript, &verifier)
+                    .unwrap();
+            assert_eq!(recovered.as_slice(), cek.as_slice());
+            assert!(!serde_json::to_string(&out).unwrap().contains(&b64.encode(&cek)));
+
+            // A tampered escrow blob fails closed (no material).
+            let mut bad = wrapped.clone();
+            *bad.last_mut().unwrap() ^= 1;
+            assert_eq!(
+                error_code(provider.release_from_escrow_ref(
+                    key_release_request(),
+                    &session_pub_b64,
+                    &b64.encode(&bad),
+                    &b64.encode(&producer_vk),
+                    &kid_hex,
+                    ddrm_envelope::SUITE_PQ_HYBRID,
+                    &b64.encode(transcript),
+                    b64.encode(b"ciphertext"),
+                    b64.encode(b"content-hash"),
+                    b64.encode(b"nonce"),
+                    None,
+                )),
+                "invalid_request",
+                "a tampered escrow blob must fail closed"
+            );
+
+            // A foreign producer vk fails closed at the signature.
+            let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([8u8; 32]);
+            assert_eq!(
+                error_code(provider.release_from_escrow_ref(
+                    key_release_request(),
+                    &session_pub_b64,
+                    &wrapped_b64,
+                    &b64.encode(&other_vk),
+                    &kid_hex,
+                    ddrm_envelope::SUITE_PQ_HYBRID,
+                    &b64.encode(transcript),
+                    b64.encode(b"ciphertext"),
+                    b64.encode(b"content-hash"),
+                    b64.encode(b"nonce"),
+                    None,
+                )),
+                "invalid_request",
+                "a foreign producer vk must fail closed"
             );
         }
 

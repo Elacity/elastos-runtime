@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~65 commits**, tip Day-59 Phase C — the CEK-escrow ENGINE is real: the reference key authority now publishes a PQ-hybrid KEM **recipient key**, `encrypt-provider` (feature `escrow`) seals a freshly-minted CEK to it via `ddrm-envelope` under a shared escrow AAD, and the authority recovers it — the full producer→authority→re-seal→decrypt path is proven on a FRESH CEK at the crypto layer (envelope=14, key-authority-ref=26, encrypt escrow=19); default builds stay fail-closed). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~66 commits**, tip Day-60 Phase C — the producer half now runs ACROSS REAL PROCESSES: `encrypt-provider` (feature `escrow`) has a `seal_inline` wire op that mints a CEK *now*, CENC-encrypts fresh bytes into a decrypt-ready segment, and emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers that CEK from the blob and re-seals it to the decrypt session; and `ddrm-producer-smoke.sh` drives `encrypt → key[recover+re-seal] → decrypt` so a video sealed *now* decrypts *now* — no raw CEK and no plaintext on any wire, no golden, fail-closed throughout). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,30 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🎬 Day 60 — the producer half runs ACROSS REAL PROCESSES (Phase C, LANDED).**
+> Day 59 proved the producer→authority→decrypt crypto spine on a fresh CEK in one test
+> process; Day 60 takes it cross-binary so a human can SEE a video sealed *now* decrypt
+> *now*. Three additive, feature-gated pieces (defaults byte-identical): (1) **Producer
+> wire op** — `encrypt-provider` (feature `escrow`) mints an ML-DSA producer key at `init`
+> and **publishes** `producer_verifying_key_b64`; a new `seal_inline` op mints a CEK
+> in-boundary, CENC-encrypts inline plaintext into a single-sample fMP4 segment (the same
+> box shape as the round-trip goldens), escrows the CEK to the authority's recipient key,
+> zeroizes, and returns only `{kid_hex, content_id_hex, segment_b64, wrapped_cek_b64}` —
+> never a raw CEK or the plaintext (encrypt escrow still 19 tests; the op is exercised by
+> the smoke). (2) **Authority recover→re-seal on the wire** — `key-provider`'s
+> `release_from_escrow_ref` takes the escrow blob + producer vk + KID + scheme (instead of
+> a raw `cek_b64`), recovers the CEK via `recover_escrowed_cek`, then re-seals it to the
+> decrypt session through the SAME shared sealing path as `release_ref`; a tampered/foreign
+> escrow blob or a forged producer fails closed (key-authority-ref 26→27). (3)
+> **`ddrm-producer-smoke.sh` + orchestrator** — drives the three REAL binaries
+> `encrypt → key[recover+re-seal] → decrypt`, asserting the session opens on the
+> freshly-sealed segment and that neither the escrow blob, any raw CEK, nor the plaintext
+> is echoed on any wire. **Gate:** full ladder INTACT (key-authority-ref 27, +wasm escrow
+> build), drift PASS, **both** smokes green (consumer + producer), no new warnings.
+> **Still upstream-only after this:** real `plaintext_ref`→IPFS in the producer op and the
+> dKMS-direct backend (needs Anders); next product rung is `publish-provider` (mint
+> contentId=KID + tokenURI — the step that puts content on-chain toward the market).
 
 > **🔐 Day 59 — the CEK-escrow ENGINE: producer→authority→decrypt on a FRESH CEK (Phase C, LANDED).**
 > Day 58 pinned the escrow *seam* fail-closed; Day 59 fills it with real PQ-hybrid crypto
