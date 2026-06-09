@@ -105,7 +105,7 @@ interchangeable **key-delivery backends**, all producing the *same* suite-tagged
 | Backend | Suite tag | Role |
 |---|---|---|
 | **Reference** (dev/native) | `elastos-pq-hybrid-threshold-v0` | In-runtime dev authority — lets us test the whole loop with no external deps. **Day 81–82:** with `init.config.authority_key_store` (a path) its signer + KEM recipient are persisted ONCE (one 32-byte master seed, atomic write, 0600) and re-derived deterministically every launch → a STABLE published recipient (escrow-at-publish), fail-closed on a corrupt store |
-| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team). **Day 83–84:** the seam is real + fail-closed — `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from a HANDED-IN descriptor (the dKMS-provisioned key material, READ never minted), VERIFIES it against the descriptor's published `verifying_key_b64`/`recipient_pub_b64` pins, and recovers/re-seals through the SAME `SealedDecryptMaterialV1` contract; no descriptor → "no dKMS node provisioned". **Day 85–86:** the pins are now REQUIRED (a pinless descriptor fails closed — a real external authority always publishes its identity) and the open runs against it end-to-end (`authority.backend:"dkms"`). **Day 87–88:** the REMOTE dKMS shape is now REAL — a SECRET-HOLDING NODE capsule (`dkms-authority`) owns the master + exposes only `recover` (recovers + re-seals in its own boundary), and `key-provider` holds a PUBLIC-ONLY descriptor (pins + endpoint, NO master, schema v2) and DELEGATES recovery to the node (spawn + JSON-RPC); a master-bearing descriptor is REJECTED, so the runtime holds NO recovery secret. **Day 89–90:** the delegation is now an AUTHENTICATED CHANNEL — `key-provider` PINS the node's published vk and VERIFIES a `hello` ATTESTATION over a fresh challenge before delegating (forged/mismatched node refused at handshake), and the node RE-AUTHORIZES every `recover` in its own boundary (refuses a denied / content-or-principal-mismatched receipt) before touching key material — the runtime-core analogue of pinning the Lit identity + the Lit action's in-TEE `hasAccessByContentId`. **Day 91–92:** the node is now a LONG-LIVED CONNECTION the client opens ONCE / proves identity ONCE / REUSES across releases (re-establishing fail-closed only on session expiry), and `hello` mints a node-signed SESSION TOKEN (binds the challenge + a bounded expiry) the node REQUIRES + verifies under its own vk on every `recover` — fail-closed on a missing/expired/forged/tampered token — the runtime-core analogue of PC2's per-view session resurrected per request to gate recovery (`secureViewSession.ts:81`–`:128`). Next: a real socket/RPC node transport + a client-held secret so the bearer token is non-replayable across callers; threshold shares across nodes |
+| **ElastOS dKMS** (product) | `elastos-pq-hybrid-threshold-v0` | Production PQ-hybrid threshold authority (Anders/dKMS team). **Day 83–84:** the seam is real + fail-closed — `init.config.dkms_authority_descriptor` (a path) RESOLVES the authority's stable signer + KEM recipient from a HANDED-IN descriptor (the dKMS-provisioned key material, READ never minted), VERIFIES it against the descriptor's published `verifying_key_b64`/`recipient_pub_b64` pins, and recovers/re-seals through the SAME `SealedDecryptMaterialV1` contract; no descriptor → "no dKMS node provisioned". **Day 85–86:** the pins are now REQUIRED (a pinless descriptor fails closed — a real external authority always publishes its identity) and the open runs against it end-to-end (`authority.backend:"dkms"`). **Day 87–88:** the REMOTE dKMS shape is now REAL — a SECRET-HOLDING NODE capsule (`dkms-authority`) owns the master + exposes only `recover` (recovers + re-seals in its own boundary), and `key-provider` holds a PUBLIC-ONLY descriptor (pins + endpoint, NO master, schema v2) and DELEGATES recovery to the node (spawn + JSON-RPC); a master-bearing descriptor is REJECTED, so the runtime holds NO recovery secret. **Day 89–90:** the delegation is now an AUTHENTICATED CHANNEL — `key-provider` PINS the node's published vk and VERIFIES a `hello` ATTESTATION over a fresh challenge before delegating (forged/mismatched node refused at handshake), and the node RE-AUTHORIZES every `recover` in its own boundary (refuses a denied / content-or-principal-mismatched receipt) before touching key material — the runtime-core analogue of pinning the Lit identity + the Lit action's in-TEE `hasAccessByContentId`. **Day 91–92:** the node is now a LONG-LIVED CONNECTION the client opens ONCE / proves identity ONCE / REUSES across releases (re-establishing fail-closed only on session expiry), and `hello` mints a node-signed SESSION TOKEN (binds the challenge + a bounded expiry) the node REQUIRES + verifies under its own vk on every `recover` — fail-closed on a missing/expired/forged/tampered token — the runtime-core analogue of PC2's per-view session resurrected per request to gate recovery (`secureViewSession.ts:81`–`:128`). **Day 93–94:** the node now has a REAL transport boundary — it BINDS + LISTENS on a Unix-domain socket and serves a length-prefixed FRAMED request/response (SAME JSON ops; one session per connection; torn/oversized/half-closed frame fails closed without wedging the daemon), the runtime CONNECTS rather than spawning, and the bearer session is NON-REPLAYABLE: `hello` binds the token to a caller-minted EPHEMERAL pubkey and every `recover` REQUIRES a signature under the matching private key the node verifies against the token-bound pubkey (a captured token replayed by a different/wrong-key caller is refused) — the runtime-core analogue of PC2's OWNER-BOUND session re-checked in the TEE (`secureViewSession.ts:87`–`:100`) + the Boson proxy's framed packets (`ProxyProtocol.ts:13`/`:251`/`:256`/`:371`). Next: a client-held long-term identity so the ephemeral key binds to a KNOWN caller; threshold shares across nodes |
 | **Lit / Chipotle** (compat) | `p256-classical-compat` | Migration backend for existing PC2 content; **not** the product root |
 | Third parties (future) | (declared per backend) | Same `release → SealedDecryptMaterialV1` contract |
 
@@ -183,8 +183,8 @@ flowchart TB
     DRM[drm-provider<br/>orchestrate drm/open]
     RTS[rights-provider]
     CHN[chain-provider<br/>has_access_by_content_id]
-    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, PINS node vk<br/>OPENS node ONCE, holds session, REUSES across releases]
-    NODE[dkms-authority node 🟩<br/>SECRET-HOLDING: owns master, hello mints SESSION TOKEN<br/>recover REQUIRES live token + re-authorizes, re-seals in-boundary, never CEK/master]
+    KEY[key-provider<br/>dKMS CLIENT: PUBLIC-only descriptor, PINS node vk<br/>CONNECTS node socket ONCE framed, mints EPHEMERAL keypair, SIGNS each recover]
+    NODE[dkms-authority node 🟩<br/>SECRET-HOLDING: owns master, BINDS+LISTENS framed Unix socket<br/>hello binds SESSION TOKEN to caller pubkey; recover REQUIRES possession proof + re-authorizes, re-seals in-boundary, never CEK/master]
     DEC[decrypt-provider<br/>OpenSessionV1 — DONE]
     VIEW[viewer capsule<br/>scoped render]
   end
@@ -199,9 +199,9 @@ flowchart TB
   WLT -->|buyAccess| CHN
   DRM --> RTS --> CHN
   RTS -->|RightsDecisionReceiptV1| KEY
-  KEY -->|1. open ONCE: hello challenge — verify attestation vs pinned vk<br/>capture node-signed SESSION TOKEN| NODE
-  KEY -->|2. recover MANY over the live session: escrow + session key + rights receipt + SESSION TOKEN<br/>persistent conn, NO master| NODE
-  NODE -->|verifies session token + re-authorizes receipt, then SealedDecryptMaterialV1<br/>re-sealed in the node| KEY
+  KEY -->|1. CONNECT ONCE over framed socket: hello challenge + caller pubkey — verify attestation vs pinned vk<br/>node binds SESSION TOKEN to caller pubkey| NODE
+  KEY -->|2. recover MANY over the live socket+session: escrow + session key + rights receipt + SESSION TOKEN + POSSESSION PROOF<br/>persistent conn, NO master| NODE
+  NODE -->|verifies token + possession proof + re-authorizes receipt, then SealedDecryptMaterialV1<br/>re-sealed in the node; torn/oversized frame fails closed| KEY
   KEY -->|SealedDecryptMaterialV1<br/>CEK sealed to session pubkey| DEC
   DEC -->|scoped output| VIEW
   DEC -->|publishes session pubkey at init| KEY
@@ -369,6 +369,30 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 93–94):** the long-lived dkms node gets a REAL transport boundary (a length-prefixed FRAMED
+  request/response over a Unix-domain socket the node BINDS + LISTENS on — the runtime CONNECTS, it does NOT own the
+  process), and the bearer session becomes NON-REPLAYABLE across callers (a per-connection possession proof) — closing
+  the two seams Day 91–92 deferred. Audited PC2 first: the secure-view session is OWNER-BOUND — the stored
+  `ownerAddress` must equal the authenticated wallet or `403 session_owner_mismatch`, re-checked in the TEE via
+  `ecrecover(delegationSig) === del.ownerAddress` (`secureViewSession.ts:87`–`:100`); the Boson proxy FRAMES every
+  packet `[2-byte length][1-byte type][body]` + `MAX_PACKET_SIZE`/`PACKET_HEADER_SIZE` (`ProxyProtocol.ts:13`/`:251`/`:256`/`:371`).
+  (1) NEW shared `ddrm-envelope` FRAME module — `frame::write_frame`/`read_frame`, `[4-byte BE len][payload]`,
+  `MAX_FRAME_BYTES=1 MiB`, fail-closed on torn/oversized/zero — plus a caller-bound session token
+  (`sign/verify_session_token` over `challenge‖caller_pub‖expires_at`) and a recover possession-proof
+  (`sign/verify_recover_proof` over the challenge + content binding); single source of truth (20→22). (2) The
+  `dkms-authority` node serves a SOCKET mode (`DKMS_AUTHORITY_LISTEN=<path>` → bind + listen + framed connections
+  sequentially, one session per connection; a torn/oversized/half-closed frame drops THAT connection only, never wedges
+  the daemon) keeping the SAME JSON ops; `hello` binds the token to the caller pubkey, `recover` REQUIRES + verifies a
+  possession proof against it BEFORE re-auth and any key material (9→11). (3) `key-provider` CONNECTS to the socket
+  (framed) instead of spawning, mints an EPHEMERAL keypair per connection, sends the pubkey at hello, and SIGNS every
+  recover — the long-lived `DkmsNodeConn` wraps the framed socket + the ephemeral signer (boxed; socket code `unix`-gated
+  so the wasm32-wasip1 ladder build stays clean) (key-provider[key-authority-ref]=41). `ddrm-runtime-open` starts the node
+  DAEMON listening + connects over the socket; verify mode adds step 17 (a torn AND an oversized frame each fail closed
+  without wedging the daemon, a clean session afterwards still succeeds) atop the socket-served steps 13–16 (identity +
+  caller-bound token; NO/EXPIRED/FORGED/tampered token, NO proof, WRONG-KEY proof refused; re-auth; ONE socket
+  connection+session → THREE recovers). Drift untouched (frame + possession proof are capsule-local protocol). Gate:
+  ladder INTACT (ddrm-envelope=22, dkms-authority=11, key-provider[key-authority-ref]=41), drift PASS, all dDRM smokes
+  green (incl. dkms), clippy clean.
 - **Status (Day 91–92):** the dkms node becomes a LONG-LIVED CONNECTION the client opens ONCE, and the handshake
   mints a node-bound SESSION the node REQUIRES on every recover. Audited PC2 first: the per-view session is
   ESTABLISHED ONCE (`begin-session`) + only RESURRECTED per request to gate recovery — `getSessionByToken(token)`

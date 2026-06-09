@@ -305,8 +305,10 @@ struct KeyProvider {
     /// the session expires, rather than spawning a fresh node per release. Interior-mutable because
     /// `release` takes `&self`; `None` until the first `dkms` release establishes it. The runtime-core
     /// analogue of PC2's per-view session opened once and resurrected per request to gate recovery.
-    #[cfg(feature = "key-authority-ref")]
-    dkms_conn: std::cell::RefCell<Option<DkmsNodeConn>>,
+    /// The transport is a Unix-domain socket, so this is `unix`-only; on non-unix targets (e.g. the
+    /// wasm32-wasip1 ladder build) the dkms socket transport is unavailable and `release` fails closed.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    dkms_conn: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
 }
 
 /// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
@@ -326,39 +328,67 @@ struct DkmsClientAuthority {
     endpoint: String,
 }
 
-/// A LONG-LIVED connection to the external dKMS node plus the live handshake SESSION (Day 91–92).
-/// The client spawns + `init`s + `hello`s the node ONCE, pins its identity, and caches the
-/// node-signed session token; subsequent recovers reuse this connection + token until the session
-/// expires. The master never crosses into this process — only the public handshake + sealed results.
-#[cfg(feature = "key-authority-ref")]
+/// A LONG-LIVED connection to the external dKMS node plus the live handshake SESSION (Day 91–94).
+/// The client CONNECTS to the node's Unix-domain socket (it does NOT own the node's process), mints
+/// an EPHEMERAL keypair, `init`s + `hello`s ONCE (sending its public half), pins the node identity,
+/// and caches the node-signed session token; subsequent recovers reuse this connection + token (and
+/// SIGN each recover under the ephemeral private key) until the session expires. The wire is
+/// length-prefixed frames. The master never crosses into this process — only the public handshake +
+/// sealed results.
+#[cfg(all(feature = "key-authority-ref", unix))]
 struct DkmsNodeConn {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// The framed Unix-domain socket to the node (write half; a buffered read half is cloned).
+    stream: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// The caller's EPHEMERAL signer — its public half is bound into the session token; we sign every
+    /// recover with it so a captured token replayed by a different caller (no key) is refused.
+    caller_signer: ddrm_envelope::seal::MlDsaSealSigner,
     /// The node-signed session token from `hello`, echoed verbatim on every recover.
     session_token: Value,
     /// The token's expiry (cached from the token) — the reuse-vs-re-establish decision.
     expires_at: u64,
 }
 
-#[cfg(feature = "key-authority-ref")]
+#[cfg(all(feature = "key-authority-ref", unix))]
 impl DkmsNodeConn {
-    /// One request line in, one response line out (the node's newline-JSON protocol).
+    /// One framed request out, one framed response in (the node's length-prefixed socket protocol).
     fn call(&mut self, req: &Value) -> Result<Value, String> {
-        use std::io::{BufRead as _, Write as _};
-        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        writeln!(self.stdin, "{line}").map_err(|e| format!("write to dkms node: {e}"))?;
-        self.stdin.flush().map_err(|e| e.to_string())?;
-        let mut resp = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut resp)
-            .map_err(|e| format!("read from dkms node: {e}"))?;
-        if n == 0 {
-            return Err("dkms node closed its output unexpectedly".to_string());
+        let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        ddrm_envelope::frame::write_frame(&mut self.stream, &payload)
+            .map_err(|e| format!("write to dkms node: {e}"))?;
+        match ddrm_envelope::frame::read_frame(&mut self.reader) {
+            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
+                .map_err(|e| format!("dkms node sent non-JSON: {e}")),
+            Ok(None) => Err("dkms node closed its connection unexpectedly".to_string()),
+            Err(e) => Err(format!("read from dkms node: {e}")),
         }
-        serde_json::from_str::<Value>(resp.trim())
-            .map_err(|e| format!("dkms node sent non-JSON: {e}: {resp}"))
+    }
+
+    /// Sign this recover's binding under the ephemeral key the session token committed to: the
+    /// node-issued challenge + the content/recipient identity of THIS recover. Returns base64.
+    fn recover_proof_b64(
+        &self,
+        content_id: &str,
+        kid_hex: &str,
+        decrypt_session_pub_b64: &str,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let challenge_b64 = self
+            .session_token
+            .get("challenge_b64")
+            .and_then(|v| v.as_str())
+            .ok_or("dkms session token is missing its challenge")?;
+        let challenge = b64.decode(challenge_b64).map_err(|e| e.to_string())?;
+        let session_pub = b64.decode(decrypt_session_pub_b64).map_err(|e| e.to_string())?;
+        let sig = ddrm_envelope::sign_recover_proof(
+            &self.caller_signer,
+            &challenge,
+            content_id.as_bytes(),
+            kid_hex.as_bytes(),
+            &session_pub,
+        );
+        Ok(b64.encode(sig))
     }
 
     /// Is the cached session still live at `now`? (Delegates to the pure decision below.)
@@ -378,13 +408,13 @@ fn dkms_session_live(expires_at: u64, now: Option<u64>) -> bool {
     }
 }
 
-/// Graceful teardown: tell the node to shut down its boundary, then reap it. Best-effort — a dead
-/// node/pipe is fine here (the connection is being discarded anyway).
-#[cfg(feature = "key-authority-ref")]
+/// Graceful teardown: tell the node to end THIS connection's session, then drop the socket.
+/// Best-effort — a closed socket is fine here (the connection is being discarded anyway), and the
+/// daemon serves the next connection. We do NOT own the node's process, so there is nothing to reap.
+#[cfg(all(feature = "key-authority-ref", unix))]
 impl Drop for DkmsNodeConn {
     fn drop(&mut self) {
         let _ = self.call(&json!({ "op": "shutdown" }));
-        let _ = self.child.wait();
     }
 }
 
@@ -395,24 +425,32 @@ impl Drop for DkmsNodeConn {
 /// transport/protocol/identity error fails closed BEFORE any recovery. The runtime-core analogue of
 /// PC2 opening + verifying a secure-view session once (`begin-session`) before resurrecting it to
 /// gate per-request recovery.
-#[cfg(feature = "key-authority-ref")]
+#[cfg(all(feature = "key-authority-ref", unix))]
 fn establish_dkms_session(
     client: &DkmsClientAuthority,
     now: Option<u64>,
 ) -> Result<DkmsNodeConn, String> {
     use base64::Engine as _;
-    use std::process::{Command, Stdio};
+    use std::os::unix::net::UnixStream;
     let b64 = base64::engine::general_purpose::STANDARD;
 
-    let mut child = Command::new(&client.endpoint)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("dkms authority node ({}) failed to launch: {e}", client.endpoint))?;
-    let stdin = child.stdin.take().ok_or("dkms node: no stdin")?;
-    let stdout = std::io::BufReader::new(child.stdout.take().ok_or("dkms node: no stdout")?);
-    let mut conn = DkmsNodeConn { child, stdin, stdout, session_token: Value::Null, expires_at: 0 };
+    // CONNECT to the node's granted endpoint (its listening Unix-domain socket). We do NOT spawn or
+    // own the node's process — a real remote authority is reached over a transport, not a child pipe.
+    let stream = UnixStream::connect(&client.endpoint)
+        .map_err(|e| format!("dkms authority node ({}) is unreachable: {e}", client.endpoint))?;
+    let reader = std::io::BufReader::new(
+        stream.try_clone().map_err(|e| format!("dkms socket clone failed: {e}"))?,
+    );
+    // Mint an EPHEMERAL keypair for THIS connection: its public half binds the session token, and we
+    // prove possession of the private half on every recover (non-replayable bearer token).
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
+    let mut conn = DkmsNodeConn {
+        stream,
+        reader,
+        caller_signer,
+        session_token: Value::Null,
+        expires_at: 0,
+    };
 
     // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
     // store path: the secret's location is the node's concern, never the client's.
@@ -424,12 +462,14 @@ fn establish_dkms_session(
         ));
     }
 
-    // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything, and
-    // capture the node-signed SESSION TOKEN that will gate every recover over this connection.
+    // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything, send
+    // our ephemeral pubkey so the token is bound to a key only WE hold, and capture the node-signed
+    // SESSION TOKEN that will gate every recover over this connection.
     let challenge = ddrm_envelope::random_seed();
     let hello = conn.call(&json!({
         "op": "hello",
         "challenge_b64": b64.encode(challenge),
+        "caller_pub_b64": b64.encode(&caller_vk),
         "now_unix": now,
     }))?;
     if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
@@ -944,7 +984,22 @@ impl KeyProvider {
     /// PC2's client RPCs the Lit network and only ever sees the sealed envelope (`recoverCEKEnvelope`,
     /// `chipotle-client.ts:1438`; the Lit action recovers + seals in the TEE, returns only the
     /// envelope, `universal-decrypt-chipotle.js:572`/`:602`/`:610`).
-    #[cfg(feature = "key-authority-ref")]
+    /// The dkms socket transport is `unix`-only; on non-unix targets (e.g. the wasm32-wasip1 ladder
+    /// build) the delegated recovery path is unavailable, so `release` fails closed rather than
+    /// silently degrading.
+    #[cfg(all(feature = "key-authority-ref", not(unix)))]
+    fn release_dkms_delegated(
+        &self,
+        _request: &KeyReleaseRequestV1,
+        _session: Option<ReleaseSessionContext>,
+    ) -> Response {
+        Response::error(
+            "not_configured",
+            "the dkms authority transport (Unix-domain socket) is only available on unix targets",
+        )
+    }
+
+    #[cfg(all(feature = "key-authority-ref", unix))]
     fn release_dkms_delegated(
         &self,
         request: &KeyReleaseRequestV1,
@@ -1019,18 +1074,26 @@ impl KeyProvider {
             // Discard any stale connection (Drop shuts the old node down) before opening a fresh one.
             *guard = None;
             match establish_dkms_session(client, now) {
-                Ok(conn) => *guard = Some(conn),
+                Ok(conn) => *guard = Some(Box::new(conn)),
                 Err(err) => return Response::error("not_configured", err),
             }
         }
-        // Attach the LIVE session token + clock and delegate recover over the reused connection. The
-        // node re-verifies the token under its own key + re-checks authorization in its own boundary.
+        // Attach the LIVE session token + clock + a POSSESSION PROOF, then delegate recover over the
+        // reused connection. We SIGN the recover binding under the ephemeral key whose public half the
+        // token committed to at `hello`, proving WE are the caller the session was issued for; the node
+        // re-verifies the token + the proof under its own key + re-checks authorization in its boundary.
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
-            let mut req = recover_req;
-            req["session_token"] = conn.session_token.clone();
-            req["now_unix"] = json!(now);
-            conn.call(&req)
+            match conn.recover_proof_b64(&request.object_cid, &kid_hex, &session.decrypt_session_pub_b64) {
+                Ok(caller_sig_b64) => {
+                    let mut req = recover_req;
+                    req["session_token"] = conn.session_token.clone();
+                    req["caller_sig_b64"] = json!(caller_sig_b64);
+                    req["now_unix"] = json!(now);
+                    conn.call(&req)
+                }
+                Err(err) => Err(err),
+            }
         };
         let recover = match recover {
             Ok(value) => value,

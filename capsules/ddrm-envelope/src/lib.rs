@@ -380,34 +380,177 @@ pub fn verify_attestation(verifier: &impl CekSealVerifier, challenge: &[u8], sig
 /// a token can never be replayed as either. Defined ONCE here so the node + client cannot drift.
 pub const DKMS_SESSION_DOMAIN: &[u8] = b"elastos.dkms.authority/session/v1";
 
-/// Canonical signed preimage of a session token: `DKMS_SESSION_DOMAIN ‖ challenge ‖ expires_at(LE)`.
-/// Tying both the challenge AND the expiry into the signed bytes means tampering with either field
-/// invalidates the signature.
-fn session_token_message(challenge: &[u8], expires_at: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(DKMS_SESSION_DOMAIN.len() + challenge.len() + 8);
-    msg.extend_from_slice(DKMS_SESSION_DOMAIN);
-    msg.extend_from_slice(challenge);
-    msg.extend_from_slice(&expires_at.to_le_bytes());
+/// Domain label for the dKMS-authority RECOVER POSSESSION PROOF (Day 93–94). The session token is a
+/// BEARER credential — anyone who captures the `hello` response holds it. To make it NON-REPLAYABLE
+/// across callers, `hello` binds the token to a caller-minted ephemeral PUBLIC key, and every
+/// `recover` must carry a signature (under the matching PRIVATE key) over this domain ‖ the session
+/// challenge ‖ the recover binding; the node verifies it against the token-bound pubkey. A caller
+/// who captured the token but lacks the private key cannot produce the proof → refused. The
+/// runtime-core analogue of PC2's session being OWNER-BOUND (the bearer token alone is insufficient;
+/// the owner is re-checked, in the TEE via `ecrecover(delegationSig)`, `secureViewSession.ts:87`–`:100`).
+/// Domain-separated from the session token + hello attestation + CEK seals.
+pub const DKMS_RECOVER_DOMAIN: &[u8] = b"elastos.dkms.authority/recover-proof/v1";
+
+/// Length-prefixed concatenation of variable-length fields into one unambiguous signed preimage:
+/// each field is preceded by its u32(LE) length, so `("a","bc")` and `("ab","c")` never collide.
+fn lp_concat(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(domain.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
+    msg.extend_from_slice(domain);
+    for f in fields {
+        msg.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        msg.extend_from_slice(f);
+    }
     msg
 }
 
-/// The NODE side: mint a session token by signing `DKMS_SESSION_DOMAIN ‖ challenge ‖ expires_at`
-/// with the node's master-derived signing key. Returns the detached signature.
-pub fn sign_session_token(signer: &impl seal::CekSealSigner, challenge: &[u8], expires_at: u64) -> Vec<u8> {
-    signer.sign(&session_token_message(challenge, expires_at))
+/// Canonical signed preimage of a session token: binds the client's `challenge`, the caller's
+/// EPHEMERAL public key (`caller_pub`), AND the `expires_at` — tampering with any field invalidates
+/// the signature, and binding `caller_pub` ties the bearer token to the key the caller must later
+/// prove possession of.
+fn session_token_message(challenge: &[u8], caller_pub: &[u8], expires_at: u64) -> Vec<u8> {
+    lp_concat(DKMS_SESSION_DOMAIN, &[challenge, caller_pub, &expires_at.to_le_bytes()])
 }
 
-/// Verify a session token's signature over `(challenge, expires_at)`. `true` only when `sig` is a
-/// valid ML-DSA-65 signature under `verifier` — a forged token, a tampered challenge/expiry, or a
-/// malformed signature all return `false`. The node verifies tokens under its OWN verifying key (it
-/// is the issuer); expiry is enforced separately against the caller's clock.
+/// The NODE side: mint a session token by signing `(challenge, caller_pub, expires_at)` with the
+/// node's master-derived signing key. Binding `caller_pub` is what makes the token non-replayable by
+/// a caller who does not hold the matching private key. Returns the detached signature.
+pub fn sign_session_token(
+    signer: &impl seal::CekSealSigner,
+    challenge: &[u8],
+    caller_pub: &[u8],
+    expires_at: u64,
+) -> Vec<u8> {
+    signer.sign(&session_token_message(challenge, caller_pub, expires_at))
+}
+
+/// Verify a session token's signature over `(challenge, caller_pub, expires_at)`. `true` only when
+/// `sig` is a valid ML-DSA-65 signature under `verifier` — a forged token, or a tampered
+/// challenge/caller_pub/expiry, or a malformed signature all return `false`. The node verifies tokens
+/// under its OWN verifying key (it is the issuer); expiry is enforced separately against the clock.
 pub fn verify_session_token(
     verifier: &impl CekSealVerifier,
     challenge: &[u8],
+    caller_pub: &[u8],
     expires_at: u64,
     sig: &[u8],
 ) -> bool {
-    verifier.verify(&session_token_message(challenge, expires_at), sig)
+    verifier.verify(&session_token_message(challenge, caller_pub, expires_at), sig)
+}
+
+/// Canonical signed preimage of a recover possession proof: the session `challenge` plus the
+/// content/recipient binding of THIS recover (`content_id`, `kid_hex`, the decrypt session pubkey).
+/// Binding the recover identity means the proof authorizes recovering THIS content for THIS session,
+/// not just "some recover" — defined ONCE here so the node + client cannot drift.
+pub fn recover_proof_message(
+    challenge: &[u8],
+    content_id: &[u8],
+    kid_hex: &[u8],
+    decrypt_session_pub: &[u8],
+) -> Vec<u8> {
+    lp_concat(DKMS_RECOVER_DOMAIN, &[challenge, content_id, kid_hex, decrypt_session_pub])
+}
+
+/// The CLIENT side: prove possession of the token-bound ephemeral private key by signing the recover
+/// binding. The node verifies this against the pubkey the session token committed to.
+pub fn sign_recover_proof(
+    signer: &impl seal::CekSealSigner,
+    challenge: &[u8],
+    content_id: &[u8],
+    kid_hex: &[u8],
+    decrypt_session_pub: &[u8],
+) -> Vec<u8> {
+    signer.sign(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub))
+}
+
+/// The NODE side: verify the caller's possession proof against the token-bound pubkey. `true` only
+/// when `sig` is valid under `verifier` (built from the token's `caller_pub`) over the SAME binding
+/// — a missing/forged proof, a proof from a different key, or a tampered binding all return `false`.
+pub fn verify_recover_proof(
+    verifier: &impl CekSealVerifier,
+    challenge: &[u8],
+    content_id: &[u8],
+    kid_hex: &[u8],
+    decrypt_session_pub: &[u8],
+    sig: &[u8],
+) -> bool {
+    verifier.verify(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub), sig)
+}
+
+/// Length-prefixed message FRAMING for the dKMS node's socket transport (Day 93–94): every message
+/// is `[4-byte length (BE)][payload]`, so a reader recovers exact message boundaries instead of
+/// trusting a raw byte stream. The runtime-core analogue of PC2's Boson proxy framing —
+/// `[2-byte length (BE, includes itself)][1-byte type][body]`, `MAX_PACKET_SIZE`, `PACKET_HEADER_SIZE`
+/// (`ProxyProtocol.ts:13`/`:251`/`:256`/`:371`). Defined ONCE here so the node + every client agree
+/// on the wire. Fail-closed: an oversized length is refused before allocating, and a torn/half frame
+/// is an error (never a partial parse).
+pub mod frame {
+    use std::io::{self, Read, Write};
+
+    /// Maximum framed payload (1 MiB). A dKMS request/response is small JSON; anything larger is a
+    /// torn/hostile frame and is refused before allocating a buffer for it.
+    pub const MAX_FRAME_BYTES: u32 = 1 << 20;
+
+    /// Write one length-prefixed frame: `[4-byte BE length][payload]`, then flush. An oversized
+    /// payload (or one that does not fit a `u32`) is refused fail-closed.
+    pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+        let len = u32::try_from(payload.len())
+            .ok()
+            .filter(|n| *n <= MAX_FRAME_BYTES)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame payload exceeds MAX_FRAME_BYTES"))?;
+        w.write_all(&len.to_be_bytes())?;
+        w.write_all(payload)?;
+        w.flush()
+    }
+
+    /// Read one length-prefixed frame. Returns `Ok(Some(payload))` for a complete frame, or
+    /// `Ok(None)` for a CLEAN end-of-stream at a frame boundary (the peer hung up between messages —
+    /// a normal half-close). ERRORS fail-closed for an oversized length, a zero length, or a TORN
+    /// frame (EOF mid-header or mid-payload) — never a partial/ambiguous parse.
+    pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+        let mut header = [0u8; 4];
+        match read_exact_or_eof(r, &mut header)? {
+            ReadState::CleanEof => return Ok(None),
+            ReadState::Torn => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "torn frame header"))
+            }
+            ReadState::Full => {}
+        }
+        let len = u32::from_be_bytes(header);
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "zero-length frame"));
+        }
+        if len > MAX_FRAME_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds MAX_FRAME_BYTES"));
+        }
+        let mut payload = vec![0u8; len as usize];
+        match read_exact_or_eof(r, &mut payload)? {
+            ReadState::Full => Ok(Some(payload)),
+            // A header that promised N bytes but the stream ended early is a torn frame, never a
+            // short read we silently accept.
+            _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "torn frame payload")),
+        }
+    }
+
+    enum ReadState {
+        Full,
+        CleanEof,
+        Torn,
+    }
+
+    /// Fill `buf` fully; distinguish a clean EOF AT THE START (no bytes read) from a torn read
+    /// (some-but-not-all bytes read) from a full read.
+    fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8]) -> io::Result<ReadState> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match r.read(&mut buf[filled..]) {
+                Ok(0) => return Ok(if filled == 0 { ReadState::CleanEof } else { ReadState::Torn }),
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(ReadState::Full)
+    }
 }
 
 /// Hybrid (classical + post-quantum) seal-signature verifier — migration-period
@@ -950,25 +1093,31 @@ mod tests {
         let (signer, vk) = crate::seal::mldsa_seal_keypair([0x5au8; 32]);
         let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
         let challenge = [0x33u8; 32];
+        let caller_pub = [0x77u8; 48];
         let expires_at = 1_000_000u64;
-        let token = crate::sign_session_token(&signer, &challenge, expires_at);
-        assert!(crate::verify_session_token(&verifier, &challenge, expires_at, &token));
+        let token = crate::sign_session_token(&signer, &challenge, &caller_pub, expires_at);
+        assert!(crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &token));
 
         // Tampering the expiry (e.g. extending the window) invalidates the signature.
-        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at + 1, &token));
+        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at + 1, &token));
 
         // Tampering the challenge invalidates the signature.
         let mut other = challenge;
         other[0] ^= 1;
-        assert!(!crate::verify_session_token(&verifier, &other, expires_at, &token));
+        assert!(!crate::verify_session_token(&verifier, &other, &caller_pub, expires_at, &token));
+
+        // Tampering the bound caller pubkey invalidates the signature (the token is caller-bound).
+        let mut other_pub = caller_pub;
+        other_pub[0] ^= 1;
+        assert!(!crate::verify_session_token(&verifier, &challenge, &other_pub, expires_at, &token));
 
         // A token forged by a different (impersonator) key does not verify under this vk.
         let (impostor, _ivk) = crate::seal::mldsa_seal_keypair([0x5bu8; 32]);
-        let forged = crate::sign_session_token(&impostor, &challenge, expires_at);
-        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, &forged));
+        let forged = crate::sign_session_token(&impostor, &challenge, &caller_pub, expires_at);
+        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &forged));
 
         // A malformed signature fails closed (no panic).
-        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, b"nope"));
+        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, b"nope"));
     }
 
     /// The session token is domain-separated from the hello attestation — a hello attestation over
@@ -978,13 +1127,80 @@ mod tests {
         let (signer, vk) = crate::seal::mldsa_seal_keypair([9u8; 32]);
         let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
         let challenge = [2u8; 32];
+        let caller_pub = [3u8; 48];
         let expires_at = 42u64;
         // A hello attestation must NOT verify as a session token over the same challenge.
         let hello = crate::attest_challenge(&signer, &challenge);
-        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, &hello));
+        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &hello));
         // …and a session token must NOT verify as a hello attestation.
-        let token = crate::sign_session_token(&signer, &challenge, expires_at);
+        let token = crate::sign_session_token(&signer, &challenge, &caller_pub, expires_at);
         assert!(!crate::verify_attestation(&verifier, &challenge, &token));
+    }
+
+    /// The recover possession proof: a signature under the caller's ephemeral key over the session
+    /// challenge + the recover binding verifies under that key — and a proof from a DIFFERENT key, a
+    /// tampered binding, or a malformed signature all fail. So a captured bearer token replayed by a
+    /// caller WITHOUT the matching private key cannot drive recovery.
+    #[test]
+    fn dkms_recover_proof_round_trips_and_rejects_wrong_key_or_tamper() {
+        let (caller, caller_vk) = crate::seal::mldsa_seal_keypair([0x61u8; 32]);
+        let caller_verifier = MlDsa65Verifier::from_encoded(&caller_vk).unwrap();
+        let challenge = [0x12u8; 32];
+        let (content, kid, sess_pub) = (b"bafContent".as_slice(), b"c5c5".as_slice(), b"sessionpub".as_slice());
+        let proof = crate::sign_recover_proof(&caller, &challenge, content, kid, sess_pub);
+        assert!(crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, &proof));
+
+        // A proof from a DIFFERENT key (a captured-token replayer without the private key) fails.
+        let (other, _ovk) = crate::seal::mldsa_seal_keypair([0x62u8; 32]);
+        let wrong = crate::sign_recover_proof(&other, &challenge, content, kid, sess_pub);
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, &wrong));
+
+        // A tampered binding (different content / kid / session pub / challenge) fails.
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, b"bafOTHER", kid, sess_pub, &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, b"ffff", sess_pub, &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, b"otherpub", &proof));
+        assert!(!crate::verify_recover_proof(&caller_verifier, b"otherchal", content, kid, sess_pub, &proof));
+
+        // The possession proof is domain-separated from the session token (different domain prefix).
+        assert!(!crate::verify_session_token(&caller_verifier, &challenge, content, 0, &proof));
+
+        // A malformed signature fails closed.
+        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, b"nope"));
+    }
+
+    /// The socket framing round-trips messages, recovers exact boundaries from a concatenated
+    /// stream, signals a clean EOF at a boundary, and fails closed on a torn frame.
+    #[test]
+    fn frame_round_trips_and_fails_closed_on_torn_or_oversized() {
+        use crate::frame::{read_frame, write_frame, MAX_FRAME_BYTES};
+        // Two frames written back-to-back are read back as two distinct messages, then a clean EOF.
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"first").unwrap();
+        write_frame(&mut buf, b"{\"op\":\"hello\"}").unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        assert_eq!(read_frame(&mut cur).unwrap().as_deref(), Some(b"first".as_slice()));
+        assert_eq!(read_frame(&mut cur).unwrap().as_deref(), Some(b"{\"op\":\"hello\"}".as_slice()));
+        assert!(read_frame(&mut cur).unwrap().is_none(), "clean EOF at a frame boundary -> None");
+
+        // A header promising more bytes than follow is a TORN frame -> error (never a partial parse).
+        let mut torn = Vec::new();
+        torn.extend_from_slice(&7u32.to_be_bytes());
+        torn.extend_from_slice(b"abc");
+        assert!(read_frame(&mut std::io::Cursor::new(torn)).is_err());
+
+        // An oversized length header is refused before allocating.
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_be_bytes());
+        assert!(read_frame(&mut std::io::Cursor::new(huge)).is_err());
+
+        // A zero-length frame is refused.
+        let zero = 0u32.to_be_bytes().to_vec();
+        assert!(read_frame(&mut std::io::Cursor::new(zero)).is_err());
+
+        // Writing an oversized payload is refused fail-closed.
+        let mut sink = Vec::new();
+        let too_big = vec![0u8; (MAX_FRAME_BYTES + 1) as usize];
+        assert!(write_frame(&mut sink, &too_big).is_err());
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.

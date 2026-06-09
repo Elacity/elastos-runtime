@@ -14,7 +14,13 @@
 //! recovery here (PC2's `recoverCEKEnvelope` RPCing the Lit network, holding only the public
 //! `pkpId`/`authority`, `chipotle-client.ts:1438`). The master never crosses into the runtime.
 //!
-//! Protocol: newline-delimited JSON over stdin/stdout, one response object per request line.
+//! Protocol: the same JSON request/response ops over two transports —
+//!   * default: newline-delimited JSON over stdin/stdout (one-shot provisioning + tests);
+//!   * `DKMS_AUTHORITY_LISTEN=<path>`: a length-prefixed FRAMED request/response transport over a
+//!     Unix-domain socket the node BINDS + LISTENS on (a real remote-authority shape — the runtime
+//!     connects but does not own the node's process). Many sequential connections, one handshake
+//!     SESSION per connection; an oversized/torn/half-closed frame fails closed WITHOUT wedging the
+//!     node (the connection is dropped, the listener keeps serving).
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -22,6 +28,11 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
 const PROVIDER_VERSION: &str = "0.1.0-dev";
+
+/// Env var selecting the SOCKET serve transport: when set to a path, the node binds + listens there
+/// instead of running the stdin/stdout loop. `unix`-only (no Unix sockets on wasm32-wasip1).
+#[cfg(unix)]
+const LISTEN_ENV: &str = "DKMS_AUTHORITY_LISTEN";
 
 /// The node's durable master-seed store schema. Node-local: the runtime never reads this file
 /// (only the node does), and the master seed never leaves this process.
@@ -37,14 +48,19 @@ const KEY_STORE_ENV: &str = "DKMS_AUTHORITY_KEY_STORE";
 /// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
 const SESSION_TTL_SECONDS: u64 = 300;
 
-/// A node-issued, node-signed SESSION TOKEN: it binds the client's handshake `challenge` to an
-/// `expires_at` and the node SIGNS `(challenge, expires_at)` with its master-derived key. The node
-/// REQUIRES one on every `recover` and verifies it under its OWN verifying key — so a long-lived
-/// node recovers only for a caller that completed the handshake IN THIS (unexpired) session, and a
-/// missing / expired / forged / tampered token is refused.
+/// A node-issued, node-signed SESSION TOKEN: it binds the client's handshake `challenge` AND the
+/// caller's ephemeral PUBLIC key (`caller_pub_b64`) to an `expires_at`, and the node SIGNS
+/// `(challenge, caller_pub, expires_at)` with its master-derived key. The node REQUIRES one on every
+/// `recover` and verifies it under its OWN verifying key — so a long-lived node recovers only for a
+/// caller that completed the handshake IN THIS (unexpired) session. Binding `caller_pub` is what
+/// makes the bearer token NON-REPLAYABLE: recover also requires a signature under the matching
+/// private key (Day 93–94). A missing / expired / forged / tampered token is refused.
 #[derive(Debug, Clone, Deserialize)]
 struct SessionToken {
     challenge_b64: String,
+    /// The caller's ephemeral verifying key (base64) the token is bound to — recover must prove
+    /// possession of the matching private key.
+    caller_pub_b64: String,
     expires_at: u64,
     sig_b64: String,
 }
@@ -78,6 +94,10 @@ enum Request {
     /// identity (the published `pkpId`/`authority`).
     Hello {
         challenge_b64: String,
+        /// The caller's EPHEMERAL verifying key (base64). The node binds the session token to it; the
+        /// caller must prove possession of the matching private key on every recover, so a captured
+        /// token replayed by a DIFFERENT caller (no private key) is refused.
+        caller_pub_b64: String,
         /// The caller's clock, so the node mints an `expires_at` lock-stepped with it (the client
         /// re-checks liveness against the same clock). Absent → the node uses its own wall clock.
         #[serde(default)]
@@ -115,6 +135,11 @@ enum Request {
         /// checks it is unexpired BEFORE re-authorizing or touching any key material; a missing token
         /// is a hard parse error (no recover without a session).
         session_token: SessionToken,
+        /// The caller's POSSESSION PROOF — REQUIRED (Day 93–94). A signature under the ephemeral
+        /// private key whose public half the token is bound to, over the session challenge + this
+        /// recover's content binding. The node verifies it against the token-bound pubkey, so a
+        /// captured token replayed without the private key (or signed by the wrong key) is refused.
+        caller_sig_b64: String,
         /// The caller's clock for the expiry check (absent → the node's own wall clock).
         #[serde(default)]
         now_unix: Option<u64>,
@@ -206,7 +231,9 @@ impl DkmsAuthorityNode {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
-            Request::Hello { challenge_b64, now_unix } => self.hello(&challenge_b64, now_unix),
+            Request::Hello { challenge_b64, caller_pub_b64, now_unix } => {
+                self.hello(&challenge_b64, &caller_pub_b64, now_unix)
+            }
             Request::Recover {
                 wrapped_cek_b64,
                 scheme,
@@ -224,6 +251,7 @@ impl DkmsAuthorityNode {
                 session_id,
                 right,
                 session_token,
+                caller_sig_b64,
                 now_unix,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
@@ -242,6 +270,7 @@ impl DkmsAuthorityNode {
                 session_id,
                 right,
                 session_token,
+                caller_sig_b64,
                 now_unix,
             }),
             Request::Shutdown => Response::empty_ok(),
@@ -252,7 +281,7 @@ impl DkmsAuthorityNode {
     /// and return the attestation + the published verifying key. The client verifies the attestation
     /// against the vk it PINNED from the descriptor, proving it is talking to the authentic node
     /// (not an impersonator) before it delegates any recovery. Requires `init` (no key, no identity).
-    fn hello(&self, challenge_b64: &str, now_unix: Option<u64>) -> Response {
+    fn hello(&self, challenge_b64: &str, caller_pub_b64: &str, now_unix: Option<u64>) -> Response {
         let authority = match self.authority.as_ref() {
             Some(authority) => authority,
             None => {
@@ -267,17 +296,30 @@ impl DkmsAuthorityNode {
             Ok(_) => return Response::error("invalid_request", "challenge_b64 must be non-empty"),
             Err(_) => return Response::error("invalid_request", "challenge_b64 is not valid base64"),
         };
+        // The caller's ephemeral PUBLIC key. We bind it into the session token; recover then requires
+        // a signature under the matching private key, so a captured token is non-replayable by anyone
+        // who does not hold that key. We require a non-empty, well-formed verifying key up front.
+        let caller_pub = match b64().decode(caller_pub_b64) {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => return Response::error("invalid_request", "caller_pub_b64 must be non-empty"),
+            Err(_) => return Response::error("invalid_request", "caller_pub_b64 is not valid base64"),
+        };
+        if ddrm_envelope::MlDsa65Verifier::from_encoded(&caller_pub).is_none() {
+            return Response::error("invalid_request", "caller_pub_b64 is not a valid verifying key");
+        }
         let attestation = ddrm_envelope::attest_challenge(&authority.signer, &challenge);
-        // Mint a node-signed SESSION TOKEN binding this challenge to a bounded expiry. The node will
-        // REQUIRE (and re-verify) it on every recover, so this handshake gates a whole session of
-        // recovers rather than a single spawn — the PC2 per-view-session analogue.
+        // Mint a node-signed SESSION TOKEN binding this challenge + the caller's pubkey to a bounded
+        // expiry. The node will REQUIRE (and re-verify) it + a matching possession proof on every
+        // recover, so this handshake gates a whole session of recovers for THIS caller only.
         let expires_at = effective_now(now_unix) + SESSION_TTL_SECONDS;
-        let token_sig = ddrm_envelope::sign_session_token(&authority.signer, &challenge, expires_at);
+        let token_sig =
+            ddrm_envelope::sign_session_token(&authority.signer, &challenge, &caller_pub, expires_at);
         Response::ok(json!({
             "verifying_key_b64": b64().encode(&authority.verifying_key),
             "attestation_b64": b64().encode(&attestation),
             "session_token": {
                 "challenge_b64": challenge_b64,
+                "caller_pub_b64": caller_pub_b64,
                 "expires_at": expires_at,
                 "sig_b64": b64().encode(&token_sig),
             },
@@ -432,29 +474,65 @@ struct RecoverArgs {
     session_id: String,
     right: String,
     session_token: SessionToken,
+    caller_sig_b64: String,
     now_unix: Option<u64>,
 }
 
-/// VERIFY the caller's session token in the node's OWN boundary: it must be a token THIS node
-/// signed (valid signature over `(challenge, expires_at)` under the node's verifying key) and still
-/// unexpired against the caller's clock. A forged/tampered token (bad signature) or an expired one
-/// is refused — so a long-lived node recovers only for a caller with a live handshake session, and
-/// a captured handshake cannot be replayed past its window. The runtime-core analogue of PC2
-/// resurrecting + validating the per-view session before recovery (`secureViewSession.ts:81`–`:128`).
+/// VERIFY the caller's session token + POSSESSION PROOF in the node's OWN boundary. First, the token
+/// must be one THIS node signed — a valid signature over `(challenge, caller_pub, expires_at)` under
+/// the node's verifying key — and still unexpired. Second, the caller must PROVE possession of the
+/// token-bound ephemeral private key by signing the session challenge + this recover's content
+/// binding, which the node verifies against the token-bound pubkey.
+/// A forged/tampered/expired token, OR a missing/wrong-key possession proof, is refused — so a
+/// long-lived node recovers only for a caller with a live handshake session who STILL holds the key
+/// the token was bound to. A captured bearer token replayed by a different caller (no private key)
+/// fails the possession check. The runtime-core analogue of PC2's session being OWNER-BOUND,
+/// re-checked in the TEE via `ecrecover(delegationSig)` (`secureViewSession.ts:87`–`:100`).
 fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), String> {
+    let token = &args.session_token;
     let challenge = b64()
-        .decode(&args.session_token.challenge_b64)
+        .decode(&token.challenge_b64)
         .map_err(|_| "session token challenge is not valid base64".to_string())?;
+    let caller_pub = b64()
+        .decode(&token.caller_pub_b64)
+        .map_err(|_| "session token caller pubkey is not valid base64".to_string())?;
     let sig = b64()
-        .decode(&args.session_token.sig_b64)
+        .decode(&token.sig_b64)
         .map_err(|_| "session token signature is not valid base64".to_string())?;
-    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&authority.verifying_key)
+    let node_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&authority.verifying_key)
         .ok_or("node verifying key is malformed")?;
-    if !ddrm_envelope::verify_session_token(&verifier, &challenge, args.session_token.expires_at, &sig) {
+    if !ddrm_envelope::verify_session_token(&node_verifier, &challenge, &caller_pub, token.expires_at, &sig)
+    {
         return Err("session token is forged or tampered (signature does not verify)".to_string());
     }
-    if effective_now(args.now_unix) > args.session_token.expires_at {
+    if effective_now(args.now_unix) > token.expires_at {
         return Err("session token has expired — re-establish the handshake session".to_string());
+    }
+
+    // POSSESSION PROOF: the caller must sign the session challenge + this recover's content binding
+    // under the private key whose public half the token committed to. This is what makes the bearer
+    // token non-replayable: a third party who captured the token but lacks the key cannot forge it.
+    let caller_verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&caller_pub)
+        .ok_or("session token caller pubkey is malformed")?;
+    let caller_sig = b64()
+        .decode(&args.caller_sig_b64)
+        .map_err(|_| "caller possession proof is not valid base64".to_string())?;
+    // Bind the proof to the SAME session-pub bytes the recover re-seals to (b64-decoded).
+    let session_pub = b64()
+        .decode(&args.decrypt_session_pub_b64)
+        .map_err(|_| "decrypt_session_pub_b64 is not valid base64".to_string())?;
+    if !ddrm_envelope::verify_recover_proof(
+        &caller_verifier,
+        &challenge,
+        args.content_id.as_bytes(),
+        args.kid_hex.as_bytes(),
+        &session_pub,
+        &caller_sig,
+    ) {
+        return Err(
+            "caller possession proof is missing, forged, or signed by the wrong key (captured token replay refused)"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -562,6 +640,22 @@ fn decode_kid_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
 
 fn main() {
     eprintln!("dkms-authority: starting v{PROVIDER_VERSION} (external key authority node)");
+    // A real remote authority is reached over a transport the runtime does NOT own the process of:
+    // when a listen path is set, BIND + LISTEN on a Unix-domain socket and serve framed connections.
+    // Otherwise keep the one-shot stdin/stdout loop (provisioning + tests). The socket transport is
+    // `unix`-only (the wasm32-wasip1 ladder build has no Unix sockets), so it is conditionally compiled.
+    #[cfg(unix)]
+    match std::env::var(LISTEN_ENV) {
+        Ok(path) if !path.trim().is_empty() => serve_socket(&path),
+        _ => serve_stdio(),
+    }
+    #[cfg(not(unix))]
+    serve_stdio();
+    eprintln!("dkms-authority exiting");
+}
+
+/// One-shot, newline-delimited JSON over stdin/stdout (provisioning identity reads + the tests).
+fn serve_stdio() {
     let mut node = DkmsAuthorityNode::default();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -594,7 +688,86 @@ fn main() {
             break;
         }
     }
-    eprintln!("dkms-authority exiting");
+}
+
+/// SOCKET serve mode: bind a Unix-domain socket and serve framed connections sequentially. The node
+/// is a long-lived daemon; each accepted connection gets its OWN fresh node state + handshake session
+/// (one session per connection). A connection that sends a torn/oversized/half-closed frame is
+/// dropped fail-closed — the listener keeps accepting, so a hostile/buggy client cannot wedge the
+/// daemon for the next legitimate one.
+#[cfg(unix)]
+fn serve_socket(path: &str) {
+    use std::os::unix::net::UnixListener;
+    // Clear any stale socket from a prior run, then bind. A bind failure is fatal (nothing to serve).
+    let _ = std::fs::remove_file(path);
+    let listener = match UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("dkms-authority: failed to bind {path}: {err}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("dkms-authority: listening on {path}");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => serve_connection(stream),
+            Err(err) => {
+                eprintln!("dkms-authority: accept error: {err}");
+                continue;
+            }
+        }
+    }
+}
+
+/// Serve ONE connection: a fresh node + session, framed request/response until the client hangs up,
+/// sends `shutdown`, or trips a transport error. Any framing/parse error ends THIS connection only
+/// (fail-closed) — it never propagates to the listener.
+#[cfg(unix)]
+fn serve_connection(stream: std::os::unix::net::UnixStream) {
+    use ddrm_envelope::frame::{read_frame, write_frame};
+    let mut node = DkmsAuthorityNode::default();
+    let mut reader = io::BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("dkms-authority: connection clone failed: {err}");
+            return;
+        }
+    });
+    let mut writer = stream;
+    loop {
+        let payload = match read_frame(&mut reader) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => break, // clean half-close at a frame boundary
+            Err(err) => {
+                // Torn/oversized/hostile frame: refuse + drop the connection (the listener serves on).
+                eprintln!("dkms-authority: framing error, dropping connection: {err}");
+                let _ = write_frame(
+                    &mut writer,
+                    &serde_json::to_vec(&Response::error("invalid_frame", err.to_string()))
+                        .unwrap_or_default(),
+                );
+                break;
+            }
+        };
+        let request = match serde_json::from_slice::<Request>(&payload) {
+            Ok(request) => request,
+            Err(err) => {
+                let resp = Response::error("invalid_request", err.to_string());
+                if write_frame(&mut writer, &serde_json::to_vec(&resp).unwrap()).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let is_shutdown = matches!(request, Request::Shutdown);
+        let response = node.handle(request);
+        if write_frame(&mut writer, &serde_json::to_vec(&response).unwrap()).is_err() {
+            break;
+        }
+        if is_shutdown {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -631,22 +804,49 @@ mod tests {
     const RIGHT: &str = "view";
     const NOW: u64 = 1_700_000_000;
 
-    /// Drive the node's real `hello` to mint a live session token at clock `NOW`.
-    fn live_token(node: &DkmsAuthorityNode) -> SessionToken {
+    /// The caller's EPHEMERAL keypair: the client mints this per connection, sends the public half at
+    /// `hello`, and signs every recover with the private half (the possession proof the node checks).
+    fn caller_keypair() -> (ddrm_envelope::seal::MlDsaSealSigner, Vec<u8>) {
+        ddrm_envelope::seal::mldsa_seal_keypair([0x33u8; 32])
+    }
+
+    /// Drive the node's real `hello` (bound to `caller_pub_b64`) to mint a live session token at `NOW`.
+    fn live_token(node: &DkmsAuthorityNode, caller_pub_b64: &str) -> SessionToken {
         let challenge = b64().encode([0xA1u8; 32]);
-        let hello = ok_data(node.hello(&challenge, Some(NOW)));
+        let hello = ok_data(node.hello(&challenge, caller_pub_b64, Some(NOW)));
         let t = &hello["session_token"];
         SessionToken {
             challenge_b64: t["challenge_b64"].as_str().unwrap().to_string(),
+            caller_pub_b64: t["caller_pub_b64"].as_str().unwrap().to_string(),
             expires_at: t["expires_at"].as_u64().unwrap(),
             sig_b64: t["sig_b64"].as_str().unwrap().to_string(),
         }
+    }
+
+    /// The caller's possession proof over a token's challenge + a recover's content binding.
+    fn proof_for(
+        signer: &ddrm_envelope::seal::MlDsaSealSigner,
+        token: &SessionToken,
+        content_id: &str,
+        kid_hex: &str,
+        session_pub_b64: &str,
+    ) -> String {
+        let challenge = b64().decode(&token.challenge_b64).unwrap();
+        let session_pub = b64().decode(session_pub_b64).unwrap();
+        b64().encode(ddrm_envelope::sign_recover_proof(
+            signer,
+            &challenge,
+            content_id.as_bytes(),
+            kid_hex.as_bytes(),
+            &session_pub,
+        ))
     }
 
     /// A structurally-valid but never-verified token (for cases that fail BEFORE the session gate).
     fn dummy_token() -> SessionToken {
         SessionToken {
             challenge_b64: b64().encode([0u8; 32]),
+            caller_pub_b64: b64().encode(caller_keypair().1),
             expires_at: NOW + 1,
             sig_b64: b64().encode([0u8; 8]),
         }
@@ -693,7 +893,9 @@ mod tests {
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
         let transcript_aad = b"day87-88-transcript".to_vec();
 
-        let token = live_token(&node);
+        let (caller, caller_vk) = caller_keypair();
+        let token = live_token(&node, &b64().encode(&caller_vk));
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
         let resp = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -711,6 +913,7 @@ mod tests {
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
             session_token: token,
+            caller_sig_b64,
             now_unix: Some(NOW),
         });
         let data = ok_data(resp);
@@ -764,9 +967,11 @@ mod tests {
         let (_s, session_public) = ddrm_envelope::mint_session();
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
 
-        // Forged producer vk → recover fails closed (a live session passes the gate, so the producer
-        // check is what we're exercising).
-        let token = live_token(&node);
+        // Forged producer vk → recover fails closed (a live session + valid possession proof pass the
+        // gate, so the producer check is what we're exercising).
+        let (caller, caller_vk) = caller_keypair();
+        let token = live_token(&node, &b64().encode(&caller_vk));
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
         let forged = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -784,6 +989,7 @@ mod tests {
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
             session_token: token,
+            caller_sig_b64,
             now_unix: Some(NOW),
         });
         assert_eq!(error_code(&forged), "invalid_request");
@@ -808,6 +1014,7 @@ mod tests {
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
             session_token: dummy_token(),
+            caller_sig_b64: b64().encode([0u8; 8]),
             now_unix: Some(NOW),
         });
         assert_eq!(error_code(&pre), "not_configured");
@@ -838,7 +1045,9 @@ mod tests {
         let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &escrow_aad, &producer_signer);
         let (_session_secret, session_public) = ddrm_envelope::mint_session();
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
-        let token = live_token(&node);
+        let (caller, caller_vk) = caller_keypair();
+        let token = live_token(&node, &b64().encode(&caller_vk));
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64);
         let args = RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -856,6 +1065,7 @@ mod tests {
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
             session_token: token,
+            caller_sig_b64,
             now_unix: Some(NOW),
         };
         (node, args)
@@ -867,15 +1077,26 @@ mod tests {
     fn hello_attests_node_identity_and_requires_init() {
         let store = unique_store("hello");
         let mut node = DkmsAuthorityNode::default();
+        let (_caller, caller_vk) = caller_keypair();
+        let caller_pub_b64 = b64().encode(&caller_vk);
 
         // Before init there is no key material → fail closed.
-        assert_eq!(error_code(&node.hello(&b64().encode([1u8; 32]), Some(NOW))), "not_configured");
+        assert_eq!(
+            error_code(&node.hello(&b64().encode([1u8; 32]), &caller_pub_b64, Some(NOW))),
+            "not_configured"
+        );
 
         let init = ok_data(node.init(json!({ "authority_key_store": store })));
         let pinned_vk_b64 = init["seal_verifying_key_b64"].as_str().unwrap().to_string();
 
+        // A malformed caller pubkey is refused up front (the token must bind a real verifying key).
+        assert_eq!(
+            error_code(&node.hello(&b64().encode([1u8; 32]), "not-a-key", Some(NOW))),
+            "invalid_request"
+        );
+
         let challenge = ddrm_envelope::random_seed();
-        let resp = ok_data(node.hello(&b64().encode(challenge), Some(NOW)));
+        let resp = ok_data(node.hello(&b64().encode(challenge), &caller_pub_b64, Some(NOW)));
         // The node advertises the SAME vk it published at init (the pin).
         assert_eq!(resp["verifying_key_b64"].as_str().unwrap(), pinned_vk_b64);
 
@@ -885,14 +1106,16 @@ mod tests {
         let attestation = b64().decode(resp["attestation_b64"].as_str().unwrap()).unwrap();
         assert!(ddrm_envelope::verify_attestation(&verifier, &challenge, &attestation));
 
-        // hello ALSO mints a node-signed SESSION TOKEN bound to this challenge + a bounded expiry,
-        // and the token verifies under the node's own vk (the node will require it on recover).
+        // hello ALSO mints a node-signed SESSION TOKEN bound to this challenge + the CALLER's pubkey
+        // + a bounded expiry, and the token verifies under the node's own vk (recover will require it).
         let token = &resp["session_token"];
         assert_eq!(token["expires_at"].as_u64().unwrap(), NOW + SESSION_TTL_SECONDS);
+        assert_eq!(token["caller_pub_b64"].as_str().unwrap(), caller_pub_b64);
         let token_sig = b64().decode(token["sig_b64"].as_str().unwrap()).unwrap();
         assert!(ddrm_envelope::verify_session_token(
             &verifier,
             &challenge,
+            &caller_vk,
             NOW + SESSION_TTL_SECONDS,
             &token_sig
         ));
@@ -947,21 +1170,163 @@ mod tests {
         let _ = std::fs::remove_file(&store);
     }
 
-    /// A `recover` with NO session token is a hard parse error — the node never recovers without a
-    /// handshake session (the `session_token` field is required on the wire).
+    /// A `recover` with NO session token (or NO possession proof) is a hard parse error — the node
+    /// never recovers without a handshake session AND a caller signature (both fields are required).
     #[test]
     fn recover_without_a_session_token_is_rejected_at_the_protocol() {
         // A recover line that omits session_token must fail to deserialize into a Request.
-        let line = json!({
+        let no_token = json!({
             "op": "recover",
             "wrapped_cek_b64": "AA==", "scheme": "s", "kid_hex": "00",
             "producer_vk_b64": "AA==", "decrypt_session_pub_b64": "AA==",
             "ciphertext_b64": "AA==", "content_hash_b64": "AA==", "nonce_b64": "AA==",
             "rights_receipt": good_receipt(),
             "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
+            "caller_sig_b64": "AA==",
         });
-        let parsed = serde_json::from_value::<Request>(line);
-        assert!(parsed.is_err(), "recover without session_token must not deserialize");
+        assert!(
+            serde_json::from_value::<Request>(no_token).is_err(),
+            "recover without session_token must not deserialize"
+        );
+
+        // A recover line that omits the possession proof (caller_sig_b64) must also fail to parse.
+        let no_proof = json!({
+            "op": "recover",
+            "wrapped_cek_b64": "AA==", "scheme": "s", "kid_hex": "00",
+            "producer_vk_b64": "AA==", "decrypt_session_pub_b64": "AA==",
+            "ciphertext_b64": "AA==", "content_hash_b64": "AA==", "nonce_b64": "AA==",
+            "rights_receipt": good_receipt(),
+            "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
+            "session_token": { "challenge_b64": "AA==", "caller_pub_b64": "AA==", "expires_at": 1, "sig_b64": "AA==" },
+        });
+        assert!(
+            serde_json::from_value::<Request>(no_proof).is_err(),
+            "recover without caller_sig_b64 must not deserialize"
+        );
+    }
+
+    /// The POSSESSION GATE (Day 93–94): even with a valid, live, node-signed token + escrow + receipt,
+    /// a recover whose possession proof is MISSING/garbage, signed by the WRONG key, or over a
+    /// TAMPERED binding is refused — so a captured BEARER token replayed by a caller who does not hold
+    /// the token-bound private key cannot drive recovery (the OWNER-BOUND analogue,
+    /// `secureViewSession.ts:87`–`:100`).
+    #[test]
+    fn recover_fails_closed_without_or_with_wrong_possession_proof() {
+        let store = unique_store("possession");
+        let (node, base) = setup_recover(&store);
+
+        // Garbage proof (a token-replayer who cannot sign) → session_invalid.
+        let mut garbage = base.clone();
+        garbage.caller_sig_b64 = b64().encode([0u8; 8]);
+        assert_eq!(error_code(&node.recover(garbage)), "session_invalid");
+
+        // Proof from a DIFFERENT key (right binding, wrong signer) → session_invalid.
+        let (other, _ovk) = ddrm_envelope::seal::mldsa_seal_keypair([0x99u8; 32]);
+        let mut wrong_key = base.clone();
+        wrong_key.caller_sig_b64 =
+            proof_for(&other, &base.session_token, CONTENT, &base.kid_hex, &base.decrypt_session_pub_b64);
+        assert_eq!(error_code(&node.recover(wrong_key)), "session_invalid");
+
+        // Sanity: the unmodified base (correct possession proof) recovers.
+        assert!(matches!(node.recover(base), Response::Ok { .. }));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// The FRAMED Unix-socket transport (Day 93–94): a full session — init → hello → recover →
+    /// shutdown — round-trips over length-prefixed frames on one connection, and a torn frame on a
+    /// FRESH connection is refused fail-closed (the handler returns an `invalid_frame` error + drops
+    /// the connection) without the served node panicking.
+    #[test]
+    fn framed_connection_serves_a_full_session_and_drops_a_torn_frame() {
+        use ddrm_envelope::frame::{read_frame, write_frame};
+        use std::os::unix::net::UnixStream;
+
+        let store = unique_store("framed");
+
+        // ---- Happy path: a full framed session over one connection. ----
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || serve_connection(server));
+
+        let call = |client: &mut UnixStream, req: Value| -> Value {
+            write_frame(client, &serde_json::to_vec(&req).unwrap()).unwrap();
+            let payload = read_frame(client).unwrap().expect("a framed response");
+            serde_json::from_slice(&payload).unwrap()
+        };
+
+        // Pass the store in config (no process-wide env — keeps parallel tests independent).
+        let init = call(&mut client, json!({ "op": "init", "config": { "authority_key_store": store } }));
+        assert_eq!(init["status"].as_str().unwrap(), "ok");
+
+        let (caller, caller_vk) = caller_keypair();
+        let challenge = b64().encode([0xB2u8; 32]);
+        let hello = call(
+            &mut client,
+            json!({ "op": "hello", "challenge_b64": challenge, "caller_pub_b64": b64().encode(&caller_vk), "now_unix": NOW }),
+        );
+        let token = &hello["data"]["session_token"];
+        let session_pub_b64 = init["data"]["seal_recipient_pub_b64"].as_str().unwrap();
+        // Escrow a CEK to the node's recipient so the recover has something real to recover.
+        let recipient_pub = b64().decode(session_pub_b64).unwrap();
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub).unwrap();
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+        let cek: Vec<u8> = (0u8..32).collect();
+        let kid16 = [0xC5u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let escrow_aad = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_pub);
+        let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &escrow_aad, &producer_signer);
+        let (_ds, dsp) = ddrm_envelope::mint_session();
+        let decrypt_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&dsp));
+        let proof = {
+            let chal = b64().decode(challenge_str(token)).unwrap();
+            let dp = b64().decode(&decrypt_pub_b64).unwrap();
+            b64().encode(ddrm_envelope::sign_recover_proof(&caller, &chal, CONTENT.as_bytes(), kid_hex.as_bytes(), &dp))
+        };
+        let recover = call(
+            &mut client,
+            json!({
+                "op": "recover",
+                "wrapped_cek_b64": b64().encode(wrapped.to_bytes()),
+                "scheme": scheme, "kid_hex": kid_hex,
+                "producer_vk_b64": b64().encode(&producer_vk),
+                "decrypt_session_pub_b64": decrypt_pub_b64,
+                "aad_b64": b64().encode(b"transcript"),
+                "ciphertext_b64": b64().encode(b"ct"),
+                "content_hash_b64": b64().encode(b"hash"),
+                "nonce_b64": b64().encode(b"nonce"),
+                "rights_receipt": good_receipt(),
+                "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
+                "session_token": token,
+                "caller_sig_b64": proof,
+                "now_unix": NOW,
+            }),
+        );
+        assert_eq!(recover["status"].as_str().unwrap(), "ok", "framed recover over the socket succeeds");
+        assert!(recover["data"]["material"].get("sealed_cek_b64").is_some());
+        // Clean shutdown ends the connection; the served thread returns without panicking.
+        write_frame(&mut client, &serde_json::to_vec(&json!({ "op": "shutdown" })).unwrap()).unwrap();
+        let _ = read_frame(&mut client);
+        handle.join().unwrap();
+
+        // ---- Torn frame on a fresh connection: refused fail-closed, no panic. ----
+        let (mut bad, server2) = UnixStream::pair().unwrap();
+        let handle2 = std::thread::spawn(move || serve_connection(server2));
+        // A header promising 64 bytes followed by only 3, then half-close.
+        use std::io::Write as _;
+        bad.write_all(&64u32.to_be_bytes()).unwrap();
+        bad.write_all(b"abc").unwrap();
+        bad.shutdown(std::net::Shutdown::Write).unwrap();
+        let resp = read_frame(&mut bad).unwrap().expect("an error frame");
+        let resp: Value = serde_json::from_slice(&resp).unwrap();
+        assert_eq!(resp["code"].as_str().unwrap(), "invalid_frame");
+        handle2.join().unwrap();
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// Pull the challenge string out of a session-token JSON value.
+    fn challenge_str(token: &Value) -> &str {
+        token["challenge_b64"].as_str().unwrap()
     }
 
     /// The node refuses a recover whose session token is EXPIRED, FORGED, or TAMPERED — even with a

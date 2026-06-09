@@ -181,6 +181,76 @@ impl Capsule {
     }
 }
 
+/// A FRAMED client to the dKMS node's listening Unix-domain socket (Day 93–94) — the transport the
+/// real `key-provider` uses. Length-prefixed request/response; the probe connects to the running
+/// daemon rather than spawning a child, exercising the SAME wire as production.
+struct NodeSocket {
+    stream: std::os::unix::net::UnixStream,
+    reader: BufReader<std::os::unix::net::UnixStream>,
+}
+
+impl NodeSocket {
+    fn connect(path: &str) -> Result<Self, String> {
+        let stream = std::os::unix::net::UnixStream::connect(path)
+            .map_err(|e| format!("connect dkms socket {path}: {e}"))?;
+        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        Ok(Self { stream, reader })
+    }
+
+    /// One framed request, one framed response.
+    fn call(&mut self, req: &Value) -> Result<Value, String> {
+        let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+        ddrm_envelope::frame::write_frame(&mut self.stream, &payload)
+            .map_err(|e| format!("write framed request: {e}"))?;
+        match ddrm_envelope::frame::read_frame(&mut self.reader) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).map_err(|e| format!("non-JSON frame: {e}")),
+            Ok(None) => Err("dkms node closed the connection".to_string()),
+            Err(e) => Err(format!("read framed response: {e}")),
+        }
+    }
+}
+
+/// A running dKMS NODE DAEMON: the node binary launched in LISTEN mode, bound to a Unix-domain
+/// socket. The runtime CONNECTS to it (it does not own the process the way it owns a child pipe), and
+/// this guard KILLS + reaps it on drop so the smoke leaves no orphan. The real-remote-authority shape.
+struct DaemonGuard {
+    child: Child,
+    sock: String,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+/// Start the dKMS node DAEMON listening on `sock` with its node-local master store, and wait for the
+/// socket to appear (fail-closed if it never binds). The daemon serves many sequential connections.
+fn start_dkms_daemon(node_bin: &str, sock: &str, node_store_path: &str) -> Result<DaemonGuard, String> {
+    let _ = std::fs::remove_file(sock);
+    let child = Command::new(node_bin)
+        .env("DKMS_AUTHORITY_LISTEN", sock)
+        .env("DKMS_AUTHORITY_KEY_STORE", node_store_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("spawn dkms daemon ({node_bin}): {e}"))?;
+    let guard = DaemonGuard { child, sock: sock.to_string() };
+    for _ in 0..400 {
+        if std::path::Path::new(sock).exists() {
+            // Confirm it actually ACCEPTS (bound + listening), not just that the file exists.
+            if std::os::unix::net::UnixStream::connect(sock).is_ok() {
+                return Ok(guard);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(format!("dkms daemon did not start listening on {sock} within timeout"))
+}
+
 fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
     if resp.get("status").and_then(Value::as_str) == Some("ok") {
         Ok(resp.get("data").cloned().unwrap_or(Value::Null))
@@ -529,6 +599,7 @@ impl PublishEscrow {
 /// CEK to it under the shared escrow AAD, and write a durable publish fixture. Mirrors PC2
 /// escrowing the CEK to the stable `DEFAULT_AUTHORITY` at encode time (`dashPackager.ts`
 /// `encryptMediaCEK`). After this, the open path NEVER escrows — it reads the fixture.
+#[allow(clippy::too_many_arguments)]
 fn publish_escrow(
     key_bin: &str,
     key_store_path: &str,
@@ -537,6 +608,7 @@ fn publish_escrow(
     descriptor_path: &std::path::Path,
     dkms_node_bin: Option<&str>,
     node_store_path: &str,
+    node_endpoint: &str,
 ) -> Result<PublishEscrow, String> {
     // PROVISION the selected authority and read its PUBLISHED identity (stable vk + recipient).
     //
@@ -583,13 +655,15 @@ fn publish_escrow(
                 .ok_or("dkms-authority node did not publish a recipient key")?
                 .to_string();
             node.shutdown();
-            // Publish the PUBLIC-ONLY descriptor — pins + endpoint, NOTHING secret. The master lives
-            // ONLY in `node_store_path` (which this runtime created via the node but never reads).
+            // Publish the PUBLIC-ONLY descriptor — pins + endpoint, NOTHING secret. The endpoint is
+            // the node's listening SOCKET PATH (the client CONNECTS, it does not spawn the node). The
+            // master lives ONLY in `node_store_path` (which this runtime created via the node but
+            // never reads).
             let descriptor = json!({
                 "schema": "elastos.dkms.authority/v2",
                 "verifying_key_b64": vk,
                 "recipient_pub_b64": recipient,
-                "authority_endpoint": node_bin,
+                "authority_endpoint": node_endpoint,
             });
             let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| e.to_string())?;
             std::fs::write(descriptor_path, bytes)
@@ -654,30 +728,30 @@ fn probe_receipt(allowed: bool, content_id: &str, principal_id: &str, right: &st
 /// session to gate recovery (`secureViewSession.ts:81`–`:128`), and re-running `hasAccessByContentId`
 /// in the TEE (`:560`–`:568`) rather than trusting the caller.
 fn dkms_node_adversarial_probe(
-    node_bin: &str,
-    node_store_path: &str,
+    sock_path: &str,
     pinned_vk_b64: &str,
     material: &KeyOpenMaterial,
 ) -> Result<(), String> {
-    let mut node = Capsule::spawn("dkms-authority(probe)", node_bin)?;
-    ok_data(
-        &node.call(&json!({ "op": "init", "config": { "authority_key_store": node_store_path } }))?,
-        "dkms-authority init (probe)",
-    )?;
+    // CONNECT to the running daemon over the framed socket (no spawn) — the SAME wire production uses.
+    let mut node = NodeSocket::connect(sock_path)?;
+    ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "dkms-authority init (probe)")?;
+
+    // The probe's EPHEMERAL keypair: its public half binds the session token; it signs every recover.
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
 
     // (a) IDENTITY HANDSHAKE — the node proves possession of the master-derived signing key AND
-    // mints a node-signed SESSION TOKEN bound to this challenge + a bounded expiry.
+    // mints a node-signed SESSION TOKEN bound to this challenge + the probe's pubkey + a bounded expiry.
     let challenge = ddrm_envelope::random_seed();
     let hello = ok_data(
         &node.call(&json!({
             "op": "hello",
             "challenge_b64": B64.encode(challenge),
+            "caller_pub_b64": B64.encode(&caller_vk),
             "now_unix": NOW_UNIX,
         }))?,
         "dkms-authority hello (probe)",
     )?;
     if hello["verifying_key_b64"].as_str() != Some(pinned_vk_b64) {
-        node.shutdown();
         return Err("dkms node hello advertised a vk that does not match the pinned descriptor".to_string());
     }
     let attestation = B64
@@ -687,7 +761,6 @@ fn dkms_node_adversarial_probe(
     let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned)
         .ok_or("pinned dkms vk is malformed")?;
     if !ddrm_envelope::verify_attestation(&verifier, &challenge, &attestation) {
-        node.shutdown();
         return Err("the genuine node attestation failed to verify under the pinned vk".to_string());
     }
     // A flipped (impersonator) vk must NOT verify this attestation → a swapped node is rejected.
@@ -695,7 +768,6 @@ fn dkms_node_adversarial_probe(
     tampered[0] ^= 1;
     if let Some(bad_verifier) = ddrm_envelope::MlDsa65Verifier::from_encoded(&tampered) {
         if ddrm_envelope::verify_attestation(&bad_verifier, &challenge, &attestation) {
-            node.shutdown();
             return Err("a tampered node identity (flipped vk) wrongly verified — pinning is broken".to_string());
         }
     }
@@ -703,24 +775,34 @@ fn dkms_node_adversarial_probe(
     let mut replay = challenge;
     replay[0] ^= 1;
     if ddrm_envelope::verify_attestation(&verifier, &replay, &attestation) {
-        node.shutdown();
         return Err("a replayed challenge wrongly verified — the attestation is not challenge-bound".to_string());
     }
     // Capture the live session token the node minted (the credential every recover must present).
     let session_token = hello["session_token"].clone();
     if !session_token.is_object() {
-        node.shutdown();
         return Err("dkms node hello returned no session token".to_string());
     }
-    step(13, "dkms node IDENTITY pinned + verified cross-binary: the node's attestation verifies under the descriptor vk; a flipped vk + a replayed challenge are both rejected; and the node minted a node-signed SESSION TOKEN");
+    step(13, "dkms node IDENTITY pinned + verified OVER THE SOCKET: the node's framed attestation verifies under the descriptor vk; a flipped vk + a replayed challenge are both rejected; and the node minted a CALLER-BOUND session token");
 
     // A GENUINE recover bundle: REAL publish-escrow material (recovers to the node recipient) + a
-    // coherent allowed receipt + the live session token. Used both for the happy (c)/(d) path and as
-    // the base the adversarial session cases vary (so a refusal is provably the session gate, not a
-    // broken bundle). The crypto is real, so the node runs the FULL pipeline.
+    // coherent allowed receipt + the live session token + a valid POSSESSION PROOF (signed under the
+    // ephemeral key the token is bound to). Used for the happy (c)/(d) path and as the base the
+    // adversarial cases vary (so a refusal is provably the gate, not a broken bundle).
     const PROBE_CONTENT: &str = "bafContent";
     const PROBE_PRINCIPAL: &str = "did:key:zViewer";
     const PROBE_SESSION: &str = "probe-session";
+    // Sign the recover binding under `signer` for `token`'s challenge (the possession proof).
+    let proof = |token: &Value, signer: &ddrm_envelope::seal::MlDsaSealSigner| -> String {
+        let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
+        let sp = B64.decode(&material.session_pub_b64).unwrap_or_default();
+        B64.encode(ddrm_envelope::sign_recover_proof(
+            signer,
+            &chal,
+            PROBE_CONTENT.as_bytes(),
+            material.kid_hex.as_bytes(),
+            &sp,
+        ))
+    };
     let genuine = |token: &Value, now: u64| {
         json!({
             "op": "recover",
@@ -739,24 +821,23 @@ fn dkms_node_adversarial_probe(
             "session_id": PROBE_SESSION,
             "right": "view",
             "session_token": token,
+            "caller_sig_b64": proof(token, &caller_signer),
             "now_unix": now,
         })
     };
 
-    // (b) SESSION GATE — the node refuses recover without a live, node-verified token, EVEN with a
-    // valid escrow + receipt. NO token, an EXPIRED token, a FORGED signature, and a token whose
-    // bound CHALLENGE was tampered are all rejected.
+    // (b) SESSION + POSSESSION GATE — the node refuses recover without a live token, EVEN with valid
+    // escrow + receipt: NO token, EXPIRED, FORGED signature, tampered CHALLENGE — and (Day 93–94) a
+    // captured token replayed WITHOUT the caller signature, or with a signature under the WRONG key.
     let mut no_token = genuine(&session_token, NOW_UNIX);
     no_token.as_object_mut().unwrap().remove("session_token");
     if node.call(&no_token)?.get("status").and_then(Value::as_str) == Some("ok") {
-        node.shutdown();
         return Err("the node recovered with NO session token — the session gate is broken".to_string());
     }
     let expires_at = session_token["expires_at"].as_u64().unwrap_or(0);
     if node.call(&genuine(&session_token, expires_at + 1))?.get("status").and_then(Value::as_str)
         == Some("ok")
     {
-        node.shutdown();
         return Err("the node recovered with an EXPIRED session token — expiry is not enforced".to_string());
     }
     let mut forged_token = session_token.clone();
@@ -764,7 +845,6 @@ fn dkms_node_adversarial_probe(
     if node.call(&genuine(&forged_token, NOW_UNIX))?.get("status").and_then(Value::as_str)
         == Some("ok")
     {
-        node.shutdown();
         return Err("the node recovered with a FORGED session token — the signature is not verified".to_string());
     }
     let mut other_challenge = session_token.clone();
@@ -772,21 +852,31 @@ fn dkms_node_adversarial_probe(
     if node.call(&genuine(&other_challenge, NOW_UNIX))?.get("status").and_then(Value::as_str)
         == Some("ok")
     {
-        node.shutdown();
         return Err("a session token bound to one challenge authorized a recover under a DIFFERENT challenge — binding is broken".to_string());
     }
-    step(14, "dkms node SESSION GATE cross-binary: recover with NO / EXPIRED / FORGED token, and a token whose bound challenge was tampered, are all refused (a captured/forged session cannot drive recovery)");
+    // POSSESSION: a captured token replayed WITHOUT the caller signature is refused.
+    let mut no_proof = genuine(&session_token, NOW_UNIX);
+    no_proof.as_object_mut().unwrap().remove("caller_sig_b64");
+    if node.call(&no_proof)?.get("status").and_then(Value::as_str) == Some("ok") {
+        return Err("the node recovered with NO possession proof — a captured bearer token is replayable".to_string());
+    }
+    // POSSESSION: a captured token replayed with a signature under the WRONG key is refused.
+    let (wrong_signer, _wrong_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x5cu8; 32]);
+    let mut wrong_proof = genuine(&session_token, NOW_UNIX);
+    wrong_proof["caller_sig_b64"] = json!(proof(&session_token, &wrong_signer));
+    if node.call(&wrong_proof)?.get("status").and_then(Value::as_str) == Some("ok") {
+        return Err("the node recovered with a possession proof under the WRONG key — the token is not caller-bound".to_string());
+    }
+    step(14, "dkms node SESSION + POSSESSION GATE over the socket: recover with NO / EXPIRED / FORGED token, a tampered-challenge token, NO possession proof, and a WRONG-KEY proof are ALL refused (a captured bearer token is non-replayable)");
 
-    // (c) NODE RE-AUTHORIZATION — with a LIVE token, the node still refuses recover whose
-    // authorization does not bind the declared content/principal.
-    let denied = genuine(&session_token, NOW_UNIX);
+    // (c) NODE RE-AUTHORIZATION — with a LIVE token + valid proof, the node still refuses recover
+    // whose authorization does not bind the declared content/principal.
     let denied = {
-        let mut d = denied;
+        let mut d = genuine(&session_token, NOW_UNIX);
         d["rights_receipt"] = probe_receipt(false, PROBE_CONTENT, PROBE_PRINCIPAL, "view");
         d
     };
     if node.call(&denied)?.get("status").and_then(Value::as_str) == Some("ok") {
-        node.shutdown();
         return Err("the node recovered for a DENIED receipt — re-authorization is broken".to_string());
     }
     let mismatched = {
@@ -795,29 +885,85 @@ fn dkms_node_adversarial_probe(
         m
     };
     if node.call(&mismatched)?.get("status").and_then(Value::as_str) == Some("ok") {
-        node.shutdown();
         return Err("the node recovered for a receipt bound to DIFFERENT content — re-authorization is broken".to_string());
     }
-    step(15, "dkms node RE-AUTHORIZED in its own boundary: even WITH a live session, it refused recover for a DENIED receipt and a receipt bound to other content (the node never trusts the caller's claim)");
+    step(15, "dkms node RE-AUTHORIZED in its own boundary: even WITH a live session + proof, it refused recover for a DENIED receipt and a receipt bound to other content (the node never trusts the caller's claim)");
 
-    // (d) MANY SEGMENTS OVER ONE SESSION — the SAME live token drives repeated SUCCESSFUL recovers
-    // over the long-lived node; each returns sealed material and never the raw CEK. The master never
-    // re-crosses the boundary (no re-init, no re-handshake between segments).
+    // (d) MANY SEGMENTS OVER ONE SOCKET CONNECTION + SESSION — the SAME live token + connection drives
+    // repeated SUCCESSFUL recovers over the long-lived node; each returns sealed material, never the
+    // raw CEK. No re-connect, re-init, or re-handshake between segments.
     for segment in 0..3 {
         let ok = ok_data(&node.call(&genuine(&session_token, NOW_UNIX))?, "dkms genuine recover (probe)")?;
         let sealed = ok["material"]["sealed_cek_b64"].as_str().unwrap_or_default();
         if sealed.is_empty() {
-            node.shutdown();
-            return Err(format!("recover {segment} over the reused session returned no sealed material"));
+            return Err(format!("recover {segment} over the reused socket session returned no sealed material"));
         }
         if serde_json::to_string(&ok).unwrap_or_default().contains(GOLDEN_CEK_B64) {
-            node.shutdown();
             return Err("the raw CEK leaked from a reused-session recover".to_string());
         }
     }
-    step(16, "dkms node ONE session → MANY recovers: three SUCCESSFUL recovers over the SAME live session token (sealed material only, raw CEK never present) — the persistent open-once/recover-many shape");
+    step(16, "dkms node ONE socket connection + session → MANY recovers: three SUCCESSFUL recovers over the SAME connection + live token (sealed material only) — the persistent open-once/recover-many shape");
 
-    node.shutdown();
+    // Close THIS connection before the framing probe: the daemon serves connections SEQUENTIALLY
+    // (one session per connection), so it cannot accept the framing probe's fresh connections until
+    // this one ends. Dropping the socket lets the daemon's accept loop move on.
+    drop(node);
+
+    // (e) MALFORMED FRAME FAILS CLOSED WITHOUT WEDGING THE DAEMON — a fresh connection that sends a
+    // torn/oversized frame is refused, and a subsequent fresh connection still completes a session.
+    dkms_malformed_frame_is_refused(sock_path)?;
+    step(17, "dkms node FRAMING fails closed: a torn AND an oversized frame on fresh connections are each refused (the daemon drops the connection, never wedges), and a clean session afterwards still succeeds");
+
+    Ok(())
+}
+
+/// Prove the daemon's framed transport fails closed: a torn frame and an oversized frame each get an
+/// `invalid_frame` refusal (or a dropped connection) WITHOUT wedging the daemon — a fresh connection
+/// afterwards still does a clean init/hello round-trip.
+fn dkms_malformed_frame_is_refused(sock_path: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+
+    // Torn frame: a header promising 64 bytes followed by only 3, then half-close the write side.
+    let mut torn = UnixStream::connect(sock_path).map_err(|e| e.to_string())?;
+    torn.write_all(&64u32.to_be_bytes()).map_err(|e| e.to_string())?;
+    torn.write_all(b"abc").map_err(|e| e.to_string())?;
+    torn.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+    let mut torn_reader = BufReader::new(torn);
+    // Either an explicit error frame, or a dropped connection — both are fail-closed.
+    if let Ok(Some(bytes)) = ddrm_envelope::frame::read_frame(&mut torn_reader) {
+        let resp: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if resp["status"].as_str() == Some("ok") {
+            return Err("the daemon accepted a torn frame — framing is not fail-closed".to_string());
+        }
+    }
+
+    // Oversized frame: a length header beyond MAX_FRAME_BYTES must be refused before allocating.
+    let mut huge = UnixStream::connect(sock_path).map_err(|e| e.to_string())?;
+    let over = ddrm_envelope::frame::MAX_FRAME_BYTES + 1;
+    huge.write_all(&over.to_be_bytes()).map_err(|e| e.to_string())?;
+    huge.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+    let mut huge_reader = BufReader::new(huge);
+    if let Ok(Some(bytes)) = ddrm_envelope::frame::read_frame(&mut huge_reader) {
+        let resp: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if resp["status"].as_str() == Some("ok") {
+            return Err("the daemon accepted an oversized frame — framing is not fail-closed".to_string());
+        }
+    }
+
+    // The daemon is NOT wedged: a fresh connection still completes a clean init/hello round-trip.
+    let mut fresh = NodeSocket::connect(sock_path)?;
+    ok_data(&fresh.call(&json!({ "op": "init", "config": {} }))?, "post-malformed init")?;
+    let (_s, vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6du8; 32]);
+    ok_data(
+        &fresh.call(&json!({
+            "op": "hello",
+            "challenge_b64": B64.encode([0x44u8; 32]),
+            "caller_pub_b64": B64.encode(&vk),
+            "now_unix": NOW_UNIX,
+        }))?,
+        "post-malformed hello",
+    )?;
     Ok(())
 }
 
@@ -1371,9 +1517,12 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // The dKMS NODE's master store — node-local, the SECRET stays here. The runtime creates it via
     // the node at provision time + names it in the env the node reads, but NEVER reads it itself.
     let node_store_path = work_dir.join("dkms-node-master.json").to_string_lossy().into_owned();
+    // The node's listening SOCKET PATH — the runtime CONNECTS here (it does not own the node's
+    // process). Published as the descriptor `authority_endpoint`.
+    let node_sock_path = work_dir.join("dkms-authority.sock").to_string_lossy().into_owned();
     if cfg.authority == AuthorityBackend::Dkms {
-        // Grant the (later) node child its store via the env it resolves — the key-provider client
-        // that spawns the node never passes or sees this path; it's the node's own concern.
+        // Grant the node DAEMON its store via the env it resolves — the key-provider client that
+        // connects to the node never passes or sees this path; it's the node's own concern.
         std::env::set_var("DKMS_AUTHORITY_KEY_STORE", &node_store_path);
     }
     let escrow = publish_escrow(
@@ -1384,7 +1533,20 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         &descriptor_path,
         cfg.dkms_authority_bin.as_deref(),
         &node_store_path,
+        &node_sock_path,
     )?;
+    // For `dkms`, START the external NODE DAEMON listening on its socket BEFORE the rail comes up, so
+    // the key-provider can CONNECT to it (rather than spawn it). The guard kills + reaps it on any
+    // return path. The master is born + stays in the daemon's node-local store.
+    let _dkms_daemon = if cfg.authority == AuthorityBackend::Dkms {
+        let node_bin = cfg
+            .dkms_authority_bin
+            .as_deref()
+            .ok_or("dkms backend requires a dkms_authority_bin in the config")?;
+        Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path)?)
+    } else {
+        None
+    };
     // The open path binds to the selected backend via its `init` config ONLY — the publish →
     // launch → open → recover/re-seal flow below is byte-identical across backends.
     let key_init_config = match cfg.authority {
@@ -1665,20 +1827,21 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         // bind the content/principal. The happy-path open above already proved the genuine identity
         // verifies + a content-bound recover decrypts; here we prove the adversarial edges.
         if cfg.mode == OpenMode::Verify {
-            let node_bin = cfg
-                .dkms_authority_bin
-                .as_deref()
-                .ok_or("dkms verify mode requires a dkms_authority_bin")?;
             let desc: Value = serde_json::from_slice(&before).map_err(|e| format!("parse dkms descriptor: {e}"))?;
             let pinned_vk = desc
                 .get("verifying_key_b64")
                 .and_then(Value::as_str)
                 .ok_or("dkms descriptor missing verifying_key_b64")?;
+            // The probe connects to the SAME running daemon the rail used, over the published socket.
+            let endpoint = desc
+                .get("authority_endpoint")
+                .and_then(Value::as_str)
+                .ok_or("dkms descriptor missing authority_endpoint")?;
             let probe_material = key_material
                 .borrow()
                 .clone()
                 .ok_or("dkms verify probe needs the bound key material from the open")?;
-            dkms_node_adversarial_probe(node_bin, &node_store_path, pinned_vk, &probe_material)?;
+            dkms_node_adversarial_probe(endpoint, pinned_vk, &probe_material)?;
         }
     }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop
