@@ -58,6 +58,7 @@ shared `protected_content` contracts.
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
+| — Plan executor | `ddrm-plan-runner` (runtime core) | 🟩 **fail-closed core that WALKS the `DrmOpenPlanV1`** — validates order + binding edges, threads each edge into the next step, fails closed on a broken/out-of-order edge; holds no authority (only the injected `StepRunner` touches a provider); the consumer smoke drives the real chain THROUGH it (Day 71) | `capsules/ddrm-plan-runner` |
 
 **Headline:** the **hardest, most security-critical boundary — decrypt — is done**
 (transcript-bound, in-sandbox minted key, expiry+audit, suite-tagged material, all
@@ -135,8 +136,9 @@ flowchart TB
     PUBP[publish-provider 🟩<br/>UnsignedMintV1 contentId=KID]
     MKT[content-market 🟩<br/>reconstruct / enrich / from_event]
   end
-  subgraph cons["CONSUMER — decrypt DONE, wiring pending"]
+  subgraph cons["CONSUMER — decrypt DONE, core executor landed, rail-wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
+    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -146,7 +148,8 @@ flowchart TB
   ENC -->|ciphertext| IPFS --> MKT
   CHN --> MKT
   WLT -. buyAccess .-> CHN
-  DRM -. declared .-> RTS --> CHN
+  DRM -->|DrmOpenPlanV1| CORE
+  CORE -. executes plan .-> RTS --> CHN
   RTS -->|receipt| KEY -->|SealedDecryptMaterialV1| DEC --> VIEW
   DEC -->|publishes session pubkey| KEY
 ```
@@ -263,12 +266,26 @@ decrypt-provider OpenSessionV1`.
   no-backend/no-session/denied/expired/kid-swap/scheme-mismatch/forged-producer. key-provider
   27→33. `ddrm-consumer-smoke.sh` now escrows the golden CEK + drives the canonical `release`
   (recover→reseal) — removing the raw-CEK shim; the consumer half runs through the op the plan names.
+- **Status (Day 71):** the runtime CORE now EXECUTES the plan. New fail-closed library
+  `capsules/ddrm-plan-runner` walks the `DrmOpenPlanV1` instead of the smoke hand-walking it.
+  Audited PC2's gated open sequencer (`secureViewSession.ts:61` resurrect-session →
+  `media.ts:1163` `hasAccessByContentId` access gate → `:1196`/`:1216` recover + unwrap the CEK
+  in-boundary — each stage gated on the prior). `DrmOpenPlan::parse` validates schema / `planned`
+  status / the `rights<key<decrypt` canonical order / every binding edge; `execute` seeds the
+  `drm_open` identities, walks the steps IN ORDER, threads each binding edge into the next step's
+  declared field, and FAILS CLOSED on a broken / out-of-order edge or a step that drops its
+  declared artifact. It holds NO authority — the only thing that touches a provider is the
+  injected `StepRunner` (the runtime's capability seam). `ddrm-consumer-smoke.sh` now drives the
+  REAL drm→rights→key→decrypt binaries THROUGH the core (the smoke is just the injected
+  transport), and a TAMPERED binding edge is rejected cross-binary by the real key-provider.
+  ddrm-plan-runner=14; drift untouched (the executor reads the plan, defines no shared contract).
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
-- **Still dev-shaped:** the orchestrator smoke stands in for the runtime core (holds no keys),
-  which is not yet driving the canonical `release` default-on; the `reference` backend is dev-only
-  (production uses the `dkms`/`lit` backends, still `not_configured`); smoke is native (a
-  `wasm32-wasip1` variant is a follow-up).
+- **Still dev-shaped:** the core executor runs today via the smoke's injected `StepRunner` (real
+  binaries spawned by the smoke); wiring it to the runtime's REAL provider→provider rail so the
+  open runs default-on inside the core is the next step (the `StepRunner` trait is that seam). The
+  `reference` backend is dev-only (production uses the `dkms`/`lit` backends, still
+  `not_configured`); smoke is native (a `wasm32-wasip1` variant is a follow-up).
 
 ### Phase B — Real chain validation (Base) via `chain-provider` 🟦 UNDERWAY
 Point `rights-provider` at `chain-provider::has_access_by_content_id` against the real

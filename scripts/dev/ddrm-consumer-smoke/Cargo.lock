@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ddrm-envelope",
+ "ddrm-plan-runner",
  "serde_json",
 ]
 
@@ -182,6 +183,13 @@ dependencies = [
  "sha2",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "ddrm-plan-runner"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

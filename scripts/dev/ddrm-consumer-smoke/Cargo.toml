@@ -18,5 +18,9 @@ path = "src/main.rs"
 # computes the canonical AAD the key authority seals to and the decrypt boundary
 # rebuilds. No private re-implementation -> no drift.
 ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+# The runtime-core open-plan EXECUTOR: the smoke no longer hand-walks the plan inline —
+# it drives the REAL binaries THROUGH the core, which threads the plan's binding edges
+# and fails closed on a broken edge. Same crate the runtime would wire to real providers.
+ddrm-plan-runner = { path = "../../../capsules/ddrm-plan-runner" }
 serde_json = "1.0"
 base64 = "0.22"
