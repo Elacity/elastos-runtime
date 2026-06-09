@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~69 commits**, tip Day-63 Phase C — the producer→chain loop is CLOSED cross-binary: `publish-provider` now emits an `UnsignedMintV1` whose STRUCTURED `op_raw`/`sell` drop STRAIGHT into `chain-provider::assemble_mint` (PC2-faithful payee arrays — creator ACCESS_TOKEN + ROYALTY_SHARE `amount=round(10*royalty)`, default `100−ELACITY_ROYALTY_PERCENT(5)`, BUY_AND_RESELL DISTRIBUTION_RIGHT + `resellerCut`), proven by `ddrm-publish-smoke.sh` driving the REAL `publish (prepare) → chain (assemble_mint)` binaries so one identity flows KID → contentId → mint calldata with tokenURI + sell terms intact and no signing/RPC in the assembler; publish=16. Earlier tip Day-62 Phase C — the prepared mint is now real CALLDATA: `chain-provider` gained a pure `assemble_mint` op that ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call (FREE `opRawData=abi.encode(bytes16 contentId)`, PAID opRawData payee/royalty arrays + `sellRawData=(copies,price,payToken)`) and returns the `{to,data,value}` an external signer signs and the existing `broadcast_transaction` (`eth_sendRawTransaction`) sends — no RPC/keys in the encoder, calldata decoded back to spec in 10 tests. Day 61 added the fail-closed `publish-provider` that ASSEMBLES the mint intent (binds `contentId == bytes16 KID`, derives `tokenURI = {metadataCid}/metadata.json`, emits the unsigned `UnsignedMintV1`; publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire, no golden). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~70 commits**, tip Day-64 Phase C — the published mint is now DISCOVERABLE: a new fail-closed `content-market` capsule reconstructs a typed `ContentListingV1` PURELY from the self-describing mint calldata (the inverse of Day-62's `assemble_mint`) — `content_id == bytes16 KID`, tokenURI→metadataCID (PC2 `extractCid`), opType, and `(copies,price,payToken)` sell terms — holding NO chain RPC / NO IPFS / NO keys and minting nothing, so a foreign/malformed call fails closed (content-market=13). `ddrm-market-smoke.sh` drives the REAL `publish → chain → content-market` binaries so a sealed asset's KID flows producer→chain→discovery as ONE identity: the listing's `content_id` IS the producer's KID. Runtime-superior vs PC2's `ContentIndexerService` (4 sources: event + tokenURI eth_call + metadata.kid + AuthorityGateway price) — our mint calldata is self-describing, so one pure decode yields a verifiable listing; human-facing fields (title/poster/mime) are delegated to ipfs+chain enrichers, not assumed. Earlier tip Day-63 Phase C — the producer→chain loop is CLOSED cross-binary: `publish-provider` now emits an `UnsignedMintV1` whose STRUCTURED `op_raw`/`sell` drop STRAIGHT into `chain-provider::assemble_mint` (PC2-faithful payee arrays — creator ACCESS_TOKEN + ROYALTY_SHARE `amount=round(10*royalty)`, default `100−ELACITY_ROYALTY_PERCENT(5)`, BUY_AND_RESELL DISTRIBUTION_RIGHT + `resellerCut`), proven by `ddrm-publish-smoke.sh` driving the REAL `publish (prepare) → chain (assemble_mint)` binaries so one identity flows KID → contentId → mint calldata with tokenURI + sell terms intact and no signing/RPC in the assembler; publish=16. Earlier tip Day-62 Phase C — the prepared mint is now real CALLDATA: `chain-provider` gained a pure `assemble_mint` op that ABI-encodes the PC2 `mint(string,uint16,bytes,bytes)` call (FREE `opRawData=abi.encode(bytes16 contentId)`, PAID opRawData payee/royalty arrays + `sellRawData=(copies,price,payToken)`) and returns the `{to,data,value}` an external signer signs and the existing `broadcast_transaction` (`eth_sendRawTransaction`) sends — no RPC/keys in the encoder, calldata decoded back to spec in 10 tests. Day 61 added the fail-closed `publish-provider` that ASSEMBLES the mint intent (binds `contentId == bytes16 KID`, derives `tokenURI = {metadataCid}/metadata.json`, emits the unsigned `UnsignedMintV1`; publish=13). Day 60 took the producer half cross-binary: `encrypt-provider` (feature `escrow`) `seal_inline` mints a CEK *now* + emits the SEALED escrow blob; `key-provider` (`release_from_escrow_ref`) recovers + re-seals it; `ddrm-producer-smoke.sh` drives `encrypt → key → decrypt` so a video sealed *now* decrypts *now*, no raw CEK/plaintext on any wire, no golden). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -13,6 +13,36 @@
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
 
+> **🛒 Day 64 — `content-market`: the mint becomes DISCOVERABLE, fail-closed (Phase C, LANDED).**
+> Days 61–63 put a sealed asset's identity on-chain as mint calldata; Day 64 makes it
+> *findable* — the step that turns a publish into something the consumer chain
+> (`has_access_by_content_id`) + the existing `rights → key → decrypt` half can act on.
+> Audited PC2's `ContentIndexerService.ts` first: it scans chain logs
+> (`AssetCreated`/`DigitalAssetRegistered`, topics at lines 59–63), `eth_call`s `tokenURI`
+> (selector `0xc87b56dd`), fetches `metadata.json`, and — crucially — sets the catalog
+> row's `content_id` from **`metadata.kid`** (lines 1106, 1117), with `extractCid`
+> (line 1140) mapping `tokenURI → CID` and a separate AuthorityGateway `sellersOf`/
+> `listings` query (selectors `0x997eab2d`/`0x6bd3a64b`) for price. So PC2 needs FOUR
+> sources to build one card. New `content-market` capsule inverts our own Day-62 calldata
+> instead: a PURE `reconstruct_listing` decodes `mint(string,uint16,bytes,bytes)` back into
+> a typed `ContentListingV1` — `content_id` = the `bytes16` that leads `opRawData`
+> (== the KID, no `metadata.json` round-trip needed), tokenURI, metadataCID via the same
+> `extractCid` rule, opType, and `(copies,price,payToken)` from `sellRawData`. Because our
+> mint is **self-describing**, one verifiable decode yields a complete listing — a genuine
+> architectural win over the 4-source indexer. It holds **no** chain RPC, **no** IPFS,
+> **no** keys and mints nothing; human-facing enrichment (title/poster/mime from
+> `metadata.json`, live event scanning) is NAMED (`ipfs-provider` + `chain-provider`) but
+> not performed — the "core injects capabilities" pattern. Fail-closed on a foreign
+> selector, truncated/overflowing offsets, a non-`bytes16` opRawData, a FREE-with-sale-terms
+> or PAID-without-terms mismatch, an unknown opType, or a bad channel. **Proof:** 13 tests
+> (free/paid/resell round-trips, content_id↔KID round-trip, 7 fail-closed cases,
+> `extractCid` fidelity) + `ddrm-market-smoke.sh` driving the REAL `publish → chain →
+> content-market` so the listing's `content_id` equals the contentId publish bound equals
+> `0x{KID}`. **Gate:** content-market=13, ladder INTACT (+wasm), drift PASS, market/publish/
+> producer/consumer smokes green, clippy clean. **Next:** metadata.json enrichment via
+> `ipfs-provider` (title/poster/mime), a live-Base event-scan path, or the live producer→
+> consumer round trip.
+>
 > **🔗 Day 63 — producer→chain loop closed end to end (Phase C, LANDED).**
 > Day 61 assembled the mint *intent*; Day 62 turned it into real calldata; Day 63 joins
 > them across real binaries so a sealed asset's identity becomes mint calldata in one hop.

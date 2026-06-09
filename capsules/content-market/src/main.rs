@@ -1,0 +1,667 @@
+//! ElastOS dDRM Content Market Capsule (Phase C, Day 64).
+//!
+//! The discovery step: it makes a published mint *findable*. It reconstructs a typed
+//! `ContentListingV1` PURELY from a content-mint's calldata — the inverse of
+//! `chain-provider::assemble_mint` (Day 62). It holds NO chain RPC, NO IPFS, and NO keys:
+//! it mints nothing and reads only the bytes it is handed, so a foreign or malformed call
+//! fails closed (no phantom listings).
+//!
+//! Why a decoder over calldata (and why this is *better* than the PC2 indexer): PC2's
+//! `ContentIndexerService` reconstructs a card from FOUR sources — the chain event
+//! (`AssetCreated`/`DigitalAssetRegistered`, tokenURI+opType), a `tokenURI()` eth_call,
+//! the `metadata.json` (where `content_id` is read from `metadata.kid`,
+//! `ContentIndexerService.ts:1106,1117`), and an AuthorityGateway `sellersOf`/`listings`
+//! price query. Our Day-62 mint calldata is SELF-DESCRIBING: it already carries the
+//! `bytes16 contentId`, the `tokenURI`, the `opType`, AND the sell terms in one verifiable
+//! artifact — so a single pure decode yields a complete listing whose `content_id`
+//! round-trips to the producer's KID. Human-facing fields (title, poster, mime) still need
+//! `metadata.json`; this capsule NAMES `ipfs-provider` + `chain-provider` for that
+//! enrichment but performs neither — the runtime's "core injects capabilities" pattern.
+//!
+//! Fidelity to PC2 (audited in `pc2-node/src/services/ContentIndexerService.ts`):
+//!   * the listing's content identity IS the KID (`content_id = metadata.kid`, line 1117) —
+//!     here read straight from the `bytes16 contentId` that leads `opRawData`;
+//!   * `tokenURI -> metadata CID` via the same `extractCid` rule (line 1140);
+//!   * `opType ∈ { FREE=0, BUY_ONCE=1, BUY_AND_RESELL=2 }`.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
+
+const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
+    Some(version) => version,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
+
+const LISTING_SCHEMA: &str = "elastos.market.listing/v1";
+/// The mint shape we invert (PC2 V3 Channel "Digital Asset").
+const MINT_FUNCTION: &str = "mint(string,uint16,bytes,bytes)";
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum Request {
+    Init {
+        #[serde(default)]
+        config: Value,
+    },
+    Status,
+    /// Reconstruct a `ContentListingV1` from a content-mint's calldata.
+    ReconstructListing {
+        request: Box<ReconstructRequestV1>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconstructRequestV1 {
+    /// The mint calldata (`0x` + 4-byte selector + ABI-encoded args) — exactly the `data`
+    /// field `chain-provider::assemble_mint` returns / the tx carries on-chain.
+    calldata: String,
+    /// The Channel contract the mint targets (the tx `to`).
+    channel_address: String,
+    #[serde(default = "default_chain_id")]
+    chain_id: u64,
+    /// Optional: if present, the calldata's leading 4-byte selector MUST match, else this
+    /// fails closed (it isn't the mint we know how to read).
+    #[serde(default)]
+    expected_selector: Option<String>,
+}
+
+fn default_chain_id() -> u64 {
+    8453 // Base mainnet (PC2 production)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Response {
+    Ok {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<Value>,
+    },
+    Error {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+    },
+}
+
+impl Response {
+    fn ok(data: Value) -> Self {
+        Response::Ok { data: Some(data) }
+    }
+
+    fn empty_ok() -> Self {
+        Response::Ok { data: None }
+    }
+
+    fn error(code: &str, message: impl Into<String>) -> Self {
+        Response::Error {
+            code: code.to_string(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ContentMarket;
+
+impl ContentMarket {
+    fn handle(&mut self, request: Request) -> Response {
+        match request {
+            Request::Init { config } => self.init(config),
+            Request::Status => self.status(),
+            Request::ReconstructListing { request } => self.reconstruct_listing(*request),
+            Request::Shutdown => Response::empty_ok(),
+        }
+    }
+
+    fn init(&mut self, _config: Value) -> Response {
+        Response::ok(json!({
+            "provider": "content-market",
+            "protocol_version": "1.0",
+            "configured": false,
+            "supported_operations": ["status", "reconstruct_listing"],
+        }))
+    }
+
+    fn status(&self) -> Response {
+        Response::ok(json!({
+            "provider": "content-market",
+            "version": PROVIDER_VERSION,
+            "configured": false,
+            "supported_operations": ["status", "reconstruct_listing"],
+            "decodes_function": MINT_FUNCTION,
+            "supported_op_types": ["free", "buy_once", "buy_and_resell"],
+            // The listing's identity IS the KID (== bytes16 contentId), no hash/truncation.
+            "content_id_rule": "bytes16 == 0x + lowercase(kid_hex[32])",
+            // content-market reconstructs a listing but holds no chain/IPFS/keys and mints
+            // nothing — discovery is read-only by construction.
+            "blocked_authority": [
+                "chain_rpc",
+                "ipfs",
+                "wallet_keys",
+                "private_key",
+                "mint",
+                "broadcast"
+            ],
+            // Human-facing enrichment (title/poster/mime from metadata.json, live event
+            // scanning) is delegated, not performed here.
+            "enrich_requires": ["ipfs-provider", "chain-provider"],
+        }))
+    }
+
+    /// Reconstruct the listing. Pure (no chain/IPFS I/O): decodes the mint calldata back
+    /// into a typed `ContentListingV1` whose `content_id` is the `bytes16` KID, closing
+    /// KID -> contentId -> listing as ONE identity. Fails closed on any malformed input.
+    fn reconstruct_listing(&self, request: ReconstructRequestV1) -> Response {
+        if let Err(err) = validate_eth_address(&request.channel_address, "channel_address") {
+            return Response::error("invalid_request", err);
+        }
+
+        let decoded = match decode_mint_calldata(&request.calldata, request.expected_selector.as_deref()) {
+            Ok(d) => d,
+            Err(err) => return Response::error("invalid_request", err),
+        };
+
+        let metadata_cid = extract_cid(&decoded.token_uri);
+
+        let mut listing = json!({
+            "schema": LISTING_SCHEMA,
+            // The producer's KID, carried on-chain as the bytes16 contentId.
+            "content_id": decoded.content_id,
+            "channel_address": request.channel_address,
+            "chain_id": request.chain_id,
+            "token_uri": decoded.token_uri,
+            "metadata_cid": metadata_cid,
+            "op_type": decoded.op_type_tag,
+            "op_type_code": decoded.op_type_code,
+            // Provenance: this listing was reconstructed from the mint calldata itself, not
+            // a trusted index — anyone holding the calldata can verify it.
+            "source": "mint_calldata",
+            "selector": decoded.selector,
+            // The crypto/identity fields are complete; the human-facing fields are not.
+            "metadata_status": "unresolved",
+            "enrich_requires": ["ipfs-provider", "chain-provider"],
+        });
+
+        if let Some(sell) = decoded.sell {
+            listing["copies"] = json!(sell.copies);
+            listing["price_wei"] = json!(sell.price_wei);
+            listing["pay_token"] = json!(sell.pay_token);
+        }
+
+        Response::ok(listing)
+    }
+}
+
+struct SellTerms {
+    copies: String,
+    price_wei: String,
+    pay_token: String,
+}
+
+struct DecodedMint {
+    selector: String,
+    token_uri: String,
+    op_type_code: u16,
+    op_type_tag: &'static str,
+    content_id: String,
+    sell: Option<SellTerms>,
+}
+
+/// Decode `mint(string _uri, uint16 opType, bytes opRawData, bytes sellRawData)` calldata
+/// back into its identity-bearing fields. The inverse of Day-62's `encode_mint_calldata`.
+/// Reads ONLY the leading `bytes16 contentId` of `opRawData` (which leads it in both the
+/// FREE and PAID encodings) and the `(copies, price, payToken)` of `sellRawData` — the
+/// payee/royalty arrays are not needed to identify a listing. Fails closed on any shape
+/// that isn't a well-formed mint.
+fn decode_mint_calldata(calldata: &str, expected_selector: Option<&str>) -> Result<DecodedMint, String> {
+    let bytes = hex_to_bytes(calldata)?;
+    if bytes.len() < 4 {
+        return Err("calldata too short for a 4-byte selector".to_string());
+    }
+    let selector = format!("0x{}", hex(&bytes[0..4]));
+    if let Some(expected) = expected_selector {
+        if !selector.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "selector {selector} does not match expected {expected} — not a known mint"
+            ));
+        }
+    }
+
+    let body = &bytes[4..];
+    // Head: 4 words — offset(_uri), opType, offset(opRawData), offset(sellRawData).
+    if body.len() < 4 * 32 {
+        return Err("calldata head truncated (expected 4 ABI words)".to_string());
+    }
+    let offset_uri = word_to_usize(word(body, 0))?;
+    let op_type_code = word_to_u16(word(body, 1))?;
+    let offset_op = word_to_usize(word(body, 2))?;
+    let offset_sell = word_to_usize(word(body, 3))?;
+
+    let token_uri = decode_abi_string(body, offset_uri)?;
+
+    // opRawData: a dynamic `bytes`. Its first 16 bytes are the left-aligned bytes16
+    // contentId (FREE: abi.encode(bytes16); PAID: the leading static head word).
+    let op_raw = decode_abi_bytes(body, offset_op)?;
+    if op_raw.len() < 32 {
+        return Err("opRawData too short to carry a bytes16 contentId".to_string());
+    }
+    let content_id = format!("0x{}", hex(&op_raw[0..16]));
+
+    // sellRawData: empty for FREE, else abi.encode(uint256 copies, uint256 price,
+    // address payToken). Enforce the op_type/sell consistency PC2 relies on.
+    let sell_raw = decode_abi_bytes(body, offset_sell)?;
+    let (op_type_tag, sell) = match op_type_code {
+        0 => {
+            if !sell_raw.is_empty() {
+                return Err("a FREE mint must carry empty sellRawData".to_string());
+            }
+            ("free", None)
+        }
+        1 | 2 => {
+            if sell_raw.len() < 96 {
+                return Err("a PAID mint must carry (copies, price, payToken)".to_string());
+            }
+            let copies = be_to_decimal(&sell_raw[0..32]);
+            let price_wei = be_to_decimal(&sell_raw[32..64]);
+            let pay_token = format!("0x{}", hex(&sell_raw[64 + 12..96]));
+            let tag = if op_type_code == 1 { "buy_once" } else { "buy_and_resell" };
+            (tag, Some(SellTerms { copies, price_wei, pay_token }))
+        }
+        other => return Err(format!("unknown opType {other} (expected 0, 1, or 2)")),
+    };
+
+    Ok(DecodedMint {
+        selector,
+        token_uri,
+        op_type_code,
+        op_type_tag,
+        content_id,
+        sell,
+    })
+}
+
+fn word(body: &[u8], index: usize) -> &[u8] {
+    &body[index * 32..index * 32 + 32]
+}
+
+/// A 32-byte word -> usize (offsets/lengths). The high 24 bytes MUST be zero; anything
+/// larger than a `usize` is a malformed/hostile offset and fails closed.
+fn word_to_usize(w: &[u8]) -> Result<usize, String> {
+    if w[..24].iter().any(|&b| b != 0) {
+        return Err("ABI offset/length exceeds addressable range".to_string());
+    }
+    let mut v = 0usize;
+    for &b in &w[24..32] {
+        v = v
+            .checked_mul(256)
+            .and_then(|x| x.checked_add(b as usize))
+            .ok_or("ABI offset/length overflow")?;
+    }
+    Ok(v)
+}
+
+fn word_to_u16(w: &[u8]) -> Result<u16, String> {
+    if w[..30].iter().any(|&b| b != 0) {
+        return Err("opType word is not a clean uint16".to_string());
+    }
+    Ok(((w[30] as u16) << 8) | w[31] as u16)
+}
+
+fn decode_abi_string(body: &[u8], offset: usize) -> Result<String, String> {
+    let raw = decode_abi_bytes(body, offset)?;
+    String::from_utf8(raw).map_err(|_| "tokenURI is not valid UTF-8".to_string())
+}
+
+/// Read a dynamic `bytes`/`string` at `offset`: a length word followed by `length` bytes.
+fn decode_abi_bytes(body: &[u8], offset: usize) -> Result<Vec<u8>, String> {
+    let len_end = offset
+        .checked_add(32)
+        .ok_or("ABI length offset overflow")?;
+    if len_end > body.len() {
+        return Err("ABI length word out of bounds".to_string());
+    }
+    let len = word_to_usize(&body[offset..len_end])?;
+    let data_end = len_end.checked_add(len).ok_or("ABI data overflow")?;
+    if data_end > body.len() {
+        return Err("ABI data out of bounds".to_string());
+    }
+    Ok(body[len_end..data_end].to_vec())
+}
+
+/// Big-endian bytes -> base-10 decimal string (handles full uint256 without precision loss).
+fn be_to_decimal(bytes: &[u8]) -> String {
+    let mut digits: Vec<u8> = vec![0]; // little-endian decimal digits
+    for &b in bytes {
+        let mut carry = b as u32;
+        for d in digits.iter_mut() {
+            let v = (*d as u32) * 256 + carry;
+            *d = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let s: String = digits.iter().rev().map(|d| (b'0' + d) as char).collect();
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `tokenURI` -> leading IPFS CID. Mirrors PC2 `extractCid` (ContentIndexerService.ts:1140):
+/// `ipfs://CID/...`, `.../ipfs/CID/...`, or a bare `Qm…`/`bafy…` path.
+fn extract_cid(uri: &str) -> Option<String> {
+    if let Some(rest) = uri.strip_prefix("ipfs://") {
+        return rest.split('/').next().filter(|s| !s.is_empty()).map(str::to_string);
+    }
+    if let Some(idx) = uri.find("/ipfs/") {
+        return uri[idx + 6..].split('/').next().filter(|s| !s.is_empty()).map(str::to_string);
+    }
+    if uri.starts_with("Qm") || uri.starts_with("bafy") {
+        return uri.split('/').next().filter(|s| !s.is_empty()).map(str::to_string);
+    }
+    None
+}
+
+fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let clean = s.strip_prefix("0x").unwrap_or(s);
+    if clean.len() % 2 != 0 {
+        return Err("calldata hex has an odd length".to_string());
+    }
+    if !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("calldata contains non-hex characters".to_string());
+    }
+    (0..clean.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn validate_eth_address(value: &str, field: &str) -> Result<(), String> {
+    let hex = value.strip_prefix("0x").unwrap_or("");
+    if value.starts_with("0x") && hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(format!("{field} must be a 0x-prefixed 20-byte address"))
+    }
+}
+
+fn main() {
+    eprintln!(
+        "content-market: starting v{} (mint -> listing reconstruction)",
+        PROVIDER_VERSION
+    );
+
+    let mut provider = ContentMarket;
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("content-market read error: {err}");
+                break;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = Response::error("invalid_request", err.to_string());
+                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
+        };
+        let is_shutdown = matches!(request, Request::Shutdown);
+        let response = provider.handle(request);
+        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        stdout.flush().unwrap();
+        if is_shutdown {
+            break;
+        }
+    }
+
+    eprintln!("content-market exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KID: &str = "38691296765e76a331f5d5630bddf9f5";
+    const CHANNEL: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+    const SELECTOR: &str = "0xaabbccdd";
+    const META_CID: &str = "QmMetaFolderCidV0";
+
+    fn ok_data(response: Response) -> Value {
+        match response {
+            Response::Ok { data: Some(data) } => data,
+            other => panic!("expected ok data, got {other:?}"),
+        }
+    }
+
+    fn error_code(response: Response) -> String {
+        match response {
+            Response::Error { code, .. } => code,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    // ── Minimal ABI tuple encoder (mirrors chain-provider's layout) so tests can build
+    // mint calldata to decode. The CROSS-BINARY smoke proves byte-compat with the real
+    // chain-provider encoder; here we just need a well-formed inverse to characterize.
+
+    fn pad_left_u64(n: u64) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[24..32].copy_from_slice(&n.to_be_bytes());
+        w
+    }
+
+    fn pad_left_u16(n: u16) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[30..32].copy_from_slice(&n.to_be_bytes());
+        w
+    }
+
+    fn bytes16_word(kid_hex: &str) -> Vec<u8> {
+        let raw = hex_to_bytes(kid_hex).unwrap();
+        let mut w = vec![0u8; 32];
+        w[0..16].copy_from_slice(&raw[0..16]); // left-aligned bytes16
+        w
+    }
+
+    fn address_word(addr: &str) -> Vec<u8> {
+        let raw = hex_to_bytes(addr).unwrap();
+        let mut w = vec![0u8; 32];
+        w[12..32].copy_from_slice(&raw);
+        w
+    }
+
+    fn dyn_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = pad_left_u64(payload.len() as u64);
+        out.extend_from_slice(payload);
+        let rem = payload.len() % 32;
+        if rem != 0 {
+            out.extend(std::iter::repeat(0u8).take(32 - rem));
+        }
+        out
+    }
+
+    /// Build mint(string,uint16,bytes,bytes) calldata. Dynamic args (string, opRaw, sell)
+    /// go in the tail; opType is the static head word.
+    fn build_mint(selector: &str, uri: &str, op_code: u16, op_raw: &[u8], sell_raw: &[u8]) -> String {
+        let sel = hex_to_bytes(selector).unwrap();
+        let uri_enc = dyn_bytes(uri.as_bytes());
+        let op_enc = dyn_bytes(op_raw);
+        let sell_enc = dyn_bytes(sell_raw);
+
+        let head = 4 * 32usize;
+        let off_uri = head;
+        let off_op = off_uri + uri_enc.len();
+        let off_sell = off_op + op_enc.len();
+
+        let mut body = Vec::new();
+        body.extend(pad_left_u64(off_uri as u64));
+        body.extend(pad_left_u16(op_code));
+        body.extend(pad_left_u64(off_op as u64));
+        body.extend(pad_left_u64(off_sell as u64));
+        body.extend(uri_enc);
+        body.extend(op_enc);
+        body.extend(sell_enc);
+
+        let mut all = sel;
+        all.extend(body);
+        format!("0x{}", hex(&all))
+    }
+
+    fn free_calldata() -> String {
+        build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), 0, &bytes16_word(KID), &[])
+    }
+
+    fn paid_calldata(op_code: u16) -> String {
+        let mut sell = pad_left_u64(100); // copies
+        sell.extend(be_decimal_to_word("1000000000000000000")); // price 1e18
+        sell.extend(address_word("0x0000000000000000000000000000000000000000")); // native
+        build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), op_code, &bytes16_word(KID), &sell)
+    }
+
+    fn be_decimal_to_word(dec: &str) -> Vec<u8> {
+        // Small helper: decimal string -> 32-byte big-endian word (test prices fit u128).
+        let n: u128 = dec.parse().unwrap();
+        let mut w = vec![0u8; 32];
+        w[16..32].copy_from_slice(&n.to_be_bytes());
+        w
+    }
+
+    fn reconstruct(calldata: &str, expected_selector: Option<&str>) -> Response {
+        let req = ReconstructRequestV1 {
+            calldata: calldata.to_string(),
+            channel_address: CHANNEL.to_string(),
+            chain_id: 8453,
+            expected_selector: expected_selector.map(str::to_string),
+        };
+        ContentMarket.reconstruct_listing(req)
+    }
+
+    #[test]
+    fn free_calldata_reconstructs_listing_with_kid_content_id() {
+        let data = ok_data(reconstruct(&free_calldata(), Some(SELECTOR)));
+        // The listing's identity IS the producer's KID, 16 bytes.
+        assert_eq!(data["content_id"], format!("0x{KID}"));
+        assert_eq!(data["op_type"], "free");
+        assert_eq!(data["token_uri"], format!("{META_CID}/metadata.json"));
+        assert_eq!(data["metadata_cid"], META_CID);
+        assert!(data["price_wei"].is_null());
+        assert_eq!(data["metadata_status"], "unresolved");
+    }
+
+    #[test]
+    fn paid_calldata_reconstructs_sell_terms() {
+        let data = ok_data(reconstruct(&paid_calldata(1), Some(SELECTOR)));
+        assert_eq!(data["content_id"], format!("0x{KID}"));
+        assert_eq!(data["op_type"], "buy_once");
+        assert_eq!(data["copies"], "100");
+        assert_eq!(data["price_wei"], "1000000000000000000");
+        assert_eq!(data["pay_token"], "0x0000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn buy_and_resell_op_type_is_recognized() {
+        let data = ok_data(reconstruct(&paid_calldata(2), Some(SELECTOR)));
+        assert_eq!(data["op_type"], "buy_and_resell");
+        assert_eq!(data["op_type_code"], 2);
+    }
+
+    #[test]
+    fn content_id_round_trips_to_the_producer_kid() {
+        // The whole point: KID -> contentId (publish) -> calldata (chain) -> listing.
+        let data = ok_data(reconstruct(&paid_calldata(1), None));
+        let id = data["content_id"].as_str().unwrap();
+        assert_eq!(id.strip_prefix("0x").unwrap(), KID);
+    }
+
+    #[test]
+    fn foreign_selector_fails_closed() {
+        assert_eq!(error_code(reconstruct(&free_calldata(), Some("0xdeadbeef"))), "invalid_request");
+    }
+
+    #[test]
+    fn truncated_calldata_fails_closed() {
+        assert_eq!(error_code(reconstruct("0xaabbccdd0011", Some(SELECTOR))), "invalid_request");
+    }
+
+    #[test]
+    fn free_with_sale_terms_fails_closed() {
+        // op_type FREE but a non-empty sellRawData is a malformed/foreign call.
+        let mut sell = pad_left_u64(1);
+        sell.extend(be_decimal_to_word("5"));
+        sell.extend(address_word("0x0000000000000000000000000000000000000000"));
+        let bad = build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), 0, &bytes16_word(KID), &sell);
+        assert_eq!(error_code(reconstruct(&bad, Some(SELECTOR))), "invalid_request");
+    }
+
+    #[test]
+    fn paid_without_sale_terms_fails_closed() {
+        let bad = build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), 1, &bytes16_word(KID), &[]);
+        assert_eq!(error_code(reconstruct(&bad, Some(SELECTOR))), "invalid_request");
+    }
+
+    #[test]
+    fn short_op_raw_without_bytes16_fails_closed() {
+        let bad = build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), 0, &[1, 2, 3, 4], &[]);
+        assert_eq!(error_code(reconstruct(&bad, Some(SELECTOR))), "invalid_request");
+    }
+
+    #[test]
+    fn unknown_op_type_fails_closed() {
+        let bad = build_mint(SELECTOR, &format!("{META_CID}/metadata.json"), 7, &bytes16_word(KID), &[]);
+        assert_eq!(error_code(reconstruct(&bad, Some(SELECTOR))), "invalid_request");
+    }
+
+    #[test]
+    fn bad_channel_address_fails_closed() {
+        let req = ReconstructRequestV1 {
+            calldata: free_calldata(),
+            channel_address: "not-an-address".to_string(),
+            chain_id: 8453,
+            expected_selector: Some(SELECTOR.to_string()),
+        };
+        assert_eq!(error_code(ContentMarket.reconstruct_listing(req)), "invalid_request");
+    }
+
+    #[test]
+    fn extract_cid_matches_pc2_rules() {
+        assert_eq!(extract_cid("QmAbc/metadata.json").as_deref(), Some("QmAbc"));
+        assert_eq!(extract_cid("ipfs://bafyXYZ/metadata.json").as_deref(), Some("bafyXYZ"));
+        assert_eq!(extract_cid("https://gw/ipfs/QmAbc/metadata.json").as_deref(), Some("QmAbc"));
+        assert_eq!(extract_cid("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn status_holds_no_authority_and_names_enrichers() {
+        let data = ok_data(ContentMarket.status());
+        let blocked = data["blocked_authority"].as_array().unwrap();
+        for must in ["chain_rpc", "ipfs", "wallet_keys", "mint", "broadcast"] {
+            assert!(blocked.iter().any(|v| v == must), "must block {must}");
+        }
+        assert_eq!(data["enrich_requires"][0], "ipfs-provider");
+        assert_eq!(data["enrich_requires"][1], "chain-provider");
+    }
+}
