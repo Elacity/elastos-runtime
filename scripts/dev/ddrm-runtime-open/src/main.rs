@@ -553,6 +553,10 @@ struct KeyOpenMaterial {
     aad_b64: String,
     content_hash_b64: String,
     nonce_b64: String,
+    /// 2-of-2 THRESHOLD (Day 99–100): node B's escrowed share. When present, the `KeyHandle` supplies
+    /// it in the `release` session context so the key-provider dual-recovers BOTH nodes. `None` for the
+    /// single-node rail.
+    wrapped_cek_share2_b64: Option<String>,
 }
 
 /// The durable PUBLISH-TIME escrow fixture: what the producer wrote when it escrowed the
@@ -566,14 +570,21 @@ struct PublishEscrow {
     producer_vk_b64: String,
     content_hash_b64: String,
     nonce_b64: String,
-    /// The recipient the CEK was escrowed to — checked against the relaunched authority's
-    /// published recipient to prove the authority identity is STABLE across processes.
+    /// The recipient the CEK (or, in the threshold case, share-1) was escrowed to — checked against
+    /// the relaunched authority's published recipient to prove the authority identity is STABLE.
     recipient_pub_b64: String,
+    /// 2-of-2 THRESHOLD (Day 99–100): node B's escrowed share-2 (`None` for the single-node rail).
+    /// The CEK was XOR-split at publish (`split_cek_xor`); share-1 rides `wrapped_cek_b64` (escrowed to
+    /// node A), share-2 rides this (escrowed to node B's recipient).
+    wrapped_cek_share2_b64: Option<String>,
+    /// Node B's published verifying key — the decrypt boundary needs it (`authority_vk2_b64`) to
+    /// unwrap share-2 in-VM. `None` for the single-node rail.
+    vk2_b64: Option<String>,
 }
 
 impl PublishEscrow {
     fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "schema": "elastos.publish.escrow.fixture/v1",
             "kid_hex": self.kid_hex,
             "wrapped_cek_b64": self.wrapped_cek_b64,
@@ -581,7 +592,14 @@ impl PublishEscrow {
             "content_hash_b64": self.content_hash_b64,
             "nonce_b64": self.nonce_b64,
             "recipient_pub_b64": self.recipient_pub_b64,
-        })
+        });
+        if let Some(share2) = &self.wrapped_cek_share2_b64 {
+            v["wrapped_cek_share2_b64"] = json!(share2);
+        }
+        if let Some(vk2) = &self.vk2_b64 {
+            v["vk2_b64"] = json!(vk2);
+        }
+        v
     }
 
     fn from_json(v: &Value) -> Result<Self, String> {
@@ -591,7 +609,10 @@ impl PublishEscrow {
                 .map(str::to_string)
                 .ok_or_else(|| format!("publish escrow fixture is missing `{k}`"))
         };
+        let opt = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         Ok(Self {
+            wrapped_cek_share2_b64: opt("wrapped_cek_share2_b64"),
+            vk2_b64: opt("vk2_b64"),
             kid_hex: field("kid_hex")?,
             wrapped_cek_b64: field("wrapped_cek_b64")?,
             producer_vk_b64: field("producer_vk_b64")?,
@@ -602,11 +623,56 @@ impl PublishEscrow {
     }
 }
 
+/// Provision ONE secret-holding dKMS node: spawn it on its node-local master store, read back its
+/// PUBLISHED identity (vk + escrow recipient), and shut the provisioning child down (the long-lived
+/// daemon is started separately). The MASTER stays in `store_path` — the runtime created it via the
+/// node but NEVER reads it. Returns the node's `(verifying_key_b64, recipient_pub_b64)` pins.
+fn provision_dkms_node(node_bin: &str, store_path: &str) -> Result<(String, String), String> {
+    let mut node = Capsule::spawn("dkms-authority(provision)", node_bin)?;
+    let init = ok_data(
+        &node.call(&json!({ "op": "init", "config": { "authority_key_store": store_path } }))?,
+        "dkms-authority init (provision)",
+    )?;
+    let vk = init["seal_verifying_key_b64"].as_str()
+        .ok_or("dkms-authority node did not publish a verifying key")?
+        .to_string();
+    let recipient = init["seal_recipient_pub_b64"].as_str()
+        .ok_or("dkms-authority node did not publish a recipient key")?
+        .to_string();
+    node.shutdown();
+    Ok((vk, recipient))
+}
+
+/// Seal `share` (the whole CEK in the single-node case, or one XOR share in the threshold case) to a
+/// node's published recipient under the SHARED escrow AAD `(suite ‖ kid16 ‖ recipient_pub)` — exactly
+/// what that node will recompute + unseal in its own boundary. The producer signs it; the runtime
+/// only ever holds the SEALED bytes.
+fn escrow_share_to_recipient(
+    recipient_pub_b64: &str,
+    share: &[u8],
+    kid16: &[u8; 16],
+    producer_signer: &ddrm_envelope::seal::MlDsaSealSigner,
+) -> Result<String, String> {
+    let recipient_bytes = B64.decode(recipient_pub_b64).map_err(|e| e.to_string())?;
+    let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_bytes)
+        .ok_or("authority published a malformed escrow recipient key")?;
+    let escrow = escrow_aad(SUITE_PQ_HYBRID, kid16, &recipient_bytes);
+    Ok(B64.encode(
+        ddrm_envelope::seal::seal_bound(&recipient_public, share, &escrow, producer_signer).to_bytes(),
+    ))
+}
+
 /// PUBLISH-TIME escrow (the producer role, run ONCE before any open): bring the
 /// durable-key-store authority up, read its STABLE published recipient, escrow the content
 /// CEK to it under the shared escrow AAD, and write a durable publish fixture. Mirrors PC2
 /// escrowing the CEK to the stable `DEFAULT_AUTHORITY` at encode time (`dashPackager.ts`
 /// `encryptMediaCEK`). After this, the open path NEVER escrows — it reads the fixture.
+///
+/// 2-of-2 THRESHOLD (Day 99–100): when `threshold` is set (dkms only), TWO secret-holding nodes are
+/// provisioned (distinct stores/sockets), the CEK is XOR-split (`split_cek_xor`) so node A escrows
+/// share-1 and node B escrows share-2 — NEITHER node ever sees the whole CEK — and the published
+/// descriptor carries a `threshold` block (`t:2`, both nodes) the key-provider resolves into a
+/// dual-recover rail. The fixture then also carries `wrapped_cek_share2_b64` + node B's `vk2_b64`.
 #[allow(clippy::too_many_arguments)]
 fn publish_escrow(
     key_bin: &str,
@@ -617,6 +683,9 @@ fn publish_escrow(
     dkms_node_bin: Option<&str>,
     node_store_path: &str,
     node_endpoint: &str,
+    threshold: bool,
+    node2_store_path: &str,
+    node2_endpoint: &str,
 ) -> Result<PublishEscrow, String> {
     // PROVISION the selected authority and read its PUBLISHED identity (stable vk + recipient).
     //
@@ -627,7 +696,9 @@ fn publish_escrow(
     // then publish a PUBLIC-ONLY descriptor (the node's pins + endpoint, NO master) the runtime later
     // RESOLVES. The master NEVER enters the runtime. The analogue of provisioning a dKMS node + its
     // published authority pubkey (PC2 holds only the public `pkpId`/`authority`, `chipotle-client.ts`).
-    let (_verifying_key_b64, recipient_pub_b64) = match backend {
+    //
+    // `(node_b_vk, node_b_recipient)` is populated only for a 2-of-2 threshold provisioning.
+    let (recipient_pub_b64, node_b): (String, Option<(String, String)>) = match backend {
         AuthorityBackend::Reference => {
             let mut key = Capsule::spawn("key-provider(publish)", key_bin)?;
             let init = ok_data(
@@ -637,61 +708,79 @@ fn publish_escrow(
                 }))?,
                 "key init (publish)",
             )?;
-            let vk = init["seal_verifying_key_b64"].as_str()
-                .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?
-                .to_string();
+            init["seal_verifying_key_b64"].as_str()
+                .ok_or("key-provider did not publish a seal verifying key (build with --features key-authority-ref)")?;
             let recipient = init["seal_recipient_pub_b64"].as_str()
                 .ok_or("key-provider did not publish an escrow recipient key (build with --features key-authority-ref)")?
                 .to_string();
             key.shutdown();
-            (vk, recipient)
+            (recipient, None)
         }
         AuthorityBackend::Dkms => {
             let node_bin = dkms_node_bin.ok_or("dkms backend requires a dkms_authority_bin in the config")?;
-            let mut node = Capsule::spawn("dkms-authority(provision)", node_bin)?;
-            let init = ok_data(
-                &node.call(&json!({
-                    "op": "init",
-                    "config": { "authority_key_store": node_store_path }
-                }))?,
-                "dkms-authority init (provision)",
-            )?;
-            let vk = init["seal_verifying_key_b64"].as_str()
-                .ok_or("dkms-authority node did not publish a verifying key")?
-                .to_string();
-            let recipient = init["seal_recipient_pub_b64"].as_str()
-                .ok_or("dkms-authority node did not publish a recipient key")?
-                .to_string();
-            node.shutdown();
-            // Publish the PUBLIC-ONLY descriptor — pins + endpoint, NOTHING secret. The endpoint is
-            // the node's listening SOCKET PATH (the client CONNECTS, it does not spawn the node). The
-            // master lives ONLY in `node_store_path` (which this runtime created via the node but
-            // never reads).
-            let descriptor = json!({
+            // Node A — the single-node rail's node, and the FIRST threshold node.
+            let (vk_a, recipient_a) = provision_dkms_node(node_bin, node_store_path)?;
+            // Node B — provisioned ONLY for a 2-of-2 threshold, with its OWN node-local store.
+            let node_b = if threshold {
+                let (vk_b, recipient_b) = provision_dkms_node(node_bin, node2_store_path)?;
+                if vk_b == vk_a {
+                    return Err("the two dkms nodes derived the SAME identity — a 2-of-2 split needs two DISTINCT secret-holders".to_string());
+                }
+                Some((vk_b, recipient_b))
+            } else {
+                None
+            };
+            // Publish the PUBLIC-ONLY descriptor — pins + endpoint, NOTHING secret. For threshold, ALSO
+            // carry a `threshold` block (`t:2`, both nodes' public identities) the key-provider resolves
+            // into a dual-recover rail. The masters live ONLY in the node stores (never read here).
+            let mut descriptor = json!({
                 "schema": "elastos.dkms.authority/v2",
-                "verifying_key_b64": vk,
-                "recipient_pub_b64": recipient,
+                "verifying_key_b64": vk_a,
+                "recipient_pub_b64": recipient_a,
                 "authority_endpoint": node_endpoint,
             });
+            if let Some((vk_b, recipient_b)) = &node_b {
+                descriptor["threshold"] = json!({
+                    "t": 2,
+                    "nodes": [
+                        { "verifying_key_b64": vk_a, "recipient_pub_b64": recipient_a, "authority_endpoint": node_endpoint },
+                        { "verifying_key_b64": vk_b, "recipient_pub_b64": recipient_b, "authority_endpoint": node2_endpoint },
+                    ],
+                });
+            }
             let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|e| e.to_string())?;
             std::fs::write(descriptor_path, bytes)
                 .map_err(|e| format!("write dkms authority descriptor: {e}"))?;
-            (vk, recipient)
+            (recipient_a, node_b)
         }
     };
 
-    let recipient_pub_bytes = B64.decode(&recipient_pub_b64).map_err(|e| e.to_string())?;
-    let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub_bytes)
-        .ok_or("key-provider published a malformed escrow recipient key")?;
     let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
     let cek_bytes = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
     let kid16 = [0xC5u8; 16];
     let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
-    let escrow = escrow_aad(SUITE_PQ_HYBRID, &kid16, &recipient_pub_bytes);
-    let wrapped_cek_b64 = B64.encode(
-        ddrm_envelope::seal::seal_bound(&recipient_public, &cek_bytes, &escrow, &producer_signer)
-            .to_bytes(),
-    );
+
+    // SINGLE NODE: escrow the WHOLE CEK to the authority's recipient. THRESHOLD: XOR-split the CEK and
+    // escrow share-1 to node A + share-2 to node B's recipient (neither node ever sees the whole key).
+    let (wrapped_cek_b64, wrapped_cek_share2_b64, vk2_b64) = match &node_b {
+        None => (
+            escrow_share_to_recipient(&recipient_pub_b64, &cek_bytes, &kid16, &producer_signer)?,
+            None,
+            None,
+        ),
+        Some((vk_b, recipient_b)) => {
+            // A uniform random mask hides the CEK information-theoretically in either share alone.
+            let seed = ddrm_envelope::random_seed();
+            let mask: Vec<u8> = seed.iter().copied().take(cek_bytes.len()).collect();
+            let (share1, share2) = ddrm_envelope::split_cek_xor(&cek_bytes, &mask)?;
+            (
+                escrow_share_to_recipient(&recipient_pub_b64, &share1, &kid16, &producer_signer)?,
+                Some(escrow_share_to_recipient(recipient_b, &share2, &kid16, &producer_signer)?),
+                Some(vk_b.clone()),
+            )
+        }
+    };
+
     let content_hash = b"consumer-smoke-content-hash-0001".to_vec(); // 32 bytes
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let fixture = PublishEscrow {
@@ -701,6 +790,8 @@ fn publish_escrow(
         content_hash_b64: B64.encode(&content_hash),
         nonce_b64: B64.encode(&nonce),
         recipient_pub_b64,
+        wrapped_cek_share2_b64,
+        vk2_b64,
     };
     let bytes = serde_json::to_vec_pretty(&fixture.to_json()).map_err(|e| e.to_string())?;
     std::fs::write(fixture_path, bytes).map_err(|e| format!("write publish fixture: {e}"))?;
@@ -1256,21 +1347,28 @@ impl ProviderHandle for KeyHandle {
             .ok_or("key transport opened before the runtime bound its session material")?;
         let mut request = key_release_request_base(&m.kid_hex, &m.wrapped_cek_b64);
         thread_into(&mut request, inputs);
+        // The runtime-injected session context. 2-of-2 THRESHOLD: when node B's escrowed share-2 is
+        // bound, supply it as `wrapped_cek_share2_b64` so the key-provider dual-recovers BOTH nodes —
+        // the key-provider NEVER reconstructs the CEK; it only welds two re-sealed shares.
+        let mut session_ctx = json!({
+            "decrypt_session_pub_b64": m.session_pub_b64,
+            "producer_vk_b64": m.producer_vk_b64,
+            "aad_b64": m.aad_b64,
+            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            "content_hash_b64": m.content_hash_b64,
+            "nonce_b64": m.nonce_b64,
+            "now_unix": NOW_UNIX,
+        });
+        if let Some(share2) = &m.wrapped_cek_share2_b64 {
+            session_ctx["wrapped_cek_share2_b64"] = json!(share2);
+        }
         let mut guard = self.key.borrow_mut();
         let key = guard.as_mut().ok_or("key capsule was already torn down")?;
         let release = ok_data(
             &key.call(&json!({
                 "op": "release",
                 "request": request,
-                "session": {
-                    "decrypt_session_pub_b64": m.session_pub_b64,
-                    "producer_vk_b64": m.producer_vk_b64,
-                    "aad_b64": m.aad_b64,
-                    "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-                    "content_hash_b64": m.content_hash_b64,
-                    "nonce_b64": m.nonce_b64,
-                    "now_unix": NOW_UNIX,
-                }
+                "session": session_ctx,
             }))?,
             "key release",
         )?;
@@ -1285,6 +1383,11 @@ impl ProviderHandle for KeyHandle {
         }
         if release_str.contains(&m.wrapped_cek_b64) {
             return Err("the producer escrow blob was echoed by the key authority".to_string());
+        }
+        if let Some(share2) = &m.wrapped_cek_share2_b64 {
+            if release_str.contains(share2) {
+                return Err("the second share escrow blob was echoed by the key authority".to_string());
+            }
         }
         Ok(BTreeMap::from([
             ("ReleaseReceiptV1".to_string(), release_receipt_json()),
@@ -1522,6 +1625,9 @@ struct DecryptLauncher {
     decrypt_bin: String,
     cell: Rc<RefCell<Option<Capsule>>>,
     rail: Rc<RefCell<RailMaterial>>,
+    /// 2-of-2 THRESHOLD: node B's verifying key (`authority_vk2_b64`), so the boundary can unwrap the
+    /// second sealed share in-VM. `None` for the single-node rail.
+    authority_vk2_b64: Option<String>,
 }
 
 impl ProviderLauncher for DecryptLauncher {
@@ -1536,8 +1642,15 @@ impl ProviderLauncher for DecryptLauncher {
             .clone()
             .ok_or("decrypt launched before the key authority published its verifying key")?;
         let mut decrypt = Capsule::spawn("decrypt-provider", &self.decrypt_bin)?;
+        // The boundary trusts node A's vk (`authority_vk_b64`); for 2-of-2 it ALSO trusts node B's vk
+        // (`authority_vk2_b64`) to unwrap share-2 — both sealed shares are unwrapped + XOR-combined
+        // ONLY inside this boundary (the CEK never exists whole before here).
+        let mut init_config = json!({ "authority_vk_b64": vk_b64 });
+        if let Some(vk2) = &self.authority_vk2_b64 {
+            init_config["authority_vk2_b64"] = json!(vk2);
+        }
         let init = ok_data(
-            &decrypt.call(&json!({ "op": "init", "config": { "authority_vk_b64": vk_b64 } }))?,
+            &decrypt.call(&json!({ "op": "init", "config": init_config }))?,
             "decrypt init",
         )?;
         let session_pub_b64 = init["decrypt_session_public_key_b64"]
@@ -1646,6 +1759,15 @@ struct OpenConfig {
     /// `authority.backend == dkms`: the publish phase provisions it (master stays in the node) and
     /// the runtime delegates recovery to it. Absent for `reference`.
     dkms_authority_bin: Option<String>,
+    /// 2-of-2 THRESHOLD (Day 99–100): when `authority.threshold == true`, the runtime provisions a
+    /// SECOND secret-holding node (its own store/socket/allow-list), XOR-splits the CEK at publish so
+    /// each node escrows only ONE share, publishes a `threshold` descriptor (both nodes), and the
+    /// `DrmHost` run-path drives the full 2-of-2 release + decrypt — the CEK is never whole before the
+    /// decrypt boundary. Requires `backend == dkms` (an external secret-holding authority); fail-closed
+    /// otherwise. We provision BOTH nodes from the SAME node binary, so this is a boolean knob rather
+    /// than a handed-in node-B descriptor path: the descriptor's `threshold` block is what the
+    /// key-provider consumes, and the runtime owns producing it.
+    threshold: bool,
 }
 
 impl OpenConfig {
@@ -1663,11 +1785,11 @@ impl OpenConfig {
             "verify" => OpenMode::Verify,
             other => return Err(format!("config `mode` must be \"open\" or \"verify\", got {other:?}")),
         };
-        // `authority` is an OBJECT (room to carry per-backend descriptors later); today only its
-        // `backend` tag is read. Absent → reference (back-compat). Fail-closed on an unknown tag or
-        // a non-object `authority`.
-        let (authority, dkms_authority_bin) = match obj.get("authority") {
-            None => (AuthorityBackend::Reference, None),
+        // `authority` is an OBJECT (room to carry per-backend descriptors later); today its
+        // `backend` tag + (for dkms) the node binary + an optional `threshold` flag are read.
+        // Absent → reference (back-compat). Fail-closed on an unknown tag or a non-object `authority`.
+        let (authority, dkms_authority_bin, threshold) = match obj.get("authority") {
+            None => (AuthorityBackend::Reference, None, false),
             Some(Value::Object(auth)) => {
                 let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
                     "reference" => AuthorityBackend::Reference,
@@ -1678,7 +1800,18 @@ impl OpenConfig {
                 if backend == AuthorityBackend::Dkms && node_bin.as_deref().map(str::trim).unwrap_or("").is_empty() {
                     return Err("config `authority.dkms_authority_bin` is required when authority.backend is \"dkms\"".to_string());
                 }
-                (backend, node_bin)
+                let threshold = match auth.get("threshold") {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return Err("config `authority.threshold` must be a boolean".to_string()),
+                };
+                // 2-of-2 threshold needs an EXTERNAL secret-holding authority (two nodes). It is
+                // meaningless for the in-runtime `reference` authority (which holds the master itself),
+                // so fail closed rather than silently ignore the request.
+                if threshold && backend != AuthorityBackend::Dkms {
+                    return Err("config `authority.threshold` requires `authority.backend` == \"dkms\" (an external secret-holding authority)".to_string());
+                }
+                (backend, node_bin, threshold)
             }
             Some(_) => return Err("config `authority` must be an object".to_string()),
         };
@@ -1693,6 +1826,7 @@ impl OpenConfig {
             mode,
             authority,
             dkms_authority_bin,
+            threshold,
         })
     }
 }
@@ -1731,6 +1865,10 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // The node's listening SOCKET PATH — the runtime CONNECTS here (it does not own the node's
     // process). Published as the descriptor `authority_endpoint`.
     let node_sock_path = work_dir.join("dkms-authority.sock").to_string_lossy().into_owned();
+    // 2-of-2 THRESHOLD (Day 99–100): node B's OWN node-local master store + listening socket (distinct
+    // from node A's). Used only when `cfg.threshold` — each node holds ONLY its own share.
+    let node2_store_path = work_dir.join("dkms-node-b-master.json").to_string_lossy().into_owned();
+    let node2_sock_path = work_dir.join("dkms-authority-b.sock").to_string_lossy().into_owned();
     // The runtime's OWN stable caller identity (Day 95–96): a per-run seed → a KNOWN ML-DSA identity
     // the node's allow-list recognizes. The same seed is handed to the key-provider (so the RAIL
     // connects as this known caller) AND to the adversarial probe (so its happy path is allow-listed);
@@ -1754,6 +1892,9 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         cfg.dkms_authority_bin.as_deref(),
         &node_store_path,
         &node_sock_path,
+        cfg.threshold,
+        &node2_store_path,
+        &node2_sock_path,
     )?;
     // For `dkms`, START the external NODE DAEMON listening on its socket BEFORE the rail comes up, so
     // the key-provider can CONNECT to it (rather than spawn it). The guard kills + reaps it on any
@@ -1766,6 +1907,17 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         // Provision the daemon's KNOWN-caller allow-list with the runtime's caller identity, so only
         // this runtime (the key-provider rail + the probe, both deriving the same identity) is served.
         Some(start_dkms_daemon(node_bin, &node_sock_path, &node_store_path, &caller_vk_b64)?)
+    } else {
+        None
+    };
+    // 2-of-2 THRESHOLD: ALSO start node B's daemon (its own store/socket, the SAME known caller
+    // allow-listed) so the key-provider's dual-recover can reach BOTH secret-holders.
+    let _dkms_daemon_b = if cfg.authority == AuthorityBackend::Dkms && cfg.threshold {
+        let node_bin = cfg
+            .dkms_authority_bin
+            .as_deref()
+            .ok_or("dkms threshold requires a dkms_authority_bin in the config")?;
+        Some(start_dkms_daemon(node_bin, &node2_sock_path, &node2_store_path, &caller_vk_b64)?)
     } else {
         None
     };
@@ -1796,6 +1948,17 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 || desc.get("authority_endpoint").and_then(Value::as_str).is_none()
             {
                 return Err("the dkms descriptor is not a complete PUBLIC-ONLY descriptor (need vk + recipient + endpoint)".to_string());
+            }
+            // THRESHOLD consistency: a threshold open MUST publish a `threshold` block (the key-provider
+            // resolves two nodes from it); a single-node open MUST NOT (else the key-provider would
+            // dual-recover but the runtime supplies only one share). Fail closed on a mismatch so a
+            // config/descriptor desync can never silently degrade the guarantee.
+            let has_threshold = desc.get("threshold").is_some();
+            if cfg.threshold && !has_threshold {
+                return Err("authority.threshold is set but the published descriptor carries no `threshold` block".to_string());
+            }
+            if !cfg.threshold && has_threshold {
+                return Err("the published descriptor carries a `threshold` block but authority.threshold is not set".to_string());
             }
             Some(bytes)
         }
@@ -1844,6 +2007,9 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 decrypt_bin: decrypt_bin.clone(),
                 cell: decrypt_cell.clone(),
                 rail: rail.clone(),
+                // 2-of-2 THRESHOLD: the boundary needs node B's vk to unwrap share-2 in-VM
+                // (`authority_vk2_b64`). `None` for the single-node rail.
+                authority_vk2_b64: escrow.vk2_b64.clone(),
             }),
             Box::new(RightsLauncher {
                 rights_bin: rights_bin.cloned(),
@@ -1904,8 +2070,14 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         aad_b64: B64.encode(&aad),
         content_hash_b64: fixture.content_hash_b64.clone(),
         nonce_b64: fixture.nonce_b64.clone(),
+        // 2-of-2 THRESHOLD: node B's escrowed share-2 (from the publish fixture); the key-provider
+        // dual-recovers BOTH nodes when present. `None` for the single-node rail.
+        wrapped_cek_share2_b64: fixture.wrapped_cek_share2_b64.clone(),
     });
-    step(3, "runtime-core host: authority recipient STABLE across relaunch; bound key material from the publish fixture + the per-open session key");
+    step(3, &format!(
+        "runtime-core host: authority recipient STABLE across relaunch; bound key material from the publish fixture + the per-open session key{}",
+        if cfg.threshold { " (2-of-2 threshold: BOTH share escrows bound, neither node holds the whole CEK)" } else { "" },
+    ));
 
     // --- the trusted host owns the open end to end ---
     let report = host.open(&cid(), VIEWER)?;
@@ -1972,6 +2144,21 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         .as_object_mut()
         .expect("key release request is an object")
         .insert("rights_receipt".to_string(), fallback_rights_receipt());
+    let mut bad_session = json!({
+        "decrypt_session_pub_b64": session_pub_b64,
+        "producer_vk_b64": producer_vk_b64,
+        "aad_b64": B64.encode(&bad_aad),
+        "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+        "content_hash_b64": B64.encode(&content_hash),
+        "nonce_b64": B64.encode(&nonce),
+        "now_unix": NOW_UNIX,
+    });
+    // THRESHOLD: the live key capsule has TWO nodes provisioned, so a release must supply share-2 or
+    // it fails closed for the WRONG reason — here we want the release to SUCCEED (re-sealing BOTH
+    // shares to the bad transcript) and the DECRYPT to be the thing that fails closed.
+    if let Some(share2) = &escrow.wrapped_cek_share2_b64 {
+        bad_session["wrapped_cek_share2_b64"] = json!(share2);
+    }
     let bad_release = ok_data(
         &key_cell
             .borrow_mut()
@@ -1980,15 +2167,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             .call(&json!({
                 "op": "release",
                 "request": bad_req,
-                "session": {
-                    "decrypt_session_pub_b64": session_pub_b64,
-                    "producer_vk_b64": producer_vk_b64,
-                    "aad_b64": B64.encode(&bad_aad),
-                    "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
-                    "content_hash_b64": B64.encode(&content_hash),
-                    "nonce_b64": B64.encode(&nonce),
-                    "now_unix": NOW_UNIX,
-                }
+                "session": bad_session,
             }))?,
         "key release (mismatch)",
     )?;
@@ -2028,6 +2207,80 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     }
     if DurableEventStore::load(&receipts_dir)?.len() != persisted_before {
         return Err("a failed open must persist no runtime-event record".to_string());
+    }
+
+    // --- fail-closed #3 + #4 (THRESHOLD wiring, Day 99–100): only when this run is a 2-of-2 rail.
+    if cfg.threshold {
+        // #3: the live THRESHOLD key capsule (two nodes provisioned) must REFUSE a release that omits
+        // the second share — it must never silently degrade to a one-node recover. Drive the live key
+        // capsule directly with a well-formed, correctly-bound release whose session DROPS
+        // `wrapped_cek_share2_b64`; the real key-provider fails closed.
+        let mut single_req = key_release_request_base(&kid_hex, &wrapped_cek_b64);
+        single_req
+            .as_object_mut()
+            .expect("key release request is an object")
+            .insert("rights_receipt".to_string(), fallback_rights_receipt());
+        let single_resp = key_cell
+            .borrow_mut()
+            .as_mut()
+            .ok_or("key capsule torn down before the threshold single-share gate")?
+            .call(&json!({
+                "op": "release",
+                "request": single_req,
+                "session": {
+                    "decrypt_session_pub_b64": session_pub_b64,
+                    "producer_vk_b64": producer_vk_b64,
+                    "aad_b64": B64.encode(&aad),
+                    "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                    "content_hash_b64": B64.encode(&content_hash),
+                    "nonce_b64": B64.encode(&nonce),
+                    "now_unix": NOW_UNIX,
+                    // NOTE: no `wrapped_cek_share2_b64` — the threshold rail must refuse this.
+                }
+            }))?;
+        if single_resp.get("status").and_then(Value::as_str) != Some("error") {
+            return Err(format!(
+                "the threshold key authority opened with only ONE share — it must fail closed without the second: {single_resp}"
+            ));
+        }
+        step(21, "key-provider (2-of-2): a release supplying only ONE share failed closed — the threshold rail refuses to degrade to a single node");
+
+        // #4: a fresh key capsule whose dkms descriptor requests an UNIMPLEMENTED threshold shape
+        // (3-of-N) must FAIL CLOSED at init — the runtime never silently downgrades a stronger
+        // threshold to what it can do. Cross-binary against the real key binary.
+        let bad_desc_path = work_dir.join("dkms-authority-3ofN.json");
+        let bad_desc = json!({
+            "schema": "elastos.dkms.authority/v2",
+            "verifying_key_b64": "AAAA",
+            "recipient_pub_b64": "BBBB",
+            "authority_endpoint": node_sock_path,
+            "threshold": {
+                "t": 3,
+                "nodes": [
+                    { "verifying_key_b64": "AAAA", "recipient_pub_b64": "BBBB", "authority_endpoint": node_sock_path },
+                    { "verifying_key_b64": "CCCC", "recipient_pub_b64": "DDDD", "authority_endpoint": node2_sock_path },
+                    { "verifying_key_b64": "EEEE", "recipient_pub_b64": "FFFF", "authority_endpoint": node_sock_path },
+                ],
+            },
+        });
+        std::fs::write(&bad_desc_path, serde_json::to_vec_pretty(&bad_desc).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("write 3-of-N descriptor: {e}"))?;
+        let mut fresh_key = Capsule::spawn("key-provider(3-of-N gate)", key_bin)?;
+        let init_resp = fresh_key.call(&json!({
+            "op": "init",
+            "config": {
+                "backend": "dkms",
+                "dkms_authority_descriptor": bad_desc_path.to_string_lossy(),
+                "dkms_caller_seed_b64": caller_seed_b64,
+            }
+        }))?;
+        fresh_key.shutdown();
+        if init_resp.get("status").and_then(Value::as_str) != Some("error") {
+            return Err(format!(
+                "a 3-of-N threshold descriptor must fail closed at key-provider init (only 2-of-2 is implemented): {init_resp}"
+            ));
+        }
+        step(22, "key-provider (2-of-2): a 3-of-N threshold descriptor failed closed at init — the runtime never silently downgrades a stronger threshold");
     }
     } // end verify-only adversarial gates
 
@@ -2191,6 +2444,52 @@ mod config_tests {
         let err = OpenConfig::from_json(&dkms)
             .expect_err("dkms without a node binary must fail closed");
         assert!(err.contains("dkms_authority_bin"), "the error names the missing field: {err}");
+    }
+
+    #[test]
+    fn threshold_parses_for_dkms_and_defaults_off() {
+        let base = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        // Default: no threshold.
+        assert!(!OpenConfig::from_json(&base).unwrap().threshold);
+
+        // dkms + threshold:true parses.
+        let mut thr = base.clone();
+        thr.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node", "threshold": true }),
+        );
+        let parsed = OpenConfig::from_json(&thr).unwrap();
+        assert!(parsed.threshold && parsed.authority == AuthorityBackend::Dkms);
+
+        // dkms + threshold:false is explicit single-node.
+        let mut single = base.clone();
+        single.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node", "threshold": false }),
+        );
+        assert!(!OpenConfig::from_json(&single).unwrap().threshold);
+    }
+
+    #[test]
+    fn threshold_requires_dkms_and_a_boolean() {
+        // threshold on the reference backend fails closed (no external secret-holders to split across).
+        let mut ref_thr = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        ref_thr.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "reference", "threshold": true }),
+        );
+        let err = OpenConfig::from_json(&ref_thr).expect_err("threshold needs dkms");
+        assert!(err.contains("threshold"), "the error names the bad field: {err}");
+
+        // A non-boolean threshold fails closed.
+        let mut bad = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        bad.as_object_mut().unwrap().insert(
+            "authority".into(),
+            json!({ "backend": "dkms", "dkms_authority_bin": "/node", "threshold": "yes" }),
+        );
+        assert!(OpenConfig::from_json(&bad)
+            .expect_err("a non-boolean threshold must fail closed")
+            .contains("threshold"));
     }
 
     #[test]

@@ -1469,15 +1469,23 @@ fn build_dkms_client(
 /// identical (not a real split), or the two nodes disagree on the content/transcript binding (a sign
 /// one node sealed for a different object). NO XOR happens here — `key-provider` never holds the CEK.
 #[cfg(all(feature = "key-authority-ref", unix))]
-fn merge_threshold_material(material_a: Value, material_b: &Value) -> Result<Value, String> {
-    let share1 = material_a
-        .get("sealed_cek_b64")
+fn merge_threshold_material(mut data_a: Value, data_b: &Value) -> Result<Value, String> {
+    // Each node returns its full recover `data` — `{ suite, material: { sealed_cek_b64, ... }, ... }`
+    // — so the sealed share + content binding live INSIDE the nested `material` object. Node A's `data`
+    // is the base (its `material` carries share-1 as `sealed_cek_b64`); node B contributes ONLY its
+    // re-sealed share-2, welded into node A's `material.sealed_cek_share2_b64`.
+    let share1 = data_a
+        .get("material")
+        .and_then(|m| m.get("sealed_cek_b64"))
         .and_then(|v| v.as_str())
-        .ok_or("first dkms node returned material without a sealed share")?;
-    let share2 = material_b
-        .get("sealed_cek_b64")
+        .ok_or("first dkms node returned material without a sealed share")?
+        .to_string();
+    let share2 = data_b
+        .get("material")
+        .and_then(|m| m.get("sealed_cek_b64"))
         .and_then(|v| v.as_str())
-        .ok_or("second dkms node returned material without a sealed share")?;
+        .ok_or("second dkms node returned material without a sealed share")?
+        .to_string();
     if share1 == share2 {
         return Err(
             "the two dkms nodes returned identical sealed shares — not a real 2-of-2 split".to_string(),
@@ -1485,17 +1493,21 @@ fn merge_threshold_material(material_a: Value, material_b: &Value) -> Result<Val
     }
     // Both nodes must bind the SAME content/transcript, or one sealed for a different object — fail
     // closed rather than ship an incoherent pair the decrypt boundary would XOR into garbage.
+    let material_a = data_a.get("material");
+    let material_b = data_b.get("material");
     for k in ["content_hash_b64", "nonce_b64", "ciphertext_b64"] {
-        if material_a.get(k) != material_b.get(k) {
+        let a = material_a.and_then(|m| m.get(k));
+        let b = material_b.and_then(|m| m.get(k));
+        if a != b {
             return Err(format!(
                 "threshold dkms nodes disagree on `{k}` — the two shares are not for the same content"
             ));
         }
     }
-    let share2 = share2.to_string();
-    let mut merged = material_a;
-    merged["sealed_cek_share2_b64"] = json!(share2);
-    Ok(merged)
+    // Weld node B's re-sealed share into node A's nested material (the shape the decrypt boundary
+    // consumes: `material.sealed_cek_share2_b64`). The CEK is reconstructed ONLY in the boundary.
+    data_a["material"]["sealed_cek_share2_b64"] = json!(share2);
+    Ok(data_a)
 }
 
 /// Parse ONE PUBLIC-ONLY dKMS authority identity (the node's published vk + escrow recipient +
@@ -2285,29 +2297,34 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn merge_threshold_material_welds_second_share_and_fails_closed() {
+            // Each node returns its full recover `data` with the sealed share nested under `material`.
             let base = |sealed: &str| {
                 json!({
                     "suite": "elastos-pq-hybrid-threshold-v0",
-                    "sealed_cek_b64": sealed,
-                    "ciphertext_b64": "CIPHER",
-                    "content_hash_b64": "HASH",
-                    "nonce_b64": "NONCE",
+                    "seal_verifying_key_b64": "VK",
+                    "material": {
+                        "suite": "elastos-pq-hybrid-threshold-v0",
+                        "sealed_cek_b64": sealed,
+                        "ciphertext_b64": "CIPHER",
+                        "content_hash_b64": "HASH",
+                        "nonce_b64": "NONCE",
+                    },
                 })
             };
             // Happy: two distinct shares for the same content merge into a two-share material.
             let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2")).expect("merge");
-            assert_eq!(merged["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
-            assert_eq!(merged["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
-            assert_eq!(merged["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
+            assert_eq!(merged["material"]["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
+            assert_eq!(merged["material"]["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
+            assert_eq!(merged["material"]["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
 
             // Identical shares → not a real split → fail closed.
             assert!(merge_threshold_material(base("SAME"), &base("SAME")).is_err());
             // A content/transcript mismatch between nodes → fail closed.
             let mut other = base("SHARE2");
-            other["content_hash_b64"] = json!("DIFFERENT");
+            other["material"]["content_hash_b64"] = json!("DIFFERENT");
             assert!(merge_threshold_material(base("SHARE1"), &other).is_err());
             // A node missing its sealed share → fail closed.
-            assert!(merge_threshold_material(json!({"ciphertext_b64":"C"}), &base("S2")).is_err());
+            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2")).is_err());
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in

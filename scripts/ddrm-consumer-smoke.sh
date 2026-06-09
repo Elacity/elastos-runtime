@@ -29,10 +29,15 @@
 set -uo pipefail
 
 BACKEND="reference"
+THRESHOLD="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend) BACKEND="${2:-}"; shift 2 ;;
     --backend=*) BACKEND="${1#*=}"; shift ;;
+    # 2-of-2 THRESHOLD (Day 99–100): the runtime provisions TWO secret-holding nodes, XOR-splits the
+    # CEK so neither node ever holds the whole key, and drives the full dual-recover + in-VM combine.
+    # Implies --backend dkms (the only backend with external secret-holders).
+    --threshold) THRESHOLD="true"; BACKEND="dkms"; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -40,13 +45,20 @@ if [[ "$BACKEND" != "reference" && "$BACKEND" != "dkms" ]]; then
   echo "FAIL: --backend must be reference|dkms (got '${BACKEND}')" >&2
   exit 2
 fi
+if [[ "$THRESHOLD" == "true" && "$BACKEND" != "dkms" ]]; then
+  echo "FAIL: --threshold requires --backend dkms" >&2
+  exit 2
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CAPSULES="${REPO_ROOT}/capsules"
 ORCH="${REPO_ROOT}/scripts/dev/ddrm-runtime-open"
 
+MODE_LABEL="${BACKEND}"
+if [[ "$THRESHOLD" == "true" ]]; then MODE_LABEL="${BACKEND}, 2-of-2 threshold"; fi
+
 echo "=============================================================="
-echo " dDRM consumer-half smoke (authority=${BACKEND}) — building real capsule binaries"
+echo " dDRM consumer-half smoke (authority=${MODE_LABEL}) — building real capsule binaries"
 echo "=============================================================="
 
 build() {
@@ -131,7 +143,7 @@ fi
 # delegates recovery to (its master never crosses into the runtime).
 AUTHORITY_JSON="{ \"backend\": \"${BACKEND}\" }"
 if [[ "$BACKEND" == "dkms" ]]; then
-  AUTHORITY_JSON="{ \"backend\": \"dkms\", \"dkms_authority_bin\": \"${DKMS_NODE_BIN}\" }"
+  AUTHORITY_JSON="{ \"backend\": \"dkms\", \"dkms_authority_bin\": \"${DKMS_NODE_BIN}\", \"threshold\": ${THRESHOLD} }"
 fi
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddrm-runtime-open.XXXXXX")"
 CONFIG_JSON="${WORK_DIR}/open-config.json"
@@ -145,8 +157,8 @@ rm -rf "$WORK_DIR"
 
 echo
 if [[ $status -eq 0 ]]; then
-  echo "ddrm-consumer-smoke (authority=${BACKEND}): PASS"
+  echo "ddrm-consumer-smoke (authority=${MODE_LABEL}): PASS"
   exit 0
 fi
-echo "ddrm-consumer-smoke (authority=${BACKEND}): FAIL" >&2
+echo "ddrm-consumer-smoke (authority=${MODE_LABEL}): FAIL" >&2
 exit 1

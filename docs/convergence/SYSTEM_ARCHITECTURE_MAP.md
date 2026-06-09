@@ -369,6 +369,30 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 99–100):** the 2-of-2 threshold now runs through the PRODUCTION `DrmHost` run-path, not just the
+  verify-mode probe — the happy open itself provisions TWO secret-holding nodes, XOR-splits the CEK at publish,
+  dual-recovers BOTH, and reconstructs the CEK ONLY inside the decrypt boundary (the CEK never exists whole before
+  the boundary). Day 97–98 landed the threshold crypto + a SELF-CONTAINED probe; this cycle wires it into the real
+  open. Audited PC2 first: PC2's run-path delegates recovery with ONE Lit RPC (`recoverCEKEnvelope`,
+  `chipotle-client.ts:1438`) and NEVER collects shares from multiple nodes in its OWN code — `decryptAndCombine` is
+  the LEGACY Datil threshold whose share-set/nodes/combine live entirely inside Lit's opaque network
+  (`chipotle-client.ts:1297`), and the current Chipotle path is a single-node PKP-AES TEE decrypt. PC2's runtime STOPS
+  at one opaque RPC; the runtime is SUPERIOR — two OWNED, inspectable nodes driven end to end inside its own host +
+  boundary. (1) `OpenConfig.authority.threshold` (bool) promotes the dkms open to 2-of-2 (fail-closed if
+  `backend != dkms` or non-boolean; +2 bin tests, 8→10) — a boolean knob, since the runtime provisions BOTH nodes from
+  the same node binary and OWNS producing the descriptor's `threshold` block. (2) `publish_escrow` provisions node A +
+  node B (distinct stores/sockets/allow-lists), `split_cek_xor`s the CEK (share-1→A, share-2→B; neither sees the whole
+  key), publishes a `threshold` descriptor (`t:2`, both nodes), and the fixture carries `wrapped_cek_share2_b64` +
+  node B's `vk2_b64`. (3) the `DrmHost` starts BOTH daemons, binds share-2, passes node B's vk to the `DecryptLauncher`
+  (`authority_vk2_b64`), and `KeyHandle` supplies `wrapped_cek_share2_b64` in the release session — so `host.open()`
+  drives the full dual-recover + in-VM XOR combine; a threshold↔descriptor desync fails closed. (4) INTEGRATION FIX:
+  `merge_threshold_material` welds node B's share into node A's NESTED `material.sealed_cek_share2_b64` (the Day 97–98
+  merge read a top-level field the real node never emits — never exercised end-to-end until the full run-path;
+  key-provider[key-authority-ref] stays 43). (5) verify gates 21–22 (threshold-only): the live rail refuses a one-share
+  release; a 3-of-N descriptor fails closed at key-provider init. NEW `ddrm-consumer-dkms-threshold-smoke.sh`
+  (+ `--threshold` flag) drives the whole 2-of-2 open cross-binary; reference + single-node dkms stay green. Drift
+  untouched. Gate: ladder INTACT (ddrm-envelope=23, key-provider[key-authority-ref]=43, decrypt-provider
+  rail-material=68), drift PASS, all dDRM smokes green (reference + dkms single-node + the NEW dkms 2-of-2), clippy clean.
 - **Status (Day 97–98):** the threshold is REAL — the CEK is XOR-split 2-of-2 across TWO secret-holding dKMS nodes,
   so no single node ever holds the whole content key, and the runtime reconstructs it ONLY inside the decrypt boundary.
   Day 95–96 left a fail-closed threshold STUB; this cycle makes 2-of-2 real end to end. Audited PC2 first: PC2's
