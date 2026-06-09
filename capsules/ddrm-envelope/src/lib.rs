@@ -371,6 +371,45 @@ pub fn verify_attestation(verifier: &impl CekSealVerifier, challenge: &[u8], sig
     verifier.verify(&msg, sig)
 }
 
+/// Domain label for the dKMS-authority SESSION TOKEN (Day 91–92). After the identity handshake, the
+/// node issues a token binding the client's `challenge` to an `expires_at` and signs it with its
+/// master-derived key; the node then REQUIRES a live, node-verified token on every `recover`, so a
+/// long-lived node only recovers for a caller that completed the handshake IN THIS session (the
+/// runtime-core analogue of PC2's per-view session resurrected to gate recovery,
+/// `secureViewSession.ts:81`–`:128`). Domain-separated from the hello attestation + the CEK seals so
+/// a token can never be replayed as either. Defined ONCE here so the node + client cannot drift.
+pub const DKMS_SESSION_DOMAIN: &[u8] = b"elastos.dkms.authority/session/v1";
+
+/// Canonical signed preimage of a session token: `DKMS_SESSION_DOMAIN ‖ challenge ‖ expires_at(LE)`.
+/// Tying both the challenge AND the expiry into the signed bytes means tampering with either field
+/// invalidates the signature.
+fn session_token_message(challenge: &[u8], expires_at: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DKMS_SESSION_DOMAIN.len() + challenge.len() + 8);
+    msg.extend_from_slice(DKMS_SESSION_DOMAIN);
+    msg.extend_from_slice(challenge);
+    msg.extend_from_slice(&expires_at.to_le_bytes());
+    msg
+}
+
+/// The NODE side: mint a session token by signing `DKMS_SESSION_DOMAIN ‖ challenge ‖ expires_at`
+/// with the node's master-derived signing key. Returns the detached signature.
+pub fn sign_session_token(signer: &impl seal::CekSealSigner, challenge: &[u8], expires_at: u64) -> Vec<u8> {
+    signer.sign(&session_token_message(challenge, expires_at))
+}
+
+/// Verify a session token's signature over `(challenge, expires_at)`. `true` only when `sig` is a
+/// valid ML-DSA-65 signature under `verifier` — a forged token, a tampered challenge/expiry, or a
+/// malformed signature all return `false`. The node verifies tokens under its OWN verifying key (it
+/// is the issuer); expiry is enforced separately against the caller's clock.
+pub fn verify_session_token(
+    verifier: &impl CekSealVerifier,
+    challenge: &[u8],
+    expires_at: u64,
+    sig: &[u8],
+) -> bool {
+    verifier.verify(&session_token_message(challenge, expires_at), sig)
+}
+
 /// Hybrid (classical + post-quantum) seal-signature verifier — migration-period
 /// profile where a classical ECDSA-P256 signature AND a PQ ML-DSA-65 signature over
 /// the same payload must BOTH verify. Wire layout: `u32 ecdsa_len ‖ ecdsa(DER) ‖
@@ -901,6 +940,51 @@ mod tests {
         use crate::seal::CekSealSigner as _;
         let bare = signer.sign(&challenge);
         assert!(!crate::verify_attestation(&verifier, &challenge, &bare));
+    }
+
+    /// A node session token verifies under the node's own vk for its `(challenge, expires_at)`, and
+    /// any tamper (challenge / expiry / forged key / malformed sig) fails — so the node can require a
+    /// live, unforgeable token on every recover.
+    #[test]
+    fn dkms_session_token_round_trips_and_rejects_tamper() {
+        let (signer, vk) = crate::seal::mldsa_seal_keypair([0x5au8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
+        let challenge = [0x33u8; 32];
+        let expires_at = 1_000_000u64;
+        let token = crate::sign_session_token(&signer, &challenge, expires_at);
+        assert!(crate::verify_session_token(&verifier, &challenge, expires_at, &token));
+
+        // Tampering the expiry (e.g. extending the window) invalidates the signature.
+        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at + 1, &token));
+
+        // Tampering the challenge invalidates the signature.
+        let mut other = challenge;
+        other[0] ^= 1;
+        assert!(!crate::verify_session_token(&verifier, &other, expires_at, &token));
+
+        // A token forged by a different (impersonator) key does not verify under this vk.
+        let (impostor, _ivk) = crate::seal::mldsa_seal_keypair([0x5bu8; 32]);
+        let forged = crate::sign_session_token(&impostor, &challenge, expires_at);
+        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, &forged));
+
+        // A malformed signature fails closed (no panic).
+        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, b"nope"));
+    }
+
+    /// The session token is domain-separated from the hello attestation — a hello attestation over
+    /// the same challenge can never be replayed as a session token (different signed prefix/shape).
+    #[test]
+    fn dkms_session_token_is_domain_separated_from_hello() {
+        let (signer, vk) = crate::seal::mldsa_seal_keypair([9u8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).unwrap();
+        let challenge = [2u8; 32];
+        let expires_at = 42u64;
+        // A hello attestation must NOT verify as a session token over the same challenge.
+        let hello = crate::attest_challenge(&signer, &challenge);
+        assert!(!crate::verify_session_token(&verifier, &challenge, expires_at, &hello));
+        // …and a session token must NOT verify as a hello attestation.
+        let token = crate::sign_session_token(&signer, &challenge, expires_at);
+        assert!(!crate::verify_attestation(&verifier, &challenge, &token));
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.

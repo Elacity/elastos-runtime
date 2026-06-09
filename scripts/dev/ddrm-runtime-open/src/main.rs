@@ -644,15 +644,20 @@ fn probe_receipt(allowed: bool, content_id: &str, principal_id: &str, right: &st
 /// Adversarial probe against the REAL dkms-authority node binary (verify mode only): prove, cross
 /// binary, that **(a)** a tampered/wrong NODE IDENTITY is rejected at the handshake — the node's
 /// attestation over a fresh challenge verifies under the descriptor-PINNED vk but NOT under a
-/// flipped vk or a replayed challenge — and **(b)** the node REFUSES a recover whose authorization
-/// does not bind the content/principal (a denied receipt, or one bound to other content) — even
-/// though the request is otherwise well-formed. The runtime-core analogue of PC2 pinning the Lit
-/// network identity (`universal-decrypt-chipotle.js:577`–`:590`) AND the Lit action re-running
-/// `hasAccessByContentId` in the TEE (`:560`–`:568`) rather than trusting the caller.
+/// flipped vk or a replayed challenge — **(b)** the node REQUIRES a live, node-verified SESSION
+/// TOKEN on every recover (no/expired/forged/tampered token is refused, even with a perfectly valid
+/// escrow + receipt) and a token minted for one challenge cannot authorize a recover under a
+/// tampered challenge/binding — **(c)** the node REFUSES a recover whose authorization does not bind
+/// the content/principal — and **(d)** ONE handshake session authorizes MANY successful recovers
+/// over the long-lived node (the persistent-session shape). The runtime-core analogue of PC2 pinning
+/// the Lit network identity (`universal-decrypt-chipotle.js:577`–`:590`), resurrecting a per-view
+/// session to gate recovery (`secureViewSession.ts:81`–`:128`), and re-running `hasAccessByContentId`
+/// in the TEE (`:560`–`:568`) rather than trusting the caller.
 fn dkms_node_adversarial_probe(
     node_bin: &str,
     node_store_path: &str,
     pinned_vk_b64: &str,
+    material: &KeyOpenMaterial,
 ) -> Result<(), String> {
     let mut node = Capsule::spawn("dkms-authority(probe)", node_bin)?;
     ok_data(
@@ -660,10 +665,15 @@ fn dkms_node_adversarial_probe(
         "dkms-authority init (probe)",
     )?;
 
-    // (a) IDENTITY HANDSHAKE — the node proves possession of the master-derived signing key.
+    // (a) IDENTITY HANDSHAKE — the node proves possession of the master-derived signing key AND
+    // mints a node-signed SESSION TOKEN bound to this challenge + a bounded expiry.
     let challenge = ddrm_envelope::random_seed();
     let hello = ok_data(
-        &node.call(&json!({ "op": "hello", "challenge_b64": B64.encode(challenge) }))?,
+        &node.call(&json!({
+            "op": "hello",
+            "challenge_b64": B64.encode(challenge),
+            "now_unix": NOW_UNIX,
+        }))?,
         "dkms-authority hello (probe)",
     )?;
     if hello["verifying_key_b64"].as_str() != Some(pinned_vk_b64) {
@@ -696,43 +706,116 @@ fn dkms_node_adversarial_probe(
         node.shutdown();
         return Err("a replayed challenge wrongly verified — the attestation is not challenge-bound".to_string());
     }
-    step(13, "dkms node IDENTITY pinned + verified cross-binary: the node's attestation verifies under the descriptor vk; a flipped vk + a replayed challenge are both rejected (impersonated node refused at handshake)");
+    // Capture the live session token the node minted (the credential every recover must present).
+    let session_token = hello["session_token"].clone();
+    if !session_token.is_object() {
+        node.shutdown();
+        return Err("dkms node hello returned no session token".to_string());
+    }
+    step(13, "dkms node IDENTITY pinned + verified cross-binary: the node's attestation verifies under the descriptor vk; a flipped vk + a replayed challenge are both rejected; and the node minted a node-signed SESSION TOKEN");
 
-    // (b) NODE RE-AUTHORIZATION — the node refuses recover whose authorization does not bind the
-    // declared content/principal. Crypto fields are dummies: re-auth runs FIRST, so the node
-    // refuses BEFORE touching any key material.
-    let recover_base = |receipt: Value, content_id: &str| {
+    // A GENUINE recover bundle: REAL publish-escrow material (recovers to the node recipient) + a
+    // coherent allowed receipt + the live session token. Used both for the happy (c)/(d) path and as
+    // the base the adversarial session cases vary (so a refusal is provably the session gate, not a
+    // broken bundle). The crypto is real, so the node runs the FULL pipeline.
+    const PROBE_CONTENT: &str = "bafContent";
+    const PROBE_PRINCIPAL: &str = "did:key:zViewer";
+    const PROBE_SESSION: &str = "probe-session";
+    let genuine = |token: &Value, now: u64| {
         json!({
             "op": "recover",
-            "wrapped_cek_b64": B64.encode(b"x"),
+            "wrapped_cek_b64": material.wrapped_cek_b64,
             "scheme": SUITE_PQ_HYBRID,
-            "kid_hex": "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
-            "producer_vk_b64": B64.encode(b"x"),
-            "decrypt_session_pub_b64": B64.encode(b"x"),
-            "aad_b64": B64.encode(b"x"),
-            "ciphertext_b64": B64.encode(b"x"),
-            "content_hash_b64": B64.encode(b"x"),
-            "nonce_b64": B64.encode(b"x"),
-            "rights_receipt": receipt,
-            "content_id": content_id,
-            "principal_id": "did:key:zViewer",
-            "session_id": "probe-session",
+            "kid_hex": material.kid_hex,
+            "producer_vk_b64": material.producer_vk_b64,
+            "decrypt_session_pub_b64": material.session_pub_b64,
+            "aad_b64": material.aad_b64,
+            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            "content_hash_b64": material.content_hash_b64,
+            "nonce_b64": material.nonce_b64,
+            "rights_receipt": probe_receipt(true, PROBE_CONTENT, PROBE_PRINCIPAL, "view"),
+            "content_id": PROBE_CONTENT,
+            "principal_id": PROBE_PRINCIPAL,
+            "session_id": PROBE_SESSION,
             "right": "view",
+            "session_token": token,
+            "now_unix": now,
         })
     };
-    // Denied receipt → refused.
-    let denied = node.call(&recover_base(probe_receipt(false, "bafContent", "did:key:zViewer", "view"), "bafContent"))?;
-    if denied.get("status").and_then(Value::as_str) == Some("ok") {
+
+    // (b) SESSION GATE — the node refuses recover without a live, node-verified token, EVEN with a
+    // valid escrow + receipt. NO token, an EXPIRED token, a FORGED signature, and a token whose
+    // bound CHALLENGE was tampered are all rejected.
+    let mut no_token = genuine(&session_token, NOW_UNIX);
+    no_token.as_object_mut().unwrap().remove("session_token");
+    if node.call(&no_token)?.get("status").and_then(Value::as_str) == Some("ok") {
+        node.shutdown();
+        return Err("the node recovered with NO session token — the session gate is broken".to_string());
+    }
+    let expires_at = session_token["expires_at"].as_u64().unwrap_or(0);
+    if node.call(&genuine(&session_token, expires_at + 1))?.get("status").and_then(Value::as_str)
+        == Some("ok")
+    {
+        node.shutdown();
+        return Err("the node recovered with an EXPIRED session token — expiry is not enforced".to_string());
+    }
+    let mut forged_token = session_token.clone();
+    forged_token["sig_b64"] = json!(B64.encode([0u8; 8]));
+    if node.call(&genuine(&forged_token, NOW_UNIX))?.get("status").and_then(Value::as_str)
+        == Some("ok")
+    {
+        node.shutdown();
+        return Err("the node recovered with a FORGED session token — the signature is not verified".to_string());
+    }
+    let mut other_challenge = session_token.clone();
+    other_challenge["challenge_b64"] = json!(B64.encode([0x99u8; 32]));
+    if node.call(&genuine(&other_challenge, NOW_UNIX))?.get("status").and_then(Value::as_str)
+        == Some("ok")
+    {
+        node.shutdown();
+        return Err("a session token bound to one challenge authorized a recover under a DIFFERENT challenge — binding is broken".to_string());
+    }
+    step(14, "dkms node SESSION GATE cross-binary: recover with NO / EXPIRED / FORGED token, and a token whose bound challenge was tampered, are all refused (a captured/forged session cannot drive recovery)");
+
+    // (c) NODE RE-AUTHORIZATION — with a LIVE token, the node still refuses recover whose
+    // authorization does not bind the declared content/principal.
+    let denied = genuine(&session_token, NOW_UNIX);
+    let denied = {
+        let mut d = denied;
+        d["rights_receipt"] = probe_receipt(false, PROBE_CONTENT, PROBE_PRINCIPAL, "view");
+        d
+    };
+    if node.call(&denied)?.get("status").and_then(Value::as_str) == Some("ok") {
         node.shutdown();
         return Err("the node recovered for a DENIED receipt — re-authorization is broken".to_string());
     }
-    // Allowed receipt bound to OTHER content than the recover declares → refused.
-    let mismatched = node.call(&recover_base(probe_receipt(true, "bafOTHER", "did:key:zViewer", "view"), "bafContent"))?;
-    if mismatched.get("status").and_then(Value::as_str) == Some("ok") {
+    let mismatched = {
+        let mut m = genuine(&session_token, NOW_UNIX);
+        m["rights_receipt"] = probe_receipt(true, "bafOTHER", PROBE_PRINCIPAL, "view");
+        m
+    };
+    if node.call(&mismatched)?.get("status").and_then(Value::as_str) == Some("ok") {
         node.shutdown();
         return Err("the node recovered for a receipt bound to DIFFERENT content — re-authorization is broken".to_string());
     }
-    step(14, "dkms node RE-AUTHORIZED in its own boundary: it refused recover for a DENIED receipt and for a receipt bound to other content (the node never trusts the caller's claim)");
+    step(15, "dkms node RE-AUTHORIZED in its own boundary: even WITH a live session, it refused recover for a DENIED receipt and a receipt bound to other content (the node never trusts the caller's claim)");
+
+    // (d) MANY SEGMENTS OVER ONE SESSION — the SAME live token drives repeated SUCCESSFUL recovers
+    // over the long-lived node; each returns sealed material and never the raw CEK. The master never
+    // re-crosses the boundary (no re-init, no re-handshake between segments).
+    for segment in 0..3 {
+        let ok = ok_data(&node.call(&genuine(&session_token, NOW_UNIX))?, "dkms genuine recover (probe)")?;
+        let sealed = ok["material"]["sealed_cek_b64"].as_str().unwrap_or_default();
+        if sealed.is_empty() {
+            node.shutdown();
+            return Err(format!("recover {segment} over the reused session returned no sealed material"));
+        }
+        if serde_json::to_string(&ok).unwrap_or_default().contains(GOLDEN_CEK_B64) {
+            node.shutdown();
+            return Err("the raw CEK leaked from a reused-session recover".to_string());
+        }
+    }
+    step(16, "dkms node ONE session → MANY recovers: three SUCCESSFUL recovers over the SAME live session token (sealed material only, raw CEK never present) — the persistent open-once/recover-many shape");
 
     node.shutdown();
     Ok(())
@@ -1591,7 +1674,11 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                 .get("verifying_key_b64")
                 .and_then(Value::as_str)
                 .ok_or("dkms descriptor missing verifying_key_b64")?;
-            dkms_node_adversarial_probe(node_bin, &node_store_path, pinned_vk)?;
+            let probe_material = key_material
+                .borrow()
+                .clone()
+                .ok_or("dkms verify probe needs the bound key material from the open")?;
+            dkms_node_adversarial_probe(node_bin, &node_store_path, pinned_vk, &probe_material)?;
         }
     }
     // The cells kept for the raw gate are now stale (the host tore the processes down); drop

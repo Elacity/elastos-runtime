@@ -32,6 +32,34 @@ const NODE_KEYSTORE_SCHEMA: &str = "elastos.dkms_node.master_seed/v1";
 /// it (it only knows the node's endpoint + the node's PUBLIC identity).
 const KEY_STORE_ENV: &str = "DKMS_AUTHORITY_KEY_STORE";
 
+/// How long a session token the node mints at `hello` stays live (seconds). A long-lived node only
+/// recovers for a caller whose handshake session is still within this window — a short, bounded
+/// credential, the analogue of PC2's session TTL (`mediaSessionManager` lifetime).
+const SESSION_TTL_SECONDS: u64 = 300;
+
+/// A node-issued, node-signed SESSION TOKEN: it binds the client's handshake `challenge` to an
+/// `expires_at` and the node SIGNS `(challenge, expires_at)` with its master-derived key. The node
+/// REQUIRES one on every `recover` and verifies it under its OWN verifying key — so a long-lived
+/// node recovers only for a caller that completed the handshake IN THIS (unexpired) session, and a
+/// missing / expired / forged / tampered token is refused.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionToken {
+    challenge_b64: String,
+    expires_at: u64,
+    sig_b64: String,
+}
+
+/// The node's effective wall clock: the caller-supplied `now_unix` when present (keeps issuance +
+/// expiry deterministic for tests + lock-stepped with the client's clock), else the real clock.
+fn effective_now(now_unix: Option<u64>) -> u64 {
+    now_unix.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 // The `recover` variant is intentionally wide (it carries the full recover bundle); these are
@@ -50,6 +78,10 @@ enum Request {
     /// identity (the published `pkpId`/`authority`).
     Hello {
         challenge_b64: String,
+        /// The caller's clock, so the node mints an `expires_at` lock-stepped with it (the client
+        /// re-checks liveness against the same clock). Absent → the node uses its own wall clock.
+        #[serde(default)]
+        now_unix: Option<u64>,
     },
     /// DELEGATED recovery: recover a producer-escrowed CEK in-boundary and re-seal it to the
     /// decrypt session. The CEK source (escrow blob), KID, scheme and producer key authenticate
@@ -79,6 +111,13 @@ enum Request {
         principal_id: String,
         session_id: String,
         right: String,
+        /// The live session token from `hello` — REQUIRED. The node verifies it under its own key +
+        /// checks it is unexpired BEFORE re-authorizing or touching any key material; a missing token
+        /// is a hard parse error (no recover without a session).
+        session_token: SessionToken,
+        /// The caller's clock for the expiry check (absent → the node's own wall clock).
+        #[serde(default)]
+        now_unix: Option<u64>,
     },
     Shutdown,
 }
@@ -167,7 +206,7 @@ impl DkmsAuthorityNode {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
-            Request::Hello { challenge_b64 } => self.hello(&challenge_b64),
+            Request::Hello { challenge_b64, now_unix } => self.hello(&challenge_b64, now_unix),
             Request::Recover {
                 wrapped_cek_b64,
                 scheme,
@@ -184,6 +223,8 @@ impl DkmsAuthorityNode {
                 principal_id,
                 session_id,
                 right,
+                session_token,
+                now_unix,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
                 scheme,
@@ -200,6 +241,8 @@ impl DkmsAuthorityNode {
                 principal_id,
                 session_id,
                 right,
+                session_token,
+                now_unix,
             }),
             Request::Shutdown => Response::empty_ok(),
         }
@@ -209,7 +252,7 @@ impl DkmsAuthorityNode {
     /// and return the attestation + the published verifying key. The client verifies the attestation
     /// against the vk it PINNED from the descriptor, proving it is talking to the authentic node
     /// (not an impersonator) before it delegates any recovery. Requires `init` (no key, no identity).
-    fn hello(&self, challenge_b64: &str) -> Response {
+    fn hello(&self, challenge_b64: &str, now_unix: Option<u64>) -> Response {
         let authority = match self.authority.as_ref() {
             Some(authority) => authority,
             None => {
@@ -225,9 +268,19 @@ impl DkmsAuthorityNode {
             Err(_) => return Response::error("invalid_request", "challenge_b64 is not valid base64"),
         };
         let attestation = ddrm_envelope::attest_challenge(&authority.signer, &challenge);
+        // Mint a node-signed SESSION TOKEN binding this challenge to a bounded expiry. The node will
+        // REQUIRE (and re-verify) it on every recover, so this handshake gates a whole session of
+        // recovers rather than a single spawn — the PC2 per-view-session analogue.
+        let expires_at = effective_now(now_unix) + SESSION_TTL_SECONDS;
+        let token_sig = ddrm_envelope::sign_session_token(&authority.signer, &challenge, expires_at);
         Response::ok(json!({
             "verifying_key_b64": b64().encode(&authority.verifying_key),
             "attestation_b64": b64().encode(&attestation),
+            "session_token": {
+                "challenge_b64": challenge_b64,
+                "expires_at": expires_at,
+                "sig_b64": b64().encode(&token_sig),
+            },
         }))
     }
 
@@ -290,7 +343,12 @@ impl DkmsAuthorityNode {
                 )
             }
         };
-        // RE-AUTHORIZE in this boundary FIRST — refuse to recover for an unauthorized caller before
+        // SESSION GATE FIRST — refuse to recover without a live, node-verified handshake session
+        // (the channel gate), before re-authorizing or touching any key material.
+        if let Err(err) = verify_session(authority, &args) {
+            return Response::error("session_invalid", err);
+        }
+        // RE-AUTHORIZE in this boundary — refuse to recover for an unauthorized caller before
         // touching any key material (the node never trusts the client's claim).
         if let Err(err) = reauthorize(&args) {
             return Response::error("access_denied", err);
@@ -373,6 +431,32 @@ struct RecoverArgs {
     principal_id: String,
     session_id: String,
     right: String,
+    session_token: SessionToken,
+    now_unix: Option<u64>,
+}
+
+/// VERIFY the caller's session token in the node's OWN boundary: it must be a token THIS node
+/// signed (valid signature over `(challenge, expires_at)` under the node's verifying key) and still
+/// unexpired against the caller's clock. A forged/tampered token (bad signature) or an expired one
+/// is refused — so a long-lived node recovers only for a caller with a live handshake session, and
+/// a captured handshake cannot be replayed past its window. The runtime-core analogue of PC2
+/// resurrecting + validating the per-view session before recovery (`secureViewSession.ts:81`–`:128`).
+fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), String> {
+    let challenge = b64()
+        .decode(&args.session_token.challenge_b64)
+        .map_err(|_| "session token challenge is not valid base64".to_string())?;
+    let sig = b64()
+        .decode(&args.session_token.sig_b64)
+        .map_err(|_| "session token signature is not valid base64".to_string())?;
+    let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&authority.verifying_key)
+        .ok_or("node verifying key is malformed")?;
+    if !ddrm_envelope::verify_session_token(&verifier, &challenge, args.session_token.expires_at, &sig) {
+        return Err("session token is forged or tampered (signature does not verify)".to_string());
+    }
+    if effective_now(args.now_unix) > args.session_token.expires_at {
+        return Err("session token has expired — re-establish the handshake session".to_string());
+    }
+    Ok(())
 }
 
 /// RE-CHECK the rights authorization in the node's OWN boundary before recovering anything. The
@@ -545,6 +629,28 @@ mod tests {
     const PRINCIPAL: &str = "did:key:zViewer";
     const SESSION: &str = "session:abc";
     const RIGHT: &str = "view";
+    const NOW: u64 = 1_700_000_000;
+
+    /// Drive the node's real `hello` to mint a live session token at clock `NOW`.
+    fn live_token(node: &DkmsAuthorityNode) -> SessionToken {
+        let challenge = b64().encode([0xA1u8; 32]);
+        let hello = ok_data(node.hello(&challenge, Some(NOW)));
+        let t = &hello["session_token"];
+        SessionToken {
+            challenge_b64: t["challenge_b64"].as_str().unwrap().to_string(),
+            expires_at: t["expires_at"].as_u64().unwrap(),
+            sig_b64: t["sig_b64"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// A structurally-valid but never-verified token (for cases that fail BEFORE the session gate).
+    fn dummy_token() -> SessionToken {
+        SessionToken {
+            challenge_b64: b64().encode([0u8; 32]),
+            expires_at: NOW + 1,
+            sig_b64: b64().encode([0u8; 8]),
+        }
+    }
 
     /// A valid, ALLOWED rights receipt bound to the canonical test content/principal/session/right.
     fn good_receipt() -> elastos_common::protected_content::RightsDecisionReceiptV1 {
@@ -587,6 +693,7 @@ mod tests {
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
         let transcript_aad = b"day87-88-transcript".to_vec();
 
+        let token = live_token(&node);
         let resp = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -603,6 +710,8 @@ mod tests {
             principal_id: PRINCIPAL.to_string(),
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
+            session_token: token,
+            now_unix: Some(NOW),
         });
         let data = ok_data(resp);
         // The response carries SEALED material only — never a raw CEK.
@@ -655,7 +764,9 @@ mod tests {
         let (_s, session_public) = ddrm_envelope::mint_session();
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
 
-        // Forged producer vk → recover fails closed.
+        // Forged producer vk → recover fails closed (a live session passes the gate, so the producer
+        // check is what we're exercising).
+        let token = live_token(&node);
         let forged = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -672,10 +783,13 @@ mod tests {
             principal_id: PRINCIPAL.to_string(),
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
+            session_token: token,
+            now_unix: Some(NOW),
         });
         assert_eq!(error_code(&forged), "invalid_request");
 
-        // Before init → not_configured.
+        // Before init → not_configured (the authority check precedes the session gate, so a dummy
+        // token is never reached).
         let fresh = DkmsAuthorityNode::default();
         let pre = fresh.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
@@ -693,6 +807,8 @@ mod tests {
             principal_id: PRINCIPAL.to_string(),
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
+            session_token: dummy_token(),
+            now_unix: Some(NOW),
         });
         assert_eq!(error_code(&pre), "not_configured");
         let _ = std::fs::remove_file(&store);
@@ -722,6 +838,7 @@ mod tests {
         let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &escrow_aad, &producer_signer);
         let (_session_secret, session_public) = ddrm_envelope::mint_session();
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
+        let token = live_token(&node);
         let args = RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -738,6 +855,8 @@ mod tests {
             principal_id: PRINCIPAL.to_string(),
             session_id: SESSION.to_string(),
             right: RIGHT.to_string(),
+            session_token: token,
+            now_unix: Some(NOW),
         };
         (node, args)
     }
@@ -750,13 +869,13 @@ mod tests {
         let mut node = DkmsAuthorityNode::default();
 
         // Before init there is no key material → fail closed.
-        assert_eq!(error_code(&node.hello(&b64().encode([1u8; 32]))), "not_configured");
+        assert_eq!(error_code(&node.hello(&b64().encode([1u8; 32]), Some(NOW))), "not_configured");
 
         let init = ok_data(node.init(json!({ "authority_key_store": store })));
         let pinned_vk_b64 = init["seal_verifying_key_b64"].as_str().unwrap().to_string();
 
         let challenge = ddrm_envelope::random_seed();
-        let resp = ok_data(node.hello(&b64().encode(challenge)));
+        let resp = ok_data(node.hello(&b64().encode(challenge), Some(NOW)));
         // The node advertises the SAME vk it published at init (the pin).
         assert_eq!(resp["verifying_key_b64"].as_str().unwrap(), pinned_vk_b64);
 
@@ -765,6 +884,18 @@ mod tests {
         let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&pinned).unwrap();
         let attestation = b64().decode(resp["attestation_b64"].as_str().unwrap()).unwrap();
         assert!(ddrm_envelope::verify_attestation(&verifier, &challenge, &attestation));
+
+        // hello ALSO mints a node-signed SESSION TOKEN bound to this challenge + a bounded expiry,
+        // and the token verifies under the node's own vk (the node will require it on recover).
+        let token = &resp["session_token"];
+        assert_eq!(token["expires_at"].as_u64().unwrap(), NOW + SESSION_TTL_SECONDS);
+        let token_sig = b64().decode(token["sig_b64"].as_str().unwrap()).unwrap();
+        assert!(ddrm_envelope::verify_session_token(
+            &verifier,
+            &challenge,
+            NOW + SESSION_TTL_SECONDS,
+            &token_sig
+        ));
 
         // An impersonating node's vk would NOT verify this attestation (client pins + rejects).
         let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0xEEu8; 32]);
@@ -813,6 +944,70 @@ mod tests {
         // we varied above), proving the failures are the re-auth, not a broken fixture.
         assert!(matches!(node.recover(base), Response::Ok { .. }));
 
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// A `recover` with NO session token is a hard parse error — the node never recovers without a
+    /// handshake session (the `session_token` field is required on the wire).
+    #[test]
+    fn recover_without_a_session_token_is_rejected_at_the_protocol() {
+        // A recover line that omits session_token must fail to deserialize into a Request.
+        let line = json!({
+            "op": "recover",
+            "wrapped_cek_b64": "AA==", "scheme": "s", "kid_hex": "00",
+            "producer_vk_b64": "AA==", "decrypt_session_pub_b64": "AA==",
+            "ciphertext_b64": "AA==", "content_hash_b64": "AA==", "nonce_b64": "AA==",
+            "rights_receipt": good_receipt(),
+            "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
+        });
+        let parsed = serde_json::from_value::<Request>(line);
+        assert!(parsed.is_err(), "recover without session_token must not deserialize");
+    }
+
+    /// The node refuses a recover whose session token is EXPIRED, FORGED, or TAMPERED — even with a
+    /// perfectly valid escrow + receipt — so a long-lived node only recovers within a live handshake
+    /// session and a captured/forged token cannot drive recovery.
+    #[test]
+    fn recover_fails_closed_on_an_expired_or_forged_session() {
+        let store = unique_store("session");
+        let (node, base) = setup_recover(&store);
+
+        // Expired: a clock past the token's expiry → session_invalid.
+        let mut expired = base.clone();
+        expired.now_unix = Some(base.session_token.expires_at + 1);
+        assert_eq!(error_code(&node.recover(expired)), "session_invalid");
+
+        // Forged signature: tamper the token sig → it no longer verifies under the node's vk.
+        let mut forged = base.clone();
+        forged.session_token.sig_b64 = b64().encode([0u8; 8]);
+        assert_eq!(error_code(&node.recover(forged)), "session_invalid");
+
+        // Tampered binding: change the token's challenge → signature no longer matches.
+        let mut tampered = base.clone();
+        tampered.session_token.challenge_b64 = b64().encode([0x99u8; 32]);
+        assert_eq!(error_code(&node.recover(tampered)), "session_invalid");
+
+        // Tampered expiry: extend the window → signature (over challenge+expiry) no longer matches.
+        let mut extended = base.clone();
+        extended.session_token.expires_at += 10_000;
+        assert_eq!(error_code(&node.recover(extended)), "session_invalid");
+
+        // Sanity: the unmodified live-session base recovers (the failures above are the session gate).
+        assert!(matches!(node.recover(base), Response::Ok { .. }));
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// ONE handshake session authorizes MANY recovers — the node accepts the same live token across
+    /// repeated recovers (the persistent-session shape: hello once, recover many).
+    #[test]
+    fn one_session_authorizes_many_recovers() {
+        let store = unique_store("many");
+        let (node, base) = setup_recover(&store);
+        // Reuse the SAME session token across three recovers — all succeed.
+        for _ in 0..3 {
+            assert!(matches!(node.recover(base.clone()), Response::Ok { .. }));
+        }
         let _ = std::fs::remove_file(&store);
     }
 }

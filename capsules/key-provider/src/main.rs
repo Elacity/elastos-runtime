@@ -299,6 +299,14 @@ struct KeyProvider {
     /// `key-authority-ref`).
     #[cfg(feature = "key-authority-ref")]
     dkms: Option<DkmsClientAuthority>,
+    /// The LONG-LIVED connection to the external dKMS node + the live handshake session (Day 91–92).
+    /// The client opens the node ONCE, proves its pinned identity ONCE, and then drives MANY
+    /// authorized recovers over the same connection + session — re-establishing fail-closed only when
+    /// the session expires, rather than spawning a fresh node per release. Interior-mutable because
+    /// `release` takes `&self`; `None` until the first `dkms` release establishes it. The runtime-core
+    /// analogue of PC2's per-view session opened once and resurrected per request to gate recovery.
+    #[cfg(feature = "key-authority-ref")]
+    dkms_conn: std::cell::RefCell<Option<DkmsNodeConn>>,
 }
 
 /// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
@@ -316,6 +324,136 @@ struct DkmsClientAuthority {
     /// Where the secret-holding authority node lives (its capsule binary path) — the granted
     /// endpoint the client RPCs for `recover`. NOT a secret; an address (PC2's `pkpId` analogue).
     endpoint: String,
+}
+
+/// A LONG-LIVED connection to the external dKMS node plus the live handshake SESSION (Day 91–92).
+/// The client spawns + `init`s + `hello`s the node ONCE, pins its identity, and caches the
+/// node-signed session token; subsequent recovers reuse this connection + token until the session
+/// expires. The master never crosses into this process — only the public handshake + sealed results.
+#[cfg(feature = "key-authority-ref")]
+struct DkmsNodeConn {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// The node-signed session token from `hello`, echoed verbatim on every recover.
+    session_token: Value,
+    /// The token's expiry (cached from the token) — the reuse-vs-re-establish decision.
+    expires_at: u64,
+}
+
+#[cfg(feature = "key-authority-ref")]
+impl DkmsNodeConn {
+    /// One request line in, one response line out (the node's newline-JSON protocol).
+    fn call(&mut self, req: &Value) -> Result<Value, String> {
+        use std::io::{BufRead as _, Write as _};
+        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+        writeln!(self.stdin, "{line}").map_err(|e| format!("write to dkms node: {e}"))?;
+        self.stdin.flush().map_err(|e| e.to_string())?;
+        let mut resp = String::new();
+        let n = self
+            .stdout
+            .read_line(&mut resp)
+            .map_err(|e| format!("read from dkms node: {e}"))?;
+        if n == 0 {
+            return Err("dkms node closed its output unexpectedly".to_string());
+        }
+        serde_json::from_str::<Value>(resp.trim())
+            .map_err(|e| format!("dkms node sent non-JSON: {e}: {resp}"))
+    }
+
+    /// Is the cached session still live at `now`? (Delegates to the pure decision below.)
+    fn session_live(&self, now: Option<u64>) -> bool {
+        dkms_session_live(self.expires_at, now)
+    }
+}
+
+/// The reuse-vs-re-establish decision: a session is live only when we have a clock AND it is before
+/// the token's expiry. Without a clock we cannot prove liveness, so we fail closed (re-establish)
+/// rather than reuse a possibly-expired session.
+#[cfg(feature = "key-authority-ref")]
+fn dkms_session_live(expires_at: u64, now: Option<u64>) -> bool {
+    match now {
+        Some(now) => now < expires_at,
+        None => false,
+    }
+}
+
+/// Graceful teardown: tell the node to shut down its boundary, then reap it. Best-effort — a dead
+/// node/pipe is fine here (the connection is being discarded anyway).
+#[cfg(feature = "key-authority-ref")]
+impl Drop for DkmsNodeConn {
+    fn drop(&mut self) {
+        let _ = self.call(&json!({ "op": "shutdown" }));
+        let _ = self.child.wait();
+    }
+}
+
+/// OPEN the long-lived node connection + establish the handshake session ONCE: spawn the granted
+/// `endpoint`, `init` it (the node resolves its OWN master store), then run the identity handshake —
+/// send a fresh challenge, require a signature over it under the descriptor-PINNED verifying key
+/// (`verify_hello_attestation`), and cache the node-signed SESSION TOKEN it mints. Any
+/// transport/protocol/identity error fails closed BEFORE any recovery. The runtime-core analogue of
+/// PC2 opening + verifying a secure-view session once (`begin-session`) before resurrecting it to
+/// gate per-request recovery.
+#[cfg(feature = "key-authority-ref")]
+fn establish_dkms_session(
+    client: &DkmsClientAuthority,
+    now: Option<u64>,
+) -> Result<DkmsNodeConn, String> {
+    use base64::Engine as _;
+    use std::process::{Command, Stdio};
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let mut child = Command::new(&client.endpoint)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("dkms authority node ({}) failed to launch: {e}", client.endpoint))?;
+    let stdin = child.stdin.take().ok_or("dkms node: no stdin")?;
+    let stdout = std::io::BufReader::new(child.stdout.take().ok_or("dkms node: no stdout")?);
+    let mut conn = DkmsNodeConn { child, stdin, stdout, session_token: Value::Null, expires_at: 0 };
+
+    // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
+    // store path: the secret's location is the node's concern, never the client's.
+    let init = conn.call(&json!({ "op": "init", "config": {} }))?;
+    if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(format!(
+            "dkms node init failed: {}",
+            init.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error")
+        ));
+    }
+
+    // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything, and
+    // capture the node-signed SESSION TOKEN that will gate every recover over this connection.
+    let challenge = ddrm_envelope::random_seed();
+    let hello = conn.call(&json!({
+        "op": "hello",
+        "challenge_b64": b64.encode(challenge),
+        "now_unix": now,
+    }))?;
+    if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(format!(
+            "dkms node hello failed: {}",
+            hello.get("message").and_then(|v| v.as_str()).unwrap_or("handshake rejected")
+        ));
+    }
+    let data = hello.get("data").ok_or("dkms node hello returned no attestation")?;
+    let node_vk_b64 = data.get("verifying_key_b64").and_then(|v| v.as_str()).unwrap_or("");
+    let attestation_b64 = data.get("attestation_b64").and_then(|v| v.as_str()).unwrap_or("");
+    verify_hello_attestation(&client.verifying_key_b64, node_vk_b64, &challenge, attestation_b64)?;
+
+    let token = data
+        .get("session_token")
+        .cloned()
+        .ok_or("dkms node hello returned no session token")?;
+    let expires_at = token
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .ok_or("dkms node session token is missing an expiry")?;
+    conn.session_token = token;
+    conn.expires_at = expires_at;
+    Ok(conn)
 }
 
 impl KeyProvider {
@@ -867,11 +1005,54 @@ impl KeyProvider {
             "session_id": request.session_id,
             "right": request.action,
         });
-        // DELEGATE — but only after the node proves its pinned identity in the handshake.
-        match delegate_to_dkms_node(&client.endpoint, &client.verifying_key_b64, &recover_req) {
+        let now = session.now_unix;
+        // OPEN-ONCE / VERIFY-ONCE / REUSE: drive recover over the LONG-LIVED node connection + the
+        // live handshake session. We re-establish (spawn + init + identity handshake) ONLY when there
+        // is no connection yet or the cached session has expired — not per release. Re-establishment
+        // fails closed; the master never crosses into this process.
+        let mut guard = self.dkms_conn.borrow_mut();
+        let need_new = match guard.as_ref() {
+            Some(conn) => !conn.session_live(now),
+            None => true,
+        };
+        if need_new {
+            // Discard any stale connection (Drop shuts the old node down) before opening a fresh one.
+            *guard = None;
+            match establish_dkms_session(client, now) {
+                Ok(conn) => *guard = Some(conn),
+                Err(err) => return Response::error("not_configured", err),
+            }
+        }
+        // Attach the LIVE session token + clock and delegate recover over the reused connection. The
+        // node re-verifies the token under its own key + re-checks authorization in its own boundary.
+        let recover = {
+            let conn = guard.as_mut().expect("session ensured above");
+            let mut req = recover_req;
+            req["session_token"] = conn.session_token.clone();
+            req["now_unix"] = json!(now);
+            conn.call(&req)
+        };
+        let recover = match recover {
+            Ok(value) => value,
+            Err(err) => {
+                // A broken connection is discarded so the next release re-establishes; fail closed now.
+                *guard = None;
+                return Response::error("not_configured", format!("dkms node transport failed: {err}"));
+            }
+        };
+        if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Response::error(
+                "not_configured",
+                format!(
+                    "dkms node recover failed: {}",
+                    recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
+                ),
+            );
+        }
+        match recover.get("data") {
             // The node returns the suite-tagged material verbatim — pass it through unchanged.
-            Ok(data) => Response::ok(data),
-            Err(err) => Response::error("not_configured", err),
+            Some(data) => Response::ok(data.clone()),
+            None => Response::error("not_configured", "dkms node recover returned no material"),
         }
     }
 
@@ -1048,13 +1229,6 @@ fn build_dkms_client(config: &Value) -> Result<Option<DkmsClientAuthority>, Stri
     Ok(Some(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint }))
 }
 
-/// DELEGATE one `recover` to the EXTERNAL dKMS authority node over the capsule protocol: spawn the
-/// granted `endpoint` binary, `init` it (the node resolves its OWN master store — from its config or
-/// the `DKMS_AUTHORITY_KEY_STORE` env the provisioner set; this client never passes or sees the
-/// secret store path), send the recover bundle, and return the node's sealed material `data`. The
-/// node owns spawn→teardown of its own boundary; we shut it down after the single recover. Any
-/// transport/protocol error fails closed. The runtime-core analogue of PC2's client RPCing the Lit
-/// network and only ever receiving the sealed envelope (`recoverCEKEnvelope`, `chipotle-client.ts:1438`).
 /// Verify a dKMS node's IDENTITY handshake response against the descriptor-PINNED verifying key.
 /// The node must (1) advertise exactly the pinned vk and (2) return a valid signature over the
 /// client's challenge under that vk — proving it holds the master-derived signing key BEHIND the
@@ -1088,90 +1262,6 @@ fn verify_hello_attestation(
         );
     }
     Ok(())
-}
-
-#[cfg(feature = "key-authority-ref")]
-fn delegate_to_dkms_node(
-    endpoint: &str,
-    pinned_vk_b64: &str,
-    recover_req: &Value,
-) -> Result<Value, String> {
-    use base64::Engine as _;
-    use std::io::{BufRead as _, BufReader, Write as _};
-    use std::process::{Command, Stdio};
-
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let mut child = Command::new(endpoint)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("dkms authority node ({endpoint}) failed to launch: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("dkms node: no stdin")?;
-    let mut stdout = BufReader::new(child.stdout.take().ok_or("dkms node: no stdout")?);
-
-    // One request line in, one response line out (the node's protocol).
-    let mut call = |req: &Value| -> Result<Value, String> {
-        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        writeln!(stdin, "{line}").map_err(|e| format!("write to dkms node: {e}"))?;
-        stdin.flush().map_err(|e| e.to_string())?;
-        let mut resp = String::new();
-        let n = stdout
-            .read_line(&mut resp)
-            .map_err(|e| format!("read from dkms node: {e}"))?;
-        if n == 0 {
-            return Err("dkms node closed its output unexpectedly".to_string());
-        }
-        serde_json::from_str::<Value>(resp.trim())
-            .map_err(|e| format!("dkms node sent non-JSON: {e}: {resp}"))
-    };
-
-    // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
-    // store path: the secret's location is the node's concern, never the client's.
-    let recover = (|| {
-        let init = call(&json!({ "op": "init", "config": {} }))?;
-        if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Err(format!(
-                "dkms node init failed: {}",
-                init.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error")
-            ));
-        }
-        // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything.
-        // We send a fresh random challenge and require a signature over it under the verifying key
-        // we PINNED from the descriptor — a forged/mismatched node fails closed here, never reaching
-        // recover (the runtime-core analogue of pinning the Lit network identity).
-        let challenge = ddrm_envelope::random_seed();
-        let hello = call(&json!({ "op": "hello", "challenge_b64": b64.encode(challenge) }))?;
-        if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Err(format!(
-                "dkms node hello failed: {}",
-                hello.get("message").and_then(|v| v.as_str()).unwrap_or("handshake rejected")
-            ));
-        }
-        let data = hello.get("data").ok_or("dkms node hello returned no attestation")?;
-        let node_vk_b64 = data.get("verifying_key_b64").and_then(|v| v.as_str()).unwrap_or("");
-        let attestation_b64 =
-            data.get("attestation_b64").and_then(|v| v.as_str()).unwrap_or("");
-        verify_hello_attestation(pinned_vk_b64, node_vk_b64, &challenge, attestation_b64)?;
-        call(recover_req)
-    })();
-
-    // Tear the node down regardless of outcome, then surface the result.
-    let _ = call(&json!({ "op": "shutdown" }));
-    let _ = child.wait();
-
-    let recover = recover?;
-    if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(format!(
-            "dkms node recover failed: {}",
-            recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
-        ));
-    }
-    recover
-        .get("data")
-        .cloned()
-        .ok_or_else(|| "dkms node returned ok without sealed material".to_string())
 }
 
 /// Deterministically derive the stable reference authority (signer + KEM recipient) from one
@@ -1956,6 +2046,23 @@ mod tests {
             // A malformed/empty attestation → rejected (no panic).
             assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "!!!not-base64").is_err());
             assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "").is_err());
+        }
+
+        /// The open-once/verify-once/REUSE decision: a cached session is reused only while it is
+        /// live (clock present AND before expiry); at/after expiry — and whenever we have no clock —
+        /// the client fails closed and re-establishes the handshake session rather than reuse a
+        /// possibly-expired one.
+        #[test]
+        fn dkms_session_reuse_is_gated_on_a_live_unexpired_clock() {
+            let expires_at = 1_000u64;
+            // Before expiry with a clock → reuse the existing connection + session.
+            assert!(dkms_session_live(expires_at, Some(999)));
+            // Exactly at expiry → no longer live (re-establish).
+            assert!(!dkms_session_live(expires_at, Some(1_000)));
+            // Past expiry → re-establish.
+            assert!(!dkms_session_live(expires_at, Some(1_001)));
+            // No clock → cannot prove liveness → fail closed (re-establish).
+            assert!(!dkms_session_live(expires_at, None));
         }
 
         fn reference_provider() -> KeyProvider {
