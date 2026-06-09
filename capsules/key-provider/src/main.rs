@@ -1030,5 +1030,77 @@ mod tests {
             );
             assert_eq!(error_code(response), "invalid_request");
         }
+
+        /// Orchestration handoff at the transcript level. The key authority builds the
+        /// CANONICAL shared `DecryptTranscriptV1` (the same field set + encoder the
+        /// decrypt boundary uses), computes `to_aad()`, and seals the CEK to it.
+        /// Sealing to the SHARED encoder — not an opaque blob — is precisely what lets
+        /// this SEPARATE capsule produce material the decrypt boundary opens: the
+        /// boundary rebuilds the identical transcript and the CEK unwraps; any field
+        /// change (a replayed nonce here) yields a different AAD and fails closed.
+        #[test]
+        fn reference_seal_binds_the_shared_decrypt_transcript() {
+            let b64 = b64();
+            let (session_secret, session_public) = ddrm_envelope::mint_session();
+            let pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+            let cek: Vec<u8> = (0u8..16).collect();
+
+            let transcript = ddrm_envelope::transcript::DecryptTranscriptV1 {
+                suite_id: ddrm_envelope::SUITE_PQ_HYBRID,
+                provider_id: "decrypt-provider",
+                principal_id: "did:elastos:alice",
+                session_id: "sess-1",
+                object_cid: "bafyobject",
+                content_hash: b"content-hash",
+                action: "decrypt",
+                viewer_interface: "video",
+                output_kind: "frames",
+                expires_at: 1_900_000_000,
+                release_receipt_hash: [7u8; 32],
+                decrypt_session_pub: &pub_bytes,
+                nonce: b"replay-nonce-1",
+            };
+            let aad = transcript.to_aad();
+
+            let data = ok_data(reference_provider().release_ref(
+                key_release_request(),
+                &b64.encode(&pub_bytes),
+                &b64.encode(&cek),
+                &b64.encode(&aad),
+                b64.encode(b"ciphertext"),
+                b64.encode(b"content-hash"),
+                b64.encode(b"nonce"),
+                None,
+            ));
+
+            let sealed = b64
+                .decode(data["material"]["sealed_cek_b64"].as_str().unwrap())
+                .unwrap();
+            let envelope = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).unwrap();
+            let vk = b64
+                .decode(data["seal_verifying_key_b64"].as_str().unwrap())
+                .unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
+
+            // The decrypt boundary rebuilds the IDENTICAL shared transcript -> opens.
+            let recovered =
+                ddrm_envelope::hybrid_unwrap_bound(&session_secret, &envelope, &aad, &verifier)
+                    .expect("matching shared transcript opens");
+            assert_eq!(recovered.as_slice(), cek.as_slice());
+
+            // A replayed/altered transcript field -> different AAD -> fail closed.
+            let mut replayed = transcript;
+            replayed.nonce = b"replay-nonce-2";
+            assert!(
+                ddrm_envelope::hybrid_unwrap_bound(
+                    &session_secret,
+                    &envelope,
+                    &replayed.to_aad(),
+                    &verifier
+                )
+                .is_err(),
+                "a replayed/altered transcript must fail closed across the capsule boundary"
+            );
+        }
     }
 }

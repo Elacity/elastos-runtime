@@ -47,6 +47,67 @@ const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
 /// The decrypt-material suite tag this envelope implements.
 pub const SUITE_PQ_HYBRID: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// Canonical decrypt-transcript binding (Anders' Day-45 decision) — the single
+/// encoder BOTH sides of the rail must agree on:
+///   - the **key authority** computes [`DecryptTranscriptV1::to_aad`] and seals the
+///     CEK to it (AES-256-GCM AAD + signed payload), via [`seal::seal_bound`];
+///   - the **decrypt boundary** rebuilds the SAME transcript from the authenticated
+///     request and passes its `to_aad()` to [`hybrid_unwrap_bound`].
+///
+/// Living here (not in either capsule) is what lets an external sealer — `key-provider`,
+/// a dKMS, a Lit-compat backend — produce material the decrypt boundary opens without
+/// re-implementing (and drifting from) the binding.
+pub mod transcript {
+    /// Domain separation + version for the transcript AAD. Bump only with a wire break.
+    pub const DECRYPT_TRANSCRIPT_LABEL: &[u8] = b"elastos-ddrm/decrypt-transcript/v1";
+
+    /// The exact field set the sealed material is welded to. Borrowed view — the
+    /// caller owns the field bytes (request-authenticated on the decrypt side).
+    pub struct DecryptTranscriptV1<'a> {
+        pub suite_id: &'a str,
+        pub provider_id: &'a str,
+        pub principal_id: &'a str,
+        pub session_id: &'a str,
+        pub object_cid: &'a str,
+        pub content_hash: &'a [u8],
+        pub action: &'a str,
+        pub viewer_interface: &'a str,
+        pub output_kind: &'a str,
+        pub expires_at: u64,
+        pub release_receipt_hash: [u8; 32],
+        pub decrypt_session_pub: &'a [u8],
+        pub nonce: &'a [u8],
+    }
+
+    impl DecryptTranscriptV1<'_> {
+        /// Deterministic, unambiguous AAD: a domain label then every field
+        /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
+        /// transcripts can collide and no field can be slid into another.
+        pub fn to_aad(&self) -> Vec<u8> {
+            let mut v = Vec::new();
+            let mut put = |bytes: &[u8]| {
+                v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                v.extend_from_slice(bytes);
+            };
+            put(DECRYPT_TRANSCRIPT_LABEL);
+            put(self.suite_id.as_bytes());
+            put(self.provider_id.as_bytes());
+            put(self.principal_id.as_bytes());
+            put(self.session_id.as_bytes());
+            put(self.object_cid.as_bytes());
+            put(self.content_hash);
+            put(self.action.as_bytes());
+            put(self.viewer_interface.as_bytes());
+            put(self.output_kind.as_bytes());
+            put(&self.expires_at.to_be_bytes());
+            put(&self.release_receipt_hash);
+            put(self.decrypt_session_pub);
+            put(self.nonce);
+            v
+        }
+    }
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -568,5 +629,78 @@ mod tests {
             let blob = vec![0u8; len];
             let _ = PqSealedEnvelope::from_bytes(&blob);
         }
+    }
+
+    // --- shared decrypt transcript (the AAD both sides must agree on) ----------
+
+    fn sample_transcript() -> crate::transcript::DecryptTranscriptV1<'static> {
+        crate::transcript::DecryptTranscriptV1 {
+            suite_id: SUITE_PQ_HYBRID,
+            provider_id: "decrypt-provider",
+            principal_id: "did:elastos:alice",
+            session_id: "sess-1",
+            object_cid: "bafyobject",
+            content_hash: b"content-hash-32-bytes-xxxxxxxxxx!",
+            action: "decrypt",
+            viewer_interface: "video",
+            output_kind: "frames",
+            expires_at: 1_900_000_000,
+            release_receipt_hash: [7u8; 32],
+            decrypt_session_pub: b"published-session-pubkey-bytes",
+            nonce: b"replay-nonce-1",
+        }
+    }
+
+    /// The encoder is deterministic and self-describing (domain label first), so the
+    /// authority and the decrypt boundary derive byte-identical AADs from equal fields.
+    #[test]
+    fn transcript_aad_is_deterministic_and_labelled() {
+        let aad = sample_transcript().to_aad();
+        assert_eq!(aad, sample_transcript().to_aad(), "equal fields -> equal AAD");
+        // First length-prefixed field is the domain label.
+        let label = crate::transcript::DECRYPT_TRANSCRIPT_LABEL;
+        assert_eq!(&aad[..4], &(label.len() as u32).to_be_bytes());
+        assert_eq!(&aad[4..4 + label.len()], label);
+    }
+
+    /// Any field change yields a different AAD — the binding is total, so a CEK sealed
+    /// for one transcript cannot open under another (replay / field-swap defense).
+    #[test]
+    fn transcript_aad_changes_with_every_field() {
+        let base = sample_transcript().to_aad();
+        let mut t = sample_transcript();
+        t.session_id = "sess-2";
+        assert_ne!(base, t.to_aad(), "session change must change the AAD");
+        let mut t = sample_transcript();
+        t.nonce = b"replay-nonce-2";
+        assert_ne!(base, t.to_aad(), "nonce change must change the AAD");
+        let mut t = sample_transcript();
+        t.expires_at += 1;
+        assert_ne!(base, t.to_aad(), "expiry change must change the AAD");
+    }
+
+    /// The seal/unwrap path is welded to the shared transcript: a CEK sealed to one
+    /// transcript's AAD opens under it and fails closed under any other — proving the
+    /// shared encoder is a sufficient contract for the cross-capsule handoff.
+    #[test]
+    fn transcript_bound_seal_round_trips_and_rejects_mismatch() {
+        let (secret, public) = mint_session();
+        let (signer, vk) = mldsa_seal_keypair(SEED);
+        let verifier = MlDsa65Verifier::from_encoded(&vk).expect("verifier");
+        let aad = sample_transcript().to_aad();
+
+        let env = seal_bound(&public, &cek(), &aad, &signer);
+        let opened = hybrid_unwrap_bound(&secret, &env, &aad, &verifier).expect("matching opens");
+        assert_eq!(opened.as_slice(), &cek());
+
+        // A different transcript changes the signed payload (`payload ‖ aad`), so the
+        // signature check fails closed first — before any KEM/AEAD work.
+        let mut other = sample_transcript();
+        other.principal_id = "did:elastos:mallory";
+        assert_eq!(
+            hybrid_unwrap_bound(&secret, &env, &other.to_aad(), &verifier),
+            Err(PqEnvelopeError::BadSignature),
+            "a different transcript must fail closed"
+        );
     }
 }

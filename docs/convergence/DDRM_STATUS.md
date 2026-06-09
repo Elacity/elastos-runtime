@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~59 commits**, tip Day-53 dedup COMPLETE — `decrypt-provider` re-exports the shared `ddrm-envelope`; the PQ crypto now lives in exactly one place). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~60 commits**, tip Day-54 shared decrypt-transcript — the `to_aad` binding now lives once in `ddrm-envelope`; both the key authority and the decrypt boundary derive the SAME AAD from one encoder). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,29 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🧬 Day 54 — shared decrypt-transcript `to_aad` (Phase A.4, LANDED).**
+> The transcript binding is now a **single encoder** in `ddrm-envelope::transcript`
+> (`DecryptTranscriptV1` + `to_aad`, domain-labelled, length-prefixed). This is the
+> same anti-drift move the crypto dedup made, applied to the AAD: the **key authority**
+> computes `to_aad()` and seals the CEK to it, and the **decrypt boundary** rebuilds the
+> identical transcript from the authenticated request and unwraps against it — neither
+> side owns a private copy of the field set/encoding, so a SEPARATE capsule (key-provider,
+> a dKMS, a Lit-compat backend) can now produce material the decrypt boundary opens.
+> `decrypt-provider` re-uses the shared struct under the historical `rail-bind` path
+> (byte-identical: rail-bind=60, rail-material=65, all goldens replay). `key-provider`'s
+> reference backend gains an orchestration proof (`key-authority-ref`=24): it builds the
+> CANONICAL shared transcript, seals to its `to_aad()`, and the decrypt-side
+> `hybrid_unwrap_bound` opens under the matching transcript and **fails closed** on any
+> field change (replayed nonce). `ddrm-envelope` itself grows transcript coverage
+> (lib=10): determinism, total field sensitivity, and a bound seal/unwrap round-trip.
+> **Gate:** full ladder INTACT (decrypt counts unchanged; `ddrm-envelope`=10,
+> `key-authority-ref`=24 pinned), wasm clean, drift PASS, no new warnings.
+> **Next (Phase A.4 cont.):** a cross-binary dev-profile orchestration smoke that runs
+> `drm/open → rights → key (reference) → decrypt (OpenSessionV1)` across the REAL capsule
+> entrypoints — minting the session in decrypt, sealing in the reference authority to the
+> shared transcript, and decrypting a segment — so a human can finally *see the consumer
+> half run end to end* with no Lit, no dKMS, no chain.
 
 > **♻️ Day 53 — dedup COMPLETE: `decrypt-provider` re-exports `ddrm-envelope` (Phase A.3b, LANDED).**
 > The PQ-hybrid crypto now lives in **exactly one place**. `decrypt-provider::pq_envelope`

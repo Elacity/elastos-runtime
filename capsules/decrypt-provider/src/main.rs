@@ -173,65 +173,20 @@ fn parse_decrypt_suite(suite: &str) -> Option<DecryptSuite> {
     }
 }
 
-/// Canonical decrypt transcript (feature `rail-bind`) — the exact field set Anders
-/// requires the sealed material to bind (Day-45 decision): principal, session,
-/// object CID + content hash, action, viewer interface, output kind, expiry,
-/// release-receipt hash, decrypt-session public key, algorithm suite, provider
-/// identity, and a replay nonce. `to_aad()` is a domain-separated, length-prefixed
-/// encoding used as the AES-256-GCM AAD and signed alongside the envelope, so any
-/// mismatch fails closed before a CEK exists.
+/// The canonical decrypt transcript (feature `rail-bind`, Anders' Day-45 field set:
+/// principal, session, object CID + content hash, action, viewer interface, output
+/// kind, expiry, release-receipt hash, decrypt-session public key, algorithm suite,
+/// provider identity, replay nonce) now lives ONCE in the shared `ddrm-envelope`
+/// crate, so the key authority computes the SAME `to_aad()` it seals to and this
+/// boundary rebuilds — no parallel encoder to drift. Re-used here under the
+/// historical path. See `ddrm_envelope::transcript::DecryptTranscriptV1`.
 #[cfg(feature = "rail-bind")]
-struct DecryptTranscriptV1<'a> {
-    suite_id: &'a str,
-    provider_id: &'a str,
-    principal_id: &'a str,
-    session_id: &'a str,
-    object_cid: &'a str,
-    content_hash: &'a [u8],
-    action: &'a str,
-    viewer_interface: &'a str,
-    output_kind: &'a str,
-    expires_at: u64,
-    release_receipt_hash: [u8; 32],
-    decrypt_session_pub: &'a [u8],
-    nonce: &'a [u8],
-}
+use ddrm_envelope::transcript::DecryptTranscriptV1;
 
-#[cfg(feature = "rail-bind")]
-const DECRYPT_TRANSCRIPT_LABEL: &[u8] = b"elastos-ddrm/decrypt-transcript/v1";
 #[cfg(feature = "rail-bind")]
 const DECRYPT_SUITE_ID: &str = "elastos-pq-hybrid-threshold-v0";
 #[cfg(feature = "rail-bind")]
 const DECRYPT_PROVIDER_ID: &str = "decrypt-provider";
-
-#[cfg(feature = "rail-bind")]
-impl DecryptTranscriptV1<'_> {
-    /// Deterministic, unambiguous AAD: a domain label then every field
-    /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
-    /// transcripts can collide and no field can be slid into another.
-    fn to_aad(&self) -> Vec<u8> {
-        let mut v = Vec::new();
-        let mut put = |bytes: &[u8]| {
-            v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            v.extend_from_slice(bytes);
-        };
-        put(DECRYPT_TRANSCRIPT_LABEL);
-        put(self.suite_id.as_bytes());
-        put(self.provider_id.as_bytes());
-        put(self.principal_id.as_bytes());
-        put(self.session_id.as_bytes());
-        put(self.object_cid.as_bytes());
-        put(self.content_hash);
-        put(self.action.as_bytes());
-        put(self.viewer_interface.as_bytes());
-        put(self.output_kind.as_bytes());
-        put(&self.expires_at.to_be_bytes());
-        put(&self.release_receipt_hash);
-        put(self.decrypt_session_pub);
-        put(self.nonce);
-        v
-    }
-}
 
 /// Bind the release receipt into the transcript by hashing its identifying fields
 /// (Anders: "release receipt hash"). Deterministic + domain-separated.
