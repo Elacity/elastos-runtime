@@ -1097,9 +1097,6 @@ pub(crate) async fn run(cmd: WebspaceCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        _ => Err(anyhow::anyhow!(
-            "this WebSpace CLI command is not wired to the current webspace-provider bridge yet; supported commands are resolve and list"
-        )),
     };
 
     let _ = bridge.shutdown().await;

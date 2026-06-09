@@ -663,6 +663,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/s/:cid", get(redirect_cid_root))
         .route("/s/:cid/", get(serve_cid_root))
         .route("/s/:cid/*path", get(serve_cid_file))
+        .route("/content/:cid", get(serve_ipfs_cid_root))
         // IPFS-compatible paths so install.sh can use this gateway like ipfs.io
         .route("/ipfs/:cid", get(serve_ipfs_cid_root))
         .route("/ipfs/:cid/", get(serve_cid_root))
