@@ -57,7 +57,7 @@ shared `protected_content` contracts.
 | 7 Key release | `key-provider` (`release`) | 🟥 validates rights receipt then `not_configured`; **needs a key authority (dKMS)** | `capsules/key-provider` |
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
-| — Orchestrator | `drm-provider` (`open`) | 🟥 declares canonical sequence, returns `not_configured` | `capsules/drm-provider` |
+| — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
 
 **Headline:** the **hardest, most security-critical boundary — decrypt — is done**
 (transcript-bound, in-sandbox minted key, expiry+audit, suite-tagged material, all
@@ -136,7 +136,7 @@ flowchart TB
     MKT[content-market 🟩<br/>reconstruct / enrich / from_event]
   end
   subgraph cons["CONSUMER — decrypt DONE, wiring pending"]
-    DRM[drm-provider 🟥<br/>declares sequence]
+    DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟥<br/>pluggable; needs live authority]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -243,6 +243,14 @@ decrypt-provider OpenSessionV1`.
   A.4 shared decrypt-transcript encoder + **the consumer half now RUNS end to end** via
   `scripts/ddrm-consumer-smoke.sh` — the real capsule binaries seal a golden CEK to a
   freshly-minted decrypt session and decrypt a CENC segment, fail-closed, no external deps.
+- **Status (Day 67):** the orchestrator is no longer a skeleton — `drm-provider::open`
+  emits a typed, executable **`DrmOpenPlanV1`** (status `planned`, never `opened`): the
+  capsule-owned canonical `drm/open` sequence + its inter-step binding edges (rights ⇒
+  `RightsDecisionReceiptV1` → `key.rights_receipt`; key ⇒ `ReleaseReceiptV1` →
+  `decrypt.release_receipt`; one content identity == KID under both `content_id`/`object_cid`),
+  holding zero authority (it PLANS, the runtime EXECUTES). `ddrm-consumer-smoke.sh` now drives
+  the REAL `drm open` and FOLLOWS the plan (order + binding edges + content identity) instead
+  of a hardcoded sequence — one canonical path owned by the capsule (PRINCIPLES #10).
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
 - **Still dev-shaped:** the orchestrator stands in for the runtime core (holds no keys);

@@ -153,7 +153,7 @@ flowchart TB
     MKT["content-market<br/>reconstruct_listing / enrich_listing / listing_from_event<br/>🟩 fail-closed"]
   end
   subgraph CONS["CONSUMER half"]
-    DRM["drm-provider<br/>declares drm/open sequence<br/>🟥 not wired"]
+    DRM["drm-provider<br/>emits DrmOpenPlanV1 (canonical seq + binding edges)<br/>🟩 planned, zero authority"]
     RTS["rights-provider<br/>chain-rights -> RightsDecisionReceiptV1<br/>🟦 (feature: chain-rights)"]
     CHN["chain-provider::has_access_by_content_id<br/>✅ typed + tested"]
     KEY["key-provider<br/>pluggable backends; release / release_from_escrow_ref<br/>🟥 needs a live authority (dKMS)"]
@@ -206,6 +206,7 @@ green + clippy clean. Commits are on `feat/decrypt-provider-cenc`.
 | 64 | C | **`content-market::reconstruct_listing`**: a `ContentListingV1` PURELY from the self-describing mint calldata; `ddrm-market-smoke.sh`. |
 | 65 | C | **`content-market::enrich_listing`**: fuses `metadata.json` fail-closed — **rejects any metadata whose `kid != contentId`** (a hardening over PC2, which trusts `metadata.kid`). |
 | 66 | C | **`content-market::listing_from_event`**: decodes real `DigitalAssetRegistered`/`AssetCreated` logs; the event path agrees with the calldata path cross-binary. |
+| 67 | **A wiring** | **`drm-provider::open` → executable `DrmOpenPlanV1`** (status `planned`, never `opened`): the capsule-owned canonical `drm/open` sequence + inter-step **binding edges** (rights⇒`RightsDecisionReceiptV1`→`key.rights_receipt`; key⇒`ReleaseReceiptV1`→`decrypt.release_receipt`; content identity==KID under both `content_id`/`object_cid`), zero authority. Consumer smoke now FOLLOWS the plan instead of hardcoding the order (PRINCIPLES #10). drm-provider=15. |
 
 **Blocked / upstream-only:** fold `SealedDecryptMaterialV1` into the shared `elastos-common`
 contract (needs push access); dKMS-direct sealing producer (needs Anders).
@@ -222,8 +223,11 @@ contract (needs push access); dKMS-direct sealing producer (needs Anders).
 3. **Key authority backend** — make one `key-provider` backend *actually release* (the
    PQ-hybrid dKMS reference, or a Lit-compat backend) so the consumer half runs without the
    dev escrow shim.
-4. **`drm-provider` orchestration** — wire the declared `drm/open` sequence
-   (`rights → key → decrypt`) end to end.
+4. **Runtime-core plan execution** — Day 67 landed `drm-provider::open → DrmOpenPlanV1`
+   (the capsule-owned canonical sequence + binding edges, `planned`), and the consumer
+   smoke now FOLLOWS it. The remaining step is the **runtime core** (not the dev
+   orchestrator) executing that plan default-on — blocked on the core's provider→provider
+   rail being available to drive it; until then the dev orchestrator stands in.
 5. **Viewer capsule** — consume `decrypt-provider` scoped output → rendered pixels.
 
 ---
@@ -301,7 +305,7 @@ scripts/ddrm-market-smoke.sh     # publish -> chain -> content-market (reconstru
 
 Current key ladder counts (update in lockstep when you add tests): `content-market`=29,
 `publish-provider`=16, `encrypt-provider [escrow]`=19, `key-provider [key-authority-ref]`=27,
-`decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10.
+`decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10, `drm-provider`=15.
 
 ---
 

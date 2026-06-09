@@ -119,8 +119,28 @@ fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
     }
 }
 
-fn decrypt_request() -> Value {
+/// The key step's release receipt, in the shape the decrypt boundary consumes.
+fn release_receipt_json() -> Value {
     json!({
+        "schema": RR_SCHEMA,
+        "request_id": RR_REQUEST_ID,
+        "object_cid": cid(),
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "action": ACTION,
+        "provider": RR_PROVIDER,
+        "status": RR_STATUS,
+        "issued_at": RR_ISSUED_AT,
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+/// Build the decrypt-session request, binding the release receipt under the field
+/// name the drm-provider's plan declares for the `key_release -> decrypt_session`
+/// edge (default `release_receipt`). Driving the field off the plan means a wrong
+/// edge would place the receipt under an unknown field and fail closed.
+fn decrypt_request(release_field: &str) -> Value {
+    let mut req = json!({
         "schema": "elastos.decrypt.session.request/v1",
         "request_id": "decrypt:consumer-smoke",
         "principal_id": PRINCIPAL,
@@ -128,22 +148,14 @@ fn decrypt_request() -> Value {
         "object_cid": cid(),
         "action": ACTION,
         "viewer_interface": VIEWER,
-        "release_receipt": {
-            "schema": RR_SCHEMA,
-            "request_id": RR_REQUEST_ID,
-            "object_cid": cid(),
-            "principal_id": PRINCIPAL,
-            "session_id": SESSION,
-            "action": ACTION,
-            "provider": RR_PROVIDER,
-            "status": RR_STATUS,
-            "issued_at": RR_ISSUED_AT,
-            "expires_at": EXPIRES_AT,
-        },
         "output_kind": OUTPUT_KIND,
         "reason": "open protected document",
         "expires_at": EXPIRES_AT,
-    })
+    });
+    req.as_object_mut()
+        .expect("decrypt request is an object")
+        .insert(release_field.to_string(), release_receipt_json());
+    req
 }
 
 fn rights_access_request() -> Value {
@@ -185,15 +197,17 @@ fn fallback_rights_receipt() -> Value {
     })
 }
 
-fn key_release_request(rights_receipt: Value) -> Value {
-    json!({
+/// Build the key-release request, binding the rights decision receipt under the
+/// field name the drm-provider's plan declares for the `rights_check -> key_release`
+/// edge (default `rights_receipt`).
+fn key_release_request(rights_receipt: Value, rights_field: &str) -> Value {
+    let mut req = json!({
         "schema": "elastos.key_release.request/v1",
         "request_id": RR_REQUEST_ID,
         "principal_id": PRINCIPAL,
         "session_id": SESSION,
         "object_cid": cid(),
         "action": ACTION,
-        "rights_receipt": rights_receipt,
         "key_envelope": {
             "scheme": "elastos-pq-hybrid-threshold-v0",
             "kid": "kid:smoke",
@@ -208,7 +222,82 @@ fn key_release_request(rights_receipt: Value) -> Value {
         },
         "reason": "open protected document",
         "expires_at": EXPIRES_AT,
+    });
+    req.as_object_mut()
+        .expect("key release request is an object")
+        .insert(rights_field.to_string(), rights_receipt);
+    req
+}
+
+/// The `drm/open` request: a sealed object whose KID is the content identity the
+/// chain keys on. The drm-provider validates it and returns the canonical open plan.
+fn drm_open_request() -> Value {
+    json!({
+        "op": "open",
+        "request": {
+            "object": {
+                "schema": "elastos.sealed.object/v1",
+                "payload_cid": "bafybeigpayload",
+                "rights_policy_cid": "bafybeigpolicy",
+                "availability_receipt_cid": "bafybeigreceipt",
+                "key_envelope": {
+                    "scheme": "elastos-pq-hybrid-threshold-v0",
+                    "kid": cid(),
+                    "wrapped_cek": "wrapped",
+                    "policy_hash": "sha256:smoke",
+                    "algorithms": {
+                        "cipher": "aes-256-gcm",
+                        "signature": ["ed25519", "ml-dsa-65"],
+                        "kem": ["x25519", "ml-kem-768"],
+                        "share_scheme": "shamir-t-of-n",
+                    },
+                },
+                "viewer": { "required_interface": VIEWER },
+            },
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "action": ACTION,
+            "reason": "open protected document",
+        }
     })
+}
+
+/// The request field a plan binding edge declares for an artifact flowing into a
+/// step — so the orchestrator threads receipts where the PLAN says, not where a
+/// hardcoded literal says.
+fn plan_binding_field(plan: &Value, produces: &str, into_step: &str) -> Result<String, String> {
+    plan["bindings"]
+        .as_array()
+        .and_then(|edges| {
+            edges.iter().find(|b| {
+                b["produces"].as_str() == Some(produces)
+                    && b["into_step"].as_str() == Some(into_step)
+            })
+        })
+        .and_then(|b| b["into_field"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("plan declares no binding {produces} -> {into_step}"))
+}
+
+/// Assert the canonical order the runtime must follow: the rights check precedes the
+/// key release, which precedes the decrypt session.
+fn assert_plan_order(plan: &Value) -> Result<(), String> {
+    let steps = plan["steps"].as_array().ok_or("plan has no steps")?;
+    let pos = |provider: &str, op: &str| {
+        steps.iter().position(|s| {
+            s["provider"].as_str() == Some(provider) && s["operation"].as_str() == Some(op)
+        })
+    };
+    let rights = pos("rights", "has_access_by_content_id").ok_or("plan missing rights step")?;
+    let key = pos("key", "release").ok_or("plan missing key step")?;
+    let decrypt = pos("decrypt", "open_session").ok_or("plan missing decrypt step")?;
+    if rights < key && key < decrypt {
+        Ok(())
+    } else {
+        Err(format!(
+            "plan steps out of canonical order: rights={rights} key={key} decrypt={decrypt}"
+        ))
+    }
 }
 
 /// Rebuild the canonical decrypt-transcript AAD exactly as the decrypt boundary will,
@@ -333,14 +422,44 @@ fn run(args: &[String]) -> Result<(), String> {
 
     println!("== dDRM consumer-half smoke (drm -> rights -> key -> decrypt) ==");
 
-    // --- front of chain: prove the providers are sequenced + alive (real ops). ------
-    if let Some(bin) = drm_bin {
+    // --- front of chain: ask the REAL drm-provider for the canonical open PLAN. -----
+    // The orchestrator no longer hardcodes the rights -> key -> decrypt order; it
+    // drives `drm open`, then FOLLOWS the plan: its declared step order and its
+    // binding edges (which receipt feeds which next-step field). The drm-provider
+    // holds no authority and decrypts nothing — it only emits the plan (`planned`).
+    let plan = if let Some(bin) = drm_bin {
         let mut drm = Capsule::spawn("drm-provider", bin)?;
-        let resp = drm.call(&json!({ "op": "status" }))?;
-        ok_data(&resp, "drm status")?;
-        step(1, "drm-provider: status ok (front door reachable)");
+        ok_data(&drm.call(&json!({ "op": "status" }))?, "drm status")?;
+        let plan = ok_data(&drm.call(&drm_open_request())?, "drm open")?;
         drm.shutdown();
-    }
+        if plan["status"].as_str() != Some("planned") {
+            return Err(format!("drm open must return a `planned` plan, got {plan}"));
+        }
+        if plan["content_id"].as_str() != Some(cid().as_str()) {
+            return Err(format!(
+                "plan content_id {} != the content identity flowing through the chain {}",
+                plan["content_id"], cid()
+            ));
+        }
+        if plan["action"].as_str() != Some(ACTION) {
+            return Err(format!("plan action {} != {ACTION}", plan["action"]));
+        }
+        assert_plan_order(&plan)?;
+        step(1, "drm-provider: emitted the canonical open plan (planned); following its order + bindings");
+        Some(plan)
+    } else {
+        None
+    };
+
+    // Thread receipts where the PLAN declares, not where a hardcoded literal does.
+    // Without a drm binary, fall back to the canonical field names directly.
+    let (rights_field, release_field) = match &plan {
+        Some(p) => (
+            plan_binding_field(p, "RightsDecisionReceiptV1", "key_release")?,
+            plan_binding_field(p, "ReleaseReceiptV1", "decrypt_session")?,
+        ),
+        None => ("rights_receipt".to_string(), "release_receipt".to_string()),
+    };
     // rights step: render the (mocked) on-chain ownership answer into a typed
     // RightsDecisionReceiptV1 via the REAL rights-provider (feature `chain-rights`).
     // The receipt then gates the key release. Falls back to a hardcoded receipt only
@@ -406,7 +525,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let release = ok_data(
         &key.call(&json!({
             "op": "release_ref",
-            "request": key_release_request(rights_receipt.clone()),
+            "request": key_release_request(rights_receipt.clone(), &rights_field),
             "decrypt_session_pub_b64": session_pub_b64,
             "cek_b64": GOLDEN_CEK_B64,
             "aad_b64": B64.encode(&aad),
@@ -430,7 +549,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // --- decrypt: push the sealed material in, unwrap in-VM, decrypt the segment. ----
     let open = decrypt.call(&json!({
         "op": "open_session_v1",
-        "request": decrypt_request(),
+        "request": decrypt_request(&release_field),
         "material": material,
         "now_unix": NOW_UNIX,
     }))?;
@@ -462,7 +581,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let bad_release = ok_data(
         &key.call(&json!({
             "op": "release_ref",
-            "request": key_release_request(rights_receipt.clone()),
+            "request": key_release_request(rights_receipt.clone(), &rights_field),
             "decrypt_session_pub_b64": session_pub_b64,
             "cek_b64": GOLDEN_CEK_B64,
             "aad_b64": B64.encode(&bad_aad),
@@ -476,7 +595,7 @@ fn run(args: &[String]) -> Result<(), String> {
     )?;
     let bad_open = decrypt.call(&json!({
         "op": "open_session_v1",
-        "request": decrypt_request(),
+        "request": decrypt_request(&release_field),
         "material": bad_release["material"].clone(),
         "now_unix": NOW_UNIX,
     }))?;

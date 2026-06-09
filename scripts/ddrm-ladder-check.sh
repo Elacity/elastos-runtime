@@ -37,7 +37,7 @@ rc=0
 LADDER=(
   "encrypt-provider (default)|encrypt-provider||17"
   "encrypt-provider escrow|encrypt-provider|escrow|19"
-  "drm-provider (default)|drm-provider||12"
+  "drm-provider (default)|drm-provider||15"
   "publish-provider (default)|publish-provider||16"
   "content-market (default)|content-market||29"
   "rights-provider (default)|rights-provider||9"
