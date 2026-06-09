@@ -1,0 +1,39 @@
+[package]
+name = "ddrm-envelope"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS dDRM PQ-hybrid CEK-seal envelope — single source of truth shared by the key authority (seal) and the decrypt boundary (unwrap)"
+license = "MIT"
+
+[lib]
+name = "ddrm_envelope"
+path = "src/lib.rs"
+
+[features]
+# hybrid: the migration-period seal-signature verifier where a classical
+# ECDSA-P256 signature AND a PQ ML-DSA-65 signature must both verify. OFF by
+# default; the product root is straight ML-DSA-65.
+hybrid = ["p256"]
+
+[dependencies]
+# Hybrid KEM (x25519 + ML-KEM-768), AEAD wrap, KDF — the runtime PQ-hybrid profile.
+ml-kem = "0.2.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+sha2 = { version = "0.10", default-features = false }
+zeroize = "1"
+# ML-DSA-65 (FIPS 204) seal signature. Sign (key authority) + verify (decrypt
+# boundary). Deterministic from-seed keygen keeps committed KATs reproducible.
+ml-dsa = { version = "0.1", default-features = false }
+# Seal + mint need entropy (KEM encapsulate, ephemeral DH, nonce, keygen). On
+# wasm32-wasip1 getrandom resolves to WASI `random_get`.
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
+# Classical half of the hybrid verifier (feature `hybrid` only).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

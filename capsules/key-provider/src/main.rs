@@ -96,6 +96,34 @@ enum Request {
     Release {
         request: Box<KeyReleaseRequestV1>,
     },
+    /// Reference key-authority seal (feature `key-authority-ref`, Phase A.2).
+    /// Capsule-local op so the shared `KeyReleaseRequestV1` stays byte-identical:
+    /// seal a recovered CEK to a decrypt session's published key and return the
+    /// suite-tagged `SealedDecryptMaterialV1` the decrypt boundary opens.
+    #[cfg(feature = "key-authority-ref")]
+    ReleaseRef {
+        request: Box<KeyReleaseRequestV1>,
+        /// The decrypt boundary's published session public key (Day-47 rail-mint):
+        /// base64 of `ddrm_envelope::session_public_bytes`.
+        decrypt_session_pub_b64: String,
+        /// The recovered CEK to seal. In production the reference authority recovers
+        /// this from the dKMS-wrapped envelope; the dev reference backend is handed
+        /// it directly through this capsule-local op (never on the shared contract).
+        /// Sealed immediately, held in `Zeroizing`, and never echoed back.
+        cek_b64: String,
+        /// Canonical decrypt-transcript bytes the seal is bound to (AES-256-GCM AAD
+        /// + signed payload). Empty = unbound. The full `DecryptTranscriptV1`
+        /// encoding becomes shared when the contract opens.
+        #[serde(default)]
+        aad_b64: String,
+        /// Content fields carried straight into the material (the authority does not
+        /// touch them).
+        ciphertext_b64: String,
+        content_hash_b64: String,
+        nonce_b64: String,
+        #[serde(default)]
+        init_segment_b64: Option<String>,
+    },
     Shutdown,
 }
 
@@ -129,11 +157,24 @@ impl Response {
     }
 }
 
-#[derive(Debug, Default)]
+/// The in-runtime reference key authority: a deterministic ML-DSA-65 seal signer +
+/// its published verifying key. Dev-only (feature `key-authority-ref`); production
+/// uses the `dkms` backend.
+#[cfg(feature = "key-authority-ref")]
+struct ReferenceAuthority {
+    signer: ddrm_envelope::seal::MlDsaSealSigner,
+    verifying_key: Vec<u8>,
+}
+
+#[derive(Default)]
 struct KeyProvider {
     /// Active key-delivery backend, selected by operator/runtime config at `init`.
     /// `None` = no authority configured = `release` fails closed.
     backend: Option<KeyAuthorityBackend>,
+    /// The reference seal authority, constructed at `init` when the `reference`
+    /// backend is selected (feature `key-authority-ref`).
+    #[cfg(feature = "key-authority-ref")]
+    reference: Option<ReferenceAuthority>,
 }
 
 impl KeyProvider {
@@ -142,6 +183,26 @@ impl KeyProvider {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
             Request::Release { request } => self.release(*request),
+            #[cfg(feature = "key-authority-ref")]
+            Request::ReleaseRef {
+                request,
+                decrypt_session_pub_b64,
+                cek_b64,
+                aad_b64,
+                ciphertext_b64,
+                content_hash_b64,
+                nonce_b64,
+                init_segment_b64,
+            } => self.release_ref(
+                *request,
+                &decrypt_session_pub_b64,
+                &cek_b64,
+                &aad_b64,
+                ciphertext_b64,
+                content_hash_b64,
+                nonce_b64,
+                init_segment_b64,
+            ),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -163,12 +224,116 @@ impl KeyProvider {
             }
         }
 
+        // Stand up the reference seal authority when that backend is selected.
+        #[cfg(feature = "key-authority-ref")]
+        {
+            self.reference = match self.backend {
+                Some(KeyAuthorityBackend::Reference) => {
+                    let (signer, verifying_key) =
+                        ddrm_envelope::seal::mldsa_seal_keypair(ref_seal_seed(&config));
+                    Some(ReferenceAuthority {
+                        signer,
+                        verifying_key,
+                    })
+                }
+                _ => None,
+            };
+        }
+
         Response::ok(json!({
             "provider": "key",
             "protocol_version": "1.0",
             "configured": false,
             "active_backend": self.backend.map(KeyAuthorityBackend::tag),
             "supported_operations": ["status", "release"],
+        }))
+    }
+
+    /// Reference key-authority seal (feature `key-authority-ref`, Phase A.2). Runs
+    /// the same fail-closed validation as `release`, requires the `reference`
+    /// backend, then seals the recovered CEK to the decrypt boundary's published
+    /// session key via the shared `ddrm-envelope` crate — the SAME code the decrypt
+    /// boundary unwraps with. The CEK is held in `Zeroizing` and only ever leaves
+    /// this boundary SEALED (the response carries no raw CEK).
+    #[cfg(feature = "key-authority-ref")]
+    #[allow(clippy::too_many_arguments)]
+    fn release_ref(
+        &self,
+        request: KeyReleaseRequestV1,
+        decrypt_session_pub_b64: &str,
+        cek_b64: &str,
+        aad_b64: &str,
+        ciphertext_b64: String,
+        content_hash_b64: String,
+        nonce_b64: String,
+        init_segment_b64: Option<String>,
+    ) -> Response {
+        use base64::Engine as _;
+        use zeroize::Zeroizing;
+
+        if let Err(err) = validate_key_release_request(&request) {
+            return Response::error("invalid_request", err);
+        }
+
+        let authority = match (self.backend, self.reference.as_ref()) {
+            (Some(KeyAuthorityBackend::Reference), Some(authority)) => authority,
+            _ => {
+                return Response::error(
+                    "not_configured",
+                    "release_ref requires the reference key authority backend",
+                );
+            }
+        };
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pub_bytes = match b64.decode(decrypt_session_pub_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Response::error(
+                    "invalid_request",
+                    "decrypt_session_pub_b64 is not valid base64",
+                )
+            }
+        };
+        let public = match ddrm_envelope::session_public_from_bytes(&pub_bytes) {
+            Some(public) => public,
+            None => {
+                return Response::error(
+                    "invalid_request",
+                    "decrypt_session_pub_b64 is not a valid session public key",
+                )
+            }
+        };
+        let aad = match b64.decode(aad_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "aad_b64 is not valid base64"),
+        };
+        let cek = match b64.decode(cek_b64) {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(_) => return Response::error("invalid_request", "cek_b64 is not valid base64"),
+        };
+
+        // Seal — the CEK leaves this boundary only as sealed material.
+        let envelope =
+            ddrm_envelope::seal::seal_bound(&public, cek.as_slice(), &aad, &authority.signer);
+        let sealed_cek_b64 = b64.encode(envelope.to_bytes());
+
+        let mut material = json!({
+            "suite": ddrm_envelope::SUITE_PQ_HYBRID,
+            "sealed_cek_b64": sealed_cek_b64,
+            "ciphertext_b64": ciphertext_b64,
+            "nonce_b64": nonce_b64,
+            "content_hash_b64": content_hash_b64,
+        });
+        if let Some(init) = init_segment_b64 {
+            material["init_segment_b64"] = json!(init);
+        }
+
+        Response::ok(json!({
+            "suite": ddrm_envelope::SUITE_PQ_HYBRID,
+            "material": material,
+            // The vk the decrypt boundary must be configured to trust for this seal.
+            "seal_verifying_key_b64": b64.encode(&authority.verifying_key),
         }))
     }
 
@@ -265,6 +430,24 @@ fn supported_backends_descriptor() -> Value {
             "state": "not_configured",
         }
     ])
+}
+
+/// The 32-byte ML-DSA-65 seed for the dev reference seal authority. Operator may
+/// pin it via `config.ref_seal_seed_b64` (32 bytes); otherwise a fixed dev seed is
+/// used (the reference backend is dev-only — production uses the `dkms` backend).
+#[cfg(feature = "key-authority-ref")]
+fn ref_seal_seed(config: &Value) -> [u8; 32] {
+    use base64::Engine as _;
+    if let Some(encoded) = config.get("ref_seal_seed_b64").and_then(|v| v.as_str()) {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) {
+            if bytes.len() == 32 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&bytes);
+                return seed;
+            }
+        }
+    }
+    [0x5Au8; 32]
 }
 
 fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), String> {
@@ -482,6 +665,7 @@ mod tests {
     fn configured(backend: KeyAuthorityBackend) -> KeyProvider {
         KeyProvider {
             backend: Some(backend),
+            ..Default::default()
         }
     }
 
@@ -682,6 +866,169 @@ mod tests {
         match response {
             Response::Error { code, .. } => code,
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    // --- reference key-authority seal engine (Phase A.2) --------------------
+
+    #[cfg(feature = "key-authority-ref")]
+    mod reference_backend {
+        use super::*;
+        use base64::Engine as _;
+
+        fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+            base64::engine::general_purpose::STANDARD
+        }
+
+        fn reference_provider() -> KeyProvider {
+            let mut provider = KeyProvider::default();
+            // init must succeed and stand up the reference authority.
+            assert!(matches!(
+                provider.init(json!({ "backend": "reference" })),
+                Response::Ok { .. }
+            ));
+            assert!(provider.reference.is_some());
+            provider
+        }
+
+        #[test]
+        fn reference_seal_round_trips_through_the_decrypt_unwrap() {
+            let b64 = b64();
+            let (session_secret, session_public) = ddrm_envelope::mint_session();
+            let pub_b64 = b64.encode(ddrm_envelope::session_public_bytes(&session_public));
+            let cek: Vec<u8> = (0u8..16).collect();
+            let aad = b"transcript:principal=alice;session=s1;object=cid1";
+
+            let response = reference_provider().release_ref(
+                key_release_request(),
+                &pub_b64,
+                &b64.encode(&cek),
+                &b64.encode(aad),
+                b64.encode(b"ciphertext"),
+                b64.encode(b"content-hash"),
+                b64.encode(b"nonce"),
+                None,
+            );
+            let data = ok_data(response);
+
+            // Material is the exact suite-tagged shape the decrypt boundary opens.
+            let material = &data["material"];
+            assert_eq!(material["suite"], ddrm_envelope::SUITE_PQ_HYBRID);
+            assert!(material["sealed_cek_b64"].is_string());
+            assert_eq!(material["ciphertext_b64"], b64.encode(b"ciphertext"));
+
+            // The sealed material the reference authority produced is opened by the
+            // SAME unwrap the decrypt boundary uses — the key->decrypt handoff is
+            // wire-compatible end to end, with no raw CEK on the wire.
+            let sealed = b64
+                .decode(material["sealed_cek_b64"].as_str().unwrap())
+                .unwrap();
+            let envelope = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).unwrap();
+            let vk = b64
+                .decode(data["seal_verifying_key_b64"].as_str().unwrap())
+                .unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
+            let recovered =
+                ddrm_envelope::hybrid_unwrap_bound(&session_secret, &envelope, aad, &verifier)
+                    .unwrap();
+            assert_eq!(recovered.as_slice(), cek.as_slice());
+
+            // The raw CEK appears nowhere in the response.
+            let serialized = serde_json::to_string(&data).unwrap();
+            assert!(!serialized.contains(&b64.encode(&cek)));
+        }
+
+        #[test]
+        fn reference_seal_binds_the_transcript() {
+            let b64 = b64();
+            let (session_secret, session_public) = ddrm_envelope::mint_session();
+            let pub_b64 = b64.encode(ddrm_envelope::session_public_bytes(&session_public));
+            let cek: Vec<u8> = (0u8..16).collect();
+
+            let data = ok_data(reference_provider().release_ref(
+                key_release_request(),
+                &pub_b64,
+                &b64.encode(&cek),
+                &b64.encode(b"transcript-A"),
+                b64.encode(b"c"),
+                b64.encode(b"h"),
+                b64.encode(b"n"),
+                None,
+            ));
+            let sealed = b64
+                .decode(data["material"]["sealed_cek_b64"].as_str().unwrap())
+                .unwrap();
+            let envelope = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).unwrap();
+            let vk = b64
+                .decode(data["seal_verifying_key_b64"].as_str().unwrap())
+                .unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
+
+            // A CEK sealed for transcript-A cannot be opened under a different one.
+            assert!(ddrm_envelope::hybrid_unwrap_bound(
+                &session_secret,
+                &envelope,
+                b"transcript-B",
+                &verifier
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn reference_seal_fails_closed_on_malformed_session_pub() {
+            let b64 = b64();
+            let response = reference_provider().release_ref(
+                key_release_request(),
+                "!!! not base64 !!!",
+                &b64.encode([0u8; 16]),
+                "",
+                b64.encode(b"c"),
+                b64.encode(b"h"),
+                b64.encode(b"n"),
+                None,
+            );
+            assert_eq!(error_code(response), "invalid_request");
+        }
+
+        #[test]
+        fn release_ref_requires_the_reference_backend() {
+            let b64 = b64();
+            let (_secret, public) = ddrm_envelope::mint_session();
+            // Configure a different backend; the reference seal op must fail closed.
+            let mut provider = KeyProvider::default();
+            provider.init(json!({ "backend": "lit" }));
+
+            let response = provider.release_ref(
+                key_release_request(),
+                &b64.encode(ddrm_envelope::session_public_bytes(&public)),
+                &b64.encode([0u8; 16]),
+                "",
+                b64.encode(b"c"),
+                b64.encode(b"h"),
+                b64.encode(b"n"),
+                None,
+            );
+            assert_eq!(error_code(response), "not_configured");
+        }
+
+        #[test]
+        fn release_ref_validation_precedes_seal() {
+            let b64 = b64();
+            let (_secret, public) = ddrm_envelope::mint_session();
+            let mut request = key_release_request();
+            request.rights_receipt.allowed = false;
+
+            let response = reference_provider().release_ref(
+                request,
+                &b64.encode(ddrm_envelope::session_public_bytes(&public)),
+                &b64.encode([0u8; 16]),
+                "",
+                b64.encode(b"c"),
+                b64.encode(b"h"),
+                b64.encode(b"n"),
+                None,
+            );
+            assert_eq!(error_code(response), "invalid_request");
         }
     }
 }

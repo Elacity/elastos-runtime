@@ -9,10 +9,25 @@ license = "MIT"
 name = "key-provider"
 path = "src/main.rs"
 
+[features]
+# key-authority-ref: the in-runtime REFERENCE key-delivery backend (Phase A.2).
+# The reference authority seals a recovered CEK to a decrypt session's published
+# key via the shared `ddrm-envelope` crate, producing the exact suite-tagged
+# `SealedDecryptMaterialV1` the decrypt boundary opens. Exposed through a
+# capsule-local `release_ref` op so the shared `KeyReleaseRequestV1` contract stays
+# byte-identical (Parallel Change). OFF by default — the default build + `release`
+# stay fail-closed; no raw CEK ever leaves this boundary (only sealed material).
+key-authority-ref = ["dep:ddrm-envelope", "dep:base64", "dep:zeroize"]
+
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Shared PQ-hybrid seal/unwrap — single source of truth with decrypt-provider
+# (feature `key-authority-ref` only).
+ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+base64 = { version = "0.22", optional = true }
+zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
 

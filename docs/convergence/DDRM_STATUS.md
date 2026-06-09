@@ -1,6 +1,6 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~55 commits**, tip Day-50 pluggable key authority). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~57 commits**, tip Day-51 reference key-authority seal + shared `ddrm-envelope`). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec — Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry + scoped CEK-free audit (`rail-audit`) — consolidated into the suite-tagged `SealedDecryptMaterialV1` drop-in (`rail-material`). Remaining work is upstream only (contract merge needs push; dKMS sealing needs Anders).**
 
 > **📦 Day 49 — consolidated `SealedDecryptMaterialV1` (drop-in contract shape, LANDED).**
 > The carrier is now a single backend-neutral, **suite-tagged** envelope — dKMS-native
@@ -12,6 +12,28 @@
 > the last clearly-ours decrypt-boundary task: the boundary is **complete**; what
 > remains is upstream — fold the envelope into the shared `elastos-common` contract
 > (needs push access) and the dKMS-direct sealing producer (needs Anders).
+
+> **🔑 Day 51 — reference key-authority seal engine + shared `ddrm-envelope` crate (Phase A.2, LANDED).**
+> The first backend that produces real sealed material. New shared crate
+> **`capsules/ddrm-envelope`** is the single source of truth for the PQ-hybrid
+> seal/unwrap + wire format + ML-DSA-65 signer/verifier (extracted byte-identical from
+> the proven `decrypt-provider::pq_envelope` island; the seal is **promoted to
+> production** since the key authority needs it). `key-provider`'s `reference` backend
+> (feature `key-authority-ref`) seals a recovered CEK to a decrypt session's published
+> key via this crate and emits the exact suite-tagged `SealedDecryptMaterialV1` the
+> decrypt boundary opens — exposed through a capsule-local `release_ref` op so the
+> shared `KeyReleaseRequestV1` stays byte-identical (Parallel Change). **Cross-boundary
+> proof:** a test seals with the reference authority and opens with the SAME
+> `ddrm_envelope::hybrid_unwrap_bound` the decrypt boundary uses — the key→decrypt
+> handoff is wire-compatible end to end, transcript-bound, with no raw CEK on the wire.
+> 23 key-provider tests under the feature (18 default + 5 reference: round-trip,
+> transcript binding, malformed-pubkey fail-closed, backend-required, validation-first);
+> 7 in `ddrm-envelope`. Default build stays fail-closed; decrypt-provider untouched
+> (its 10-combo ladder unchanged). Ladder pins `ddrm-envelope`=7 + `key-authority-ref`=23
+> + both wasm builds. Mirrors PC2 `envelopeCEK` (`universal-decrypt-chipotle.js`).
+> **Next (Phase A.3):** migrate `decrypt-provider` onto `ddrm-envelope` (pure refactor,
+> gated by the committed goldens) to delete the duplication and yield the literal
+> cross-capsule golden; then wire the orchestration (`drm/open → rights → key → decrypt`).
 
 > **🔌 Day 50 — `key-provider` is a pluggable multi-backend authority (Phase A.1, LANDED).**
 > Confirmed Anders' model in code: `key-provider` is the *authority boundary*, hosting
