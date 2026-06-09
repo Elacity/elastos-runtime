@@ -108,7 +108,41 @@ struct PublishRequestV1 {
     /// Paid listings only: number of access-token copies to mint.
     #[serde(default)]
     copies: Option<u64>,
+    /// Paid listings only: the creator's payout address (the ACCESS_TOKEN holder + the
+    /// default royalty payee). Required for a paid mint.
+    #[serde(default)]
+    creator_address: Option<String>,
+    /// Paid listings only: royalty splits. Defaults to a single 100−ELACITY_ROYALTY_PERCENT
+    /// share to the creator (PC2 app.js:1596).
+    #[serde(default)]
+    royalties: Option<Vec<RoyaltyPartner>>,
+    /// BUY_AND_RESELL only: resale royalty in basis points (PC2 default 900).
+    #[serde(default)]
+    reseller_cut: Option<u16>,
 }
+
+/// A royalty payee (PC2 `royalties[]`): `royalty` is a percent (the on-chain amount is
+/// `round(10 * royalty)`, app.js:1608). `identifier` "C" marks the distributor for
+/// BUY_AND_RESELL's DISTRIBUTION_RIGHT entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoyaltyPartner {
+    address: String,
+    royalty: f64,
+    #[serde(default)]
+    identifier: Option<String>,
+}
+
+/// PC2 role types (app.js:56–58).
+const ROLE_ACCESS_TOKEN: u64 = 1;
+const ROLE_ROYALTY_SHARE: u64 = 2;
+const ROLE_DISTRIBUTION_RIGHT: u64 = 3;
+/// Protocol cut taken automatically; the creator's default share is the remainder.
+const ELACITY_ROYALTY_PERCENT: f64 = 5.0;
+/// PC2 default resale royalty (basis points), app.js getResellerCut fallback.
+const DEFAULT_RESELLER_CUT: u16 = 900;
+/// Native (no ERC-20) payment token.
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 fn default_chain_id() -> u64 {
     8453 // Base mainnet (PC2 production)
@@ -207,16 +241,18 @@ impl PublishProvider {
         let token_uri = format!("{}/metadata.json", request.metadata_cid);
 
         // The structured args the chain capability ABI-encodes. opRawData/sellRawData are
-        // left STRUCTURED (not raw calldata) so the EVM specialist (chain-provider) owns
-        // the encoding and publish-provider stays capability-clean.
-        let mut sell = json!(null);
-        if request.op_type.is_paid() {
-            sell = json!({
-                "price_wei": request.price_wei,
-                "currency_address": request.currency_address,
-                "copies": request.copies.unwrap_or(1),
-            });
-        }
+        // left STRUCTURED (not raw calldata, in EXACTLY the shape chain-provider's
+        // `assemble_mint` consumes) so the EVM specialist owns the encoding and
+        // publish-provider stays capability-clean.
+        let (op_raw, sell) = if request.op_type.is_paid() {
+            match build_paid_terms(&request, &token_uri) {
+                Ok(terms) => terms,
+                Err(err) => return Response::error("invalid_request", err),
+            }
+        } else {
+            (Value::Null, Value::Null)
+        };
+
         let unsigned_mint = json!({
             "schema": UNSIGNED_MINT_SCHEMA,
             "chain_id": request.chain_id,
@@ -227,6 +263,8 @@ impl PublishProvider {
             "op_type_code": request.op_type.code(),
             // opRawData leads with the bytes16 contentId (PC2 app.js:1620).
             "content_id": content_id,
+            // Directly consumable by chain-provider::assemble_mint (paid only).
+            "op_raw": op_raw,
             "sell": sell,
             // The mint is payable; the fee comes from chain state, not from us.
             "value_wei": Value::Null,
@@ -254,6 +292,80 @@ impl PublishProvider {
 
         Response::ok(receipt)
     }
+}
+
+/// Build the PAID `op_raw` + `sell` terms in the EXACT shape `chain-provider::
+/// assemble_mint` consumes. Mirrors PC2 `encodeOpRawData` (app.js:1583): addresses lead
+/// with the creator as the ACCESS_TOKEN holder, then a ROYALTY_SHARE per payee
+/// (`amount = round(10 * royalty)`), plus a DISTRIBUTION_RIGHT for the BUY_AND_RESELL
+/// distributor (identifier "C", distinct from the creator). `metadata_uri = ipfs://{cid}`.
+fn build_paid_terms(request: &PublishRequestV1, _token_uri: &str) -> Result<(Value, Value), String> {
+    let creator = request
+        .creator_address
+        .as_deref()
+        .ok_or("creator_address is required for a paid op_type")?;
+    let copies = request.copies.unwrap_or(1);
+    let resellable = request.op_type == OpType::BuyAndResell;
+
+    let royalties = request.royalties.clone().unwrap_or_else(|| {
+        vec![RoyaltyPartner {
+            address: creator.to_string(),
+            royalty: 100.0 - ELACITY_ROYALTY_PERCENT,
+            identifier: Some("A".to_string()),
+        }]
+    });
+
+    let mut addresses: Vec<String> = vec![creator.to_string()];
+    let mut role_types: Vec<u64> = vec![ROLE_ACCESS_TOKEN];
+    let mut amounts: Vec<String> = vec![copies.to_string()];
+
+    for r in &royalties {
+        validate_eth_address(&r.address, "royalties[].address")?;
+        if !(r.royalty.is_finite() && r.royalty >= 0.0) {
+            return Err("royalties[].royalty must be a non-negative number".to_string());
+        }
+        addresses.push(r.address.clone());
+        role_types.push(ROLE_ROYALTY_SHARE);
+        amounts.push(((10.0 * r.royalty).round() as u64).to_string());
+    }
+
+    if resellable {
+        if let Some(dist) = royalties
+            .iter()
+            .find(|r| r.identifier.as_deref() == Some("C"))
+        {
+            if !dist.address.eq_ignore_ascii_case(creator) {
+                addresses.push(dist.address.clone());
+                role_types.push(ROLE_DISTRIBUTION_RIGHT);
+                amounts.push("1".to_string());
+            }
+        }
+    }
+
+    let pay_token = request
+        .currency_address
+        .as_deref()
+        .filter(|a| !a.is_empty())
+        .unwrap_or(ZERO_ADDRESS)
+        .to_string();
+
+    let mut op_raw = json!({
+        "metadata_uri": format!("ipfs://{}", request.metadata_cid),
+        "addresses": addresses,
+        "role_types": role_types,
+        "amounts": amounts,
+    });
+    if resellable {
+        op_raw["reseller_cut"] = json!(request.reseller_cut.unwrap_or(DEFAULT_RESELLER_CUT));
+    }
+
+    let sell = json!({
+        "copies": copies.to_string(),
+        "price_wei": request.price_wei,
+        "pay_token": pay_token,
+    });
+
+    Ok((op_raw, sell))
 }
 
 /// KID -> on-chain `bytes16` contentId. Mirrors PC2 `kidToContentId` (app.js:1568) and
@@ -288,6 +400,11 @@ fn validate_publish_request(request: &PublishRequestV1) -> Result<(), String> {
             Some(p) if !p.is_empty() => validate_decimal(p, "price_wei")?,
             _ => return Err("price_wei is required for a paid op_type".to_string()),
         }
+        // The creator's payout address (ACCESS_TOKEN holder + default royalty payee).
+        match request.creator_address.as_deref() {
+            Some(addr) if !addr.is_empty() => validate_eth_address(addr, "creator_address")?,
+            _ => return Err("creator_address is required for a paid op_type".to_string()),
+        }
         if let Some(addr) = request.currency_address.as_deref() {
             if !addr.is_empty() {
                 validate_eth_address(addr, "currency_address")?;
@@ -298,8 +415,11 @@ fn validate_publish_request(request: &PublishRequestV1) -> Result<(), String> {
         if request.price_wei.as_deref().is_some_and(|p| !p.is_empty())
             || request.currency_address.as_deref().is_some_and(|a| !a.is_empty())
             || request.copies.is_some()
+            || request.creator_address.as_deref().is_some_and(|a| !a.is_empty())
+            || request.royalties.is_some()
+            || request.reseller_cut.is_some()
         {
-            return Err("a free op_type must not carry price/currency/copies".to_string());
+            return Err("a free op_type must not carry sale/royalty terms".to_string());
         }
     }
     Ok(())
@@ -404,6 +524,8 @@ mod tests {
         PublishProvider.handle(request)
     }
 
+    const CREATOR: &str = "0x1111111111111111111111111111111111111111";
+
     fn paid_request() -> Value {
         json!({
             "schema": PUBLISH_REQUEST_SCHEMA,
@@ -414,6 +536,7 @@ mod tests {
             "op_type": "buy_once",
             "price_wei": "1000000000000000000",
             "copies": 100,
+            "creator_address": CREATOR,
         })
     }
 
@@ -549,10 +672,52 @@ mod tests {
     }
 
     #[test]
-    fn paid_publish_carries_structured_sale_terms() {
+    fn paid_publish_carries_assemble_mint_ready_sell_terms() {
         let data = ok_data(prepare(paid_request()));
         let sell = &data["unsigned_mint"]["sell"];
+        // Shape EXACTLY matches chain-provider::assemble_mint's MintSell.
         assert_eq!(sell["price_wei"], "1000000000000000000");
-        assert_eq!(sell["copies"], 100);
+        assert_eq!(sell["copies"], "100"); // decimal string for uint256
+        assert_eq!(sell["pay_token"], ZERO_ADDRESS); // native default
+    }
+
+    #[test]
+    fn paid_op_raw_mirrors_pc2_payee_arrays() {
+        let data = ok_data(prepare(paid_request()));
+        let op = &data["unsigned_mint"]["op_raw"];
+        assert_eq!(op["metadata_uri"], "ipfs://QmMetaFolderCidV0");
+        // [creator(ACCESS_TOKEN, copies), creator(ROYALTY_SHARE, round(10*95)=950)].
+        assert_eq!(op["addresses"][0], CREATOR);
+        assert_eq!(op["addresses"][1], CREATOR);
+        assert_eq!(op["role_types"][0], ROLE_ACCESS_TOKEN);
+        assert_eq!(op["role_types"][1], ROLE_ROYALTY_SHARE);
+        assert_eq!(op["amounts"][0], "100");
+        assert_eq!(op["amounts"][1], "950");
+        // BUY_ONCE carries no resellerCut (it would shift the ABI layout).
+        assert!(op["reseller_cut"].is_null());
+    }
+
+    #[test]
+    fn buy_and_resell_appends_reseller_cut_and_distribution_right() {
+        let mut req = paid_request();
+        req["op_type"] = json!("buy_and_resell");
+        req["royalties"] = json!([
+            { "address": CREATOR, "royalty": 90.0, "identifier": "A" },
+            { "address": "0x2222222222222222222222222222222222222222", "royalty": 5.0, "identifier": "C" },
+        ]);
+        let data = ok_data(prepare(req));
+        let op = &data["unsigned_mint"]["op_raw"];
+        assert_eq!(op["reseller_cut"], DEFAULT_RESELLER_CUT);
+        // creator(ACCESS) + 2 royalties + distributor(DISTRIBUTION_RIGHT).
+        assert_eq!(op["role_types"].as_array().unwrap().len(), 4);
+        assert_eq!(op["role_types"][3], ROLE_DISTRIBUTION_RIGHT);
+        assert_eq!(op["amounts"][3], "1");
+    }
+
+    #[test]
+    fn paid_publish_requires_a_creator_address() {
+        let mut req = paid_request();
+        req.as_object_mut().unwrap().remove("creator_address");
+        assert_eq!(error_code(prepare(req)), "invalid_request");
     }
 }

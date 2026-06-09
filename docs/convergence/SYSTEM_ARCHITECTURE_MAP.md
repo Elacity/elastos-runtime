@@ -205,7 +205,7 @@ authority; the CEK only ever exists, in clear, inside the decrypt sandbox.
 | AuthorityGateway `hasAccessByContentId` | `chain-provider::has_access_by_content_id` | Implemented + typed; `rights-provider` must call it |
 | `buyAccess` / operative tokens | `wallet-provider` + `chain-provider` + a content-purchase flow | Signing exists; orchestration is the gap |
 | Helia + cluster pin + `.ddrm` capsule | `ipfs-provider` + `content` + a download/seed flow | Pin/serve exist; the `.ddrm`-style launcher descriptor is missing |
-| Channel/operative mint | `publish-provider` (intent) → `chain-provider::assemble_mint` (calldata) → wallet sign → broadcast | Intent DONE (Day 61); ABI calldata DONE (Day 62, decoded-to-spec); end-to-end publish→chain wiring + live broadcast are the next step |
+| Channel/operative mint | `publish-provider` (intent) → `chain-provider::assemble_mint` (calldata) → wallet sign → broadcast | Intent DONE (Day 61); ABI calldata DONE (Day 62, decoded-to-spec); publish→chain wiring DONE cross-binary (Day 63, `ddrm-publish-smoke.sh`); live broadcast is the next step |
 | SQLite `content_catalog` indexer | a `content-market` provider | Missing; index chain events + IPFS metadata |
 | secure-view render-to-pixels | a `viewer` capsule consuming decrypt scoped output | Missing |
 | Puter IPC wallet bridge, Chipotle proxy, ela.city upload, supernode topology | **dropped** | PC2-shell / Lit-infra specific; replaced by capability model |
@@ -314,10 +314,18 @@ Wire `encrypt-provider seal` (CENC + escrow CEK to the key authority), a
   seam — capability split intact. 10 tests DECODE the calldata back against the Solidity ABI
   spec (no ethers); fail-closed on a non-`bytes16` id, bad selector/channel, free-with-terms,
   paid-without-terms, or a mismatched reseller_cut.
-- **Remaining:** wire `publish-provider`→`chain-provider` end to end (feed `UnsignedMintV1`
-  into `assemble_mint`, paid payee arrays included) + a live broadcast path, a `content-market`
-  index that scans the mint event, and real `plaintext_ref`→IPFS in the producer op (today
-  inline bytes for the smoke).
+- **Status (Day 63 — producer→chain loop closed cross-binary):** `publish-provider`'s
+  `UnsignedMintV1` now emits STRUCTURED `op_raw` (`metadata_uri, addresses, role_types,
+  amounts[, reseller_cut]`) + `sell` (`copies, price_wei, pay_token`) in the EXACT shape
+  `assemble_mint` consumes — PC2-faithful payee arrays (creator ACCESS_TOKEN + ROYALTY_SHARE
+  `amount=round(10*royalty)`, default `100−ELACITY_ROYALTY_PERCENT(5)`, BUY_AND_RESELL
+  DISTRIBUTION_RIGHT for distributor "C" + `resellerCut` default 900). `ddrm-publish-smoke.sh`
+  drives the REAL `publish (prepare) → chain (assemble_mint)` binaries so one identity flows
+  KID → contentId → mint calldata (tokenURI + sell terms intact, assembler never signs);
+  PAID and FREE both flow (publish=16, 3 new tests).
+- **Remaining:** a live broadcast path (`assemble_mint → prepare_transaction → wallet sign →
+  broadcast`), a `content-market` index that scans the mint event into a listing, and real
+  `plaintext_ref`→IPFS in the producer op (today inline bytes for the smoke).
 - **Testable:** create from `library`, publish, see it in the market, end to end.
 
 ### Phase D — Viewer + full loop
