@@ -201,6 +201,32 @@ minted secret — proven end to end with no injected secret and a fresh key per 
 Minting is the ONLY entropy the boundary needs; the unwrap path remains RNG-free
 (separate feature axis), preserving the verify-only wasm property of the lower rungs.
 
+### Short-expiry enforcement + scoped audit — LANDED (`rail-audit`, Day 48)
+
+Anders' "short expiry, audit" requirement is implemented. The `OpenSessionAudited`
+op takes an **injected capability clock** (`now_unix` — never an ambient read) and:
+- **Enforces expiry before any crypto:** if `now_unix` is past `request.expires_at`
+  or the release receipt's expiry, it fails closed with `expired` and performs no
+  unwrap (the CEK never materializes for a stale grant).
+- **Emits a scoped audit record on every decision** (`opened`|`denied`): schema
+  `elastos.ddrm/decrypt-audit@1` carrying request_id, principal, session, object,
+  action, suite, provider, decision, reason, **`transcript_hash`** (SHA-256 of the
+  bound transcript) and the timestamp — and **no CEK and no plaintext**. On `opened`
+  it also carries the scoped session; on `denied`, the reason only.
+
+Proven (`rail-audit`=62): a fresh grant opens and audits `opened`; an expired grant
+fails closed and audits `denied`/`expired` with no session; the audit envelope is
+CEK/plaintext-free on both paths. (The shared bound-open path was refactored into
+`prepare_bound_open`; `rail-bind`/`rail-mint` counts unchanged.)
+
+**Status of Anders' decrypt-side spec:** all four requirements are now implemented
+as fail-closed references — Option A push-in (`rail-live`), full-transcript binding
+(`rail-bind`), in-sandbox session key (`rail-mint`), short-expiry + audit
+(`rail-audit`). What is left is genuinely upstream and not on the decrypt boundary:
+(1) fold the `sealed_decrypt_material` envelope into the shared
+`DecryptSessionRequestV1` (needs push access); (2) the dKMS-direct sealing producer
+(or the audited key-provider re-seal migration).
+
 ## Isolation tier — wasm now, microVM as hardening (recommendation)
 
 All providers declare `type: microvm`, but the microVM substrate (CrosvmProvider)

@@ -82,6 +82,13 @@ rail-bind = ["rail-live"]
 # it builds + runs on wasm32-wasip1. OFF by default. Builds on rail-bind so the
 # minted key feeds the transcript-bound open. See DDRM_DECRYPT_RAIL.md §Transcript binding.
 rail-mint = ["rail-bind", "dep:rand_core", "dep:getrandom"]
+# rail-audit: the "short expiry, audit" half of Anders' Day-45 spec. The audited
+# open ENFORCES the grant expiry (reject when the injected `now_unix` is past the
+# request / release-receipt expiry, before any unwrap) and emits a scoped,
+# tamper-evident audit record bound to the transcript hash on EVERY decision
+# (opened|denied) — carrying no CEK and no plaintext. The clock is an injected
+# capability input, never ambient. OFF by default. See DDRM_DECRYPT_RAIL.md.
+rail-audit = ["rail-bind"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and
 # is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).

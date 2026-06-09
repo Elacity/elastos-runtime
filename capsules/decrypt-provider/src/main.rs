@@ -72,6 +72,14 @@ enum Request {
         request: Box<DecryptSessionRequestV1>,
         material: BoundRailMaterial,
     },
+    // Audited, expiry-enforcing open (feature `rail-audit`): adds the injected
+    // capability clock (`now_unix`) and returns a scoped audit envelope.
+    #[cfg(feature = "rail-audit")]
+    OpenSessionAudited {
+        request: Box<DecryptSessionRequestV1>,
+        material: BoundRailMaterial,
+        now_unix: u64,
+    },
     Shutdown,
 }
 
@@ -259,6 +267,10 @@ impl DecryptProvider {
             Request::OpenSessionBound { request, material } => {
                 self.open_session_bound(*request, &material)
             }
+            #[cfg(feature = "rail-audit")]
+            Request::OpenSessionAudited { request, material, now_unix } => {
+                self.open_session_audited(*request, &material, now_unix)
+            }
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -439,54 +451,64 @@ impl DecryptProvider {
     /// signature before any plaintext exists.
     #[cfg(feature = "rail-bind")]
     fn open_session_bound(&self, request: DecryptSessionRequestV1, material: &BoundRailMaterial) -> Response {
+        let prepared = match self.prepare_bound_open(&request, material) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        match rail_shim::decrypt_from_carrier_bound(
+            prepared.session,
+            &prepared.carrier,
+            &prepared.aad,
+            &prepared.verifier,
+        ) {
+            Ok((_plaintext, meta)) => scoped_session_response(&request, &meta),
+            Err(_) => Response::error("decrypt_failed", "decrypt session could not be opened"),
+        }
+    }
+
+    /// Validate, check provisioning, decode the carrier, and rebuild the transcript
+    /// AAD from the AUTHENTICATED request + the boundary's own provisioned state.
+    /// Shared by the bound and audited rails so the binding is identical. Returns a
+    /// fail-closed `Response` on any malformed/unprovisioned input.
+    #[cfg(feature = "rail-bind")]
+    fn prepare_bound_open(
+        &self,
+        request: &DecryptSessionRequestV1,
+        material: &BoundRailMaterial,
+    ) -> Result<PreparedBoundOpen<'_>, Response> {
         use base64::Engine as _;
 
-        if let Err(err) = validate_decrypt_session_request(&request) {
-            return Response::error("invalid_request", err);
+        if let Err(err) = validate_decrypt_session_request(request) {
+            return Err(Response::error("invalid_request", err));
         }
 
-        let session = match self.session.as_ref() {
-            Some(s) => s,
-            None => return Response::error("not_configured", "decrypt session key is not provisioned in this boundary"),
-        };
-        let session_pub = match self.session_pub.as_ref() {
-            Some(p) => p,
-            None => return Response::error("not_configured", "decrypt session public key is not published"),
-        };
-        let authority_vk = match self.authority_vk.as_ref() {
-            Some(vk) => vk,
-            None => return Response::error("not_configured", "trusted key-authority verifying key is not configured"),
-        };
+        let session = self.session.as_ref().ok_or_else(|| {
+            Response::error("not_configured", "decrypt session key is not provisioned in this boundary")
+        })?;
+        let session_pub = self.session_pub.as_ref().ok_or_else(|| {
+            Response::error("not_configured", "decrypt session public key is not published")
+        })?;
+        let authority_vk = self.authority_vk.as_ref().ok_or_else(|| {
+            Response::error("not_configured", "trusted key-authority verifying key is not configured")
+        })?;
 
         let b64 = base64::engine::general_purpose::STANDARD;
-        let sealed_cek = match b64.decode(&material.sealed_cek_b64) {
-            Ok(b) => b,
-            Err(_) => return Response::error("invalid_request", "sealed_cek_b64 is not valid base64"),
+        let decode = |s: &str, field: &str| -> Result<Vec<u8>, Response> {
+            b64.decode(s)
+                .map_err(|_| Response::error("invalid_request", format!("{field} is not valid base64")))
         };
-        let ciphertext_segment = match b64.decode(&material.ciphertext_b64) {
-            Ok(b) => b,
-            Err(_) => return Response::error("invalid_request", "ciphertext_b64 is not valid base64"),
-        };
-        let init_segment = match material.init_segment_b64.as_deref().map(|s| b64.decode(s)) {
+        let sealed_cek = decode(&material.sealed_cek_b64, "sealed_cek_b64")?;
+        let ciphertext_segment = decode(&material.ciphertext_b64, "ciphertext_b64")?;
+        let init_segment = match material.init_segment_b64.as_deref() {
             None => None,
-            Some(Ok(b)) => Some(b),
-            Some(Err(_)) => return Response::error("invalid_request", "init_segment_b64 is not valid base64"),
+            Some(s) => Some(decode(s, "init_segment_b64")?),
         };
-        let nonce = match b64.decode(&material.nonce_b64) {
-            Ok(b) => b,
-            Err(_) => return Response::error("invalid_request", "nonce_b64 is not valid base64"),
-        };
-        let content_hash = match b64.decode(&material.content_hash_b64) {
-            Ok(b) => b,
-            Err(_) => return Response::error("invalid_request", "content_hash_b64 is not valid base64"),
-        };
+        let nonce = decode(&material.nonce_b64, "nonce_b64")?;
+        let content_hash = decode(&material.content_hash_b64, "content_hash_b64")?;
 
-        let verifier = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
-            Some(v) => v,
-            None => return Response::error("not_configured", "configured key-authority verifying key is malformed"),
-        };
+        let verifier = crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk)
+            .ok_or_else(|| Response::error("not_configured", "configured key-authority verifying key is malformed"))?;
 
-        // Rebuild the transcript from the AUTHENTICATED request + provisioned state.
         let aad = DecryptTranscriptV1 {
             suite_id: DECRYPT_SUITE_ID,
             provider_id: DECRYPT_PROVIDER_ID,
@@ -504,18 +526,119 @@ impl DecryptProvider {
         }
         .to_aad();
 
-        let carrier = rail_shim::SealedDecryptCarrier {
-            profile: rail_shim::SealProfile::PqHybrid,
-            sealed_cek,
-            ciphertext_segment,
-            init_segment,
+        Ok(PreparedBoundOpen {
+            session,
+            verifier,
+            aad,
+            carrier: rail_shim::SealedDecryptCarrier {
+                profile: rail_shim::SealProfile::PqHybrid,
+                sealed_cek,
+                ciphertext_segment,
+                init_segment,
+            },
+        })
+    }
+
+    /// Audited, expiry-enforcing open (feature `rail-audit`, Anders' "short expiry,
+    /// audit"). Rejects a stale grant — `now_unix > request.expires_at` or the
+    /// release receipt expired — BEFORE any unwrap, and emits a scoped, tamper-
+    /// evident audit record (bound to the transcript hash, carrying NO CEK or
+    /// plaintext) on every decision. The clock is an injected capability input
+    /// (`now_unix`), never an ambient read.
+    #[cfg(feature = "rail-audit")]
+    fn open_session_audited(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: &BoundRailMaterial,
+        now_unix: u64,
+    ) -> Response {
+        let prepared = match self.prepare_bound_open(&request, material) {
+            Ok(p) => p,
+            // Pre-decision input/provisioning failures stay fail-closed errors
+            // (no grant existed to audit yet).
+            Err(resp) => return resp,
+        };
+        let transcript_hash = {
+            use sha2::{Digest, Sha256};
+            let h: [u8; 32] = Sha256::digest(&prepared.aad).into();
+            h
         };
 
-        match rail_shim::decrypt_from_carrier_bound(session, &carrier, &aad, &verifier) {
-            Ok((_plaintext, meta)) => scoped_session_response(&request, &meta),
-            Err(_) => Response::error("decrypt_failed", "decrypt session could not be opened"),
+        // Short-expiry enforcement — before any crypto.
+        let expired = now_unix > request.expires_at
+            || now_unix > request.release_receipt.expires_at;
+        if expired {
+            return audited_response(
+                &request,
+                &transcript_hash,
+                now_unix,
+                "denied",
+                "expired",
+                None,
+            );
+        }
+
+        match rail_shim::decrypt_from_carrier_bound(
+            prepared.session,
+            &prepared.carrier,
+            &prepared.aad,
+            &prepared.verifier,
+        ) {
+            Ok((_plaintext, meta)) => {
+                let scoped = match scoped_session_response(&request, &meta) {
+                    Response::Ok { data: Some(data) } => data,
+                    other => return other,
+                };
+                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
+            }
+            Err(_) => audited_response(&request, &transcript_hash, now_unix, "denied", "decrypt_failed", None),
         }
     }
+}
+
+/// Prepared, transcript-bound open inputs (feature `rail-bind`).
+#[cfg(feature = "rail-bind")]
+struct PreparedBoundOpen<'a> {
+    session: &'a rail_shim::SessionSecret,
+    verifier: crate::pq_envelope::mldsa::MlDsa65Verifier,
+    aad: Vec<u8>,
+    carrier: rail_shim::SealedDecryptCarrier,
+}
+
+/// Build the uniform audit envelope (feature `rail-audit`): a scoped, CEK/plaintext-
+/// free record of the decision, bound to the transcript hash. On `opened` it carries
+/// the scoped session; on `denied` it carries the reason only.
+#[cfg(feature = "rail-audit")]
+fn audited_response(
+    request: &DecryptSessionRequestV1,
+    transcript_hash: &[u8; 32],
+    now_unix: u64,
+    decision: &str,
+    reason: &str,
+    session: Option<Value>,
+) -> Response {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let audit = json!({
+        "schema": "elastos.ddrm/decrypt-audit@1",
+        "request_id": request.request_id,
+        "principal_id": request.principal_id,
+        "session_id": request.session_id,
+        "object_cid": request.object_cid,
+        "action": request.action,
+        "suite": DECRYPT_SUITE_ID,
+        "provider": DECRYPT_PROVIDER_ID,
+        "decision": decision,
+        "reason": reason,
+        "transcript_hash_b64": b64.encode(transcript_hash),
+        "timestamp": now_unix,
+    });
+    Response::ok(json!({
+        "decision": decision,
+        "audit": audit,
+        // Present only when the session actually opened.
+        "session": session,
+    }))
 }
 
 /// Decrypt a protected-content segment using session material (the decrypt-step core).
@@ -1613,5 +1736,75 @@ mod tests {
         assert_ne!(k1, k2, "each sandbox mints a fresh per-session key");
         // x25519(32) ‖ ML-KEM-768 ek(1184) = 1216 published bytes.
         assert_eq!(b64.decode(&k1).unwrap().len(), 32 + 1184);
+    }
+
+    // --- short-expiry enforcement + audit (feature `rail-audit`) ----------------
+    //
+    // Anders: "short expiry, audit." A fresh grant opens and emits an `opened`
+    // audit record; an expired grant fails closed (`expired`) BEFORE any unwrap and
+    // emits a `denied` audit record. The audit envelope is bound to the transcript
+    // hash and carries no CEK and no plaintext.
+
+    #[cfg(feature = "rail-audit")]
+    #[test]
+    fn audited_fresh_grant_opens_and_emits_audit_without_leaking() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let plaintext = b"audited fresh-grant payload";
+        let (material, session, authority_vk, pub_bytes) =
+            bound_setup([0xA1u8; 32], &req, &cek, plaintext, b"nonce-aud-1", &[0xABu8; 32]);
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let now = 1_850_000_000u64; // before expiry (1_900_000_000)
+        let resp = provider.handle(Request::OpenSessionAudited {
+            request: Box::new(req),
+            material,
+            now_unix: now,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("opened"));
+        assert_eq!(v["data"]["audit"]["decision"], json!("opened"));
+        assert_eq!(v["data"]["audit"]["timestamp"], json!(now));
+        assert!(v["data"]["audit"]["transcript_hash_b64"].is_string());
+        assert!(v["data"]["session"].is_object(), "opened carries a scoped session");
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+    }
+
+    #[cfg(feature = "rail-audit")]
+    #[test]
+    fn audited_expired_grant_fails_closed_and_audits_denied() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let plaintext = b"audited expired-grant payload";
+        let (material, session, authority_vk, pub_bytes) =
+            bound_setup([0xA2u8; 32], &req, &cek, plaintext, b"nonce-aud-2", &[0xABu8; 32]);
+        let mut provider = DecryptProvider {
+            session: Some(session),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+        };
+        let now = 2_000_000_000u64; // past expiry (1_900_000_000)
+        let resp = provider.handle(Request::OpenSessionAudited {
+            request: Box::new(req),
+            material,
+            now_unix: now,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("denied"));
+        assert_eq!(v["data"]["audit"]["reason"], json!("expired"));
+        assert!(v["data"]["session"].is_null(), "a denied open carries no session");
+        // The audit record is CEK/plaintext-free even on deny.
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
     }
 }

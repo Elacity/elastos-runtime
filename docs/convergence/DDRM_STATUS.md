@@ -1,6 +1,20 @@
 # dDRM chain — status & review package
 
-**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~51 commits**, tip Day-47 in-sandbox mint). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); Option A WIRED (`rail-live`), sealed material BINDS the full transcript (`rail-bind`), and the boundary MINTS + publishes its own per-session key in-sandbox (`rail-mint`).**
+**Branch:** `feat/decrypt-provider-cenc` (based on `origin/0.4.0`, **~52 commits**, tip Day-48 expiry+audit). **0.4.0 released — crypto core verified green on the released `v0.4.0`; rebase surface measured (see `PUSH_PLAN.md`). Anders confirmed the rail (Day 45); the decrypt boundary now implements his ENTIRE decrypt-side spec: Option A push-in (`rail-live`), full-transcript binding (`rail-bind`), in-sandbox key mint+publish (`rail-mint`), short-expiry enforcement + scoped CEK-free audit (`rail-audit`).**
+
+> **🧾 Day 48 — short-expiry enforcement + scoped audit (Anders' "short expiry, audit", LANDED).**
+> `rail-audit`=62: new `OpenSessionAudited` op takes an injected capability clock
+> (`now_unix`, never ambient), REJECTS a stale grant (`now_unix` past the request or
+> release-receipt expiry) **before any unwrap** (fail-closed `expired`), and emits a
+> scoped, tamper-evident **audit record bound to the transcript hash** on every
+> decision (`opened`|`denied`) carrying **no CEK and no plaintext**. Proven: fresh
+> grant opens + audits `opened`; expired grant fails closed + audits `denied`/
+> `expired` with no session and no unwrap attempted. The shared bound-open logic was
+> refactored into `prepare_bound_open` with `rail-bind`/`rail-mint` counts unchanged
+> (no regression). Default + every golden unchanged; drift PASS. **With this the
+> decrypt boundary implements all four of Anders' decrypt-side requirements** (push-in,
+> transcript binding, in-sandbox key, expiry+audit). Remaining is upstream only: fold
+> `sealed_decrypt_material` into the shared contract (needs push) + dKMS-direct sealing.
 
 > **🔑 Day 47 — in-sandbox session-key mint + publish (Anders' Day-45 ask, LANDED).**
 > Anders required the decrypt-provider to *"create a per-session one-time public key
