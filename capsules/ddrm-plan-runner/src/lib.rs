@@ -210,10 +210,67 @@ impl RuntimeStepRunner {
         Ok(Self { handles: map })
     }
 
+    /// Build the runner by RESOLVING each provider the plan requires from the runtime
+    /// capability table — the composition-root constructor. Calls `table.resolve` once
+    /// per required provider (handlers never re-resolve, mirroring PC2's "handlers must
+    /// NOT re-load by token", `secureViewSession.ts:13`) and fails closed if the table
+    /// holds no capability for a required provider, or hands back a handle for the wrong
+    /// provider. The final fail-closed checks (required/stray/duplicate) run in [`new`].
+    pub fn resolve_from(
+        plan: &DrmOpenPlan,
+        table: &mut dyn CapabilityTable,
+    ) -> Result<Self, String> {
+        let mut handles: Vec<Box<dyn ProviderHandle>> = Vec::new();
+        for provider in plan.required_provider_keys() {
+            let handle = table.resolve(&provider).ok_or_else(|| {
+                format!(
+                    "runtime capability table holds no handle for required provider `{provider}` — the core cannot drive the plan"
+                )
+            })?;
+            if handle.provider() != provider {
+                return Err(format!(
+                    "capability table returned a `{}` handle when asked for `{provider}`",
+                    handle.provider()
+                ));
+            }
+            handles.push(handle);
+        }
+        Self::new(plan, handles)
+    }
+
     /// The provider keys this runner can drive (one per injected handle).
     pub fn provider_keys(&self) -> Vec<&str> {
         self.handles.keys().map(String::as_str).collect()
     }
+}
+
+/// A runtime-supplied capability table: resolves the injected [`ProviderHandle`] for a
+/// provider role, or `None` if the runtime holds no capability for it. This is the
+/// runtime-core analogue of PC2's backend-keyed session factory
+/// (`BackendSessionService.getSessionView(token)` dispatching on `stored.backend`,
+/// `src/services/session/BackendSessionService.ts:368`): the ONE place a capability is
+/// resolved from runtime-held state. The core entrypoint [`open_drm_plan`] calls it once
+/// per required provider; nothing downstream re-resolves.
+pub trait CapabilityTable {
+    fn resolve(&mut self, provider: &str) -> Option<Box<dyn ProviderHandle>>;
+}
+
+/// The runtime-core composition root for a dDRM open: parse the plan, resolve each
+/// provider the plan requires from the runtime capability `table` (fail closed if the
+/// table holds no capability for a required provider), build the [`RuntimeStepRunner`],
+/// and execute — returning the [`ExecutionReport`]. This is the SINGLE entrypoint the
+/// trusted runtime calls; the consumer smoke calls the SAME function with a table backed
+/// by spawned capsule binaries (no second code path). Mirrors PC2's
+/// `requireSecureViewSession` composition root, which resolves the session view once
+/// (`src/api/middleware/secureViewSession.ts:124`) and hands it to the handler (`:129`),
+/// the handler invoking it from request state rather than re-resolving (`media.ts:481`).
+pub fn open_drm_plan(
+    plan: &Value,
+    table: &mut dyn CapabilityTable,
+) -> Result<ExecutionReport, String> {
+    let plan = DrmOpenPlan::parse(plan)?;
+    let mut runner = RuntimeStepRunner::resolve_from(&plan, table)?;
+    plan.execute(&mut runner)
 }
 
 impl StepRunner for RuntimeStepRunner {
@@ -900,5 +957,102 @@ mod tests {
         plan.execute(&mut runner).unwrap();
         assert!(!log.borrow().iter().any(|p| p == "content"));
         assert_eq!(runner.provider_keys(), vec!["decrypt", "key", "rights"]);
+    }
+
+    // ── open_drm_plan: the runtime-core composition root over a capability table ──
+
+    /// A runtime capability table backed by fake handles — the test analogue of PC2's
+    /// backend-keyed session factory. Records which providers it was asked to resolve;
+    /// `withhold`/`misroute` model a runtime that cannot (or wrongly) supplies a handle.
+    struct FakeTable {
+        invoked: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        resolved: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        withhold: Option<String>,
+        misroute: bool,
+    }
+
+    impl FakeTable {
+        fn new(
+            invoked: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+            resolved: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        ) -> Self {
+            FakeTable {
+                invoked: invoked.clone(),
+                resolved: resolved.clone(),
+                withhold: None,
+                misroute: false,
+            }
+        }
+    }
+
+    impl CapabilityTable for FakeTable {
+        fn resolve(&mut self, provider: &str) -> Option<Box<dyn ProviderHandle>> {
+            self.resolved.borrow_mut().push(provider.to_string());
+            if self.withhold.as_deref() == Some(provider) {
+                return None;
+            }
+            // A misrouting table hands back a `decrypt` handle when asked for `key`.
+            let served = if self.misroute && provider == "key" {
+                "decrypt"
+            } else {
+                provider
+            };
+            Some(FakeHandle::boxed(served, &self.invoked))
+        }
+    }
+
+    #[test]
+    fn open_drm_plan_drives_the_plan_through_a_capability_table() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let resolved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = FakeTable::new(&invoked, &resolved);
+        let report = open_drm_plan(&canonical_plan(), &mut table).expect("the core entrypoint drives the plan");
+        assert!(report.artifact("decrypt_session").is_some());
+        // The composition root resolved each required provider exactly once, in order,
+        // from the table — and only those (no `content` resolve).
+        assert_eq!(*resolved.borrow(), vec!["rights", "key", "decrypt"]);
+        assert_eq!(*invoked.borrow(), vec!["rights", "key", "decrypt", "decrypt"]);
+    }
+
+    #[test]
+    fn open_drm_plan_fails_closed_when_the_table_lacks_a_required_provider() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let resolved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = FakeTable::new(&invoked, &resolved);
+        table.withhold = Some("key".to_string());
+        let err = open_drm_plan(&canonical_plan(), &mut table).unwrap_err();
+        assert!(
+            err.contains("holds no handle for required provider `key`"),
+            "{err}"
+        );
+        // It never reached the decrypt resolve (fail-closed at the missing key), and the
+        // plan never executed a single provider call.
+        assert!(invoked.borrow().is_empty());
+    }
+
+    #[test]
+    fn open_drm_plan_rejects_a_table_that_misroutes_a_provider() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let resolved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = FakeTable::new(&invoked, &resolved);
+        table.misroute = true;
+        let err = open_drm_plan(&canonical_plan(), &mut table).unwrap_err();
+        assert!(
+            err.contains("returned a `decrypt` handle when asked for `key`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_drm_plan_refuses_a_non_planned_plan_before_touching_the_table() {
+        let invoked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let resolved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut table = FakeTable::new(&invoked, &resolved);
+        let mut p = canonical_plan();
+        p["status"] = json!("opened");
+        let err = open_drm_plan(&p, &mut table).unwrap_err();
+        assert!(err.contains("non-planned"), "{err}");
+        // The composition root parses BEFORE resolving — a bad plan never reaches the table.
+        assert!(resolved.borrow().is_empty());
     }
 }

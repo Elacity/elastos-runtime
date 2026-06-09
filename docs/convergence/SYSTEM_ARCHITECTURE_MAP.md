@@ -58,7 +58,7 @@ shared `protected_content` contracts.
 | 8 Decrypt | `decrypt-provider` | 🟥 default fail-closed; ✅ **crypto + rail COMPLETE behind `rail-*` flags (Days 45–49)** | `capsules/decrypt-provider` |
 | 8 Playback/render | (viewer) | ⬜ no in-runtime decrypt→viewer path | — |
 | — Orchestrator | `drm-provider` (`open`) | 🟩 emits executable `DrmOpenPlanV1` (`planned`): canonical sequence + binding edges, zero authority (Day 67) | `capsules/drm-provider` |
-| — Plan executor | `ddrm-plan-runner` (runtime core) | 🟩 **fail-closed core that WALKS the `DrmOpenPlanV1`** — validates order + binding edges, threads each edge into the next step, fails closed on a broken/out-of-order edge; holds no authority (only the injected `StepRunner` touches a provider). `RuntimeStepRunner` resolves each step through INJECTED per-provider `ProviderHandle`s, refusing to build without a handle for every `next_required_providers` entry and rejecting a stray handle (Day 71→72) | `capsules/ddrm-plan-runner` |
+| — Plan executor | `ddrm-plan-runner` (runtime core) | 🟩 **fail-closed core that WALKS the `DrmOpenPlanV1`** — validates order + binding edges, threads each edge into the next step, fails closed on a broken/out-of-order edge; holds no authority (only the injected `StepRunner` touches a provider). `RuntimeStepRunner` resolves each step through INJECTED per-provider `ProviderHandle`s, refusing to build without a handle for every `next_required_providers` entry and rejecting a stray handle. **`open_drm_plan(plan, &mut CapabilityTable)`** is the single composition root: parse → resolve each handle from the runtime table → build → execute (Day 71→73) | `capsules/ddrm-plan-runner` |
 
 **Headline:** the **hardest, most security-critical boundary — decrypt — is done**
 (transcript-bound, in-sandbox minted key, expiry+audit, suite-tagged material, all
@@ -138,7 +138,7 @@ flowchart TB
   end
   subgraph cons["CONSUMER — decrypt DONE, core executor landed, rail-wiring pending"]
     DRM[drm-provider 🟩<br/>emits DrmOpenPlanV1 planned]
-    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles]
+    CORE[ddrm-plan-runner 🟩<br/>core executor: walks plan, threads edges, fail-closed<br/>RuntimeStepRunner over injected per-provider handles<br/>open_drm_plan = composition root: parse -> resolve from CapabilityTable -> execute]
     RTS[rights-provider 🟦<br/>chain-rights receipt]
     KEY[key-provider 🟩<br/>canonical release: recover-from-escrow + reseal]
     DEC[decrypt-provider ✅ behind rail-*<br/>🟥 default]
@@ -294,12 +294,24 @@ decrypt-provider OpenSessionV1`.
   (`RightsHandle`/`KeyHandle`/`DecryptHandle`, each wrapping ONE real capsule binary) injected into
   the SAME runner the trusted core will use (no second code path). ddrm-plan-runner 14→21; drift
   untouched.
+- **Status (Day 73):** the runtime CORE now has a single COMPOSITION ROOT. New `open_drm_plan(plan,
+  &mut CapabilityTable)` parses the plan, RESOLVES each provider the plan requires from a
+  runtime-supplied `CapabilityTable` (the analogue of PC2's backend-keyed session factory) at ONE
+  point via `RuntimeStepRunner::resolve_from`, builds the runner, and executes — the one entrypoint
+  the trusted runtime calls. Audited PC2's composition root first: the middleware resolves the
+  per-stage handle once from `sessionService.getSessionView(token)` (dispatching on `stored.backend`,
+  `BackendSessionService.ts:368`) and attaches it to request state (`secureViewSession.ts:124`→`:129`);
+  the handler reads it from state and never re-resolves (`media.ts:481`→`:482`, helper takes `session`
+  as a param `:1192`; doc forbids re-loading by token `secureViewSession.ts:13`). Fail-closed: parses
+  before touching the table (a bad plan never reaches the runtime's capabilities), fails closed on a
+  withheld required provider (zero step invocations), rejects a misrouting table. ddrm-plan-runner
+  21→25; drift untouched.
 - **Conforms:** key-provider never exposes raw CEK; decrypt stays the only place the
   CEK is clear (proven on both inter-process wires); transcript-mismatch fails closed.
-- **Still dev-shaped:** the `RuntimeStepRunner` runs today over handles wrapping the smoke's
-  spawned binaries; standing it up INSIDE the trusted core wired to the runtime's REAL
-  provider→provider rail (the smoke proves the injected-handle seam; the core supplies the real
-  handles) so the open runs default-on inside the core is the next step. The `reference` backend is
+- **Still dev-shaped:** `open_drm_plan` runs today over a `CapabilityTable` whose handles wrap the
+  smoke's spawned binaries; standing the entrypoint up INSIDE a trusted runtime-core caller wired to
+  the runtime's REAL provider→provider rail (the smoke proves the entrypoint; the core supplies the
+  real table) so the open runs default-on inside the core is the next step. The `reference` backend is
   dev-only (production uses the `dkms`/`lit` backends, still `not_configured`); smoke is native (a
   `wasm32-wasip1` variant is a follow-up).
 

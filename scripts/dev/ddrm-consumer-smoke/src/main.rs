@@ -26,21 +26,24 @@
 //! end through the op drm-provider's plan actually names.
 //!
 //! The chain is no longer hand-walked here: the REAL `drm-provider` emits the plan and
-//! the runtime-core executor (`ddrm-plan-runner`) walks it. The smoke drives it through
-//! the runtime-core `RuntimeStepRunner` over three INJECTED per-provider capability
-//! handles (`RightsHandle`/`KeyHandle`/`DecryptHandle`, each wrapping one real capsule
-//! binary) — the same injected-handle seam the trusted core will use with real
-//! providers, no second code path. Construction fails closed unless every provider the
-//! plan's `next_required_providers` names has a handle. Two fail-closed gates ride
-//! along: a transcript-mismatched seal must not open, and a TAMPERED plan edge (driven
-//! back through the core) must be rejected by the real key-provider.
+//! the smoke calls the runtime-core composition root `ddrm_plan_runner::open_drm_plan`,
+//! which parses the plan, RESOLVES each provider the plan requires from a runtime
+//! capability table, builds the `RuntimeStepRunner`, and executes — the SAME entrypoint
+//! the trusted core will call. The smoke supplies a `SmokeCapabilityTable` (the runtime
+//! analogue of PC2's backend-keyed session factory) that hands out three INJECTED
+//! per-provider handles (`RightsHandle`/`KeyHandle`/`DecryptHandle`), each wrapping one
+//! real capsule binary — no second code path. The core fails closed unless the table
+//! holds a handle for every provider the plan's `next_required_providers` names. Two
+//! fail-closed gates ride along: a transcript-mismatched seal must not open, and a
+//! TAMPERED plan edge (driven back through the SAME entrypoint) must be rejected by the
+//! real key-provider.
 //!
 //! Usage: ddrm-consumer-smoke <key-provider-bin> <decrypt-provider-bin> <drm-bin> [rights-bin]
 
 use base64::Engine as _;
 use ddrm_envelope::transcript::{escrow_aad, release_receipt_hash, DecryptTranscriptV1};
 use ddrm_envelope::SUITE_PQ_HYBRID;
-use ddrm_plan_runner::{DrmOpenPlan, ProviderHandle, RuntimeStepRunner, StepInputs};
+use ddrm_plan_runner::{open_drm_plan, CapabilityTable, ProviderHandle, StepInputs};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -566,6 +569,56 @@ impl ProviderHandle for DecryptHandle {
     }
 }
 
+/// The runtime capability table the smoke supplies to `open_drm_plan` — the runtime
+/// analogue of PC2's backend-keyed session factory (`getSessionView(token)` dispatching
+/// on `stored.backend`). It holds the live capsule handles (shared so the post-walk
+/// fail-closed checks + shutdown can still reach them) plus the per-session material the
+/// runtime provisioned up front, and RESOLVES a fresh per-provider `ProviderHandle`
+/// (bound to the same capsules) on demand. The core calls `resolve` once per provider
+/// the plan requires; an un-named provider resolves to `None`.
+struct SmokeCapabilityTable {
+    rights: Rc<RefCell<Option<Capsule>>>,
+    chain_attestation: Value,
+    chain_mode: String,
+    key: Rc<RefCell<Capsule>>,
+    decrypt: Rc<RefCell<Capsule>>,
+    kid_hex: String,
+    wrapped_cek_b64: String,
+    producer_vk_b64: String,
+    session_pub_b64: String,
+    aad_b64: String,
+    content_hash_b64: String,
+    nonce_b64: String,
+}
+
+impl CapabilityTable for SmokeCapabilityTable {
+    fn resolve(&mut self, provider: &str) -> Option<Box<dyn ProviderHandle>> {
+        match provider {
+            "rights" => Some(Box::new(RightsHandle {
+                rights: self.rights.clone(),
+                chain_attestation: self.chain_attestation.clone(),
+                chain_mode: self.chain_mode.clone(),
+            })),
+            "key" => Some(Box::new(KeyHandle {
+                key: self.key.clone(),
+                kid_hex: self.kid_hex.clone(),
+                wrapped_cek_b64: self.wrapped_cek_b64.clone(),
+                producer_vk_b64: self.producer_vk_b64.clone(),
+                session_pub_b64: self.session_pub_b64.clone(),
+                aad_b64: self.aad_b64.clone(),
+                content_hash_b64: self.content_hash_b64.clone(),
+                nonce_b64: self.nonce_b64.clone(),
+            })),
+            "decrypt" => Some(Box::new(DecryptHandle {
+                decrypt: self.decrypt.clone(),
+            })),
+            // The runtime holds no capability for the `content` (status/fetch) steps in
+            // this smoke — the core treats an un-resolved, un-required provider as a no-op.
+            _ => None,
+        }
+    }
+}
+
 /// Ask the REAL drm-provider for the canonical open plan, and validate it carries the
 /// content identity flowing through the chain. The drm-provider holds no authority and
 /// decrypts nothing — it only emits the plan (`planned`).
@@ -600,8 +653,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // the runtime-core executor (ddrm-plan-runner) parses + validates: schema,
     // `planned` status, the rights<key<decrypt canonical order, and every binding edge.
     let plan_json = fetch_plan(drm_bin)?;
-    let plan = DrmOpenPlan::parse(&plan_json)?;
-    step(1, "drm-provider: emitted the canonical open plan (planned); the core parsed + validated its order + binding edges");
+    step(1, "drm-provider: emitted the canonical open plan (planned) — the core composition root will parse + validate it");
 
     // --- runtime capability provisioning (BEFORE the walk): the authority + decrypt
     // boundary come up, the content CEK is ESCROWED to the authority's recipient, and
@@ -657,41 +709,35 @@ fn run(args: &[String]) -> Result<(), String> {
     let nonce = b"consumer-smoke-nonce-1".to_vec();
     let aad = transcript_aad(&session_pub, &content_hash, &nonce);
 
-    // --- drive the chain THROUGH the runtime core: build the runtime-core
-    // RuntimeStepRunner over three INJECTED per-provider handles (each wrapping a real
-    // capsule binary). Construction fails closed unless every provider the plan's
-    // `next_required_providers` names has a handle — the same seam the trusted core
-    // uses with real providers, no second code path. The capsules are shared so the
-    // post-walk fail-closed checks + shutdown can still reach them.
+    // --- drive the chain THROUGH the runtime-core COMPOSITION ROOT: build the runtime
+    // capability table (the analogue of PC2's backend-keyed session factory) and hand it
+    // + the plan to `open_drm_plan`, which parses the plan, RESOLVES each required
+    // provider's handle from the table at ONE point, builds the RuntimeStepRunner, and
+    // executes. The smoke calls the SAME entrypoint the trusted core will — no second
+    // code path. The capsules are shared so the post-walk fail-closed checks + shutdown
+    // can still reach them after the table has handed handles to the core.
     let rights_cell = Rc::new(RefCell::new(rights));
     let key_cell = Rc::new(RefCell::new(key));
     let decrypt_cell = Rc::new(RefCell::new(decrypt));
-    let handles: Vec<Box<dyn ProviderHandle>> = vec![
-        Box::new(RightsHandle {
-            rights: rights_cell.clone(),
-            chain_attestation: attestation,
-            chain_mode: chain_mode.clone(),
-        }),
-        Box::new(KeyHandle {
-            key: key_cell.clone(),
-            kid_hex: kid_hex.clone(),
-            wrapped_cek_b64: wrapped_cek_b64.clone(),
-            producer_vk_b64: producer_vk_b64.clone(),
-            session_pub_b64: session_pub_b64.clone(),
-            aad_b64: B64.encode(&aad),
-            content_hash_b64: B64.encode(&content_hash),
-            nonce_b64: B64.encode(&nonce),
-        }),
-        Box::new(DecryptHandle {
-            decrypt: decrypt_cell.clone(),
-        }),
-    ];
-    let mut runner = RuntimeStepRunner::new(&plan, handles)?;
-    let report = plan.execute(&mut runner)?;
+    let mut table = SmokeCapabilityTable {
+        rights: rights_cell.clone(),
+        chain_attestation: attestation,
+        chain_mode: chain_mode.clone(),
+        key: key_cell.clone(),
+        decrypt: decrypt_cell.clone(),
+        kid_hex: kid_hex.clone(),
+        wrapped_cek_b64: wrapped_cek_b64.clone(),
+        producer_vk_b64: producer_vk_b64.clone(),
+        session_pub_b64: session_pub_b64.clone(),
+        aad_b64: B64.encode(&aad),
+        content_hash_b64: B64.encode(&content_hash),
+        nonce_b64: B64.encode(&nonce),
+    };
+    let report = open_drm_plan(&plan_json, &mut table)?;
     if report.artifact("decrypt_session").is_none() {
-        return Err("the executor finished without opening a decrypt session".to_string());
+        return Err("the core entrypoint finished without opening a decrypt session".to_string());
     }
-    // The walk succeeded — narrate the steps the core drove through the injected handles.
+    // The open succeeded — narrate the steps the core drove through the resolved handles.
     step(4, &format!("rights-provider: on-chain ownership ({chain_mode}) -> allowed; typed receipt issued"));
     step(5, "key-provider: canonical `release` recovered the escrowed CEK + re-sealed it to the session (no raw CEK, no shim)");
     step(6, "decrypt-provider: unwrapped in-VM + decrypted the segment; only a scoped session returned");
@@ -740,28 +786,25 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     step(7, "decrypt-provider: a transcript-mismatched seal failed closed");
 
-    // --- fail-closed #2 (plan integrity): TAMPER a binding edge and re-run THROUGH the
-    // core. The executor threads the rights receipt into the wrong field, so the real
-    // key-provider (deny_unknown_fields over a required `rights_receipt`) rejects it —
-    // proving the core only proceeds when the plan's edges are intact, cross-binary.
+    // --- fail-closed #2 (plan integrity): TAMPER a binding edge and re-run through the
+    // SAME core entrypoint with the SAME capability table. The executor threads the
+    // rights receipt into the wrong field, so the real key-provider (deny_unknown_fields
+    // over a required `rights_receipt`) rejects it — proving the composition root only
+    // proceeds when the plan's edges are intact, cross-binary.
     let mut tampered = plan_json.clone();
     for b in tampered["bindings"].as_array_mut().ok_or("plan has no bindings")? {
         if b["into_step"] == json!("key_release") {
             b["into_field"] = json!("bogus_edge");
         }
     }
-    let tampered_plan = DrmOpenPlan::parse(&tampered)?;
-    // Re-run THROUGH the same runtime-core runner: the tampered plan only relabels the
-    // edge, so the SAME injected handles drive it and the real key-provider rejects the
-    // rights receipt threaded under the wrong field — fail-closed, cross-binary.
-    match tampered_plan.execute(&mut runner) {
+    match open_drm_plan(&tampered, &mut table) {
         Ok(_) => return Err("a tampered plan edge must NOT drive a successful open".to_string()),
         Err(_) => step(8, "runtime-core: a tampered binding edge failed closed at the real key-provider"),
     }
 
-    // Drop the runner first so its injected handles release their capsule references,
-    // then shut down the (now solely-held) capsules.
-    drop(runner);
+    // Drop the table so the handles it would hand out release nothing extra, then shut
+    // down the capsules (still held by this scope's shared cells).
+    drop(table);
     if let Some(rights) = rights_cell.borrow_mut().as_mut() {
         rights.shutdown();
     }

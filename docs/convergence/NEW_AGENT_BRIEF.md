@@ -211,6 +211,7 @@ green + clippy clean. Commits are on `feat/decrypt-provider-cenc`.
 | 70 | **A** | **the canonical `key-provider::release` actually releases (reference backend)** — recover the producer-escrowed CEK from the rights-bound `key_envelope` → re-seal to the runtime-injected decrypt session as `SealedDecryptMaterialV1`. Audited PC2's Lit authority (`universal-decrypt-chipotle.js`: access-check `:560–568` → recover `:570–575` → CEK↔KID↔authority bind `:577–590` → seal-to-session `:602–608`). The wrapped CEK rides INSIDE the validated request; per-session material is a capsule-local `session` context (shared `KeyReleaseRequestV1` byte-identical, drift untouched). Fail-closed: no backend/no session/denied/expired/kid-swap/scheme-mismatch/forged-producer. The op `drm-provider`'s `DrmOpenPlanV1` names is now real. key-provider 27→33; `ddrm-consumer-smoke.sh` escrows the golden CEK + drives the canonical `release` (recover→reseal), removing the raw-CEK `release_ref` shim. |
 | 69 | C | **`encrypt-provider::seal` runs the full production pipeline on HANDED-IN bytes → complete `SealedObjectV1`** (closes the dev `seal_inline` ↔ production `seal` gap). Audited PC2's input path (`dashPackager.ts`: host `readFileSync`:504 → `executeCENCEncrypt(.., seg.data)`:432 — the WASM fetches nothing). `seal` gained `content_b64`/`recipient_pub_b64`/`availability_receipt_cid` (`deny_unknown_fields` kept); given bytes+recipient it runs the ONE shared `run_seal_pipeline` (mint→CENC→content-address→escrow; `seal_inline` delegates too, PRINCIPLES #10) → `SealedObjectV1` with real `payload_cid`, bytes16-KID envelope, `policy_hash=sha256(rights_policy_cid)`, chain-validated PQ-hybrid suite. NO fetch authority; fail-closed without bytes+recipient. `ddrm-producer-smoke.sh` drives the real `seal`, deserializes into the SHARED `SealedObjectV1` + runs the SAME validator `key-provider` runs. encrypt-provider escrow 22→25. |
 | 71 | **A wiring** | **runtime-core plan EXECUTOR (`capsules/ddrm-plan-runner`)** — the `DrmOpenPlanV1` is no longer hand-walked by the smoke; a fail-closed core walks it. Audited PC2's open sequencer (each stage gated on the prior: `secureViewSession.ts:61` resurrect-session → `media.ts:1163` `hasAccessByContentId` access gate → `:1196`/`:1216` recover+unwrap CEK in-boundary). The executor `parse`s the plan (schema, `planned`, the `rights<key<decrypt` canonical order, every binding names real steps/identities), seeds the `drm_open` identities, then walks the steps **threading each binding edge** into the next step's request and **failing closed** when a step needs an artifact not yet produced (out-of-order/silent failure) or runs without emitting its declared artifact. It holds **no authority**: the only thing that touches a provider is the injected `StepRunner`. `ddrm-consumer-smoke.sh` now drives the REAL drm→rights→key→decrypt binaries THROUGH the core (the smoke is just the injected transport), with a new fail-closed gate: a TAMPERED binding edge is rejected by the real key-provider (`deny_unknown_fields` over required `rights_receipt`). ddrm-plan-runner=14 (new rung). |
+| 73 | **A wiring** | **runtime-core COMPOSITION ROOT (`open_drm_plan` in `ddrm-plan-runner`)** — a single entrypoint the trusted runtime calls to open a plan: it parses the plan, RESOLVES each required provider's handle from a runtime-supplied `CapabilityTable` (the analogue of PC2's backend-keyed session factory) at ONE point via `RuntimeStepRunner::resolve_from`, builds the runner, and executes. Audited PC2's composition root (`sessionService.getSessionView(token)` dispatches on `stored.backend` `BackendSessionService.ts:368`; the middleware resolves the handle once `secureViewSession.ts:124`→`:129` and the handler reads it from request state, never re-resolving `media.ts:481`→`:482`, doc forbids re-loading by token `:13`). New `CapabilityTable` trait + `open_drm_plan` (parse → resolve → execute). Fail-closed: parses BEFORE touching the table (a bad plan never reaches the runtime's capabilities), fails closed on a withheld required provider (zero step invocations), rejects a misrouting table. `ddrm-consumer-smoke.sh` supplies a `SmokeCapabilityTable` + calls `open_drm_plan` for BOTH the canonical open and the tampered-edge re-run — same entrypoint, no second code path. ddrm-plan-runner 21→25. |
 | 72 | **A wiring** | **runtime-core INJECTED capability handles (`RuntimeStepRunner` in `ddrm-plan-runner`)** — the Day-71 executor gained a runtime-core `StepRunner` that resolves each step through INJECTED per-provider handles instead of one monolithic runner. Audited PC2's per-stage injection (the middleware resurrects a `BackendSessionView` once per request — `secureViewSession.ts:124` — and threads it into the downstream stage — `media.ts:1207` `recoverMediaCEK`/`recoverCEKEnvelope`, `:541` `/segment` reuses the same view; a stage uses the handle it's given). New `ProviderHandle` trait (the injected capability) + `RuntimeStepRunner` over a `BTreeMap<provider, handle>` routing each step to the handle for its `provider`, holding **no authority** itself. Fail-closed construction: refuses to build without a handle for every provider the plan's `next_required_providers` names (no ambient default) and rejects a STRAY handle for an un-named provider (the `blocked_authority` set is unreachable from the runner type). `ddrm-consumer-smoke.sh`'s monolithic `SmokeRunner` is replaced by three per-provider handles (`RightsHandle`/`KeyHandle`/`DecryptHandle`, each wrapping ONE real capsule binary) injected into the SAME runner the trusted core will use — no second code path. ddrm-plan-runner 14→21. |
 
 **Blocked / upstream-only:** fold `SealedDecryptMaterialV1` into the shared `elastos-common`
@@ -220,16 +221,17 @@ contract (needs push access); dKMS-direct sealing producer (needs Anders).
 
 ## 5. What's next (unblocked candidates, pick the highest-value)
 
-1. **Runtime-core plan execution — stand the `RuntimeStepRunner` up inside the trusted core.**
+1. **Runtime-core plan execution — stand `open_drm_plan` up inside a trusted runtime caller.**
    Day 67 landed `drm-provider::open → DrmOpenPlanV1`, Day 70 made `key-provider::release`
-   actually release, **Day 71 landed the core executor** (`ddrm-plan-runner`), and **Day 72
-   landed the injected-handle seam** (`RuntimeStepRunner` over per-provider `ProviderHandle`s,
-   fail-closed on a missing/stray handle). Today the runner is driven by the consumer smoke
-   over handles wrapping spawned binaries. The remaining step is to construct the
-   `RuntimeStepRunner` INSIDE the trusted core, injecting the runtime's REAL capability handles
-   (the actual provider→provider rail) instead of the smoke's binaries, so the open runs
-   default-on inside the runtime. The `ProviderHandle`/`RuntimeStepRunner` seam is exactly the
-   shape the core plugs its real handles into (the smoke proves it; no second code path).
+   actually release, **Day 71 landed the core executor** (`ddrm-plan-runner`), **Day 72 landed
+   the injected-handle seam** (`RuntimeStepRunner` over per-provider `ProviderHandle`s), and
+   **Day 73 landed the composition root** (`open_drm_plan(plan, &mut CapabilityTable)` — parse →
+   resolve each handle from a runtime table → build → execute, fail-closed). Today the entrypoint
+   is driven by the consumer smoke supplying a capsule-backed `CapabilityTable`. The remaining
+   step is to construct that `CapabilityTable` INSIDE the trusted core, resolving the runtime's
+   REAL capability handles (the actual provider→provider rail) instead of the smoke's binaries,
+   so the open runs default-on inside the runtime. `open_drm_plan` + `CapabilityTable` is exactly
+   the entrypoint the core calls (the smoke proves it; no second code path).
 2. **Live-Base read-only round trip** — real `eth_getLogs` → `listing_from_event` →
    `enrich_listing`, behind an opt-in env flag (like the existing live `has_access` smoke).
 3. **Producer IPFS pin + multi-block `payload_cid`** — Day 68/69 made the producer
@@ -309,7 +311,7 @@ scripts/ddrm-drift-check.sh
 scripts/ddrm-ladder-check.sh
 
 # 3. Cross-binary smokes — each expect: PASS
-scripts/ddrm-consumer-smoke.sh   # drm(plan) -> [core RuntimeStepRunner + injected handles] -> rights -> key -> decrypt
+scripts/ddrm-consumer-smoke.sh   # drm(plan) -> open_drm_plan(plan, CapabilityTable) -> rights -> key -> decrypt
 scripts/ddrm-producer-smoke.sh   # encrypt(seal_inline) -> key(release_from_escrow_ref) -> decrypt
 scripts/ddrm-publish-smoke.sh    # publish(prepare) -> chain(assemble_mint)
 scripts/ddrm-market-smoke.sh     # publish -> chain -> content-market (reconstruct + enrich + event)
@@ -319,7 +321,7 @@ Current key ladder counts (update in lockstep when you add tests): `content-mark
 `publish-provider`=16, `key-provider [key-authority-ref]`=33,
 `decrypt-provider [rail-material]`=65, `chain-provider mint*` rung=10, `drm-provider`=15,
 `encrypt-provider`=20 (default) / 25 (`escrow`), `key-provider`=18 (default),
-`ddrm-plan-runner`=21 (the runtime-core plan executor + `RuntimeStepRunner` injected-handle seam).
+`ddrm-plan-runner`=25 (the runtime-core plan executor + `RuntimeStepRunner` injected-handle seam + `open_drm_plan` composition root).
 
 ---
 
