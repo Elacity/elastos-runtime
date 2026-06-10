@@ -124,6 +124,41 @@ pub fn decrypt_from_carrier_bound(
     }
 }
 
+/// Multi-SEGMENT transcript-bound carrier open: as [`decrypt_from_carrier_bound`] but the CEK is
+/// unwrapped ONCE and drives the decrypt of the whole ordered asset — the carrier's primary
+/// `ciphertext_segment` FIRST, then `extra_segments` in order — under that one presentation CEK.
+/// The ordered segment set is welded into `aad` by the caller (the transcript's `segment_digests`),
+/// so any reorder/drop/substitute fails the unwrap closed before a byte is decrypted. PQ-hybrid only
+/// (the product, transcript-bound profile); a classical carrier or a profile/secret mismatch fails
+/// closed. Returns each segment's plaintext plus aggregate metadata (`segment_count`, summed
+/// `sample_count`).
+pub fn decrypt_from_carrier_bound_segments(
+    session: &SessionSecret,
+    carrier: &SealedDecryptBundle,
+    extra_segments: &[Vec<u8>],
+    aad: &[u8],
+    verifier: &impl CekSealVerifier,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    let init = carrier.init_segment.as_deref();
+    match (&carrier.profile, session) {
+        (SealProfile::PqHybrid, SessionSecret::PqHybrid(secret)) => {
+            let envelope =
+                PqSealedEnvelope::from_bytes(&carrier.sealed_cek).map_err(|e| format!("{e:?}"))?;
+            // Presentation order: the primary segment, then the extras.
+            let mut segments: Vec<Vec<u8>> = Vec::with_capacity(1 + extra_segments.len());
+            segments.push(carrier.ciphertext_segment.clone());
+            segments.extend_from_slice(extra_segments);
+            crate::pq_envelope::decrypt_pq_sealed_segments_bound(
+                secret, &envelope, aad, verifier, &segments, init,
+            )
+        }
+        (SealProfile::ClassicalP256, _) => {
+            Err("multi-segment open requires the PQ-hybrid profile".to_string())
+        }
+        _ => Err("carrier profile does not match the VM session secret".to_string()),
+    }
+}
+
 /// Transcript-bound **2-of-2 threshold** carrier open (Day 97–98): the CEK was
 /// XOR-split across two dKMS nodes at publish, so NO single node ever held the whole
 /// content key. This is the runtime's explicit, owned analogue of Lit's opaque

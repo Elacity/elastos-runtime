@@ -42,7 +42,7 @@ LADDER=(
   "content-market (default)|content-market||29"
   "rights-provider (default)|rights-provider||9"
   "rights-provider chain-rights|rights-provider|chain-rights|18"
-  "ddrm-envelope (lib)|ddrm-envelope||37"
+  "ddrm-envelope (lib)|ddrm-envelope||38"
   "ddrm-plan-runner (lib)|ddrm-plan-runner||45"
   "key-provider (default)|key-provider||18"
   "key-provider key-authority-ref|key-provider|key-authority-ref|47"
@@ -62,7 +62,7 @@ LADDER=(
   "decrypt-provider rail-bind|decrypt-provider|rail-bind|63"
   "decrypt-provider rail-mint|decrypt-provider|rail-mint|65"
   "decrypt-provider rail-audit|decrypt-provider|rail-audit|65"
-  "decrypt-provider rail-material|decrypt-provider|rail-material|75"
+  "decrypt-provider rail-material|decrypt-provider|rail-material|76"
 )
 
 bold "== dDRM ladder (1/2): test suites + asserted counts =="

@@ -156,6 +156,17 @@ pub mod transcript {
         /// length-prefixed (be32 len ‖ bytes) / fixed-width, so no two distinct
         /// transcripts can collide and no field can be slid into another.
         pub fn to_aad(&self) -> Vec<u8> {
+            self.to_aad_with_segments(None)
+        }
+
+        /// As [`Self::to_aad`], but additionally binds an ordered MULTI-SEGMENT asset into the
+        /// transcript: `segment_digests` is the concatenation of each segment's 32-byte content
+        /// digest, in presentation order (see [`segment_digests`]). It is appended ONLY when
+        /// present, AFTER `node_set_id`, so a single-segment open (digests `None`) produces a
+        /// BYTE-IDENTICAL AAD to [`Self::to_aad`] — while a multi-segment open is welded to the
+        /// exact ordered set of segments (a reordered, dropped, added, or substituted segment
+        /// changes the digest concatenation and the seal fails to unwrap → fail closed).
+        pub fn to_aad_with_segments(&self, segment_digests: Option<&[u8]>) -> Vec<u8> {
             let mut v = Vec::new();
             let mut put = |bytes: &[u8]| {
                 v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -182,9 +193,29 @@ pub mod transcript {
             if let Some(node_set_id) = self.node_set_id {
                 put(node_set_id);
             }
+            // Multi-segment binding (same strictly-extending pattern): absent for single-segment.
+            if let Some(digests) = segment_digests {
+                put(digests);
+            }
             v
         }
     }
+}
+
+/// The ordered MULTI-SEGMENT binding input for
+/// [`transcript::DecryptTranscriptV1::to_aad_with_segments`]: the concatenation of each segment's
+/// 32-byte SHA-256 content digest, in presentation order. This is the same digest that underlies
+/// each segment's raw CIDv1, so binding it into the transcript welds the open to the EXACT ordered
+/// set of content-addressed segments. The producer (sealing the CEK) and the decrypt boundary
+/// (unwrapping it) compute this identically from the same ordered bytes; any reorder/drop/add/
+/// substitute changes the result and the AEAD unwrap fails closed.
+pub fn segment_digests(segments: &[&[u8]]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(segments.len() * 32);
+    for seg in segments {
+        out.extend_from_slice(&Sha256::digest(seg));
+    }
+    out
 }
 
 /// Threshold CEK share-split (2-of-2 XOR secret-sharing) — the PRODUCER side.
@@ -1862,6 +1893,30 @@ mod tests {
             nonce: b"replay-nonce-1",
             node_set_id: None,
         }
+    }
+
+    /// The multi-segment binding is strictly ADDITIVE: `to_aad()` equals
+    /// `to_aad_with_segments(None)` byte-for-byte (single-segment opens are untouched), while a
+    /// present digest list strictly extends the AAD and is sensitive to segment order/content —
+    /// so a CEK sealed for an ordered segment set cannot open under a reordered or altered set.
+    #[test]
+    fn transcript_segment_binding_is_additive_and_ordered() {
+        let t = sample_transcript();
+        assert_eq!(t.to_aad(), t.to_aad_with_segments(None), "absent digests == plain to_aad");
+
+        let seg_a = b"segment-zero-bytes".as_slice();
+        let seg_b = b"segment-one-bytes-longer".as_slice();
+        let d_ab = crate::segment_digests(&[seg_a, seg_b]);
+        let bound = t.to_aad_with_segments(Some(&d_ab));
+        assert_ne!(t.to_aad(), bound, "binding a segment list extends the AAD");
+        assert!(bound.starts_with(&t.to_aad()), "the binding strictly EXTENDS the single-segment AAD");
+
+        // Reordering the segments changes the binding (order is welded in).
+        let d_ba = crate::segment_digests(&[seg_b, seg_a]);
+        assert_ne!(bound, t.to_aad_with_segments(Some(&d_ba)), "segment ORDER is bound");
+        // Substituting a segment changes the binding.
+        let d_ax = crate::segment_digests(&[seg_a, b"tampered".as_slice()]);
+        assert_ne!(bound, t.to_aad_with_segments(Some(&d_ax)), "segment CONTENT is bound");
     }
 
     /// The encoder is deterministic and self-describing (domain label first), so the

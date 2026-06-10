@@ -605,6 +605,254 @@ fn transcript_aad(
     .to_aad()
 }
 
+/// MULTI-SEGMENT variant of [`transcript_aad`]: binds an ordered segment set into the transcript via
+/// `segment_digests` (the concatenation of each segment's content digest, presentation order). The
+/// decrypt boundary rebuilds the IDENTICAL AAD from the segments in the material, so a CEK sealed for
+/// THIS ordered, content-addressed asset can only open over exactly that set. `None` ⇒ byte-identical
+/// to the single-segment [`transcript_aad`] (single-node rail).
+fn transcript_aad_with_segments(
+    session_pub: &[u8],
+    content_hash: &[u8],
+    nonce: &[u8],
+    segment_digests: Option<&[u8]>,
+) -> Vec<u8> {
+    let c = cid();
+    let receipt_hash = release_receipt_hash(
+        RR_SCHEMA,
+        RR_REQUEST_ID,
+        &c,
+        PRINCIPAL,
+        SESSION,
+        ACTION,
+        RR_PROVIDER,
+        RR_STATUS,
+        RR_ISSUED_AT,
+        EXPIRES_AT,
+    );
+    DecryptTranscriptV1 {
+        suite_id: SUITE_PQ_HYBRID,
+        provider_id: "decrypt-provider",
+        principal_id: PRINCIPAL,
+        session_id: SESSION,
+        object_cid: &c,
+        content_hash,
+        action: ACTION,
+        viewer_interface: VIEWER,
+        output_kind: OUTPUT_KIND,
+        expires_at: EXPIRES_AT,
+        release_receipt_hash: receipt_hash,
+        decrypt_session_pub: session_pub,
+        nonce,
+        node_set_id: None,
+    }
+    .to_aad_with_segments(segment_digests)
+}
+
+/// LIVE multi-segment open gate (Verify mode): drive a genuinely multi-segment asset — the SAME
+/// 3-fragment golden the encrypt↔decrypt seam pins — END TO END through the REAL key-provider
+/// `release` + the REAL decrypt-provider `open_session_v1`. The key is released ONCE; every segment
+/// is fetched by its OWN CIDv1 through the content capability; the whole ordered set is welded into
+/// the transcript AAD; all segments are decrypted in-VM under that one re-sealed CEK. Proves:
+///   (a) the happy N-segment open returns `segment_count == N` and a summed `sample_count`;
+///   (b) a SUBSTITUTED segment fails the WHOLE open closed (the AAD digest binding rejects it before
+///       a byte is decrypted — even though the sealed CEK is otherwise valid);
+///   (c) neither the CEK nor any segment's plaintext crosses the boundary.
+/// Uses the reference authority (deterministic, offline) regardless of the configured backend — it
+/// exercises the LIVE single-node rail, not a backend.
+fn multisegment_live_gate(
+    key_bin: &str,
+    decrypt_bin: &str,
+    work_dir: &std::path::Path,
+) -> Result<(), String> {
+    use base64::Engine as _;
+
+    // The asset: the SAME multi-segment golden the encrypt-provider minted and the decrypt-provider
+    // seam test replays (one CEK, globally-unique per-sample IVs continuing across fragments).
+    let golden: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../capsules/decrypt-provider/tests/vectors/roundtrip_multisegment_encrypt_to_decrypt.json"
+    )))
+    .map_err(|e| format!("load multisegment golden: {e}"))?;
+    let kid_hex = golden["kid_hex"].as_str().ok_or("golden missing kid_hex")?.to_string();
+    let cek_b64 = golden["cek_b64"].as_str().ok_or("golden missing cek_b64")?.to_string();
+    let cek = B64.decode(&cek_b64).map_err(|e| e.to_string())?;
+    let decode_list = |key: &str| -> Result<Vec<Vec<u8>>, String> {
+        golden[key]
+            .as_array()
+            .ok_or_else(|| format!("golden missing {key}"))?
+            .iter()
+            .map(|s| B64.decode(s.as_str().unwrap_or_default()).map_err(|e| e.to_string()))
+            .collect()
+    };
+    let segments = decode_list("segments_b64")?;
+    let expected = decode_list("expected_plaintexts_b64")?;
+    if segments.len() < 2 {
+        return Err("the live multi-segment gate needs >= 2 segments".to_string());
+    }
+
+    // CONTENT PLANE: publish each segment and fetch it back BY ITS OWN CIDv1 (per-segment
+    // content-addressing — exactly how a DASH/fMP4 fragment list is resolved).
+    let mut store = ContentStore::new();
+    let cids: Vec<String> = segments.iter().map(|s| store.put(s)).collect();
+    let mut fetched: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
+    for c in &cids {
+        let (bytes, _avail) = content_capability_fetch(&store, c)?;
+        fetched.push(bytes);
+    }
+
+    // Escrow the asset CEK (the golden's) to a FRESH reference authority under the golden's KID.
+    let mut kid16 = [0u8; 16];
+    for (i, b) in kid16.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&kid_hex[i * 2..i * 2 + 2], 16).map_err(|e| format!("kid hex: {e}"))?;
+    }
+    let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+
+    let key_store = work_dir.join("multiseg-key-store.json").to_string_lossy().into_owned();
+    let mut key = Capsule::spawn("key-provider(multiseg)", key_bin)?;
+    let key_init = ok_data(
+        &key.call(&json!({
+            "op": "init",
+            "config": { "backend": "reference", "authority_key_store": key_store }
+        }))?,
+        "multiseg key init",
+    )?;
+    let authority_vk_b64 = key_init["seal_verifying_key_b64"]
+        .as_str()
+        .ok_or("multiseg key-provider did not publish a verifying key")?
+        .to_string();
+    let recipient_pub_b64 = key_init["seal_recipient_pub_b64"]
+        .as_str()
+        .ok_or("multiseg key-provider did not publish a recipient key")?
+        .to_string();
+    let wrapped_cek_b64 = escrow_share_to_recipient(&recipient_pub_b64, &cek, &kid16, &producer_signer)?;
+
+    // The REAL decrypt boundary, trusting that authority's published verifying key.
+    let mut decrypt = Capsule::spawn("decrypt-provider(multiseg)", decrypt_bin)?;
+    let dec_init = ok_data(
+        &decrypt.call(&json!({ "op": "init", "config": { "authority_vk_b64": authority_vk_b64 } }))?,
+        "multiseg decrypt init",
+    )?;
+    let session_pub_b64 = dec_init["decrypt_session_public_key_b64"]
+        .as_str()
+        .ok_or("multiseg decrypt-provider did not publish a session key")?
+        .to_string();
+    let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
+
+    let content_hash = b"consumer-smoke-content-hash-0001".to_vec();
+    let nonce = b"consumer-smoke-nonce-1".to_vec();
+
+    // Weld the WHOLE ordered, content-addressed segment set into the transcript AAD.
+    let ordered: Vec<&[u8]> = fetched.iter().map(|s| s.as_slice()).collect();
+    let digests = ddrm_envelope::segment_digests(&ordered);
+    let aad = transcript_aad_with_segments(&session_pub, &content_hash, &nonce, Some(&digests));
+
+    // RELEASE ONCE: segment 0 → `ciphertext_b64`, the rest → `extra_segments_b64`.
+    let extra_b64: Vec<String> = fetched[1..].iter().map(|s| B64.encode(s)).collect();
+    let mut request = key_release_request_base(&kid_hex, &wrapped_cek_b64);
+    request["rights_receipt"] = fallback_rights_receipt();
+    let session_ctx = json!({
+        "decrypt_session_pub_b64": session_pub_b64,
+        "producer_vk_b64": B64.encode(&producer_vk),
+        "aad_b64": B64.encode(&aad),
+        "ciphertext_b64": B64.encode(&fetched[0]),
+        "content_hash_b64": B64.encode(&content_hash),
+        "nonce_b64": B64.encode(&nonce),
+        "extra_segments_b64": extra_b64,
+        "now_unix": NOW_UNIX,
+    });
+    let release = ok_data(
+        &key.call(&json!({ "op": "release", "request": request, "session": session_ctx }))?,
+        "multiseg key release",
+    )?;
+    let material = release["material"].clone();
+    // Containment on the key→decrypt wire: the raw CEK never rides the release.
+    if serde_json::to_string(&release).unwrap_or_default().contains(&cek_b64) {
+        return Err("the raw CEK leaked from the multiseg key release".to_string());
+    }
+
+    // OPEN: the whole asset decrypts in-VM under the ONE re-sealed CEK.
+    let mut dreq = decrypt_request_base();
+    dreq["object_cid"] = json!(cid());
+    dreq["viewer_interface"] = json!(VIEWER);
+    dreq["release_receipt"] = release_receipt_json();
+    let open = decrypt.call(&json!({
+        "op": "open_session_v1",
+        "request": dreq,
+        "material": material,
+        "now_unix": NOW_UNIX,
+    }))?;
+    let open_data = ok_data(&open, "multiseg open_session_v1")?;
+    if open_data["decision"].as_str() != Some("opened") {
+        key.shutdown();
+        decrypt.shutdown();
+        return Err(format!("multiseg open did not open the session: {open}"));
+    }
+    let session = &open_data["session"];
+    if session["segment_count"].as_u64() != Some(segments.len() as u64) {
+        key.shutdown();
+        decrypt.shutdown();
+        return Err(format!("multiseg segment_count != {}: {open}", segments.len()));
+    }
+    let sample_count = session["sample_count"].as_u64().unwrap_or(0);
+    if sample_count < segments.len() as u64 {
+        key.shutdown();
+        decrypt.shutdown();
+        return Err(format!("multiseg sample_count not summed across segments: {open}"));
+    }
+    // Containment at the consumer edge: neither the CEK nor ANY segment's plaintext crosses out.
+    let open_str = serde_json::to_string(&open).map_err(|e| e.to_string())?;
+    if open_str.contains(&cek_b64) {
+        key.shutdown();
+        decrypt.shutdown();
+        return Err("CEK leaked from the multiseg decrypt boundary".to_string());
+    }
+    for pt in &expected {
+        if let Ok(s) = std::str::from_utf8(pt) {
+            if !s.is_empty() && open_str.contains(s) {
+                key.shutdown();
+                decrypt.shutdown();
+                return Err("a segment's plaintext leaked from the multiseg decrypt boundary".to_string());
+            }
+        }
+    }
+
+    // FAIL CLOSED: a SUBSTITUTED fragment (a node serving different bytes for one segment) is rejected
+    // by the transcript's segment-digest binding — the recomputed AAD no longer matches the seal, so
+    // the CEK unwrap fails BEFORE any byte is decrypted. The whole open fails closed, not partially.
+    let mut tampered = release["material"].clone();
+    let extra_arr = tampered["extra_segments_b64"]
+        .as_array()
+        .ok_or("multiseg material lost its extra_segments_b64")?
+        .clone();
+    let mut seg = B64.decode(extra_arr[0].as_str().unwrap_or_default()).map_err(|e| e.to_string())?;
+    let n = seg.len();
+    seg[n - 1] ^= 0x01;
+    tampered["extra_segments_b64"].as_array_mut().unwrap()[0] = json!(B64.encode(&seg));
+    let bad = decrypt.call(&json!({
+        "op": "open_session_v1",
+        "request": dreq,
+        "material": tampered,
+        "now_unix": NOW_UNIX,
+    }))?;
+    let bad_data = ok_data(&bad, "multiseg tampered open")?;
+    key.shutdown();
+    decrypt.shutdown();
+    if bad_data["decision"].as_str() == Some("opened") {
+        return Err("a SUBSTITUTED segment opened — the multi-segment AAD binding failed open".to_string());
+    }
+
+    println!(
+        "  [decrypt-rail/multi-segment] {}-segment asset opened LIVE end-to-end (key released ONCE, \
+         each segment fetched by its CIDv1, all decrypted in-VM): segment_count={}, sample_count={} \
+         summed across fragments; a SUBSTITUTED segment failed the whole open closed; no CEK/plaintext \
+         crossed the boundary",
+        segments.len(),
+        segments.len(),
+        sample_count
+    );
+    Ok(())
+}
+
 /// Day 103–104: the runtime's persisting event sink — writes each runtime event as the SAME
 /// durable, CEK-free record the lib's `PersistingEventSink` would (`open_event_record`, one
 /// canonical shape) and, on the 2-of-2 threshold rail, STAMPS the NODE-SET IDENTITY into it
@@ -5160,6 +5408,13 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
              failed closed",
             media.len(), root, media_avail.size, media_avail.backend
         );
+
+        // --- DECRYPT RAIL (multi-segment): carry a genuinely MULTI-SEGMENT asset through the LIVE
+        // key-provider `release` + decrypt-provider `open_session_v1` rail — the key released once,
+        // every segment fetched by its CIDv1, the whole ordered set welded into the transcript AAD,
+        // and a substituted segment failing the whole open closed. The single-segment open below is
+        // the default path; this proves the N-segment path opens with the key, end to end.
+        multisegment_live_gate(&cfg.key_bin, &cfg.decrypt_bin, &work_dir)?;
     }
 
     *key_material.borrow_mut() = Some(KeyOpenMaterial {

@@ -193,15 +193,29 @@ ladder seam gate now pins **four** round-trip goldens (single + multisample + su
 multisegment). Per-segment byte-tampering is caught EARLIER by the content plane's per-segment CID
 integrity (above), before bytes reach the boundary.
 
-Remaining on the runnable-E2E ladder: wiring the multi-segment LIST through the **live sealed
-rail + transcript** (today the live consumer open decrypts ONE segment; the boundary CAPABILITY,
-the producer packaging, and the per-segment content-addressing are all real + verified, but the
-live `open_session_v1` material still carries a single ciphertext). The single CENC segment the
-live open decrypts is already a REAL content-addressed CENC fMP4 produced by `encrypt-provider`'s
-in-boundary engine (the decrypt-provider seam goldens + `ddrm-producer-smoke` prove
-mint→seal→escrow→decrypt-now on real fMP4 shapes); plaintext is validated INSIDE the decrypt
-boundary (containment — it never crosses the wire), not at the orchestrator. Also pending: a
-balanced dag-pb **tree** above ~174 leaves (content plane, fail-closed today).
+**Multi-segment through the LIVE rail + transcript.** The multi-segment LIST now travels the full
+live path — published, fetched by CID, released ONCE, decrypted in-VM — not just at the seam. The
+binding is strictly **additive**: `DecryptTranscriptV1::to_aad_with_segments(Some(digests))` appends
+the concatenation of each segment's content digest (the same digest under each segment's raw CIDv1)
+AFTER `node_set_id`, so a single-segment open (`None`) is **byte-identical** to before, while a
+multi-segment open is welded to the EXACT ordered, content-addressed set. The optional ordered
+`extra_segments_b64` (segment 0 stays `ciphertext_b64`) threads key-provider release context →
+`SealedDecryptMaterialV1` → the decrypt boundary, which recomputes the digests, rebuilds the
+segment-bound AAD, and loops `decrypt_session_segments` under the ONE re-sealed CEK
+(`decrypt_from_carrier_bound_segments` / `decrypt_pq_sealed_segments_bound` — CEK unwrapped once,
+held in `Zeroizing` across the loop). A reorder/drop/add/**substitute** changes the digests, the
+AAD no longer matches the seal, and the unwrap fails closed BEFORE any byte is decrypted — proven
+LIVE by `multisegment_live_gate` (3 fragments → `segment_count==3`, `sample_count==5` summed; a
+substituted fragment fails the whole open closed; no CEK/plaintext crosses out), which runs in every
+verify-mode `ddrm-consumer-smoke.sh`. The threshold/quorum rails stay single-segment (a multi-segment
+threshold material is refused up front).
+
+**The runnable-E2E ladder is COMPLETE:** a content-addressed, multi-segment, owned asset opens
+end-to-end with a real distributed key — fetched by CID, released once, decrypted in-VM, fail-closed
+at every seam, no CEK/plaintext on any wire. Remaining (explicitly out of the runnable path): a
+balanced dag-pb **tree** above ~174 leaves (the only fail-closed content-plane gap), and
+multi-segment on the **threshold/quorum** rails (single-node multi-segment is live; the quorum rail
+is single-segment by design today).
 
 ---
 

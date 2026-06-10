@@ -207,6 +207,11 @@ struct ReleaseSessionContext {
     nonce_b64: String,
     #[serde(default)]
     init_segment_b64: Option<String>,
+    /// MULTI-SEGMENT (optional): the segments AFTER `ciphertext_b64` (segment 0), in presentation
+    /// order, carried straight into the sealed material (the authority never touches segment bytes —
+    /// the runtime already bound the ordered set into `aad_b64`). Absent → single-segment release.
+    #[serde(default)]
+    extra_segments_b64: Option<Vec<String>>,
     /// 2-of-2 THRESHOLD (Day 97–98): the SECOND node's escrow blob (base64) — the producer escrowed
     /// `share2` to node B's recipient at publish. Node A's escrow rides in the rights-bound
     /// `key_envelope.wrapped_cek` (share1). When this is present AND a second node is provisioned,
@@ -959,6 +964,7 @@ impl KeyProvider {
             content_hash_b64,
             nonce_b64,
             init_segment_b64,
+            None,
         )
     }
 
@@ -1053,6 +1059,7 @@ impl KeyProvider {
             content_hash_b64,
             nonce_b64,
             init_segment_b64,
+            None,
         )
     }
 
@@ -1217,6 +1224,7 @@ impl KeyProvider {
                 session.content_hash_b64,
                 session.nonce_b64,
                 session.init_segment_b64,
+                session.extra_segments_b64,
             )
         }
         #[cfg(not(feature = "key-authority-ref"))]
@@ -1651,6 +1659,7 @@ fn seal_recovered_cek_into_material(
     content_hash_b64: String,
     nonce_b64: String,
     init_segment_b64: Option<String>,
+    extra_segments_b64: Option<Vec<String>>,
 ) -> Response {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -1664,6 +1673,11 @@ fn seal_recovered_cek_into_material(
     });
     if let Some(init) = init_segment_b64 {
         material["init_segment_b64"] = json!(init);
+    }
+    // MULTI-SEGMENT passthrough: the extra segments ride into the material unchanged (the authority
+    // never inspects segment bytes; the runtime already welded the ordered set into `aad`).
+    if let Some(extra) = extra_segments_b64.filter(|e| !e.is_empty()) {
+        material["extra_segments_b64"] = json!(extra);
     }
     Response::ok(json!({
         "suite": ddrm_envelope::SUITE_PQ_HYBRID,

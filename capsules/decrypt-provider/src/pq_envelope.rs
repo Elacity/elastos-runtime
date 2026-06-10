@@ -129,6 +129,30 @@ pub fn decrypt_pq_sealed_segment_bound(
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
+/// Multi-SEGMENT transcript-bound PQ data path: as [`decrypt_pq_sealed_segment_bound`] but the CEK
+/// is unwrapped ONCE and then drives the decrypt of the WHOLE ordered segment list in-VM (a
+/// DASH/fMP4 asset shares one presentation CEK). The CEK is held in `Zeroizing` across the loop and
+/// never reaches the scoped output; the segment list is welded into `aad` by the caller (via the
+/// transcript's `segment_digests`), so a reordered/dropped/substituted segment fails the unwrap
+/// closed before any byte is decrypted.
+#[cfg(feature = "pq-rail-prep")]
+pub fn decrypt_pq_sealed_segments_bound(
+    session: &SessionKemSecret,
+    sealed_envelope: &PqSealedEnvelope,
+    aad: &[u8],
+    verifier: &impl CekSealVerifier,
+    ciphertext_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, serde_json::Value), String> {
+    use base64::Engine as _;
+    use zeroize::Zeroizing;
+
+    let cek =
+        hybrid_unwrap_bound(session, sealed_envelope, aad, verifier).map_err(|err| format!("{err:?}"))?;
+    let cek_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(cek.as_slice()));
+    crate::decrypt_session_segments(&cek_b64, ciphertext_segments, init_segment)
+}
+
 /// Key-authority-side seal helpers — the counterpart of the in-VM unwrap. The seal
 /// ENGINE itself now lives once in the shared `ddrm-envelope` crate (the same code
 /// the real key authority seals with), re-exported here under the historical
