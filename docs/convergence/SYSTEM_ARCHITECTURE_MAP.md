@@ -369,6 +369,32 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 121–125):** the QUORUM is RECONFIGURABLE — a LIVE 2-of-3 set is RE-SHARED into a 3-of-5 set across REAL
+  daemons, so the THRESHOLD and the MEMBERSHIP both change while the CEK never reassembles, with no re-publish. Day
+  113–116 made the threshold a real QUORUM; Day 117–120 gave it a rotation lifecycle at the SAME (t,n); this unit lets
+  the (t,n) AND membership EVOLVE (2-of-3 → 3-of-5: more redundancy, a higher bar). The KEY INSIGHT (proactive
+  re-sharing): an OLD member `i` holding `p(x_i)` draws a FRESH degree-(k−1) polynomial `q_i` with `q_i(0)=p(x_i)` and
+  sends `q_i(y_j)` to each NEW node `j`; node `j` combines over the OLD-contributor Lagrange `P(y_j)=Σ λ_i·q_i(y_j)`, so
+  `P(0)=Σ λ_i·q_i(0)=Σ λ_i·p(x_i)=p(0)=CEK` — a FRESH degree-(k−1) polynomial through the SAME secret. The threshold is
+  now k, the membership is now m, an OLD share (on `p`) is dead against the new set (on `P`), every member touches only
+  its OWN point, a single new share reveals nothing, and the CEK exists NOWHERE during the reconfiguration (all new
+  nodes combine over the SAME fixed old quorum → one consistent `P`). Audited PC2 first: PC2 has NO reconfiguration
+  concept — Lit's t, n, membership AND refresh policy are invisible + unconfigurable (a key is its threshold forever),
+  and Chipotle abandoned t-of-n for a single master PKP (`chipotle-client.ts:1290`). (1) PRIMITIVE (ddrm-envelope 34→35):
+  `lagrange_combine_at_zero(points)` (general t-point Lagrange at 0 — the 2-point `combine_cek_shamir2` generalized;
+  serves BOTH the new-node sub-share combine AND the k-of-m reconstruction) + `reshare_eval(share, higher, y)` (the
+  degree-(k−1) sub-share polynomial) + `reshare_aad`/`reshare_subshare_aad` (operator + contributor→target bindings) +
+  a golden 2-of-3→3-of-5 (any 3 reconstruct, any 2 don't, old material dead, fail-closed edges). (2) BOUNDARY
+  (decrypt-provider): `decrypt_from_carrier_quorum_k` (pins all m identities, reconstructs k IN-BOUNDARY, FAILS CLOSED
+  below k; real-ML-DSA-65 3-of-5 test: any 3 decrypt, 2 fail closed, a replayed share never reaches quorum, a
+  mis-indexed share refused). (3) NODE (dkms-authority 18→19): `reshare_contribute` (an OLD member emits sealed
+  sub-shares) + `reshare_install` (a NEW member combines + re-escrows its share to itself), operator-authorized, with a
+  full live-protocol node test. (4) RUNTIME + GATES 46–48 (`dkms_quorum_reconfigure_gates`, EIGHT real daemons): (46)
+  re-share the live 2-of-3 into a 3-of-5 across real daemons → any three of five RELEASE + reconstruct the EXACT CEK;
+  (47) FAILS CLOSED below k AND SURVIVES (m−k)=2 dead new daemons; (48) the install is OPERATOR-BOUND (a non-operator
+  authorization refused live) and the OLD node-set pin no longer matches the reconfigured descriptor. Gate: ladder
+  INTACT (ddrm-envelope=35, dkms-authority=19, decrypt-provider rail rungs +1), drift PASS, ALL dDRM smokes green (the
+  2-of-3 quorum smoke now driving gates 38–48), clippy clean.
 - **Status (Day 117–120):** the QUORUM now has a LIFECYCLE — a LIVE share-wise ROTATION of the 2-of-3 set to THREE
   successor nodes via per-node COORDINATE-BOUND refresh deltas `q(x_i)` (a degree-1 proactive-refresh polynomial with
   `q(0)=0` over GF(256)), so a quorum member can be decommissioned to a successor WITHOUT the CEK reassembling and

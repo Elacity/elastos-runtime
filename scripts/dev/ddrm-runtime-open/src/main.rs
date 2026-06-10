@@ -645,9 +645,16 @@ fn derive_node_set_from_descriptor(descriptor_path: &std::path::Path) -> Result<
         .and_then(|t| t.get("nodes"))
         .and_then(Value::as_array)
         .ok_or("threshold descriptor carries no node list to pin")?;
-    if nodes.len() != 2 && nodes.len() != 3 {
-        return Err("threshold descriptor must list two (2-of-2) or three (2-of-3) nodes for a node-set".to_string());
+    if nodes.len() < 2 {
+        return Err("threshold descriptor must list at least two nodes for a node-set".to_string());
     }
+    // The threshold `t` is part of the node-set identity (2-of-2 and 2-of-3 both pin t=2; a
+    // reconfigured 3-of-5 pins t=3). Default to 2 for the historical descriptors that omit it.
+    let t = desc
+        .get("threshold")
+        .and_then(|th| th.get("t"))
+        .and_then(Value::as_u64)
+        .unwrap_or(2) as u8;
     let vk_of = |i: usize| -> Result<Vec<u8>, String> {
         let s = nodes[i]
             .get("verifying_key_b64")
@@ -657,7 +664,7 @@ fn derive_node_set_from_descriptor(descriptor_path: &std::path::Path) -> Result<
     };
     let vks: Vec<Vec<u8>> = (0..nodes.len()).map(vk_of).collect::<Result<_, _>>()?;
     let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
-    Ok(ddrm_envelope::threshold_node_set_id_n(2, &vk_refs))
+    Ok(ddrm_envelope::threshold_node_set_id_n(t, &vk_refs))
 }
 
 fn step(n: u32, msg: &str) {
@@ -2503,6 +2510,331 @@ fn dkms_quorum_rotation_gates(
     Ok(())
 }
 
+/// QUORUM RECONFIGURATION (Day 121–125): the live 2-of-3 set is RE-SHARED into a 3-of-5 set across
+/// REAL daemons — the threshold AND the membership change while the CEK never reassembles. Two OLD
+/// members CONTRIBUTE sub-shares of their shares over the socket; five fresh NEW daemons INSTALL
+/// their shares by combining them; the reconfigured set OPENS to the EXACT CEK; it SURVIVES (m−k)=2
+/// dead new nodes; it FAILS CLOSED below k; the OLD node-set pin no longer matches; and a
+/// non-operator reconfiguration is refused. PC2 has no analogue — Lit's t, n and membership are
+/// fixed and uninspectable, so a key minted at 2-of-3 is 2-of-3 forever.
+#[allow(clippy::too_many_arguments)]
+fn dkms_quorum_reconfigure_gates(
+    node_bin: &str,
+    work_dir: &std::path::Path,
+    fixture: &PublishEscrow,
+    descriptor_path: &std::path::Path,
+    caller_seed: [u8; 32],
+    operator_signer: &ddrm_envelope::seal::MlDsaSealSigner,
+    operator_vk_b64: &str,
+) -> Result<(), String> {
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+
+    // The CURRENT (pre-reconfiguration) 3-node set, from the published descriptor.
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("read descriptor for reconfigure: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor for reconfigure: {e}"))?;
+    let nodes = desc["threshold"]["nodes"].as_array().ok_or("descriptor has no threshold nodes")?;
+    if nodes.len() != 3 {
+        return Err("quorum reconfigure gate requires a 3-node descriptor".to_string());
+    }
+    let node_field = |i: usize, k: &str| -> Result<String, String> {
+        nodes[i][k].as_str().map(str::to_string).ok_or_else(|| format!("descriptor node {i} missing {k}"))
+    };
+    let share2 = fixture.wrapped_cek_share2_b64.as_ref().ok_or("reconfigure fixture needs share-2 escrow")?;
+    let share3 = fixture.wrapped_cek_share3_b64.as_ref().ok_or("reconfigure fixture needs share-3 escrow")?;
+    // (vk, recipient, endpoint, current-share-escrow) per OLD node.
+    let old: Vec<(String, String, String, String)> = vec![
+        (node_field(0, "verifying_key_b64")?, node_field(0, "recipient_pub_b64")?, node_field(0, "authority_endpoint")?, fixture.wrapped_cek_b64.clone()),
+        (node_field(1, "verifying_key_b64")?, node_field(1, "recipient_pub_b64")?, node_field(1, "authority_endpoint")?, share2.clone()),
+        (node_field(2, "verifying_key_b64")?, node_field(2, "recipient_pub_b64")?, node_field(2, "authority_endpoint")?, share3.clone()),
+    ];
+    let kid16 = {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&fixture.kid_hex[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("fixture kid hex: {e}"))?;
+        }
+        out
+    };
+    let cek = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
+
+    // PROVISION + START five fresh NEW daemons (genuinely new identities, the new membership).
+    let (k, m) = (3u8, 5u8);
+    let mut new_stores: Vec<String> = Vec::new();
+    let mut new_endpoints: Vec<String> = Vec::new();
+    let mut new_vk: Vec<String> = Vec::new();
+    let mut new_recipient: Vec<String> = Vec::new();
+    let mut new_daemons: Vec<DaemonGuard> = Vec::new();
+    for j in 0..m as usize {
+        let store = work_dir.join(format!("dkms-reconfig-new-{j}.json")).to_string_lossy().into_owned();
+        let (vk, recipient) = provision_dkms_node(node_bin, &store)?;
+        let endpoint = work_dir.join(format!("dkms-reconfig-new-{j}.sock")).to_string_lossy().into_owned();
+        new_daemons.push(start_dkms_daemon(node_bin, &endpoint, &store, &caller_vk_b64, operator_vk_b64)?);
+        new_stores.push(store);
+        new_endpoints.push(endpoint);
+        new_vk.push(vk);
+        new_recipient.push(recipient);
+    }
+    {
+        // All eight identities (3 old + 5 new) must be pairwise distinct.
+        let mut all: Vec<&str> = old.iter().map(|n| n.0.as_str()).collect();
+        all.extend(new_vk.iter().map(String::as_str));
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                if all[i] == all[j] {
+                    return Err("reconfigure provisioning did not produce distinct identities".to_string());
+                }
+            }
+        }
+    }
+
+    // The node-set ids + the operator-bound reconfiguration AAD.
+    let old_vk_bytes: Vec<Vec<u8>> = old.iter().map(|n| B64.decode(&n.0).unwrap_or_default()).collect();
+    let old_refs: Vec<&[u8]> = old_vk_bytes.iter().map(|v| v.as_slice()).collect();
+    let old_set_id = ddrm_envelope::threshold_node_set_id_n(2, &old_refs);
+    let new_vk_bytes: Vec<Vec<u8>> = new_vk.iter().map(|v| B64.decode(v).unwrap_or_default()).collect();
+    let new_refs: Vec<&[u8]> = new_vk_bytes.iter().map(|v| v.as_slice()).collect();
+    let new_set_id = ddrm_envelope::threshold_node_set_id_n(k, &new_refs);
+    let reshare_aad = ddrm_envelope::reshare_aad(&kid16, &old_set_id, &new_set_id, k, m);
+    let old_set_b64 = B64.encode(old_set_id);
+    let new_set_b64 = B64.encode(new_set_id);
+
+    // The operator seals a reconfiguration authorization to a recipient (bound to the whole context).
+    let seal_auth_with = |recipient_b64: &str, signer: &ddrm_envelope::seal::MlDsaSealSigner| -> Result<String, String> {
+        let bytes = B64.decode(recipient_b64).map_err(|e| e.to_string())?;
+        let public = ddrm_envelope::session_public_from_bytes(&bytes).ok_or("recipient key malformed")?;
+        Ok(B64.encode(ddrm_envelope::seal::seal_bound(&public, b"reconfigure", &reshare_aad, signer).to_bytes()))
+    };
+
+    // CONTRIBUTE over the socket: the OLD quorum {x=1, x=2} re-shares to the five new recipients.
+    let contributors = [0usize, 1usize];
+    let mut by_target: Vec<Vec<(u8, String, String)>> = vec![Vec::new(); m as usize];
+    for &ci in &contributors {
+        let mut node = NodeSocket::connect(&old[ci].2)?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "reconfigure contributor init")?;
+        let data = ok_data(
+            &node.call(&json!({
+                "op": "reshare_contribute",
+                "wrapped_cek_b64": old[ci].3,
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": fixture.kid_hex,
+                "producer_vk_b64": fixture.producer_vk_b64,
+                "operator_auth_b64": seal_auth_with(&old[ci].1, operator_signer)?,
+                "old_node_set_id_b64": old_set_b64,
+                "new_node_set_id_b64": new_set_b64,
+                "k": k,
+                "m": m,
+                "new_recipient_pubs_b64": new_recipient,
+            }))?,
+            "reshare_contribute",
+        )?;
+        let cx = data["contributor_x"].as_u64().ok_or("no contributor_x")? as u8;
+        if cx != (ci + 1) as u8 {
+            return Err("contributor reported the wrong coordinate".to_string());
+        }
+        let cvk = data["contributor_vk_b64"].as_str().ok_or("no contributor vk")?.to_string();
+        for sub in data["subshares"].as_array().ok_or("no subshares")? {
+            let tx = sub["target_x"].as_u64().ok_or("no target_x")? as usize;
+            by_target[tx - 1].push((cx, cvk.clone(), sub["sealed_subshare_b64"].as_str().ok_or("no sealed subshare")?.to_string()));
+        }
+    }
+
+    // INSTALL over the socket: each NEW daemon combines its sub-shares into its new share.
+    let contributions_json = |j: usize| -> Vec<Value> {
+        by_target[j]
+            .iter()
+            .map(|(cx, vk, sealed)| json!({
+                "contributor_x": cx,
+                "contributor_vk_b64": vk,
+                "sealed_subshare_b64": sealed,
+            }))
+            .collect()
+    };
+    let mut new_escrow: Vec<String> = Vec::new();
+    for j in 0..m as usize {
+        let mut node = NodeSocket::connect(&new_endpoints[j])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "reconfigure installer init")?;
+        let data = ok_data(
+            &node.call(&json!({
+                "op": "reshare_install",
+                "operator_auth_b64": seal_auth_with(&new_recipient[j], operator_signer)?,
+                "old_node_set_id_b64": old_set_b64,
+                "new_node_set_id_b64": new_set_b64,
+                "k": k,
+                "m": m,
+                "target_x": (j + 1) as u8,
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": fixture.kid_hex,
+                "contributions": contributions_json(j),
+            }))?,
+            "reshare_install",
+        )?;
+        if data["escrow_producer_vk_b64"].as_str() != Some(new_vk[j].as_str()) {
+            return Err("a new escrow does not name the installing node as its producer".to_string());
+        }
+        new_escrow.push(data["wrapped_cek_b64"].as_str().ok_or("no new escrow")?.to_string());
+    }
+
+    // Publish the reconfigured 5-node, t=3 descriptor; its node-set id must be the new one.
+    let new_desc_path = work_dir.join("dkms-reconfigured-3of5.json");
+    let new_nodes_json: Vec<Value> = (0..m as usize)
+        .map(|j| json!({
+            "verifying_key_b64": new_vk[j],
+            "recipient_pub_b64": new_recipient[j],
+            "authority_endpoint": new_endpoints[j],
+        }))
+        .collect();
+    let new_desc = json!({
+        "schema": "elastos.dkms.authority/v2",
+        "verifying_key_b64": new_vk[0],
+        "recipient_pub_b64": new_recipient[0],
+        "authority_endpoint": new_endpoints[0],
+        "threshold": { "t": k, "nodes": new_nodes_json },
+    });
+    std::fs::write(&new_desc_path, serde_json::to_vec_pretty(&new_desc).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write reconfigured descriptor: {e}"))?;
+    let new_set_from_desc = derive_node_set_from_descriptor(&new_desc_path)?;
+    if new_set_from_desc != new_set_id {
+        return Err("the reconfigured descriptor's node-set id does not match the re-share's new set".to_string());
+    }
+
+    // The decrypt-boundary stand-in: a fresh session + a transcript AAD naming the RECONFIGURED set.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
+    let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
+    let new_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&new_set_id));
+    let new_aad_b64 = B64.encode(&new_aad);
+    const RC_CONTENT: &str = "bafReconfigure";
+
+    // Drive a NEW node's `recover` over the socket, releasing its reconfigured share re-sealed to the
+    // session — the same full identity + session + possession + freshness path every recover walks.
+    let recover_new = |j: usize| -> Result<(u8, Vec<u8>), String> {
+        let mut node = NodeSocket::connect(&new_endpoints[j])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "reconfigured node init")?;
+        let challenge = ddrm_envelope::random_seed();
+        let hello = ok_data(
+            &node.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": caller_vk_b64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "reconfigured node hello",
+        )?;
+        let token = hello["session_token"].clone();
+        let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
+        let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
+            &caller_signer,
+            &chal,
+            RC_CONTENT.as_bytes(),
+            fixture.kid_hex.as_bytes(),
+            &session_pub_bytes,
+            1,
+        ));
+        let recover = ok_data(
+            &node.call(&json!({
+                "op": "recover",
+                "wrapped_cek_b64": new_escrow[j],
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": fixture.kid_hex,
+                "producer_vk_b64": new_vk[j],
+                "decrypt_session_pub_b64": session_pub_b64,
+                "aad_b64": new_aad_b64,
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": fixture.content_hash_b64,
+                "nonce_b64": fixture.nonce_b64,
+                "rights_receipt": probe_receipt(true, RC_CONTENT, "did:key:zViewer", "view"),
+                "content_id": RC_CONTENT,
+                "principal_id": "did:key:zViewer",
+                "session_id": "probe-session",
+                "right": "view",
+                "session_token": token,
+                "caller_sig_b64": caller_sig_b64,
+                "recover_seq": 1u64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "reconfigured node recover",
+        )?;
+        if serde_json::to_string(&recover).unwrap_or_default().contains(GOLDEN_CEK_B64) {
+            return Err("the raw CEK leaked from a reconfigured node recover".to_string());
+        }
+        let sealed = B64.decode(recover["material"]["sealed_cek_b64"].as_str().ok_or("no sealed share")?)
+            .map_err(|e| e.to_string())?;
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).map_err(|e| format!("{e:?}"))?;
+        let vk = B64.decode(&new_vk[j]).map_err(|e| e.to_string())?;
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).ok_or("new vk malformed")?;
+        let payload = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, &new_aad, &verifier)
+            .map_err(|e| format!("session unwrap of reconfigured share: {e:?}"))?;
+        let (x, body) = ddrm_envelope::parse_indexed_share(&payload).ok_or("reconfigured share is not indexed")?;
+        Ok((x, body.to_vec()))
+    };
+    let combine = |idxs: &[usize]| -> Result<Vec<u8>, String> {
+        let shares: Vec<(u8, Vec<u8>)> = idxs.iter().map(|&j| recover_new(j)).collect::<Result<_, _>>()?;
+        let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, b)| (*x, b.as_slice())).collect();
+        Ok(ddrm_envelope::lagrange_combine_at_zero(&points)?.to_vec())
+    };
+
+    // --- Gate 46: the reconfigured 3-of-5 OPENS to the EXACT CEK (the threshold + membership lifted). ---
+    if combine(&[0, 2, 4])? != cek {
+        return Err("the reconfigured 3-of-5 did not reconstruct the original CEK".to_string());
+    }
+    step(46, "dkms quorum RECONFIGURATION: a live 2-of-3 set was RE-SHARED into a 3-of-5 set across REAL daemons — two OLD members CONTRIBUTED sub-shares, five fresh NEW daemons INSTALLED their shares by combining over the old-quorum Lagrange, and any THREE of the five released + reconstructed the EXACT CEK (the threshold AND the membership changed, the CEK never reassembling)");
+
+    // --- Gate 47: the reconfigured set FAILS CLOSED below k AND SURVIVES (m−k)=2 dead new nodes. ---
+    // Below quorum: two reconfigured shares do not reconstruct the CEK (the threshold genuinely lifted).
+    let two_idx = [1usize, 3usize];
+    let two = {
+        let shares: Vec<(u8, Vec<u8>)> = two_idx.iter().map(|&j| recover_new(j)).collect::<Result<_, _>>()?;
+        let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, b)| (*x, b.as_slice())).collect();
+        ddrm_envelope::lagrange_combine_at_zero(&points)?.to_vec()
+    };
+    if two == cek {
+        return Err("two reconfigured shares reconstructed the CEK — the threshold did not lift to k".to_string());
+    }
+    // Kill two new daemons; any THREE of the remaining still reconstruct.
+    let _dead_a = new_daemons.remove(4);
+    let _dead_b = new_daemons.remove(3);
+    drop(_dead_a);
+    drop(_dead_b);
+    if combine(&[0, 1, 2])? != cek {
+        return Err("the reconfigured set did not survive (m−k)=2 dead new nodes".to_string());
+    }
+    step(47, "dkms quorum RECONFIGURATION: the new set FAILS CLOSED below k (two reconfigured shares do not reconstruct) AND SURVIVES (m−k)=2 dead new daemons (any three of the five serve) — the redundancy genuinely rose from 2-of-3 to 3-of-5");
+
+    // --- Gate 48: the reconfiguration is operator-bound AND old material is dead. ---
+    // (a) A NON-operator authorization is refused live, even with perfectly-formed sub-shares.
+    let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+    let mut installer = NodeSocket::connect(&new_endpoints[0])?;
+    ok_data(&installer.call(&json!({ "op": "init", "config": {} }))?, "operator-binding installer init")?;
+    let bad = installer.call(&json!({
+        "op": "reshare_install",
+        "operator_auth_b64": seal_auth_with(&new_recipient[0], &impostor)?,
+        "old_node_set_id_b64": old_set_b64,
+        "new_node_set_id_b64": new_set_b64,
+        "k": k,
+        "m": m,
+        "target_x": 1u8,
+        "scheme": SUITE_PQ_HYBRID,
+        "kid_hex": fixture.kid_hex,
+        "contributions": contributions_json(0),
+    }))?;
+    if bad.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a NON-operator reconfiguration was accepted — the install is not operator-bound".to_string());
+    }
+    // (b) The OLD node-set pin no longer matches the reconfigured descriptor (the change is visible).
+    if B64.encode(new_set_id) == *fixture.node_set_id_b64.as_ref().ok_or("fixture must pin a node-set")? {
+        return Err("the reconfigured descriptor matches the OLD pin — reconfiguration is invisible".to_string());
+    }
+    step(48, "dkms quorum RECONFIGURATION: the install is OPERATOR-BOUND (a non-operator authorization is refused live) and the OLD node-set pin no longer matches the reconfigured descriptor — a consumer pinning the old (t,n,membership) cannot be silently moved, and the change is cryptographically visible");
+
+    drop(new_daemons);
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -4155,6 +4487,18 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                         &descriptor_path,
                         caller_seed,
                         &caller_seed_b64,
+                        &operator_signer,
+                        &operator_vk_b64,
+                    )?;
+                    // RECONFIGURABILITY (Day 121–125): re-share the live 2-of-3 into a 3-of-5 across
+                    // real daemons — the threshold AND the membership change, the new set opens to the
+                    // exact CEK, survives (m−k) dead, fails closed below k, and is operator-bound.
+                    dkms_quorum_reconfigure_gates(
+                        node_bin,
+                        &work_dir,
+                        &fixture,
+                        &descriptor_path,
+                        caller_seed,
                         &operator_signer,
                         &operator_vk_b64,
                     )?;

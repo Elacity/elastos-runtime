@@ -236,6 +236,88 @@ pub fn decrypt_from_carrier_quorum<V: CekSealVerifier>(
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
+/// Reconstruct a CEK from a RECONFIGURABLE **k-of-m** quorum and decrypt — the
+/// generalization of [`decrypt_from_carrier_quorum`] once the node-set has been
+/// re-shared to an arbitrary threshold `k` and membership `m` (Day 121–125).
+///
+/// The boundary pins ALL `m` node identities (`node_verifiers`, in coordinate order
+/// `x = 1..=m`) but is handed exactly the `k` sealed shares a live sub-quorum returned.
+/// Each sealed share is unwrapped against the pinned identity that verifies it, and the
+/// x-coordinate sealed INSIDE the payload is bound to that identity's position — a node
+/// can neither lie about its index nor stand in for another. The CEK is then reconstructed
+/// IN-BOUNDARY via the general Lagrange combine ([`ddrm_envelope::lagrange_combine_at_zero`]),
+/// which refuses duplicate/zero coordinates, so the SAME share replayed `k` times — or any
+/// sub-`k` set — can never reassemble the key. Fails CLOSED if fewer than `k` distinct shares
+/// are supplied: the threshold is enforced by the count of verified, distinct coordinates, not
+/// by the caller's say-so.
+pub fn decrypt_from_carrier_quorum_k<V: CekSealVerifier>(
+    session: &SessionSecret,
+    k: usize,
+    sealed_shares: &[&[u8]],
+    aad: &[u8],
+    node_verifiers: &[V],
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("quorum reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+    if k < 2 {
+        return Err("a quorum threshold k must be at least 2".to_string());
+    }
+    if sealed_shares.len() < k {
+        return Err(format!(
+            "below quorum: {} sealed shares supplied for a {}-of-{} set",
+            sealed_shares.len(),
+            k,
+            node_verifiers.len()
+        ));
+    }
+
+    // Unwrap ONE sealed indexed share against the m pinned identities (x = index+1).
+    let unwrap_indexed = |sealed: &[u8]| -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
+        let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
+        for (i, verifier) in node_verifiers.iter().enumerate() {
+            let expected_x = (i + 1) as u8;
+            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
+            {
+                let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
+                    .ok_or("sealed quorum share carries no valid x-coordinate")?;
+                if x != expected_x {
+                    return Err(
+                        "quorum share x-coordinate does not match the node identity that sealed it"
+                            .to_string(),
+                    );
+                }
+                return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
+            }
+        }
+        Err("no pinned node identity verifies this sealed quorum share".to_string())
+    };
+
+    // Collect exactly the first k verified shares; their coordinates must be distinct
+    // (the combine re-checks, but we surface a clear error before reconstruction).
+    let mut shares: Vec<(u8, zeroize::Zeroizing<Vec<u8>>)> = Vec::with_capacity(k);
+    for sealed in sealed_shares.iter().take(k) {
+        let (x, body) = unwrap_indexed(sealed)?;
+        if shares.iter().any(|(seen, _)| *seen == x) {
+            return Err("the same node share was presented twice — not a real quorum".to_string());
+        }
+        shares.push((x, body));
+    }
+
+    let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, body)| (*x, body.as_slice())).collect();
+    let cek = ddrm_envelope::lagrange_combine_at_zero(&points).map_err(|e| e.to_string())?;
+    let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cek.as_slice(),
+    ));
+    crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,5 +827,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(!err.contains(&pt_str), "error string must not contain the plaintext");
+    }
+
+    /// Day 121–125: the boundary OPENS a RECONFIGURED **3-of-5** quorum — the
+    /// generalization of the 2-of-3 path once the node-set has been re-shared to a new
+    /// threshold + membership. Five distinct ML-DSA-65 node identities are pinned (x =
+    /// 1..=5); ANY THREE sealed shares reconstruct the CEK + decrypt, any TWO fail CLOSED
+    /// (below quorum), the SAME share replayed can never reach quorum, and a share whose
+    /// sealed x-coordinate disagrees with its signing identity is refused.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn boundary_opens_a_reconfigured_3_of_5_quorum_and_fails_closed_below_k() {
+        use crate::pq_envelope::mldsa::MlDsa65Verifier;
+        use crate::pq_envelope::seal_support::{mldsa_seal_keypair, seal_bound};
+
+        let (secret, public) = gen_session();
+        let cek = [0x42u8; 16];
+        let iv8 = [0x11u8; 8];
+        let plaintext = b"reconfigured-quorum-opens";
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+        let aad = b"reconfig-escrow-aad/v1";
+
+        // 3-of-5 sharing of the CEK: P(y) = cek + c1*y + c2*y^2 at y = 1..=5 (reshare_eval
+        // with the CEK as the constant term IS a fresh degree-2 split of the same secret).
+        let c1 = [0x9Au8; 16];
+        let c2 = [0x37u8; 16];
+        let higher: [&[u8]; 2] = [&c1, &c2];
+
+        let mut signers = Vec::new();
+        let mut verifiers: Vec<MlDsa65Verifier> = Vec::new();
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        for i in 0..5u8 {
+            let (signer, vk) = mldsa_seal_keypair([i + 1; 32]);
+            let x = i + 1;
+            let share = ddrm_envelope::reshare_eval(&cek, &higher, x).expect("share");
+            let payload = ddrm_envelope::indexed_share(x, &share);
+            let env = seal_bound(&public, &payload, aad, &signer);
+            sealed.push(env.to_bytes());
+            verifiers.push(MlDsa65Verifier::from_encoded(&vk).expect("vk decodes"));
+            signers.push(signer);
+        }
+        let session = SessionSecret::PqHybrid(secret);
+
+        // ANY THREE shares open the reconfigured quorum and decrypt.
+        let pick = [sealed[0].as_slice(), sealed[2].as_slice(), sealed[4].as_slice()];
+        let (out, meta) =
+            decrypt_from_carrier_quorum_k(&session, 3, &pick, aad, &verifiers, &segment, None)
+                .expect("any 3-of-5 shares open the reconfigured quorum");
+        let off = segment.len() - plaintext.len();
+        assert_eq!(&out[off..], plaintext);
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+
+        // BELOW quorum: two shares fail closed.
+        let two = [sealed[0].as_slice(), sealed[1].as_slice()];
+        assert!(
+            decrypt_from_carrier_quorum_k(&session, 3, &two, aad, &verifiers, &segment, None).is_err(),
+            "two shares are below the 3-of-5 quorum"
+        );
+
+        // A replayed single share can never reach quorum.
+        let dup = [sealed[0].as_slice(), sealed[0].as_slice(), sealed[0].as_slice()];
+        assert!(
+            decrypt_from_carrier_quorum_k(&session, 3, &dup, aad, &verifiers, &segment, None).is_err(),
+            "the same share presented three times is not a real quorum"
+        );
+
+        // A share whose sealed x disagrees with its signing identity is refused: node x=1
+        // signs an x=2 payload — the boundary binds the coordinate to the identity.
+        let mis_payload =
+            ddrm_envelope::indexed_share(2, &ddrm_envelope::reshare_eval(&cek, &higher, 2).unwrap());
+        let mis_env = seal_bound(&public, &mis_payload, aad, &signers[0]);
+        let mis = [mis_env.to_bytes(), sealed[2].clone(), sealed[3].clone()];
+        let mis_refs: Vec<&[u8]> = mis.iter().map(|s| s.as_slice()).collect();
+        assert!(
+            decrypt_from_carrier_quorum_k(&session, 3, &mis_refs, aad, &verifiers, &segment, None)
+                .is_err(),
+            "a share whose x-coordinate doesn't match its signing identity is refused"
+        );
     }
 }

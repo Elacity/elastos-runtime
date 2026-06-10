@@ -408,6 +408,108 @@ pub fn shamir_refresh_delta(refresh_coeff: &[u8], x: u8) -> Result<Vec<u8>, &'st
     Ok(delta)
 }
 
+/// General Lagrange interpolation at x=0 over GF(256) — the secret-recovery /
+/// share-combine workhorse generalized to ANY number of points (the t=2
+/// [`combine_cek_shamir2`] is the two-point special case). Given the points
+/// `(x_i, value_i)`, returns `Σ value_i · λ_i` where `λ_i = Π_{l≠i} x_l/(x_l ⊕ x_i)`
+/// is the Lagrange basis evaluated at 0 (negation is identity in GF(2^8), so
+/// `0 ⊖ x_l = x_l` and `x_i ⊖ x_l = x_i ⊕ x_l`).
+///
+/// Used in TWO places by quorum RECONFIGURATION (Day 121–125): a new node combines
+/// the sub-shares an OLD quorum sent it into its new share (the points are the old
+/// CONTRIBUTORS' coordinates), and the decrypt boundary reconstructs the CEK from k
+/// new shares (the points are the new nodes' coordinates). Fails closed on an empty
+/// set, a zero coordinate (x=0 IS the secret), duplicate coordinates (not a real
+/// quorum), a length mismatch, or empty values. Result rides in `Zeroizing`.
+pub fn lagrange_combine_at_zero(
+    points: &[(u8, &[u8])],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if points.is_empty() {
+        return Err("need at least one share to combine");
+    }
+    let len = points[0].1.len();
+    if len == 0 {
+        return Err("shares must be non-empty");
+    }
+    for &(x, value) in points {
+        if x == 0 {
+            return Err("share x-coordinate must be non-zero");
+        }
+        if value.len() != len {
+            return Err("share length mismatch");
+        }
+    }
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            if points[i].0 == points[j].0 {
+                return Err("a quorum needs DISTINCT share x-coordinates");
+            }
+        }
+    }
+    let mut acc = zeroize::Zeroizing::new(vec![0u8; len]);
+    for (i, &(xi, value_i)) in points.iter().enumerate() {
+        let mut num = 1u8;
+        let mut den = 1u8;
+        for (j, &(xj, _)) in points.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            num = gf256_mul(num, xj);
+            den = gf256_mul(den, xi ^ xj);
+        }
+        let lambda = gf256_mul(num, gf256_inv(den));
+        for (a, &b) in acc.iter_mut().zip(value_i.iter()) {
+            *a ^= gf256_mul(lambda, b);
+        }
+    }
+    Ok(acc)
+}
+
+/// Quorum RECONFIGURATION sub-share evaluation (Day 121–125) — the t-of-n → k-of-m
+/// re-sharing primitive. An OLD quorum member holding `share` (= `p(x_i)`, its single
+/// point of the current degree-(t−1) polynomial) draws a FRESH degree-(k−1) polynomial
+/// whose CONSTANT TERM is its own share — `q_i(y) = share ⊕ Σ_{d=1..k-1} higher[d-1]·y^d`
+/// over GF(256) — and evaluates it at a NEW node's coordinate `y` to produce the
+/// sub-share `q_i(y)` it seals to that new node.
+///
+/// Why this reconfigures the secret WITHOUT ever reassembling it: define
+/// `P(y) = Σ_i λ_i · q_i(y)` over an old quorum (the new node's combine, [`lagrange_combine_at_zero`]
+/// with the old contributors' λ_i). `P` is degree (k−1), and `P(0) = Σ_i λ_i · q_i(0)
+/// = Σ_i λ_i · p(x_i) = p(0) = CEK` — so the new shares lie on a FRESH degree-(k−1)
+/// polynomial through the SAME secret. The new threshold is k, the new membership is m,
+/// and an OLD share (on `p`) is dead against the new set (on `P`). Each member only ever
+/// touches its OWN share; the CEK never exists anywhere during reconfiguration.
+///
+/// `higher` holds the (k−1) fresh random coefficient vectors (each the SAME length as
+/// `share`, CSPRNG-drawn by the caller — the RNG stays OUT of this crate). `k` is
+/// `higher.len() + 1`; `k = 1` (no higher coefficients) is a degenerate constant sharing
+/// and is refused. Fails closed on a zero coordinate, empty/!-matching coefficient lengths.
+pub fn reshare_eval(share: &[u8], higher: &[&[u8]], y: u8) -> Result<Vec<u8>, &'static str> {
+    if share.is_empty() {
+        return Err("share must be non-empty");
+    }
+    if y == 0 {
+        return Err("new share coordinate must be non-zero");
+    }
+    if higher.is_empty() {
+        return Err("re-sharing needs at least one higher coefficient (k must be ≥ 2)");
+    }
+    for c in higher {
+        if c.len() != share.len() {
+            return Err("re-sharing coefficient length must equal the share length");
+        }
+    }
+    let mut out = share.to_vec();
+    let mut y_pow = 1u8; // y^0
+    for c in higher {
+        y_pow = gf256_mul(y_pow, y); // y^d for d = 1..k-1
+        for (o, &cd) in out.iter_mut().zip(c.iter()) {
+            *o ^= gf256_mul(cd, y_pow);
+        }
+    }
+    Ok(out)
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -832,6 +934,56 @@ pub fn rotation_aad(
     successor_recipient_pub: &[u8],
 ) -> Vec<u8> {
     lp_concat(DKMS_ROTATE_DOMAIN, &[kid_bytes16, source_recipient_pub, successor_recipient_pub])
+}
+
+/// Domain label for a quorum RECONFIGURATION (Day 121–125): the operator instructs a live k-of-m
+/// re-sharing — each OLD quorum member sub-shares its share under a fresh degree-(k−1) polynomial
+/// and each NEW node combines the sub-shares into its new share, so the threshold AND the membership
+/// change while the CEK is never reassembled. Domain-separated from the share-wise ROTATION
+/// (`DKMS_ROTATE_DOMAIN`) so a rotation delta can never be replayed as a reconfiguration instruction
+/// or vice-versa. (PC2 has no analogue at all — its t-of-n is Lit's opaque network, whose t, n, and
+/// membership are fixed and uninspectable; there is no protocol to change them.) Defined ONCE here
+/// so the operator, the contributing nodes, and the new nodes cannot drift.
+pub const DKMS_RESHARE_DOMAIN: &[u8] = b"elastos.dkms.authority/reshare/v1";
+
+/// Canonical reconfiguration AAD: `DKMS_RESHARE_DOMAIN ‖ lp(kid16) ‖ lp(old_node_set_id) ‖
+/// lp(new_node_set_id) ‖ lp([k]) ‖ lp([m])`. The operator seals the re-sharing authorization bound
+/// to the EXACT (kid, old set, new set, new threshold k, new size m): an instruction minted for one
+/// reconfiguration cannot be replayed against another kid, redirected to a different new set, or
+/// silently DOWNGRADED to a smaller k — every field is welded into the AEAD. `old_node_set_id` /
+/// `new_node_set_id` are the [`threshold_node_set_id_n`] hashes pinning each membership + threshold.
+pub fn reshare_aad(
+    kid_bytes16: &[u8; 16],
+    old_node_set_id: &[u8],
+    new_node_set_id: &[u8],
+    k: u8,
+    m: u8,
+) -> Vec<u8> {
+    lp_concat(DKMS_RESHARE_DOMAIN, &[kid_bytes16, old_node_set_id, new_node_set_id, &[k], &[m]])
+}
+
+/// Domain label for a single RECONFIGURATION SUB-SHARE — the sealed `q_i(y_j)` an OLD contributor
+/// `i` routes to a NEW node `j` during a re-share. Separated from the reconfiguration AUTHORIZATION
+/// (`DKMS_RESHARE_DOMAIN`) so an operator-authorization envelope can never be unwrapped as a
+/// sub-share or vice-versa.
+pub const DKMS_RESHARE_SUBSHARE_DOMAIN: &[u8] = b"elastos.dkms.authority/reshare-subshare/v1";
+
+/// Canonical sub-share AAD: `DKMS_RESHARE_SUBSHARE_DOMAIN ‖ lp(kid16) ‖ lp(new_node_set_id) ‖
+/// lp([contributor_x]) ‖ lp([target_x])`. The contributing node seals `contributor_x ‖ q_i(y_j)`
+/// to new node `j` bound to this AAD; the new node re-derives the SAME AAD and verifies under the
+/// contributor's identity, so a sub-share minted for one (contributor → target) pair cannot be
+/// redirected to a different new node, replayed across reconfigurations, or have its contributor
+/// coordinate forged (the coordinate that determines its Lagrange weight is welded into the AEAD).
+pub fn reshare_subshare_aad(
+    kid_bytes16: &[u8; 16],
+    new_node_set_id: &[u8],
+    contributor_x: u8,
+    target_x: u8,
+) -> Vec<u8> {
+    lp_concat(
+        DKMS_RESHARE_SUBSHARE_DOMAIN,
+        &[kid_bytes16, new_node_set_id, &[contributor_x], &[target_x]],
+    )
 }
 
 /// Domain label for an OPERATOR-signed caller REVOCATION (Day 109–112): the node removes a caller
@@ -1818,6 +1970,116 @@ mod tests {
         // Fail-closed surface.
         assert!(crate::shamir_refresh_delta(&refresh, 0).is_err(), "x=0 is the secret, never a node");
         assert!(crate::shamir_refresh_delta(&[], 1).is_err(), "empty refresh_coeff is refused");
+    }
+
+    /// Quorum RECONFIGURATION (Day 121–125): a live 2-of-3 set is RE-SHARED into a 3-of-5 set that
+    /// reconstructs the SAME CEK at a NEW threshold + NEW membership, the CEK never reassembling.
+    /// Each OLD quorum member sub-shares its share under a fresh degree-2 polynomial (k=3); each NEW
+    /// node combines the sub-shares from the old quorum into its new share; ANY THREE new shares
+    /// reconstruct the CEK, any TWO do not, and OLD material is dead against the new set.
+    #[test]
+    fn reshare_2of3_to_3of5_keeps_cek_and_lifts_the_threshold() {
+        let cek = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let coeff = [0x9Au8, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78];
+        // OLD 2-of-3 set: shares p(1), p(2), p(3) on a degree-1 polynomial.
+        let old = crate::split_cek_shamir2(&cek, &coeff).expect("old split");
+        // Sanity: any two old shares already reconstruct via the general combine.
+        assert_eq!(
+            crate::lagrange_combine_at_zero(&[(1, &old[0]), (2, &old[1])]).expect("old combine").to_vec(),
+            cek,
+            "the general Lagrange combine reconstructs the old 2-of-3 secret"
+        );
+
+        // RECONFIGURE to 3-of-5 using the OLD quorum {x=1, x=2} as contributors. Each contributor
+        // draws a FRESH degree-2 polynomial (k-1 = 2 higher coefficients) with its share as q(0).
+        let k = 3usize;
+        let new_xs: [u8; 5] = [1, 2, 3, 4, 5];
+        // Distinct fresh coefficient sets per contributor (would be CSPRNG in production).
+        let contrib1_c1 = [0x0Fu8, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78];
+        let contrib1_c2 = [0xA1u8, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18];
+        let contrib2_c1 = [0x33u8, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        let contrib2_c2 = [0x1Cu8, 0x2B, 0x3A, 0x49, 0x58, 0x67, 0x76, 0x85];
+        let c1_higher: [&[u8]; 2] = [&contrib1_c1, &contrib1_c2];
+        let c2_higher: [&[u8]; 2] = [&contrib2_c1, &contrib2_c2];
+        assert_eq!(c1_higher.len() + 1, k, "k = (k-1 higher coeffs) + 1");
+
+        // Each new node j gets a sub-share q_i(y_j) from EACH contributor i, tagged with i's OLD x.
+        let new_shares: Vec<(u8, Vec<u8>)> = new_xs
+            .iter()
+            .map(|&y| {
+                let sub1 = crate::reshare_eval(&old[0], &c1_higher, y).expect("contrib1 eval"); // x_i = 1
+                let sub2 = crate::reshare_eval(&old[1], &c2_higher, y).expect("contrib2 eval"); // x_i = 2
+                let share = crate::lagrange_combine_at_zero(&[(1, &sub1), (2, &sub2)])
+                    .expect("new node combine")
+                    .to_vec();
+                (y, share)
+            })
+            .collect();
+
+        // The new shares differ from the old shares at the same coordinate (a genuinely fresh poly).
+        assert_ne!(new_shares[0].1, old[0], "new share at x=1 is on a different polynomial");
+
+        // INVARIANT: ANY THREE of the five new shares reconstruct the EXACT CEK.
+        let combine3 = |a: usize, b: usize, c: usize| -> Vec<u8> {
+            crate::lagrange_combine_at_zero(&[
+                (new_shares[a].0, new_shares[a].1.as_slice()),
+                (new_shares[b].0, new_shares[b].1.as_slice()),
+                (new_shares[c].0, new_shares[c].1.as_slice()),
+            ])
+            .expect("combine 3")
+            .to_vec()
+        };
+        assert_eq!(combine3(0, 1, 2), cek, "new shares {{1,2,3}} reconstruct the CEK");
+        assert_eq!(combine3(0, 2, 4), cek, "new shares {{1,3,5}} reconstruct the CEK");
+        assert_eq!(combine3(2, 3, 4), cek, "new shares {{3,4,5}} reconstruct the CEK");
+
+        // BELOW the NEW quorum: any TWO new shares do NOT reconstruct the CEK (degree-2 needs 3).
+        let two = crate::lagrange_combine_at_zero(&[
+            (new_shares[0].0, new_shares[0].1.as_slice()),
+            (new_shares[1].0, new_shares[1].1.as_slice()),
+        ])
+        .expect("combine 2")
+        .to_vec();
+        assert_ne!(two, cek, "two new shares are below the new 3-of-5 quorum");
+
+        // OLD MATERIAL DEAD: mixing OLD shares (on the old degree-1 poly) with the new set yields
+        // garbage — a node compromised before the reconfiguration holds nothing useful after.
+        let mixed = crate::lagrange_combine_at_zero(&[
+            (1, old[0].as_slice()),
+            (new_shares[1].0, new_shares[1].1.as_slice()),
+            (new_shares[2].0, new_shares[2].1.as_slice()),
+        ])
+        .expect("mixed combine")
+        .to_vec();
+        assert_ne!(mixed, cek, "an old share inside a new-set reconstruction is garbage");
+
+        // The NEW node-set identity is distinct (different k AND different membership).
+        let vks: Vec<Vec<u8>> = (0..5u8).map(|i| vec![0xC0 ^ i; 40]).collect();
+        let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
+        let new_set_id = crate::threshold_node_set_id_n(3, &vk_refs);
+        assert_ne!(
+            new_set_id,
+            crate::threshold_node_set_id_n(2, &vk_refs[..3]),
+            "the reconfigured set has a distinct node-set id (k and m both changed)"
+        );
+
+        // The reshare AAD welds (kid, old set, new set, k, m): any field change diverges.
+        let kid = [0x5Au8; 16];
+        let old_id = crate::threshold_node_set_id_n(2, &vk_refs[..3]);
+        let aad = crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 5);
+        assert_eq!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 5));
+        assert_ne!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 2, 5), "k is bound");
+        assert_ne!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 4), "m is bound");
+        assert!(aad.starts_with(crate::DKMS_RESHARE_DOMAIN));
+
+        // Fail-closed surface.
+        assert!(crate::reshare_eval(&cek, &c1_higher, 0).is_err(), "y=0 is the secret, never a node");
+        assert!(crate::reshare_eval(&cek, &[], 1).is_err(), "k=1 (no higher coeffs) is degenerate");
+        assert!(crate::lagrange_combine_at_zero(&[]).is_err(), "empty point set is refused");
+        assert!(
+            crate::lagrange_combine_at_zero(&[(1, &old[0]), (1, &old[1])]).is_err(),
+            "duplicate coordinates are not a quorum"
+        );
     }
 
     /// The n-node node-set id generalization: byte-identical to the 2-node id for n=2 (no

@@ -208,7 +208,56 @@ enum Request {
         caller_pub_b64: String,
         operator_sig_b64: String,
     },
+    /// QUORUM RECONFIGURATION — CONTRIBUTE (Day 121–125): THIS node is an OLD quorum member asked to
+    /// re-share its share into a NEW k-of-m set. It opens an operator authorization bound to
+    /// `reshare_aad(kid, old_set, new_set, k, m)`, recovers its INDEXED share `x_i ‖ p(x_i)`, draws a
+    /// fresh degree-(k−1) polynomial `q_i` with `q_i(0) = p(x_i)`, and returns the sub-share
+    /// `q_i(y_j)` SEALED to each new node `j` (signed by this node, AEAD-bound to the
+    /// contributor→target pair). The CEK is never reassembled — this node only ever touches ITS
+    /// share. PC2 has no analogue (Lit's t, n and membership are fixed and uninspectable).
+    ReshareContribute {
+        wrapped_cek_b64: String,
+        scheme: String,
+        kid_hex: String,
+        producer_vk_b64: String,
+        operator_auth_b64: String,
+        old_node_set_id_b64: String,
+        new_node_set_id_b64: String,
+        k: u8,
+        m: u8,
+        /// The m new-node escrow recipient public keys, in coordinate order (`x = 1..=m`).
+        new_recipient_pubs_b64: Vec<String>,
+    },
+    /// QUORUM RECONFIGURATION — INSTALL (Day 121–125): THIS node is a NEW member assembling its share
+    /// of the reconfigured set. It opens the same operator authorization (sealed to ITS recipient),
+    /// unwraps the sub-shares an OLD quorum routed it (each verified under its contributor's identity,
+    /// bound to this contributor→target pair), combines them via the OLD-contributor Lagrange
+    /// (`P(y_j) = Σ λ_i · q_i(y_j)`, so `P(0) = CEK`), and RE-ESCROWS its new indexed share
+    /// `y_j ‖ P(y_j)` to ITSELF — the share the k-of-m boundary later opens. The CEK never exists here.
+    ReshareInstall {
+        operator_auth_b64: String,
+        old_node_set_id_b64: String,
+        new_node_set_id_b64: String,
+        k: u8,
+        m: u8,
+        /// This new node's coordinate `y_j` in the reconfigured set (`1..=m`).
+        target_x: u8,
+        scheme: String,
+        kid_hex: String,
+        /// The sub-shares this node received from an OLD quorum (≥ the old threshold, distinct).
+        contributions: Vec<ReshareContribution>,
+    },
     Shutdown,
+}
+
+/// One sub-share an OLD quorum member routed to a NEW node during reconfiguration: the
+/// contributor's coordinate `x_i` (its Lagrange weight), its verifying key (to authenticate the
+/// sub-share), and the sealed `contributor_x ‖ q_i(y_j)` payload.
+#[derive(Debug, Deserialize)]
+struct ReshareContribution {
+    contributor_x: u8,
+    contributor_vk_b64: String,
+    sealed_subshare_b64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +302,12 @@ struct NodeAuthority {
     #[cfg_attr(not(unix), allow(dead_code))]
     channel_secret: ddrm_envelope::SessionKemSecret,
     channel_public: Vec<u8>,
+    /// Master-derived seed for the node's RE-SHARING sub-share polynomials (Day 121–125). When this
+    /// node contributes to a quorum reconfiguration it draws its fresh degree-(k−1) coefficients by
+    /// expanding this seed over the target new-set id — secret (master-derived, never published),
+    /// unpredictable to any adversary, and deterministic so a re-driven contribution is stable. Kept
+    /// out of the envelope crate (the RNG/PRF-input policy) and domain-separated from every key seed.
+    reshare_seed: [u8; 32],
 }
 
 impl NodeAuthority {
@@ -267,6 +322,7 @@ impl NodeAuthority {
         let channel_seed = ddrm_envelope::derive_seed(master, b"key-authority/channel/v1");
         let (channel_secret, channel_public) =
             ddrm_envelope::mint_session_from_seed(channel_seed);
+        let reshare_seed = ddrm_envelope::derive_seed(master, b"key-authority/reshare/v1");
         Self {
             signer,
             verifying_key,
@@ -274,7 +330,33 @@ impl NodeAuthority {
             recipient_public: ddrm_envelope::session_public_bytes(&recipient_public),
             channel_secret,
             channel_public: ddrm_envelope::session_public_bytes(&channel_public),
+            reshare_seed,
         }
+    }
+
+    /// Expand the master-derived [`Self::reshare_seed`] into `count` fresh degree-coefficient vectors
+    /// of `len` bytes each, bound to `new_set_id` and the coefficient index — the secret higher
+    /// coefficients of THIS node's re-sharing polynomial `q_i`. Domain-separated counter expansion
+    /// over `derive_seed` (no RNG, deterministic, so a re-driven contribution reproduces the SAME
+    /// sub-shares). Each vector is independent of the others and of every key seed.
+    fn reshare_coefficients(&self, new_set_id: &[u8], count: usize, len: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|d| {
+                let mut info = b"reshare/coeff/v1".to_vec();
+                info.extend_from_slice(new_set_id);
+                info.extend_from_slice(&(d as u32).to_be_bytes());
+                let mut out = Vec::with_capacity(len);
+                let mut block = 0u32;
+                while out.len() < len {
+                    let mut blk_info = info.clone();
+                    blk_info.extend_from_slice(&block.to_be_bytes());
+                    out.extend_from_slice(&ddrm_envelope::derive_seed(&self.reshare_seed, &blk_info));
+                    block += 1;
+                }
+                out.truncate(len);
+                out
+            })
+            .collect()
     }
 
     /// Recover a CEK the producer escrowed to THIS node's recipient key. Recomputes the IDENTICAL
@@ -394,6 +476,50 @@ impl DkmsAuthorityNode {
             Request::RevokeCaller { caller_pub_b64, operator_sig_b64 } => {
                 self.revoke_caller(&caller_pub_b64, &operator_sig_b64)
             }
+            Request::ReshareContribute {
+                wrapped_cek_b64,
+                scheme,
+                kid_hex,
+                producer_vk_b64,
+                operator_auth_b64,
+                old_node_set_id_b64,
+                new_node_set_id_b64,
+                k,
+                m,
+                new_recipient_pubs_b64,
+            } => self.reshare_contribute(ReshareContributeArgs {
+                wrapped_cek_b64,
+                scheme,
+                kid_hex,
+                producer_vk_b64,
+                operator_auth_b64,
+                old_node_set_id_b64,
+                new_node_set_id_b64,
+                k,
+                m,
+                new_recipient_pubs_b64,
+            }),
+            Request::ReshareInstall {
+                operator_auth_b64,
+                old_node_set_id_b64,
+                new_node_set_id_b64,
+                k,
+                m,
+                target_x,
+                scheme,
+                kid_hex,
+                contributions,
+            } => self.reshare_install(ReshareInstallArgs {
+                operator_auth_b64,
+                old_node_set_id_b64,
+                new_node_set_id_b64,
+                k,
+                m,
+                target_x,
+                scheme,
+                kid_hex,
+                contributions,
+            }),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -551,7 +677,7 @@ impl DkmsAuthorityNode {
             "provider": "dkms-authority",
             "version": PROVIDER_VERSION,
             "configured": self.authority.is_some(),
-            "supported_operations": ["status", "init", "hello", "recover", "rotate_share", "revoke_caller"],
+            "supported_operations": ["status", "init", "hello", "recover", "rotate_share", "revoke_caller", "reshare_contribute", "reshare_install"],
             // The node NEVER returns these — the master + raw CEK stay inside this boundary.
             "blocked_authority": ["raw_cek", "master_seed", "recipient_secret"],
         }))
@@ -859,6 +985,256 @@ impl DkmsAuthorityNode {
         }
         Response::ok(json!({ "revoked": true }))
     }
+
+    /// QUORUM RECONFIGURATION — CONTRIBUTE (Day 121–125). This OLD quorum member re-shares its share
+    /// into the new k-of-m set. Authorization is the OPERATOR SEAL, checked FIRST: the auth envelope
+    /// must open under this node's recipient secret, verify under the pinned operator identity, and
+    /// be AEAD-bound to `reshare_aad(kid, old_set, new_set, k, m)` — so a non-operator instruction, a
+    /// tampered context, a kid/threshold/membership swap all fail BEFORE any share is touched. The
+    /// node then recovers its INDEXED share `x_i ‖ p(x_i)`, draws a fresh degree-(k−1) polynomial with
+    /// `q_i(0) = p(x_i)`, and seals `x_i ‖ q_i(y_j)` to each new node (signed by this node, bound to
+    /// the contributor→target pair). The full share, the coefficients and the sub-shares live only in
+    /// `Zeroizing`-class scope; the CEK is never reassembled — this node only ever holds ITS point.
+    fn reshare_contribute(&self, args: ReshareContributeArgs) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => return Response::error("not_configured", "dkms-authority node is not initialized (send `init` first)"),
+        };
+        let operator_verifier = match self.pinned_operator_verifier() {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let kid16 = match decode_kid_bytes16(&args.kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        if args.k < 2 {
+            return Response::error("invalid_request", "reconfiguration threshold k must be at least 2");
+        }
+        if args.new_recipient_pubs_b64.len() != args.m as usize || args.m < args.k {
+            return Response::error("invalid_request", "new_recipient_pubs_b64 must list exactly m recipients with m ≥ k");
+        }
+        let old_set_id = match b64().decode(&args.old_node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "old_node_set_id_b64 is not valid base64"),
+        };
+        let new_set_id = match b64().decode(&args.new_node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "new_node_set_id_b64 is not valid base64"),
+        };
+        // OPERATOR AUTHORIZATION FIRST — bind the whole reconfiguration context into the AEAD.
+        let reshare_aad = ddrm_envelope::reshare_aad(&kid16, &old_set_id, &new_set_id, args.k, args.m);
+        if let Err(resp) = self.open_operator_auth(&args.operator_auth_b64, &reshare_aad, &operator_verifier) {
+            return resp;
+        }
+        // Recover THIS node's current INDEXED share (the same authenticated path `recover` uses).
+        let wrapped = match b64().decode(&args.wrapped_cek_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "wrapped_cek_b64 is not valid base64"),
+        };
+        let producer_vk = match b64().decode(&args.producer_vk_b64) {
+            Ok(bytes) => bytes,
+            Err(_) => return Response::error("invalid_request", "producer_vk_b64 is not valid base64"),
+        };
+        let indexed = match authority.recover_escrowed_cek(&wrapped, &args.scheme, &kid16, &producer_vk) {
+            Ok(share) => share,
+            Err(_) => return Response::error("invalid_request", "escrowed share could not be recovered (foreign/tampered escrow, wrong KID/scheme, or bad producer key)"),
+        };
+        let (contributor_x, body) = match ddrm_envelope::parse_indexed_share(&indexed) {
+            Some((x, body)) => (x, body),
+            None => return Response::error("invalid_request", "this node's escrow is not a valid indexed quorum share"),
+        };
+        // Fresh degree-(k−1) polynomial: k−1 higher coefficients, master-derived + new-set-bound.
+        let higher = authority.reshare_coefficients(&new_set_id, (args.k - 1) as usize, body.len());
+        let higher_refs: Vec<&[u8]> = higher.iter().map(|c| c.as_slice()).collect();
+
+        let mut subshares = Vec::with_capacity(args.m as usize);
+        for (j, recipient_b64) in args.new_recipient_pubs_b64.iter().enumerate() {
+            let target_x = (j + 1) as u8;
+            let recipient_bytes = match b64().decode(recipient_b64) {
+                Ok(b) => b,
+                Err(_) => return Response::error("invalid_request", "a new recipient key is not valid base64"),
+            };
+            let recipient_public = match ddrm_envelope::session_public_from_bytes(&recipient_bytes) {
+                Some(p) => p,
+                None => return Response::error("invalid_request", "a new recipient key is not a valid escrow recipient"),
+            };
+            let sub_body = match ddrm_envelope::reshare_eval(body, &higher_refs, target_x) {
+                Ok(s) => zeroize::Zeroizing::new(s),
+                Err(e) => return Response::error("invalid_request", e),
+            };
+            // The sub-share carries the CONTRIBUTOR's coordinate (its Lagrange weight at the new node).
+            let payload = zeroize::Zeroizing::new(ddrm_envelope::indexed_share(contributor_x, &sub_body));
+            let aad = ddrm_envelope::reshare_subshare_aad(&kid16, &new_set_id, contributor_x, target_x);
+            let sealed = ddrm_envelope::seal::seal_bound(&recipient_public, payload.as_slice(), &aad, &authority.signer);
+            subshares.push(json!({
+                "target_x": target_x,
+                "sealed_subshare_b64": b64().encode(sealed.to_bytes()),
+            }));
+        }
+        Response::ok(json!({
+            "contributor_x": contributor_x,
+            "contributor_vk_b64": b64().encode(&authority.verifying_key),
+            "subshares": subshares,
+        }))
+    }
+
+    /// QUORUM RECONFIGURATION — INSTALL (Day 121–125). This NEW member assembles its share of the
+    /// reconfigured set. Authorization is the OPERATOR SEAL (sealed to THIS node's recipient), bound
+    /// to `reshare_aad(kid, old_set, new_set, k, m)` — checked first. It then unwraps each sub-share
+    /// (verified under its contributor's identity, AEAD-bound to the contributor→THIS-node pair, the
+    /// inner coordinate matching the declared contributor), and combines them via the OLD-contributor
+    /// Lagrange — `P(y_j) = Σ λ_i · q_i(y_j)`, whose constant term is the original CEK. The node
+    /// RE-ESCROWS its new indexed share `y_j ‖ P(y_j)` to ITSELF (signed by this node, the new
+    /// escrow's producer identity the k-of-m boundary verifies). The CEK never exists here; a single
+    /// new share is one point of the new polynomial and reveals nothing.
+    fn reshare_install(&self, args: ReshareInstallArgs) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => return Response::error("not_configured", "dkms-authority node is not initialized (send `init` first)"),
+        };
+        let operator_verifier = match self.pinned_operator_verifier() {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let kid16 = match decode_kid_bytes16(&args.kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        if args.k < 2 || args.target_x == 0 {
+            return Response::error("invalid_request", "reconfiguration needs k ≥ 2 and a non-zero target coordinate");
+        }
+        if args.contributions.len() < 2 {
+            return Response::error("invalid_request", "reconfiguration install needs at least an old-quorum's worth of sub-shares");
+        }
+        let old_set_id = match b64().decode(&args.old_node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "old_node_set_id_b64 is not valid base64"),
+        };
+        let new_set_id = match b64().decode(&args.new_node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "new_node_set_id_b64 is not valid base64"),
+        };
+        let reshare_aad = ddrm_envelope::reshare_aad(&kid16, &old_set_id, &new_set_id, args.k, args.m);
+        if let Err(resp) = self.open_operator_auth(&args.operator_auth_b64, &reshare_aad, &operator_verifier) {
+            return resp;
+        }
+        // Unwrap + authenticate each sub-share, then combine over the OLD contributors' coordinates.
+        let mut points: Vec<(u8, zeroize::Zeroizing<Vec<u8>>)> = Vec::with_capacity(args.contributions.len());
+        for c in &args.contributions {
+            if c.contributor_x == 0 {
+                return Response::error("invalid_request", "a contributor coordinate is zero (the secret position is never a node)");
+            }
+            if points.iter().any(|(x, _)| *x == c.contributor_x) {
+                return Response::error("invalid_request", "duplicate contributor coordinate — not a real old quorum");
+            }
+            let vk = match b64().decode(&c.contributor_vk_b64) {
+                Ok(b) => b,
+                Err(_) => return Response::error("invalid_request", "a contributor verifying key is not valid base64"),
+            };
+            let verifier = match ddrm_envelope::MlDsa65Verifier::from_encoded(&vk) {
+                Some(v) => v,
+                None => return Response::error("invalid_request", "a contributor verifying key is malformed"),
+            };
+            let env = match b64().decode(&c.sealed_subshare_b64).ok().and_then(|b| ddrm_envelope::PqSealedEnvelope::from_bytes(&b).ok()) {
+                Some(env) => env,
+                None => return Response::error("invalid_request", "a sealed sub-share is not a valid envelope"),
+            };
+            let aad = ddrm_envelope::reshare_subshare_aad(&kid16, &new_set_id, c.contributor_x, args.target_x);
+            let payload = match ddrm_envelope::hybrid_unwrap_bound(&authority.recipient_secret, &env, &aad, &verifier) {
+                Ok(p) => p,
+                Err(_) => return Response::error("access_denied", "a sub-share did not open under THIS node for its declared contributor→target pair (forged, tampered, or redirected)"),
+            };
+            let (inner_x, body) = match ddrm_envelope::parse_indexed_share(&payload) {
+                Some((x, body)) => (x, body),
+                None => return Response::error("invalid_request", "a sub-share carries no valid contributor coordinate"),
+            };
+            if inner_x != c.contributor_x {
+                return Response::error("invalid_request", "a sub-share's sealed coordinate disagrees with its declared contributor");
+            }
+            points.push((c.contributor_x, zeroize::Zeroizing::new(body.to_vec())));
+        }
+        let point_refs: Vec<(u8, &[u8])> = points.iter().map(|(x, b)| (*x, b.as_slice())).collect();
+        let new_share = match ddrm_envelope::lagrange_combine_at_zero(&point_refs) {
+            Ok(s) => s,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        // Re-escrow `target_x ‖ P(target_x)` to THIS node under the shared escrow AAD, signed by it.
+        let indexed = zeroize::Zeroizing::new(ddrm_envelope::indexed_share(args.target_x, new_share.as_slice()));
+        let escrow_aad = ddrm_envelope::transcript::escrow_aad(&args.scheme, &kid16, &authority.recipient_public);
+        let escrow = ddrm_envelope::seal::seal_bound(
+            &ddrm_envelope::session_public_from_bytes(&authority.recipient_public).expect("node recipient is a valid escrow key"),
+            indexed.as_slice(),
+            &escrow_aad,
+            &authority.signer,
+        );
+        Response::ok(json!({
+            "target_x": args.target_x,
+            "wrapped_cek_b64": b64().encode(escrow.to_bytes()),
+            "escrow_producer_vk_b64": b64().encode(&authority.verifying_key),
+        }))
+    }
+
+    /// The pinned operator verifier or a fail-closed response (shared by every lifecycle op).
+    fn pinned_operator_verifier(&self) -> Result<ddrm_envelope::MlDsa65Verifier, Response> {
+        let operator_vk = self.operator_vk.as_ref().ok_or_else(|| {
+            Response::error("not_configured", "this node has no pinned operator identity — lifecycle ops are refused (provision DKMS_AUTHORITY_OPERATOR_VK)")
+        })?;
+        ddrm_envelope::MlDsa65Verifier::from_encoded(operator_vk)
+            .ok_or_else(|| Response::error("not_configured", "pinned operator identity is malformed"))
+    }
+
+    /// Open an operator-sealed authorization envelope under this node's recipient secret, verified
+    /// under the pinned operator identity and AEAD-bound to `expected_aad`. Fail-closed on any
+    /// mismatch (forged signer, tampered bytes, wrong reconfiguration context). The payload is
+    /// discarded — the AUTHORIZATION is the successful, identity-verified, context-bound open itself.
+    fn open_operator_auth(
+        &self,
+        auth_b64: &str,
+        expected_aad: &[u8],
+        operator_verifier: &ddrm_envelope::MlDsa65Verifier,
+    ) -> Result<(), Response> {
+        let authority = self.authority.as_ref().expect("authority checked by caller");
+        let env = b64()
+            .decode(auth_b64)
+            .ok()
+            .and_then(|b| ddrm_envelope::PqSealedEnvelope::from_bytes(&b).ok())
+            .ok_or_else(|| Response::error("invalid_request", "operator_auth_b64 is not a valid sealed envelope"))?;
+        ddrm_envelope::hybrid_unwrap_bound(&authority.recipient_secret, &env, expected_aad, operator_verifier)
+            .map(|_| ())
+            .map_err(|_| {
+                Response::error(
+                    "access_denied",
+                    "reconfiguration refused: the authorization does not open under the pinned operator identity for THIS (kid, old set, new set, k, m)",
+                )
+            })
+    }
+}
+
+#[derive(Clone)]
+struct ReshareContributeArgs {
+    wrapped_cek_b64: String,
+    scheme: String,
+    kid_hex: String,
+    producer_vk_b64: String,
+    operator_auth_b64: String,
+    old_node_set_id_b64: String,
+    new_node_set_id_b64: String,
+    k: u8,
+    m: u8,
+    new_recipient_pubs_b64: Vec<String>,
+}
+
+struct ReshareInstallArgs {
+    operator_auth_b64: String,
+    old_node_set_id_b64: String,
+    new_node_set_id_b64: String,
+    k: u8,
+    m: u8,
+    target_x: u8,
+    scheme: String,
+    kid_hex: String,
+    contributions: Vec<ReshareContribution>,
 }
 
 #[derive(Clone)]
@@ -1341,7 +1717,11 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             && channel.is_none()
             && matches!(
                 request,
-                Request::Recover { .. } | Request::RotateShare { .. } | Request::RevokeCaller { .. }
+                Request::Recover { .. }
+                    | Request::RotateShare { .. }
+                    | Request::RevokeCaller { .. }
+                    | Request::ReshareContribute { .. }
+                    | Request::ReshareInstall { .. }
             )
         {
             let resp = Response::error(
@@ -2292,6 +2672,208 @@ mod tests {
         assert_eq!(error_code(&resp), "invalid_request");
 
         let _ = std::fs::remove_file(&store);
+    }
+
+    /// QUORUM RECONFIGURATION (Day 121–125), full live protocol across real nodes: a 2-of-3 set is
+    /// RE-SHARED into a 3-of-5 set. Two OLD members CONTRIBUTE sub-shares of their shares under a
+    /// fresh polynomial each; five NEW members INSTALL their shares by combining the sub-shares over
+    /// the OLD-contributor Lagrange. ANY THREE of the five reconstruct the EXACT original CEK, any
+    /// TWO do not, and the CEK is never reassembled on any node. A non-operator authorization and a
+    /// redirected sub-share are both refused.
+    #[test]
+    fn reshare_2of3_to_3of5_across_real_nodes_reconstructs_and_lifts_the_threshold() {
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let kid16 = [0xC5u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
+        let producer_vk_b64 = b64().encode(&producer_vk);
+
+        // OLD 2-of-3 sharing of the CEK.
+        let cek: Vec<u8> = (0u8..16).collect();
+        let coeff: Vec<u8> = (200u8..216).collect();
+        let old_shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).unwrap();
+
+        // Provision 3 OLD nodes, each holding its INDEXED escrowed share.
+        let mut stores: Vec<String> = Vec::new();
+        let mut old_nodes: Vec<DkmsAuthorityNode> = Vec::new();
+        let mut old_vk: Vec<String> = Vec::new();
+        let mut old_recipient: Vec<String> = Vec::new();
+        let mut old_escrow: Vec<String> = Vec::new();
+        for (i, old_share) in old_shares.iter().enumerate() {
+            let store = unique_store(&format!("reshare-old-{i}"));
+            let mut node = DkmsAuthorityNode::default();
+            let init = ok_data(node.init(json!({ "authority_key_store": store })));
+            node.operator_vk = Some(operator_vk.clone());
+            let recipient_b64 = init["seal_recipient_pub_b64"].as_str().unwrap().to_string();
+            let recipient_bytes = b64().decode(&recipient_b64).unwrap();
+            let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_bytes).unwrap();
+            let payload = ddrm_envelope::indexed_share((i + 1) as u8, old_share);
+            let aad = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_bytes);
+            let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &payload, &aad, &producer_signer);
+            old_vk.push(init["seal_verifying_key_b64"].as_str().unwrap().to_string());
+            old_recipient.push(recipient_b64);
+            old_escrow.push(b64().encode(wrapped.to_bytes()));
+            old_nodes.push(node);
+            stores.push(store);
+        }
+
+        // Provision 5 NEW nodes (fresh masters → genuinely new identities).
+        let mut new_nodes: Vec<DkmsAuthorityNode> = Vec::new();
+        let mut new_vk: Vec<String> = Vec::new();
+        let mut new_recipient: Vec<String> = Vec::new();
+        for j in 0..5usize {
+            let store = unique_store(&format!("reshare-new-{j}"));
+            let mut node = DkmsAuthorityNode::default();
+            let init = ok_data(node.init(json!({ "authority_key_store": store })));
+            node.operator_vk = Some(operator_vk.clone());
+            new_vk.push(init["seal_verifying_key_b64"].as_str().unwrap().to_string());
+            new_recipient.push(init["seal_recipient_pub_b64"].as_str().unwrap().to_string());
+            new_nodes.push(node);
+            stores.push(store);
+        }
+
+        let (k, m) = (3u8, 5u8);
+        let decode_vks = |vks: &[String]| -> Vec<Vec<u8>> {
+            vks.iter().map(|v| b64().decode(v).unwrap()).collect()
+        };
+        let old_vk_bytes = decode_vks(&old_vk);
+        let old_refs: Vec<&[u8]> = old_vk_bytes.iter().map(|v| v.as_slice()).collect();
+        let old_set_id = ddrm_envelope::threshold_node_set_id_n(2, &old_refs);
+        let new_vk_bytes = decode_vks(&new_vk);
+        let new_refs: Vec<&[u8]> = new_vk_bytes.iter().map(|v| v.as_slice()).collect();
+        let new_set_id = ddrm_envelope::threshold_node_set_id_n(k, &new_refs);
+        let reshare_aad = ddrm_envelope::reshare_aad(&kid16, &old_set_id, &new_set_id, k, m);
+        let old_set_b64 = b64().encode(old_set_id);
+        let new_set_b64 = b64().encode(new_set_id);
+
+        // The operator seals an authorization to a recipient, bound to the WHOLE reconfiguration.
+        let seal_auth_with = |recipient_b64: &str, signer: &ddrm_envelope::seal::MlDsaSealSigner| -> String {
+            let bytes = b64().decode(recipient_b64).unwrap();
+            let public = ddrm_envelope::session_public_from_bytes(&bytes).unwrap();
+            b64().encode(ddrm_envelope::seal::seal_bound(&public, b"reconfigure", &reshare_aad, signer).to_bytes())
+        };
+
+        // CONTRIBUTE: the OLD quorum {x=1, x=2} re-shares; collect each sub-share by target new node.
+        let contributors = [0usize, 1usize];
+        let mut by_target: Vec<Vec<(u8, String, String)>> = vec![Vec::new(); 5];
+        for &ci in &contributors {
+            let data = ok_data(old_nodes[ci].reshare_contribute(ReshareContributeArgs {
+                wrapped_cek_b64: old_escrow[ci].clone(),
+                scheme: scheme.to_string(),
+                kid_hex: kid_hex.clone(),
+                producer_vk_b64: producer_vk_b64.clone(),
+                operator_auth_b64: seal_auth_with(&old_recipient[ci], &operator),
+                old_node_set_id_b64: old_set_b64.clone(),
+                new_node_set_id_b64: new_set_b64.clone(),
+                k,
+                m,
+                new_recipient_pubs_b64: new_recipient.clone(),
+            }));
+            let cx = data["contributor_x"].as_u64().unwrap() as u8;
+            assert_eq!(cx, (ci + 1) as u8, "contributor reports its own coordinate");
+            let cvk = data["contributor_vk_b64"].as_str().unwrap().to_string();
+            for sub in data["subshares"].as_array().unwrap() {
+                let tx = sub["target_x"].as_u64().unwrap() as usize;
+                by_target[tx - 1].push((cx, cvk.clone(), sub["sealed_subshare_b64"].as_str().unwrap().to_string()));
+            }
+        }
+
+        // INSTALL: each NEW node combines its two sub-shares into its share of the reconfigured set.
+        let install_contributions = |j: usize| -> Vec<ReshareContribution> {
+            by_target[j]
+                .iter()
+                .map(|(cx, vk, sealed)| ReshareContribution {
+                    contributor_x: *cx,
+                    contributor_vk_b64: vk.clone(),
+                    sealed_subshare_b64: sealed.clone(),
+                })
+                .collect()
+        };
+        let mut new_escrow: Vec<String> = Vec::new();
+        for j in 0..5usize {
+            let data = ok_data(new_nodes[j].reshare_install(ReshareInstallArgs {
+                operator_auth_b64: seal_auth_with(&new_recipient[j], &operator),
+                old_node_set_id_b64: old_set_b64.clone(),
+                new_node_set_id_b64: new_set_b64.clone(),
+                k,
+                m,
+                target_x: (j + 1) as u8,
+                scheme: scheme.to_string(),
+                kid_hex: kid_hex.clone(),
+                contributions: install_contributions(j),
+            }));
+            assert_eq!(data["escrow_producer_vk_b64"].as_str().unwrap(), new_vk[j], "new escrow names the new node");
+            new_escrow.push(data["wrapped_cek_b64"].as_str().unwrap().to_string());
+        }
+
+        // Recover each new node's INDEXED share in its OWN boundary (the path the k-of-m open uses).
+        let new_share = |j: usize| -> (u8, Vec<u8>) {
+            let wrapped = b64().decode(&new_escrow[j]).unwrap();
+            let vk = b64().decode(&new_vk[j]).unwrap();
+            let payload = new_nodes[j]
+                .authority
+                .as_ref()
+                .unwrap()
+                .recover_escrowed_cek(&wrapped, scheme, &kid16, &vk)
+                .expect("the new node recovers its own reconfigured share");
+            let (x, body) = ddrm_envelope::parse_indexed_share(&payload).unwrap();
+            assert_eq!(x, (j + 1) as u8, "the new share is indexed by the new node's coordinate");
+            (x, body.to_vec())
+        };
+
+        // ANY THREE of the five reconstruct the EXACT original CEK.
+        for triple in [[0usize, 2, 4], [1, 2, 3], [0, 1, 4]] {
+            let a = new_share(triple[0]);
+            let b = new_share(triple[1]);
+            let c = new_share(triple[2]);
+            let cek_out = ddrm_envelope::lagrange_combine_at_zero(&[
+                (a.0, &a.1),
+                (b.0, &b.1),
+                (c.0, &c.1),
+            ])
+            .unwrap();
+            assert_eq!(cek_out.to_vec(), cek, "any 3 of the reconfigured 3-of-5 reconstruct the CEK");
+        }
+        // TWO of the five do NOT (the threshold genuinely lifted to 3).
+        let a = new_share(0);
+        let b = new_share(1);
+        let two = ddrm_envelope::lagrange_combine_at_zero(&[(a.0, &a.1), (b.0, &b.1)]).unwrap();
+        assert_ne!(two.to_vec(), cek, "two reconfigured shares are below the NEW threshold");
+
+        // FAIL-CLOSED: a NON-operator authorization is refused.
+        let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+        let bad = new_nodes[0].reshare_install(ReshareInstallArgs {
+            operator_auth_b64: seal_auth_with(&new_recipient[0], &impostor),
+            old_node_set_id_b64: old_set_b64.clone(),
+            new_node_set_id_b64: new_set_b64.clone(),
+            k,
+            m,
+            target_x: 1,
+            scheme: scheme.to_string(),
+            kid_hex: kid_hex.clone(),
+            contributions: install_contributions(0),
+        });
+        assert_eq!(error_code(&bad), "access_denied", "a non-operator reconfiguration is refused");
+
+        // FAIL-CLOSED: a sub-share minted for new node 1 (target_x=1) routed to new node 2 (target_x=2)
+        // is refused — the sub-share is bound to its (contributor → target) pair AND its recipient.
+        let redirected = new_nodes[1].reshare_install(ReshareInstallArgs {
+            operator_auth_b64: seal_auth_with(&new_recipient[1], &operator),
+            old_node_set_id_b64: old_set_b64.clone(),
+            new_node_set_id_b64: new_set_b64.clone(),
+            k,
+            m,
+            target_x: 2,
+            scheme: scheme.to_string(),
+            kid_hex: kid_hex.clone(),
+            contributions: install_contributions(0),
+        });
+        assert_eq!(error_code(&redirected), "access_denied", "a redirected sub-share is refused");
+
+        for store in &stores {
+            let _ = std::fs::remove_file(store);
+        }
     }
 
     /// LIVE CALLER REVOCATION (Day 109–112): only the pinned operator can revoke; once revoked, the
