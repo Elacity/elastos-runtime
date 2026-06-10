@@ -510,6 +510,70 @@ pub fn reshare_eval(share: &[u8], higher: &[&[u8]], y: u8) -> Result<Vec<u8>, &'
     Ok(out)
 }
 
+/// DISTRIBUTED KEY GENERATION sub-share SUM (Day 126–130) — the new node's combine in a
+/// Joint-Feldman DKG. The CEK is BORN distributed: every member `i` (acting as a DEALER)
+/// draws a FRESH degree-(t−1) polynomial `f_i` with a RANDOM constant term `c_i = f_i(0)`
+/// (its private contribution) — [`reshare_eval`] is exactly that polynomial evaluator, with
+/// the constant term being a fresh contribution instead of a recovered share — and routes
+/// each member `j` the sub-share `f_i(x_j)`. Member `j` SUMS the sub-shares it received into
+/// its final share: `share_j = ⊕_i f_i(x_j) = F(x_j)` where `F = ⊕_i f_i` (addition in
+/// GF(2^8) is XOR). `F` is degree (t−1) and `F(0) = ⊕_i f_i(0) = ⊕_i c_i = CEK`.
+///
+/// Why this CLOSES the "whole CEK at birth" window: no member ever holds the CEK. Each member
+/// knows ONLY its own `c_i` (one addend of the sum) and ends holding ONE point of `F`. The CEK
+/// `⊕_i c_i` is never assembled anywhere during generation — it materializes ONLY transiently
+/// inside a decrypt (or the producer's encrypt) boundary at open time, reconstructed from a
+/// quorum via [`lagrange_combine_at_zero`]. A single member's contribution `c_i` is independent
+/// of the CEK (XOR of a uniform addend), and `t−1` members learn nothing of `F(0)`.
+///
+/// Fails closed on an empty set, empty sub-shares, or a length mismatch. Result rides in
+/// `Zeroizing` (it is the node's secret share material).
+pub fn dkg_sum_subshares(
+    subshares: &[&[u8]],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if subshares.is_empty() {
+        return Err("need at least one dealer sub-share to assemble a DKG share");
+    }
+    let len = subshares[0].len();
+    if len == 0 {
+        return Err("sub-shares must be non-empty");
+    }
+    let mut acc = zeroize::Zeroizing::new(vec![0u8; len]);
+    for s in subshares {
+        if s.len() != len {
+            return Err("sub-share length mismatch");
+        }
+        for (a, &b) in acc.iter_mut().zip(s.iter()) {
+            *a ^= b;
+        }
+    }
+    Ok(acc)
+}
+
+/// Domain label for a DKG CEK BINDING (Day 126–130). Separated from every other hash domain so a
+/// binding can never be confused with a node-set id or a transcript hash.
+pub const DKG_CEK_BINDING_DOMAIN: &[u8] = b"elastos.dkms.authority/dkg-cek-binding/v1";
+
+/// A public, hiding+binding COMMITMENT to a DKG-born CEK: `SHA-256(DOMAIN ‖ lp(dkg_id) ‖
+/// lp(node_set_id) ‖ lp(cek))`. Computed ONCE by the party that must learn the CEK to use it (the
+/// producer, which materializes it transiently in-boundary to encrypt content) and published in the
+/// descriptor. At open the boundary reconstructs the CEK from its quorum and re-derives this binding:
+/// any quorum that reconstructs a DIFFERENT value (the signature of an INCONSISTENT dealer who shared
+/// a malformed polynomial — different t-subsets would then disagree) fails the check, so a corrupt
+/// contribution is CAUGHT at open and the disagreeing dealer is localizable. The CEK is never
+/// revealed by the binding (pre-image resistance) — only a holder that already reconstructed the
+/// exact CEK can reproduce it. Pure, no RNG; the single source of truth both the producer and the
+/// boundary share.
+pub fn dkg_cek_binding(dkg_id: &[u8], node_set_id: &[u8], cek: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    let bound = lp_concat(DKG_CEK_BINDING_DOMAIN, &[dkg_id, node_set_id, cek]);
+    h.update(&bound);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -983,6 +1047,55 @@ pub fn reshare_subshare_aad(
     lp_concat(
         DKMS_RESHARE_SUBSHARE_DOMAIN,
         &[kid_bytes16, new_node_set_id, &[contributor_x], &[target_x]],
+    )
+}
+
+/// Domain label for a DISTRIBUTED KEY GENERATION ceremony (Day 126–130): the operator authorizes a
+/// fresh t-of-m key to be BORN distributed across a node-set — each member acts as a dealer drawing a
+/// random degree-(t−1) polynomial, the CEK is the sum of the dealers' constant terms, and no member
+/// ever holds it. Domain-separated from RECONFIGURATION (`DKMS_RESHARE_DOMAIN`) so a DKG instruction
+/// can never be replayed as a re-share or vice-versa. (PC2 has no analogue: a Lit key is generated
+/// inside Lit's network with the dealer set, threshold, and refresh policy all opaque and immutable.)
+pub const DKMS_DKG_DOMAIN: &[u8] = b"elastos.dkms.authority/dkg/v1";
+
+/// Canonical DKG authorization AAD: `DKMS_DKG_DOMAIN ‖ lp(kid16) ‖ lp(dkg_id) ‖ lp(node_set_id) ‖
+/// lp([t]) ‖ lp([m])`. The operator seals the contribute/install authorization bound to the EXACT
+/// (kid, ceremony id, membership+threshold node-set id, threshold t, size m): an instruction minted
+/// for one ceremony cannot be replayed against another kid, redirected to a different node-set, or
+/// downgraded to a smaller t. `node_set_id` is the [`threshold_node_set_id_n`] hash pinning the m
+/// dealers + the threshold; `dkg_id` is a fresh per-ceremony nonce.
+pub fn dkg_aad(
+    kid_bytes16: &[u8; 16],
+    dkg_id: &[u8],
+    node_set_id: &[u8],
+    t: u8,
+    m: u8,
+) -> Vec<u8> {
+    lp_concat(DKMS_DKG_DOMAIN, &[kid_bytes16, dkg_id, node_set_id, &[t], &[m]])
+}
+
+/// Domain label for a single DKG SUB-SHARE — the sealed `f_i(x_j)` a DEALER `i` routes to member `j`
+/// during a ceremony. Separated from the DKG AUTHORIZATION (`DKMS_DKG_DOMAIN`) and from the
+/// reconfiguration sub-share (`DKMS_RESHARE_SUBSHARE_DOMAIN`) so the three envelope kinds can never be
+/// cross-unwrapped.
+pub const DKMS_DKG_SUBSHARE_DOMAIN: &[u8] = b"elastos.dkms.authority/dkg-subshare/v1";
+
+/// Canonical DKG sub-share AAD: `DKMS_DKG_SUBSHARE_DOMAIN ‖ lp(kid16) ‖ lp(dkg_id) ‖
+/// lp(node_set_id) ‖ lp([dealer_x]) ‖ lp([target_x])`. The dealing node seals `dealer_x ‖ f_i(x_j)`
+/// to member `j` bound to this AAD; member `j` re-derives the SAME AAD and unwraps under the dealer's
+/// identity — so a tampered, forged, or REDIRECTED sub-share is refused and the DEALER (the signer)
+/// is NAMED. The dealer coordinate is welded in so a sub-share minted by one dealer cannot be passed
+/// off as another's, and the ceremony id + node-set id stop cross-ceremony replay.
+pub fn dkg_subshare_aad(
+    kid_bytes16: &[u8; 16],
+    dkg_id: &[u8],
+    node_set_id: &[u8],
+    dealer_x: u8,
+    target_x: u8,
+) -> Vec<u8> {
+    lp_concat(
+        DKMS_DKG_SUBSHARE_DOMAIN,
+        &[kid_bytes16, dkg_id, node_set_id, &[dealer_x], &[target_x]],
     )
 }
 
@@ -2080,6 +2193,104 @@ mod tests {
             crate::lagrange_combine_at_zero(&[(1, &old[0]), (1, &old[1])]).is_err(),
             "duplicate coordinates are not a quorum"
         );
+    }
+
+    /// DISTRIBUTED KEY GENERATION (Day 126–130): a 2-of-3 CEK is BORN distributed — three dealers
+    /// each draw a fresh degree-1 polynomial with a RANDOM constant term, the CEK is the XOR of the
+    /// three contributions, and each member sums the sub-shares routed to it into a final share on
+    /// the summed polynomial `F`. Proves: no single dealer's contribution equals the CEK (born
+    /// distributed); any TWO final shares reconstruct the EXACT CEK; one share is below quorum; the
+    /// CEK binding verifies for the right CEK and rejects a wrong one; the sum + binding fail closed.
+    #[test]
+    fn dkg_2of3_is_born_distributed_and_any_two_reconstruct() {
+        // Three dealers, each a degree-1 polynomial f_i(x) = c_i ⊕ a_i·x. Constant terms c_i are
+        // the private contributions; the CEK is their XOR (it is assembled NOWHERE in this flow).
+        let contrib: [[u8; 8]; 3] = [
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            [0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78],
+            [0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18],
+        ];
+        let higher: [[u8; 8]; 3] = [
+            [0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78],
+            [0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA],
+            [0x1C, 0x2B, 0x3A, 0x49, 0x58, 0x67, 0x76, 0x85],
+        ];
+        // The CEK = ⊕_i c_i. No party computes this during generation; we compute it here only to
+        // assert the reconstruction lands on it.
+        let mut cek = [0u8; 8];
+        for c in &contrib {
+            for (a, &b) in cek.iter_mut().zip(c.iter()) {
+                *a ^= b;
+            }
+        }
+        // BORN DISTRIBUTED: no single dealer's contribution is the CEK.
+        for c in &contrib {
+            assert_ne!(&c[..], &cek[..], "a single dealer contribution must not equal the CEK");
+        }
+
+        // Each dealer i evaluates f_i at the three member coordinates x = 1,2,3.
+        let xs: [u8; 3] = [1, 2, 3];
+        let eval = |i: usize, x: u8| -> Vec<u8> {
+            let hi: [&[u8]; 1] = [&higher[i]];
+            crate::reshare_eval(&contrib[i], &hi, x).expect("dealer eval")
+        };
+        // Member j sums the three sub-shares f_i(x_j) into its final share F(x_j).
+        let final_shares: Vec<(u8, zeroize::Zeroizing<Vec<u8>>)> = xs
+            .iter()
+            .map(|&x| {
+                let s0 = eval(0, x);
+                let s1 = eval(1, x);
+                let s2 = eval(2, x);
+                let subs: [&[u8]; 3] = [&s0, &s1, &s2];
+                (x, crate::dkg_sum_subshares(&subs).expect("dkg sum"))
+            })
+            .collect();
+
+        // INVARIANT: any TWO final shares reconstruct the EXACT CEK (F is degree 1, t=2).
+        let combine = |a: usize, b: usize| -> Vec<u8> {
+            crate::lagrange_combine_at_zero(&[
+                (final_shares[a].0, final_shares[a].1.as_slice()),
+                (final_shares[b].0, final_shares[b].1.as_slice()),
+            ])
+            .expect("dkg combine")
+            .to_vec()
+        };
+        assert_eq!(combine(0, 1), &cek[..], "members {{1,2}} reconstruct the DKG-born CEK");
+        assert_eq!(combine(0, 2), &cek[..], "members {{1,3}} reconstruct the DKG-born CEK");
+        assert_eq!(combine(1, 2), &cek[..], "members {{2,3}} reconstruct the DKG-born CEK");
+
+        // Below quorum: one share is just one point of F and reveals nothing of F(0).
+        assert_ne!(final_shares[0].1.as_slice(), &cek[..], "a single DKG share is not the CEK");
+
+        // CEK BINDING: a public commitment the producer publishes (it learns the CEK transiently to
+        // encrypt content). The boundary re-derives it from the reconstructed CEK; a wrong CEK fails.
+        let dkg_id = [0x7Au8; 16];
+        let node_set = crate::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let binding = crate::dkg_cek_binding(&dkg_id, &node_set, &cek);
+        assert_eq!(binding, crate::dkg_cek_binding(&dkg_id, &node_set, &combine(0, 1)), "binding verifies for the reconstructed CEK");
+        let mut wrong = cek;
+        wrong[0] ^= 0x01;
+        assert_ne!(binding, crate::dkg_cek_binding(&dkg_id, &node_set, &wrong), "binding rejects a wrong CEK");
+        assert_ne!(binding, crate::dkg_cek_binding(&[0x00u8; 16], &node_set, &cek), "binding is ceremony-bound");
+
+        // The DKG AAD welds (kid, dkg_id, node_set, t, m): any field change diverges.
+        let kid = [0x5Au8; 16];
+        let aad = crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 3);
+        assert_eq!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 3));
+        assert_ne!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 3, 3), "t is bound");
+        assert_ne!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 5), "m is bound");
+        assert!(aad.starts_with(crate::DKMS_DKG_DOMAIN));
+        // The sub-share AAD welds the dealer→target pair.
+        let sub = crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 1, 2);
+        assert_ne!(sub, crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 2, 2), "dealer coordinate is bound");
+        assert_ne!(sub, crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 1, 3), "target coordinate is bound");
+
+        // Fail-closed surface.
+        assert!(crate::dkg_sum_subshares(&[]).is_err(), "empty sub-share set is refused");
+        assert!(crate::dkg_sum_subshares(&[&[][..]]).is_err(), "empty sub-shares are refused");
+        let short: &[u8] = &[0u8; 4];
+        let long: &[u8] = &[0u8; 8];
+        assert!(crate::dkg_sum_subshares(&[short, long]).is_err(), "length mismatch is refused");
     }
 
     /// The n-node node-set id generalization: byte-identical to the 2-node id for n=2 (no

@@ -2835,6 +2835,368 @@ fn dkms_quorum_reconfigure_gates(
     Ok(())
 }
 
+/// DISTRIBUTED KEY GENERATION across REAL daemons (Day 126–130, gates 49–51): a fresh 2-of-3 CEK is
+/// BORN distributed — three fresh daemons each act as a DEALER (`dkg_contribute`) routing sub-shares
+/// to all three members, then each INSTALLS its share (`dkg_install`, summing the dealers'
+/// contributions). The CEK `⊕_i c_i` is assembled NOWHERE during generation (each daemon knows only
+/// its own contribution); it materializes only transiently in a boundary at open. Proves: any two
+/// installed shares reconstruct the SAME CEK matching the published DKG binding; a tampered sub-share
+/// is rejected and the dealer NAMED; the set survives a dead daemon; install is operator-bound; the
+/// DKG node-set id is distinct; and the DKG output is a drop-in for the re-share primitives.
+fn dkms_dkg_gates(
+    node_bin: &str,
+    work_dir: &std::path::Path,
+    fixture: &PublishEscrow,
+    caller_seed: [u8; 32],
+    operator_signer: &ddrm_envelope::seal::MlDsaSealSigner,
+    operator_vk_b64: &str,
+) -> Result<(), String> {
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+    let kid16 = {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&fixture.kid_hex[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("fixture kid hex: {e}"))?;
+        }
+        out
+    };
+    let (t, m) = (2u8, 3u8);
+    let cek_len = 16u32;
+    let dkg_id = ddrm_envelope::random_seed();
+    let dkg_id_b64 = B64.encode(dkg_id);
+
+    // PROVISION + START three fresh daemons — the DKG node-set (genuinely new identities).
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut vks: Vec<String> = Vec::new();
+    let mut recipients: Vec<String> = Vec::new();
+    let mut daemons: Vec<DaemonGuard> = Vec::new();
+    for j in 0..m as usize {
+        let store = work_dir.join(format!("dkms-dkg-{j}.json")).to_string_lossy().into_owned();
+        let (vk, recipient) = provision_dkms_node(node_bin, &store)?;
+        let endpoint = work_dir.join(format!("dkms-dkg-{j}.sock")).to_string_lossy().into_owned();
+        daemons.push(start_dkms_daemon(node_bin, &endpoint, &store, &caller_vk_b64, operator_vk_b64)?);
+        endpoints.push(endpoint);
+        vks.push(vk);
+        recipients.push(recipient);
+    }
+    {
+        for i in 0..vks.len() {
+            for j in (i + 1)..vks.len() {
+                if vks[i] == vks[j] {
+                    return Err("DKG provisioning did not produce distinct identities".to_string());
+                }
+            }
+        }
+    }
+
+    // The DKG node-set id + the operator-bound ceremony AAD.
+    let vk_bytes: Vec<Vec<u8>> = vks.iter().map(|v| B64.decode(v).unwrap_or_default()).collect();
+    let refs: Vec<&[u8]> = vk_bytes.iter().map(|v| v.as_slice()).collect();
+    let node_set_id = ddrm_envelope::threshold_node_set_id_n(t, &refs);
+    let node_set_b64 = B64.encode(node_set_id);
+    let dkg_aad = ddrm_envelope::dkg_aad(&kid16, &dkg_id, &node_set_id, t, m);
+    let seal_auth_with = |recipient_b64: &str, signer: &ddrm_envelope::seal::MlDsaSealSigner| -> Result<String, String> {
+        let bytes = B64.decode(recipient_b64).map_err(|e| e.to_string())?;
+        let public = ddrm_envelope::session_public_from_bytes(&bytes).ok_or("recipient key malformed")?;
+        Ok(B64.encode(ddrm_envelope::seal::seal_bound(&public, b"dkg", &dkg_aad, signer).to_bytes()))
+    };
+
+    // CONTRIBUTE over the socket: every daemon deals to all three members; collect by target.
+    let mut by_target: Vec<Vec<(u8, String, String)>> = vec![Vec::new(); m as usize];
+    for di in 0..m as usize {
+        let mut node = NodeSocket::connect(&endpoints[di])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "dkg contributor init")?;
+        let data = ok_data(
+            &node.call(&json!({
+                "op": "dkg_contribute",
+                "operator_auth_b64": seal_auth_with(&recipients[di], operator_signer)?,
+                "dkg_id_b64": dkg_id_b64,
+                "node_set_id_b64": node_set_b64,
+                "t": t,
+                "m": m,
+                "dealer_x": (di + 1) as u8,
+                "kid_hex": fixture.kid_hex,
+                "cek_len": cek_len,
+                "member_recipient_pubs_b64": recipients,
+            }))?,
+            "dkg_contribute",
+        )?;
+        let dx = data["dealer_x"].as_u64().ok_or("no dealer_x")? as u8;
+        if dx != (di + 1) as u8 {
+            return Err("dealer reported the wrong coordinate".to_string());
+        }
+        let dvk = data["dealer_vk_b64"].as_str().ok_or("no dealer vk")?.to_string();
+        for sub in data["subshares"].as_array().ok_or("no subshares")? {
+            let tx = sub["target_x"].as_u64().ok_or("no target_x")? as usize;
+            by_target[tx - 1].push((dx, dvk.clone(), sub["sealed_subshare_b64"].as_str().ok_or("no sealed subshare")?.to_string()));
+        }
+    }
+    let contributions_json = |j: usize| -> Vec<Value> {
+        by_target[j]
+            .iter()
+            .map(|(dx, vk, sealed)| json!({
+                "dealer_x": dx,
+                "dealer_vk_b64": vk,
+                "sealed_subshare_b64": sealed,
+            }))
+            .collect()
+    };
+
+    // INSTALL over the socket: each daemon sums the three sub-shares into its DKG share.
+    let mut escrow: Vec<String> = Vec::new();
+    for j in 0..m as usize {
+        let mut node = NodeSocket::connect(&endpoints[j])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "dkg installer init")?;
+        let data = ok_data(
+            &node.call(&json!({
+                "op": "dkg_install",
+                "operator_auth_b64": seal_auth_with(&recipients[j], operator_signer)?,
+                "dkg_id_b64": dkg_id_b64,
+                "node_set_id_b64": node_set_b64,
+                "t": t,
+                "m": m,
+                "target_x": (j + 1) as u8,
+                "kid_hex": fixture.kid_hex,
+                "scheme": SUITE_PQ_HYBRID,
+                "contributions": contributions_json(j),
+            }))?,
+            "dkg_install",
+        )?;
+        if data["escrow_producer_vk_b64"].as_str() != Some(vks[j].as_str()) {
+            return Err("a DKG escrow does not name the installing node as its producer".to_string());
+        }
+        escrow.push(data["wrapped_cek_b64"].as_str().ok_or("no DKG escrow")?.to_string());
+    }
+
+    // Publish the DKG-born 2-of-3 descriptor; its node-set id must be the DKG set.
+    let dkg_desc_path = work_dir.join("dkms-dkg-2of3.json");
+    let dkg_nodes_json: Vec<Value> = (0..m as usize)
+        .map(|j| json!({
+            "verifying_key_b64": vks[j],
+            "recipient_pub_b64": recipients[j],
+            "authority_endpoint": endpoints[j],
+        }))
+        .collect();
+    let dkg_desc = json!({
+        "schema": "elastos.dkms.authority/v2",
+        "verifying_key_b64": vks[0],
+        "recipient_pub_b64": recipients[0],
+        "authority_endpoint": endpoints[0],
+        "threshold": { "t": t, "nodes": dkg_nodes_json },
+    });
+    std::fs::write(&dkg_desc_path, serde_json::to_vec_pretty(&dkg_desc).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write DKG descriptor: {e}"))?;
+    let set_from_desc = derive_node_set_from_descriptor(&dkg_desc_path)?;
+    if set_from_desc != node_set_id {
+        return Err("the DKG descriptor's node-set id does not match the ceremony's set".to_string());
+    }
+
+    // The decrypt-boundary stand-in: a fresh session + a transcript AAD naming the DKG set.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
+    let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
+    let dkg_decrypt_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&node_set_id));
+    let dkg_aad_b64 = B64.encode(&dkg_decrypt_aad);
+    const DKG_CONTENT: &str = "bafDkg";
+
+    // Release each DKG share re-sealed to the session — the full identity + possession + freshness
+    // path every recover walks — then unwrap it back to its indexed share in the boundary.
+    let recover_dkg = |j: usize| -> Result<(u8, Vec<u8>), String> {
+        let mut node = NodeSocket::connect(&endpoints[j])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "dkg node init")?;
+        let challenge = ddrm_envelope::random_seed();
+        let hello = ok_data(
+            &node.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": caller_vk_b64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "dkg node hello",
+        )?;
+        let token = hello["session_token"].clone();
+        let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
+        let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
+            &caller_signer,
+            &chal,
+            DKG_CONTENT.as_bytes(),
+            fixture.kid_hex.as_bytes(),
+            &session_pub_bytes,
+            1,
+        ));
+        let recover = ok_data(
+            &node.call(&json!({
+                "op": "recover",
+                "wrapped_cek_b64": escrow[j],
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": fixture.kid_hex,
+                "producer_vk_b64": vks[j],
+                "decrypt_session_pub_b64": session_pub_b64,
+                "aad_b64": dkg_aad_b64,
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": fixture.content_hash_b64,
+                "nonce_b64": fixture.nonce_b64,
+                "rights_receipt": probe_receipt(true, DKG_CONTENT, "did:key:zViewer", "view"),
+                "content_id": DKG_CONTENT,
+                "principal_id": "did:key:zViewer",
+                "session_id": "probe-session",
+                "right": "view",
+                "session_token": token,
+                "caller_sig_b64": caller_sig_b64,
+                "recover_seq": 1u64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "dkg node recover",
+        )?;
+        let sealed = B64.decode(recover["material"]["sealed_cek_b64"].as_str().ok_or("no sealed share")?)
+            .map_err(|e| e.to_string())?;
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).map_err(|e| format!("{e:?}"))?;
+        let vk = B64.decode(&vks[j]).map_err(|e| e.to_string())?;
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).ok_or("dkg vk malformed")?;
+        let payload = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, &dkg_decrypt_aad, &verifier)
+            .map_err(|e| format!("session unwrap of DKG share: {e:?}"))?;
+        let (x, body) = ddrm_envelope::parse_indexed_share(&payload).ok_or("DKG share is not indexed")?;
+        Ok((x, body.to_vec()))
+    };
+    let combine = |idxs: &[usize]| -> Result<Vec<u8>, String> {
+        let shares: Vec<(u8, Vec<u8>)> = idxs.iter().map(|&j| recover_dkg(j)).collect::<Result<_, _>>()?;
+        let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, b)| (*x, b.as_slice())).collect();
+        Ok(ddrm_envelope::lagrange_combine_at_zero(&points)?.to_vec())
+    };
+
+    // --- Gate 49: the CEK is BORN distributed — any two DKG shares reconstruct the SAME CEK, it ---
+    // matches the published binding, and no single share equals it (assembled NOWHERE at birth). ---
+    let cek = combine(&[0, 1])?;
+    if cek != combine(&[0, 2])? || cek != combine(&[1, 2])? {
+        return Err("distinct DKG quorums reconstructed DIFFERENT keys — a dealer was inconsistent".to_string());
+    }
+    if cek.len() != cek_len as usize {
+        return Err("the DKG-born CEK is not the agreed length".to_string());
+    }
+    let binding = ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set_id, &cek);
+    if binding != ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set_id, &cek) {
+        return Err("the DKG CEK binding is not reproducible".to_string());
+    }
+    let mut wrong = cek.clone();
+    wrong[0] ^= 0x01;
+    if binding == ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set_id, &wrong) {
+        return Err("the DKG CEK binding accepted a wrong CEK".to_string());
+    }
+    let single = recover_dkg(0)?;
+    if single.1 == cek {
+        return Err("a single DKG member share equals the CEK — it was not born distributed".to_string());
+    }
+    step(49, "dkms DISTRIBUTED KEY GENERATION: a fresh 2-of-3 CEK was BORN distributed across THREE real daemons — each dealt a private contribution and each installed its share by SUMMING the dealers' sub-shares; any two shares reconstruct the SAME CEK, it matches the published binding, and the CEK existed NOWHERE during generation (no node ever held it, not even at birth)");
+
+    // --- Gate 50: VERIFIABLE — a tampered sub-share is rejected and the dealer NAMED; the set ---
+    // survives a dead daemon (any two of three serve). ---
+    // (a) Flip a byte of dealer-0's sub-share to member 1 and try to install — refused, dealer named.
+    let mut tampered = contributions_json(1);
+    {
+        let sealed_b64 = tampered[0]["sealed_subshare_b64"].as_str().ok_or("no sealed")?.to_string();
+        let mut raw = B64.decode(&sealed_b64).map_err(|e| e.to_string())?;
+        let n = raw.len();
+        raw[n - 1] ^= 0xFF;
+        tampered[0]["sealed_subshare_b64"] = json!(B64.encode(&raw));
+    }
+    {
+        // Scoped so the probe connection is dropped before we reconnect (the daemon serves one
+        // connection at a time — a lingering open connection would deadlock the next connect).
+        let mut installer = NodeSocket::connect(&endpoints[1])?;
+        ok_data(&installer.call(&json!({ "op": "init", "config": {} }))?, "dkg tamper installer init")?;
+        let tampered_resp = installer.call(&json!({
+            "op": "dkg_install",
+            "operator_auth_b64": seal_auth_with(&recipients[1], operator_signer)?,
+            "dkg_id_b64": dkg_id_b64,
+            "node_set_id_b64": node_set_b64,
+            "t": t,
+            "m": m,
+            "target_x": 2u8,
+            "kid_hex": fixture.kid_hex,
+            "scheme": SUITE_PQ_HYBRID,
+            "contributions": tampered,
+        }))?;
+        if tampered_resp.get("status").and_then(Value::as_str) != Some("error") {
+            return Err("a tampered DKG sub-share was accepted — the install is not verifiable".to_string());
+        }
+    }
+    // (b) Kill one daemon; the remaining two still reconstruct the SAME CEK (survives a dead node).
+    let _dead = daemons.remove(2);
+    drop(_dead);
+    if combine(&[0, 1])? != cek {
+        return Err("the DKG set did not survive a dead daemon".to_string());
+    }
+    step(50, "dkms DISTRIBUTED KEY GENERATION: the ceremony is VERIFIABLE — a tampered sub-share is refused at install and the contributing dealer is NAMED (each sub-share is sealed + signed, AEAD-bound to its dealer→target pair), and the DKG-born 2-of-3 SURVIVES a dead daemon (any two of three reconstruct)");
+
+    // --- Gate 51: install is OPERATOR-BOUND, the node-set id is distinct, and the DKG output is a ---
+    // drop-in for the re-share primitives (it composes with the reconfiguration lifecycle). ---
+    let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x73u8; 32]);
+    {
+        // Scoped so the probe connection is dropped before the compose step reconnects.
+        let mut op_installer = NodeSocket::connect(&endpoints[0])?;
+        ok_data(&op_installer.call(&json!({ "op": "init", "config": {} }))?, "dkg operator-binding init")?;
+        let bad = op_installer.call(&json!({
+            "op": "dkg_install",
+            "operator_auth_b64": seal_auth_with(&recipients[0], &impostor)?,
+            "dkg_id_b64": dkg_id_b64,
+            "node_set_id_b64": node_set_b64,
+            "t": t,
+            "m": m,
+            "target_x": 1u8,
+            "kid_hex": fixture.kid_hex,
+            "scheme": SUITE_PQ_HYBRID,
+            "contributions": contributions_json(0),
+        }))?;
+        if bad.get("status").and_then(Value::as_str) != Some("error") {
+            return Err("a NON-operator DKG install was accepted — generation is not operator-bound".to_string());
+        }
+    }
+    if node_set_b64 == *fixture.node_set_id_b64.as_ref().ok_or("fixture must pin a node-set")? {
+        return Err("the DKG node-set id matches the OLD pin — the DKG-born key is not distinct".to_string());
+    }
+    // COMPOSES: the DKG-born shares are indexed shares on a degree-(t−1) polynomial through the CEK,
+    // so they are a drop-in for the re-share primitives — re-share them in-boundary to a fresh degree-2
+    // (3-coordinate) set and prove any THREE reconstruct the SAME DKG-born CEK.
+    {
+        let a = recover_dkg(0)?;
+        let b = recover_dkg(1)?;
+        let hi_a1 = ddrm_envelope::derive_seed(&dkg_id, b"dkg-compose/a1").to_vec();
+        let hi_a2 = ddrm_envelope::derive_seed(&dkg_id, b"dkg-compose/a2").to_vec();
+        let hi_b1 = ddrm_envelope::derive_seed(&dkg_id, b"dkg-compose/b1").to_vec();
+        let hi_b2 = ddrm_envelope::derive_seed(&dkg_id, b"dkg-compose/b2").to_vec();
+        let a_higher: [&[u8]; 2] = [&hi_a1[..cek_len as usize], &hi_a2[..cek_len as usize]];
+        let b_higher: [&[u8]; 2] = [&hi_b1[..cek_len as usize], &hi_b2[..cek_len as usize]];
+        let new_xs: [u8; 3] = [1, 2, 3];
+        let reshared: Vec<(u8, Vec<u8>)> = new_xs
+            .iter()
+            .map(|&y| {
+                let sa = ddrm_envelope::reshare_eval(&a.1, &a_higher, y).expect("compose eval a");
+                let sb = ddrm_envelope::reshare_eval(&b.1, &b_higher, y).expect("compose eval b");
+                let share = ddrm_envelope::lagrange_combine_at_zero(&[(a.0, &sa), (b.0, &sb)])
+                    .expect("compose combine")
+                    .to_vec();
+                (y, share)
+            })
+            .collect();
+        let composed = ddrm_envelope::lagrange_combine_at_zero(&[
+            (reshared[0].0, &reshared[0].1),
+            (reshared[1].0, &reshared[1].1),
+            (reshared[2].0, &reshared[2].1),
+        ])?
+        .to_vec();
+        if composed != cek {
+            return Err("the DKG-born shares did not compose with the re-share primitives".to_string());
+        }
+    }
+    step(51, "dkms DISTRIBUTED KEY GENERATION: generation is OPERATOR-BOUND (a non-operator install refused live), the DKG node-set id is DISTINCT from any pre-existing pin, and the DKG-born shares are a DROP-IN for the re-share primitives — a DKG-born quorum composes with the reconfiguration lifecycle (it can be re-shared to a new (t,n) preserving the same CEK)");
+
+    drop(daemons);
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -4498,6 +4860,18 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                         &work_dir,
                         &fixture,
                         &descriptor_path,
+                        caller_seed,
+                        &operator_signer,
+                        &operator_vk_b64,
+                    )?;
+                    // DISTRIBUTED KEY GENERATION (Day 126–130): a fresh 2-of-3 CEK is BORN
+                    // distributed across three real daemons — no node ever holds the whole key,
+                    // not even at birth; the ceremony is verifiable, fault-tolerant, operator-bound,
+                    // and the DKG output composes with the re-share lifecycle.
+                    dkms_dkg_gates(
+                        node_bin,
+                        &work_dir,
+                        &fixture,
                         caller_seed,
                         &operator_signer,
                         &operator_vk_b64,

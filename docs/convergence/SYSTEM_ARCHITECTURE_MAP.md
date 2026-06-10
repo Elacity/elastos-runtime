@@ -369,6 +369,36 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 126–130):** the CEK is BORN DISTRIBUTED — a verifiable Distributed Key Generation (DKG) so NO node, not
+  even the provisioner, EVER holds the whole key. Day 113–116 made the threshold a real quorum, 117–120 gave it a
+  rotation lifecycle, 121–125 made it reconfigurable — but the CEK was still GENERATED then SPLIT (the whole secret
+  existed in one place for an instant). This unit closes that window: the key is born ALREADY SPLIT. The KEY INSIGHT
+  (additive / Joint-Feldman DKG in our own GF(256) arithmetic): each member `i` acts as a DEALER drawing a FRESH
+  degree-(t−1) polynomial `f_i` with a RANDOM private constant `c_i = f_i(0)`, routing each member `j` the sub-share
+  `f_i(x_j)`; member `j` SUMS them into its share `F(x_j) = ⊕_i f_i(x_j)`, where `F = ⊕_i f_i` is degree (t−1) and
+  `F(0) = ⊕_i c_i = CEK`. No member knows more than its OWN `c_i`, `t−1` members learn nothing of `F(0)`, and the CEK is
+  assembled NOWHERE during generation — it materializes only transiently inside a decrypt (or the producer's encrypt)
+  boundary at open. The producer (which must learn the CEK once to encrypt content) publishes a hiding+binding
+  commitment `dkg_cek_binding`; at open the boundary re-derives it from its quorum, so an INCONSISTENT dealer (whose
+  shares make quorum-subsets disagree) is CAUGHT. Audited PC2 first: PC2 has NO DKG — a Lit key is generated inside
+  Lit's network with the dealer set, threshold, and policy opaque + immutable (the app never participates and cannot
+  verify it), and Chipotle abandoned t-of-n for a single master PKP minted in one TEE (`chipotle-client.ts:1290`). The
+  runtime OWNS verifiable distributed generation: no single point holds the key, not even at birth. (1) PRIMITIVE
+  (ddrm-envelope 35→36): `dkg_sum_subshares` (the member's GF(256) XOR-sum combine) + `dkg_cek_binding` (the published
+  commitment) + `dkg_aad`/`dkg_subshare_aad` (operator + dealer→target bindings); the dealer polynomial reuses
+  `reshare_eval` (constant = a fresh contribution) + a golden 2-of-3 (born-distributed, any-two-reconstruct, binding
+  verifies/rejects, fail-closed edges). (2) BOUNDARY (decrypt-provider): `decrypt_from_carrier_quorum_k` opens a
+  DKG-born quorum (the shares are member shares of `F`, byte-identical in shape) + matches the binding (real-ML-DSA
+  2-of-3 test, one share fails closed). (3) NODE (dkms-authority 19→20): `dkg_contribute` (a DEALER seals
+  `dealer_x ‖ f_i(x_j)` to each member, coefficients master-derived + ceremony-bound) + `dkg_install` (a MEMBER
+  authenticates each sub-share against its dealer→target binding, SUMS, re-escrows `x_j ‖ F(x_j)` to itself),
+  operator-authorized, with a full live-protocol node test. (4) RUNTIME + GATES 49–51 (`dkms_dkg_gates`, THREE real
+  daemons): (49) a fresh 2-of-3 CEK BORN distributed → any two reconstruct the SAME CEK, it matches the binding, no
+  single share equals it; (50) VERIFIABLE — a tampered sub-share refused at install + the dealer NAMED, and the set
+  SURVIVES a dead daemon; (51) generation is OPERATOR-BOUND, the node-set id DISTINCT, and the DKG-born shares COMPOSE
+  with the re-share primitives (re-shared in-boundary, the same CEK preserved). Gate: ladder INTACT (ddrm-envelope=36,
+  dkms-authority=20, decrypt-provider rail rungs +1), drift PASS, ALL dDRM smokes green (the 2-of-3 quorum smoke now
+  driving gates 38–51), clippy clean.
 - **Status (Day 121–125):** the QUORUM is RECONFIGURABLE — a LIVE 2-of-3 set is RE-SHARED into a 3-of-5 set across REAL
   daemons, so the THRESHOLD and the MEMBERSHIP both change while the CEK never reassembles, with no re-publish. Day
   113–116 made the threshold a real QUORUM; Day 117–120 gave it a rotation lifecycle at the SAME (t,n); this unit lets

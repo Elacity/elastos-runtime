@@ -247,7 +247,60 @@ enum Request {
         /// The sub-shares this node received from an OLD quorum (≥ the old threshold, distinct).
         contributions: Vec<ReshareContribution>,
     },
+    /// DISTRIBUTED KEY GENERATION — CONTRIBUTE (Day 126–130): THIS node is a DEALER in a fresh t-of-m
+    /// ceremony. It opens an operator authorization bound to `dkg_aad(kid, dkg_id, node_set, t, m)`,
+    /// draws a FRESH degree-(t−1) polynomial `f_i` whose CONSTANT term `c_i = f_i(0)` is a private,
+    /// master-derived, ceremony-bound contribution (so the CEK `⊕_i c_i` is born distributed — this
+    /// node knows ONLY its own addend), evaluates `f_i` at every member coordinate, and returns the
+    /// sub-share `f_i(x_j)` SEALED to each member `j` (signed by this node, AEAD-bound to the
+    /// dealer→target pair). The CEK is assembled NOWHERE. PC2 has no analogue (a Lit key is generated
+    /// inside the Lit network with the dealer set, threshold, and policy opaque and immutable).
+    DkgContribute {
+        operator_auth_b64: String,
+        dkg_id_b64: String,
+        node_set_id_b64: String,
+        t: u8,
+        m: u8,
+        /// THIS dealer's coordinate `x_i` in the node-set (`1..=m`) — tags its sub-shares.
+        dealer_x: u8,
+        kid_hex: String,
+        /// The agreed CEK byte length (every dealer draws a polynomial of this length so the summed
+        /// shares — and the reconstructed `F(0)` — are exactly this many bytes).
+        cek_len: u32,
+        /// The m member escrow recipient public keys, in coordinate order (`x = 1..=m`).
+        member_recipient_pubs_b64: Vec<String>,
+    },
+    /// DISTRIBUTED KEY GENERATION — INSTALL (Day 126–130): THIS node is a MEMBER assembling its share
+    /// of the DKG-born key. It opens the same operator authorization (sealed to ITS recipient),
+    /// unwraps the sub-shares every dealer routed it (each verified under its dealer's identity, bound
+    /// to the dealer→THIS pair — a tampered/forged/redirected sub-share is refused and the dealer
+    /// NAMED), SUMS them over GF(256) into its final share `F(x_j) = ⊕_i f_i(x_j)`, and RE-ESCROWS its
+    /// indexed share `x_j ‖ F(x_j)` to ITSELF (the share the t-of-m boundary later opens). The CEK
+    /// never exists here — a single member share is one point of `F` and reveals nothing of `F(0)`.
+    DkgInstall {
+        operator_auth_b64: String,
+        dkg_id_b64: String,
+        node_set_id_b64: String,
+        t: u8,
+        m: u8,
+        /// This member's coordinate `x_j` in the node-set (`1..=m`).
+        target_x: u8,
+        kid_hex: String,
+        scheme: String,
+        /// The sub-shares this member received from the dealers (one per dealer, distinct dealers).
+        contributions: Vec<DkgContribution>,
+    },
     Shutdown,
+}
+
+/// One sub-share a DEALER routed to a MEMBER during a DKG ceremony: the dealer's coordinate `x_i`
+/// (only used to authenticate + dedupe — DKG members SUM, they do not Lagrange-weight), its verifying
+/// key, and the sealed `dealer_x ‖ f_i(x_j)` payload.
+#[derive(Debug, Deserialize)]
+struct DkgContribution {
+    dealer_x: u8,
+    dealer_vk_b64: String,
+    sealed_subshare_b64: String,
 }
 
 /// One sub-share an OLD quorum member routed to a NEW node during reconfiguration: the
@@ -308,6 +361,13 @@ struct NodeAuthority {
     /// unpredictable to any adversary, and deterministic so a re-driven contribution is stable. Kept
     /// out of the envelope crate (the RNG/PRF-input policy) and domain-separated from every key seed.
     reshare_seed: [u8; 32],
+    /// Master-derived seed for this node's DKG dealer polynomials (Day 126–130). When this node acts
+    /// as a dealer in a key-generation ceremony it draws its FRESH degree-(t−1) polynomial — the
+    /// private contribution `c_i = f_i(0)` AND the higher coefficients — by expanding this seed over
+    /// the ceremony id. Secret (master-derived, never published), unpredictable to any adversary, and
+    /// deterministic so a re-driven contribution is byte-stable. Domain-separated from `reshare_seed`
+    /// and every key seed (a re-share delta and a DKG contribution can never collide).
+    dkg_seed: [u8; 32],
 }
 
 impl NodeAuthority {
@@ -323,6 +383,7 @@ impl NodeAuthority {
         let (channel_secret, channel_public) =
             ddrm_envelope::mint_session_from_seed(channel_seed);
         let reshare_seed = ddrm_envelope::derive_seed(master, b"key-authority/reshare/v1");
+        let dkg_seed = ddrm_envelope::derive_seed(master, b"key-authority/dkg/v1");
         Self {
             signer,
             verifying_key,
@@ -331,6 +392,7 @@ impl NodeAuthority {
             channel_secret,
             channel_public: ddrm_envelope::session_public_bytes(&channel_public),
             reshare_seed,
+            dkg_seed,
         }
     }
 
@@ -351,6 +413,32 @@ impl NodeAuthority {
                     let mut blk_info = info.clone();
                     blk_info.extend_from_slice(&block.to_be_bytes());
                     out.extend_from_slice(&ddrm_envelope::derive_seed(&self.reshare_seed, &blk_info));
+                    block += 1;
+                }
+                out.truncate(len);
+                out
+            })
+            .collect()
+    }
+
+    /// Expand the master-derived [`Self::dkg_seed`] into THIS dealer's fresh degree-(t−1) polynomial
+    /// for a ceremony: `t` coefficient vectors of `len` bytes each (index 0 = the private constant
+    /// term `c_i = f_i(0)`, indices 1..t-1 = the higher coefficients), bound to `dkg_id` and the
+    /// coefficient index. Domain-separated counter expansion over `derive_seed` (no RNG,
+    /// deterministic, so a re-driven contribution reproduces the SAME sub-shares). Each vector is
+    /// independent of the others, of the re-sharing coefficients, and of every key seed.
+    fn dkg_polynomial(&self, dkg_id: &[u8], t: usize, len: usize) -> Vec<Vec<u8>> {
+        (0..t)
+            .map(|d| {
+                let mut info = b"dkg/coeff/v1".to_vec();
+                info.extend_from_slice(dkg_id);
+                info.extend_from_slice(&(d as u32).to_be_bytes());
+                let mut out = Vec::with_capacity(len);
+                let mut block = 0u32;
+                while out.len() < len {
+                    let mut blk_info = info.clone();
+                    blk_info.extend_from_slice(&block.to_be_bytes());
+                    out.extend_from_slice(&ddrm_envelope::derive_seed(&self.dkg_seed, &blk_info));
                     block += 1;
                 }
                 out.truncate(len);
@@ -520,6 +608,48 @@ impl DkmsAuthorityNode {
                 kid_hex,
                 contributions,
             }),
+            Request::DkgContribute {
+                operator_auth_b64,
+                dkg_id_b64,
+                node_set_id_b64,
+                t,
+                m,
+                dealer_x,
+                kid_hex,
+                cek_len,
+                member_recipient_pubs_b64,
+            } => self.dkg_contribute(DkgContributeArgs {
+                operator_auth_b64,
+                dkg_id_b64,
+                node_set_id_b64,
+                t,
+                m,
+                dealer_x,
+                kid_hex,
+                cek_len,
+                member_recipient_pubs_b64,
+            }),
+            Request::DkgInstall {
+                operator_auth_b64,
+                dkg_id_b64,
+                node_set_id_b64,
+                t,
+                m,
+                target_x,
+                kid_hex,
+                scheme,
+                contributions,
+            } => self.dkg_install(DkgInstallArgs {
+                operator_auth_b64,
+                dkg_id_b64,
+                node_set_id_b64,
+                t,
+                m,
+                target_x,
+                kid_hex,
+                scheme,
+                contributions,
+            }),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -677,7 +807,7 @@ impl DkmsAuthorityNode {
             "provider": "dkms-authority",
             "version": PROVIDER_VERSION,
             "configured": self.authority.is_some(),
-            "supported_operations": ["status", "init", "hello", "recover", "rotate_share", "revoke_caller", "reshare_contribute", "reshare_install"],
+            "supported_operations": ["status", "init", "hello", "recover", "rotate_share", "revoke_caller", "reshare_contribute", "reshare_install", "dkg_contribute", "dkg_install"],
             // The node NEVER returns these — the master + raw CEK stay inside this boundary.
             "blocked_authority": ["raw_cek", "master_seed", "recipient_secret"],
         }))
@@ -1175,6 +1305,190 @@ impl DkmsAuthorityNode {
         }))
     }
 
+    /// DISTRIBUTED KEY GENERATION — CONTRIBUTE (Day 126–130). THIS node is a DEALER in a fresh t-of-m
+    /// ceremony. Authorization is the OPERATOR SEAL (sealed to THIS node's recipient), bound to
+    /// `dkg_aad(kid, dkg_id, node_set, t, m)` — checked first. It then draws its FRESH degree-(t−1)
+    /// polynomial `f_i` (constant term `c_i` + (t−1) higher coefficients, all master-derived +
+    /// ceremony-bound via [`NodeAuthority::dkg_polynomial`]), evaluates `f_i` at each member
+    /// coordinate `x_j = 1..=m`, and seals the sub-share `dealer_x ‖ f_i(x_j)` to member `j` (signed
+    /// by this node, AEAD-bound to the dealer→target pair). The private contribution `c_i` never
+    /// leaves the node; the CEK `⊕_i c_i` is assembled nowhere.
+    fn dkg_contribute(&self, args: DkgContributeArgs) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => return Response::error("not_configured", "dkms-authority node is not initialized (send `init` first)"),
+        };
+        let operator_verifier = match self.pinned_operator_verifier() {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let kid16 = match decode_kid_bytes16(&args.kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        if args.t < 2 {
+            return Response::error("invalid_request", "DKG threshold t must be at least 2");
+        }
+        if args.dealer_x == 0 {
+            return Response::error("invalid_request", "dealer coordinate must be non-zero (x=0 is the secret position)");
+        }
+        if args.cek_len == 0 {
+            return Response::error("invalid_request", "cek_len must be non-zero");
+        }
+        if args.member_recipient_pubs_b64.len() != args.m as usize || args.m < args.t {
+            return Response::error("invalid_request", "member_recipient_pubs_b64 must list exactly m recipients with m ≥ t");
+        }
+        let dkg_id = match b64().decode(&args.dkg_id_b64) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return Response::error("invalid_request", "dkg_id_b64 must be non-empty base64"),
+        };
+        let node_set_id = match b64().decode(&args.node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "node_set_id_b64 is not valid base64"),
+        };
+        let dkg_aad = ddrm_envelope::dkg_aad(&kid16, &dkg_id, &node_set_id, args.t, args.m);
+        if let Err(resp) = self.open_operator_auth(&args.operator_auth_b64, &dkg_aad, &operator_verifier) {
+            return resp;
+        }
+        // Fresh degree-(t−1) polynomial: coeff[0] = the private contribution c_i, coeff[1..t] higher.
+        let len = args.cek_len as usize;
+        let coeffs = authority.dkg_polynomial(&dkg_id, args.t as usize, len);
+        let contribution = zeroize::Zeroizing::new(coeffs[0].clone());
+        let higher_refs: Vec<&[u8]> = coeffs[1..].iter().map(|c| c.as_slice()).collect();
+
+        let mut subshares = Vec::with_capacity(args.m as usize);
+        for (j, recipient_b64) in args.member_recipient_pubs_b64.iter().enumerate() {
+            let target_x = (j + 1) as u8;
+            let recipient_bytes = match b64().decode(recipient_b64) {
+                Ok(b) => b,
+                Err(_) => return Response::error("invalid_request", "a member recipient key is not valid base64"),
+            };
+            let recipient_public = match ddrm_envelope::session_public_from_bytes(&recipient_bytes) {
+                Some(p) => p,
+                None => return Response::error("invalid_request", "a member recipient key is not a valid escrow recipient"),
+            };
+            // f_i(x_j) = c_i ⊕ Σ_{d≥1} coeff[d]·x_j^d — reshare_eval evaluates exactly this polynomial.
+            let sub_body = match ddrm_envelope::reshare_eval(contribution.as_slice(), &higher_refs, target_x) {
+                Ok(s) => zeroize::Zeroizing::new(s),
+                Err(e) => return Response::error("invalid_request", e),
+            };
+            // The sub-share carries this DEALER's coordinate (used to authenticate + dedupe).
+            let payload = zeroize::Zeroizing::new(ddrm_envelope::indexed_share(args.dealer_x, &sub_body));
+            let aad = ddrm_envelope::dkg_subshare_aad(&kid16, &dkg_id, &node_set_id, args.dealer_x, target_x);
+            let sealed = ddrm_envelope::seal::seal_bound(&recipient_public, payload.as_slice(), &aad, &authority.signer);
+            subshares.push(json!({
+                "target_x": target_x,
+                "sealed_subshare_b64": b64().encode(sealed.to_bytes()),
+            }));
+        }
+        Response::ok(json!({
+            "dealer_x": args.dealer_x,
+            "dealer_vk_b64": b64().encode(&authority.verifying_key),
+            "subshares": subshares,
+        }))
+    }
+
+    /// DISTRIBUTED KEY GENERATION — INSTALL (Day 126–130). THIS node is a MEMBER assembling its share
+    /// of the DKG-born key. Authorization is the OPERATOR SEAL (sealed to THIS node's recipient),
+    /// bound to `dkg_aad(kid, dkg_id, node_set, t, m)` — checked first. It then unwraps each dealer's
+    /// sub-share (verified under the dealer's identity, AEAD-bound to the dealer→THIS-node pair, the
+    /// inner coordinate matching the declared dealer — a tampered/forged/redirected sub-share is
+    /// refused and the dealer NAMED), and SUMS them over GF(256) into its final share
+    /// `F(x_j) = ⊕_i f_i(x_j)` ([`ddrm_envelope::dkg_sum_subshares`]). It RE-ESCROWS its indexed share
+    /// `x_j ‖ F(x_j)` to ITSELF (signed by this node, the new escrow's producer identity the t-of-m
+    /// boundary verifies). The CEK never exists here; a single member share reveals nothing of `F(0)`.
+    fn dkg_install(&self, args: DkgInstallArgs) -> Response {
+        let authority = match self.authority.as_ref() {
+            Some(authority) => authority,
+            None => return Response::error("not_configured", "dkms-authority node is not initialized (send `init` first)"),
+        };
+        let operator_verifier = match self.pinned_operator_verifier() {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        let kid16 = match decode_kid_bytes16(&args.kid_hex) {
+            Ok(k) => k,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        if args.t < 2 || args.target_x == 0 {
+            return Response::error("invalid_request", "DKG install needs t ≥ 2 and a non-zero target coordinate");
+        }
+        // A member's share is the sum of EVERY dealer's contribution; fewer than m dealers means the
+        // CEK is missing addends. Require the full declared dealer set (m distinct dealers).
+        if args.contributions.len() != args.m as usize {
+            return Response::error("invalid_request", "DKG install needs exactly one sub-share from each of the m dealers");
+        }
+        let dkg_id = match b64().decode(&args.dkg_id_b64) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return Response::error("invalid_request", "dkg_id_b64 must be non-empty base64"),
+        };
+        let node_set_id = match b64().decode(&args.node_set_id_b64) {
+            Ok(b) => b,
+            Err(_) => return Response::error("invalid_request", "node_set_id_b64 is not valid base64"),
+        };
+        let dkg_aad = ddrm_envelope::dkg_aad(&kid16, &dkg_id, &node_set_id, args.t, args.m);
+        if let Err(resp) = self.open_operator_auth(&args.operator_auth_b64, &dkg_aad, &operator_verifier) {
+            return resp;
+        }
+        // Unwrap + authenticate each dealer's sub-share, then SUM (not Lagrange — DKG members sum the
+        // dealers' polynomials evaluated at THIS coordinate).
+        let mut seen_dealers: Vec<u8> = Vec::with_capacity(args.contributions.len());
+        let mut bodies: Vec<zeroize::Zeroizing<Vec<u8>>> = Vec::with_capacity(args.contributions.len());
+        for c in &args.contributions {
+            if c.dealer_x == 0 {
+                return Response::error("invalid_request", "a dealer coordinate is zero (the secret position is never a dealer)");
+            }
+            if seen_dealers.contains(&c.dealer_x) {
+                return Response::error("invalid_request", "duplicate dealer coordinate — a dealer cannot contribute twice");
+            }
+            let vk = match b64().decode(&c.dealer_vk_b64) {
+                Ok(b) => b,
+                Err(_) => return Response::error("invalid_request", "a dealer verifying key is not valid base64"),
+            };
+            let verifier = match ddrm_envelope::MlDsa65Verifier::from_encoded(&vk) {
+                Some(v) => v,
+                None => return Response::error("invalid_request", "a dealer verifying key is malformed"),
+            };
+            let env = match b64().decode(&c.sealed_subshare_b64).ok().and_then(|b| ddrm_envelope::PqSealedEnvelope::from_bytes(&b).ok()) {
+                Some(env) => env,
+                None => return Response::error("invalid_request", "a sealed sub-share is not a valid envelope"),
+            };
+            let aad = ddrm_envelope::dkg_subshare_aad(&kid16, &dkg_id, &node_set_id, c.dealer_x, args.target_x);
+            let payload = match ddrm_envelope::hybrid_unwrap_bound(&authority.recipient_secret, &env, &aad, &verifier) {
+                Ok(p) => p,
+                Err(_) => return Response::error("access_denied", "a DKG sub-share did not open under THIS node for its declared dealer→target pair (forged, tampered, or redirected — the dealer is named by its coordinate/key)"),
+            };
+            let (inner_x, body) = match ddrm_envelope::parse_indexed_share(&payload) {
+                Some((x, body)) => (x, body),
+                None => return Response::error("invalid_request", "a sub-share carries no valid dealer coordinate"),
+            };
+            if inner_x != c.dealer_x {
+                return Response::error("invalid_request", "a sub-share's sealed coordinate disagrees with its declared dealer");
+            }
+            seen_dealers.push(c.dealer_x);
+            bodies.push(zeroize::Zeroizing::new(body.to_vec()));
+        }
+        let body_refs: Vec<&[u8]> = bodies.iter().map(|b| b.as_slice()).collect();
+        let new_share = match ddrm_envelope::dkg_sum_subshares(&body_refs) {
+            Ok(s) => s,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        // Re-escrow `target_x ‖ F(target_x)` to THIS node under the shared escrow AAD, signed by it.
+        let indexed = zeroize::Zeroizing::new(ddrm_envelope::indexed_share(args.target_x, new_share.as_slice()));
+        let escrow_aad = ddrm_envelope::transcript::escrow_aad(&args.scheme, &kid16, &authority.recipient_public);
+        let escrow = ddrm_envelope::seal::seal_bound(
+            &ddrm_envelope::session_public_from_bytes(&authority.recipient_public).expect("node recipient is a valid escrow key"),
+            indexed.as_slice(),
+            &escrow_aad,
+            &authority.signer,
+        );
+        Response::ok(json!({
+            "target_x": args.target_x,
+            "wrapped_cek_b64": b64().encode(escrow.to_bytes()),
+            "escrow_producer_vk_b64": b64().encode(&authority.verifying_key),
+        }))
+    }
+
     /// The pinned operator verifier or a fail-closed response (shared by every lifecycle op).
     fn pinned_operator_verifier(&self) -> Result<ddrm_envelope::MlDsa65Verifier, Response> {
         let operator_vk = self.operator_vk.as_ref().ok_or_else(|| {
@@ -1235,6 +1549,30 @@ struct ReshareInstallArgs {
     scheme: String,
     kid_hex: String,
     contributions: Vec<ReshareContribution>,
+}
+
+struct DkgContributeArgs {
+    operator_auth_b64: String,
+    dkg_id_b64: String,
+    node_set_id_b64: String,
+    t: u8,
+    m: u8,
+    dealer_x: u8,
+    kid_hex: String,
+    cek_len: u32,
+    member_recipient_pubs_b64: Vec<String>,
+}
+
+struct DkgInstallArgs {
+    operator_auth_b64: String,
+    dkg_id_b64: String,
+    node_set_id_b64: String,
+    t: u8,
+    m: u8,
+    target_x: u8,
+    kid_hex: String,
+    scheme: String,
+    contributions: Vec<DkgContribution>,
 }
 
 #[derive(Clone)]
@@ -1722,6 +2060,8 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     | Request::RevokeCaller { .. }
                     | Request::ReshareContribute { .. }
                     | Request::ReshareInstall { .. }
+                    | Request::DkgContribute { .. }
+                    | Request::DkgInstall { .. }
             )
         {
             let resp = Response::error(
@@ -2870,6 +3210,165 @@ mod tests {
             contributions: install_contributions(0),
         });
         assert_eq!(error_code(&redirected), "access_denied", "a redirected sub-share is refused");
+
+        for store in &stores {
+            let _ = std::fs::remove_file(store);
+        }
+    }
+
+    /// DISTRIBUTED KEY GENERATION across REAL nodes (Day 126–130): a 2-of-3 CEK is BORN distributed —
+    /// three nodes each act as a DEALER (`dkg_contribute`) routing sub-shares to all three members,
+    /// each node then INSTALLS its share (`dkg_install`, summing the dealers' sub-shares). Any TWO
+    /// installed shares reconstruct the SAME CEK; the CEK is assembled nowhere (each dealer knows only
+    /// its own contribution); a tampered/redirected sub-share is refused and the dealer named; and a
+    /// non-operator authorization is refused.
+    #[test]
+    fn dkg_2of3_across_real_nodes_is_born_distributed_and_reconstructs() {
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let kid16 = [0xD7u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let (operator, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Fu8; 32]);
+        let (t, m) = (2u8, 3u8);
+        let cek_len = 16u32;
+        let dkg_id = [0x33u8; 16];
+        let dkg_id_b64 = b64().encode(dkg_id);
+
+        // Provision 3 nodes (fresh masters → distinct identities); each is both a dealer and a member.
+        let mut stores: Vec<String> = Vec::new();
+        let mut nodes: Vec<DkmsAuthorityNode> = Vec::new();
+        let mut vk: Vec<String> = Vec::new();
+        let mut recipient: Vec<String> = Vec::new();
+        for i in 0..m as usize {
+            let store = unique_store(&format!("dkg-{i}"));
+            let mut node = DkmsAuthorityNode::default();
+            let init = ok_data(node.init(json!({ "authority_key_store": store })));
+            node.operator_vk = Some(operator_vk.clone());
+            vk.push(init["seal_verifying_key_b64"].as_str().unwrap().to_string());
+            recipient.push(init["seal_recipient_pub_b64"].as_str().unwrap().to_string());
+            nodes.push(node);
+            stores.push(store);
+        }
+
+        let vk_bytes: Vec<Vec<u8>> = vk.iter().map(|v| b64().decode(v).unwrap()).collect();
+        let refs: Vec<&[u8]> = vk_bytes.iter().map(|v| v.as_slice()).collect();
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(t, &refs);
+        let node_set_b64 = b64().encode(node_set_id);
+        let dkg_aad = ddrm_envelope::dkg_aad(&kid16, &dkg_id, &node_set_id, t, m);
+        let seal_auth_with = |recipient_b64: &str, signer: &ddrm_envelope::seal::MlDsaSealSigner| -> String {
+            let bytes = b64().decode(recipient_b64).unwrap();
+            let public = ddrm_envelope::session_public_from_bytes(&bytes).unwrap();
+            b64().encode(ddrm_envelope::seal::seal_bound(&public, b"dkg", &dkg_aad, signer).to_bytes())
+        };
+
+        // CONTRIBUTE: each node deals to all three members; collect each sub-share by target member.
+        let mut by_target: Vec<Vec<(u8, String, String)>> = vec![Vec::new(); m as usize];
+        for di in 0..m as usize {
+            let data = ok_data(nodes[di].dkg_contribute(DkgContributeArgs {
+                operator_auth_b64: seal_auth_with(&recipient[di], &operator),
+                dkg_id_b64: dkg_id_b64.clone(),
+                node_set_id_b64: node_set_b64.clone(),
+                t,
+                m,
+                dealer_x: (di + 1) as u8,
+                kid_hex: kid_hex.clone(),
+                cek_len,
+                member_recipient_pubs_b64: recipient.clone(),
+            }));
+            let dx = data["dealer_x"].as_u64().unwrap() as u8;
+            assert_eq!(dx, (di + 1) as u8, "dealer reports its own coordinate");
+            let dvk = data["dealer_vk_b64"].as_str().unwrap().to_string();
+            for sub in data["subshares"].as_array().unwrap() {
+                let tx = sub["target_x"].as_u64().unwrap() as usize;
+                by_target[tx - 1].push((dx, dvk.clone(), sub["sealed_subshare_b64"].as_str().unwrap().to_string()));
+            }
+        }
+
+        let install_contributions = |j: usize| -> Vec<DkgContribution> {
+            by_target[j]
+                .iter()
+                .map(|(dx, dvk, sealed)| DkgContribution {
+                    dealer_x: *dx,
+                    dealer_vk_b64: dvk.clone(),
+                    sealed_subshare_b64: sealed.clone(),
+                })
+                .collect()
+        };
+
+        // INSTALL: each member sums the three sub-shares routed to it into its final share.
+        let mut escrow: Vec<String> = Vec::new();
+        for j in 0..m as usize {
+            let data = ok_data(nodes[j].dkg_install(DkgInstallArgs {
+                operator_auth_b64: seal_auth_with(&recipient[j], &operator),
+                dkg_id_b64: dkg_id_b64.clone(),
+                node_set_id_b64: node_set_b64.clone(),
+                t,
+                m,
+                target_x: (j + 1) as u8,
+                kid_hex: kid_hex.clone(),
+                scheme: scheme.to_string(),
+                contributions: install_contributions(j),
+            }));
+            assert_eq!(data["escrow_producer_vk_b64"].as_str().unwrap(), vk[j], "DKG escrow names the member");
+            escrow.push(data["wrapped_cek_b64"].as_str().unwrap().to_string());
+        }
+
+        // Recover each member's INDEXED share in its OWN boundary (the path the t-of-m open uses).
+        let share = |j: usize| -> (u8, Vec<u8>) {
+            let wrapped = b64().decode(&escrow[j]).unwrap();
+            let vkj = b64().decode(&vk[j]).unwrap();
+            let payload = nodes[j]
+                .authority
+                .as_ref()
+                .unwrap()
+                .recover_escrowed_cek(&wrapped, scheme, &kid16, &vkj)
+                .expect("the member recovers its own DKG share");
+            let (x, body) = ddrm_envelope::parse_indexed_share(&payload).unwrap();
+            assert_eq!(x, (j + 1) as u8, "the DKG share is indexed by the member's coordinate");
+            (x, body.to_vec())
+        };
+
+        // ANY TWO of the three reconstruct the SAME CEK; one share is below quorum.
+        let s1 = share(0);
+        let s2 = share(1);
+        let s3 = share(2);
+        let cek12 = ddrm_envelope::lagrange_combine_at_zero(&[(s1.0, &s1.1), (s2.0, &s2.1)]).unwrap().to_vec();
+        let cek13 = ddrm_envelope::lagrange_combine_at_zero(&[(s1.0, &s1.1), (s3.0, &s3.1)]).unwrap().to_vec();
+        let cek23 = ddrm_envelope::lagrange_combine_at_zero(&[(s2.0, &s2.1), (s3.0, &s3.1)]).unwrap().to_vec();
+        assert_eq!(cek12, cek13, "distinct quorums reconstruct the SAME DKG-born CEK (dealers are consistent)");
+        assert_eq!(cek12, cek23, "distinct quorums reconstruct the SAME DKG-born CEK (dealers are consistent)");
+        assert_eq!(cek12.len(), cek_len as usize, "the DKG-born CEK is the agreed length");
+        // BORN DISTRIBUTED: no single installed share equals the CEK.
+        assert_ne!(s1.1, cek12, "a single DKG member share is not the CEK");
+
+        // FAIL-CLOSED: a NON-operator authorization is refused.
+        let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+        let bad = nodes[0].dkg_install(DkgInstallArgs {
+            operator_auth_b64: seal_auth_with(&recipient[0], &impostor),
+            dkg_id_b64: dkg_id_b64.clone(),
+            node_set_id_b64: node_set_b64.clone(),
+            t,
+            m,
+            target_x: 1,
+            kid_hex: kid_hex.clone(),
+            scheme: scheme.to_string(),
+            contributions: install_contributions(0),
+        });
+        assert_eq!(error_code(&bad), "access_denied", "a non-operator DKG install is refused");
+
+        // FAIL-CLOSED: a sub-share routed to member 1 (target_x=1) installed at member 2 (target_x=2)
+        // is refused — bound to its (dealer → target) pair AND its recipient; the dealer is named.
+        let redirected = nodes[1].dkg_install(DkgInstallArgs {
+            operator_auth_b64: seal_auth_with(&recipient[1], &operator),
+            dkg_id_b64: dkg_id_b64.clone(),
+            node_set_id_b64: node_set_b64.clone(),
+            t,
+            m,
+            target_x: 2,
+            kid_hex: kid_hex.clone(),
+            scheme: scheme.to_string(),
+            contributions: install_contributions(0),
+        });
+        assert_eq!(error_code(&redirected), "access_denied", "a redirected DKG sub-share is refused");
 
         for store in &stores {
             let _ = std::fs::remove_file(store);

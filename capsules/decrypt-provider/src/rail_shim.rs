@@ -905,4 +905,84 @@ mod tests {
             "a share whose x-coordinate doesn't match its signing identity is refused"
         );
     }
+
+    /// The boundary opens a DKG-BORN quorum (Day 126–130): the shares are member shares of a
+    /// distributively-generated key `F = ⊕_i f_i` (each dealer's degree-1 polynomial summed), so the
+    /// CEK `F(0) = ⊕_i f_i(0)` was assembled NOWHERE during generation. The boundary reconstructs it
+    /// transiently from a quorum, decrypts, AND the reconstructed CEK matches the published DKG CEK
+    /// BINDING (a wrong CEK would fail the binding — the signature of an inconsistent dealer).
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn boundary_opens_a_dkg_born_quorum_and_matches_the_cek_binding() {
+        use crate::pq_envelope::mldsa::MlDsa65Verifier;
+        use crate::pq_envelope::seal_support::{mldsa_seal_keypair, seal_bound};
+
+        let (secret, public) = gen_session();
+        let iv8 = [0x22u8; 8];
+        let plaintext = b"dkg-born-key-opens";
+        let aad = b"dkg-escrow-aad/v1";
+
+        // Three dealers, each a degree-1 polynomial f_i(x) = c_i ⊕ a_i·x. The CEK is the XOR of the
+        // three private contributions c_i — never assembled during the (simulated) ceremony.
+        let contrib: [[u8; 16]; 3] = [[0x11u8; 16], [0x0Fu8; 16], [0xA1u8; 16]];
+        let higher: [[u8; 16]; 3] = [[0x9Au8; 16], [0x33u8; 16], [0x1Cu8; 16]];
+        let mut cek = [0u8; 16];
+        for c in &contrib {
+            for (a, &b) in cek.iter_mut().zip(c.iter()) {
+                *a ^= b;
+            }
+        }
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+
+        // Each member j (x = 1..=3) sums the dealers' sub-shares f_i(x_j) into its share F(x_j).
+        let mut signers = Vec::new();
+        let mut verifiers: Vec<MlDsa65Verifier> = Vec::new();
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        for j in 0..3u8 {
+            let x = j + 1;
+            let subs: Vec<Vec<u8>> = (0..3usize)
+                .map(|i| {
+                    let hi: [&[u8]; 1] = [&higher[i]];
+                    ddrm_envelope::reshare_eval(&contrib[i], &hi, x).expect("dealer eval")
+                })
+                .collect();
+            let sub_refs: Vec<&[u8]> = subs.iter().map(|s| s.as_slice()).collect();
+            let share = ddrm_envelope::dkg_sum_subshares(&sub_refs).expect("dkg sum");
+            let payload = ddrm_envelope::indexed_share(x, &share);
+            let (signer, vk) = mldsa_seal_keypair([x; 32]);
+            sealed.push(seal_bound(&public, &payload, aad, &signer).to_bytes());
+            verifiers.push(MlDsa65Verifier::from_encoded(&vk).expect("vk decodes"));
+            signers.push(signer);
+        }
+        let session = SessionSecret::PqHybrid(secret);
+
+        // ANY TWO of the three DKG-born shares open the quorum and decrypt.
+        let pick = [sealed[0].as_slice(), sealed[2].as_slice()];
+        let (out, meta) =
+            decrypt_from_carrier_quorum_k(&session, 2, &pick, aad, &verifiers, &segment, None)
+                .expect("any 2-of-3 DKG-born shares open the quorum");
+        let off = segment.len() - plaintext.len();
+        assert_eq!(&out[off..], plaintext, "the DKG-born quorum decrypts the content");
+        assert_eq!(meta["is_protected"], serde_json::json!(true));
+
+        // The DKG CEK BINDING verifies for the reconstructed CEK (and rejects a wrong one).
+        let dkg_id = [0x33u8; 16];
+        let node_set = ddrm_envelope::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let binding = ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &cek);
+        assert_eq!(
+            binding,
+            ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &cek),
+            "the binding verifies for the DKG-born CEK"
+        );
+        let mut wrong = cek;
+        wrong[0] ^= 0x01;
+        assert_ne!(binding, ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &wrong), "binding rejects a wrong CEK");
+
+        // BELOW quorum: one DKG-born share fails closed.
+        let one = [sealed[1].as_slice()];
+        assert!(
+            decrypt_from_carrier_quorum_k(&session, 2, &one, aad, &verifiers, &segment, None).is_err(),
+            "one DKG-born share is below the 2-of-3 quorum"
+        );
+    }
 }
