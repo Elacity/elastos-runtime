@@ -217,6 +217,12 @@ balanced dag-pb **tree** above ~174 leaves (the only fail-closed content-plane g
 multi-segment on the **threshold/quorum** rails (single-node multi-segment is live; the quorum rail
 is single-segment by design today).
 
+**Operator runbook:** [`RUN_E2E.md`](./RUN_E2E.md) walks a fresh operator zero → provision dKMS
+node(s) → publish an owned multi-segment asset → open it through the live rail, with the exact
+**verified** commands (`ddrm-consumer-smoke.sh`, `ddrm-producer-smoke.sh`, the dkms/threshold/quorum/tcp
+variants, `--deny-ownership`, and the real Base-mainnet wallet check), the trust boundary at each seam,
+and a one-table "this is what replaces Lit" mapping.
+
 ---
 
 ## 3. Architecture map — current state
