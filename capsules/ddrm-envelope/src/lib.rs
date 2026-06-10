@@ -925,6 +925,214 @@ pub fn verify_recover_proof(
     )
 }
 
+/// Domain label for a QUORUM RELEASE ATTESTATION (Day 131–135): every secret-holder that serves a
+/// threshold open CO-SIGNS a portable proof that *it* authorized *this* content for *this* principal
+/// under *this* decrypt session. The boundary aggregates the t co-signatures into a
+/// [`QuorumReleaseProofV1`]-style bundle that a THIRD PARTY can verify OFFLINE — no runtime, no
+/// secrets, no live node — to confirm WHICH node-set served the open, that a real quorum (≥ t
+/// DISTINCT members) signed, that it is bound to that exact principal+content+session, and that it
+/// has not expired. Today an open persists a CEK-free record the runtime writes ABOUT ITSELF; a
+/// relying party still has to trust the runtime authored it faithfully. This closes that gap: the
+/// evidence is signed by the secret-holders THEMSELVES, so its authenticity does not depend on the
+/// runtime. Domain-separated from the hello/session/recover/seal labels so a release attestation can
+/// never be replayed as any of them (or vice-versa). (PC2 has no analogue: its open emits no
+/// portable, independently-verifiable proof of WHICH nodes served it — the Lit network is opaque.)
+/// Defined ONCE here so every node + every verifier compute byte-identical preimages.
+pub const DKMS_RELEASE_ATTEST_DOMAIN: &[u8] = b"elastos.dkms.authority/release-attestation/v1";
+
+/// Canonical signed preimage of a single node's release attestation:
+/// `DKMS_RELEASE_ATTEST_DOMAIN ‖ lp(content_id) ‖ lp(principal_id) ‖ lp(right) ‖ lp(node_set_id) ‖
+/// lp(decrypt_session_pub) ‖ lp(kid16) ‖ lp(expiry_le)`. Every field is bound: the grant
+/// (`content_id`, `principal_id`, `right`), the node-set the signer claims membership of
+/// (`node_set_id`), the per-open freshness (`decrypt_session_pub` — a fresh ephemeral key per open,
+/// so a captured attestation cannot be replayed against a DIFFERENT open), the key id (`kid16`), and
+/// the `expiry`. ALL quorum members sign byte-identical preimages, which is what lets the boundary
+/// aggregate their signatures into one portable proof.
+pub fn release_attestation_message(
+    content_id: &[u8],
+    principal_id: &[u8],
+    right: &[u8],
+    node_set_id: &[u8],
+    decrypt_session_pub: &[u8],
+    kid_bytes16: &[u8; 16],
+    expiry: u64,
+) -> Vec<u8> {
+    lp_concat(
+        DKMS_RELEASE_ATTEST_DOMAIN,
+        &[
+            content_id,
+            principal_id,
+            right,
+            node_set_id,
+            decrypt_session_pub,
+            kid_bytes16,
+            &expiry.to_le_bytes(),
+        ],
+    )
+}
+
+/// The NODE side: co-sign a release attestation for THIS open with the node's master-derived signing
+/// key (the same identity behind the vk pinned in the descriptor). Returns the detached signature
+/// the boundary collects from every releasing member.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_release_attestation(
+    signer: &impl seal::CekSealSigner,
+    content_id: &[u8],
+    principal_id: &[u8],
+    right: &[u8],
+    node_set_id: &[u8],
+    decrypt_session_pub: &[u8],
+    kid_bytes16: &[u8; 16],
+    expiry: u64,
+) -> Vec<u8> {
+    signer.sign(&release_attestation_message(
+        content_id,
+        principal_id,
+        right,
+        node_set_id,
+        decrypt_session_pub,
+        kid_bytes16,
+        expiry,
+    ))
+}
+
+/// Verify ONE node's release attestation under its verifying key. `true` only when `sig` is a valid
+/// ML-DSA-65 signature over the EXACT binding — a forged signature, a tampered grant/session/expiry,
+/// or a signature from the wrong key all return `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_release_attestation(
+    verifier: &impl CekSealVerifier,
+    content_id: &[u8],
+    principal_id: &[u8],
+    right: &[u8],
+    node_set_id: &[u8],
+    decrypt_session_pub: &[u8],
+    kid_bytes16: &[u8; 16],
+    expiry: u64,
+    sig: &[u8],
+) -> bool {
+    verifier.verify(
+        &release_attestation_message(
+            content_id,
+            principal_id,
+            right,
+            node_set_id,
+            decrypt_session_pub,
+            kid_bytes16,
+            expiry,
+        ),
+        sig,
+    )
+}
+
+/// Why a [`verify_quorum_release_proof`] check failed — every variant FAILS CLOSED and, where an
+/// individual member is at fault, NAMES it by its index in the ordered member list so a relying
+/// party can attribute the bad attestation to a specific node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuorumProofError {
+    /// The proof carries no member vks — nothing to verify against.
+    EmptyMembers,
+    /// The `node_set_id` the proof claims does not equal the id RECOMPUTED from `(t, members)` — the
+    /// proof is lying about WHICH node-set it represents (or the member list was tampered).
+    NodeSetMismatch,
+    /// A signature references a member index outside the member list, or a member vk is malformed.
+    MalformedMember { member_index: usize },
+    /// The same member index signed twice — a quorum requires t DISTINCT members; a duplicate cannot
+    /// pad the count.
+    DuplicateSigner { member_index: usize },
+    /// A member's signature does not verify over the bound grant/session/expiry — that member did not
+    /// authorize THIS open (forged, redirected, or bound to different fields). Names the member.
+    BadSignature { member_index: usize },
+    /// Fewer than `t` DISTINCT members produced valid signatures — not a real quorum.
+    BelowQuorum { have: usize, need: usize },
+    /// `now` is past the attested `expiry` — the proof has aged out.
+    Expired,
+}
+
+/// The STANDALONE, OFFLINE verifier for an aggregated quorum release proof (Day 131–135) — the heart
+/// of "the quorum PROVES it served you". Given the proof's `(t, members, node_set_id)`, the grant +
+/// session + expiry the relying party EXPECTS, the current time, and the collected
+/// `(member_index, signature)` pairs, it confirms, with NO runtime and NO secrets:
+///
+/// 1. the proof represents a real, NAMED node-set — `node_set_id` must equal
+///    `threshold_node_set_id_n(t, members)`, so a proof cannot claim a set it isn't (and after a
+///    reconfiguration a proof names the CURRENT set, since its members + t recompute the live id);
+/// 2. at least `t` DISTINCT members signed — duplicates are refused, so an under-quorum bundle (or a
+///    single node replaying its own signature t times) is rejected;
+/// 3. EVERY counted signature verifies over the binding the relying party expects — so a proof minted
+///    for principal A / content X / session S does NOT verify when checked for a different principal,
+///    content, or session (the signatures were never over those bytes), and a forged member
+///    signature is rejected AND that member is named;
+/// 4. the proof has not expired (`now <= expiry`).
+///
+/// Returns the count of valid DISTINCT signers on success. Note the binding is supplied by the
+/// CALLER, not read from the proof's self-description: the verifier confirms the quorum signed
+/// EXACTLY the grant/session the relying party cares about, which is what makes "wrong-principal" and
+/// "replayed-against-another-open" attempts fail closed.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_quorum_release_proof(
+    t: u8,
+    members: &[&[u8]],
+    node_set_id: &[u8],
+    content_id: &[u8],
+    principal_id: &[u8],
+    right: &[u8],
+    decrypt_session_pub: &[u8],
+    kid_bytes16: &[u8; 16],
+    expiry: u64,
+    now: u64,
+    signatures: &[(usize, &[u8])],
+) -> Result<usize, QuorumProofError> {
+    if members.is_empty() {
+        return Err(QuorumProofError::EmptyMembers);
+    }
+    // (1) The proof must NAME the node-set it represents: recompute the id from the ordered members +
+    // threshold and refuse any mismatch BEFORE trusting a single signature.
+    let recomputed = threshold_node_set_id_n(t, members);
+    if recomputed.as_slice() != node_set_id {
+        return Err(QuorumProofError::NodeSetMismatch);
+    }
+    // (4) Expiry is a cheap, signer-independent gate — check it before signature work.
+    if now > expiry {
+        return Err(QuorumProofError::Expired);
+    }
+    // (2)+(3) Count DISTINCT members whose signature verifies over the EXPECTED binding.
+    let mut seen: Vec<usize> = Vec::with_capacity(signatures.len());
+    let mut valid = 0usize;
+    for (idx, sig) in signatures {
+        let idx = *idx;
+        if idx >= members.len() {
+            return Err(QuorumProofError::MalformedMember { member_index: idx });
+        }
+        if seen.contains(&idx) {
+            return Err(QuorumProofError::DuplicateSigner { member_index: idx });
+        }
+        seen.push(idx);
+        let verifier = match MlDsa65Verifier::from_encoded(members[idx]) {
+            Some(v) => v,
+            None => return Err(QuorumProofError::MalformedMember { member_index: idx }),
+        };
+        if !verify_release_attestation(
+            &verifier,
+            content_id,
+            principal_id,
+            right,
+            node_set_id,
+            decrypt_session_pub,
+            kid_bytes16,
+            expiry,
+            sig,
+        ) {
+            return Err(QuorumProofError::BadSignature { member_index: idx });
+        }
+        valid += 1;
+    }
+    if valid < t as usize {
+        return Err(QuorumProofError::BelowQuorum { have: valid, need: t as usize });
+    }
+    Ok(valid)
+}
+
 /// Domain label for the dKMS ENCRYPTED-CHANNEL key attestation (Day 105–108). When the node is
 /// reached over a NETWORK transport (TCP), the client and node establish an app-layer encrypted,
 /// mutually-authenticated channel: at `hello` the node publishes a master-derived CHANNEL KEM key
@@ -2291,6 +2499,125 @@ mod tests {
         let short: &[u8] = &[0u8; 4];
         let long: &[u8] = &[0u8; 8];
         assert!(crate::dkg_sum_subshares(&[short, long]).is_err(), "length mismatch is refused");
+    }
+
+    /// Day 131–135 — a genuine t-of-n quorum's co-signed release attestations aggregate into a proof
+    /// that verifies OFFLINE, names WHICH node-set served the open, and fails closed for every forgery
+    /// (under-quorum, wrong-principal, expired, duplicate-padding, forged member, wrong node-set).
+    #[test]
+    fn quorum_release_proof_verifies_offline_and_fails_closed() {
+        // A 2-of-3 node-set: three secret-holders, each with its own master-derived seal keypair.
+        let (s0, vk0) = mldsa_seal_keypair([0xA0u8; 32]);
+        let (s1, vk1) = mldsa_seal_keypair([0xB1u8; 32]);
+        let (_s2, vk2) = mldsa_seal_keypair([0xC2u8; 32]);
+        let members: Vec<&[u8]> = vec![&vk0, &vk1, &vk2];
+        let t = 2u8;
+        let node_set_id = threshold_node_set_id_n(t, &members);
+
+        // The grant + per-open session + expiry every releasing member co-signs.
+        let content_id = b"content:matrix-4k".as_slice();
+        let principal_id = b"principal:alice".as_slice();
+        let right = b"play".as_slice();
+        let kid = [0x5Au8; 16];
+        let session_pub = [0x77u8; 32]; // a fresh decrypt-session ephemeral pubkey (freshness)
+        let expiry = 2_000u64;
+        let now = 1_000u64;
+
+        let sign = |signer: &MlDsaSealSigner| {
+            sign_release_attestation(signer, content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry)
+        };
+        let sig0 = sign(&s0);
+        let sig1 = sign(&s1);
+
+        // GENUINE: members {0,1} (a real quorum) → verifies offline, returns the distinct-signer count.
+        let proof: Vec<(usize, &[u8])> = vec![(0, &sig0), (1, &sig1)];
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            Ok(2),
+            "a genuine quorum proof verifies offline"
+        );
+
+        // WRONG-PRINCIPAL: same signatures, but a relying party checking for a DIFFERENT principal —
+        // the signatures were never over those bytes, so the first counted signer is named as bad.
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, b"principal:mallory", right, &session_pub, &kid, expiry, now, &proof),
+            Err(QuorumProofError::BadSignature { member_index: 0 }),
+            "a proof bound to alice does not authorize mallory"
+        );
+        // REPLAYED AGAINST ANOTHER OPEN: a different decrypt session → the freshness binding fails.
+        let other_session = [0x88u8; 32];
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &other_session, &kid, expiry, now, &proof),
+            Err(QuorumProofError::BadSignature { member_index: 0 }),
+            "an attestation cannot be replayed against a different open"
+        );
+
+        // UNDER-QUORUM: only one valid signature → not a real quorum.
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, sig0.as_slice())]),
+            Err(QuorumProofError::BelowQuorum { have: 1, need: 2 }),
+            "one signer is below quorum"
+        );
+        // DUPLICATE PADDING: one node cannot replay its own signature to fake a quorum.
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, sig0.as_slice()), (0, sig0.as_slice())]),
+            Err(QuorumProofError::DuplicateSigner { member_index: 0 }),
+            "a duplicate signer cannot pad the count"
+        );
+        // EXPIRED: now past the attested expiry.
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, expiry + 1, &proof),
+            Err(QuorumProofError::Expired),
+            "an aged-out proof is rejected"
+        );
+        // FORGED MEMBER: an impostor signs but its key is not member[2] — naming member 2 as bad.
+        let (imp, _impvk) = mldsa_seal_keypair([0xEEu8; 32]);
+        let forged = sign(&imp);
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, &sig0), (2, &forged)]),
+            Err(QuorumProofError::BadSignature { member_index: 2 }),
+            "a forged member signature is rejected AND the member is named"
+        );
+        // WRONG NODE-SET: a proof claiming an id that does not match its (t, members) is rejected.
+        let bogus_id = [0x00u8; 32];
+        assert_eq!(
+            verify_quorum_release_proof(t, &members, &bogus_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            Err(QuorumProofError::NodeSetMismatch),
+            "a proof cannot claim a node-set it is not"
+        );
+
+        // COMPOSES WITH RECONFIGURATION: the SAME primitives over a reconfigured 3-of-5 set name the
+        // CURRENT set (members + t recompute the live id; a 2-of-3 proof would mismatch).
+        let (s3, vk3) = mldsa_seal_keypair([0xD3u8; 32]);
+        let (s4, vk4) = mldsa_seal_keypair([0xE4u8; 32]);
+        let big: Vec<&[u8]> = vec![&vk0, &vk1, &vk2, &vk3, &vk4];
+        let big_id = threshold_node_set_id_n(3, &big);
+        assert_ne!(big_id, node_set_id, "the reconfigured set has a DISTINCT id");
+        let bsign = |signer: &MlDsaSealSigner| {
+            sign_release_attestation(signer, content_id, principal_id, right, &big_id, &session_pub, &kid, expiry)
+        };
+        let b1 = bsign(&s1);
+        let b3 = bsign(&s3);
+        let b4 = bsign(&s4);
+        assert_eq!(
+            verify_quorum_release_proof(3, &big, &big_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(1, &b1), (3, &b3), (4, &b4)]),
+            Ok(3),
+            "a 3-of-5 proof on the reconfigured set verifies and names the current set"
+        );
+
+        // EMPTY: no members → nothing to verify against.
+        assert_eq!(
+            verify_quorum_release_proof(t, &[], &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            Err(QuorumProofError::EmptyMembers),
+        );
+        // The preimage is domain-separated and field-bound.
+        let msg = release_attestation_message(content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry);
+        assert!(msg.starts_with(DKMS_RELEASE_ATTEST_DOMAIN));
+        assert_ne!(
+            msg,
+            release_attestation_message(content_id, principal_id, b"download", &node_set_id, &session_pub, &kid, expiry),
+            "the right is bound"
+        );
     }
 
     /// The n-node node-set id generalization: byte-identical to the 2-node id for n=2 (no

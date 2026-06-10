@@ -176,6 +176,19 @@ enum Request {
         /// The caller's clock for the expiry check (absent → the node's own wall clock).
         #[serde(default)]
         now_unix: Option<u64>,
+        /// QUORUM RELEASE ATTESTATION (Day 131–135): the node-set id this open is served by, base64.
+        /// When present (with `attest_expiry`), the node CO-SIGNS a release attestation binding
+        /// `(content_id, principal_id, right, node_set_id, decrypt_session_pub, kid, expiry)` and
+        /// returns it as `release_attestation_b64`; the boundary aggregates the t co-signatures into
+        /// a portable, offline-verifiable `QuorumReleaseProofV1`. Absent → no attestation (a single
+        /// node-set open needs no quorum proof). The node binds the id it is HANDED; the offline
+        /// verifier independently recomputes it from the member vks, so a lie does not help an attacker.
+        #[serde(default)]
+        attest_node_set_id_b64: Option<String>,
+        /// The release attestation's expiry (unix seconds) — REQUIRED to co-sign. The offline verifier
+        /// rejects a proof once `now > expiry`.
+        #[serde(default)]
+        attest_expiry: Option<u64>,
     },
     /// SHARE-WISE ROTATION (Day 109–112): re-escrow THIS node's current share to a SUCCESSOR node,
     /// refreshed by an operator-sealed XOR delta — the whole CEK is NEVER reassembled anywhere
@@ -525,6 +538,8 @@ impl DkmsAuthorityNode {
                 caller_sig_b64,
                 recover_seq,
                 now_unix,
+                attest_node_set_id_b64,
+                attest_expiry,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
                 scheme,
@@ -545,6 +560,8 @@ impl DkmsAuthorityNode {
                 caller_sig_b64,
                 recover_seq,
                 now_unix,
+                attest_node_set_id_b64,
+                attest_expiry,
             }),
             Request::RotateShare {
                 wrapped_cek_b64,
@@ -924,11 +941,39 @@ impl DkmsAuthorityNode {
         if let Some(init) = args.init_segment_b64.as_ref() {
             material["init_segment_b64"] = json!(init);
         }
-        Response::ok(json!({
+        let mut ok = json!({
             "suite": ddrm_envelope::SUITE_PQ_HYBRID,
             "material": material,
             "seal_verifying_key_b64": b64().encode(&authority.verifying_key),
-        }))
+        });
+        // QUORUM RELEASE ATTESTATION (Day 131–135): when the boundary declares the node-set this open
+        // is served by + an expiry, the node CO-SIGNS a portable proof that IT authorized THIS grant
+        // for THIS principal under THIS decrypt session — signed by the secret-holder itself, so a
+        // relying party need not trust the runtime's self-authored record. The decrypt session pubkey
+        // is the per-open freshness; the binding is over the EXACT (content, principal, right,
+        // node_set, session, kid, expiry). Only emitted when both fields are present (fail-closed:
+        // missing/invalid attestation inputs simply omit the attestation rather than fabricate one).
+        if let (Some(node_set_b64), Some(expiry)) =
+            (args.attest_node_set_id_b64.as_ref(), args.attest_expiry)
+        {
+            if let Ok(node_set_id) = b64().decode(node_set_b64) {
+                if let Ok(session_pub) = b64().decode(&args.decrypt_session_pub_b64) {
+                    let sig = ddrm_envelope::sign_release_attestation(
+                        &authority.signer,
+                        args.content_id.as_bytes(),
+                        args.principal_id.as_bytes(),
+                        args.right.as_bytes(),
+                        &node_set_id,
+                        &session_pub,
+                        &kid16,
+                        expiry,
+                    );
+                    ok["release_attestation_b64"] = json!(b64().encode(&sig));
+                    ok["release_attestation_expiry"] = json!(expiry);
+                }
+            }
+        }
+        Response::ok(ok)
     }
 
     /// SHARE-WISE ROTATION (Day 109–112): unwrap THIS node's escrowed share, XOR it with the
@@ -1596,6 +1641,8 @@ struct RecoverArgs {
     caller_sig_b64: String,
     recover_seq: u64,
     now_unix: Option<u64>,
+    attest_node_set_id_b64: Option<String>,
+    attest_expiry: Option<u64>,
 }
 
 /// VERIFY the caller's session token + POSSESSION PROOF in the node's OWN boundary. First, the token
@@ -2293,6 +2340,8 @@ mod tests {
             caller_sig_b64,
             recover_seq: 1,
             now_unix: Some(NOW),
+            attest_node_set_id_b64: None,
+            attest_expiry: None,
         });
         let data = ok_data(resp);
         // The response carries SEALED material only — never a raw CEK.
@@ -2307,6 +2356,88 @@ mod tests {
         let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&node_vk).unwrap();
         let opened = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, &transcript_aad, &verifier).unwrap();
         assert_eq!(opened.as_slice(), cek.as_slice());
+
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// Day 131–135 — a real node `recover` co-signs a release attestation bound to THIS grant +
+    /// session + node-set, and the standalone offline verifier accepts it as a (1-of-1) quorum proof
+    /// while rejecting a wrong-principal check. Proves the node-side half of the portable proof.
+    #[test]
+    fn recover_co_signs_a_release_attestation_the_offline_verifier_accepts() {
+        let store = unique_store("attest");
+        let mut node = DkmsAuthorityNode::default();
+        let init = ok_data(node.init(json!({ "authority_key_store": store })));
+        let recipient_pub_b64 = init["seal_recipient_pub_b64"].as_str().unwrap().to_string();
+        let recipient_pub = b64().decode(&recipient_pub_b64).unwrap();
+        let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_pub).unwrap();
+        let node_vk = b64().decode(init["seal_verifying_key_b64"].as_str().unwrap()).unwrap();
+
+        // The node-set this open is served by (a 1-of-1 set keyed on the node's own vk).
+        let t = 1u8;
+        let members: Vec<&[u8]> = vec![&node_vk];
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(t, &members);
+        let expiry = NOW + 3_600;
+
+        let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x71u8; 32]);
+        let cek: Vec<u8> = (0u8..32).collect();
+        let kid16 = [0xC6u8; 16];
+        let kid_hex: String = kid16.iter().map(|b| format!("{b:02x}")).collect();
+        let scheme = ddrm_envelope::SUITE_PQ_HYBRID;
+        let escrow_aad = ddrm_envelope::transcript::escrow_aad(scheme, &kid16, &recipient_pub);
+        let wrapped = ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &escrow_aad, &producer_signer);
+
+        let (_session_secret, session_public) = ddrm_envelope::mint_session();
+        let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
+        let session_pub = b64().decode(&session_pub_b64).unwrap();
+
+        let (caller, caller_vk) = caller_keypair();
+        let token = live_token(&node, &b64().encode(&caller_vk));
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
+        let data = ok_data(node.recover(RecoverArgs {
+            wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
+            scheme: scheme.to_string(),
+            kid_hex,
+            producer_vk_b64: b64().encode(&producer_vk),
+            decrypt_session_pub_b64: session_pub_b64.clone(),
+            aad_b64: b64().encode(b"attest-transcript"),
+            ciphertext_b64: b64().encode(b"ct"),
+            content_hash_b64: b64().encode(b"hash"),
+            nonce_b64: b64().encode(b"nonce"),
+            init_segment_b64: None,
+            rights_receipt: good_receipt(),
+            content_id: CONTENT.to_string(),
+            principal_id: PRINCIPAL.to_string(),
+            session_id: SESSION.to_string(),
+            right: RIGHT.to_string(),
+            session_token: token,
+            caller_sig_b64,
+            recover_seq: 1,
+            now_unix: Some(NOW),
+            attest_node_set_id_b64: Some(b64().encode(node_set_id)),
+            attest_expiry: Some(expiry),
+        }));
+
+        // The node emitted a co-signed attestation; the offline verifier accepts the 1-of-1 quorum.
+        let att = b64().decode(data["release_attestation_b64"].as_str().expect("attestation present")).unwrap();
+        assert_eq!(data["release_attestation_expiry"].as_u64(), Some(expiry));
+        assert_eq!(
+            ddrm_envelope::verify_quorum_release_proof(
+                t, &members, &node_set_id, CONTENT.as_bytes(), PRINCIPAL.as_bytes(), RIGHT.as_bytes(),
+                &session_pub, &kid16, expiry, NOW, &[(0, &att)],
+            ),
+            Ok(1),
+            "the node's co-signed attestation verifies offline as a quorum proof"
+        );
+        // Wrong-principal check fails closed and names the node.
+        assert_eq!(
+            ddrm_envelope::verify_quorum_release_proof(
+                t, &members, &node_set_id, CONTENT.as_bytes(), b"principal:not-alice", RIGHT.as_bytes(),
+                &session_pub, &kid16, expiry, NOW, &[(0, &att)],
+            ),
+            Err(ddrm_envelope::QuorumProofError::BadSignature { member_index: 0 }),
+            "the attestation does not authorize a different principal"
+        );
 
         let _ = std::fs::remove_file(&store);
     }
@@ -2370,6 +2501,8 @@ mod tests {
             caller_sig_b64,
             recover_seq: 1,
             now_unix: Some(NOW),
+            attest_node_set_id_b64: None,
+            attest_expiry: None,
         });
         assert_eq!(error_code(&forged), "invalid_request");
 
@@ -2396,6 +2529,8 @@ mod tests {
             caller_sig_b64: b64().encode([0u8; 8]),
             recover_seq: 1,
             now_unix: Some(NOW),
+            attest_node_set_id_b64: None,
+            attest_expiry: None,
         });
         assert_eq!(error_code(&pre), "not_configured");
         let _ = std::fs::remove_file(&store);
@@ -2450,6 +2585,8 @@ mod tests {
             caller_sig_b64,
             recover_seq: 1,
             now_unix: Some(NOW),
+            attest_node_set_id_b64: None,
+            attest_expiry: None,
         };
         (node, args, caller)
     }

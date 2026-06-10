@@ -3197,6 +3197,344 @@ fn dkms_dkg_gates(
     Ok(())
 }
 
+/// Schema of the portable, offline-verifiable quorum release proof (Day 131–135).
+const QUORUM_RELEASE_PROOF_SCHEMA: &str = "elastos.dkms.authority/quorum-release-proof/v1";
+
+/// The STANDALONE, OFFLINE verifier — no runtime, no daemons, no secrets. It reads a serialized
+/// `QuorumReleaseProofV1` from disk and re-checks it from scratch: recompute the node-set id from the
+/// listed member vks, require ≥ t DISTINCT valid signatures over the bound grant/session/expiry, and
+/// reject anything expired. The `expected_*` arguments are the binding the RELYING PARTY cares about;
+/// the proof's self-described copy is checked against them so a relayed proof cannot be re-pointed at
+/// a different principal/content/session, and the signatures are verified over the EXPECTED bytes.
+#[allow(clippy::too_many_arguments)]
+fn verify_quorum_release_proof_file(
+    path: &std::path::Path,
+    expected_content_id: &str,
+    expected_principal_id: &str,
+    expected_right: &str,
+    expected_session_pub: &[u8],
+    expected_kid_hex: &str,
+    now: u64,
+) -> Result<usize, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read proof: {e}"))?;
+    let p: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse proof: {e}"))?;
+    if p["schema"].as_str() != Some(QUORUM_RELEASE_PROOF_SCHEMA) {
+        return Err("proof schema mismatch".to_string());
+    }
+    // The relying party confirms the proof is ABOUT the grant/session it cares about.
+    if p["content_id"].as_str() != Some(expected_content_id)
+        || p["principal_id"].as_str() != Some(expected_principal_id)
+        || p["right"].as_str() != Some(expected_right)
+        || p["kid_hex"].as_str() != Some(expected_kid_hex)
+        || p["decrypt_session_pub_b64"].as_str() != Some(&B64.encode(expected_session_pub))
+    {
+        return Err("proof binding does not match the expected grant/session".to_string());
+    }
+    let t = p["t"].as_u64().ok_or("no t")? as u8;
+    let node_set_id = B64
+        .decode(p["node_set_id_b64"].as_str().ok_or("no node_set_id")?)
+        .map_err(|e| e.to_string())?;
+    let members_bytes: Vec<Vec<u8>> = p["members_vk_b64"]
+        .as_array()
+        .ok_or("no members")?
+        .iter()
+        .map(|v| B64.decode(v.as_str().unwrap_or("")).unwrap_or_default())
+        .collect();
+    let members: Vec<&[u8]> = members_bytes.iter().map(|m| m.as_slice()).collect();
+    let mut kid16 = [0u8; 16];
+    for (i, b) in kid16.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&expected_kid_hex[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
+    }
+    let expiry = p["expiry"].as_u64().ok_or("no expiry")?;
+    let sigs_owned: Vec<(usize, Vec<u8>)> = p["signatures"]
+        .as_array()
+        .ok_or("no signatures")?
+        .iter()
+        .map(|s| {
+            let idx = s["member_index"].as_u64().unwrap_or(u64::MAX) as usize;
+            let sig = B64.decode(s["sig_b64"].as_str().unwrap_or("")).unwrap_or_default();
+            (idx, sig)
+        })
+        .collect();
+    let sigs: Vec<(usize, &[u8])> = sigs_owned.iter().map(|(i, s)| (*i, s.as_slice())).collect();
+    ddrm_envelope::verify_quorum_release_proof(
+        t,
+        &members,
+        &node_set_id,
+        expected_content_id.as_bytes(),
+        expected_principal_id.as_bytes(),
+        expected_right.as_bytes(),
+        expected_session_pub,
+        &kid16,
+        expiry,
+        now,
+        &sigs,
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// THRESHOLD ATTESTATION gates (Day 131–135), driven across THREE real daemons: every threshold open
+/// emits a portable `QuorumReleaseProofV1` that a standalone verifier confirms OFFLINE — proving
+/// WHICH node-set served the open, that a real quorum signed, and that it is bound to this exact
+/// principal+content+session, while leaking zero key material. (52) a genuine open's proof verifies
+/// offline from a file on disk; (53) forged / under-quorum / wrong-principal / expired / replayed
+/// proofs are all rejected and the offending node is NAMED; (54) it composes with reconfiguration —
+/// a proof names the CURRENT node-set, and a proof minted for one set is refused against another.
+fn dkms_release_attestation_gates(
+    node_bin: &str,
+    work_dir: &std::path::Path,
+    fixture: &PublishEscrow,
+    caller_seed: [u8; 32],
+    operator_vk_b64: &str,
+) -> Result<(), String> {
+    let (caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+    let kid16 = {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&fixture.kid_hex[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("fixture kid hex: {e}"))?;
+        }
+        out
+    };
+    let (t, m) = (2u8, 3u8);
+
+    // PROVISION + START three fresh daemons — the serving node-set.
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut vks: Vec<String> = Vec::new();
+    let mut recipients: Vec<String> = Vec::new();
+    let mut daemons: Vec<DaemonGuard> = Vec::new();
+    for j in 0..m as usize {
+        let store = work_dir.join(format!("dkms-attest-{j}.json")).to_string_lossy().into_owned();
+        let (vk, recipient) = provision_dkms_node(node_bin, &store)?;
+        let endpoint = work_dir.join(format!("dkms-attest-{j}.sock")).to_string_lossy().into_owned();
+        daemons.push(start_dkms_daemon(node_bin, &endpoint, &store, &caller_vk_b64, operator_vk_b64)?);
+        endpoints.push(endpoint);
+        vks.push(vk);
+        recipients.push(recipient);
+    }
+
+    // The serving node-set id (over the three node vks) — the proof must NAME it.
+    let vk_bytes: Vec<Vec<u8>> = vks.iter().map(|v| B64.decode(v).unwrap_or_default()).collect();
+    let refs: Vec<&[u8]> = vk_bytes.iter().map(|v| v.as_slice()).collect();
+    let node_set_id = ddrm_envelope::threshold_node_set_id_n(t, &refs);
+    let node_set_b64 = B64.encode(node_set_id);
+
+    // A producer SHAMIR-splits a CEK over the three nodes and escrows each indexed share to its node.
+    let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x6Bu8; 32]);
+    let producer_vk_b64 = B64.encode(&producer_vk);
+    let cek: Vec<u8> = (0u8..16).map(|b| b ^ 0x5A).collect();
+    let coeff: Vec<u8> = (0u8..16).map(|b| b ^ 0x13).collect();
+    let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff)?;
+    let escrow_for = |j: usize| -> Result<String, String> {
+        escrow_share_to_recipient(
+            &recipients[j],
+            &ddrm_envelope::indexed_share((j + 1) as u8, &shares[j]),
+            &kid16,
+            &producer_signer,
+        )
+    };
+
+    // The decrypt-boundary stand-in: a fresh session + a transcript AAD naming the serving set.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
+    let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
+    let decrypt_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&node_set_id));
+    let aad_b64 = B64.encode(&decrypt_aad);
+    const CONTENT: &str = "bafAttest";
+    const PRINCIPAL: &str = "did:key:zViewer";
+    const RIGHT: &str = "view";
+    let expiry = NOW_UNIX + 3_600;
+
+    // Drive a full `recover` on node `j` WITH the attestation request — returns the node's re-sealed
+    // share (so the open genuinely succeeds) AND the co-signed release attestation it emitted.
+    let release = |j: usize| -> Result<(Vec<u8>, String), String> {
+        let mut node = NodeSocket::connect(&endpoints[j])?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "attest node init")?;
+        let challenge = ddrm_envelope::random_seed();
+        let hello = ok_data(
+            &node.call(&json!({
+                "op": "hello",
+                "challenge_b64": B64.encode(challenge),
+                "caller_pub_b64": caller_vk_b64,
+                "now_unix": NOW_UNIX,
+            }))?,
+            "attest node hello",
+        )?;
+        let token = hello["session_token"].clone();
+        let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
+        let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
+            &caller_signer,
+            &chal,
+            CONTENT.as_bytes(),
+            fixture.kid_hex.as_bytes(),
+            &session_pub_bytes,
+            1,
+        ));
+        let recover = ok_data(
+            &node.call(&json!({
+                "op": "recover",
+                "wrapped_cek_b64": escrow_for(j)?,
+                "scheme": SUITE_PQ_HYBRID,
+                "kid_hex": fixture.kid_hex,
+                "producer_vk_b64": producer_vk_b64,
+                "decrypt_session_pub_b64": session_pub_b64,
+                "aad_b64": aad_b64,
+                "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+                "content_hash_b64": fixture.content_hash_b64,
+                "nonce_b64": fixture.nonce_b64,
+                "rights_receipt": probe_receipt(true, CONTENT, PRINCIPAL, RIGHT),
+                "content_id": CONTENT,
+                "principal_id": PRINCIPAL,
+                "session_id": "probe-session",
+                "right": RIGHT,
+                "session_token": token,
+                "caller_sig_b64": caller_sig_b64,
+                "recover_seq": 1u64,
+                "now_unix": NOW_UNIX,
+                "attest_node_set_id_b64": node_set_b64,
+                "attest_expiry": expiry,
+            }))?,
+            "attest node recover",
+        )?;
+        let att = recover["release_attestation_b64"]
+            .as_str()
+            .ok_or("node did not co-sign a release attestation")?
+            .to_string();
+        let sealed = B64.decode(recover["material"]["sealed_cek_b64"].as_str().ok_or("no sealed share")?)
+            .map_err(|e| e.to_string())?;
+        Ok((sealed, att))
+    };
+
+    // --- Gate 52: a GENUINE open emits a portable proof that verifies OFFLINE from a file. ---
+    let (sealed0, att0) = release(0)?;
+    let (sealed1, att1) = release(1)?;
+    // The open genuinely reconstructs the CEK in-boundary (the attestation rides a REAL release).
+    let unwrap_share = |sealed: &[u8], j: usize| -> Result<(u8, Vec<u8>), String> {
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
+        let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk_bytes[j]).ok_or("vk malformed")?;
+        let payload = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, &decrypt_aad, &verifier)
+            .map_err(|e| format!("session unwrap: {e:?}"))?;
+        let (x, body) = ddrm_envelope::parse_indexed_share(&payload).ok_or("share not indexed")?;
+        Ok((x, body.to_vec()))
+    };
+    let (x0, body0) = unwrap_share(&sealed0, 0)?;
+    let (x1, body1) = unwrap_share(&sealed1, 1)?;
+    let opened = ddrm_envelope::lagrange_combine_at_zero(&[(x0, &body0), (x1, &body1)])?.to_vec();
+    if opened != cek {
+        return Err("the attested open did not reconstruct the CEK".to_string());
+    }
+    // Aggregate the two co-signatures into a portable proof, serialize it, write it to disk.
+    let proof = json!({
+        "schema": QUORUM_RELEASE_PROOF_SCHEMA,
+        "t": t,
+        "node_set_id_b64": node_set_b64,
+        "members_vk_b64": vks,
+        "content_id": CONTENT,
+        "principal_id": PRINCIPAL,
+        "right": RIGHT,
+        "decrypt_session_pub_b64": session_pub_b64,
+        "kid_hex": fixture.kid_hex,
+        "expiry": expiry,
+        "signatures": [
+            { "member_index": 0, "sig_b64": att0 },
+            { "member_index": 1, "sig_b64": att1 },
+        ],
+    });
+    let proof_path = work_dir.join("quorum-release-proof.json");
+    std::fs::write(&proof_path, serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write proof: {e}"))?;
+    // The standalone, offline verifier accepts the genuine proof and reports a real quorum.
+    let valid = verify_quorum_release_proof_file(
+        &proof_path, CONTENT, PRINCIPAL, RIGHT, &session_pub_bytes, &fixture.kid_hex, NOW_UNIX,
+    )?;
+    if valid < t as usize {
+        return Err("the genuine proof reported below quorum".to_string());
+    }
+    // No key material leaks into the portable proof.
+    let proof_str = serde_json::to_string(&proof).unwrap_or_default();
+    if proof_str.contains(GOLDEN_CEK_B64) || proof_str.contains(&B64.encode(&cek)) {
+        return Err("the release proof leaked key material".to_string());
+    }
+    step(52, "dkms THRESHOLD ATTESTATION: a genuine 2-of-3 open across THREE real daemons emitted a portable QuorumReleaseProofV1 — each releasing node CO-SIGNED that IT authorized this content for this principal under this decrypt session — that a STANDALONE verifier confirmed OFFLINE from a file on disk (it named the serving node-set, counted a real quorum, and bound the exact grant/session), while leaking ZERO key material");
+
+    // --- Gate 53: forged / under-quorum / wrong-principal / expired / replayed are all rejected ---
+    // and the offending node is NAMED. (driven directly against the offline verifier primitive) ---
+    let members = refs.clone();
+    let a0 = B64.decode(&att0).map_err(|e| e.to_string())?;
+    let a1 = B64.decode(&att1).map_err(|e| e.to_string())?;
+    let genuine: Vec<(usize, &[u8])> = vec![(0, &a0), (1, &a1)];
+    let verify_with = |content: &str, principal: &str, right: &str, session: &[u8], now: u64, sigs: &[(usize, &[u8])]| {
+        ddrm_envelope::verify_quorum_release_proof(
+            t, &members, &node_set_id, content.as_bytes(), principal.as_bytes(), right.as_bytes(), session, &kid16, expiry, now, sigs,
+        )
+    };
+    // (a) UNDER-QUORUM: one signature is not a quorum.
+    if !matches!(verify_with(CONTENT, PRINCIPAL, RIGHT, &session_pub_bytes, NOW_UNIX, &[(0, &a0)]), Err(ddrm_envelope::QuorumProofError::BelowQuorum { .. })) {
+        return Err("an under-quorum proof was accepted".to_string());
+    }
+    // (b) WRONG-PRINCIPAL: bound to PRINCIPAL, so a different principal fails AND the first signer is named.
+    match verify_with(CONTENT, "did:key:zMallory", RIGHT, &session_pub_bytes, NOW_UNIX, &genuine) {
+        Err(ddrm_envelope::QuorumProofError::BadSignature { member_index: 0 }) => {}
+        other => return Err(format!("a wrong-principal proof was not rejected with a named node: {other:?}")),
+    }
+    // (c) REPLAYED against a DIFFERENT open (fresh session) — the freshness binding fails.
+    let (_other_secret, other_public) = ddrm_envelope::mint_session();
+    let other_session = ddrm_envelope::session_public_bytes(&other_public);
+    if !matches!(verify_with(CONTENT, PRINCIPAL, RIGHT, &other_session, NOW_UNIX, &genuine), Err(ddrm_envelope::QuorumProofError::BadSignature { .. })) {
+        return Err("a proof replayed against a different open was accepted".to_string());
+    }
+    // (d) EXPIRED: now past the attested expiry.
+    if !matches!(verify_with(CONTENT, PRINCIPAL, RIGHT, &session_pub_bytes, expiry + 1, &genuine), Err(ddrm_envelope::QuorumProofError::Expired)) {
+        return Err("an expired proof was accepted".to_string());
+    }
+    // (e) FORGED member: a signature from a non-member key, presented as member 2, is rejected + named.
+    let (impostor, _ivk) = ddrm_envelope::seal::mldsa_seal_keypair([0x7Fu8; 32]);
+    let forged = ddrm_envelope::sign_release_attestation(
+        &impostor, CONTENT.as_bytes(), PRINCIPAL.as_bytes(), RIGHT.as_bytes(), &node_set_id, &session_pub_bytes, &kid16, expiry,
+    );
+    match verify_with(CONTENT, PRINCIPAL, RIGHT, &session_pub_bytes, NOW_UNIX, &[(0, &a0), (2, &forged)]) {
+        Err(ddrm_envelope::QuorumProofError::BadSignature { member_index: 2 }) => {}
+        other => return Err(format!("a forged member attestation was not rejected with a named node: {other:?}")),
+    }
+    step(53, "dkms THRESHOLD ATTESTATION: every forgery FAILS CLOSED — an under-quorum bundle, a proof checked for the WRONG principal, a proof REPLAYED against a different open (fresh session), and an EXPIRED proof are all rejected, and a FORGED member attestation is refused with the offending node NAMED by its node-set index");
+
+    // --- Gate 54: composes with RECONFIGURATION — a proof NAMES the current node-set; a proof ---
+    // minted over THIS set is refused when checked against a DIFFERENT (reconfigured) set. ---
+    // A larger set's id differs, so the genuine proof's signatures (over THIS set's id) do not verify
+    // against the other set — the proof is inseparably bound to the node-set that produced it.
+    let (_s3, vk3) = ddrm_envelope::seal::mldsa_seal_keypair([0xD3u8; 32]);
+    let (_s4, vk4) = ddrm_envelope::seal::mldsa_seal_keypair([0xE4u8; 32]);
+    let big_refs: Vec<&[u8]> = vec![refs[0], refs[1], refs[2], &vk3, &vk4];
+    let big_id = ddrm_envelope::threshold_node_set_id_n(3, &big_refs);
+    if big_id == node_set_id {
+        return Err("a reconfigured set collided with the original node-set id".to_string());
+    }
+    // The genuine signatures were over THIS set's id; verifying them as if they belonged to the larger
+    // set (different node_set_id in the signed preimage) fails — a proof cannot be re-pointed at
+    // another set. (NodeSetMismatch is impossible here because we pass the recomputed big_id; the
+    // signatures themselves do not verify because their preimage embedded the ORIGINAL node_set_id.)
+    let cross = ddrm_envelope::verify_quorum_release_proof(
+        3, &big_refs, &big_id, CONTENT.as_bytes(), PRINCIPAL.as_bytes(), RIGHT.as_bytes(), &session_pub_bytes, &kid16, expiry, NOW_UNIX, &genuine,
+    );
+    if !matches!(cross, Err(ddrm_envelope::QuorumProofError::BadSignature { .. })) {
+        return Err("a proof minted over one node-set verified against a different set".to_string());
+    }
+    // And a proof that LIES about its id (claims a set it isn't) is rejected up front.
+    let bogus = ddrm_envelope::verify_quorum_release_proof(
+        t, &members, &[0u8; 32], CONTENT.as_bytes(), PRINCIPAL.as_bytes(), RIGHT.as_bytes(), &session_pub_bytes, &kid16, expiry, NOW_UNIX, &genuine,
+    );
+    if !matches!(bogus, Err(ddrm_envelope::QuorumProofError::NodeSetMismatch)) {
+        return Err("a proof claiming a node-set it is not was accepted".to_string());
+    }
+    step(54, "dkms THRESHOLD ATTESTATION: the proof NAMES its node-set and composes with the lifecycle — a proof minted over THIS set is inseparably bound to it (it fails against a reconfigured set, since each member signs the set id into its attestation), and a proof that LIES about which set it represents is rejected up front (the verifier recomputes the id from the member vks)");
+
+    drop(daemons);
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -4874,6 +5212,18 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                         &fixture,
                         caller_seed,
                         &operator_signer,
+                        &operator_vk_b64,
+                    )?;
+                    // THRESHOLD ATTESTATION (Day 131–135): every threshold open emits a portable
+                    // QuorumReleaseProofV1 that a standalone verifier confirms OFFLINE — proving
+                    // WHICH node-set served the open, that a real quorum signed, bound to this exact
+                    // principal+content+session — while leaking zero key material; forgeries fail
+                    // closed with the offending node named, and the proof names the CURRENT set.
+                    dkms_release_attestation_gates(
+                        node_bin,
+                        &work_dir,
+                        &fixture,
+                        caller_seed,
                         &operator_vk_b64,
                     )?;
                 }

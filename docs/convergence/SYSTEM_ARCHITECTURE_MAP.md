@@ -369,6 +369,36 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 131–135):** the quorum PROVES it served you — verifiable, publicly-auditable THRESHOLD ATTESTATION. Every
+  threshold open emits a portable proof that *these specific t-of-n nodes* authorized *this* content for *this* principal
+  under *this* decrypt session, checkable by ANYONE OFFLINE without trusting the runtime. Prior cycles made the quorum
+  real (113–116), rotatable (117–120), reconfigurable (121–125), born-distributed (126–130) — but the audit trail was
+  still a CEK-free record the RUNTIME wrote ABOUT ITSELF; a third party had to TRUST it was faithful. This unit closes
+  that: the release proof is CO-SIGNED by the secret-holders themselves. KEY INSIGHT: each releasing node already holds a
+  descriptor-pinned ML-DSA identity, so at `recover` (handed the node-set id + an expiry) it co-signs a domain-separated
+  release attestation binding `(content_id, principal_id, right, node_set_id, decrypt_session_pub, kid, expiry)` — all
+  members sign byte-identical preimages, so the boundary AGGREGATES the t co-signatures into one portable
+  `QuorumReleaseProofV1`. The freshness is `decrypt_session_pub` (fresh per open → no cross-open replay). A STANDALONE
+  verifier (`verify_quorum_release_proof`, pure, secret-free, from a file on disk) confirms: it NAMES the node-set
+  (recompute `threshold_node_set_id_n(t, members)` — a proof cannot claim a set it isn't), a REAL quorum signed (≥ t
+  DISTINCT members, no duplicate-padding), every counted signature verifies over the binding the RELYING PARTY expects
+  (wrong principal/content/session fail), and it has not expired — a bad member is NAMED by index. Audited PC2 first: the
+  Lit network is opaque and emits NO portable, independently-verifiable proof of WHICH nodes served an open; the only
+  "audit" is whatever the app server logged about itself. The runtime is SUPERIOR: the evidence is signed by the
+  secret-holders, so its authenticity does not depend on the runtime. (1) PRIMITIVE (ddrm-envelope 36→37):
+  `DKMS_RELEASE_ATTEST_DOMAIN` + `release_attestation_message` + `sign_release_attestation`/`verify_release_attestation` +
+  the offline `verify_quorum_release_proof` with `QuorumProofError` naming the bad node + a golden (genuine 2-of-3
+  verifies; wrong-principal/replay/under-quorum/duplicate/expired/forged/wrong-set fail; a 3-of-5 reconfigured proof
+  verifies). (2) NODE (dkms-authority 20→21): `recover` co-signs when handed `attest_node_set_id_b64`+`attest_expiry`,
+  returns `release_attestation_b64` (fail-closed: omit rather than fabricate). (3) BOUNDARY (decrypt-provider): a real
+  2-of-3 open decrypts AND aggregates the two attestations into an offline-verifiable proof. (4) RUNTIME + GATES 52–54
+  (`dkms_release_attestation_gates` + a standalone `verify_quorum_release_proof_file`, THREE real daemons): (52) a genuine
+  open emits a portable proof written to disk that the offline verifier confirms (names the set, real quorum, exact
+  grant/session, zero key material); (53) under-quorum/wrong-principal/replayed/expired/forged all rejected with the node
+  NAMED; (54) the proof names its node-set and composes — inseparably bound to the producing set (fails against a
+  reconfigured set), and a proof that LIES about its id is rejected up front. Gate: ladder INTACT (ddrm-envelope=37,
+  dkms-authority=21, decrypt-provider rail-material=75), drift PASS, ALL dDRM smokes green (2-of-3 now driving gates
+  38–54), clippy clean.
 - **Status (Day 126–130):** the CEK is BORN DISTRIBUTED — a verifiable Distributed Key Generation (DKG) so NO node, not
   even the provisioner, EVER holds the whole key. Day 113–116 made the threshold a real quorum, 117–120 gave it a
   rotation lifecycle, 121–125 made it reconfigurable — but the CEK was still GENERATED then SPLIT (the whole secret

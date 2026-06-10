@@ -985,4 +985,94 @@ mod tests {
             "one DKG-born share is below the 2-of-3 quorum"
         );
     }
+
+    /// Day 131–135 — when the boundary opens a 2-of-3 quorum it AGGREGATES the releasing nodes'
+    /// co-signed release attestations into a `QuorumReleaseProofV1`-style bundle that a standalone
+    /// verifier accepts OFFLINE: it names WHICH node-set served the open, confirms ≥ t DISTINCT
+    /// signers, is bound to this exact principal/content/session, and fails closed for an under-quorum
+    /// or wrong-principal proof — while the open itself still decrypts the content.
+    #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
+    #[test]
+    fn boundary_open_emits_an_offline_verifiable_quorum_release_proof() {
+        use crate::pq_envelope::mldsa::MlDsa65Verifier;
+        use crate::pq_envelope::seal_support::{mldsa_seal_keypair, seal_bound};
+
+        let (secret, public) = gen_session();
+        let iv8 = [0x44u8; 8];
+        let plaintext = b"served-by-the-quorum";
+        let aad = b"attest-escrow-aad/v1";
+
+        // A 2-of-3 Shamir quorum over the CEK (shares at x = 1, 2, 3).
+        let cek = [0x5Cu8; 16];
+        let segment = build_encrypted_segment(plaintext, &cek, &iv8);
+        let coeff = [0x3Bu8; 16];
+        let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("split");
+
+        // Each node has a seal keypair (its release-attestation identity) AND seals its share.
+        let mut verifiers: Vec<MlDsa65Verifier> = Vec::new();
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        let mut node_signers = Vec::new();
+        let mut node_vks: Vec<Vec<u8>> = Vec::new();
+        for (i, share) in shares.iter().enumerate() {
+            let x = (i as u8) + 1;
+            let payload = ddrm_envelope::indexed_share(x, share);
+            let (signer, vk) = mldsa_seal_keypair([(i as u8) + 1; 32]);
+            sealed.push(seal_bound(&public, &payload, aad, &signer).to_bytes());
+            verifiers.push(MlDsa65Verifier::from_encoded(&vk).expect("vk decodes"));
+            // Independent ddrm-envelope identity used to co-sign the release attestation.
+            let (asigner, avk) = ddrm_envelope::seal::mldsa_seal_keypair([(i as u8) + 100; 32]);
+            node_signers.push(asigner);
+            node_vks.push(avk);
+        }
+        let session = SessionSecret::PqHybrid(secret);
+
+        // The boundary opens with members {0,2} (a real quorum) and decrypts.
+        let pick = [sealed[0].as_slice(), sealed[2].as_slice()];
+        let (out, _meta) =
+            decrypt_from_carrier_quorum_k(&session, 2, &pick, aad, &verifiers, &segment, None)
+                .expect("2-of-3 opens");
+        let off = segment.len() - plaintext.len();
+        assert_eq!(&out[off..], plaintext, "the quorum decrypts the content");
+
+        // The boundary AGGREGATES the two releasing nodes' attestations into a portable proof.
+        let members: Vec<&[u8]> = node_vks.iter().map(|v| v.as_slice()).collect();
+        let t = 2u8;
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(t, &members);
+        let content_id = b"content:served".as_slice();
+        let principal_id = b"principal:bob".as_slice();
+        let right = b"play".as_slice();
+        let kid = [0x9Eu8; 16];
+        let session_pub = [0x42u8; 32];
+        let expiry = 9_000u64;
+        let now = 1u64;
+        let att = |i: usize| {
+            ddrm_envelope::sign_release_attestation(
+                &node_signers[i], content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry,
+            )
+        };
+        let a0 = att(0);
+        let a2 = att(2);
+        let proof: Vec<(usize, &[u8])> = vec![(0, &a0), (2, &a2)];
+        assert_eq!(
+            ddrm_envelope::verify_quorum_release_proof(
+                t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof,
+            ),
+            Ok(2),
+            "the aggregated proof verifies offline and names the serving node-set"
+        );
+        // Under-quorum: a single attestation is rejected.
+        assert!(matches!(
+            ddrm_envelope::verify_quorum_release_proof(
+                t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, a0.as_slice())],
+            ),
+            Err(ddrm_envelope::QuorumProofError::BelowQuorum { .. })
+        ));
+        // Wrong-principal: the proof does not authorize a different principal.
+        assert!(matches!(
+            ddrm_envelope::verify_quorum_release_proof(
+                t, &members, &node_set_id, content_id, b"principal:eve", right, &session_pub, &kid, expiry, now, &proof,
+            ),
+            Err(ddrm_envelope::QuorumProofError::BadSignature { .. })
+        ));
+    }
 }
