@@ -2211,6 +2211,298 @@ fn dkms_rotation_and_revocation_gates(
     Ok(())
 }
 
+/// QUORUM SECRET-HOLDER LIFECYCLE (Day 117–120): the t-of-n generalization of the live rotation
+/// gates, driven against THREE real successor daemons. The dKMS node's `rotate_share` op is
+/// UNCHANGED across schemes — it blind-XORs its escrowed payload with the operator-sealed delta it
+/// is handed (`share' = share ⊕ delta`). What generalizes is the DELTA the operator computes: the
+/// 2-of-2 XOR rail hands every node the SAME mask; the quorum hands each node a DIFFERENT,
+/// coordinate-bound delta `q(x_i)` derived from ONE fresh refresh coefficient via GF(256), with
+/// `q(0) = 0`. The escrowed payload is the INDEXED share `x ‖ p(x)`, so each delta is `0x00 ‖
+/// q(x_i)` ([`ddrm_envelope::shamir_refresh_delta`]) — the leading zero preserves the coordinate
+/// the decrypt boundary pins, the body moves `p(x) → p(x) ⊕ q(x)`, a NEW degree-1 polynomial with
+/// the SAME constant term. Gates: (42) the rotated 2-of-3 opens through a fresh key-provider to the
+/// EXACT CEK; (43) the rotated quorum SURVIVES a dead successor; (44) the refresh kills old material
+/// (an old share next to a rotated one is garbage, a successor refuses an old escrow, the old pin
+/// refuses the rotated descriptor); (45) the delta is COORDINATE-BOUND — a wrong-coordinate delta
+/// (the XOR rail's single-mask mistake) silently corrupts the pair. The operator-only authorization
+/// edges (forged/tampered/redirected delta, no-operator node) and live revocation are byte-identical
+/// to the node op the 2-of-2 gates already prove, so they are not duplicated here.
+#[allow(clippy::too_many_arguments)]
+fn dkms_quorum_rotation_gates(
+    node_bin: &str,
+    key_bin: &str,
+    work_dir: &std::path::Path,
+    fixture: &PublishEscrow,
+    descriptor_path: &std::path::Path,
+    caller_seed: [u8; 32],
+    caller_seed_b64: &str,
+    operator_signer: &ddrm_envelope::seal::MlDsaSealSigner,
+    operator_vk_b64: &str,
+) -> Result<(), String> {
+    let (_caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let caller_vk_b64 = B64.encode(&caller_vk);
+
+    // The CURRENT (pre-rotation) 3-node set, from the published descriptor.
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("read descriptor for quorum rotation: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor for quorum rotation: {e}"))?;
+    let nodes = desc["threshold"]["nodes"].as_array().ok_or("descriptor has no threshold nodes")?;
+    if nodes.len() != 3 {
+        return Err("quorum rotation gate requires a 3-node descriptor".to_string());
+    }
+    let node_field = |i: usize, k: &str| -> Result<String, String> {
+        nodes[i][k].as_str().map(str::to_string).ok_or_else(|| format!("descriptor node {i} missing {k}"))
+    };
+    // (vk, recipient, endpoint, current-share-escrow) per old node. Shares: A in the rights-bound
+    // envelope (wrapped_cek_b64), B + C in the side escrows. All three signed by the ONE producer.
+    let share2 = fixture.wrapped_cek_share2_b64.as_ref().ok_or("quorum fixture needs share-2 escrow")?;
+    let share3 = fixture.wrapped_cek_share3_b64.as_ref().ok_or("quorum fixture needs share-3 escrow")?;
+    let old: Vec<(String, String, String, String)> = vec![
+        (node_field(0, "verifying_key_b64")?, node_field(0, "recipient_pub_b64")?, node_field(0, "authority_endpoint")?, fixture.wrapped_cek_b64.clone()),
+        (node_field(1, "verifying_key_b64")?, node_field(1, "recipient_pub_b64")?, node_field(1, "authority_endpoint")?, share2.clone()),
+        (node_field(2, "verifying_key_b64")?, node_field(2, "recipient_pub_b64")?, node_field(2, "authority_endpoint")?, share3.clone()),
+    ];
+    let kid16 = {
+        let mut out = [0u8; 16];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&fixture.kid_hex[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("fixture kid hex: {e}"))?;
+        }
+        out
+    };
+    let cek = B64.decode(GOLDEN_CEK_B64).map_err(|e| e.to_string())?;
+
+    // PROVISION three SUCCESSOR secret-holders — fresh node-local masters, genuinely new identities.
+    let succ_stores: Vec<String> = (0..3)
+        .map(|i| work_dir.join(format!("dkms-quorum-successor-{i}.json")).to_string_lossy().into_owned())
+        .collect();
+    let mut succ: Vec<(String, String)> = Vec::new();
+    for store in &succ_stores {
+        succ.push(provision_dkms_node(node_bin, store)?);
+    }
+    {
+        // All six identities (3 old + 3 new) must be pairwise distinct.
+        let mut all: Vec<&str> = old.iter().map(|n| n.0.as_str()).collect();
+        all.extend(succ.iter().map(|(vk, _)| vk.as_str()));
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                if all[i] == all[j] {
+                    return Err("quorum successor provisioning did not produce distinct identities".to_string());
+                }
+            }
+        }
+    }
+
+    // ONE fresh refresh coefficient → per-node COORDINATE-BOUND deltas q(x_i), each operator-sealed
+    // to (kid, that node, its successor). This is the only thing that differs from the XOR rail.
+    let refresh: Vec<u8> = ddrm_envelope::random_seed().iter().copied().take(cek.len()).collect();
+    let seal_delta = |source_recipient_b64: &str, successor_recipient_b64: &str, x: u8| -> Result<String, String> {
+        let source_bytes = B64.decode(source_recipient_b64).map_err(|e| e.to_string())?;
+        let source_public = ddrm_envelope::session_public_from_bytes(&source_bytes)
+            .ok_or("source recipient key is malformed")?;
+        let successor_bytes = B64.decode(successor_recipient_b64).map_err(|e| e.to_string())?;
+        let delta = ddrm_envelope::shamir_refresh_delta(&refresh, x)?;
+        let aad = ddrm_envelope::rotation_aad(&kid16, &source_bytes, &successor_bytes);
+        Ok(B64.encode(
+            ddrm_envelope::seal::seal_bound(&source_public, &delta, &aad, operator_signer).to_bytes(),
+        ))
+    };
+
+    // Drive ONE node's `rotate_share` (the UNCHANGED op) over a fresh connection.
+    let rotate = |endpoint: &str, wrapped_b64: &str, producer_vk_b64: &str, successor_recipient_b64: &str, delta_env_b64: &str| -> Result<Value, String> {
+        let mut node = NodeSocket::connect(endpoint)?;
+        ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "quorum rotation node init")?;
+        node.call(&json!({
+            "op": "rotate_share",
+            "wrapped_cek_b64": wrapped_b64,
+            "scheme": SUITE_PQ_HYBRID,
+            "kid_hex": fixture.kid_hex,
+            "producer_vk_b64": producer_vk_b64,
+            "successor_recipient_pub_b64": successor_recipient_b64,
+            "delta_envelope_b64": delta_env_b64,
+        }))
+    };
+
+    // --- Gate 42: ALL THREE nodes rotate; the ROTATED 2-of-3 opens to the EXACT CEK. ---
+    let mut rotated_share_escrows: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let (_vk, recipient_old, endpoint, escrow) = &old[i];
+        let (_succ_vk, succ_recipient) = &succ[i];
+        let x = (i + 1) as u8;
+        let delta = seal_delta(recipient_old, succ_recipient, x)?;
+        let rot = ok_data(
+            &rotate(endpoint, escrow, &fixture.producer_vk_b64, succ_recipient, &delta)?,
+            "quorum node rotate_share",
+        )?;
+        // Each rotated escrow names the ROTATING (old) node as its producer.
+        if rot["escrow_producer_vk_b64"].as_str() != Some(old[i].0.as_str()) {
+            return Err("a rotated quorum escrow does not name the rotating node as its producer".to_string());
+        }
+        rotated_share_escrows.push(rot["rotated_wrapped_cek_b64"].as_str().ok_or("no rotated share")?.to_string());
+    }
+
+    // Bring the THREE successor daemons up + publish the rotated 3-node descriptor.
+    let succ_endpoints: Vec<String> = (0..3)
+        .map(|i| work_dir.join(format!("dkms-quorum-succ-{i}.sock")).to_string_lossy().into_owned())
+        .collect();
+    let mut succ_daemons: Vec<DaemonGuard> = Vec::new();
+    for i in 0..3 {
+        succ_daemons.push(start_dkms_daemon(node_bin, &succ_endpoints[i], &succ_stores[i], &caller_vk_b64, operator_vk_b64)?);
+    }
+    let rotated_desc_path = work_dir.join("dkms-quorum-post-rotation.json");
+    let rotated_nodes: Vec<Value> = (0..3)
+        .map(|i| json!({
+            "verifying_key_b64": succ[i].0,
+            "recipient_pub_b64": succ[i].1,
+            "authority_endpoint": succ_endpoints[i],
+        }))
+        .collect();
+    let rotated_desc = json!({
+        "schema": "elastos.dkms.authority/v2",
+        "verifying_key_b64": succ[0].0,
+        "recipient_pub_b64": succ[0].1,
+        "authority_endpoint": succ_endpoints[0],
+        "threshold": { "t": 2, "nodes": rotated_nodes },
+    });
+    std::fs::write(&rotated_desc_path, serde_json::to_vec_pretty(&rotated_desc).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("write rotated quorum descriptor: {e}"))?;
+    let rotated_set = derive_node_set_from_descriptor(&rotated_desc_path)?;
+
+    // The decrypt-boundary stand-in: a fresh session + a transcript AAD naming the ROTATED node-set.
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = B64.decode(&fixture.content_hash_b64).map_err(|e| e.to_string())?;
+    let nonce = B64.decode(&fixture.nonce_b64).map_err(|e| e.to_string())?;
+    let rotated_aad = transcript_aad(&session_pub_bytes, &content_hash, &nonce, Some(&rotated_set));
+
+    // A FRESH key-provider bound to the ROTATED descriptor runs the quorum release — per-share
+    // producer identities are the OLD nodes (each signed its own re-escrow).
+    let release = |share1: &str, share2: &str, share3: &str| -> Result<Value, String> {
+        let mut key = Capsule::spawn("key-provider(quorum rotation)", key_bin)?;
+        ok_data(
+            &key.call(&json!({
+                "op": "init",
+                "config": {
+                    "backend": "dkms",
+                    "dkms_authority_descriptor": rotated_desc_path.to_string_lossy(),
+                    "dkms_caller_seed_b64": caller_seed_b64,
+                }
+            }))?,
+            "rotated quorum key init",
+        )?;
+        let mut req = key_release_request_base(&fixture.kid_hex, share1);
+        req.as_object_mut()
+            .expect("key release request is an object")
+            .insert("rights_receipt".to_string(), fallback_rights_receipt());
+        let session = json!({
+            "decrypt_session_pub_b64": session_pub_b64,
+            "producer_vk_b64": old[0].0,
+            "producer_vk2_b64": old[1].0,
+            "producer_vk3_b64": old[2].0,
+            "aad_b64": B64.encode(&rotated_aad),
+            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            "content_hash_b64": fixture.content_hash_b64,
+            "nonce_b64": fixture.nonce_b64,
+            "wrapped_cek_share2_b64": share2,
+            "wrapped_cek_share3_b64": share3,
+            "now_unix": NOW_UNIX,
+        });
+        let resp = key.call(&json!({ "op": "release", "request": req, "session": session }))?;
+        key.shutdown();
+        Ok(resp)
+    };
+
+    // Unwrap a returned sealed share under WHICHEVER successor vk verifies it, then read the
+    // x-coordinate from INSIDE the authenticated indexed payload (exactly as the decrypt boundary
+    // does) — never trusting a position.
+    let succ_vks: Vec<String> = succ.iter().map(|(vk, _)| vk.clone()).collect();
+    let unwrap_indexed = |sealed_b64: &str| -> Result<(u8, Vec<u8>), String> {
+        let sealed = B64.decode(sealed_b64).map_err(|e| e.to_string())?;
+        let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed).map_err(|e| format!("{e:?}"))?;
+        for vk_b64 in &succ_vks {
+            let vk = B64.decode(vk_b64).map_err(|e| e.to_string())?;
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).ok_or("succ vk malformed")?;
+            if let Ok(payload) = ddrm_envelope::hybrid_unwrap_bound(&session_secret, &env, &rotated_aad, &verifier) {
+                let (x, body) = ddrm_envelope::parse_indexed_share(&payload).ok_or("rotated share is not a valid indexed share")?;
+                return Ok((x, body.to_vec()));
+            }
+        }
+        Err("no pinned successor identity verified the rotated share".to_string())
+    };
+    let reconstruct = |resp: &Value| -> Result<Vec<u8>, String> {
+        let m = &resp["material"];
+        let (xa, sa) = unwrap_indexed(m["sealed_cek_b64"].as_str().ok_or("no rotated sealed share-a")?)?;
+        let (xb, sb) = unwrap_indexed(m["sealed_cek_share2_b64"].as_str().ok_or("no rotated sealed share-b")?)?;
+        Ok(ddrm_envelope::combine_cek_shamir2(xa, &sa, xb, &sb)?.to_vec())
+    };
+
+    let rotated_release = ok_data(
+        &release(&rotated_share_escrows[0], &rotated_share_escrows[1], &rotated_share_escrows[2])?,
+        "rotated quorum release",
+    )?;
+    if reconstruct(&rotated_release)? != cek {
+        return Err("the ROTATED 2-of-3 quorum did not reconstruct the original CEK".to_string());
+    }
+    step(42, "dkms quorum lifecycle: LIVE SHARE-WISE ROTATION across THREE nodes — each rotated its INDEXED share to a real successor with a coordinate-bound q(x_i) delta (the node op UNCHANGED), and the ROTATED 2-of-3 released + Shamir-reconstructed the EXACT CEK through a fresh key-provider");
+
+    // --- Gate 43: the rotated quorum SURVIVES a dead successor (availability outlives rotation). ---
+    let dead = succ_daemons.remove(2); // node C'
+    drop(dead);
+    let survived = ok_data(
+        &release(&rotated_share_escrows[0], &rotated_share_escrows[1], &rotated_share_escrows[2])?,
+        "rotated quorum release with successor C down",
+    )?;
+    if reconstruct(&survived)? != cek {
+        return Err("the rotated quorum did not survive a dead successor (A'+B' must serve)".to_string());
+    }
+    step(43, "dkms quorum lifecycle: the ROTATED rail SURVIVES a dead successor — with node C' down, A'+B' served the quorum and reconstructed the EXACT CEK (availability outlives rotation, as the 2-of-2 rail structurally cannot)");
+
+    // --- Gate 44: the refresh makes OLD material DEAD (the live-only properties). ---
+    // (a) The OLD node-set pin no longer matches the rotated descriptor (rotation is visible).
+    if B64.encode(rotated_set) == *fixture.node_set_id_b64.as_ref().ok_or("quorum fixture must pin a node-set")? {
+        return Err("the rotated quorum descriptor matches the old pin — rotation is invisible".to_string());
+    }
+    // (b) A SUCCESSOR refuses an OLD escrow (sealed to its predecessor's recipient): even an
+    // operator-authorized rotate on the successor fails at the unwrap, so a captured PRE-rotation
+    // escrow cannot be re-driven through the new node-set. (That an old share next to a rotated one
+    // Shamir-reconstructs GARBAGE is proven deterministically by the envelope's refresh golden test.)
+    let stale_delta = seal_delta(&succ[0].1, &succ[1].1, 1)?;
+    let stale = rotate(&succ_endpoints[0], &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &succ[1].1, &stale_delta)?;
+    if stale.get("status").and_then(Value::as_str) != Some("error") {
+        return Err("a successor opened an escrow sealed to its PREDECESSOR — old escrows must be dead".to_string());
+    }
+    step(44, "dkms quorum lifecycle: the refresh makes OLD material DEAD — the old node-set pin refuses the rotated descriptor and a successor refuses a predecessor's escrow (a node captured before the refresh holds nothing usable after; the old⊕rotated → garbage math is pinned by the envelope refresh test)");
+
+    // --- Gate 45: the delta is COORDINATE-BOUND (the quorum-specific property). ---
+    // Rotate old node A (x=1) with node B's delta (q at x=2) — the XOR rail's "one shared mask"
+    // mistake. The mis-delta'd share lands on no shared polynomial, so the pair touching it
+    // reconstructs garbage, proving each node MUST get q for ITS OWN coordinate.
+    let mis_delta = seal_delta(&old[0].1, &succ[0].1, 2)?; // q(2) sealed for node A→A'
+    let mis_rot = ok_data(
+        &rotate(&old[0].2, &fixture.wrapped_cek_b64, &fixture.producer_vk_b64, &succ[0].1, &mis_delta)?,
+        "mis-coordinate rotate",
+    )?;
+    let mis_escrow = mis_rot["rotated_wrapped_cek_b64"].as_str().ok_or("no mis-rotated share")?.to_string();
+    let mis_release = ok_data(
+        &release(&mis_escrow, &rotated_share_escrows[1], &rotated_share_escrows[2])?,
+        "mis-coordinate quorum release",
+    )?;
+    // A'(wrong) + B'(correct): the boundary still parses both indexed shares + combines, but the
+    // result is garbage — the wrong-coordinate delta silently corrupted the pair.
+    let (mxa, msa) = unwrap_indexed(mis_release["material"]["sealed_cek_b64"].as_str().unwrap())?;
+    let (mxb, msb) = unwrap_indexed(mis_release["material"]["sealed_cek_share2_b64"].as_str().unwrap())?;
+    let mis_combined = ddrm_envelope::combine_cek_shamir2(mxa, &msa, mxb, &msb)?;
+    if mis_combined.to_vec() == cek {
+        return Err("a WRONG-COORDINATE refresh delta still reconstructed the CEK — the delta is not coordinate-bound".to_string());
+    }
+    step(45, "dkms quorum lifecycle: the refresh delta is COORDINATE-BOUND — rotating a node with another coordinate's delta (the 2-of-2 single-mask mistake) silently corrupts the quorum, so each of the t-of-n nodes MUST receive q(x_i) for ITS OWN coordinate");
+
+    drop(succ_daemons);
+    Ok(())
+}
+
 // The consumer half is now driven by the runtime-core `RuntimeStepRunner` over three
 // INJECTED per-provider capability handles — the runtime-core analogue of PC2's
 // per-request `BackendSessionView` (resurrected in middleware, threaded into the
@@ -3494,7 +3786,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         if host.open(&cid(), VIEWER).is_ok() {
             return Err("the 2-of-3 rail opened BELOW quorum (two nodes dead) — it must fail closed".to_string());
         }
-        if DurableEventStore::load(&receipts_dir)?.len() != 0 {
+        if !DurableEventStore::load(&receipts_dir)?.is_empty() {
             return Err("a below-quorum open must persist no runtime-event record".to_string());
         }
         step(37, "key-provider (2-of-3): nodes A AND C dead → BELOW quorum → the live rail failed closed (one share is never enough, no record persisted)");
@@ -3833,11 +4125,8 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
 
                 // SECRET-HOLDER LIFECYCLE (Day 109–112): live share-wise rotation to REAL successor
                 // daemons, refresh-dead old material, operator-only authorization, and live caller
-                // revocation. LAST (it revokes the runtime's caller on old node A). 2-NODE rail only:
-                // the gates drive the 2-of-2 XOR fixture shape; the quorum generalization of LIVE
-                // rotation (per-node `q(x_i)` refresh deltas with q(0)=0 — the node op is unchanged)
-                // is the next unit's finisher and is already covered at the math level by the
-                // envelope's refresh test.
+                // revocation. LAST (it revokes the runtime's caller on old node A). 2-NODE rail: the
+                // gates drive the 2-of-2 XOR fixture shape.
                 if cfg.threshold && cfg.nodes == 2 {
                     dkms_rotation_and_revocation_gates(
                         node_bin,
@@ -3846,6 +4135,24 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
                         &fixture,
                         &descriptor_path,
                         cfg.dkms_transport,
+                        caller_seed,
+                        &caller_seed_b64,
+                        &operator_signer,
+                        &operator_vk_b64,
+                    )?;
+                }
+                // QUORUM SECRET-HOLDER LIFECYCLE (Day 117–120): the t-of-n generalization of live
+                // rotation. The node's `rotate_share` op is UNCHANGED (blind `share' = share ⊕
+                // delta`); the quorum hands each node a DIFFERENT, coordinate-bound delta `q(x_i)`
+                // derived from ONE fresh refresh coefficient (q(0)=0), so the CEK is invariant, any
+                // two refreshed shares still serve, and old material dies.
+                if cfg.threshold && cfg.nodes == 3 {
+                    dkms_quorum_rotation_gates(
+                        node_bin,
+                        key_bin,
+                        &work_dir,
+                        &fixture,
+                        &descriptor_path,
                         caller_seed,
                         &caller_seed_b64,
                         &operator_signer,

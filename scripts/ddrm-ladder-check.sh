@@ -42,7 +42,7 @@ LADDER=(
   "content-market (default)|content-market||29"
   "rights-provider (default)|rights-provider||9"
   "rights-provider chain-rights|rights-provider|chain-rights|18"
-  "ddrm-envelope (lib)|ddrm-envelope||33"
+  "ddrm-envelope (lib)|ddrm-envelope||34"
   "ddrm-plan-runner (lib)|ddrm-plan-runner||45"
   "key-provider (default)|key-provider||18"
   "key-provider key-authority-ref|key-provider|key-authority-ref|47"

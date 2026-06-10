@@ -369,6 +369,36 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 117–120):** the QUORUM now has a LIFECYCLE — a LIVE share-wise ROTATION of the 2-of-3 set to THREE
+  successor nodes via per-node COORDINATE-BOUND refresh deltas `q(x_i)` (a degree-1 proactive-refresh polynomial with
+  `q(0)=0` over GF(256)), so a quorum member can be decommissioned to a successor WITHOUT the CEK reassembling and
+  WITHOUT weakening the quorum. The KEY INSIGHT: the dKMS node's `rotate_share` op is UNCHANGED across schemes — it
+  blind-XORs its escrowed payload with the operator-sealed delta (`share' = share ⊕ delta`). The 2-of-2 XOR rail
+  hands EVERY node the SAME mask (CEK invariant trivially); a Shamir quorum CAN'T (one mask shifts every share onto
+  the same offset and corrupts the polynomial), so the operator adds `q(x)=refresh_coeff·x` with `q(0)=0` and hands
+  each node a DIFFERENT `q(x_i)`. Because `q(0)=0` the reconstructed secret `p'(0)=CEK` is INVARIANT while every share
+  moves to a NEW polynomial `p'(x)=p(x)⊕q(x)` (an OLD captured share is dead next to a refreshed one). The escrowed
+  payload is the INDEXED share `x ‖ p(x)`, so each delta is `0x00 ‖ q(x_i)` — the leading zero PRESERVES the
+  coordinate the decrypt boundary pins, the body refreshes. Audited PC2 first: PC2 has NO key-authority rotation at
+  all (a pinned-constant redeploy, `chipotle-client.ts:125`, no content migration, no refresh of standing material)
+  and a fortiori no quorum-aware proactive refresh — the runtime OWNS proactive secret-sharing refresh end to end, the
+  textbook defense against a mobile adversary compromising one share at a time. (1) PRIMITIVE (ddrm-envelope 33→34):
+  `shamir_refresh_delta(refresh_coeff, x)` → `0x00 ‖ (refresh_coeff·x over GF(256))` (fail-closed on x=0 / empty
+  coeff) + a golden test proving the invariant / old-dead / coordinate-bound / fail-closed properties
+  deterministically. (2) CLIENT (key-provider 47, test extended): optional `producer_vk3_b64` (the quorum
+  generalization of `producer_vk2_b64`) — after a rotation share-3's escrow is signed by node C, so it authenticates
+  under node C's identity (absent → byte-identical non-rotated rail). (3) RUNTIME + GATES 42–45
+  (`dkms_quorum_rotation_gates`, THREE real successor daemons, `--nodes 3`): (42) all three rotate their indexed
+  shares to fresh successors with coordinate-bound deltas → a fresh key-provider on the ROTATED 3-node descriptor
+  opens the quorum → the boundary Shamir-reconstructs the EXACT original CEK; (43) the rotated rail SURVIVES a dead
+  successor (C' down → A'+B' → exact CEK — availability outlives rotation, which the 2-of-2 rail structurally
+  cannot); (44) the refresh kills OLD material (old node-set pin refuses the rotated descriptor; a successor refuses
+  a predecessor's escrow; the old⊕rotated → garbage math is pinned by the envelope test); (45) the delta is
+  COORDINATE-BOUND (rotating a node with another coordinate's delta — the 2-of-2 single-mask mistake — silently
+  corrupts the quorum). The dKMS node + operator-only authorization edges + live revocation are byte-identical to the
+  node op gates 32–35 already prove, so they are NOT duplicated. Gate: ladder INTACT (ddrm-envelope=34,
+  key-provider[key-authority-ref]=47), drift PASS, ALL dDRM smokes green (incl. the 2-of-3 quorum smoke now driving
+  all 45 gates), clippy clean.
 - **Status (Day 113–116):** the threshold is REAL t-of-n — the CEK is SHAMIR-split 2-of-3 over GF(256) into INDEXED
   shares across THREE secret-holding dKMS nodes; ANY TWO live nodes serve an open, so the production rail SURVIVES a
   dead node while BELOW quorum it still fails closed. Audited PC2 first: PC2's only t-of-n is the LEGACY Lit

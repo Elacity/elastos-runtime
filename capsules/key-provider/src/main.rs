@@ -229,6 +229,14 @@ struct ReleaseSessionContext {
     /// below quorum. Absent → the 2-of-2 / single-node rails.
     #[serde(default)]
     wrapped_cek_share3_b64: Option<String>,
+    /// QUORUM SHARE-WISE ROTATION (Day 117–120): the key that signed share-3's CURRENT escrow,
+    /// when it differs from the original producer. The 2-of-3 generalization of `producer_vk2_b64`
+    /// — at first publish ONE producer signed all three indexed escrows (this is `None`, share-3
+    /// authenticates under `producer_vk_b64`); after a quorum rotation each share's new escrow is
+    /// signed by the NODE that rotated it, so the runtime supplies node C's identity here and the
+    /// share-3 recover authenticates under it. Absent → falls back to `producer_vk_b64`.
+    #[serde(default)]
+    producer_vk3_b64: Option<String>,
     /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
     /// authority refuses to release (fail-closed), never sealing a CEK past its window.
     #[serde(default)]
@@ -1509,6 +1517,9 @@ impl KeyProvider {
         }
         let mut req_c = recover_req.clone();
         req_c["wrapped_cek_b64"] = json!(share3_escrow);
+        if let Some(vk3) = session.producer_vk3_b64.as_ref() {
+            req_c["producer_vk_b64"] = json!(vk3);
+        }
         let content_id = recover_req
             .get("content_id")
             .and_then(|v| v.as_str())
@@ -3337,11 +3348,16 @@ mod tests {
                 "nonce_b64": b64.encode(b"nonce"),
                 "wrapped_cek_share2_b64": "U0hBUkUy",
                 "wrapped_cek_share3_b64": "U0hBUkUz",
+                "producer_vk3_b64": "Uk9UQVRFRC1OPURFLUM",
             });
             let ctx: ReleaseSessionContext =
                 serde_json::from_value(v).expect("quorum session context parses");
             assert_eq!(ctx.wrapped_cek_share2_b64.as_deref(), Some("U0hBUkUy"));
             assert_eq!(ctx.wrapped_cek_share3_b64.as_deref(), Some("U0hBUkUz"));
+            // QUORUM ROTATION (Day 117–120): the per-share-3 producer identity is carried so a
+            // rotated share-3 (re-escrowed + signed by node C) authenticates under the right key.
+            assert_eq!(ctx.producer_vk3_b64.as_deref(), Some("Uk9UQVRFRC1OPURFLUM"));
+            assert!(base.producer_vk3_b64.is_none(), "absent on the non-rotated rails");
         }
 
         /// A denied rights receipt is rejected BEFORE the escrow is ever touched

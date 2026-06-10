@@ -372,6 +372,42 @@ pub fn parse_indexed_share(payload: &[u8]) -> Option<(u8, &[u8])> {
     Some((x, share))
 }
 
+/// Shamir 2-of-3 PROACTIVE-REFRESH delta for ONE node (Day 117–120) — the QUORUM
+/// generalization of the 2-of-2 XOR rotation delta. A proactive refresh adds a
+/// degree-1 polynomial `q(x) = refresh_coeff·x` (per byte, over GF(256)) to every
+/// node's share. Because `q(0) = 0`, the reconstructed secret `p(0)` is INVARIANT
+/// (`p'(0) = p(0) ⊕ q(0) = cek`) while every share moves to a NEW polynomial
+/// `p'(x) = p(x) ⊕ q(x)` — so an OLD captured share (on `p`) is dead next to a
+/// refreshed one (on `p'`): the two no longer interpolate to the CEK.
+///
+/// The escrowed quorum payload is the INDEXED share `x ‖ p(x)` ([`indexed_share`]),
+/// and the node's `rotate_share` blind-XORs the WHOLE payload with the delta it is
+/// handed (`share' = share ⊕ delta` — the SAME byte op the 2-of-2 XOR rail uses, so
+/// the node code is UNCHANGED across schemes). To keep that op correct here this
+/// returns `0x00 ‖ q(x)`: the leading zero leaves the x-coordinate prefix UNTOUCHED
+/// (the successor must still answer to the same coordinate the decrypt boundary
+/// pins) and the body refreshes `p(x) → p(x) ⊕ refresh_coeff·x`.
+///
+/// The CONTRAST with XOR is the whole point of t-of-n: the 2-of-2 rail hands every
+/// node the SAME delta; the quorum hands each node a DIFFERENT, coordinate-bound
+/// delta derived from ONE fresh `refresh_coeff` — `q(x_i)` — so a single shared mask
+/// would corrupt the polynomial. `refresh_coeff` MUST be a fresh CSPRNG draw the SAME
+/// length as the share body (the RNG stays OUT of this crate, same policy as
+/// [`split_cek_shamir2`]'s `coeff`). Fails closed on a zero coordinate (x=0 is the
+/// secret, never a node) or an empty `refresh_coeff`.
+pub fn shamir_refresh_delta(refresh_coeff: &[u8], x: u8) -> Result<Vec<u8>, &'static str> {
+    if x == 0 {
+        return Err("share x-coordinate must be non-zero");
+    }
+    if refresh_coeff.is_empty() {
+        return Err("refresh_coeff must be non-empty");
+    }
+    let mut delta = Vec::with_capacity(1 + refresh_coeff.len());
+    delta.push(0u8); // the indexed-share x prefix is preserved across the rotation
+    delta.extend(refresh_coeff.iter().map(|&c| gf256_mul(c, x)));
+    Ok(delta)
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -1720,6 +1756,68 @@ mod tests {
         // Empty / index-only payloads are refused.
         assert!(crate::parse_indexed_share(&[]).is_none());
         assert!(crate::parse_indexed_share(&[2]).is_none());
+    }
+
+    /// PROACTIVE REFRESH of the 2-of-3 quorum (Day 117–120): rotating ALL THREE shares with
+    /// per-node deltas `q(x_i)` derived from ONE fresh `refresh_coeff` keeps the CEK invariant
+    /// (any TWO refreshed shares still reconstruct it — the quorum survives the refresh) WHILE
+    /// killing old material (an OLD share next to a REFRESHED share is garbage). Also proves the
+    /// delta is COORDINATE-BOUND (the x prefix is preserved; a wrong-coordinate delta corrupts the
+    /// pair) and fails closed on bad inputs.
+    #[test]
+    fn shamir_refresh_keeps_cek_invariant_and_kills_old_material() {
+        let cek = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let coeff = [0x9Au8, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78];
+        let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
+        // Escrowed payloads are the INDEXED shares the nodes hold + rotate.
+        let indexed: Vec<Vec<u8>> =
+            (0..3).map(|i| crate::indexed_share((i + 1) as u8, &shares[i])).collect();
+
+        // ONE fresh refresh coefficient → per-node coordinate-bound deltas q(x_i).
+        let refresh = [0x0Fu8, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78];
+        let rotate = |payload: &[u8], x: u8| -> Vec<u8> {
+            let delta = crate::shamir_refresh_delta(&refresh, x).expect("delta");
+            assert_eq!(delta.len(), payload.len(), "delta must match the indexed-share length");
+            assert_eq!(delta[0], 0, "the index prefix byte must be untouched");
+            // The node's UNCHANGED blind XOR.
+            payload.iter().zip(delta.iter()).map(|(a, b)| a ^ b).collect()
+        };
+        let refreshed: Vec<Vec<u8>> =
+            (0..3).map(|i| rotate(&indexed[i], (i + 1) as u8)).collect();
+
+        // The x prefix survived on every refreshed share, and the body changed.
+        for i in 0..3 {
+            let (x, body) = crate::parse_indexed_share(&refreshed[i]).expect("refreshed parse");
+            assert_eq!(x, (i + 1) as u8, "the coordinate is preserved across rotation");
+            assert_ne!(body, shares[i].as_slice(), "the share body was refreshed");
+        }
+
+        // INVARIANT: any TWO refreshed shares reconstruct the EXACT original CEK.
+        let combine = |a: &[u8], b: &[u8]| -> Vec<u8> {
+            let (xa, sa) = crate::parse_indexed_share(a).unwrap();
+            let (xb, sb) = crate::parse_indexed_share(b).unwrap();
+            crate::combine_cek_shamir2(xa, sa, xb, sb).expect("combine").to_vec()
+        };
+        assert_eq!(combine(&refreshed[0], &refreshed[1]), cek, "A'+B' reconstructs the CEK");
+        assert_eq!(combine(&refreshed[0], &refreshed[2]), cek, "A'+C' reconstructs the CEK");
+        assert_eq!(combine(&refreshed[1], &refreshed[2]), cek, "B'+C' reconstructs the CEK");
+
+        // OLD MATERIAL DEAD: an OLD share next to a REFRESHED share no longer interpolates the CEK.
+        assert_ne!(combine(&indexed[0], &refreshed[1]), cek, "old A + refreshed B is garbage");
+        assert_ne!(combine(&indexed[1], &refreshed[2]), cek, "old B + refreshed C is garbage");
+
+        // COORDINATE-BOUND: rotating node A (x=1) with node B's delta (q at x=2) puts A' on no
+        // shared polynomial — the pair touching it reconstructs garbage, while B'+C' still works.
+        let mis_a = {
+            let wrong = crate::shamir_refresh_delta(&refresh, 2).expect("delta@2");
+            indexed[0].iter().zip(wrong.iter()).map(|(a, b)| a ^ b).collect::<Vec<u8>>()
+        };
+        assert_ne!(combine(&mis_a, &refreshed[1]), cek, "a coordinate-mismatched delta breaks the pair");
+        assert_eq!(combine(&refreshed[1], &refreshed[2]), cek, "the correctly-refreshed pair is unaffected");
+
+        // Fail-closed surface.
+        assert!(crate::shamir_refresh_delta(&refresh, 0).is_err(), "x=0 is the secret, never a node");
+        assert!(crate::shamir_refresh_delta(&[], 1).is_err(), "empty refresh_coeff is refused");
     }
 
     /// The n-node node-set id generalization: byte-identical to the 2-node id for n=2 (no
