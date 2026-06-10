@@ -137,10 +137,32 @@ and PC2/Helia single-chunk**) through a `content_capability_fetch` seam, verifyi
 availability receipt. The capability **fails closed** on an unknown CID *and* on a tampered
 backend (served bytes that don't hash back to the requested CID — content-addressing
 integrity, so a corrupt/malicious store can never substitute content). No raw HTTP, no
-daemon: the backend is in-process, and swapping in the `elastos-server` `StorageProvider`
-(iroh Carrier today; Kubo / Elacity / supernode backends) is a backend change **behind the
-same fetch-by-CID contract**, zero change to the open path. Proven by harness unit tests
+daemon: the backend is in-process, and the production IPFS backend behind the **same
+fetch-by-CID contract** is **Kubo** (the `ipfs-provider` capsule), which speaks the identical
+CIDv1/dag-pb addressing — a backend change with zero change to the open path. (NB: iroh
+Carrier is the runtime's P2P *transport* and uses BLAKE3 blob hashes, **not** IPFS CIDs — it
+is the wire under a backend, not itself an IPFS content-addressed store; an earlier note that
+listed "iroh Carrier" as a fetch-by-CID backend was imprecise.) Proven by harness unit tests
 (CID byte-compat goldens + round-trip + fail-closed) and the live consumer open.
+
+**Content plane — MULTI-MiB media (chunked UnixFS, Helia byte-compatible).** Real media is
+multi-MiB, so the content plane now chunks beyond a single block exactly as `@helia/unixfs`
+`addBytes` does (the call PC2 uses, `pc2-node/src/storage/ipfs.ts`): **1 MiB fixed-size raw
+leaves** under a **dag-pb root** (`bafybei…`), with a single chunk collapsing to its raw leaf
+(`bafkrei…`, Helia `reduceSingleLeafToSelf`). `ContentStore::put_chunked` stores the full block
+graph (leaves + root); `content_capability_fetch_dag` fetches by the **root CID**, verifies the
+root hashes to the requested CID, parses the dag-pb links, fetches + **per-leaf hash-verifies**
+each chunk, and reassembles — checking the UnixFS `filesize` + per-leaf `blocksizes`. It **fails
+closed** on a missing leaf, a tampered leaf or root (hash mismatch), or any length/structure
+mismatch — a corrupt or malicious backend can never substitute, reorder, or truncate content
+under a root the runtime trusts. The dag-pb encoding + root CIDs are pinned **byte-for-byte**
+against the **real Helia importer** by `scripts/dev/unixfs-oracle` (a Node ground-truth oracle
+using `@helia/unixfs` directly) — so a runtime-minted root CID is the SAME identity any IPFS/Helia
+peer resolves to the same bytes. Proven by harness unit tests (oracle goldens for single-chunk
+collapse + 2-/3-leaf dag-pb roots, round-trip, tampered-leaf / missing-leaf / tampered-root
+fail-closed) and a live multi-MiB content-plane gate in the consumer smoke. Remaining: a balanced
+**tree** above one root's fan-out (≈174 leaves / ~174 MiB) — fail-closed today, not guessed
+without an oracle vector.
 
 **Ownership plane (real-by-default) — the open REALLY asks the chain.** The wallet-ownership
 gate is no longer a static `has_access: true`. The canonical open now drives the **real
@@ -156,11 +178,13 @@ on-chain `contentId`) — the mock is a drop-in for the RPC node, nothing else c
 harness unit tests (mock serves the owned/denied bool word; well-formed 32-byte ABI word) and
 the live consumer gates (owned opens; not-owned fails closed), across **all** authority backends.
 
-Remaining on the runnable-E2E ladder: genuinely-playable **multi-MiB media** (chunked UnixFS,
-beyond the single-chunk CENC segment the open fetches today). The segment is already a REAL
-content-addressed CENC fMP4 produced by `encrypt-provider`'s in-boundary engine (the
-decrypt-provider seam goldens + `ddrm-producer-smoke` prove mint→seal→escrow→decrypt-now on real
-fMP4 shapes); the plaintext is validated INSIDE the decrypt boundary (containment — it never
+Remaining on the runnable-E2E ladder: wiring a multi-**segment** CENC asset through the
+**decrypt boundary** end to end (each segment fetched by CID, decrypted in-VM with the right
+sample/segment count). The content-addressing for multi-MiB is now real + Helia-verified (above);
+what's left is the decrypt-side multi-segment loop. The single CENC segment the open decrypts today
+is already a REAL content-addressed CENC fMP4 produced by `encrypt-provider`'s in-boundary engine
+(the decrypt-provider seam goldens + `ddrm-producer-smoke` prove mint→seal→escrow→decrypt-now on
+real fMP4 shapes); plaintext is validated INSIDE the decrypt boundary (containment — it never
 crosses the wire), not at the orchestrator.
 
 ---

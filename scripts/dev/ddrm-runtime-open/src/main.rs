@@ -680,9 +680,16 @@ fn step(n: u32, msg: &str) {
 //
 // `content_capability_fetch` is the SEAM the open speaks (fetch-by-CID). The backend here is an
 // in-process content-addressed store so the gate runs with NO daemon and NO raw HTTP — honoring
-// Principle #4 (capsules speak Carrier-shaped capability calls, not raw sockets/HTTP). Swapping in
-// the `elastos-server` `StorageProvider` (iroh Carrier today; Kubo/Elacity/supernode backends) is a
-// backend change BEHIND this same fetch-by-CID contract, with zero change to the open path.
+// Principle #4 (capsules speak Carrier-shaped capability calls, not raw sockets/HTTP). The
+// production IPFS backend behind this SAME fetch-by-CID contract is Kubo (the `ipfs-provider`
+// capsule), which speaks the identical CIDv1/dag-pb addressing — a backend change with zero change
+// to the open path. (NB: iroh Carrier is the runtime's P2P *transport* and uses BLAKE3 blob hashes,
+// NOT IPFS CIDs — it is the wire under a backend, not itself an IPFS content-addressed store.)
+//
+// Single-chunk content uses a raw CIDv1 (`bafkrei…`); MULTI-MiB content is chunked into 1 MiB raw
+// leaves under a dag-pb root (`bafybei…`), byte-for-byte what `@helia/unixfs` `addBytes` mints (the
+// call PC2 uses, `pc2-node/src/storage/ipfs.ts`). The dag-pb encoding + root CIDs are pinned against
+// the real importer by `scripts/dev/unixfs-oracle` (the ground-truth Helia oracle).
 
 /// Content-address `bytes` as an IPFS **CIDv1** (raw codec, sha2-256 multihash, multibase base32) —
 /// byte-for-byte identical to `encrypt-provider::payload_cid_v1_raw` and PC2/Helia single-chunk
@@ -717,6 +724,270 @@ fn base32_lower_nopad(data: &[u8]) -> String {
     out
 }
 
+// --- chunked UnixFS (multi-MiB content) -------------------------------------------------------
+//
+// `@helia/unixfs` `addBytes` (the call PC2 content-addresses with) splits a file into 1 MiB
+// fixed-size RAW leaves and, above one chunk, builds a balanced dag-pb root linking them. A
+// single chunk COLLAPSES to its raw leaf (Helia `reduceSingleLeafToSelf`). We reproduce that
+// byte-for-byte so a multi-MiB asset gets ONE root CID that is identical to Helia's (pinned by
+// `scripts/dev/unixfs-oracle`).
+
+/// Helia fixed-size chunk (1 MiB). Matches `encrypt-provider::UNIXFS_SINGLE_CHUNK_MAX`.
+const UNIXFS_CHUNK_SIZE: usize = 1_048_576;
+
+/// `@helia/unixfs` balanced-layout default fan-out. Our multi-MiB media fits a SINGLE dag-pb root
+/// over up to this many leaves; above it a balanced TREE of intermediate nodes is required, which
+/// we DO NOT guess without an oracle vector — fail closed instead.
+const UNIXFS_MAX_LEAVES_SINGLE_ROOT: usize = 174;
+
+/// The raw 36-byte CIDv1 binary of `chunk` (`0x01 0x55 0x12 0x20 ‖ sha2-256`) — the bytes a dag-pb
+/// `PBLink` carries as its `Hash`, the same identity `payload_cid_v1_raw` renders as a string.
+fn raw_cid_binary(chunk: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(chunk);
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&[0x01, 0x55, 0x12, 0x20]);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Content-address a dag-pb block as a **CIDv1** (codec 0x70, sha2-256, multibase base32) — the
+/// identity of a UnixFS root, byte-for-byte what Helia mints for a multi-chunk file (`bafybei…`).
+fn dag_pb_cid_v1(block: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(block);
+    let mut cid_bytes = Vec::with_capacity(4 + digest.len());
+    cid_bytes.extend_from_slice(&[0x01, 0x70, 0x12, 0x20]);
+    cid_bytes.extend_from_slice(&digest);
+    format!("b{}", base32_lower_nopad(&cid_bytes))
+}
+
+/// Append `value` as a protobuf base-128 varint (LEB128).
+fn put_uvarint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Encode a length-delimited protobuf field: `<tag(field,wire=2)><len><bytes>`.
+fn put_len_field(buf: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    put_uvarint(buf, (field << 3) | 2);
+    put_uvarint(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+/// Encode a varint protobuf field: `<tag(field,wire=0)><varint>`.
+fn put_varint_field(buf: &mut Vec<u8>, field: u64, value: u64) {
+    put_uvarint(buf, field << 3);
+    put_uvarint(buf, value);
+}
+
+/// Build the UnixFS `Data` for a chunked File: `Type=File(2)`, `filesize`, repeated `blocksizes`
+/// (field order 1,3,4 — the exact bytes Helia emits; no inline `Data`, no hashType/fanout).
+fn unixfs_file_data(filesize: u64, blocksizes: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint_field(&mut out, 1, 2);
+    put_varint_field(&mut out, 3, filesize);
+    for &bs in blocksizes {
+        put_varint_field(&mut out, 4, bs);
+    }
+    out
+}
+
+/// Build one dag-pb `PBLink` for a raw leaf: `Hash(1)=<cid bytes>`, `Name(2)=""` (present + empty,
+/// as Helia sets it), `Tsize(3)=<raw byte length>` — field order 1,2,3.
+fn pb_link(leaf_cid_binary: &[u8], tsize: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_len_field(&mut out, 1, leaf_cid_binary);
+    put_len_field(&mut out, 2, b"");
+    put_varint_field(&mut out, 3, tsize);
+    out
+}
+
+/// Build the dag-pb `PBNode` for a chunked UnixFS file: every `PBLink` (field 2) FIRST in leaf
+/// order, then the UnixFS `Data` (field 1) — the canonical @ipld/dag-pb byte order.
+fn dag_pb_file_node(links: &[(Vec<u8>, u64)], unixfs_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (cid_binary, tsize) in links {
+        let link = pb_link(cid_binary, *tsize);
+        put_len_field(&mut out, 2, &link);
+    }
+    put_len_field(&mut out, 1, unixfs_data);
+    out
+}
+
+/// A content-addressed block graph: `(CID, block bytes)` pairs (raw leaves + a dag-pb root).
+type ContentBlocks = Vec<(String, Vec<u8>)>;
+
+/// Import `bytes` as Helia-compatible UnixFS → `(root_cid, blocks)` where `blocks` is every
+/// content-addressed block (raw leaves + the dag-pb root) keyed by CID. Mirrors `@helia/unixfs`
+/// `addBytes` defaults (1 MiB fixed-size raw leaves, single dag-pb root, single-chunk collapse to
+/// the raw leaf). Fails closed above one root's fan-out (no guessed intermediate-node tree).
+fn unixfs_import(bytes: &[u8]) -> Result<(String, ContentBlocks), String> {
+    // Empty input is one empty leaf (Helia's empty-file CID); else chunk into <=1 MiB leaves.
+    let chunks: Vec<&[u8]> =
+        if bytes.is_empty() { vec![bytes] } else { bytes.chunks(UNIXFS_CHUNK_SIZE).collect() };
+    // Single chunk collapses to the raw leaf (Helia `reduceSingleLeafToSelf`): root == leaf CID.
+    if chunks.len() == 1 {
+        let cid = payload_cid_v1_raw(chunks[0]);
+        return Ok((cid.clone(), vec![(cid, chunks[0].to_vec())]));
+    }
+    if chunks.len() > UNIXFS_MAX_LEAVES_SINGLE_ROOT {
+        return Err(format!(
+            "{} leaves exceeds the {UNIXFS_MAX_LEAVES_SINGLE_ROOT}-leaf single-root fan-out; a \
+             balanced dag-pb TREE is required and is not built without an oracle vector",
+            chunks.len()
+        ));
+    }
+    let mut blocks: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunks.len() + 1);
+    let mut links: Vec<(Vec<u8>, u64)> = Vec::with_capacity(chunks.len());
+    let mut blocksizes: Vec<u64> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        blocks.push((payload_cid_v1_raw(chunk), chunk.to_vec()));
+        links.push((raw_cid_binary(chunk), chunk.len() as u64));
+        blocksizes.push(chunk.len() as u64);
+    }
+    let unixfs_data = unixfs_file_data(bytes.len() as u64, &blocksizes);
+    let root_block = dag_pb_file_node(&links, &unixfs_data);
+    let root_cid = dag_pb_cid_v1(&root_block);
+    blocks.push((root_cid.clone(), root_block));
+    Ok((root_cid, blocks))
+}
+
+/// Read a protobuf base-128 varint at `*pos`, advancing it. Fail-closed on truncation/overflow.
+fn read_uvarint(buf: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *buf.get(*pos).ok_or("truncated varint")?;
+        *pos += 1;
+        if shift >= 64 {
+            return Err("varint overflow".to_string());
+        }
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(result)
+}
+
+/// A parsed dag-pb file root: ordered raw-leaf links `(cid_string, tsize)` + the UnixFS filesize +
+/// per-leaf blocksizes — just what the content capability needs to fetch + verify a chunked file.
+struct DagPbFileRoot {
+    leaves: Vec<(String, u64)>,
+    filesize: u64,
+    blocksizes: Vec<u64>,
+}
+
+/// Parse a dag-pb `PBLink` → `(raw leaf CID string, Tsize)`. `Name` is ignored.
+fn parse_pb_link(link: &[u8]) -> Result<(String, u64), String> {
+    let mut pos = 0;
+    let mut hash: Option<Vec<u8>> = None;
+    let mut tsize: u64 = 0;
+    while pos < link.len() {
+        let tag = read_uvarint(link, &mut pos)?;
+        match (tag >> 3, tag & 0x7) {
+            (1, 2) => {
+                let len = read_uvarint(link, &mut pos)? as usize;
+                let end = pos.checked_add(len).ok_or("link hash overflow")?;
+                hash = Some(link.get(pos..end).ok_or("truncated link hash")?.to_vec());
+                pos = end;
+            }
+            (3, 0) => tsize = read_uvarint(link, &mut pos)?,
+            (_, 0) => {
+                read_uvarint(link, &mut pos)?;
+            }
+            (_, 2) => {
+                let len = read_uvarint(link, &mut pos)? as usize;
+                pos = pos.checked_add(len).ok_or("link skip overflow")?;
+            }
+            (_, w) => return Err(format!("unsupported PBLink wire type {w}")),
+        }
+    }
+    let hash = hash.ok_or("PBLink has no Hash")?;
+    Ok((format!("b{}", base32_lower_nopad(&hash)), tsize))
+}
+
+/// Parse a UnixFS `Data` message → `(filesize, blocksizes)`; fail closed if it is not a File.
+fn parse_unixfs_file_data(data: &[u8]) -> Result<(u64, Vec<u64>), String> {
+    let mut pos = 0;
+    let mut typ: Option<u64> = None;
+    let mut filesize: u64 = 0;
+    let mut blocksizes: Vec<u64> = Vec::new();
+    while pos < data.len() {
+        let tag = read_uvarint(data, &mut pos)?;
+        match (tag >> 3, tag & 0x7) {
+            (1, 0) => typ = Some(read_uvarint(data, &mut pos)?),
+            (3, 0) => filesize = read_uvarint(data, &mut pos)?,
+            (4, 0) => blocksizes.push(read_uvarint(data, &mut pos)?),
+            (_, 0) => {
+                read_uvarint(data, &mut pos)?;
+            }
+            (_, 2) => {
+                let len = read_uvarint(data, &mut pos)? as usize;
+                pos = pos.checked_add(len).ok_or("unixfs skip overflow")?;
+            }
+            (_, w) => return Err(format!("unsupported UnixFS wire type {w}")),
+        }
+    }
+    if typ != Some(2) {
+        return Err(format!("UnixFS Data is not a File (Type={typ:?})"));
+    }
+    Ok((filesize, blocksizes))
+}
+
+/// Parse a dag-pb file root `PBNode`: Links (field 2) + the UnixFS `Data` (field 1).
+fn parse_dag_pb_file_root(block: &[u8]) -> Result<DagPbFileRoot, String> {
+    let mut pos = 0;
+    let mut leaves: Vec<(String, u64)> = Vec::new();
+    let mut data_msg: Option<Vec<u8>> = None;
+    while pos < block.len() {
+        let tag = read_uvarint(block, &mut pos)?;
+        match (tag >> 3, tag & 0x7) {
+            (2, 2) => {
+                let len = read_uvarint(block, &mut pos)? as usize;
+                let end = pos.checked_add(len).ok_or("link length overflow")?;
+                leaves.push(parse_pb_link(block.get(pos..end).ok_or("truncated link")?)?);
+                pos = end;
+            }
+            (1, 2) => {
+                let len = read_uvarint(block, &mut pos)? as usize;
+                let end = pos.checked_add(len).ok_or("data length overflow")?;
+                data_msg = Some(block.get(pos..end).ok_or("truncated data")?.to_vec());
+                pos = end;
+            }
+            (_, 0) => {
+                read_uvarint(block, &mut pos)?;
+            }
+            (_, 2) => {
+                let len = read_uvarint(block, &mut pos)? as usize;
+                pos = pos.checked_add(len).ok_or("node skip overflow")?;
+            }
+            (_, w) => return Err(format!("unsupported PBNode wire type {w}")),
+        }
+    }
+    let data = data_msg.ok_or("dag-pb root has no UnixFS Data")?;
+    let (filesize, blocksizes) = parse_unixfs_file_data(&data)?;
+    if blocksizes.len() != leaves.len() {
+        return Err(format!(
+            "UnixFS blocksizes ({}) != dag-pb links ({})",
+            blocksizes.len(),
+            leaves.len()
+        ));
+    }
+    Ok(DagPbFileRoot { leaves, filesize, blocksizes })
+}
+
 /// A content-addressed store — the in-process backend behind the content capability. Keys are the
 /// CIDv1 of the bytes, so storage IS content-addressing.
 struct ContentStore {
@@ -733,6 +1004,17 @@ impl ContentStore {
         let cid = payload_cid_v1_raw(bytes);
         self.blocks.insert(cid.clone(), bytes.to_vec());
         cid
+    }
+
+    /// Publish bytes as chunked UnixFS (Helia-compatible); stores every block (raw leaves + the
+    /// dag-pb root) and returns the ROOT CID — a raw `bafkrei…` for single-chunk content, a dag-pb
+    /// `bafybei…` for multi-chunk. The identity any IPFS/Helia peer would resolve to the same bytes.
+    fn put_chunked(&mut self, bytes: &[u8]) -> Result<String, String> {
+        let (root, blocks) = unixfs_import(bytes)?;
+        for (cid, block) in blocks {
+            self.blocks.insert(cid, block);
+        }
+        Ok(root)
     }
 }
 
@@ -766,6 +1048,79 @@ fn content_capability_fetch(
     Ok((
         bytes.clone(),
         AvailabilityReceiptV1 { cid: cid.to_string(), size: bytes.len(), backend: "in-process-content-addressed" },
+    ))
+}
+
+/// The content capability for a (possibly multi-MiB, chunked) UnixFS root: fetch by ROOT CID and
+/// reassemble the file with per-BLOCK content-addressing integrity. A raw root (`bafkrei…`,
+/// single-chunk) returns its bytes directly; a dag-pb root (`bafybei…`) is verified to hash to the
+/// requested CID, parsed, and each raw leaf is fetched + verified to hash to its link, concatenated,
+/// and checked against the UnixFS filesize + per-leaf blocksizes. Fails CLOSED on a missing block, a
+/// TAMPERED block (hash mismatch), or any length/structure mismatch — a corrupt or malicious backend
+/// can never substitute, reorder, or truncate content under a root the runtime trusts.
+fn content_capability_fetch_dag(
+    store: &ContentStore,
+    root_cid: &str,
+) -> Result<(Vec<u8>, AvailabilityReceiptV1), String> {
+    let root_block = store
+        .blocks
+        .get(root_cid)
+        .ok_or_else(|| format!("content {root_cid} is not available via the content capability"))?;
+    // Single-chunk raw root: the bytes ARE the content (integrity == raw CID recompute).
+    if payload_cid_v1_raw(root_block) == root_cid {
+        return Ok((
+            root_block.clone(),
+            AvailabilityReceiptV1 {
+                cid: root_cid.to_string(),
+                size: root_block.len(),
+                backend: "in-process-content-addressed (raw leaf)",
+            },
+        ));
+    }
+    // Otherwise it must be a dag-pb root that hashes to the requested CID (root integrity FIRST).
+    if dag_pb_cid_v1(root_block) != root_cid {
+        return Err(format!(
+            "content-address integrity failure: root block hashes to neither the raw nor the dag-pb \
+             form of {root_cid} — fail closed rather than serve a substituted root"
+        ));
+    }
+    let root = parse_dag_pb_file_root(root_block)?;
+    let mut content = Vec::with_capacity(root.filesize as usize);
+    for (i, (leaf_cid, tsize)) in root.leaves.iter().enumerate() {
+        let leaf = store
+            .blocks
+            .get(leaf_cid)
+            .ok_or_else(|| format!("leaf {leaf_cid} (chunk {i}) is not available — fail closed"))?;
+        // Per-leaf content-addressing integrity: the served leaf MUST hash to its link CID.
+        if payload_cid_v1_raw(leaf) != *leaf_cid {
+            return Err(format!(
+                "content-address integrity failure: chunk {i} served bytes do not hash to {leaf_cid} \
+                 — a tampered leaf can never be substituted"
+            ));
+        }
+        if leaf.len() as u64 != *tsize || leaf.len() as u64 != root.blocksizes[i] {
+            return Err(format!(
+                "chunk {i} length {} mismatches its link Tsize {tsize} / blocksize {}",
+                leaf.len(),
+                root.blocksizes[i]
+            ));
+        }
+        content.extend_from_slice(leaf);
+    }
+    if content.len() as u64 != root.filesize {
+        return Err(format!(
+            "reassembled {} bytes != the UnixFS filesize {} — fail closed",
+            content.len(),
+            root.filesize
+        ));
+    }
+    Ok((
+        content,
+        AvailabilityReceiptV1 {
+            cid: root_cid.to_string(),
+            size: root.filesize as usize,
+            backend: "in-process-content-addressed (dag-pb)",
+        },
     ))
 }
 
@@ -4775,10 +5130,37 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let ciphertext_b64 = B64.encode(&fetched_ciphertext);
     println!(
         "  [content-plane] ciphertext fetched by its CIDv1 ({}) through the content capability \
-         (in-process content-addressed backend; swappable for iroh Carrier / Kubo) — no raw HTTP; \
+         (in-process content-addressed backend; swappable for the Kubo IPFS backend) — no raw HTTP; \
          availability receipt verified ({} bytes via {})",
         availability.cid, availability.size, availability.backend
     );
+
+    // --- CONTENT PLANE (multi-MiB): the SAME fetch-by-CID contract scales to chunked UnixFS. A
+    // sealed segment is one raw block, but real media is multi-MiB. Publish a multi-MiB blob as
+    // Helia-compatible chunked UnixFS (1 MiB raw leaves under a dag-pb root — the SAME bytes
+    // `@helia/unixfs` `addBytes` mints, pinned by `scripts/dev/unixfs-oracle`), fetch it back BY ITS
+    // ROOT CID with per-leaf integrity, and prove a tampered leaf fails closed. Pure content-plane
+    // (independent of the CEK / decrypt transcript); verify mode only.
+    if cfg.mode == OpenMode::Verify {
+        let media: Vec<u8> = (0..(2 * 1_048_576 + 4_096)).map(|i| (i & 0xff) as u8).collect();
+        let mut media_store = ContentStore::new();
+        let root = media_store.put_chunked(&media)?;
+        let (reassembled, media_avail) = content_capability_fetch_dag(&media_store, &root)?;
+        if reassembled != media {
+            return Err("multi-MiB content did not reassemble to the published bytes".to_string());
+        }
+        let leaf0 = payload_cid_v1_raw(&media[..1_048_576]);
+        media_store.blocks.insert(leaf0, vec![0u8; 1_048_576]);
+        if content_capability_fetch_dag(&media_store, &root).is_ok() {
+            return Err("a tampered leaf was served — content integrity failed open".to_string());
+        }
+        println!(
+            "  [content-plane/multi-MiB] {}-byte media published as chunked UnixFS (Helia-byte-compatible \
+             dag-pb root {}), fetched back BY ROOT CID + reassembled ({} bytes via {}); a tampered leaf \
+             failed closed",
+            media.len(), root, media_avail.size, media_avail.backend
+        );
+    }
 
     *key_material.borrow_mut() = Some(KeyOpenMaterial {
         kid_hex: kid_hex.clone(),
@@ -5631,6 +6013,103 @@ mod content_plane_tests {
     fn content_address_is_collision_sensitive() {
         assert_ne!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0002"));
         assert_eq!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0001"));
+    }
+
+    // --- multi-MiB chunked UnixFS ---------------------------------------------------------------
+
+    /// The cross-language deterministic byte stream the `scripts/dev/unixfs-oracle` Helia oracle
+    /// used to mint the golden root CIDs below (`out[i] = (i + seed) & 0xff`).
+    fn det_bytes(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i + seed) & 0xff) as u8).collect()
+    }
+
+    const MIB: usize = 1_048_576;
+
+    /// The dag-pb root CID our importer mints for multi-MiB content is BYTE-FOR-BYTE what the REAL
+    /// `@helia/unixfs` `addBytes` (the call PC2 uses) produces — pinned against the oracle goldens.
+    /// Equality of the root CID transitively proves the dag-pb block bytes are byte-identical (the
+    /// CID is sha2-256 of that block). Covers single-chunk collapse + 2- and 3-leaf dag-pb roots.
+    #[test]
+    fn unixfs_root_cid_matches_helia_oracle() {
+        let cases: &[(Vec<u8>, &str)] = &[
+            (det_bytes(0, 0), "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"),
+            (b"abc".to_vec(), "bafkreif2pall7dybz7vecqka3zo24irdwabwdi4wc55jznaq75q7eaavvu"),
+            (det_bytes(MIB, 256), "bafkreih3xkzit57zjmsxg3cyxzdktfgeih6qevjmyybcguxd3bws7k34qm"),
+            (det_bytes(MIB + 1, 257), "bafybeidqnoughpohfft5gkvy5kh7iglp556xedbdxxcfngjy22lm37p5k4"),
+            (det_bytes(2 * MIB + MIB / 2, 546), "bafybeicgrbzvwivnauy6ideyy3hgxb3auouofedlgayoibdbwmqqvevspa"),
+            (det_bytes(3 * MIB, 819), "bafybeia2icvdgx6lyddzql2654yt2q4wzjcf3z2u7jmlimyrvfg2mq64ba"),
+        ];
+        for (bytes, expected_root) in cases {
+            let mut store = ContentStore::new();
+            let root = store.put_chunked(bytes).expect("import");
+            assert_eq!(&root, expected_root, "root CID for {} bytes", bytes.len());
+        }
+    }
+
+    /// A single chunk (<=1 MiB) COLLAPSES to its raw leaf — the root is the raw CID of the bytes,
+    /// identical to `payload_cid_v1_raw` (Helia `reduceSingleLeafToSelf`). No dag-pb node is made.
+    #[test]
+    fn single_chunk_collapses_to_raw_leaf() {
+        let mut store = ContentStore::new();
+        let bytes = det_bytes(MIB, 7); // exactly one chunk
+        let root = store.put_chunked(&bytes).expect("import");
+        assert_eq!(root, payload_cid_v1_raw(&bytes));
+        assert!(root.starts_with("bafkrei"), "raw CIDv1: {root}");
+        assert_eq!(store.blocks.len(), 1, "no dag-pb root block for single-chunk content");
+    }
+
+    /// Multi-MiB content publishes → fetches BY ITS ROOT CID → reassembles to exactly the original
+    /// bytes, through the dag-pb path (parse links, fetch + verify each leaf, concatenate).
+    #[test]
+    fn chunked_content_round_trips_by_root_cid() {
+        let mut store = ContentStore::new();
+        let bytes = det_bytes(2 * MIB + 12_345, 99);
+        let root = store.put_chunked(&bytes).expect("import");
+        assert!(root.starts_with("bafybei"), "multi-chunk => dag-pb root: {root}");
+        let (fetched, receipt) = content_capability_fetch_dag(&store, &root).expect("fetch by root");
+        assert_eq!(fetched, bytes, "reassembled bytes equal the published file");
+        assert_eq!(receipt.size, bytes.len());
+        assert_eq!(receipt.cid, root);
+    }
+
+    /// A TAMPERED leaf (bytes mutated under its CID) is caught by per-block content-addressing: the
+    /// served leaf no longer hashes to its link, so reassembly fails closed rather than serve it.
+    #[test]
+    fn chunked_fetch_fails_closed_on_tampered_leaf() {
+        let mut store = ContentStore::new();
+        let bytes = det_bytes(2 * MIB + 5, 3);
+        let root = store.put_chunked(&bytes).expect("import");
+        // Mutate the FIRST 1 MiB leaf under its key (a corrupt/malicious backend).
+        let leaf0 = payload_cid_v1_raw(&bytes[..MIB]);
+        store.blocks.insert(leaf0, vec![0u8; MIB]);
+        let err = content_capability_fetch_dag(&store, &root).expect_err("tampered leaf must fail");
+        assert!(err.contains("integrity"), "fail-closed names the integrity failure: {err}");
+    }
+
+    /// A MISSING leaf (an unavailable chunk) fails closed — the file is never partially served.
+    #[test]
+    fn chunked_fetch_fails_closed_on_missing_leaf() {
+        let mut store = ContentStore::new();
+        let bytes = det_bytes(2 * MIB + 5, 4);
+        let root = store.put_chunked(&bytes).expect("import");
+        let leaf1 = payload_cid_v1_raw(&bytes[MIB..2 * MIB]);
+        store.blocks.remove(&leaf1);
+        let err = content_capability_fetch_dag(&store, &root).expect_err("missing leaf must fail");
+        assert!(err.contains("not available"), "fail-closed names the miss: {err}");
+    }
+
+    /// A TAMPERED dag-pb root (links/sizes mutated) no longer hashes to the requested root CID, so
+    /// the capability refuses it before fetching any leaf — the root itself is content-addressed.
+    #[test]
+    fn chunked_fetch_fails_closed_on_tampered_root() {
+        let mut store = ContentStore::new();
+        let bytes = det_bytes(2 * MIB + 5, 6);
+        let root = store.put_chunked(&bytes).expect("import");
+        let mut tampered = store.blocks.get(&root).unwrap().clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        store.blocks.insert(root.clone(), tampered);
+        let err = content_capability_fetch_dag(&store, &root).expect_err("tampered root must fail");
+        assert!(err.contains("integrity"), "fail-closed names the integrity failure: {err}");
     }
 }
 
