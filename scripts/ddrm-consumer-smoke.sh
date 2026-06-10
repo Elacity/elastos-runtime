@@ -31,6 +31,7 @@ set -uo pipefail
 BACKEND="reference"
 THRESHOLD="false"
 TRANSPORT="unix"
+NODES="2"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend) BACKEND="${2:-}"; shift 2 ;;
@@ -39,6 +40,11 @@ while [[ $# -gt 0 ]]; do
     # CEK so neither node ever holds the whole key, and drives the full dual-recover + in-VM combine.
     # Implies --backend dkms (the only backend with external secret-holders).
     --threshold) THRESHOLD="true"; BACKEND="dkms"; shift ;;
+    # 2-of-3 QUORUM (Day 113–116): THREE secret-holding nodes, the CEK Shamir-split over GF(256)
+    # into indexed shares — ANY TWO live nodes serve an open (the rail survives a dead node), and
+    # below quorum it fails closed. Implies --threshold (and so --backend dkms).
+    --nodes) NODES="${2:-}"; shift 2 ;;
+    --nodes=*) NODES="${1#*=}"; shift ;;
     # NETWORK TRANSPORT (Day 105–108): the dKMS node daemons listen on REAL TCP endpoints
     # (tcp:127.0.0.1:PORT) instead of Unix sockets; the rail requires the app-layer encrypted,
     # mutually-authenticated channel and the network adversarial gates run (plaintext recover
@@ -65,13 +71,27 @@ if [[ "$TRANSPORT" == "tcp" && "$BACKEND" != "dkms" ]]; then
   echo "FAIL: --transport tcp requires --backend dkms" >&2
   exit 2
 fi
+if [[ "$NODES" != "2" && "$NODES" != "3" ]]; then
+  echo "FAIL: --nodes must be 2|3 (got '${NODES}')" >&2
+  exit 2
+fi
+if [[ "$NODES" == "3" && "$THRESHOLD" != "true" ]]; then
+  echo "FAIL: --nodes 3 requires --threshold" >&2
+  exit 2
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CAPSULES="${REPO_ROOT}/capsules"
 ORCH="${REPO_ROOT}/scripts/dev/ddrm-runtime-open"
 
 MODE_LABEL="${BACKEND}"
-if [[ "$THRESHOLD" == "true" ]]; then MODE_LABEL="${BACKEND}, 2-of-2 threshold"; fi
+if [[ "$THRESHOLD" == "true" ]]; then
+  if [[ "$NODES" == "3" ]]; then
+    MODE_LABEL="${BACKEND}, 2-of-3 quorum"
+  else
+    MODE_LABEL="${BACKEND}, 2-of-2 threshold"
+  fi
+fi
 if [[ "$TRANSPORT" == "tcp" ]]; then MODE_LABEL="${MODE_LABEL}, tcp + encrypted channel"; fi
 
 echo "=============================================================="
@@ -160,7 +180,7 @@ fi
 # delegates recovery to (its master never crosses into the runtime).
 AUTHORITY_JSON="{ \"backend\": \"${BACKEND}\" }"
 if [[ "$BACKEND" == "dkms" ]]; then
-  AUTHORITY_JSON="{ \"backend\": \"dkms\", \"dkms_authority_bin\": \"${DKMS_NODE_BIN}\", \"threshold\": ${THRESHOLD}, \"transport\": \"${TRANSPORT}\" }"
+  AUTHORITY_JSON="{ \"backend\": \"dkms\", \"dkms_authority_bin\": \"${DKMS_NODE_BIN}\", \"threshold\": ${THRESHOLD}, \"nodes\": ${NODES}, \"transport\": \"${TRANSPORT}\" }"
 fi
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddrm-runtime-open.XXXXXX")"
 CONFIG_JSON="${WORK_DIR}/open-config.json"

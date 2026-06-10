@@ -5,9 +5,10 @@
 # Proves the chain's front door executes correctly under a real WASI host
 # (wasmtime) and that the fail-closed contract holds in the sandbox: blocked raw
 # authority advertised, the canonical open sequence declared, malformed input and
-# non-sealed objects rejected, and a valid open fails closed (not_configured)
-# until the rights/key/decrypt providers + runtime events exist
-# (see docs/convergence/DDRM_DECRYPT_RAIL.md).
+# non-sealed objects rejected, and a valid open emits ONLY the executable
+# DrmOpenPlanV1 (Day 67: `status: planned` — the plan the runtime host executes)
+# with NO session and NO key material; the rights/key/decrypt providers do the
+# actual work (see docs/convergence/DDRM_DECRYPT_RAIL.md).
 #
 # Usage: capsules/drm-provider/scripts/wasm-smoke.sh
 # Exit code: 0 if all cases pass, 1 otherwise.
@@ -57,8 +58,18 @@ run_case "status declares canonical open sequence" \
 run_case "malformed op fails closed" \
   '{"op":"bogus"}' '"code":"invalid_request"' || failures=$((failures + 1))
 
-run_case "valid open fails closed (chain not configured yet)" \
-  "$VALID_OPEN" '"code":"not_configured"' || failures=$((failures + 1))
+# Day 67+: a valid open is fail-closed by SHAPE — the orchestrator emits the
+# executable plan (`elastos.drm.open.plan/v1`, status `planned`) and NEVER a
+# session or key material; executing the plan is the runtime host's job.
+run_case "valid open emits the canonical plan (planned, no session/key)" \
+  "$VALID_OPEN" '"schema":"elastos.drm.open.plan/v1"' || failures=$((failures + 1))
+plan_out="$(printf '%s\n' "$VALID_OPEN" | wasmtime run "$WASM" 2>/dev/null)"
+if [[ "$plan_out" == *'"status":"planned"'* && "$plan_out" != *'"wrapped_cek"'* && "$plan_out" != *'decrypt_session_pub'* ]]; then
+  echo "   PASS (plan is planned-only: no CEK, no session material)"
+else
+  echo "   FAIL (plan must be planned-only with no key/session material)"
+  failures=$((failures + 1))
+fi
 
 run_case "non-sealed object rejected" \
   "$NON_SEALED" '"code":"invalid_request"' || failures=$((failures + 1))

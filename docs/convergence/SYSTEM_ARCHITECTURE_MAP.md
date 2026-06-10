@@ -369,6 +369,40 @@ decrypt-provider OpenSessionV1`.
   (escrow → durable fixture) then an OPEN phase via `DrmHost::launch` that RELAUNCHES the authority from the
   SAME store, PROVES the recipient is byte-identical across the relaunch, READS the fixture (never
   re-escrows), binds only the per-open session AAD. drift untouched.
+- **Status (Day 113–116):** the threshold is REAL t-of-n — the CEK is SHAMIR-split 2-of-3 over GF(256) into INDEXED
+  shares across THREE secret-holding dKMS nodes; ANY TWO live nodes serve an open, so the production rail SURVIVES a
+  dead node while BELOW quorum it still fails closed. Audited PC2 first: PC2's only t-of-n is the LEGACY Lit
+  `decryptAndCombine` (`non-media-decrypt.js:76`) — threshold BLS across Lit's own nodes, combined inside Lit's TEE;
+  t, n, the membership, and the failover policy are all INVISIBLE and unconfigurable (availability is RENTED, not
+  owned) — and its CURRENT Chipotle path abandoned t-of-n entirely for a SINGLE master PKP inside ONE TEE endpoint
+  (`chipotle-client.ts:1290`). The runtime now OWNS what PC2 rents: explicit t and n, our own field arithmetic, an
+  explicit quorum policy, and gated failover. (1) PRIMITIVES (ddrm-envelope 29→33): GF(256) arithmetic (`gf256_mul`
+  over the AES polynomial 0x11B with constant control-flow; `gf256_inv` via a^254) + `split_cek_shamir2(cek, coeff)`
+  (degree-1 `p(x)=cek[j]⊕coeff[j]·x` per byte, shares at x=1,2,3 — any single share information-theoretically
+  useless) + `combine_cek_shamir2(x_a, share_a, x_b, share_b)` (Lagrange interpolation at x=0, distinct non-zero
+  coordinates enforced, `Zeroizing` output, golden vector pinned) + `indexed_share`/`parse_indexed_share`
+  (`x ‖ share` — the coordinate rides INSIDE the sealed envelope, authenticated by the escrow seal + every node
+  re-seal, never forgeable cleartext JSON) + `threshold_node_set_id_n(t, vks)` — the n-node node-set identity,
+  BYTE-IDENTICAL to the 2-node id so nothing re-pins on upgrade. (2) CLIENT (key-provider 45→47): the descriptor
+  resolves a THREE-node `threshold` block (`t:2`, all node identities pairwise DISTINCT, fail-closed otherwise);
+  `release_quorum` tries node A→B→C in order and succeeds with re-sealed indexed shares from ANY TWO live nodes — a
+  dead node is a TOLERATED FAULT, not a failed open — while below quorum the release is REFUSED outright (no
+  single-share material is ever emitted); the third share escrow is REQUIRED in the session context (a missing
+  escrow is a config error, never a silent degrade). (3) DECRYPT BOUNDARY (rail-material 70→72): a THIRD pinned vk
+  (`authority_vk3_b64`, requires vk2) flips the boundary into quorum mode; `decrypt_from_carrier_quorum` verifies
+  EACH sealed share against the pinned node identities and REQUIRES the x-coordinate found INSIDE the authenticated
+  payload to MATCH the verifying node's index — a MIS-INDEXED share fails even though its signature verifies, a
+  DUPLICATED share (x_a == x_b — one secret-holder twice) is refused, and the Lagrange reconstruction happens ONLY
+  in-boundary. (4) RUNTIME + GATES 36–41 (live daemons, real node-kills, through the production `DrmHost`):
+  `authority.nodes` (2|3; 3 requires `threshold`; anything else fails closed), three-daemon provisioning, Shamir
+  split at publish; (36) node C KILLED → the open SURVIVES (A+B serve, durable records persisted); (37) nodes A+C
+  dead → BELOW quorum → fail closed, no record; (38) node A restored → a DIFFERENT live pair serves the same
+  content (any-2-of-3, not a fixed pair); (39) node B killed → A+C serve — the x=1/x=3 Lagrange pair's first
+  production use; (40) a MIS-INDEXED share (genuine node B re-sealing a payload that claims node A's x) fails at
+  the boundary; (41) a DUPLICATED share (one node's re-sealed view in both material slots) fails closed. NEW
+  `ddrm-consumer-dkms-quorum-smoke.sh` (`--threshold --nodes 3`); the 2-of-2 XOR rail (+ its rotation/revocation
+  gates) is untouched and still green. Gate: ladder INTACT (ddrm-envelope=33, key-provider[key-authority-ref]=47,
+  decrypt-provider[rail-material]=72), drift PASS, ALL dDRM smokes green, clippy clean.
 - **Status (Day 109–112):** the secret-holders have a LIFECYCLE — live share-wise ROTATION to successor nodes with a
   proactive REFRESH, OPERATOR-ONLY authorization, and LIVE CALLER REVOCATION that outranks a live session. Audited PC2
   first: PC2 has NO key-authority rotation concept (a constant redeploy, `chipotle-client.ts:125`, or a supernode

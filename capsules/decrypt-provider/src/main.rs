@@ -262,6 +262,14 @@ struct DecryptProvider {
     // second sealed share. Absent for the single-node rail (threshold off).
     #[cfg(feature = "rail-live")]
     authority_vk2: Option<Vec<u8>>,
+    // The THIRD trusted dKMS-node ML-DSA-65 verifying key (2-of-3 QUORUM, Day
+    // 113–116, `rail-material`). Provisioned at `init` (`authority_vk3_b64`). When
+    // present the boundary is a 2-of-3 quorum boundary: the CEK was Shamir-split
+    // across THREE nodes and ANY TWO indexed re-sealed shares reconstruct it
+    // (`rail_shim::decrypt_from_carrier_quorum`); each share verifies under the
+    // pinned identity its x-coordinate names. Absent → the 2-of-2/single rails.
+    #[cfg(feature = "rail-live")]
+    authority_vk3: Option<Vec<u8>>,
     // The published decrypt-session public key (transcript binding, `rail-bind`).
     // It is minted in-sandbox and is what the key authority seals the CEK to; it
     // is bound into the transcript so a carrier cannot be replayed against a
@@ -335,6 +343,23 @@ impl DecryptProvider {
             match b64.decode(vk_b64) {
                 Ok(vk) => self.authority_vk2 = Some(vk),
                 Err(_) => return Response::error("invalid_request", "authority_vk2_b64 is not valid base64"),
+            }
+        }
+
+        // The THIRD node verifying key promotes this boundary to a 2-of-3 QUORUM
+        // (Day 113–116). It only makes sense alongside the second — a third pinned
+        // identity with no second is a misconfigured node-set; fail closed at init
+        // rather than guess which rail was meant.
+        if let Some(vk_b64) = config.get("authority_vk3_b64").and_then(Value::as_str) {
+            if self.authority_vk2.is_none() {
+                return Response::error(
+                    "invalid_request",
+                    "authority_vk3_b64 without authority_vk2_b64 — a 2-of-3 quorum needs all three pinned node identities",
+                );
+            }
+            match b64.decode(vk_b64) {
+                Ok(vk) => self.authority_vk3 = Some(vk),
+                Err(_) => return Response::error("invalid_request", "authority_vk3_b64 is not valid base64"),
             }
         }
 
@@ -731,7 +756,13 @@ impl DecryptProvider {
                 return Response::error("not_configured", "trusted key-authority verifying key is not configured")
             }
         };
-        let node_set_id = ddrm_envelope::threshold_node_set_id(2, authority_vk, authority_vk2);
+        // Day 113–116: a THIRD pinned identity makes this a 2-of-3 QUORUM boundary — the
+        // node-set identity then covers ALL THREE secret-holders (any-2 serve, but the SET
+        // the producer escrowed to is the trio), byte-identical to the 2-node id otherwise.
+        let node_set_id = match self.authority_vk3.as_ref() {
+            Some(vk3) => ddrm_envelope::threshold_node_set_id_n(2, &[authority_vk, authority_vk2, vk3]),
+            None => ddrm_envelope::threshold_node_set_id(2, authority_vk, authority_vk2),
+        };
 
         // Reuse the single-share prepare to get the session, transcript AAD (now node-set
         // bound), and the first node's verifier + carrier (share-1 + the ciphertext segment).
@@ -773,16 +804,51 @@ impl DecryptProvider {
             return audited_response(&request, &transcript_hash, now_unix, "denied", "expired", None);
         }
 
-        match rail_shim::decrypt_from_carrier_threshold(
-            prepared.session,
-            &prepared.carrier.sealed_cek,
-            &sealed_share2,
-            &prepared.aad,
-            &prepared.verifier,
-            &verifier2,
-            &prepared.carrier.ciphertext_segment,
-            prepared.carrier.init_segment.as_deref(),
-        ) {
+        // 2-of-3 QUORUM (Day 113–116): with a third pinned identity, the two arriving
+        // shares are INDEXED Shamir shares from ANY TWO of the three nodes — unwrap each
+        // under the pinned identity its x names and Lagrange-combine in `Zeroizing`.
+        let opened = if let Some(vk3) = self.authority_vk3.as_ref() {
+            let verifier3 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(vk3) {
+                Some(v) => v,
+                None => {
+                    return Response::error(
+                        "not_configured",
+                        "configured third key-authority verifying key is malformed",
+                    )
+                }
+            };
+            let verifier1 =
+                match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
+                    Some(v) => v,
+                    None => {
+                        return Response::error(
+                            "not_configured",
+                            "configured key-authority verifying key is malformed",
+                        )
+                    }
+                };
+            rail_shim::decrypt_from_carrier_quorum(
+                prepared.session,
+                &prepared.carrier.sealed_cek,
+                &sealed_share2,
+                &prepared.aad,
+                &[verifier1, verifier2, verifier3],
+                &prepared.carrier.ciphertext_segment,
+                prepared.carrier.init_segment.as_deref(),
+            )
+        } else {
+            rail_shim::decrypt_from_carrier_threshold(
+                prepared.session,
+                &prepared.carrier.sealed_cek,
+                &sealed_share2,
+                &prepared.aad,
+                &prepared.verifier,
+                &verifier2,
+                &prepared.carrier.ciphertext_segment,
+                prepared.carrier.init_segment.as_deref(),
+            )
+        };
+        match opened {
             Ok((_plaintext, meta)) => {
                 let scoped = match scoped_session_response(&request, &meta) {
                     Response::Ok { data: Some(data) } => data,
@@ -1767,6 +1833,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(req),
@@ -1798,6 +1865,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(replay_req),
@@ -1823,6 +1891,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionBound {
             request: Box::new(decrypt_request()),
@@ -1841,6 +1910,7 @@ mod tests {
             authority_vk: Some(authority_vk2),
             session_pub: Some(pub_bytes2),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp2 = provider2.handle(Request::OpenSessionBound {
             request: Box::new(decrypt_request()),
@@ -1965,6 +2035,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let now = 1_850_000_000u64; // before expiry (1_900_000_000)
         let resp = provider.handle(Request::OpenSessionAudited {
@@ -1998,6 +2069,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let now = 2_000_000_000u64; // past expiry (1_900_000_000)
         let resp = provider.handle(Request::OpenSessionAudited {
@@ -2052,6 +2124,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(req),
@@ -2078,6 +2151,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "invalid_request", "an unknown suite must fail closed before any crypto");
@@ -2096,6 +2170,7 @@ mod tests {
             authority_vk: Some(authority_vk),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "invalid_request", "compat suite is migration-only on the bound product path");
@@ -2190,6 +2265,7 @@ mod tests {
             authority_vk: Some(vk_a),
             session_pub: Some(pub_bytes),
             authority_vk2: Some(vk_b),
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(req),
@@ -2227,6 +2303,7 @@ mod tests {
             authority_vk: Some(vk_a),
             session_pub: Some(pub_bytes),
             authority_vk2: Some(unrelated_vk),
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(req),
@@ -2255,6 +2332,7 @@ mod tests {
             authority_vk: Some(vk_a),
             session_pub: Some(pub_bytes),
             authority_vk2: None,
+            authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(error_code(resp), "not_configured", "threshold material requires a second node vk");
@@ -2280,6 +2358,7 @@ mod tests {
             authority_vk: Some(vk_a),
             session_pub: Some(pub_bytes),
             authority_vk2: Some(vk_b),
+            authority_vk3: None,
         };
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(req),
@@ -2324,6 +2403,7 @@ mod tests {
             authority_vk: Some(vk_a),
             session_pub: Some(pub_bytes),
             authority_vk2: Some(vk_b),
+            authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
         assert_eq!(
@@ -2331,5 +2411,195 @@ mod tests {
             "invalid_request",
             "a threshold-provisioned boundary must refuse a single-share material"
         );
+    }
+
+    // --- 2-of-3 QUORUM reconstruction (feature `rail-material`, Day 113–116) -----
+    //
+    // The CEK is Shamir-split over GF(256) across THREE dKMS nodes at publish; each
+    // share is escrowed as `x ‖ share` so its coordinate is sealed + authenticated.
+    // ANY TWO re-sealed shares reconstruct the CEK in-VM — the rail survives a dead
+    // node — and each share must verify under the pinned identity its x names.
+
+    /// Seal the three indexed Shamir shares for a 2-of-3 quorum boundary. Returns the
+    /// per-node sealed shares (b64, x order), the VM session, the three node vks, the
+    /// session public bytes, and the encrypted segment (b64).
+    #[cfg(feature = "rail-material")]
+    #[allow(clippy::type_complexity)]
+    fn quorum_setup(
+        seal_req: &DecryptSessionRequestV1,
+        cek: &[u8; 16],
+        coeff: &[u8; 16],
+        plaintext: &[u8],
+        nonce: &[u8],
+        content_hash: &[u8],
+    ) -> (Vec<String>, crate::rail_shim::SessionSecret, Vec<Vec<u8>>, Vec<u8>, String) {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let keys: Vec<_> = [[0xE1u8; 32], [0xE2u8; 32], [0xE3u8; 32]]
+            .into_iter()
+            .map(mldsa_seal_keypair)
+            .collect();
+        let vks: Vec<Vec<u8>> = keys.iter().map(|(_, vk)| vk.clone()).collect();
+
+        // The quorum transcript binds the node-set identity over ALL THREE members.
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &[&vks[0], &vks[1], &vks[2]]);
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &seal_req.principal_id,
+            session_id: &seal_req.session_id,
+            object_cid: &seal_req.object_cid,
+            content_hash,
+            action: &seal_req.action,
+            viewer_interface: &seal_req.viewer_interface,
+            output_kind: &seal_req.output_kind,
+            expires_at: seal_req.expires_at,
+            release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+            node_set_id: Some(&node_set_id),
+        }
+        .to_aad();
+
+        let shares = ddrm_envelope::split_cek_shamir2(cek, coeff).expect("shamir split");
+        let sealed: Vec<String> = shares
+            .iter()
+            .enumerate()
+            .map(|(i, share)| {
+                let payload = ddrm_envelope::indexed_share((i + 1) as u8, share);
+                b64.encode(seal_bound(&public, &payload, &aad, &keys[i].0).to_bytes())
+            })
+            .collect();
+        let segment = build_encrypted_segment(plaintext, cek, &[0x77u8; 8]);
+        (
+            sealed,
+            crate::rail_shim::SessionSecret::PqHybrid(secret),
+            vks,
+            pub_bytes,
+            b64.encode(&segment),
+        )
+    }
+
+    /// The happy 2-of-3: EVERY pair of the three nodes' re-sealed shares opens the
+    /// session — including the pairs that skip node A or node B — proving the rail
+    /// no longer needs any one fixed node, while the CEK still only materializes in-VM.
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_quorum_2of3_opens_with_any_two_nodes() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cek = [0x5Au8; 16];
+        let coeff = [0x9Du8; 16];
+        let plaintext = b"two-of-three quorum reconstructed payload!!";
+
+        for (a, b) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            let req = decrypt_request();
+            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+                quorum_setup(&req, &cek, &coeff, plaintext, b"nonce-qrm-1", &[0xABu8; 32]);
+            let material = SealedDecryptMaterialV1 {
+                suite: DECRYPT_SUITE_ID.to_string(),
+                sealed_cek_b64: sealed[a].clone(),
+                sealed_cek_share2_b64: Some(sealed[b].clone()),
+                ciphertext_b64,
+                init_segment_b64: None,
+                nonce_b64: b64.encode(b"nonce-qrm-1"),
+                content_hash_b64: b64.encode([0xABu8; 32]),
+            };
+            let mut provider = DecryptProvider {
+                session: Some(session),
+                authority_vk: Some(vks[0].clone()),
+                session_pub: Some(pub_bytes),
+                authority_vk2: Some(vks[1].clone()),
+                authority_vk3: Some(vks[2].clone()),
+            };
+            let resp = provider.handle(Request::OpenSessionV1 {
+                request: Box::new(req),
+                material,
+                now_unix: 1_850_000_000,
+            });
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(
+                v["data"]["decision"],
+                json!("opened"),
+                "quorum pair (node {}, node {}) must open: {v}",
+                a + 1,
+                b + 1
+            );
+            let s = serde_json::to_string(&resp).unwrap();
+            assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+            assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+        }
+    }
+
+    /// Quorum fail-closed + order-free surfaces, each against its OWN coherent
+    /// session: (a) one node's share supplied TWICE is not a quorum (duplicate x);
+    /// (b) a share sealed by an UNRELATED key is refused (no pinned identity
+    /// verifies it); (c) the quorum is order-free — (node2, node1) opens like
+    /// (node1, node2). The deeper mis-index forgery (a genuine node sealing a
+    /// payload that claims ANOTHER node's x) is driven cross-binary by the runtime
+    /// quorum gates.
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_quorum_forged_or_duplicate_share_fails_closed() {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cek = [0x5Au8; 16];
+        let coeff = [0x9Du8; 16];
+
+        // Drive one open against a coherent quorum context, with the two material slots
+        // chosen by `pick` from (the three genuine sealed shares, an optional forged blob).
+        let drive = |pick: &dyn Fn(&[String], &str) -> (String, String)| -> Value {
+            let req = decrypt_request();
+            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+                quorum_setup(&req, &cek, &coeff, b"payload", b"nonce-qrm-2", &[0xABu8; 32]);
+            // A forged share: a well-formed indexed payload sealed by an UNRELATED key (to a
+            // throwaway session — the pinned-identity signature check refuses it first).
+            let (forger, _forger_vk) = mldsa_seal_keypair([0xEEu8; 32]);
+            let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("split");
+            let payload = ddrm_envelope::indexed_share(2, &shares[1]);
+            let (_throwaway_secret, throwaway_public) = gen_session();
+            let forged = b64.encode(seal_bound(&throwaway_public, &payload, b"", &forger).to_bytes());
+            let (slot_a, slot_b) = pick(&sealed, &forged);
+            let material = SealedDecryptMaterialV1 {
+                suite: DECRYPT_SUITE_ID.to_string(),
+                sealed_cek_b64: slot_a,
+                sealed_cek_share2_b64: Some(slot_b),
+                ciphertext_b64,
+                init_segment_b64: None,
+                nonce_b64: b64.encode(b"nonce-qrm-2"),
+                content_hash_b64: b64.encode([0xABu8; 32]),
+            };
+            let mut provider = DecryptProvider {
+                session: Some(session),
+                authority_vk: Some(vks[0].clone()),
+                session_pub: Some(pub_bytes),
+                authority_vk2: Some(vks[1].clone()),
+                authority_vk3: Some(vks[2].clone()),
+            };
+            let resp = provider.handle(Request::OpenSessionV1 {
+                request: Box::new(req),
+                material,
+                now_unix: 1_850_000_000,
+            });
+            serde_json::to_value(&resp).unwrap()
+        };
+
+        // (a) DUPLICATE node: node 1's sealed share twice — the combine refuses x_a == x_b.
+        let v = drive(&|sealed, _forged| (sealed[0].clone(), sealed[0].clone()));
+        assert_eq!(v["data"]["decision"], json!("denied"), "one node's share twice is NOT a quorum: {v}");
+
+        // (b) FORGED share: no pinned identity verifies the unrelated signer.
+        let v = drive(&|sealed, forged| (sealed[0].clone(), forged.to_string()));
+        assert_eq!(v["data"]["decision"], json!("denied"), "a forged quorum share must be denied: {v}");
+
+        // (c) ORDER-FREE: (node2, node1) opens exactly like (node1, node2).
+        let v = drive(&|sealed, _forged| (sealed[1].clone(), sealed[0].clone()));
+        assert_eq!(v["data"]["decision"], json!("opened"), "the quorum is order-free: {v}");
     }
 }

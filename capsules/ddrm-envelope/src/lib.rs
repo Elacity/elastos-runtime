@@ -234,6 +234,144 @@ pub fn combine_cek_xor(
     ))
 }
 
+// ── Shamir t-of-n CEK secret-sharing over GF(256) (Day 113–116) ────────────────
+//
+// The REAL threshold: `t` shares of `n` reconstruct the CEK; fewer than `t` reveal
+// NOTHING (information-theoretic, like the XOR split — every byte of a sub-quorum
+// view is uniformly random). This is the runtime's explicit, owned analogue of the
+// t-of-n threshold living inside Lit's network for PC2's legacy `decryptAndCombine`
+// rail (`non-media-decrypt.js:76`) — where t, n, and the combine are all OPAQUE to
+// PC2. Ours are in this file, under golden vectors.
+//
+// Field: GF(2^8) with the AES reduction polynomial x^8+x^4+x^3+x+1 (0x11B). Addition
+// is XOR — which is exactly why the Day 109–112 share-wise rotation primitive
+// (`share' = share ⊕ delta`) carries over UNCHANGED: a proactive refresh adds a
+// random polynomial q with q(0)=0, delivered to node i as `delta_i = q(x_i)`.
+
+/// GF(2^8) multiply (AES polynomial 0x11B). Constant pattern, no tables.
+fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut acc = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            acc ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1B;
+        }
+        b >>= 1;
+    }
+    acc
+}
+
+/// GF(2^8) multiplicative inverse via a^254 (Fermat). `a` must be non-zero —
+/// callers enforce distinct, non-zero share x-coordinates before division.
+fn gf256_inv(a: u8) -> u8 {
+    // a^254 = a^(2+4+8+16+32+64+128) by square-and-multiply.
+    let mut result = 1u8;
+    let mut power = a; // a^1
+    let mut exp = 254u8;
+    while exp > 0 {
+        if exp & 1 != 0 {
+            result = gf256_mul(result, power);
+        }
+        power = gf256_mul(power, power);
+        exp >>= 1;
+    }
+    result
+}
+
+/// Shamir 2-of-3 CEK split — the PRODUCER side. Evaluates the degree-1 polynomial
+/// `p(x) = cek[j] ⊕ coeff[j]·x` per byte at x = 1, 2, 3, yielding three shares such
+/// that ANY TWO reconstruct the CEK ([`combine_cek_shamir2`]) and any SINGLE share
+/// is information-theoretically useless (for a uniform `coeff`, each share byte is
+/// uniform and independent of the CEK byte).
+///
+/// `coeff` is the fresh random degree-1 coefficient vector; it MUST be uniformly
+/// random and the SAME length as the CEK, drawn from a CSPRNG by the caller — the
+/// RNG stays OUT of this crate (same policy as [`split_cek_xor`]'s `mask`) so the
+/// split is deterministic + replayable under golden vectors. Returns the shares in
+/// x order: `[p(1), p(2), p(3)]` — share `i` (0-based) belongs to x-coordinate
+/// `i + 1`. Escrow share `i` to node `i+1` and carry the x alongside (the combine
+/// needs it).
+pub fn split_cek_shamir2(cek: &[u8], coeff: &[u8]) -> Result<[Vec<u8>; 3], &'static str> {
+    if cek.is_empty() {
+        return Err("cek must be non-empty");
+    }
+    if cek.len() != coeff.len() {
+        return Err("coeff length must equal cek length");
+    }
+    let eval = |x: u8| -> Vec<u8> {
+        cek.iter()
+            .zip(coeff.iter())
+            .map(|(&c, &k)| c ^ gf256_mul(k, x))
+            .collect()
+    };
+    Ok([eval(1), eval(2), eval(3)])
+}
+
+/// Shamir t=2 CEK reconstruction from ANY TWO indexed shares — the DECRYPT-BOUNDARY
+/// side. Lagrange interpolation at x=0 over GF(256), per byte:
+/// `cek[j] = share_a[j]·(x_b/(x_a⊕x_b)) ⊕ share_b[j]·(x_a/(x_a⊕x_b))`.
+///
+/// Fails closed on: a zero x (x=0 IS the secret — accepting it would let a forged
+/// "share" name the CEK's own coordinate), duplicate x's (two copies of one node's
+/// share are NOT a quorum), a length mismatch, or empty shares. Like
+/// [`combine_cek_xor`], this MUST run ONLY inside the decrypt sandbox, and the
+/// result rides in `Zeroizing`.
+pub fn combine_cek_shamir2(
+    x_a: u8,
+    share_a: &[u8],
+    x_b: u8,
+    share_b: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if share_a.is_empty() {
+        return Err("shares must be non-empty");
+    }
+    if share_a.len() != share_b.len() {
+        return Err("share length mismatch");
+    }
+    if x_a == 0 || x_b == 0 {
+        return Err("share x-coordinate must be non-zero");
+    }
+    if x_a == x_b {
+        return Err("a quorum needs two DISTINCT share x-coordinates");
+    }
+    // Lagrange basis at 0: l_a = x_b/(x_a+x_b), l_b = x_a/(x_a+x_b) (+ is XOR).
+    let denom_inv = gf256_inv(x_a ^ x_b);
+    let l_a = gf256_mul(x_b, denom_inv);
+    let l_b = gf256_mul(x_a, denom_inv);
+    Ok(zeroize::Zeroizing::new(
+        share_a
+            .iter()
+            .zip(share_b.iter())
+            .map(|(&a, &b)| gf256_mul(a, l_a) ^ gf256_mul(b, l_b))
+            .collect(),
+    ))
+}
+
+/// Prefix a Shamir share with its x-coordinate for escrow — `x ‖ share` — so the
+/// index rides INSIDE the sealed envelope (authenticated by the escrow seal + every
+/// node re-seal), never as forgeable cleartext JSON beside it. The boundary parses
+/// it back with [`parse_indexed_share`] and fails closed on a zero/out-of-range x.
+pub fn indexed_share(x: u8, share: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + share.len());
+    v.push(x);
+    v.extend_from_slice(share);
+    v
+}
+
+/// Parse `x ‖ share` back ([`indexed_share`]). `None` on an empty payload or a
+/// zero x (never a valid Shamir coordinate — x=0 is the secret itself).
+pub fn parse_indexed_share(payload: &[u8]) -> Option<(u8, &[u8])> {
+    let (&x, share) = payload.split_first()?;
+    if x == 0 || share.is_empty() {
+        return None;
+    }
+    Some((x, share))
+}
+
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
 /// internal state (which half failed).
 #[derive(Debug, PartialEq, Eq)]
@@ -342,13 +480,21 @@ pub fn derive_seed(master: &[u8; 32], label: &[u8]) -> [u8; 32] {
 /// different secret-holder than the producer escrowed to). Pure, no RNG — the single source of truth
 /// both the runtime (descriptor check) and any auditor share. Order matters: `(a,b) != (b,a)`.
 pub fn threshold_node_set_id(t: u8, vk_a: &[u8], vk_b: &[u8]) -> [u8; 32] {
+    threshold_node_set_id_n(t, &[vk_a, vk_b])
+}
+
+/// The n-NODE generalization of [`threshold_node_set_id`] (Day 113–116, the 2-of-3 quorum
+/// rail): the same domain + encoding over an ORDERED list of node vks, so the 2-node id is
+/// byte-identical to the original (no re-pinning on upgrade) and a t-of-n set pins ALL n
+/// secret-holders — adding, removing, reordering, or swapping ANY member changes the id.
+pub fn threshold_node_set_id_n(t: u8, vks: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"elastos.dkms.threshold.node-set/v1");
     h.update([t]);
-    h.update((vk_a.len() as u32).to_be_bytes());
-    h.update(vk_a);
-    h.update((vk_b.len() as u32).to_be_bytes());
-    h.update(vk_b);
+    for vk in vks {
+        h.update((vk.len() as u32).to_be_bytes());
+        h.update(vk);
+    }
     let digest = h.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..32]);
@@ -1464,6 +1610,140 @@ mod tests {
         assert!(crate::split_cek_xor(&[], &[]).is_err());
         assert!(crate::combine_cek_xor(&share1, &share2[..15]).is_err());
         assert!(crate::combine_cek_xor(&[], &[]).is_err());
+    }
+
+    /// Shamir 2-of-3 over GF(256): ANY two of the three shares reconstruct the CEK exactly;
+    /// a single share is information-theoretically useless; malformed quorums fail closed.
+    #[test]
+    fn cek_shamir_2of3_any_pair_reconstructs_and_fails_closed() {
+        let cek: Vec<u8> = (0u8..32).collect();
+        let coeff: Vec<u8> = (0u8..32).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
+        let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
+
+        // ALL THREE pairs reconstruct the identical CEK — this is what survives a dead node.
+        for (xa, xb) in [(1u8, 2u8), (1, 3), (2, 3)] {
+            let a = &shares[(xa - 1) as usize];
+            let b = &shares[(xb - 1) as usize];
+            let rec = crate::combine_cek_shamir2(xa, a, xb, b).expect("combine");
+            assert_eq!(rec.as_slice(), cek.as_slice(), "pair ({xa},{xb}) must reconstruct the CEK");
+            // Order of the pair does not matter.
+            let rec_swapped = crate::combine_cek_shamir2(xb, b, xa, a).expect("combine swapped");
+            assert_eq!(rec_swapped.as_slice(), cek.as_slice());
+        }
+
+        // No single share is the CEK, and a sub-quorum is structurally refused: combining a
+        // share with ITSELF (duplicate x — one node's view twice) is not a quorum.
+        for (i, share) in shares.iter().enumerate() {
+            assert_ne!(share.as_slice(), cek.as_slice(), "share {} alone must not be the CEK", i + 1);
+            assert!(crate::combine_cek_shamir2((i + 1) as u8, share, (i + 1) as u8, share).is_err());
+        }
+        // INFORMATION-THEORETIC uselessness: two different coefficient vectors produce splits
+        // where the SAME x-1 share bytes are consistent with DIFFERENT CEKs — a single share
+        // pins nothing. (Pick coeff' so share1 collides: cek' ⊕ k'·1 == cek ⊕ k·1.)
+        let cek2: Vec<u8> = cek.iter().map(|&b| b ^ 0xFF).collect();
+        let coeff2: Vec<u8> = cek2
+            .iter()
+            .zip(shares[0].iter())
+            .map(|(&c2, &s1)| c2 ^ s1) // k'·1 = k' = cek'[j] ⊕ share1[j]
+            .collect();
+        let shares2 = crate::split_cek_shamir2(&cek2, &coeff2).expect("split 2");
+        assert_eq!(shares2[0], shares[0], "the same share-1 bytes serve BOTH CEKs");
+        assert_ne!(cek, cek2);
+
+        // MIXED-SPLIT shares (x=2 of split 1 + x=3 of split 2 — two shares that never came
+        // from one split) reconstruct GARBAGE, never either CEK.
+        let mixed = crate::combine_cek_shamir2(2, &shares[1], 3, &shares2[2]).expect("mixed combines");
+        assert_ne!(mixed.as_slice(), cek.as_slice());
+        assert_ne!(mixed.as_slice(), cek2.as_slice());
+
+        // Fail-closed shapes: zero x (x=0 IS the secret), length mismatch, empty.
+        assert!(crate::combine_cek_shamir2(0, &shares[0], 2, &shares[1]).is_err());
+        assert!(crate::combine_cek_shamir2(1, &shares[0], 0, &shares[1]).is_err());
+        assert!(crate::combine_cek_shamir2(1, &shares[0], 2, &shares[1][..31]).is_err());
+        assert!(crate::combine_cek_shamir2(1, &[], 2, &[]).is_err());
+        assert!(crate::split_cek_shamir2(&cek, &coeff[..31]).is_err());
+        assert!(crate::split_cek_shamir2(&[], &[]).is_err());
+
+        // The XOR-rotation refresh delta carries over: refresh every share with q(x_i) for a
+        // random q with q(0)=0 (q(x) = c·x) and the SAME CEK still reconstructs from the
+        // refreshed shares, while an old+new mix is garbage (proactive refresh invalidates).
+        let c = 0x5Au8;
+        let refreshed: Vec<Vec<u8>> = shares
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let qx = crate::gf256_mul(c, (i + 1) as u8);
+                s.iter().map(|&b| b ^ qx).collect()
+            })
+            .collect();
+        let rec = crate::combine_cek_shamir2(1, &refreshed[0], 3, &refreshed[2]).expect("refreshed");
+        assert_eq!(rec.as_slice(), cek.as_slice(), "a q(0)=0 refresh preserves the CEK");
+        let mixed_gen = crate::combine_cek_shamir2(1, &shares[0], 3, &refreshed[2]).expect("old+new");
+        assert_ne!(mixed_gen.as_slice(), cek.as_slice(), "old+refreshed shares must NOT reconstruct");
+    }
+
+    /// GOLDEN VECTOR: the Shamir split/combine is pinned byte-for-byte (a refactor or a GF
+    /// arithmetic change that alters the wire shares is caught here, like the envelope goldens).
+    #[test]
+    fn cek_shamir_2of3_golden_vector() {
+        let cek = [0xC5u8, 0x01, 0x7F, 0xFF, 0x00, 0xAB, 0x10, 0x42];
+        let coeff = [0x02u8, 0x80, 0xFF, 0x1B, 0x01, 0x00, 0xA5, 0x33];
+        let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
+        // p(x) = cek ⊕ coeff·x over GF(2^8)/0x11B, evaluated at x = 1, 2, 3.
+        assert_eq!(shares[0], vec![0xC7, 0x81, 0x80, 0xE4, 0x01, 0xAB, 0xB5, 0x71]);
+        assert_eq!(shares[1], vec![0xC1, 0x1A, 0x9A, 0xC9, 0x02, 0xAB, 0x41, 0x24]);
+        assert_eq!(shares[2], vec![0xC3, 0x9A, 0x65, 0xD2, 0x03, 0xAB, 0xE4, 0x17]);
+        for (xa, xb) in [(1u8, 2u8), (1, 3), (2, 3)] {
+            let rec = crate::combine_cek_shamir2(
+                xa,
+                &shares[(xa - 1) as usize],
+                xb,
+                &shares[(xb - 1) as usize],
+            )
+            .expect("golden combine");
+            assert_eq!(rec.as_slice(), cek.as_slice());
+        }
+    }
+
+    /// The indexed-share escrow encoding (`x ‖ share`) round-trips and fails closed on a
+    /// zero x or an empty payload — the x rides INSIDE the sealed envelope, authenticated.
+    #[test]
+    fn indexed_share_round_trips_and_fails_closed() {
+        let share = vec![0xAAu8; 16];
+        let payload = crate::indexed_share(3, &share);
+        assert_eq!(payload.len(), 17);
+        let (x, parsed) = crate::parse_indexed_share(&payload).expect("parse");
+        assert_eq!(x, 3);
+        assert_eq!(parsed, share.as_slice());
+        // x = 0 is never a valid Shamir coordinate (x=0 is the secret itself).
+        assert!(crate::parse_indexed_share(&crate::indexed_share(0, &share)).is_none());
+        // Empty / index-only payloads are refused.
+        assert!(crate::parse_indexed_share(&[]).is_none());
+        assert!(crate::parse_indexed_share(&[2]).is_none());
+    }
+
+    /// The n-node node-set id generalization: byte-identical to the 2-node id for n=2 (no
+    /// re-pinning on upgrade), and a 3-node set pins ALL THREE members + their order + t.
+    #[test]
+    fn threshold_node_set_id_n_extends_two_node_id_byte_identically() {
+        let vk_a = vec![0xA1u8; 40];
+        let vk_b = vec![0xB2u8; 52];
+        let vk_c = vec![0xC3u8; 44];
+        assert_eq!(
+            crate::threshold_node_set_id(2, &vk_a, &vk_b),
+            crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b]),
+            "the 2-node id must be byte-identical through the n-node derivation"
+        );
+        let id3 = crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b, &vk_c]);
+        assert_ne!(id3, crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b]), "adding a member changes the id");
+        assert_ne!(id3, crate::threshold_node_set_id_n(2, &[&vk_a, &vk_c, &vk_b]), "order matters");
+        assert_ne!(id3, crate::threshold_node_set_id_n(3, &[&vk_a, &vk_b, &vk_c]), "t is bound");
+        let (_s, rogue) = crate::seal::mldsa_seal_keypair([0x99u8; 32]);
+        assert_ne!(
+            id3,
+            crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b, &rogue]),
+            "swapping the third member is detectable"
+        );
     }
 
     /// The 2-of-2 node-set identity is deterministic, order-sensitive, and changes if ANY node's

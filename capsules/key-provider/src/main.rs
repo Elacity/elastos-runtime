@@ -222,6 +222,13 @@ struct ReleaseSessionContext {
     /// rail is byte-identical).
     #[serde(default)]
     producer_vk2_b64: Option<String>,
+    /// 2-of-3 QUORUM (Day 113–116): the THIRD node's escrow blob (base64) — the producer
+    /// Shamir-split the CEK over GF(256) and escrowed indexed share `3‖p(3)` to node C's
+    /// recipient at publish. Present only on the quorum rail (three nodes provisioned);
+    /// `release` then recovers re-sealed shares from ANY TWO live nodes and fails closed
+    /// below quorum. Absent → the 2-of-2 / single-node rails.
+    #[serde(default)]
+    wrapped_cek_share3_b64: Option<String>,
     /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
     /// authority refuses to release (fail-closed), never sealing a CEK past its window.
     #[serde(default)]
@@ -321,6 +328,13 @@ struct KeyProvider {
     /// decrypt boundary, which reconstructs `cek = share1 ⊕ share2` IN-VM. `None` = single-node rail.
     #[cfg(feature = "key-authority-ref")]
     dkms2: Option<DkmsClientAuthority>,
+    /// The THIRD secret-holding dKMS node for 2-of-3 QUORUM recovery (Day 113–116). Resolved at
+    /// `init` from a three-node `threshold` block (`t == 2`, three distinct PUBLIC-ONLY entries).
+    /// When present, the CEK was Shamir-split over GF(256) at publish and escrowed as THREE indexed
+    /// shares — one per node — and `release` succeeds with re-sealed shares from ANY TWO live nodes
+    /// (the rail survives a dead node), failing closed below quorum. `None` = 2-of-2 / single rails.
+    #[cfg(feature = "key-authority-ref")]
+    dkms3: Option<DkmsClientAuthority>,
     /// The LONG-LIVED connection to the external dKMS node + the live handshake session (Day 91–92).
     /// The client opens the node ONCE, proves its pinned identity ONCE, and then drives MANY
     /// authorized recovers over the same connection + session — re-establishing fail-closed only when
@@ -335,6 +349,10 @@ struct KeyProvider {
     /// `dkms_conn`. `None` until the first threshold release establishes it.
     #[cfg(all(feature = "key-authority-ref", unix))]
     dkms_conn2: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
+    /// The long-lived connection to the THIRD quorum node (Day 113–116), same lifecycle as
+    /// `dkms_conn`. `None` until the first quorum release establishes it.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    dkms_conn3: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
 }
 
 /// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
@@ -814,9 +832,10 @@ impl KeyProvider {
                 // present-but-bad (or secret-bearing) descriptor fails closed here.
                 Some(KeyAuthorityBackend::Dkms) => {
                     match build_dkms_client(&config) {
-                        Ok((node_a, node_b)) => {
+                        Ok((node_a, node_b, node_c)) => {
                             self.dkms = node_a;
                             self.dkms2 = node_b;
+                            self.dkms3 = node_c;
                         }
                         Err(err) => return Response::error("not_configured", err),
                     };
@@ -1287,6 +1306,16 @@ impl KeyProvider {
             "right": request.action,
         });
         let now = session.now_unix;
+
+        // 2-of-3 QUORUM (Day 113–116): a THIRD node is provisioned, so the CEK was Shamir-split
+        // into three indexed shares and ANY TWO live nodes serve the release. Route BEFORE the
+        // node-A recover below — on the quorum rail node A itself may be the dead node, and the
+        // open must still succeed. PC2's only analogue is retrying the whole opaque Lit RPC
+        // (`chipotle-client.ts:575`); per-node failover policy is not expressible there.
+        if self.dkms3.is_some() {
+            return self.release_quorum(client, &recover_req, &session, &kid_hex, now);
+        }
+
         // Recover a re-sealed share from node A. Node A's escrow (share-1 in the threshold case, or the
         // whole CEK in the single-node case) rides in the rights-bound `key_envelope.wrapped_cek`.
         let material_a = match self.delegate_recover(
@@ -1416,6 +1445,125 @@ impl KeyProvider {
         match recover.get("data") {
             Some(data) => Ok(data.clone()),
             None => Err(Response::error("not_configured", "dkms node recover returned no material")),
+        }
+    }
+
+    /// 2-of-3 QUORUM release (Day 113–116): try ALL THREE secret-holding nodes in order and
+    /// succeed with re-sealed indexed shares from ANY TWO — a dead/unreachable node is a
+    /// tolerated fault, not a failed open. Strictly FAIL-CLOSED below quorum: fewer than two
+    /// served shares refuses the release outright (no single-share material is ever emitted,
+    /// and the decrypt boundary independently refuses one anyway). Each node recovers ITS OWN
+    /// escrow (share `x‖p(x)` sealed to its recipient at publish) over its OWN connection +
+    /// session + possession proof — the per-node security gates are identical to the 2-of-2
+    /// rail. The shares are merged WITHOUT combining (the CEK reconstructs only in-VM).
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    fn release_quorum(
+        &self,
+        node_a: &DkmsClientAuthority,
+        recover_req: &Value,
+        session: &ReleaseSessionContext,
+        kid_hex: &str,
+        now: Option<u64>,
+    ) -> Response {
+        let node_b = match self.dkms2.as_ref() {
+            Some(node) => node,
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "a third quorum node is provisioned without a second — the node-set is incoherent",
+                )
+            }
+        };
+        let node_c = match self.dkms3.as_ref() {
+            Some(node) => node,
+            None => {
+                return Response::error("not_configured", "quorum release requires a third provisioned node")
+            }
+        };
+        // ALL THREE escrows must be supplied — a missing escrow silently shrinks the candidate
+        // set and degrades availability below what the descriptor promises; refuse instead.
+        let share2_escrow = match session.wrapped_cek_share2_b64.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "quorum dkms is provisioned (three nodes) but the second share escrow \
+                     (wrapped_cek_share2_b64) was not supplied — refusing a degraded release",
+                )
+            }
+        };
+        let share3_escrow = match session.wrapped_cek_share3_b64.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "quorum dkms is provisioned (three nodes) but the third share escrow \
+                     (wrapped_cek_share3_b64) was not supplied — refusing a degraded release",
+                )
+            }
+        };
+        let mut req_b = recover_req.clone();
+        req_b["wrapped_cek_b64"] = json!(share2_escrow);
+        if let Some(vk2) = session.producer_vk2_b64.as_ref() {
+            req_b["producer_vk_b64"] = json!(vk2);
+        }
+        let mut req_c = recover_req.clone();
+        req_c["wrapped_cek_b64"] = json!(share3_escrow);
+        let content_id = recover_req
+            .get("content_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        type NodeConnCell = std::cell::RefCell<Option<Box<DkmsNodeConn>>>;
+        let candidates: [(&DkmsClientAuthority, &NodeConnCell, Value, &str); 3] = [
+            (node_a, &self.dkms_conn, recover_req.clone(), "node A"),
+            (node_b, &self.dkms_conn2, req_b, "node B"),
+            (node_c, &self.dkms_conn3, req_c, "node C"),
+        ];
+        let mut materials: Vec<Value> = Vec::new();
+        let mut faults: Vec<String> = Vec::new();
+        for (client, conn, req, label) in candidates {
+            if materials.len() == 2 {
+                break; // quorum met — do not touch the remaining node
+            }
+            match self.delegate_recover(
+                client,
+                conn,
+                &req,
+                kid_hex,
+                &session.decrypt_session_pub_b64,
+                &content_id,
+                now,
+            ) {
+                Ok(data) => materials.push(data),
+                Err(resp) => {
+                    // A dead/refusing node is a TOLERATED fault on the quorum rail — record it
+                    // and try the next secret-holder. Quorum math below decides the outcome.
+                    let msg = match &resp {
+                        Response::Error { message, .. } => message.clone(),
+                        _ => "node recover failed".to_string(),
+                    };
+                    faults.push(format!("{label}: {msg}"));
+                }
+            }
+        }
+        if materials.len() < 2 {
+            return Response::error(
+                "not_configured",
+                format!(
+                    "2-of-3 quorum NOT met — only {} of 3 secret-holders served (need 2); \
+                     a sub-quorum release is refused outright [{}]",
+                    materials.len(),
+                    faults.join("; ")
+                ),
+            );
+        }
+        let material_b = materials.pop().expect("two materials checked above");
+        let material_a = materials.pop().expect("two materials checked above");
+        match merge_threshold_material(material_a, &material_b) {
+            Ok(merged) => Response::ok(merged),
+            Err(err) => Response::error("not_configured", err),
         }
     }
 
@@ -1560,12 +1708,20 @@ fn build_reference_authority(config: &Value) -> Result<ReferenceAuthority, Strin
 /// `chipotle-client.ts:1438`), never the PKP secret.
 #[cfg(feature = "key-authority-ref")]
 #[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 fn build_dkms_client(
     config: &Value,
-) -> Result<(Option<DkmsClientAuthority>, Option<DkmsClientAuthority>), String> {
+) -> Result<
+    (
+        Option<DkmsClientAuthority>,
+        Option<DkmsClientAuthority>,
+        Option<DkmsClientAuthority>,
+    ),
+    String,
+> {
     let path = match config.get("dkms_authority_descriptor").and_then(|v| v.as_str()) {
         Some(path) => path,
-        None => return Ok((None, None)),
+        None => return Ok((None, None, None)),
     };
     let bytes = std::fs::read(path).map_err(|e| format!("dkms authority descriptor {path}: {e}"))?;
     let desc: Value = serde_json::from_slice(&bytes)
@@ -1588,23 +1744,24 @@ fn build_dkms_client(
     // FIRST threshold node). It MUST NOT carry any secret (HARD BOUNDARY enforced in the parser).
     let node_a = parse_public_authority(path, &desc, caller_seed_b64.clone())?;
 
-    // THRESHOLD (Day 97–98): a `threshold` block promotes the rail to 2-of-2. The CEK was XOR-split
-    // and escrowed as TWO shares — one per node — so no single node ever holds the whole key. We
-    // support EXACTLY 2-of-2: `t == 2` AND exactly two PUBLIC-ONLY node entries. Node A = `nodes[0]`'s
-    // identity (which must match the top-level pins), node B = `nodes[1]`. Any other shape (t != 2,
-    // != 2 nodes, 3-of-N, …) fails closed rather than silently degrading the guarantee the descriptor
-    // asks for. A single-node descriptor (no `threshold`, or `threshold.t == 1`) keeps the legacy rail.
-    let node_b = match desc.get("threshold") {
-        None => None,
+    // THRESHOLD (Day 97–98) / QUORUM (Day 113–116): a `threshold` block promotes the rail. We
+    // support EXACTLY `t == 2` with TWO nodes (the 2-of-2 XOR split) or THREE nodes (the 2-of-3
+    // Shamir quorum — any two live nodes serve, the rail survives a dead node). Node A = `nodes[0]`'s
+    // identity (which must match the top-level pins); every node identity must be DISTINCT. Any
+    // other shape (t != 2, more nodes, 3-of-N, …) fails closed rather than silently degrading the
+    // guarantee the descriptor asks for. A single-node descriptor (no `threshold`, or
+    // `threshold.t == 1`) keeps the legacy rail.
+    let (node_b, node_c) = match desc.get("threshold") {
+        None => (None, None),
         Some(threshold) => {
             let t = threshold.get("t").and_then(|v| v.as_u64()).unwrap_or(0);
             let nodes = threshold.get("nodes").and_then(|v| v.as_array());
             let node_count = nodes.map(|a| a.len()).unwrap_or(0);
             if t == 1 && node_count <= 1 {
                 // Degenerate single-node threshold — same as no threshold.
-                None
-            } else if t == 2 && node_count == 2 {
-                let nodes = nodes.expect("node_count == 2 implies an array");
+                (None, None)
+            } else if t == 2 && (node_count == 2 || node_count == 3) {
+                let nodes = nodes.expect("node_count >= 2 implies an array");
                 // Node A's threshold entry must match the top-level pins (one coherent identity).
                 let entry_a = parse_public_authority(path, &nodes[0], caller_seed_b64.clone())?;
                 if entry_a.verifying_key_b64 != node_a.verifying_key_b64
@@ -1615,22 +1772,38 @@ fn build_dkms_client(
                     ));
                 }
                 let node_b = parse_public_authority(path, &nodes[1], caller_seed_b64.clone())?;
-                if node_b.verifying_key_b64 == node_a.verifying_key_b64 {
-                    return Err(format!(
-                        "dkms authority descriptor {path} threshold nodes share an identity — \
-                         a 2-of-2 split needs two DISTINCT secret-holding nodes"
-                    ));
+                let node_c = if node_count == 3 {
+                    Some(parse_public_authority(path, &nodes[2], caller_seed_b64.clone())?)
+                } else {
+                    None
+                };
+                // EVERY node must be a DISTINCT secret-holder — a duplicated identity silently
+                // collapses the threshold (two "nodes" with one master are one node).
+                let mut vks = vec![&node_a.verifying_key_b64, &node_b.verifying_key_b64];
+                if let Some(c) = &node_c {
+                    vks.push(&c.verifying_key_b64);
                 }
-                Some(node_b)
+                for i in 0..vks.len() {
+                    for j in (i + 1)..vks.len() {
+                        if vks[i] == vks[j] {
+                            return Err(format!(
+                                "dkms authority descriptor {path} threshold nodes share an identity — \
+                                 a t-of-n split needs DISTINCT secret-holding nodes"
+                            ));
+                        }
+                    }
+                }
+                (Some(node_b), node_c)
             } else {
                 return Err(format!(
                     "dkms authority descriptor {path} requests threshold recovery (t={t}, nodes={node_count}) — \
-                     only 2-of-2 (t=2, two distinct nodes) is implemented; the runtime fails closed otherwise"
+                     only t=2 with two (2-of-2) or three (2-of-3 quorum) distinct nodes is implemented; \
+                     the runtime fails closed otherwise"
                 ));
             }
         }
     };
-    Ok((Some(node_a), node_b))
+    Ok((Some(node_a), node_b, node_c))
 }
 
 /// Merge two node-recovered materials into ONE 2-of-2 threshold `SealedDecryptMaterialV1` WITHOUT
@@ -2463,6 +2636,67 @@ mod tests {
             }
         }
 
+        /// 2-of-3 QUORUM (Day 113–116): a `t == 2` descriptor with THREE distinct PUBLIC-ONLY
+        /// nodes resolves all three clients (any two serve a release; the rail survives a dead
+        /// node), while a duplicated identity anywhere in the trio — which would silently
+        /// collapse the quorum — fails closed, as does any t other than 2.
+        #[test]
+        fn dkms_resolves_a_2of3_quorum_and_fails_closed_on_duplicates() {
+            let node_a = dkms_node_entry(&[0x8au8; 32], "/path/to/node-a");
+            let node_b = dkms_node_entry(&[0x8bu8; 32], "/path/to/node-b");
+            let node_c = dkms_node_entry(&[0x8cu8; 32], "/path/to/node-c");
+
+            // The real 2-of-3: top-level = node A, threshold.nodes = [A, B, C].
+            let mut desc = node_a.clone();
+            desc["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            desc["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
+            let path = unique_store_path("dkms-quorum-2of3");
+            std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
+            let mut p = KeyProvider::default();
+            assert!(matches!(
+                p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &path })),
+                Response::Ok { .. }
+            ));
+            assert!(p.dkms.is_some() && p.dkms2.is_some() && p.dkms3.is_some(), "all three quorum nodes resolve");
+            let vks = [
+                p.dkms.as_ref().unwrap().verifying_key_b64.clone(),
+                p.dkms2.as_ref().unwrap().verifying_key_b64.clone(),
+                p.dkms3.as_ref().unwrap().verifying_key_b64.clone(),
+            ];
+            assert!(vks[0] != vks[1] && vks[0] != vks[2] && vks[1] != vks[2], "three DISTINCT secret-holders");
+
+            // A duplicated identity in the trio (node C == node B) collapses the quorum → fail closed.
+            let mut dup = node_a.clone();
+            dup["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            dup["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_b.clone()] });
+            let dup_path = unique_store_path("dkms-quorum-dup");
+            std::fs::write(&dup_path, serde_json::to_vec(&dup).unwrap()).unwrap();
+            let mut q = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))),
+                "not_configured",
+                "a duplicated quorum identity must fail closed"
+            );
+            assert!(q.dkms3.is_none());
+
+            // t = 3 over three nodes (a 3-of-3) is still unimplemented → fail closed (no downgrade).
+            let mut t3 = node_a.clone();
+            t3["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
+            t3["threshold"] = json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
+            let t3_path = unique_store_path("dkms-quorum-t3");
+            std::fs::write(&t3_path, serde_json::to_vec(&t3).unwrap()).unwrap();
+            let mut r = KeyProvider::default();
+            assert_eq!(
+                error_code_ref(&r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &t3_path }))),
+                "not_configured",
+                "t=3 must fail closed rather than silently downgrade"
+            );
+
+            for p in [&path, &dup_path, &t3_path] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
         /// `merge_threshold_material` welds node B's re-sealed share into node A's material as the
         /// second share — WITHOUT combining (no XOR; `key-provider` never holds the CEK) — and fails
         /// closed on a missing share, identical shares, or a content/transcript mismatch.
@@ -3082,6 +3316,32 @@ mod tests {
             let ctx: ReleaseSessionContext =
                 serde_json::from_value(v).expect("rotated session context parses");
             assert_eq!(ctx.producer_vk2_b64.as_deref(), Some("Uk9UQVRFRC1OT0RFLVZL"));
+        }
+
+        /// 2-of-3 QUORUM (Day 113–116): the session context carries an OPTIONAL third share
+        /// escrow. Absent → the 2-of-2 / single-node rails parse byte-identically; present →
+        /// the quorum release recovers from ANY TWO of the three nodes. `deny_unknown_fields`
+        /// keeps a typo'd field from silently dropping the third escrow.
+        #[test]
+        fn session_context_carries_an_optional_third_share_escrow() {
+            let s = escrow_scenario();
+            let base = session_ctx(&s, &s.producer_vk, None).expect("session context");
+            assert!(base.wrapped_cek_share3_b64.is_none(), "absent on the non-quorum rails");
+            let b64 = b64();
+            let v = json!({
+                "decrypt_session_pub_b64": s.session_pub_b64,
+                "producer_vk_b64": b64.encode(&s.producer_vk),
+                "aad_b64": b64.encode(&s.transcript),
+                "ciphertext_b64": b64.encode(b"ciphertext"),
+                "content_hash_b64": b64.encode(b"content-hash"),
+                "nonce_b64": b64.encode(b"nonce"),
+                "wrapped_cek_share2_b64": "U0hBUkUy",
+                "wrapped_cek_share3_b64": "U0hBUkUz",
+            });
+            let ctx: ReleaseSessionContext =
+                serde_json::from_value(v).expect("quorum session context parses");
+            assert_eq!(ctx.wrapped_cek_share2_b64.as_deref(), Some("U0hBUkUy"));
+            assert_eq!(ctx.wrapped_cek_share3_b64.as_deref(), Some("U0hBUkUz"));
         }
 
         /// A denied rights receipt is rejected BEFORE the escrow is ever touched

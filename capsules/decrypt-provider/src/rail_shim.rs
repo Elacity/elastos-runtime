@@ -166,6 +166,76 @@ pub fn decrypt_from_carrier_threshold(
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
+/// Transcript-bound **2-of-3 QUORUM** carrier open (Day 113–116): the CEK was
+/// Shamir-split over GF(256) across THREE dKMS nodes at publish
+/// (`ddrm_envelope::split_cek_shamir2`), so ANY TWO of the three re-sealed shares
+/// reconstruct it — the rail survives a dead node — while a single share remains
+/// information-theoretically useless. PC2's legacy rail rents this property from
+/// Lit's opaque network (`decryptAndCombine`, `non-media-decrypt.js:76`); here the
+/// field arithmetic, the share set, and the quorum policy are owned and inspectable.
+///
+/// Each share was escrowed as `x ‖ share` (`indexed_share`) — its Shamir x-coordinate
+/// rides INSIDE the sealed payload, authenticated end-to-end by the producer escrow
+/// seal and the node re-seal, never as forgeable cleartext beside the envelope.
+/// `node_verifiers` is the boundary's PINNED node identity list in x order
+/// (`node_verifiers[i]` ↔ x = i+1). For each sealed share we find the pinned node
+/// whose signature verifies, then REQUIRE the inside-x to equal that node's
+/// coordinate — so node j can never impersonate node i's share, even with a valid
+/// signature of its own. Fails closed on: no pinned identity verifying a share, an
+/// x/identity mismatch, a duplicate x (one node's share twice is NOT a quorum), a
+/// zero x, malformed payloads, or a classical session.
+pub fn decrypt_from_carrier_quorum<V: CekSealVerifier>(
+    session: &SessionSecret,
+    sealed_share_a: &[u8],
+    sealed_share_b: &[u8],
+    aad: &[u8],
+    node_verifiers: &[V],
+    ciphertext_segment: &[u8],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<u8>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("quorum reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+
+    // Unwrap ONE sealed indexed share: find the pinned node identity that verifies it,
+    // and bind that identity to the x-coordinate carried inside the sealed payload.
+    let unwrap_indexed = |sealed: &[u8]| -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
+        let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
+        for (i, verifier) in node_verifiers.iter().enumerate() {
+            let expected_x = (i + 1) as u8;
+            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
+            {
+                let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
+                    .ok_or("sealed quorum share carries no valid x-coordinate")?;
+                if x != expected_x {
+                    return Err(
+                        "quorum share x-coordinate does not match the node identity that sealed it"
+                            .to_string(),
+                    );
+                }
+                return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
+            }
+        }
+        Err("no pinned node identity verifies this sealed quorum share".to_string())
+    };
+
+    let (x_a, share_a) = unwrap_indexed(sealed_share_a)?;
+    let (x_b, share_b) = unwrap_indexed(sealed_share_b)?;
+
+    // Reconstruct the CEK INSIDE the boundary (Lagrange at x=0 over GF(256)); the
+    // combine itself refuses duplicate/zero x's — a sub-quorum can never slip through.
+    let cek = ddrm_envelope::combine_cek_shamir2(x_a, share_a.as_slice(), x_b, share_b.as_slice())
+        .map_err(|e| e.to_string())?;
+    let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cek.as_slice(),
+    ));
+    crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
