@@ -371,8 +371,12 @@ the proven in-boundary engines now exists behind the `rail-shim` feature
 `OpenSession`). It encodes recommended **Option A** (decrypt VM *receives*
 VM-sealed material) for **both** profiles:
 
-- `SealedDecryptCarrier { profile, sealed_cek, ciphertext_segment, init_segment }`
-  — carries only sealed/public bytes, **never** a raw CEK.
+- `SealedDecryptBundle { profile, sealed_cek, ciphertext_segment, init_segment }`
+  — carries only sealed/public bytes, **never** a raw CEK. (Renamed from
+  `SealedDecryptCarrier` to kill the collision with Principle #4's Carrier *plane*:
+  "carrier" here is the *data* the CEK is carried in, not the transport substrate.
+  The `decrypt_from_carrier*` function family keeps its name — it matches the
+  `rail_carrier_*.json` goldens — and there "carrier" always means *this bundle*.)
 - `SessionSecret` (the VM's in-VM session key, a separate argument — never on the
   wire) dispatches: `ClassicalP256` → `decrypt_sealed_segment` (`rail-prep`);
   `PqHybrid` → `PqSealedEnvelope::from_bytes` (new wire-decode) →

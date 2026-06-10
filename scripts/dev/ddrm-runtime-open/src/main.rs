@@ -1035,6 +1035,19 @@ fn publish_escrow(
                 .map_err(|e| format!("write dkms authority descriptor: {e}"))?;
             (recipient_a, extra_nodes)
         }
+        AuthorityBackend::Lit => {
+            // The provider plane ADMITS Lit (legacy/migration content escrowed to Lit's network),
+            // but no Lit proxy ships. Fail CLOSED at provision — the operator surface honestly
+            // exposes the slot, and the runtime refuses to open until a real Lit proxy is wired
+            // (mirrors `key-provider`'s "Lit/Chipotle compat backend selected but no Lit proxy is
+            // provisioned"). This proves the third provider is real, not a silent stub.
+            return Err(
+                "authority.backend == \"lit\" selected: the Lit/Chipotle compat provider slot \
+                 exists for legacy content escrowed to Lit's network, but no Lit proxy is \
+                 provisioned in this runtime — opening fails closed until one is wired"
+                    .to_string(),
+            );
+        }
     };
 
     let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([0x70u8; 32]);
@@ -4006,6 +4019,12 @@ enum AuthorityBackend {
     /// PUBLIC identity (a public-only descriptor) and DELEGATES recovery to the node — never the
     /// master, never the raw CEK.
     Dkms,
+    /// Lit/Chipotle COMPAT provider slot (Anders: "different dDRM providers in the capsule").
+    /// The runtime's decryption plane is provider-pluggable; this slot exists so LEGACY content
+    /// whose CEK was escrowed to Lit's network can keep being served THROUGH the runtime without
+    /// a forced migration, while new content uses the owned `dkms` provider. No Lit proxy ships
+    /// today, so selecting it fails CLOSED at publish — the seam is honest, never a silent stub.
+    Lit,
 }
 
 impl AuthorityBackend {
@@ -4013,6 +4032,7 @@ impl AuthorityBackend {
         match self {
             AuthorityBackend::Reference => "reference",
             AuthorityBackend::Dkms => "dkms",
+            AuthorityBackend::Lit => "lit",
         }
     }
 }
@@ -4097,7 +4117,8 @@ impl OpenConfig {
                 let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
                     "reference" => AuthorityBackend::Reference,
                     "dkms" => AuthorityBackend::Dkms,
-                    other => return Err(format!("config `authority.backend` must be \"reference\" or \"dkms\", got {other:?}")),
+                    "lit" => AuthorityBackend::Lit,
+                    other => return Err(format!("config `authority.backend` must be \"reference\", \"dkms\", or \"lit\", got {other:?}")),
                 };
                 let node_bin = auth.get("dkms_authority_bin").and_then(Value::as_str).map(str::to_string);
                 if backend == AuthorityBackend::Dkms && node_bin.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -4311,6 +4332,8 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             // The rail connects to the node as the runtime's KNOWN caller identity (allow-listed).
             "dkms_caller_seed_b64": caller_seed_b64,
         }),
+        // `lit` fails closed at `publish_escrow` above, so the open flow never reaches here.
+        AuthorityBackend::Lit => unreachable!("lit backend fails closed at publish_escrow"),
     };
     // For `dkms`, snapshot the descriptor so we can PROVE the runtime treated it as immutable
     // published data (read-only) across the whole open — the key-provider only ever READS it.
@@ -4343,6 +4366,8 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             Some(bytes)
         }
         AuthorityBackend::Reference => None,
+        // `lit` fails closed at `publish_escrow` above, so the open flow never reaches here.
+        AuthorityBackend::Lit => unreachable!("lit backend fails closed at publish_escrow"),
     };
     step(1, &format!(
         "producer (publish-time): escrowed the CEK to the {} authority's STABLE recipient + wrote a durable publish fixture{}",
@@ -4413,6 +4438,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         match cfg.authority {
             AuthorityBackend::Reference => "reference, relaunched from the durable store",
             AuthorityBackend::Dkms => "dkms, PUBLIC-ONLY client (delegates recovery to the external node)",
+            AuthorityBackend::Lit => unreachable!("lit backend fails closed at publish_escrow"),
         }
     ));
 
@@ -5343,6 +5369,31 @@ mod config_tests {
         let parsed_ref = OpenConfig::from_json(&explicit_ref).unwrap();
         assert!(parsed_ref.authority == AuthorityBackend::Reference);
         assert_eq!(parsed_ref.dkms_authority_bin, None);
+    }
+
+    #[test]
+    fn lit_is_an_operator_selectable_provider_slot_that_fails_closed() {
+        // The decryption plane is provider-pluggable (Anders: "different dDRM providers in the
+        // capsule"). The operator surface ADMITS `lit` as the legacy/migration provider...
+        let mut lit = json!({ "key_bin": "/k", "decrypt_bin": "/d", "drm_bin": "/m" });
+        lit.as_object_mut().unwrap().insert("authority".into(), json!({ "backend": "lit" }));
+        let parsed = OpenConfig::from_json(&lit).expect("lit is a known provider slot");
+        assert!(parsed.authority == AuthorityBackend::Lit);
+        assert_eq!(parsed.authority.tag(), "lit");
+
+        // ...but no Lit proxy ships, so provisioning fails CLOSED with an honest message — the
+        // seam is real, never a silent stub that pretends to open content it cannot.
+        let tmp = std::path::Path::new("/tmp/ddrm-lit-fail-closed");
+        let err = match publish_escrow(
+            "/k", "/store", tmp, AuthorityBackend::Lit, tmp, None, "/n", "/e", false, "/n2", "/e2",
+            2, "/n3", "/e3",
+        ) {
+            Ok(_) => panic!("lit must fail closed without a provisioned proxy"),
+            Err(e) => e,
+        };
+        assert!(err.contains("lit"), "the error names the backend: {err}");
+        assert!(err.contains("no Lit proxy"), "the error is honest about the missing proxy: {err}");
+        assert!(err.contains("fails closed"), "the error states the fail-closed stance: {err}");
     }
 
     #[test]

@@ -1383,7 +1383,7 @@ the sealed-CEK material off the wire and hands it to the right engine. That adap
 now exists behind the `rail-shim` feature (`decrypt-provider/src/rail_shim.rs`,
 default OFF, **NOT** wired into `OpenSession`/dispatch — a Parallel-Change island):
 
-- `SealedDecryptCarrier { profile, sealed_cek, ciphertext_segment, init_segment }` —
+- `SealedDecryptBundle { profile, sealed_cek, ciphertext_segment, init_segment }` —
   carries only sealed/public bytes (**never** a raw CEK), mirroring rail Option A
   (decrypt VM *receives* VM-sealed material) and PC2 `session::unwrap_envelope`
   (the VM holds the session key; the envelope arrives from outside).

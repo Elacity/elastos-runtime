@@ -480,7 +480,7 @@ impl DecryptProvider {
             None => return Response::error("not_configured", "configured key-authority verifying key is malformed"),
         };
 
-        let carrier = rail_shim::SealedDecryptCarrier {
+        let carrier = rail_shim::SealedDecryptBundle {
             profile,
             sealed_cek,
             ciphertext_segment,
@@ -593,7 +593,7 @@ impl DecryptProvider {
             session,
             verifier,
             aad,
-            carrier: rail_shim::SealedDecryptCarrier {
+            carrier: rail_shim::SealedDecryptBundle {
                 profile: rail_shim::SealProfile::PqHybrid,
                 sealed_cek,
                 ciphertext_segment,
@@ -867,7 +867,7 @@ struct PreparedBoundOpen<'a> {
     session: &'a rail_shim::SessionSecret,
     verifier: crate::pq_envelope::mldsa::MlDsa65Verifier,
     aad: Vec<u8>,
-    carrier: rail_shim::SealedDecryptCarrier,
+    carrier: rail_shim::SealedDecryptBundle,
 }
 
 /// Build the uniform audit envelope (feature `rail-audit`): a scoped, CEK/plaintext-

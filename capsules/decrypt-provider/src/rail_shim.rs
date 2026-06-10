@@ -44,7 +44,16 @@ pub enum SealProfile {
 
 /// The sealed decrypt material the runtime hands the decrypt VM on `OpenSession`
 /// (rail Option A). Carries only sealed/public bytes — **never** a raw CEK.
-pub struct SealedDecryptCarrier {
+///
+/// NAMING (disambiguation): this type was historically `SealedDecryptCarrier`.
+/// In this rail, "carrier" is a *data* noun — the bundle of sealed bytes that the
+/// CEK is *carried in* off the wire. It is UNRELATED to Principle #4's Carrier
+/// *plane* (the capability/transport substrate capsules communicate over). To kill
+/// that collision the type is `SealedDecryptBundle`; the `decrypt_from_carrier*`
+/// function family keeps its historical name (it is the documented rail API and
+/// matches the `rail_carrier_*.json` golden vectors), but "carrier" there always
+/// means *this bundle*, never the transport plane.
+pub struct SealedDecryptBundle {
     pub profile: SealProfile,
     /// The CEK sealed to the VM session key: a classical envelope blob, or a
     /// `PqSealedEnvelope::to_bytes()` blob, per `profile`.
@@ -69,7 +78,7 @@ pub enum SessionSecret {
 /// or bad signature (the underlying engines never emit plaintext on error).
 pub fn decrypt_from_carrier(
     session: &SessionSecret,
-    carrier: &SealedDecryptCarrier,
+    carrier: &SealedDecryptBundle,
     verifier: &impl CekSealVerifier,
 ) -> Result<(Vec<u8>, Value), String> {
     decrypt_from_carrier_bound(session, carrier, b"", verifier)
@@ -87,7 +96,7 @@ pub fn decrypt_from_carrier(
 /// on a classical carrier is rejected rather than silently unbound.
 pub fn decrypt_from_carrier_bound(
     session: &SessionSecret,
-    carrier: &SealedDecryptCarrier,
+    carrier: &SealedDecryptBundle,
     aad: &[u8],
     verifier: &impl CekSealVerifier,
 ) -> Result<(Vec<u8>, Value), String> {
@@ -372,8 +381,8 @@ mod tests {
         .unwrap()
     }
 
-    fn classical_carrier(v: &Value) -> SealedDecryptCarrier {
-        SealedDecryptCarrier {
+    fn classical_carrier(v: &Value) -> SealedDecryptBundle {
+        SealedDecryptBundle {
             profile: SealProfile::ClassicalP256,
             sealed_cek: b64().decode(v["sealed_envelope_b64"].as_str().unwrap()).unwrap(),
             ciphertext_segment: b64().decode(v["encrypted_segment_b64"].as_str().unwrap()).unwrap(),
@@ -441,10 +450,10 @@ mod tests {
 
     // --- PQ-hybrid profile (the shipped target) ---
 
-    fn pq_carrier(public: &crate::pq_envelope::SessionKemPublic, cek: &[u8; 16], segment: Vec<u8>) -> SealedDecryptCarrier {
+    fn pq_carrier(public: &crate::pq_envelope::SessionKemPublic, cek: &[u8; 16], segment: Vec<u8>) -> SealedDecryptBundle {
         // The key authority seals the CEK; the carrier transports its wire form.
         let env = seal(public, cek, &StubSigner);
-        SealedDecryptCarrier {
+        SealedDecryptBundle {
             profile: SealProfile::PqHybrid,
             sealed_cek: env.to_bytes(),
             ciphertext_segment: segment,
@@ -539,7 +548,7 @@ mod tests {
     fn rail_carrier_golden_replays_through_shim() {
         let v = rail_carrier_classical();
         assert_eq!(v.profile, "ClassicalP256");
-        let carrier = SealedDecryptCarrier {
+        let carrier = SealedDecryptBundle {
             profile: SealProfile::ClassicalP256,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -563,7 +572,7 @@ mod tests {
         let mut sealed = b64().decode(&v.sealed_cek_b64).unwrap();
         let n = sealed.len();
         sealed[n - 1] ^= 0xFF;
-        let carrier = SealedDecryptCarrier {
+        let carrier = SealedDecryptBundle {
             profile: SealProfile::ClassicalP256,
             sealed_cek: sealed,
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -604,7 +613,7 @@ mod tests {
     fn rail_carrier_pq_golden_replays_through_shim() {
         let v = rail_carrier_pq();
         assert_eq!(v.profile, "PqHybrid");
-        let carrier = SealedDecryptCarrier {
+        let carrier = SealedDecryptBundle {
             profile: SealProfile::PqHybrid,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -628,7 +637,7 @@ mod tests {
         let mut sealed = b64().decode(&v.sealed_cek_b64).unwrap();
         let n = sealed.len();
         sealed[n - 1] ^= 0xFF; // corrupt the signature tail
-        let carrier = SealedDecryptCarrier {
+        let carrier = SealedDecryptBundle {
             profile: SealProfile::PqHybrid,
             sealed_cek: sealed,
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -667,8 +676,8 @@ mod tests {
     }
 
     #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
-    fn pq_mldsa_carrier(v: &crate::vector_format::RailCarrierVector) -> SealedDecryptCarrier {
-        SealedDecryptCarrier {
+    fn pq_mldsa_carrier(v: &crate::vector_format::RailCarrierVector) -> SealedDecryptBundle {
+        SealedDecryptBundle {
             profile: SealProfile::PqHybrid,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -759,7 +768,7 @@ mod tests {
     #[test]
     fn harden_pq_carrier_with_classical_secret_fails_closed() {
         let v = rail_carrier_pq();
-        let carrier = SealedDecryptCarrier {
+        let carrier = SealedDecryptBundle {
             profile: SealProfile::PqHybrid,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
@@ -784,7 +793,7 @@ mod tests {
         for i in 0..sealed.len() {
             let mut s = sealed.clone();
             s[i] ^= 0xFF;
-            let carrier = SealedDecryptCarrier {
+            let carrier = SealedDecryptBundle {
                 profile: SealProfile::PqHybrid,
                 sealed_cek: s,
                 ciphertext_segment: segment.clone(),
