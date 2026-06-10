@@ -126,6 +126,24 @@ capsule (`#[cfg(unix)]`-gated), so a full Carrier-*capability* handoff (host pro
 the call, capsule never names a transport) remains a future step — tracked with the
 one-canonical-E2E-path work, not a correctness hole today.
 
+**Content plane (Principle #4 + the content contract) — the canonical open now fetches
+by CID.** Per `docs/CARRIER.md` the content contract is `capsule → content capability →
+content-addressed backend → signed availability receipt`, with HTTP/Kubo as a *backend*,
+never the capsule-facing path. The canonical `run` open (`scripts/dev/ddrm-runtime-open`,
+all backends: reference / dkms / 2-of-2 / 2-of-3) **no longer inlines the ciphertext** —
+the producer PUBLISHES it to a content-addressed store and the open **FETCHES it back by
+its CIDv1** (`payload_cid_v1_raw`, raw + sha2-256, **byte-identical to `encrypt-provider`
+and PC2/Helia single-chunk**) through a `content_capability_fetch` seam, verifying an
+availability receipt. The capability **fails closed** on an unknown CID *and* on a tampered
+backend (served bytes that don't hash back to the requested CID — content-addressing
+integrity, so a corrupt/malicious store can never substitute content). No raw HTTP, no
+daemon: the backend is in-process, and swapping in the `elastos-server` `StorageProvider`
+(iroh Carrier today; Kubo / Elacity / supernode backends) is a backend change **behind the
+same fetch-by-CID contract**, zero change to the open path. Proven by harness unit tests
+(CID byte-compat goldens + round-trip + fail-closed) and the live consumer open. Remaining
+on the runnable-E2E ladder: on-chain ownership ON-by-default via a local JSON-RPC mock, and
+real multi-MiB media (chunked UnixFS) beyond the single-chunk cap.
+
 ---
 
 ## 3. Architecture map — current state

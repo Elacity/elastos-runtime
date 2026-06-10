@@ -190,6 +190,7 @@ dependencies = [
  "ddrm-envelope",
  "ddrm-plan-runner",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

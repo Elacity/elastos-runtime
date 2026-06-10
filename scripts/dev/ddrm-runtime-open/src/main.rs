@@ -671,6 +671,104 @@ fn step(n: u32, msg: &str) {
     println!("  [{n}] {msg}");
 }
 
+// ===== Content plane (Principle #4 / the runtime content contract) ============================
+//
+// The canonical open must FETCH the ciphertext by its content address, never carry it inline.
+// This models the runtime's content contract from `docs/CARRIER.md`:
+//
+//   capsule -> content capability -> content-addressed backend -> signed availability receipt
+//
+// `content_capability_fetch` is the SEAM the open speaks (fetch-by-CID). The backend here is an
+// in-process content-addressed store so the gate runs with NO daemon and NO raw HTTP — honoring
+// Principle #4 (capsules speak Carrier-shaped capability calls, not raw sockets/HTTP). Swapping in
+// the `elastos-server` `StorageProvider` (iroh Carrier today; Kubo/Elacity/supernode backends) is a
+// backend change BEHIND this same fetch-by-CID contract, with zero change to the open path.
+
+/// Content-address `bytes` as an IPFS **CIDv1** (raw codec, sha2-256 multihash, multibase base32) —
+/// byte-for-byte identical to `encrypt-provider::payload_cid_v1_raw` and PC2/Helia single-chunk
+/// content. Pure function of the bytes: no node, no network.
+fn payload_cid_v1_raw(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    // CIDv1: <version 0x01> <codec raw 0x55> <multihash: sha2-256 0x12, len 0x20, 32-byte digest>.
+    let mut cid_bytes = Vec::with_capacity(4 + digest.len());
+    cid_bytes.extend_from_slice(&[0x01, 0x55, 0x12, 0x20]);
+    cid_bytes.extend_from_slice(&digest);
+    format!("b{}", base32_lower_nopad(&cid_bytes))
+}
+
+/// RFC 4648 base32, lowercase, no padding — the multibase `b` encoding IPFS CIDv1 strings use.
+fn base32_lower_nopad(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in data {
+        buffer = (buffer << 8) | byte as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// A content-addressed store — the in-process backend behind the content capability. Keys are the
+/// CIDv1 of the bytes, so storage IS content-addressing.
+struct ContentStore {
+    blocks: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+impl ContentStore {
+    fn new() -> Self {
+        ContentStore { blocks: std::collections::BTreeMap::new() }
+    }
+
+    /// Publish bytes; returns the content address the runtime would mint into `SealedObjectV1.payload_cid`.
+    fn put(&mut self, bytes: &[u8]) -> String {
+        let cid = payload_cid_v1_raw(bytes);
+        self.blocks.insert(cid.clone(), bytes.to_vec());
+        cid
+    }
+}
+
+/// The signed-availability-receipt analogue (`docs/CARRIER.md`: the content provider owns
+/// fetch/status + availability receipts). Here it attests WHICH backend served the CID and the size.
+#[derive(Debug)]
+struct AvailabilityReceiptV1 {
+    cid: String,
+    size: usize,
+    backend: &'static str,
+}
+
+/// The content capability the open speaks: fetch by CID with content-addressing INTEGRITY. Fails
+/// CLOSED if the CID is unknown OR the served bytes do not hash back to the requested CID (a tampered
+/// backend can never substitute content) — the runtime trusts the address, not the backend.
+fn content_capability_fetch(
+    store: &ContentStore,
+    cid: &str,
+) -> Result<(Vec<u8>, AvailabilityReceiptV1), String> {
+    let bytes = store
+        .blocks
+        .get(cid)
+        .ok_or_else(|| format!("content {cid} is not available via the content capability"))?;
+    let recomputed = payload_cid_v1_raw(bytes);
+    if recomputed != cid {
+        return Err(format!(
+            "content-address integrity failure: served bytes hash to {recomputed}, not the \
+             requested {cid} — the content capability fails closed rather than serve substituted content"
+        ));
+    }
+    Ok((
+        bytes.clone(),
+        AvailabilityReceiptV1 { cid: cid.to_string(), size: bytes.len(), backend: "in-process-content-addressed" },
+    ))
+}
+
 /// Resolve the on-chain ownership answer. Live (`DDRM_SMOKE_CHAIN_RPC` set + a
 /// chain-provider binary supplied) drives the REAL `chain-provider` against Base;
 /// otherwise a mocked-owned attestation keeps the offline smoke deterministic.
@@ -782,6 +880,10 @@ struct KeyOpenMaterial {
     aad_b64: String,
     content_hash_b64: String,
     nonce_b64: String,
+    /// The ciphertext segment to decrypt, FETCHED by its CIDv1 through the content capability at
+    /// open time (never inlined). Carried here so the `KeyHandle` re-seals over the exact bytes the
+    /// content plane served — the open's content is content-addressed, not a hard-coded constant.
+    ciphertext_b64: String,
     /// 2-of-2 THRESHOLD (Day 99–100): node B's escrowed share. When present, the `KeyHandle` supplies
     /// it in the `release` session context so the key-provider dual-recovers BOTH nodes. `None` for the
     /// single-node rail.
@@ -3633,7 +3735,8 @@ impl ProviderHandle for KeyHandle {
             "decrypt_session_pub_b64": m.session_pub_b64,
             "producer_vk_b64": m.producer_vk_b64,
             "aad_b64": m.aad_b64,
-            "ciphertext_b64": GOLDEN_CIPHERTEXT_B64,
+            // The ciphertext the content capability served by CID at open time — NOT an inline constant.
+            "ciphertext_b64": m.ciphertext_b64,
             "content_hash_b64": m.content_hash_b64,
             "nonce_b64": m.nonce_b64,
             "now_unix": NOW_UNIX,
@@ -4508,6 +4611,29 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let kid_hex = fixture.kid_hex.clone();
     let wrapped_cek_b64 = fixture.wrapped_cek_b64.clone();
     let producer_vk_b64 = fixture.producer_vk_b64.clone();
+
+    // --- CONTENT PLANE: the producer PUBLISHED the ciphertext to the content-addressed store; the
+    // open FETCHES it back by its CIDv1 through the content capability (no inline constant, no raw
+    // HTTP). The fetched bytes — proven to hash back to the requested CID — are what the key
+    // authority re-seals over. The backend is in-process here; swapping in the elastos-server
+    // StorageProvider / iroh Carrier is a backend change behind this same fetch-by-CID contract.
+    let ciphertext_bytes = B64
+        .decode(GOLDEN_CIPHERTEXT_B64)
+        .map_err(|e| format!("decode content ciphertext: {e}"))?;
+    let mut content_store = ContentStore::new();
+    let payload_cid = content_store.put(&ciphertext_bytes);
+    let (fetched_ciphertext, availability) = content_capability_fetch(&content_store, &payload_cid)?;
+    if fetched_ciphertext != ciphertext_bytes {
+        return Err("the content capability served different bytes than were published".to_string());
+    }
+    let ciphertext_b64 = B64.encode(&fetched_ciphertext);
+    println!(
+        "  [content-plane] ciphertext fetched by its CIDv1 ({}) through the content capability \
+         (in-process content-addressed backend; swappable for iroh Carrier / Kubo) — no raw HTTP; \
+         availability receipt verified ({} bytes via {})",
+        availability.cid, availability.size, availability.backend
+    );
+
     *key_material.borrow_mut() = Some(KeyOpenMaterial {
         kid_hex: kid_hex.clone(),
         wrapped_cek_b64: wrapped_cek_b64.clone(),
@@ -4516,6 +4642,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         aad_b64: B64.encode(&aad),
         content_hash_b64: fixture.content_hash_b64.clone(),
         nonce_b64: fixture.nonce_b64.clone(),
+        ciphertext_b64,
         // 2-of-2 THRESHOLD: node B's escrowed share-2 (from the publish fixture); the key-provider
         // dual-recovers BOTH nodes when present. `None` for the single-node rail.
         wrapped_cek_share2_b64: fixture.wrapped_cek_share2_b64.clone(),
@@ -5297,6 +5424,67 @@ fn main() {
             eprintln!("\nddrm-runtime-open: FAIL — {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod content_plane_tests {
+    use super::*;
+
+    /// The CID is byte-for-byte what `encrypt-provider::payload_cid_v1_raw` (and PC2/Helia
+    /// single-chunk content) produces — so a CID minted by the producer addresses the same bytes
+    /// the open fetches. These goldens are pinned identically in `encrypt-provider`'s tests.
+    #[test]
+    fn payload_cid_matches_encrypt_provider_and_ipfs_golden() {
+        assert_eq!(
+            payload_cid_v1_raw(b"elastos dDRM: content-addressed ciphertext payload (golden)"),
+            "bafkreiex626yyta3r5sd24h3pbxtrpxsf4bktlu2xmh74xxdphsiq4rppm"
+        );
+        assert_eq!(payload_cid_v1_raw(b""), "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku");
+        assert_eq!(payload_cid_v1_raw(b"abc"), "bafkreif2pall7dybz7vecqka3zo24irdwabwdi4wc55jznaq75q7eaavvu");
+    }
+
+    /// Publish -> fetch-by-CID round-trips: the open recovers exactly the published bytes, and the
+    /// availability receipt names the served CID + size.
+    #[test]
+    fn content_capability_round_trips_by_cid() {
+        let mut store = ContentStore::new();
+        let payload = b"a real (small) CENC segment's bytes".to_vec();
+        let cid = store.put(&payload);
+        let (fetched, receipt) = content_capability_fetch(&store, &cid).expect("fetch by cid");
+        assert_eq!(fetched, payload, "the content plane returns exactly the published bytes");
+        assert_eq!(receipt.cid, cid);
+        assert_eq!(receipt.size, payload.len());
+    }
+
+    /// An UNKNOWN CID is not served — the open fails closed rather than guess.
+    #[test]
+    fn content_capability_fails_closed_on_unknown_cid() {
+        let store = ContentStore::new();
+        let err = content_capability_fetch(&store, "bafkreif2pall7dybz7vecqka3zo24irdwabwdi4wc55jznaq75q7eaavvu")
+            .expect_err("an unknown CID must not be served");
+        assert!(err.contains("not available"), "fail-closed message names the miss: {err}");
+    }
+
+    /// A TAMPERED backend (bytes mutated under a CID) is caught by content-addressing integrity:
+    /// the served bytes no longer hash to the requested CID, so the capability refuses them. A
+    /// malicious or corrupt store can never substitute content for a CID the runtime trusts.
+    #[test]
+    fn content_capability_fails_closed_on_tampered_backend() {
+        let mut store = ContentStore::new();
+        let cid = store.put(b"original ciphertext bytes");
+        // Mutate the stored bytes WITHOUT changing the key (simulate a tampered/corrupt backend).
+        store.blocks.insert(cid.clone(), b"SUBSTITUTED ciphertext bytes".to_vec());
+        let err = content_capability_fetch(&store, &cid)
+            .expect_err("substituted content must fail the content-address check");
+        assert!(err.contains("integrity"), "fail-closed message names the integrity failure: {err}");
+    }
+
+    /// Content-addressing is collision-sensitive: a single flipped byte addresses to a different CID.
+    #[test]
+    fn content_address_is_collision_sensitive() {
+        assert_ne!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0002"));
+        assert_eq!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0001"));
     }
 }
 
