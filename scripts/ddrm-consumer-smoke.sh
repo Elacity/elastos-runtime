@@ -32,10 +32,15 @@ BACKEND="reference"
 THRESHOLD="false"
 TRANSPORT="unix"
 NODES="2"
+EXPECT_DENY="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --backend) BACKEND="${2:-}"; shift 2 ;;
     --backend=*) BACKEND="${1#*=}"; shift ;;
+    # NOT-OWNED gate (ownership real-by-default): drive the REAL chain-provider against the
+    # in-process JSON-RPC mock with a not-owned answer and ASSERT the open FAILS CLOSED at
+    # the rights gate (the chain says you do not own this content). Inverts the exit check.
+    --deny-ownership) EXPECT_DENY="true"; shift ;;
     # 2-of-2 THRESHOLD (Day 99–100): the runtime provisions TWO secret-holding nodes, XOR-splits the
     # CEK so neither node ever holds the whole key, and drives the full dual-recover + in-VM combine.
     # Implies --backend dkms (the only backend with external secret-holders).
@@ -139,26 +144,33 @@ if [[ "$BACKEND" == "dkms" ]]; then
   fi
 fi
 
-# Optional live wallet-ownership check: when DDRM_SMOKE_CHAIN_RPC is set we build and
-# pass the REAL chain-provider so the rights step queries the AuthorityGateway on Base
-# (your wallet vs the content's contentId). Offline (default) the orchestrator uses a
-# deterministic mocked-owned attestation and chain-provider is never built/spawned.
-#   DDRM_SMOKE_CHAIN_RPC=https://...   (required to enable live mode)
-#   DDRM_SMOKE_CHAIN_CONTRACT=0x...    AuthorityGateway address
-#   DDRM_SMOKE_CHAIN_SELECTOR=0x...    has_access selector
-#   DDRM_SMOKE_CHAIN_SUBJECT=0x...     your wallet address
+# Wallet-ownership is checked through the REAL chain-provider BY DEFAULT: we always build
+# and pass it, and the orchestrator drives `has_access_by_content_id` (encode calldata ->
+# eth_call -> decode the ABI bool -> rights decision). With NO external RPC the open runs
+# that path against an in-process JSON-RPC mock (deterministic, owned by default; pass
+# --deny-ownership to flip it not-owned and assert the open fails closed). Point it at a
+# real endpoint to query Base mainnet (your wallet vs the content's contentId):
+#   DDRM_SMOKE_CHAIN_RPC=https://...   external RPC endpoint (real network)
+#   DDRM_SMOKE_CHAIN_CONTRACT=0x...    AuthorityGateway address   (required for external RPC)
+#   DDRM_SMOKE_CHAIN_SELECTOR=0x...    has_access selector        (required for external RPC)
+#   DDRM_SMOKE_CHAIN_SUBJECT=0x...     your wallet address        (required for external RPC)
 #   DDRM_SMOKE_CONTENT_ID=...          on-chain contentId/KID (defaults to golden CID)
 #   DDRM_SMOKE_CHAIN_NETWORK=base  DDRM_SMOKE_CHAIN_ID=8453   (optional)
-CHAIN_ARG=()
+#   DDRM_SMOKE_CHAIN_ACCESS=owned|denied   local-mock answer (default owned)
+build chain-provider
+CHAIN_BIN="${CAPSULES}/chain-provider/target/debug/chain-provider"
+if [[ ! -x "$CHAIN_BIN" ]]; then
+  echo "FAIL: missing built binary ${CHAIN_BIN}" >&2
+  exit 1
+fi
+CHAIN_ARG=("$CHAIN_BIN")
 if [[ -n "${DDRM_SMOKE_CHAIN_RPC:-}" ]]; then
-  build chain-provider
-  CHAIN_BIN="${CAPSULES}/chain-provider/target/debug/chain-provider"
-  if [[ ! -x "$CHAIN_BIN" ]]; then
-    echo "FAIL: missing built binary ${CHAIN_BIN}" >&2
-    exit 1
-  fi
-  CHAIN_ARG=("$CHAIN_BIN")
-  echo "live chain mode: querying ${DDRM_SMOKE_CHAIN_RPC}"
+  echo "live chain mode: querying ${DDRM_SMOKE_CHAIN_RPC} (external RPC)"
+elif [[ "$EXPECT_DENY" == "true" ]]; then
+  export DDRM_SMOKE_CHAIN_ACCESS="denied"
+  echo "chain mode: real chain-provider vs in-process mock (NOT-OWNED — expecting fail-closed)"
+else
+  echo "chain mode: real chain-provider vs in-process mock (owned — no external network)"
 fi
 
 echo
@@ -193,6 +205,16 @@ status=$?
 rm -rf "$WORK_DIR"
 
 echo
+if [[ "$EXPECT_DENY" == "true" ]]; then
+  # NOT-OWNED gate: the open MUST fail closed (the chain said not-owned). A zero exit here
+  # would mean the rights gate let through content the chain says you do not own.
+  if [[ $status -ne 0 ]]; then
+    echo "ddrm-consumer-smoke (authority=${MODE_LABEL}, NOT-OWNED): PASS — open failed closed as required"
+    exit 0
+  fi
+  echo "ddrm-consumer-smoke (authority=${MODE_LABEL}, NOT-OWNED): FAIL — open succeeded despite the chain saying not-owned" >&2
+  exit 1
+fi
 if [[ $status -eq 0 ]]; then
   echo "ddrm-consumer-smoke (authority=${MODE_LABEL}): PASS"
   exit 0

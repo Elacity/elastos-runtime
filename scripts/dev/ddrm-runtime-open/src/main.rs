@@ -769,30 +769,75 @@ fn content_capability_fetch(
     ))
 }
 
-/// Resolve the on-chain ownership answer. Live (`DDRM_SMOKE_CHAIN_RPC` set + a
-/// chain-provider binary supplied) drives the REAL `chain-provider` against Base;
-/// otherwise a mocked-owned attestation keeps the offline smoke deterministic.
+// Canned inputs the local-mock chain query uses when the operator did not pin a real
+// contract/selector/subject (they keep ownership a REAL query without forcing the user to
+// own a Base wallet just to run the smoke). The mock ignores the calldata and answers the
+// configured bool — but the calldata is still REALLY encoded + sent + decoded, so the
+// `chain-provider` `has_access_by_content_id` path is exercised end to end.
+const DEFAULT_MOCK_CONTRACT: &str = "0x00000000000000000000000000000000000000aa";
+const DEFAULT_MOCK_SELECTOR: &str = "0x12345678";
+const DEFAULT_MOCK_SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
+
+/// Resolve the on-chain ownership answer for the open. Three modes, in priority order:
+///
+/// 1. **External RPC** (`DDRM_SMOKE_CHAIN_RPC` set + a chain-provider binary): the REAL
+///    `chain-provider` queries the named endpoint (e.g. Base mainnet) — your wallet vs the
+///    content's on-chain `contentId`.
+/// 2. **Local-mock chain (DEFAULT when a chain-provider binary is supplied):** ownership is
+///    REALLY queried through the `chain-provider` `has_access_by_content_id` path (encode
+///    calldata → `eth_call` → decode the ABI bool → rights decision), but against an
+///    in-process JSON-RPC mock so there is NO external network and the answer is
+///    deterministic. `DDRM_SMOKE_CHAIN_ACCESS=denied` flips the mock to not-owned, so the
+///    open MUST fail closed at the rights gate (the not-owned gate).
+/// 3. **Static attestation** (no chain-provider binary at all): a hardcoded owned answer —
+///    the pure-offline fallback for environments that don't build chain-provider.
+///
 /// Returns `(attestation, mode_label)`.
 fn chain_attestation(chain_bin: Option<&String>) -> Result<(Value, String), String> {
-    let rpc = std::env::var("DDRM_SMOKE_CHAIN_RPC").ok().filter(|s| !s.is_empty());
-    match (rpc, chain_bin) {
-        (Some(rpc_url), Some(bin)) => Ok((live_chain_attestation(bin, &rpc_url)?, "live chain".to_string())),
-        (Some(_), None) => Err("DDRM_SMOKE_CHAIN_RPC is set but no chain-provider binary was supplied".to_string()),
-        _ => Ok((owned_chain_attestation(), "mocked owned".to_string())),
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let external_rpc = env("DDRM_SMOKE_CHAIN_RPC");
+    match (external_rpc, chain_bin) {
+        (Some(rpc_url), Some(bin)) => {
+            Ok((query_chain(bin, &rpc_url, None)?, "live chain (external RPC)".to_string()))
+        }
+        (Some(_), None) => {
+            Err("DDRM_SMOKE_CHAIN_RPC is set but no chain-provider binary was supplied".to_string())
+        }
+        (None, Some(bin)) => {
+            // Ownership is real-by-default: drive the REAL chain-provider against an
+            // in-process mock. `DDRM_SMOKE_CHAIN_ACCESS=denied` => the chain says not-owned.
+            let owned = env("DDRM_SMOKE_CHAIN_ACCESS").map(|s| s != "denied").unwrap_or(true);
+            let mock = ChainRpcMock::start(owned)?;
+            let attestation = query_chain(bin, &mock.url, Some(owned))?;
+            drop(mock);
+            let label = format!(
+                "local-mock chain (real chain-provider, {})",
+                if owned { "owned" } else { "DENIED" }
+            );
+            Ok((attestation, label))
+        }
+        (None, None) => Ok((owned_chain_attestation(), "static owned (no chain-provider)".to_string())),
     }
 }
 
-/// Drive the real `chain-provider` for a live `has_access_by_content_id` query, and
-/// return its response shaped as the rights attestation (1:1 by field name). All the
-/// network/contract/subject inputs come from the environment so nothing is hard-coded.
-fn live_chain_attestation(bin: &str, rpc_url: &str) -> Result<Value, String> {
+/// Drive the real `chain-provider` for a `has_access_by_content_id` query and return its
+/// response shaped as the rights attestation (1:1 by field name). When `mock_owned` is
+/// `Some(_)` the query runs against the in-process mock and the contract/selector/subject
+/// fall back to canned values (still really encoded + sent); for an external RPC
+/// (`mock_owned == None`) they are REQUIRED from the environment so nothing is hard-coded.
+fn query_chain(bin: &str, rpc_url: &str, mock_owned: Option<bool>) -> Result<Value, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let network = env("DDRM_SMOKE_CHAIN_NETWORK").unwrap_or_else(|| "base".to_string());
+    let is_mock = mock_owned.is_some();
+    let network = env("DDRM_SMOKE_CHAIN_NETWORK")
+        .unwrap_or_else(|| if is_mock { "base-local-mock".to_string() } else { "base".to_string() });
     let contract = env("DDRM_SMOKE_CHAIN_CONTRACT")
+        .or_else(|| is_mock.then(|| DEFAULT_MOCK_CONTRACT.to_string()))
         .ok_or("DDRM_SMOKE_CHAIN_CONTRACT (AuthorityGateway address) is required for a live chain check")?;
     let selector = env("DDRM_SMOKE_CHAIN_SELECTOR")
+        .or_else(|| is_mock.then(|| DEFAULT_MOCK_SELECTOR.to_string()))
         .ok_or("DDRM_SMOKE_CHAIN_SELECTOR (has_access selector, e.g. 0x........) is required for a live chain check")?;
     let subject = env("DDRM_SMOKE_CHAIN_SUBJECT")
+        .or_else(|| is_mock.then(|| DEFAULT_MOCK_SUBJECT.to_string()))
         .ok_or("DDRM_SMOKE_CHAIN_SUBJECT (your wallet address) is required for a live chain check")?;
     let chain_id: i64 = env("DDRM_SMOKE_CHAIN_ID").and_then(|s| s.parse().ok()).unwrap_or(8453);
 
@@ -842,6 +887,107 @@ fn live_chain_attestation(bin: &str, rpc_url: &str) -> Result<Value, String> {
         "right": resp["right"],
         "has_access": resp["has_access"],
     }))
+}
+
+/// A minimal in-process JSON-RPC endpoint that stands in for a Base RPC node so the REAL
+/// `chain-provider` `eth_call` (the wallet-ownership query) drives the canonical open with
+/// NO external network. It answers EVERY request with a canned 32-byte ABI bool word —
+/// `…01` (owned) or `…00` (not owned) — exactly what `has_access_by_content_id` decodes.
+/// Binds an ephemeral loopback port; the open points chain-provider at its URL and drops it
+/// (joining the server thread) once the single ownership query has run.
+struct ChainRpcMock {
+    url: String,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ChainRpcMock {
+    /// `owned = true` => `has_access` decodes true (the open proceeds); `false` => not-owned
+    /// (the open MUST fail closed at the rights gate).
+    fn start(owned: bool) -> Result<Self, String> {
+        use std::sync::atomic::Ordering;
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind chain RPC mock: {e}"))?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = shutdown.clone();
+        // The 32-byte ABI bool eth_call returns: 31 zero bytes + {00,01}.
+        let bool_word = format!("0x{:064x}", u8::from(owned));
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match stream {
+                    Ok(mut s) => {
+                        let _ = serve_one_rpc(&mut s, &bool_word);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self { url: format!("http://127.0.0.1:{port}"), shutdown, handle: Some(handle) })
+    }
+}
+
+impl Drop for ChainRpcMock {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Nudge the accept loop out of its WouldBlock sleep so it observes `stop` and exits.
+        let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Read one HTTP request (headers + `Content-Length` body) off `stream` and write a single
+/// JSON-RPC `{ "result": <bool_word> }` 200 response. Minimal by design — just enough for
+/// the chain-provider's `reqwest` client. `Connection: close` so the client never reuses it.
+fn serve_one_rpc(stream: &mut std::net::TcpStream, bool_word: &str) -> std::io::Result<()> {
+    use std::io::Read as _;
+    stream.set_nonblocking(false)?;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 64 * 1024 {
+            return Ok(());
+        }
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let content_len = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + content_len {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{bool_word}\"}}");
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes())?;
+    stream.flush()
 }
 
 /// Thread the plan's binding inputs into a base request: each artifact lands under the
@@ -5485,6 +5631,79 @@ mod content_plane_tests {
     fn content_address_is_collision_sensitive() {
         assert_ne!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0002"));
         assert_eq!(payload_cid_v1_raw(b"segment-0001"), payload_cid_v1_raw(b"segment-0001"));
+    }
+}
+
+#[cfg(test)]
+mod chain_mock_tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// Make one JSON-RPC POST to the mock and return its raw HTTP response — the exact path
+    /// the chain-provider's `reqwest` client drives for `eth_call`.
+    fn post_eth_call(mock: &ChainRpcMock) -> String {
+        let addr = mock.url.trim_start_matches("http://");
+        let mut s = std::net::TcpStream::connect(addr).expect("connect to chain RPC mock");
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x00","data":"0x"},"latest"]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        s.write_all(req.as_bytes()).expect("write request");
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).expect("read response");
+        resp
+    }
+
+    /// Owned: the mock returns the 32-byte ABI bool word `…01`, exactly what
+    /// `chain-provider::decode_evm_bool` reads as `true` — the open proceeds.
+    #[test]
+    fn chain_rpc_mock_serves_owned_bool_word() {
+        let mock = ChainRpcMock::start(true).expect("start mock");
+        let resp = post_eth_call(&mock);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "valid HTTP response: {resp}");
+        let owned_word = format!("0x{:064x}", 1u8);
+        assert!(resp.contains(&format!("\"result\":\"{owned_word}\"")), "owned bool word: {resp}");
+    }
+
+    /// Not-owned: the mock returns the all-zero bool word `…00` — `decode_evm_bool` reads
+    /// `false`, so the rights gate denies and the open MUST fail closed.
+    #[test]
+    fn chain_rpc_mock_serves_denied_bool_word() {
+        let mock = ChainRpcMock::start(false).expect("start mock");
+        let resp = post_eth_call(&mock);
+        let denied_word = format!("0x{:064x}", 0u8);
+        assert!(resp.contains(&format!("\"result\":\"{denied_word}\"")), "denied bool word: {resp}");
+    }
+
+    /// The bool word is a well-formed 32-byte ABI word (0x + 64 hex), so the upstream
+    /// `decode_evm_bool` (which requires exactly 32 bytes, high bytes zero) accepts it.
+    #[test]
+    fn bool_word_is_a_32_byte_abi_word() {
+        for owned in [true, false] {
+            let word = format!("0x{:064x}", u8::from(owned));
+            let hex = word.strip_prefix("0x").unwrap();
+            assert_eq!(hex.len(), 64, "32-byte word");
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "hex only");
+            assert_eq!(hex.chars().last().unwrap(), if owned { '1' } else { '0' });
+            assert!(hex[..63].chars().all(|c| c == '0'), "high bytes are zero");
+        }
+    }
+
+    /// With no chain-provider binary AND no external RPC, ownership falls back to the static
+    /// owned attestation (the pure-offline path) — shaped exactly like the chain answer the
+    /// rights gate consumes (`has_access: true`).
+    #[test]
+    fn chain_attestation_falls_back_to_static_owned_without_a_binary() {
+        // This path does not read the chain env when no binary is supplied UNLESS an external
+        // RPC is pinned; guard against a developer-set RPC so the assertion stays deterministic.
+        if std::env::var("DDRM_SMOKE_CHAIN_RPC").is_ok() {
+            return;
+        }
+        let (attestation, label) = chain_attestation(None).expect("static owned fallback");
+        assert_eq!(attestation["has_access"], serde_json::json!(true));
+        assert!(label.contains("static owned"), "label names the offline fallback: {label}");
     }
 }
 

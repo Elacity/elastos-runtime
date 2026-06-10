@@ -140,9 +140,28 @@ integrity, so a corrupt/malicious store can never substitute content). No raw HT
 daemon: the backend is in-process, and swapping in the `elastos-server` `StorageProvider`
 (iroh Carrier today; Kubo / Elacity / supernode backends) is a backend change **behind the
 same fetch-by-CID contract**, zero change to the open path. Proven by harness unit tests
-(CID byte-compat goldens + round-trip + fail-closed) and the live consumer open. Remaining
-on the runnable-E2E ladder: on-chain ownership ON-by-default via a local JSON-RPC mock, and
-real multi-MiB media (chunked UnixFS) beyond the single-chunk cap.
+(CID byte-compat goldens + round-trip + fail-closed) and the live consumer open.
+
+**Ownership plane (real-by-default) — the open REALLY asks the chain.** The wallet-ownership
+gate is no longer a static `has_access: true`. The canonical open now drives the **real
+`chain-provider`** `has_access_by_content_id` path end to end — encode the calldata → JSON-RPC
+`eth_call` → decode the 32-byte ABI bool → rights decision — BY DEFAULT, with **no external
+network**: `ddrm-runtime-open` stands up an **in-process JSON-RPC mock** (`ChainRpcMock`, an
+ephemeral-loopback HTTP endpoint returning the canned ABI bool word) so the answer is
+deterministic. Owned → the rights gate allows and the open proceeds; `DDRM_SMOKE_CHAIN_ACCESS=denied`
+(or `ddrm-consumer-smoke.sh --deny-ownership`) flips the mock to not-owned and the open **fails
+closed** at the rights gate ("the chain says you do not own it"). Point `DDRM_SMOKE_CHAIN_RPC`
+at a real endpoint and the SAME path queries Base mainnet (your wallet vs the content's
+on-chain `contentId`) — the mock is a drop-in for the RPC node, nothing else changes. Proven by
+harness unit tests (mock serves the owned/denied bool word; well-formed 32-byte ABI word) and
+the live consumer gates (owned opens; not-owned fails closed), across **all** authority backends.
+
+Remaining on the runnable-E2E ladder: genuinely-playable **multi-MiB media** (chunked UnixFS,
+beyond the single-chunk CENC segment the open fetches today). The segment is already a REAL
+content-addressed CENC fMP4 produced by `encrypt-provider`'s in-boundary engine (the
+decrypt-provider seam goldens + `ddrm-producer-smoke` prove mint→seal→escrow→decrypt-now on real
+fMP4 shapes); the plaintext is validated INSIDE the decrypt boundary (containment — it never
+crosses the wire), not at the orchestrator.
 
 ---
 
