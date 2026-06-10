@@ -178,14 +178,30 @@ on-chain `contentId`) — the mock is a drop-in for the RPC node, nothing else c
 harness unit tests (mock serves the owned/denied bool word; well-formed 32-byte ABI word) and
 the live consumer gates (owned opens; not-owned fails closed), across **all** authority backends.
 
-Remaining on the runnable-E2E ladder: wiring a multi-**segment** CENC asset through the
-**decrypt boundary** end to end (each segment fetched by CID, decrypted in-VM with the right
-sample/segment count). The content-addressing for multi-MiB is now real + Helia-verified (above);
-what's left is the decrypt-side multi-segment loop. The single CENC segment the open decrypts today
-is already a REAL content-addressed CENC fMP4 produced by `encrypt-provider`'s in-boundary engine
-(the decrypt-provider seam goldens + `ddrm-producer-smoke` prove mint→seal→escrow→decrypt-now on
-real fMP4 shapes); plaintext is validated INSIDE the decrypt boundary (containment — it never
-crosses the wire), not at the orchestrator.
+**Decrypt boundary — MULTI-SEGMENT assets (DASH/fMP4).** Real media is many `moof+mdat`
+fragments that share ONE presentation CEK. The decrypt boundary now opens the whole asset as a
+SEQUENCE: `decrypt_session_segments` (in `decrypt-provider`) loops the in-VM single-segment
+decrypt over N segments under the one CEK (with globally-unique per-sample IVs — the counter
+continues across segments, so no IV is reused), summing the `sample_count` and reporting a
+`segment_count`. It **fails closed on the first bad segment** (naming its index — never a
+partially-decrypted asset) and preserves containment across the whole asset (the scoped response
+carries counts, never bytes or the CEK). Proven by the encrypt↔decrypt SEAM golden:
+`encrypt-provider`'s real engine emits a multi-segment fMP4 golden (3 fragments, sample counts
+2/1/2, one CEK, continuing IVs) and `decrypt-provider` replays it — recovering every segment's
+exact bytes, asserting the segment + summed-sample counts, and refusing a truncated segment. The
+ladder seam gate now pins **four** round-trip goldens (single + multisample + subsample +
+multisegment). Per-segment byte-tampering is caught EARLIER by the content plane's per-segment CID
+integrity (above), before bytes reach the boundary.
+
+Remaining on the runnable-E2E ladder: wiring the multi-segment LIST through the **live sealed
+rail + transcript** (today the live consumer open decrypts ONE segment; the boundary CAPABILITY,
+the producer packaging, and the per-segment content-addressing are all real + verified, but the
+live `open_session_v1` material still carries a single ciphertext). The single CENC segment the
+live open decrypts is already a REAL content-addressed CENC fMP4 produced by `encrypt-provider`'s
+in-boundary engine (the decrypt-provider seam goldens + `ddrm-producer-smoke` prove
+mint→seal→escrow→decrypt-now on real fMP4 shapes); plaintext is validated INSIDE the decrypt
+boundary (containment — it never crosses the wire), not at the orchestrator. Also pending: a
+balanced dag-pb **tree** above ~174 leaves (content plane, fail-closed today).
 
 ---
 

@@ -51,7 +51,7 @@ LADDER=(
   "decrypt-provider rail-prep|decrypt-provider|rail-prep|27"
   "decrypt-provider pq-envelope|decrypt-provider|pq-envelope|29"
   "decrypt-provider pq-rail-prep|decrypt-provider|pq-rail-prep|31"
-  "decrypt-provider vectors|decrypt-provider|vectors|42"
+  "decrypt-provider vectors|decrypt-provider|vectors|44"
   "decrypt-provider rail-shim|decrypt-provider|rail-shim|45"
   "decrypt-provider pq-mldsa|decrypt-provider|pq-mldsa|34"
   "decrypt-provider envelope-conformance|decrypt-provider|envelope-conformance|35"
@@ -89,18 +89,19 @@ done
 #
 # The round-trip goldens (produced by encrypt-provider's real in-boundary engine,
 # replayed by decrypt-provider) are the artifacts that pin invariant #1 <-> #2 over
-# real playback shapes: single-sample, multi-sample, and subsample (clear leader).
-# Run them BY NAME (filter `round_trip_golden` -> exactly these 3) so a rename /
+# real playback shapes: single-sample, multi-sample, subsample (clear leader), and
+# multi-SEGMENT (several fMP4 fragments under one CEK, decrypted as a sequence).
+# Run them BY NAME (filter `round_trip_golden` -> exactly these 4) so a rename /
 # cfg-drift / encrypt-side break that silently drops one fails the gate instead of
 # just shifting the count.
-SEAM_EXPECTED=3
+SEAM_EXPECTED=4
 echo
 bold "== dDRM ladder (1b/2): encrypt<->decrypt seam exercised =="
 seam_out="$(cd "$CAPSULES/decrypt-provider" && cargo test --features vectors round_trip_golden 2>/dev/null)"
 seam_passed="$(printf '%s\n' "$seam_out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
 seam_failed="$(printf '%s\n' "$seam_out" | sed -n 's/.*ok\. [0-9]* passed; \([0-9]*\) failed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
 if [ "$seam_passed" -eq "$SEAM_EXPECTED" ] && [ "$seam_failed" -eq 0 ]; then
-  green "  ok    *_round_trip_golden — $seam_passed passed (single + multisample + subsample seams live)"
+  green "  ok    *_round_trip_golden — $seam_passed passed (single + multisample + subsample + multisegment seams live)"
 else
   red "  FAIL  *_round_trip_golden — expected $SEAM_EXPECTED passed / 0 failed, got $seam_passed/$seam_failed (a seam dropped?)"
   rc=1

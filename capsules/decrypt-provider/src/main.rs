@@ -939,6 +939,38 @@ fn decrypt_session_segment(
     Ok((plaintext, meta))
 }
 
+/// Decrypt a SEQUENCE of CENC media segments under ONE presentation CEK — the multi-segment asset
+/// shape (DASH/fMP4: many `moof+mdat` fragments share the content key, with globally-unique
+/// per-sample IVs). Loops the single-segment decrypt in-VM, returning each segment's plaintext plus
+/// aggregate metadata: `segment_count` and the `sample_count` SUMMED across segments. Fails CLOSED
+/// on the FIRST segment that fails (a missing/empty/structurally-corrupt segment stops the whole
+/// open — never a partially-decrypted asset), naming the offending segment index. Plaintext stays
+/// contained exactly as for a single segment: the caller-facing response carries counts, not bytes.
+#[allow(dead_code)]
+fn decrypt_session_segments(
+    cek_b64: &str,
+    ciphertext_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    if ciphertext_segments.is_empty() {
+        return Err("multi-segment open requires at least one segment — fail closed".to_string());
+    }
+    let mut plaintexts = Vec::with_capacity(ciphertext_segments.len());
+    let mut total_samples: u64 = 0;
+    for (i, segment) in ciphertext_segments.iter().enumerate() {
+        let (plaintext, meta) = decrypt_session_segment(cek_b64, segment, init_segment)
+            .map_err(|err| format!("segment {i} failed closed: {err}"))?;
+        total_samples += meta.get("sample_count").and_then(Value::as_u64).unwrap_or(0);
+        plaintexts.push(plaintext);
+    }
+    let meta = json!({
+        "is_protected": true,
+        "segment_count": ciphertext_segments.len(),
+        "sample_count": total_samples,
+    });
+    Ok((plaintexts, meta))
+}
+
 /// Rail-landing composition (PREP — gated behind the `rail-prep` feature; not yet
 /// wired into `open_session`/`render`).
 ///
@@ -1408,6 +1440,99 @@ mod tests {
             !serialized.contains(std::str::from_utf8(&expected).unwrap()),
             "plaintext must not cross the boundary"
         );
+    }
+
+    /// Replay the producer's MULTI-SEGMENT round-trip golden (real DASH/fMP4 asset shape): the
+    /// real engine sealed SEVERAL `moof+mdat` segments under ONE presentation CEK with
+    /// globally-unique per-sample IVs. This provider must decrypt the WHOLE sequence
+    /// segment-by-segment, recover each segment's exact bytes, report the segment count + the
+    /// samples summed across segments, and leak neither the CEK nor any segment's plaintext across
+    /// the scoped boundary (containment holds for the whole asset, not just one fragment).
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn encrypt_to_decrypt_multisegment_round_trip_golden() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v: crate::vector_format::RoundTripMultiSegmentVector =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/vectors/roundtrip_multisegment_encrypt_to_decrypt.json"
+            )))
+            .unwrap();
+
+        let cek_b64 = v.cek_b64.clone();
+        let segments: Vec<Vec<u8>> =
+            v.segments_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
+        let expected: Vec<Vec<u8>> =
+            v.expected_plaintexts_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
+        assert!(segments.len() >= 2, "the golden is a multi-segment asset");
+        // The segments are genuinely distinct fragments (each is independently content-addressed
+        // by the content plane and fetched by its own CIDv1 before reaching this boundary).
+        for i in 1..segments.len() {
+            assert_ne!(segments[i], segments[0], "segments are distinct media fragments");
+        }
+
+        // Decrypt the whole asset segment-by-segment under the ONE presentation CEK.
+        let (plaintexts, meta) = decrypt_session_segments(&cek_b64, &segments, None).unwrap();
+        assert_eq!(plaintexts.len(), expected.len(), "every segment recovered");
+        for (i, (out, exp)) in plaintexts.iter().zip(expected.iter()).enumerate() {
+            let mdat_off = segments[i].len() - exp.len();
+            assert_eq!(
+                &out[mdat_off..],
+                exp.as_slice(),
+                "segment {i} recovers the producer's exact bytes"
+            );
+        }
+        assert_eq!(meta["is_protected"], json!(true));
+        assert_eq!(meta["segment_count"], json!(segments.len()));
+        assert!(
+            meta["sample_count"].as_u64().unwrap() >= segments.len() as u64,
+            "samples are summed across segments (>= one per segment)"
+        );
+
+        // Containment across the WHOLE asset: the scoped response leaks neither the (rail stand-in)
+        // CEK nor ANY segment's recovered plaintext.
+        let response = scoped_session_response(&decrypt_request(), &meta);
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        for exp in &expected {
+            assert!(
+                !serialized.contains(std::str::from_utf8(exp).unwrap()),
+                "no segment plaintext crosses the boundary"
+            );
+        }
+    }
+
+    /// A structurally-corrupt or missing segment fails the WHOLE multi-segment open closed (never a
+    /// partially-decrypted asset), and the offending segment index is named. An empty asset (no
+    /// segments) also fails closed. (Byte-level tampering of a segment is caught earlier, by the
+    /// content plane's per-segment CID integrity, before the bytes ever reach this boundary.)
+    #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
+    #[test]
+    fn multisegment_open_fails_closed_on_a_bad_segment() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v: crate::vector_format::RoundTripMultiSegmentVector =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/vectors/roundtrip_multisegment_encrypt_to_decrypt.json"
+            )))
+            .unwrap();
+        let cek_b64 = v.cek_b64.clone();
+        let mut segments: Vec<Vec<u8>> =
+            v.segments_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
+
+        // Truncate the LAST segment so its box structure is unparseable: the loop must refuse the
+        // whole asset (and name the segment), not return the segments it managed to decrypt first.
+        let last = segments.last_mut().unwrap();
+        last.truncate(8);
+        let err = decrypt_session_segments(&cek_b64, &segments, None)
+            .expect_err("a corrupt segment must fail the open closed");
+        assert!(
+            err.contains(&format!("segment {}", segments.len() - 1)),
+            "the failure names the offending segment: {err}"
+        );
+
+        // An empty asset (no segments) fails closed too.
+        assert!(decrypt_session_segments(&cek_b64, &[], None).is_err());
     }
 
     #[test]

@@ -62,6 +62,24 @@ pub struct RoundTripVector {
     pub expected_plaintext_b64: String,
 }
 
+/// Multi-SEGMENT encrypt→decrypt round-trip golden: a real asset split into several CENC fMP4
+/// media segments (DASH/fMP4 shape — many `moof+mdat` fragments) that share **one** presentation
+/// CEK, with globally-unique per-sample IVs (the counter continues across segments). The consumer
+/// must decrypt the WHOLE sequence segment-by-segment back to each segment's bytes. Pins the
+/// multi-segment decrypt loop; the CEK is captured as the rail stand-in (as for `RoundTripVector`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RoundTripMultiSegmentVector {
+    pub description: String,
+    /// The in-boundary-minted Key ID (hex) the producer surfaced.
+    pub kid_hex: String,
+    /// The single 16-byte CEK shared across every segment (rail stand-in).
+    pub cek_b64: String,
+    /// The encrypted fMP4 media segments, in presentation order.
+    pub segments_b64: Vec<String>,
+    /// The plaintext each segment must decrypt to (concatenated samples), aligned to `segments_b64`.
+    pub expected_plaintexts_b64: Vec<String>,
+}
+
 /// Rail carrier wire shape (rail Option A — the decrypt VM *receives* sealed
 /// material): the sealed CEK + ciphertext the runtime hands the decrypt boundary
 /// on `OpenSession`, captured as a portable golden and replayed through

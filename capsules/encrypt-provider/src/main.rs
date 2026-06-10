@@ -1586,6 +1586,68 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gen-vectors")]
+    fn write_roundtrip_multisegment_vector(
+        kid_hex: &str,
+        cek: &[u8],
+        segments_b64: Vec<String>,
+        expected_plaintexts_b64: Vec<String>,
+    ) {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let v = json!({
+            "description":
+                "encrypt-provider in-boundary mint+CENC (3 segments, ONE CEK, globally-unique \
+                 per-sample IVs continuing across segments) -> decrypt-provider multi-segment loop; \
+                 CEK captured (rail stand-in)",
+            "kid_hex": kid_hex,
+            "cek_b64": b64.encode(cek),
+            "segments_b64": segments_b64,
+            "expected_plaintexts_b64": expected_plaintexts_b64,
+        });
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../decrypt-provider/tests/vectors");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = format!("{dir}/roundtrip_multisegment_encrypt_to_decrypt.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    /// Regenerate the MULTI-SEGMENT round-trip golden (real DASH/fMP4 asset shape): several
+    /// `moof+mdat` segments sharing ONE presentation CEK, with globally-unique per-sample IVs
+    /// (the counter CONTINUES across segments, as real CENC requires). Mixes per-segment sample
+    /// counts (2,1,2) so the decrypt loop's per-segment + summed sample accounting is exercised.
+    /// `cargo test --features gen-vectors emit_roundtrip_multisegment_vector`
+    #[cfg(feature = "gen-vectors")]
+    #[test]
+    fn emit_roundtrip_multisegment_vector() {
+        let minted = mint_cek_and_kid().expect("mint");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let seg_plaintexts: [&[u8]; 3] = [
+            b"seg0-sample-0..!seg0-sample-1-longer", // 2 samples (16 + 20)
+            b"seg1-single-sample-32-bytes-long",     // 1 sample (32)
+            b"AAAseg2BBBseg2CC",                      // 2 samples (8 + 8)
+        ];
+        let seg_sizes: [&[u32]; 3] = [&[16, 20], &[32], &[8, 8]];
+        let mut segments_b64 = Vec::new();
+        let mut expected_b64 = Vec::new();
+        // The per-sample IV counter is GLOBAL across the presentation (Bento4-style): segment k's
+        // first sample continues from the running sample index, so no IV is ever reused.
+        let mut counter: u64 = 0;
+        for (pt, sizes) in seg_plaintexts.iter().zip(seg_sizes.iter()) {
+            assert_eq!(sizes.iter().sum::<u32>() as usize, pt.len(), "sample sizes cover the plaintext");
+            let iv_seed = counter.to_be_bytes();
+            let (ciphertext, ivs, _subs) =
+                cenc::encrypt_samples(pt, &minted.cek, sizes, &iv_seed, 0).expect("encrypt");
+            // `mux_multisample_segment` with one sample is byte-identical to the single-sample
+            // muxer (same trun sample-size-present + senc flags=0 layout), so one muxer covers
+            // every segment regardless of sample count.
+            let segment = mux_multisample_segment(&ciphertext, sizes, &ivs);
+            segments_b64.push(b64.encode(&segment));
+            expected_b64.push(b64.encode(pt));
+            counter += sizes.len() as u64;
+        }
+        write_roundtrip_multisegment_vector(&minted.kid_hex, &*minted.cek, segments_b64, expected_b64);
+    }
+
     /// Regenerate the SUBSAMPLE round-trip golden (clear-leader + encrypted body).
     /// `cargo test --features gen-vectors emit_roundtrip_subsample_vector`
     #[cfg(feature = "gen-vectors")]
