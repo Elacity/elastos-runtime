@@ -188,14 +188,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ddrm-viewer-demo"
-version = "0.1.0"
-dependencies = [
- "ddrm-media",
- "serde_json",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,20 @@
+[package]
+name = "ddrm-media"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Local dDRM media prep: CENC packaging + transcript-bound CEK seal + rail decrypt-provider client. Shared by the viewer-seam demo and the gateway."
+
+[lib]
+name = "ddrm_media"
+path = "src/lib.rs"
+
+[dependencies]
+ddrm-envelope = { path = "../ddrm-envelope" }
+serde_json = "1.0"
+base64 = "0.22"
+aes = "0.8"
+ctr = "0.9"
+rand = "0.8"
+
+[workspace]
