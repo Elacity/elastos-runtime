@@ -1,0 +1,31 @@
+[package]
+name = "ddrm-media-authority"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The LOCAL KEY-AUTHORITY, run as an isolated subprocess (a "local test KMS"
+# adapter in Anders' terms). The gateway spawns ONE of these per media open; it
+# CENC-packs the asset under a fresh CEK, launches a SEPARATE rail decrypt-provider
+# boundary, seals the CEK to that boundary's in-VM-minted session key (PQ-hybrid,
+# ddrm-envelope), zeroizes the CEK, and then answers per-segment read requests over
+# a tiny stdio protocol — relaying ONLY already-decrypted, senc-stripped segment
+# bytes. The CEK never leaves this process unsealed; the gateway never sees it.
+#
+# It lives in its own workspace specifically so the PQ crypto stack (ml-dsa/ml-kem)
+# is NOT linked into elastos-server, whose existing ed25519-dalek 3.0-pre / iroh
+# stack feature-unifies onto a pre-release sha2 that the PQ crates would break.
+
+[[bin]]
+name = "ddrm-media-authority"
+path = "src/main.rs"
+
+[dependencies]
+ddrm-media = { path = "../../../capsules/ddrm-media" }
+serde_json = "1.0"
+base64 = "0.22"
+
+[profile.dev]
+opt-level = 1
+
+[workspace]

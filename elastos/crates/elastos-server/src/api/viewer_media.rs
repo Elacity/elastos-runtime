@@ -106,6 +106,35 @@ pub struct MediaSession {
     pub decrypt_request: Value,
     /// The CEK-free sealed decrypt material relayed per segment.
     pub sealed_material: Value,
+    /// When set, this session is served by a gateway-spawned LOCAL KEY-AUTHORITY
+    /// subprocess (which owns a SEPARATE rail `decrypt-provider` boundary and
+    /// sealed the CEK to it). Segment reads relay to that helper, which returns
+    /// already-decrypted, `senc`-stripped bytes. The CEK never reaches the gateway.
+    pub authority: Option<Arc<super::media_authority::MediaAuthorityProc>>,
+}
+
+impl MediaSession {
+    /// Build a media session served by a gateway-spawned local key-authority,
+    /// deriving public metadata from the helper's key-free session descriptor.
+    pub fn from_authority(
+        viewer: impl Into<String>,
+        principal_id: impl Into<String>,
+        authority: Arc<super::media_authority::MediaAuthorityProc>,
+    ) -> Self {
+        Self {
+            viewer: viewer.into(),
+            principal_id: principal_id.into(),
+            mime: authority.mime.clone(),
+            segment_count: authority.segment_count,
+            has_init: !authority.init_bytes.is_empty(),
+            init_bytes: authority.init_bytes.clone(),
+            is_protected: true,
+            expires_at: authority.expires_at,
+            decrypt_request: Value::Null,
+            sealed_material: Value::Null,
+            authority: Some(authority),
+        }
+    }
 }
 
 type SessionStore = Mutex<HashMap<String, Arc<MediaSession>>>;
@@ -196,6 +225,20 @@ pub async fn viewer_media_segment(
     // Range + expiry are enforced BEFORE any decrypt relay — fail closed.
     if let Err(resp) = check_segment_readable(&session, index, crate::auth::now_ts()) {
         return *resp;
+    }
+    // Gateway-spawned local key-authority (the dDRM viewer seam): relay the read to
+    // the helper, which decrypts in-VM through its own boundary and strips `senc`.
+    if let Some(authority) = session.authority.clone() {
+        let decrypted =
+            tokio::task::spawn_blocking(move || authority.segment(index)).await;
+        return match decrypted {
+            Ok(Ok(bytes)) => octet_stream(bytes),
+            Ok(Err(err)) => {
+                tracing::warn!(index, "media segment fail-closed: {err}");
+                media_error(StatusCode::BAD_GATEWAY, "the decrypt provider could not serve this segment")
+            }
+            Err(_) => media_error(StatusCode::BAD_GATEWAY, "the decrypt provider could not serve this segment"),
+        };
     }
     let Some(registry) = state.provider_registry.as_ref() else {
         return media_error(StatusCode::SERVICE_UNAVAILABLE, "decrypt provider unavailable");
@@ -373,6 +416,7 @@ mod tests {
             expires_at,
             decrypt_request: json!({ "session_id": "s1", "output_kind": "stream" }),
             sealed_material: json!({ "suite": "elastos-pq-hybrid-threshold-v0" }),
+            authority: None,
         }
     }
 

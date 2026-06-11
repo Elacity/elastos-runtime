@@ -11,6 +11,7 @@ pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 pub mod gateway;
 pub mod handlers;
+pub mod media_authority;
 pub mod middleware;
 pub mod routes;
 pub mod server;

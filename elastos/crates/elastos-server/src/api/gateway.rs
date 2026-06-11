@@ -644,6 +644,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
                 .put(super::viewer_gateway::viewer_storage_put),
         )
         .route(
+            "/api/viewers/elacity-player/media/open",
+            axum::routing::post(super::media_authority::open_demo_media),
+        )
+        .route(
             "/api/viewers/:viewer/media/:session",
             get(super::viewer_media::viewer_media_manifest),
         )
