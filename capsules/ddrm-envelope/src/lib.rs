@@ -167,6 +167,24 @@ pub mod transcript {
         /// exact ordered set of segments (a reordered, dropped, added, or substituted segment
         /// changes the digest concatenation and the seal fails to unwrap → fail closed).
         pub fn to_aad_with_segments(&self, segment_digests: Option<&[u8]>) -> Vec<u8> {
+            self.to_aad_with_bindings(segment_digests, None)
+        }
+
+        /// As [`Self::to_aad_with_segments`], but additionally welds a RIGHTS-DECISION
+        /// binding (the rights-provider receipt hash) into the transcript. Appended ONLY
+        /// when present, AFTER the multi-segment digests, so:
+        ///   - a session WITHOUT a rights binding (`None`) is BYTE-IDENTICAL to
+        ///     [`Self::to_aad_with_segments`] — the committed goldens replay unchanged; and
+        ///   - a gated session is cryptographically bound to the EXACT rights decision that
+        ///     authorized it (a seal minted under one decision cannot be replayed under
+        ///     another — the AEAD open fails closed at the decrypt boundary).
+        /// Both the key-authority (sealing) and the decrypt boundary (rebuilding) call this
+        /// with the same `rights_receipt_hash`, so there is one encoder and no drift.
+        pub fn to_aad_with_bindings(
+            &self,
+            segment_digests: Option<&[u8]>,
+            rights_receipt_hash: Option<&[u8]>,
+        ) -> Vec<u8> {
             let mut v = Vec::new();
             let mut put = |bytes: &[u8]| {
                 v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -196,6 +214,11 @@ pub mod transcript {
             // Multi-segment binding (same strictly-extending pattern): absent for single-segment.
             if let Some(digests) = segment_digests {
                 put(digests);
+            }
+            // Rights-decision binding (same strictly-extending pattern): absent for an
+            // ungated seal, so existing transcripts are byte-identical.
+            if let Some(rights) = rights_receipt_hash {
+                put(rights);
             }
             v
         }

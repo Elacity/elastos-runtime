@@ -24,4 +24,4 @@ pub mod rail;
 pub mod seal;
 
 pub use rail::DecryptProviderProc;
-pub use seal::{prepare, PreparedSession, SessionParams};
+pub use seal::{prepare, prepare_blob, PreparedSession, SessionParams};

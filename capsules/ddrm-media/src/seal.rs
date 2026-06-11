@@ -43,6 +43,10 @@ pub struct SessionParams {
     pub ttl_secs: u64,
     /// Human-readable reason recorded on the request.
     pub reason: String,
+    /// Optional rights-decision receipt hash (the live-chain gate). When present it is
+    /// welded into the decrypt transcript AAD so the seal is bound to THIS rights
+    /// decision; `None` keeps the AAD byte-identical to an ungated seal.
+    pub rights_receipt_hash: Option<Vec<u8>>,
 }
 
 impl SessionParams {
@@ -56,6 +60,7 @@ impl SessionParams {
             release_request_id: format!("release-{}", random_token()),
             ttl_secs: 3600,
             reason: "owned media playback".to_string(),
+            rights_receipt_hash: None,
         }
     }
 }
@@ -88,6 +93,15 @@ impl PreparedSession {
             .stream_segment(&self.request, &self.material, index, now_unix)?;
         mp4::strip_senc(&decrypted)
     }
+
+    /// Decrypt a NON-MEDIA object: the whole asset was wrapped as a single-sample
+    /// fragment (see [`prepare_blob`]), so we decrypt segment 0 in-VM and unwrap the
+    /// `mdat` payload back to the original bytes. The CEK never leaves the boundary;
+    /// the bytes returned here are the cleartext object the viewer renders.
+    pub fn decrypt_object(&self, now_unix: u64) -> Result<Vec<u8>, String> {
+        let fragment = self.decrypt_segment_clean(0, now_unix)?;
+        mp4::extract_mdat(&fragment)
+    }
 }
 
 /// Prepare a transcript-bound media session from a fragmented MP4.
@@ -107,6 +121,45 @@ pub fn prepare(
         return Err("asset has no media fragments".to_string());
     }
     let mime = format!("video/mp4; codecs=\"{}\"", mp4::avc_codec_string(&split.init));
+    seal_session(split.init, split.fragments, mime, decrypt_bin, params, now_unix)
+}
+
+/// Prepare a transcript-bound NON-MEDIA object session from arbitrary bytes.
+///
+/// The object (image, PDF, text, glTF binary, …) is wrapped as a single-sample
+/// CENC fragment and sealed through the EXACT same rail as media — the unchanged
+/// `decrypt-provider` unwraps the CEK in-VM and decrypts it. `mime` is the asset's
+/// real content type, recorded on the descriptor so the viewer renders it correctly.
+/// There is no init segment (non-media never touches MSE).
+pub fn prepare_blob(
+    object: &[u8],
+    mime: impl Into<String>,
+    decrypt_bin: &str,
+    params: &SessionParams,
+    now_unix: u64,
+) -> Result<PreparedSession, String> {
+    if object.is_empty() {
+        return Err("object is empty".to_string());
+    }
+    let fragment = mp4::wrap_blob_as_fragment(object);
+    seal_session(Vec::new(), vec![fragment], mime.into(), decrypt_bin, params, now_unix)
+}
+
+/// Seal a CEK to a freshly launched decrypt boundary over the supplied (already
+/// fragment-shaped) cleartext fragments. Shared by [`prepare`] (media) and
+/// [`prepare_blob`] (non-media): both produce the identical sealed-material handoff.
+fn seal_session(
+    init: Vec<u8>,
+    fragments: Vec<Vec<u8>>,
+    mime: String,
+    decrypt_bin: &str,
+    params: &SessionParams,
+    now_unix: u64,
+) -> Result<PreparedSession, String> {
+    let split = mp4::SplitAsset { init, fragments };
+    if split.fragments.is_empty() {
+        return Err("asset has no media fragments".to_string());
+    }
 
     // Fresh CEK + a local key-authority seal identity (ML-DSA-65).
     let mut cek = [0u8; 16];
@@ -152,8 +205,16 @@ pub fn prepare(
         expires_at,
     );
 
+    // Segment digests are welded into the AAD ONLY for a multi-segment asset — this
+    // mirrors the decrypt boundary's `prepare_bound_open` convention exactly (single
+    // segment ⇒ `None`). A single-segment object/clip that always welds `Some` would
+    // seal an AAD the boundary rebuilds as `None`, so the unwrap would fail closed.
     let seg_refs: Vec<&[u8]> = encrypted.iter().map(|s| s.as_slice()).collect();
-    let digests = segment_digests(&seg_refs);
+    let digests = if seg_refs.len() > 1 {
+        Some(segment_digests(&seg_refs))
+    } else {
+        None
+    };
     let aad = DecryptTranscriptV1 {
         suite_id: SUITE_PQ_HYBRID,
         provider_id: "decrypt-provider",
@@ -170,12 +231,12 @@ pub fn prepare(
         nonce: &nonce,
         node_set_id: None,
     }
-    .to_aad_with_segments(Some(&digests));
+    .to_aad_with_bindings(digests.as_deref(), params.rights_receipt_hash.as_deref());
     let sealed = seal_bound(&public, &cek, &aad, &signer).to_bytes();
     // Scrub the CEK now that it is sealed — it never leaves this process unsealed.
     cek.iter_mut().for_each(|byte| *byte = 0);
 
-    let material = json!({
+    let mut material = json!({
         "suite": SUITE_PQ_HYBRID,
         "sealed_cek_b64": b64.encode(&sealed),
         "ciphertext_b64": b64.encode(&encrypted[0]),
@@ -184,6 +245,11 @@ pub fn prepare(
         "content_hash_b64": b64.encode(content_hash),
         "extra_segments_b64": encrypted[1..].iter().map(|s| b64.encode(s)).collect::<Vec<_>>(),
     });
+    // The rights-decision binding the boundary must rebuild into its AAD (only when
+    // gated, so an ungated material stays byte-identical to the pre-gate wire form).
+    if let Some(rights) = params.rights_receipt_hash.as_deref() {
+        material["rights_receipt_hash_b64"] = Value::String(b64.encode(rights));
+    }
     let request = json!({
         "schema": "elastos.decrypt.session.request/v1",
         "request_id": params.request_id,

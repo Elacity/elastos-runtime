@@ -144,6 +144,10 @@ struct BoundRailMaterial {
     /// `SealedDecryptMaterialV1::extra_segments_b64`. Absent ⇒ single-segment (default).
     #[serde(default)]
     extra_segments_b64: Option<Vec<String>>,
+    /// Optional rights-decision binding (base64 of the rights receipt hash), welded into
+    /// the transcript AAD when present. Absent ⇒ ungated seal (byte-identical AAD).
+    #[serde(default)]
+    rights_receipt_hash_b64: Option<String>,
 }
 
 /// Consolidated, backend-neutral sealed decrypt material (feature `rail-material`)
@@ -180,6 +184,10 @@ struct SealedDecryptMaterialV1 {
     /// the transcript AAD (`segment_digests`), so a reordered/altered set fails the unwrap closed.
     #[serde(default)]
     extra_segments_b64: Option<Vec<String>>,
+    /// Optional rights-decision binding (base64 of the rights receipt hash), carried into
+    /// the transcript AAD by [`DecryptProvider::prepare_bound_open`] when present.
+    #[serde(default)]
+    rights_receipt_hash_b64: Option<String>,
 }
 
 /// The algorithm suite a `SealedDecryptMaterialV1` declares.
@@ -594,6 +602,13 @@ impl DecryptProvider {
         };
         let nonce = decode(&material.nonce_b64, "nonce_b64")?;
         let content_hash = decode(&material.content_hash_b64, "content_hash_b64")?;
+        // Rights-decision binding (live-chain gate): when the key-authority welded a
+        // rights receipt hash into the seal, the boundary MUST rebuild the identical
+        // AAD or the unwrap fails closed. Absent ⇒ ungated (byte-identical AAD).
+        let rights_receipt_hash = match material.rights_receipt_hash_b64.as_deref() {
+            None => None,
+            Some(s) => Some(decode(s, "rights_receipt_hash_b64")?),
+        };
 
         // MULTI-SEGMENT: decode the extra segments (after segment 0). When present, the WHOLE
         // ordered set (segment 0 + extras) is welded into the transcript AAD via `segment_digests`,
@@ -636,7 +651,7 @@ impl DecryptProvider {
             nonce: &nonce,
             node_set_id: node_set_id.map(|id| id.as_slice()),
         }
-        .to_aad_with_segments(segment_digests.as_deref());
+        .to_aad_with_bindings(segment_digests.as_deref(), rights_receipt_hash.as_deref());
 
         Ok(PreparedBoundOpen {
             session,
@@ -776,6 +791,7 @@ impl DecryptProvider {
             nonce_b64: material.nonce_b64,
             content_hash_b64: material.content_hash_b64,
             extra_segments_b64: material.extra_segments_b64,
+            rights_receipt_hash_b64: material.rights_receipt_hash_b64,
         };
         self.open_session_audited(request, &bound, now_unix)
     }
@@ -834,6 +850,7 @@ impl DecryptProvider {
             nonce_b64: material.nonce_b64,
             content_hash_b64: material.content_hash_b64,
             extra_segments_b64: material.extra_segments_b64,
+            rights_receipt_hash_b64: material.rights_receipt_hash_b64,
         };
         let prepared = match self.prepare_bound_open(&request, &bound, None) {
             Ok(p) => p,
@@ -963,6 +980,7 @@ impl DecryptProvider {
             // `prepare_bound_open`, and the reconstructed CEK drives every segment. Absent ⇒ a
             // single-segment, node-set-bound open (byte-identical to the historical behaviour).
             extra_segments_b64: material.extra_segments_b64.clone(),
+            rights_receipt_hash_b64: material.rights_receipt_hash_b64.clone(),
         };
         let prepared = match self.prepare_bound_open(&request, &bound, Some(&node_set_id)) {
             Ok(p) => p,
@@ -2172,6 +2190,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: None,
+            rights_receipt_hash_b64: None,
         };
         (material, crate::rail_shim::SessionSecret::PqHybrid(secret), authority_vk, pub_bytes)
     }
@@ -2341,6 +2360,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: None,
+            rights_receipt_hash_b64: None,
         };
 
         // Open using the MINTED secret the boundary holds (never injected).
@@ -2465,6 +2485,7 @@ mod tests {
             nonce_b64: bound.nonce_b64.clone(),
             content_hash_b64: bound.content_hash_b64.clone(),
             extra_segments_b64: bound.extra_segments_b64.clone(),
+            rights_receipt_hash_b64: bound.rights_receipt_hash_b64.clone(),
         }
     }
 
@@ -2556,6 +2577,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: Some(extra),
+            rights_receipt_hash_b64: None,
         };
 
         let mut provider = DecryptProvider {
@@ -2660,6 +2682,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: Some(extra),
+            rights_receipt_hash_b64: None,
         };
 
         let mut provider = DecryptProvider {
@@ -2831,6 +2854,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: None,
+            rights_receipt_hash_b64: None,
         };
         (material, crate::rail_shim::SessionSecret::PqHybrid(secret), vk_a, vk_b, pub_bytes)
     }
@@ -2982,6 +3006,7 @@ mod tests {
             nonce_b64: bound.nonce_b64,
             content_hash_b64: bound.content_hash_b64,
             extra_segments_b64: None,
+            rights_receipt_hash_b64: None,
         };
         // ... arriving at a boundary provisioned for a 2-of-2 threshold.
         use crate::pq_envelope::seal_support::mldsa_seal_keypair;
@@ -3098,6 +3123,7 @@ mod tests {
                 nonce_b64: b64.encode(b"nonce-qrm-1"),
                 content_hash_b64: b64.encode([0xABu8; 32]),
                 extra_segments_b64: None,
+                rights_receipt_hash_b64: None,
             };
             let mut provider = DecryptProvider {
                 session: Some(session),
@@ -3164,6 +3190,7 @@ mod tests {
                 nonce_b64: b64.encode(b"nonce-qrm-2"),
                 content_hash_b64: b64.encode([0xABu8; 32]),
                 extra_segments_b64: None,
+                rights_receipt_hash_b64: None,
             };
             let mut provider = DecryptProvider {
                 session: Some(session),
@@ -3268,6 +3295,7 @@ mod tests {
             nonce_b64: b64.encode(nonce),
             content_hash_b64: b64.encode(content_hash),
             extra_segments_b64: Some(extra),
+            rights_receipt_hash_b64: None,
         };
 
         let mut provider = DecryptProvider {

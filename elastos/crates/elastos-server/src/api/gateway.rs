@@ -644,6 +644,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
                 .put(super::viewer_gateway::viewer_storage_put),
         )
         .route(
+            "/api/viewers/open",
+            axum::routing::post(super::viewer_open::open_owned_in_viewer),
+        )
+        .route(
             "/api/viewers/elacity-player/media/open",
             axum::routing::post(super::media_authority::open_demo_media),
         )
@@ -658,6 +662,18 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route(
             "/api/viewers/:viewer/media/:session/segment/:index",
             get(super::viewer_media::viewer_media_segment),
+        )
+        .route(
+            "/api/viewers/ddrm-viewer/object/open",
+            axum::routing::post(super::object_authority::open_owned_object),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session",
+            get(super::viewer_object::viewer_object_manifest),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session/bytes",
+            get(super::viewer_object::viewer_object_bytes),
         )
         .route(
             "/apps/:app",

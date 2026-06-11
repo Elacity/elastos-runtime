@@ -3142,6 +3142,40 @@ fn is_unencrypted_principal_root_object(err: &anyhow::Error) -> bool {
     })
 }
 
+/// An owned object's plaintext bytes + presentation metadata, for the dDRM viewer
+/// seam (Library-bound open).
+pub struct OwnedObjectForViewer {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub content_cid: Option<String>,
+    pub name: String,
+}
+
+/// Read an owned object for the dDRM viewer seam: resolve the URI within the
+/// signed-in principal's OWN library root — the local-sovereign ownership gate, since
+/// [`library_target`] only ever resolves the principal's own tree (a URI outside that
+/// root, a traversal, or another principal's object never resolves) — then return the
+/// PLAINTEXT bytes (decrypting at-rest as needed) plus the asset's mime, content CID,
+/// and name. Any failure is a fail-closed "not an owned object" for the caller.
+pub fn read_owned_object_for_viewer(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<OwnedObjectForViewer> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    if !target.path.is_file() {
+        anyhow::bail!("owned object is not a file");
+    }
+    let bytes = read_library_file_bytes(data_dir, principal_id, &target)?;
+    let object = library_object(data_dir, principal_id, &target.uri)?;
+    Ok(OwnedObjectForViewer {
+        bytes,
+        mime: object.mime,
+        content_cid: object.content_cid,
+        name: object.name,
+    })
+}
+
 fn read_library_file_bytes(
     data_dir: &Path,
     principal_id: &str,
@@ -6475,20 +6509,33 @@ fn viewer_options_for_name(data_dir: &Path, name: &str) -> Vec<LibraryViewerOpti
 
 fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
     let lower = name.to_lowercase();
+    // The dDRM viewers (`elacity-player` for video, `ddrm-viewer` for images/docs/3D)
+    // open ANY owned object the principal holds: the Library open routes through
+    // `/api/viewers/open`, which seals the real bytes through the local key-authority +
+    // a decrypt-provider boundary. They are offered as the default for protected-capable
+    // types; `documents` stays an option for text/pdf editing.
     if archive_family_for_name(&lower).is_some() {
         vec!["archive-manager"]
     } else if lower.ends_with(".md") || lower.ends_with(".txt") {
-        vec!["documents"]
+        vec!["documents", "ddrm-viewer"]
     } else if lower.ends_with(".png")
         || lower.ends_with(".jpg")
         || lower.ends_with(".jpeg")
         || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".svg")
     {
-        vec!["image-viewer"]
-    } else if lower.ends_with(".mp4") {
-        vec!["video-viewer"]
+        vec!["ddrm-viewer"]
+    } else if lower.ends_with(".mp4")
+        || lower.ends_with(".m4v")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".webm")
+    {
+        vec!["elacity-player"]
     } else if lower.ends_with(".pdf") {
-        vec!["documents"]
+        vec!["ddrm-viewer", "documents"]
+    } else if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+        vec!["ddrm-viewer"]
     } else if lower.ends_with(".gba") || lower.ends_with(".gb") || lower.ends_with(".gbc") {
         vec!["gba-emulator"]
     } else {
@@ -6513,6 +6560,8 @@ fn viewer_label(id: &str) -> &str {
         "documents" => "Documents",
         "image-viewer" => "Image Viewer",
         "video-viewer" => "Video Viewer",
+        "elacity-player" => "Owned Video",
+        "ddrm-viewer" => "Owned Asset",
         "gba-emulator" => "GBA Emulator",
         "archive-manager" => "Archive",
         _ => id,

@@ -48,6 +48,17 @@ const DEV_DECRYPT_BIN: &str = concat!(
     "/../../../capsules/decrypt-provider/target/debug/decrypt-provider"
 );
 
+/// Resolve the local key-authority helper binary (env override or dev-tree default).
+pub(crate) fn resolve_helper_bin() -> String {
+    std::env::var("ELASTOS_DDRM_MEDIA_AUTHORITY_BIN")
+        .unwrap_or_else(|_| DEV_MEDIA_AUTHORITY_BIN.to_string())
+}
+
+/// Resolve the rail decrypt-provider binary (env override or dev-tree default).
+pub(crate) fn resolve_decrypt_bin() -> String {
+    std::env::var("ELASTOS_DDRM_DECRYPT_BIN").unwrap_or_else(|_| DEV_DECRYPT_BIN.to_string())
+}
+
 /// A live media decrypt session backed by a gateway-spawned local key-authority
 /// subprocess. Holds the helper's process handle + the key-free session descriptor;
 /// each segment read is relayed to the helper, which returns already-decrypted,
@@ -72,16 +83,26 @@ struct ProcIo {
 
 impl MediaAuthorityProc {
     /// Spawn the helper, read its one-line session descriptor, and return a handle.
-    fn launch(
+    /// `object_cid`, when set, binds the decrypt transcript to the real owned object's
+    /// content identity (Library-bound open); `None` uses the demo default.
+    pub fn launch(
         helper_bin: &str,
         decrypt_bin: &str,
         principal_id: &str,
         video: Option<&str>,
+        object_cid: Option<&str>,
+        rights_binding: Option<&str>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(helper_bin);
         cmd.args(["--principal", principal_id, "--decrypt-bin", decrypt_bin]);
         if let Some(video) = video {
             cmd.args(["--video", video]);
+        }
+        if let Some(object_cid) = object_cid {
+            cmd.args(["--object-cid", object_cid]);
+        }
+        if let Some(binding) = rights_binding {
+            cmd.args(["--rights-binding", binding]);
         }
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -206,7 +227,14 @@ pub async fn open_demo_media(State(state): State<GatewayState>, headers: HeaderM
 
     // Spawning runs ffmpeg + the seal handshake — keep it off the async runtime.
     let built = tokio::task::spawn_blocking(move || {
-        MediaAuthorityProc::launch(&helper_bin, &decrypt_bin, &principal_id, video.as_deref())
+        MediaAuthorityProc::launch(
+            &helper_bin,
+            &decrypt_bin,
+            &principal_id,
+            video.as_deref(),
+            None,
+            None,
+        )
     })
     .await;
     let proc = match built {

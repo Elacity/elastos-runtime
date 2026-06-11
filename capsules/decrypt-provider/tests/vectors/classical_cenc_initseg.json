@@ -1,7 +1,7 @@
 {
   "description": "P-256 ECDH envelope -> CENC AES-128-CTR, 16-byte IV via init-segment tenc; byte-compatible with PC2 ddrm-decrypt",
-  "session_secret_key_b64": "spi9XfBjdElKaxsRJmrqxiaZoYSTJrhgkj9rkDsfP/A=",
-  "sealed_envelope_b64": "AAAAAwAhA19KcJNAlP87dJNphREvyu7t5zzoRCS/PsUqeqZ2ILjENr061MOgZ0WNYjowiLW25gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAII5dovw4K2bWDvqU6tugabtI6cVSeoQmJgZuPnYq3cli",
+  "session_secret_key_b64": "B8hne/z8fpH0qcf5ggdzpWDcCOdY7TUf5V8u87VX/L4=",
+  "sealed_envelope_b64": "AAAAAwAhAjfv4mTq7dNeRtXELaIScbYtqeXt3blOkMfKAIorqq7EGlQ9ol29DPeVwXlk8ceIUgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIDufh05AYgw3e67f6xhScUpBEMi4vcyeU0eGo7pLvDbT",
   "cek_b64": "EREREREREREREREREREREQ==",
   "encrypted_segment_b64": "AAAARG1vb2YAAAA8dHJhZgAAABR0cnVuAAACAAAAAAEAAAAgAAAAIHNlbmMAAAAAAAAAATMzMzMzMzMzMzMzMzMzMzMAAAAobWRhdJ0iJWv07+5K8qlbsAeHuJ/iSSeP+YXDfuju3l7wsg/Y",
   "expected_plaintext_b64": "c2l4dGVlbi1ieXRlIElWIHNhbXBsZSBwbGFpbnRleHQ=",

@@ -596,20 +596,29 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
-  // elacity-player launched standalone (from the launcher) means "play an owned
-  // video": it has no bound object, so we mint a decrypt session via the gateway
-  // and open the player at the returned play URL instead of the generic route.
-  if (targetId === "elacity-player") {
+  // The dDRM viewers open in one of two modes:
+  //   • bound to a REAL owned object (Library passes objectUri/uri) — the gateway
+  //     seals THAT file through the local key-authority and picks the viewer itself;
+  //   • standalone from the launcher (no object) — a sample asset demo.
+  // Either way the CEK stays in the decrypt boundary; the browser only ever sees
+  // already-decrypted bytes.
+  if (targetId === "elacity-player" || targetId === "ddrm-viewer") {
     if (ignoreRepeatedAction(launchActionKey(targetId, options.query))) {
       return;
     }
-    launchOwnedMediaWindow(options).catch((error) => {
+    const ownedUri = libraryUriFromQuery(options.query);
+    const launch = ownedUri
+      ? () => launchOwnedFromLibrary(ownedUri, options)
+      : targetId === "elacity-player"
+        ? () => launchOwnedMediaWindow(options)
+        : () => launchOwnedObjectWindow(options);
+    launch().catch((error) => {
       const status = Number(error && error.status);
       if (status === 401 || status === 403) {
         requireWindowHooks().requestHomeUnlock?.();
         return;
       }
-      console.error("failed to open owned media", error);
+      console.error("failed to open owned asset", error);
       renderTargetLaunchError(targetId, error);
     });
     return;
@@ -778,6 +787,60 @@ async function launchOwnedMediaWindow(options = {}) {
   const launched = {
     target: "elacity-player",
     title: "Owned video",
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return openLaunchedWindow(launched, options);
+}
+
+// The Library object URI an open carries, if any. Library hands us `objectUri`
+// (preferred) or `uri` when a user opens an item with one of the dDRM viewers.
+function libraryUriFromQuery(query) {
+  const q = normalizedLaunchQuery(query);
+  const uri = q.objectUri || q.uri || "";
+  return typeof uri === "string" && uri.trim() ? uri.trim() : null;
+}
+
+// Owned object bound to a REAL Library file: ask the gateway to seal THAT object
+// through the local key-authority + a SEPARATE decrypt-provider boundary. The gateway
+// resolves the URI inside the principal's own root (ownership gate), reads the
+// plaintext, picks the viewer by content type, and returns { viewer, play_url }. The
+// CEK never reaches the browser — only already-decrypted bytes are loaded.
+async function launchOwnedFromLibrary(uri, options = {}) {
+  const opened = await fetchJson("/api/viewers/open", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uri }),
+  });
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("owned open did not return a view URL");
+  }
+  const target = typeof opened.viewer === "string" && opened.viewer ? opened.viewer : "ddrm-viewer";
+  const launched = {
+    target,
+    title: typeof opened.title === "string" && opened.title ? opened.title : "Owned asset",
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return openLaunchedWindow(launched, options);
+}
+
+// Owned non-media: ask the gateway to stand up an OBJECT decrypt session through the
+// local key-authority + a SEPARATE decrypt-provider boundary, then open ddrm-viewer
+// at the returned view URL (session + scoped launch token baked in). The CEK never
+// reaches the browser — only the already-decrypted object bytes are loaded.
+async function launchOwnedObjectWindow(options = {}) {
+  const opened = await fetchJson("/api/viewers/ddrm-viewer/object/open", {
+    method: "POST",
+  });
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("object open did not return a view URL");
+  }
+  const launched = {
+    target: "ddrm-viewer",
+    title: "Owned asset",
     route: opened.play_url,
     attach_kind: "iframe",
     launch_status: "launched",

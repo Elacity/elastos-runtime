@@ -560,15 +560,30 @@ fn home_browser_state(
         }
         Err(err) => return Err(err),
     };
-    let mut state: HomeBrowserStateSummary = serde_json::from_slice(&bytes)?;
-    if state.schema != HOME_BROWSER_STATE_SCHEMA {
-        anyhow::bail!("unsupported Home browser state schema");
-    }
-    if state.principal_id != principal_id {
-        anyhow::bail!("Home browser state principal mismatch");
-    }
-    if state.localhost_root != localhost_root {
-        anyhow::bail!("Home browser state root mismatch");
+    // browser-state.json carries NO authority — only cosmetic UI state (recent
+    // targets + window layout). A corrupt/mismatched file (e.g. the desktop app
+    // rewriting it non-atomically, leaving valid JSON + trailing bytes) must never
+    // fail-close the Home summary and block sign-in. So a parse/schema/principal/root
+    // failure resets to default with a warning, exactly like the missing/unencrypted
+    // fallbacks above. Our own writer uses atomic_write, so the runtime never creates
+    // this corruption.
+    let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                "resetting corrupt Home browser-state (cosmetic, no authority): {err}"
+            );
+            return Ok(default_home_browser_state(context));
+        }
+    };
+    if state.schema != HOME_BROWSER_STATE_SCHEMA
+        || state.principal_id != principal_id
+        || state.localhost_root != localhost_root
+    {
+        tracing::warn!(
+            "resetting mismatched Home browser-state (schema/principal/root mismatch) — cosmetic, no authority"
+        );
+        return Ok(default_home_browser_state(context));
     }
     state.recent_targets = sanitize_recent_targets(state.recent_targets);
     sanitize_home_browser_state_targets(data_dir, &mut state);

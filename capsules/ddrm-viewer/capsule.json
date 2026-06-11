@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "ddrm-viewer",
+  "version": "0.1.0",
+  "description": "Render an owned, protected NON-MEDIA asset (image, PDF, text/code, 3D) from a scoped decrypt session. Satisfies the elastos.viewer/document@1 interface; consumes only the scoped decrypted object bytes over a session handle, never the CEK, IV, or release receipt.",
+  "role": "viewer",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 96,
+    "gpu": false
+  }
+}

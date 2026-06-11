@@ -369,6 +369,47 @@ pub fn strip_senc(frag: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Wrap arbitrary bytes as a single-sample fragmented-MP4 fragment so a NON-MEDIA
+/// object can ride the exact same CENC rail as media. The blob becomes one sample
+/// inside `mdat`; the synthesized `moof/traf/trun` carry the one flag set
+/// [`encrypt_fragment`] requires: `data_offset` (0x1) + per-sample `size` (0x200),
+/// `sample_count = 1`, `size = blob.len()`. [`encrypt_fragment`] then CTR-encrypts
+/// the whole blob under one IV and injects `senc`; the unchanged decrypt boundary
+/// reverses it, and [`extract_mdat`] recovers the original bytes.
+pub fn wrap_blob_as_fragment(blob: &[u8]) -> Vec<u8> {
+    // trun content: version(0)+flags(0x000201), sample_count(1), data_offset(0),
+    // sample[0].size(blob.len()).
+    let mut trun_content = Vec::with_capacity(16);
+    trun_content.extend_from_slice(&[0x00, 0x00, 0x02, 0x01]); // version 0, flags 0x000201
+    trun_content.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+    trun_content.extend_from_slice(&0i32.to_be_bytes()); // data_offset (patched on encrypt)
+    trun_content.extend_from_slice(&(blob.len() as u32).to_be_bytes()); // sample[0] size
+    let trun = make_box(b"trun", &trun_content);
+    let traf = make_box(b"traf", &trun);
+    let moof = make_box(b"moof", &traf);
+    let mdat = make_box(b"mdat", blob);
+
+    let mut out = Vec::with_capacity(moof.len() + mdat.len());
+    out.extend_from_slice(&moof);
+    out.extend_from_slice(&mdat);
+    out
+}
+
+/// Extract the `mdat` payload from a fragment — the inverse of the container that
+/// [`wrap_blob_as_fragment`] built. Used after the decrypt boundary returns the
+/// (senc-stripped) cleartext fragment, to recover the original NON-MEDIA bytes.
+pub fn extract_mdat(frag: &[u8]) -> Result<Vec<u8>, String> {
+    let boxes = top_level_boxes(frag)?;
+    let (mdat_off, mdat_h) = boxes
+        .iter()
+        .copied()
+        .find(|(_, h)| &h.box_type == b"mdat")
+        .ok_or("decrypted object fragment has no mdat")?;
+    let start = mdat_off + mdat_h.header_size;
+    let end = mdat_off + mdat_h.size;
+    Ok(frag[start..end].to_vec())
+}
+
 /// Read the avc1 `codecs` string (e.g. `avc1.42E01E`) from the init segment by
 /// finding the `avcC` box and reading profile/constraints/level. Falls back to a
 /// safe baseline string if not found.

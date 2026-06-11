@@ -175,7 +175,10 @@ cargo build --manifest-path capsules/decrypt-provider/Cargo.toml \
 # 2. local key-authority helper (isolated PQ-crypto workspace)
 cargo build --manifest-path scripts/dev/ddrm-media-authority/Cargo.toml
 
-# 3. the gateway itself
+# 3. rights-provider capsule WITH the chain-rights dev profile (the live-chain gate)
+cargo build --manifest-path capsules/rights-provider/Cargo.toml --features chain-rights
+
+# 4. the gateway itself
 cargo build --manifest-path elastos/Cargo.toml -p elastos-server
 ```
 
@@ -192,6 +195,33 @@ macOS: `brew install ffmpeg`.
 Open **http://localhost:8090/apps/home/**, sign in, and click the **Owned Video** tile.
 A player window opens and the clip plays.
 
+> ✅ **`feat/ddrm-home-playback` now carries the home-summary resilience fix too.** It
+> was ported onto this branch (mirrors `35845b6`), so the gateway you build from THIS
+> repo for dDRM work also tolerates a corrupt `browser-state.json` — you no longer need
+> the `/tmp` worktree just to avoid the `500 … trailing characters` login failure.
+
+### Live-chain rights gate (Library opens)
+
+Opening an owned object from the **Library** (`POST /api/viewers/open`) now runs a
+live-chain authorization gate **before** anything is sealed or decrypted, exactly as
+Anders specified — the DECISION lives in the `rights-provider` capsule, not the gateway:
+
+1. The gateway resolves + reads the object inside the principal's own root (ownership
+   gate), then builds a typed on-chain ownership attestation (`ChainAccessAttestationV1`).
+   On this host that attestation is a **dev local-attestation** (stands in for a
+   `chain-provider.has_access_by_content_id` read against the Base contract).
+2. It spawns the real `rights-provider` (built with `--features chain-rights`) and asks it
+   to `decide_access_from_chain`. The capsule binds the attestation to the request and
+   mints a signed `RightsDecisionReceiptV1`.
+3. **Deny ⇒ `403` and nothing is sealed.** Allow ⇒ the receipt's hash is welded into the
+   decrypt-transcript AAD (`ddrm-envelope`), so the seal is cryptographically bound to
+   THIS rights decision — a seal made under one decision cannot be replayed under another
+   (the AEAD open fails closed at the decrypt boundary).
+
+To exercise the **fail-closed** path locally (simulate a not-owned / no-access-token
+object), list its content CID in `ELASTOS_DDRM_DENY_CIDS` (comma-separated) before
+launching the gateway; that CID then returns `403` from the open endpoint.
+
 ### Overrides (optional)
 
 | Env var | Purpose |
@@ -199,15 +229,72 @@ A player window opens and the clip plays.
 | `ELASTOS_DDRM_DECRYPT_BIN` | Path to the `rail-stream,rail-mint` decrypt-provider binary |
 | `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` | Path to the `ddrm-media-authority` helper |
 | `ELASTOS_DDRM_SAMPLE_VIDEO` | Use your own source clip instead of the synthesized one |
+| `ELASTOS_RIGHTS_PROVIDER_BIN` | Path to the `chain-rights` rights-provider binary (the live-chain gate) |
+| `ELASTOS_DDRM_DENY_CIDS` | Comma-separated content CIDs the dev attestation should DENY (fail-closed testing) |
 
 ### dDRM troubleshooting
 
 | Symptom | Cause | Fix |
 | ------- | ----- | --- |
 | `could not open owned media: … decrypt-provider did not configure` | decrypt-provider built as the fail-closed stub (no rail features) | Rebuild with `--features rail-stream,rail-mint` |
+| `rights provider unavailable; cannot authorize open` (503) | `rights-provider` not built with `chain-rights`, or wrong path | Build step 3 above, or set `ELASTOS_RIGHTS_PROVIDER_BIN` |
+| `no valid access token for this content (rights provider denied)` (403) | The CID is in `ELASTOS_DDRM_DENY_CIDS`, or (future) the chain says no token | Expected fail-closed behaviour; remove the CID from the deny list to allow |
 | `media-authority helper not found at …` | helper not built, or running a gateway from a different tree | Build step 2 above, run gateway from this repo, or set `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` |
 | `could not open owned media: … ffmpeg` | `ffmpeg`/`ffprobe` not on `PATH` | `brew install ffmpeg` |
 | Tile missing from launcher | gateway built/run from a different `capsules/` tree | Build + run the gateway from this repo on `feat/ddrm-home-playback` |
+
+---
+
+## Restarting the node cleanly (and recovering from the passkey 500)
+
+Use this whenever you rebuild the gateway or hit a stale process. It is the exact loop
+that avoids the two recurring failures: a held host lock, and the `500 … trailing
+characters` login error.
+
+```bash
+# 1. Free port / host lock — kill any gateway already on 8090
+lsof -ti tcp:8090 | xargs kill 2>/dev/null; sleep 1
+
+# 2. (Re)build the gateway from THIS repo/branch (feat/ddrm-home-playback)
+cargo build --manifest-path elastos/Cargo.toml -p elastos-server
+
+# 3. Relaunch against the real data dir
+./elastos/target/debug/elastos gateway --addr 127.0.0.1:8090 > /tmp/elastos-gateway.log 2>&1 &
+
+# 4. Probe — both must be 200
+curl -s -o /dev/null -w "home:    %{http_code}\n" http://localhost:8090/apps/home/
+curl -s -o /dev/null -w "summary: %{http_code}\n" http://localhost:8090/api/apps/home/summary
+```
+
+### The passkey "500 … trailing characters" — what it is and how to clear it
+
+Your passkey login *succeeds*; the failure is the **next** call,
+`GET /api/apps/home/summary`, which Home renders onto the sign-in card so it looks like
+login failed. The cause is `browser-state.json` (cosmetic UI state — recent targets +
+window layout, **no authority**) left as *valid JSON followed by trailing bytes* by the
+**Electron desktop app rewriting it non-atomically** while sharing this data dir.
+
+There are two layers of defense — you want both:
+
+1. **The durable fix (in the binary).** Build/run a gateway that carries the resilience
+   fix — now on **both** `fix/home-summary-resilience` *and* `feat/ddrm-home-playback`.
+   On a corrupt/mismatched `browser-state.json` it logs a warning and resets to default
+   instead of 500-ing, so login can never be blocked by this file again. Our own writer
+   uses `atomic_write`, so the runtime never creates the corruption — only the desktop
+   app does.
+
+2. **Manual reset (if you're on an older binary, or want to force-clear).** The file
+   regenerates on next write, so deleting it is safe:
+
+   ```bash
+   # find + remove any corrupt browser-state.json under the data dir
+   find "$HOME/Library/Application Support/elastos" -name browser-state.json -print -delete
+   ```
+
+> Rule of thumb: if sign-in shows `500 … trailing characters`, you are either running a
+> gateway *without* the resilience fix, or the desktop app is actively fighting the
+> gateway for the data dir. Run the fixed binary (step 2 of the restart loop) and quit
+> `ElastOS.app` so only one host owns the data dir.
 
 ---
 
@@ -216,7 +303,7 @@ A player window opens and the clip plays.
 | Symptom | Cause | Fix |
 | ------- | ----- | --- |
 | `This is an invalid domain.` on *Use passkey* | Page opened on `127.0.0.1` (bare IP) | Open `http://localhost:8090/apps/home/` instead |
-| `request failed: 500 … trailing characters` after login | Corrupt `browser-state.json` (shared with Electron app) | Use the `fix/home-summary-resilience` binary; it resets corrupt state |
+| `request failed: 500 … trailing characters` after login | Corrupt `browser-state.json` (Electron app rewrites it non-atomically) | Run a binary with the resilience fix (`feat/ddrm-home-playback` or `fix/home-summary-resilience`); or `find "$HOME/Library/Application Support/elastos" -name browser-state.json -delete`. See *Restarting the node cleanly* above |
 | `another ElastOS host already owns … host-process.lock` | Desktop app / another `serve`/`gateway` holds the lock | Quit `ElastOS.app`, `kill` the pid in `host-process.lock`, retry |
 | `elastos-server` won't compile on macOS | Missing the crosvm Darwin gate | Build from `fix/home-summary-resilience` (includes `5b167f1`) |
 | Passkey not offered on `localhost` | Existing passkey bound to the desktop app's origin | Create a fresh passkey on the `localhost` page (same identity vault) |

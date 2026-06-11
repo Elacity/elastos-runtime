@@ -29,7 +29,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use ddrm_media::{prepare, PreparedSession, SessionParams};
+use ddrm_media::{prepare, prepare_blob, PreparedSession, SessionParams};
+
+/// Guess a content type from a file extension for the NON-MEDIA object path.
+fn mime_for_path(path: &str) -> &'static str {
+    let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match lower.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "json" => "application/json",
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A small self-contained sample asset for the out-of-the-box non-media demo (no
+/// scripts, no external refs) — renders as an image in the viewer to make the
+/// click-to-play obvious without a real owned file on disk.
+fn sample_object_svg() -> String {
+    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450">
+  <rect width="800" height="450" fill="#0b0d12"/>
+  <rect x="24" y="24" width="752" height="402" rx="18" fill="#14171f" stroke="#6ea8fe" stroke-width="2"/>
+  <text x="400" y="180" fill="#e8eaf0" font-family="system-ui, sans-serif" font-size="40" font-weight="700" text-anchor="middle">Owned protected asset</text>
+  <text x="400" y="240" fill="#8b90a0" font-family="system-ui, sans-serif" font-size="22" text-anchor="middle">decrypted in the dDRM boundary · rendered via ddrm-viewer</text>
+  <text x="400" y="300" fill="#6ea8fe" font-family="ui-monospace, monospace" font-size="18" text-anchor="middle">elastos.viewer/document@1</text>
+</svg>
+"##
+    .to_string()
+}
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -43,20 +76,63 @@ fn main() {
     }
 }
 
+/// Decode the optional `--rights-binding` hex into raw bytes (the rights-decision
+/// receipt hash). `None`/empty => no binding (byte-identical to the pre-gate seal).
+fn decode_rights_binding(hex_str: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    match hex_str.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(hex_str) => {
+            let bytes = hex_decode(hex_str).ok_or("--rights-binding must be valid hex")?;
+            Ok(Some(bytes))
+        }
+    }
+}
+
+/// Minimal hex decoder (no extra dep): even-length ASCII hex -> bytes.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks(2) {
+        out.push((val(pair[0])? << 4) | val(pair[1])?);
+    }
+    Some(out)
+}
+
 fn run() -> Result<(), String> {
     let mut principal: Option<String> = None;
     let mut video: Option<String> = None;
+    let mut object_file: Option<String> = None;
+    let mut object_mime: Option<String> = None;
+    let mut object_mode = false;
     let mut decrypt_bin: Option<String> = None;
     let mut object_cid = "elastos-owned-media".to_string();
     let mut ttl_secs: u64 = 3600;
+    let mut rights_binding: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--principal" => principal = args.next(),
             "--video" => video = args.next(),
+            "--object" => object_mode = true,
+            "--object-file" => object_file = args.next(),
+            "--mime" => object_mime = args.next(),
             "--decrypt-bin" => decrypt_bin = args.next(),
             "--object-cid" => object_cid = args.next().ok_or("--object-cid needs a value")?,
+            // Hex SHA-256 of the rights-decision receipt; welded into the decrypt
+            // transcript so the seal is bound to THIS rights decision.
+            "--rights-binding" => rights_binding = args.next(),
             "--ttl-secs" => {
                 ttl_secs = args
                     .next()
@@ -66,10 +142,25 @@ fn run() -> Result<(), String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    let rights_binding = decode_rights_binding(rights_binding.as_deref())?;
     let principal = principal.ok_or("--principal is required")?;
     let decrypt_bin = decrypt_bin.ok_or("--decrypt-bin is required")?;
     if !Path::new(&decrypt_bin).is_file() {
         return Err(format!("decrypt-provider binary not found: {decrypt_bin}"));
+    }
+
+    // NON-MEDIA object mode: seal an arbitrary owned asset (image/pdf/text/3D) and
+    // serve it as a single decrypted blob through the SAME rail as media.
+    if object_mode || object_file.is_some() {
+        return run_object(
+            &principal,
+            object_file.as_deref(),
+            object_mime,
+            &decrypt_bin,
+            &object_cid,
+            ttl_secs,
+            rights_binding,
+        );
     }
 
     // CENC-pack + launch the boundary + seal the CEK (all in the shared crate).
@@ -81,11 +172,13 @@ fn run() -> Result<(), String> {
 
     let mut params = SessionParams::for_object(&principal, &object_cid);
     params.ttl_secs = ttl_secs;
+    params.rights_receipt_hash = rights_binding;
     let session = prepare(&raw, &decrypt_bin, &params, now_unix())?;
 
     // Print the descriptor line (NO key material), then serve segment reads.
     let descriptor = json!({
         "schema": "elastos.media-authority.session/v1",
+        "kind": "media",
         "mime": session.mime,
         "segment_count": session.segment_count,
         "init_b64": base64::engine::general_purpose::STANDARD.encode(&session.init),
@@ -97,6 +190,91 @@ fn run() -> Result<(), String> {
     out.flush().map_err(|e| format!("flush descriptor: {e}"))?;
 
     serve(&session, &mut out)
+}
+
+/// NON-MEDIA path: seal an owned object and serve it as one decrypted blob. When no
+/// `--object-file` is supplied (the out-of-the-box demo, mirroring the generated test
+/// clip on the media path), a built-in sample SVG stands in.
+#[allow(clippy::too_many_arguments)]
+fn run_object(
+    principal: &str,
+    path: Option<&str>,
+    mime: Option<String>,
+    decrypt_bin: &str,
+    object_cid: &str,
+    ttl_secs: u64,
+    rights_binding: Option<Vec<u8>>,
+) -> Result<(), String> {
+    let (bytes, mime) = match path {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("read object {path}: {e}"))?;
+            if bytes.is_empty() {
+                return Err(format!("object {path} is empty"));
+            }
+            let mime = mime.unwrap_or_else(|| mime_for_path(path).to_string());
+            (bytes, mime)
+        }
+        None => (
+            sample_object_svg().into_bytes(),
+            mime.unwrap_or_else(|| "image/svg+xml".to_string()),
+        ),
+    };
+
+    let mut params = SessionParams::for_object(principal, object_cid);
+    params.ttl_secs = ttl_secs;
+    params.reason = "owned object render".to_string();
+    params.rights_receipt_hash = rights_binding;
+    let session = prepare_blob(&bytes, &mime, decrypt_bin, &params, now_unix())?;
+
+    let descriptor = json!({
+        "schema": "elastos.media-authority.session/v1",
+        "kind": "object",
+        "mime": mime,
+        "byte_length": bytes.len(),
+        "expires_at": session.expires_at,
+    });
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{descriptor}").map_err(|e| format!("write descriptor: {e}"))?;
+    out.flush().map_err(|e| format!("flush descriptor: {e}"))?;
+
+    serve_object(&session, &mut out)
+}
+
+fn serve_object(session: &PreparedSession, out: &mut impl Write) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| format!("read stdin: {e}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(e) => {
+                reply(out, &json!({"status": "error", "message": format!("bad request json: {e}")}))?;
+                continue;
+            }
+        };
+        match req.get("op").and_then(Value::as_str) {
+            Some("shutdown") => return Ok(()),
+            Some("object") => match session.decrypt_object(now_unix()) {
+                Ok(bytes) => reply(
+                    out,
+                    &json!({
+                        "status": "ok",
+                        "object_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    }),
+                )?,
+                Err(e) => reply(out, &json!({"status": "error", "message": e}))?,
+            },
+            other => reply(
+                out,
+                &json!({"status": "error", "message": format!("unknown op: {other:?}")}),
+            )?,
+        }
+    }
+    Ok(())
 }
 
 fn serve(session: &PreparedSession, out: &mut impl Write) -> Result<(), String> {
