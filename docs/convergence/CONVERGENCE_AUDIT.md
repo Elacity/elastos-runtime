@@ -43,7 +43,7 @@ chain/IPFS/UI for real, and adding the surfaces.**
 | 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🔴 | signing + `eth_sendRawTransaction` exist | live assemble→sign→broadcast flow |
 | 2 | IPFS pin | `ipfs-provider` | 🟡 | contract + addressing | live pin wired into publish |
 | 3 | Marketplace / discovery | `content-market` | 🟢 (offline) | listing from calldata + chain event + metadata | live `eth_getLogs` |
-| 3 | Buy / trade access | `wallet-provider`, `chain-provider` | 🔴 | ownership *check* is real | the *purchase* flow (buyAccess UI + tx) |
+| 3 | Buy / trade access | `buy_authority`, `wallet-provider`, `chain-provider` | 🟡 | **buy ORCHESTRATION wired** (assemble→broadcast→record→re-check); offline `denied→buy→owned→open` loop proven (chain-mock + ledger); Home auto-buys on a rights-denied open | real `buyAccess` ABI (operator-pinned config today) + live EVM tx signing (same seam as mint) |
 | 4 | Rights check | `rights-provider`, `chain-provider` | 🟢 | real `has_access_by_content_id` (owned→open, not-owned→fail-closed) | — |
 | 4 | Key authority (dKMS) | `key-provider`, `dkms-authority` | 🟢 built | born-distributed DKG, 2-of-2 + 2-of-3, rotatable/reconfigurable, authenticated PQ channel over TCP, quorum attestation | **production multi-node deployment** (ops) |
 | 4 | Lit compat backend | `key-provider` | 🟡 seam-only | operator-selectable slot, fails closed honestly | ship a Lit proxy adapter |
@@ -188,8 +188,41 @@ SAME real `chain-provider` read behind the rights gate (`ELASTOS_DDRM_RIGHTS=cha
 decide_access_from_chain`, and welds the minted receipt hash into the decrypt transcript.
 Owned → opens; not-owned → `403`, nothing sealed; no wallet in chain mode → fail closed.
 
-**Still open:** the live *purchase* flow (buyAccess tx) that puts a token in the wallet in
-the first place, and wiring a real Base RPC + the production Elacity contract/selector.
+---
+
+## 8. Buy flow (PC2 stage 5) — putting a token in the wallet
+
+PC2 buys access via `AuthorityGateway.buyAccess(...)` (USDC/USDT/ETH → operative Access
+Token, role 1). The runtime now mirrors this as an **orchestration over the existing real
+seams**, in `elastos-server/src/api/buy_authority.rs`:
+
+```
+resolve object + listing/price → assemble buyAccess tx { to, value, data }
+  → sign (wallet) → broadcast (chain-provider eth_sendRawTransaction)
+  → await/record → the rights gate's hasAccessByContentId now reads owned
+```
+
+- The `buyAccess` **calldata is operator-pinned config** (`ELASTOS_DDRM_BUY_SELECTOR` /
+  `_TO` / `_VALUE`), exactly like the `has_access` and `mint` selectors are pinned from
+  real PC2 source. The arg layout the gateway assembles is a documented, overridable demo
+  default — **no contract signature is guessed as product truth** (the real Elacity
+  AuthorityGateway ABI is not in-repo; it slots in via config when available).
+- **chain-mock** broadcasts a representative signed tx through the REAL
+  `chain-provider.broadcast_transaction` op against an in-process RPC mock, then records
+  the purchase in a local owned-token ledger; the chain-mock rights read
+  (`ELASTOS_DDRM_CHAIN_ACCESS=ledger`) consults that ledger. This proves
+  **not-owned → buy → owned → open** end to end, offline, exercising the production
+  broadcast path. (`buy_then_open_loop` integration test.)
+- **dev** records the purchase in the ledger and returns a synthetic hash.
+- **chain** assembles the unsigned tx and broadcasts an externally-signed tx
+  (`ELASTOS_DDRM_BUY_SIGNED_TX`), or returns the unsigned tx (`409`) for an external
+  signer. Ownership is read back from `hasAccessByContentId`, never the ledger.
+- The **Home shell auto-recovers**: a rights-denied open calls `POST /api/market/buy`
+  and retries the open once, so a click goes `denied → buy → owned → plays`.
+
+**Still open:** the real Elacity `buyAccess` ABI (config-driven today) and live EVM
+transaction signing — the SAME seam the live mint broadcast is waiting on (no signer in
+the repo yet) — plus wiring a real Base RPC + the production contract/selector.
 
 ---
 

@@ -241,6 +241,96 @@ pub async fn open_owned_in_viewer(
     }
 }
 
+/// POST /api/market/buy — buy an access token for an owned Library object, then report
+/// whether the rights gate will now allow the open.
+///
+/// This resolves the object EXACTLY as `/api/viewers/open` does (same root-scoped read,
+/// same `content_id` derivation, same wallet `subject`), so the purchase is keyed on the
+/// identifier the rights gate reads back. The buy itself (assemble → sign → broadcast →
+/// await) lives in `buy_authority`; here we only authenticate, resolve, and report.
+pub async fn buy_owned_access(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<OpenOwnedRequest>,
+) -> Response {
+    let context = match require_home_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
+    };
+    let principal_id = context.principal_id.clone();
+
+    // Resolve the object inside the principal's OWN root (the same ownership gate the
+    // open uses) so we buy access for an object they can actually address.
+    let data_dir = state.data_dir.clone();
+    let uri = req.uri.clone();
+    let pid = principal_id.clone();
+    let owned = match tokio::task::spawn_blocking(move || {
+        crate::library::read_owned_object_for_viewer(&data_dir, &pid, &uri)
+    })
+    .await
+    {
+        Ok(Ok(owned)) => owned,
+        Ok(Err(err)) => {
+            tracing::warn!("buy: owned object resolve refused: {err}");
+            return (StatusCode::NOT_FOUND, "owned object not found").into_response();
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object read panicked")
+                .into_response()
+        }
+    };
+
+    let content_id = owned
+        .content_cid
+        .clone()
+        .unwrap_or_else(|| format!("owned:{}", owned.name));
+    let subject = resolve_subject_address(&state, &principal_id).await;
+    let now = now_unix();
+
+    let bought = {
+        let principal_id = principal_id.clone();
+        let content_id = content_id.clone();
+        let subject = subject.clone();
+        tokio::task::spawn_blocking(move || {
+            super::buy_authority::buy_access(&principal_id, &content_id, &subject, now)
+        })
+        .await
+    };
+    match bought {
+        Ok(Ok(outcome)) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "schema": "elastos.market.buy/v1",
+                "content_id": content_id,
+                "subject": subject,
+                "transaction_hash": outcome.tx_hash,
+                // True when the open can now proceed (dev / chain-mock). On real chain the
+                // open re-reads `hasAccessByContentId` once the tx confirms.
+                "owned_now": outcome.owned_now,
+                "mode": outcome.mode,
+                "unsigned_tx": outcome.unsigned_tx,
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => {
+            if err.contains("wallet not linked") {
+                return (StatusCode::FORBIDDEN, "link an EVM wallet to buy access")
+                    .into_response();
+            }
+            // A live buy that needs an external signer is a precondition (409), not an
+            // outage — surface the assembled tx so the caller can sign it.
+            if err.contains("needs a signed transaction") {
+                tracing::info!("buy requires external signature: {err}");
+                return (StatusCode::CONFLICT, err).into_response();
+            }
+            tracing::warn!("buy failed: {err}");
+            (StatusCode::BAD_GATEWAY, "could not complete buy").into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "buy task panicked").into_response(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_media(
     state: GatewayState,

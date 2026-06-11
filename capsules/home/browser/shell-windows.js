@@ -808,11 +808,23 @@ function libraryUriFromQuery(query) {
 // plaintext, picks the viewer by content type, and returns { viewer, play_url }. The
 // CEK never reaches the browser — only already-decrypted bytes are loaded.
 async function launchOwnedFromLibrary(uri, options = {}) {
-  const opened = await fetchJson("/api/viewers/open", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ uri }),
-  });
+  let opened;
+  try {
+    opened = await openOwnedRequest(uri);
+  } catch (error) {
+    // A rights-denied open (no access token yet) is recoverable: buy the access token,
+    // then retry the open ONCE. Auth failures (no wallet / locked) are not retried here.
+    if (isRightsDeniedError(error)) {
+      await fetchJson("/api/market/buy", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uri }),
+      });
+      opened = await openOwnedRequest(uri);
+    } else {
+      throw error;
+    }
+  }
   if (typeof opened.play_url !== "string" || opened.play_url === "") {
     throw new Error("owned open did not return a view URL");
   }
@@ -825,6 +837,26 @@ async function launchOwnedFromLibrary(uri, options = {}) {
     launch_status: "launched",
   };
   return openLaunchedWindow(launched, options);
+}
+
+function openOwnedRequest(uri) {
+  return fetchJson("/api/viewers/open", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uri }),
+  });
+}
+
+// A 403 whose body is the rights-provider's denial (no access token yet) — distinct
+// from an auth/lock 403, which we leave to the unlock prompt. The buy-and-retry loop
+// only triggers on the former.
+function isRightsDeniedError(error) {
+  const status = Number(error && error.status);
+  if (status !== 403) {
+    return false;
+  }
+  const message = String((error && error.message) || "");
+  return message.includes("rights provider denied") || message.includes("no valid access token");
 }
 
 // Owned non-media: ask the gateway to stand up an OBJECT decrypt session through the

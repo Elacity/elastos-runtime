@@ -68,13 +68,13 @@ pub struct RightsDecision {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RightsMode {
+pub(crate) enum RightsMode {
     Dev,
     Chain,
     ChainMock,
 }
 
-fn rights_mode() -> RightsMode {
+pub(crate) fn rights_mode() -> RightsMode {
     match std::env::var("ELASTOS_DDRM_RIGHTS").ok().as_deref() {
         Some("chain") => RightsMode::Chain,
         Some("chain-mock") => RightsMode::ChainMock,
@@ -87,12 +87,12 @@ fn resolve_rights_bin() -> String {
         .unwrap_or_else(|_| DEV_RIGHTS_PROVIDER_BIN.to_string())
 }
 
-fn resolve_chain_bin() -> String {
+pub(crate) fn resolve_chain_bin() -> String {
     std::env::var("ELASTOS_CHAIN_PROVIDER_BIN")
         .unwrap_or_else(|_| DEV_CHAIN_PROVIDER_BIN.to_string())
 }
 
-fn env_nonempty(key: &str) -> Option<String> {
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
@@ -236,10 +236,18 @@ fn chain_attestation(
     // Resolve network/contract/selector/rpc. Real chain REQUIRES all of them; the mock
     // supplies canned contract/selector and stands up its own loopback RPC.
     let (network, contract, selector, rpc_url, mock_guard) = if mock {
-        let owned = std::env::var("ELASTOS_DDRM_CHAIN_ACCESS")
-            .ok()
-            .map(|s| s != "denied")
-            .unwrap_or(true);
+        // The mock's ownership answer, by precedence:
+        //   - `ELASTOS_DDRM_CHAIN_ACCESS=denied` -> not owned (force the fail-closed path)
+        //   - `ELASTOS_DDRM_CHAIN_ACCESS=owned`  -> owned
+        //   - `ELASTOS_DDRM_CHAIN_ACCESS=ledger` -> owned IFF the local owned-token ledger
+        //       has this `(content_id, subject)` (the offline buy->own->open loop)
+        //   - unset / other -> owned (back-compat: the "everything owned" local demo)
+        let owned = match env_nonempty("ELASTOS_DDRM_CHAIN_ACCESS").as_deref() {
+            Some("denied") => false,
+            Some("owned") => true,
+            Some("ledger") => super::owned_ledger::contains(content_id, subject),
+            _ => true,
+        };
         let guard = ChainRpcMock::start(owned)?;
         (
             MOCK_NETWORK.to_string(),
@@ -312,9 +320,9 @@ fn chain_attestation(
     Ok((attestation, source))
 }
 
-/// Spawn chain-provider, send `init` then `has_access_by_content_id` + `shutdown`,
-/// returning the query's `data`.
-fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Result<Value, String> {
+/// Spawn chain-provider, send `init` then one op (e.g. `has_access_by_content_id` or
+/// `broadcast_transaction`) + `shutdown`, returning the op's `data`.
+pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Result<Value, String> {
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -346,7 +354,7 @@ fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Result<Value, St
 
     if query_resp.get("status").and_then(Value::as_str) != Some("ok") {
         return Err(format!(
-            "chain has_access_by_content_id failed: {}",
+            "chain-provider op failed: {}",
             query_resp.get("message").and_then(Value::as_str).unwrap_or("unknown")
         ));
     }
@@ -440,21 +448,29 @@ fn canonical_json(value: &Value) -> String {
 /// answers every request with a canned 32-byte ABI bool word — `…01` (owned) or `…00`
 /// (not owned) — exactly what `has_access_by_content_id` decodes. Mirrors the proven
 /// `ChainRpcMock` in `scripts/dev/ddrm-runtime-open`.
-struct ChainRpcMock {
-    url: String,
+pub(crate) struct ChainRpcMock {
+    pub(crate) url: String,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ChainRpcMock {
     fn start(owned: bool) -> Result<Self, String> {
+        Self::start_with_word(format!("0x{:064x}", u8::from(owned)))
+    }
+
+    /// Stand up a loopback JSON-RPC endpoint that answers EVERY request with the same
+    /// 32-byte hex `result` word. Used by the rights gate (a `0…01`/`0…00` ABI bool) and
+    /// by the buy broadcast path (a canned `eth_sendRawTransaction` tx hash) — both are
+    /// 32-byte hex, exactly what the REAL chain-provider decoders expect.
+    pub(crate) fn start_with_word(result_word: String) -> Result<Self, String> {
         let listener =
             TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind chain RPC mock: {e}"))?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
-        let bool_word = format!("0x{:064x}", u8::from(owned));
+        let bool_word = result_word;
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stop.load(Ordering::Relaxed) {

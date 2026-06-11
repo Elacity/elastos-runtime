@@ -648,6 +648,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
             axum::routing::post(super::viewer_open::open_owned_in_viewer),
         )
         .route(
+            "/api/market/buy",
+            axum::routing::post(super::viewer_open::buy_owned_access),
+        )
+        .route(
             "/api/viewers/elacity-player/media/open",
             axum::routing::post(super::media_authority::open_demo_media),
         )

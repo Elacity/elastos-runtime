@@ -234,7 +234,8 @@ The on-chain ownership answer comes from one of three sources, selected by
 - **dev fail-closed:** list a CID in `ELASTOS_DDRM_DENY_CIDS` → that open returns `403`.
 - **chain-mock:** set `ELASTOS_DDRM_RIGHTS=chain-mock`; `ELASTOS_DDRM_CHAIN_ACCESS=denied`
   flips the mock to not-owned so the open fails closed — the calldata is still really
-  ABI-encoded, sent, and decoded through the real `chain-provider`.
+  ABI-encoded, sent, and decoded through the real `chain-provider`. `…=owned` forces owned;
+  `…=ledger` answers from the local owned-token ledger (see the buy flow below).
 - **chain:** set `ELASTOS_DDRM_RIGHTS=chain` plus `ELASTOS_CHAIN_BASE_RPC`,
   `ELASTOS_DDRM_RIGHTS_CONTRACT`, and `ELASTOS_DDRM_RIGHTS_SELECTOR`. The `subject` is the
   signed-in principal's linked EVM wallet (or `ELASTOS_DDRM_SUBJECT` override); chain mode
@@ -244,6 +245,40 @@ Verify the chain path end to end (real chain-provider + mock + real rights-provi
 
 ```bash
 cargo test -p elastos-server rights_authority::tests -- --include-ignored
+```
+
+### Buy flow — put an access token in the wallet (`POST /api/market/buy`)
+
+A Library open that is **denied** (no access token yet) is recoverable: the buy flow
+assembles a `buyAccess` transaction, signs + broadcasts it, and the rights gate then
+reads the new ownership. The Home shell does this automatically — a rights-denied open
+calls `/api/market/buy { uri }` and retries the open once, so a click goes
+**denied → buy → owned → plays**. The gateway invents NO contract semantics: the
+`buyAccess` selector + value are operator-pinned config (like the `has_access`/`mint`
+selectors), never a guessed signature.
+
+Three modes (shared with `ELASTOS_DDRM_RIGHTS`):
+
+- **dev** — records the purchase in the local owned-token ledger and returns a synthetic
+  tx hash. Offline; no chain, no signing.
+- **chain-mock** — assembles the calldata and broadcasts a representative signed tx
+  through the REAL `chain-provider.broadcast_transaction` op against an in-process RPC
+  mock (the production broadcast path runs), then records the purchase in the ledger.
+  Pair with the rights gate's `ELASTOS_DDRM_CHAIN_ACCESS=ledger` so a fresh object is
+  **not owned → 403**, and **owned → opens** right after the buy. Fully offline.
+- **chain** — assembles the unsigned `{ to, value, data }` against the configured Base
+  contract. EVM transaction signing is the same seam the live mint broadcast is waiting
+  on, so this path broadcasts an **externally-signed** tx (`ELASTOS_DDRM_BUY_SIGNED_TX`)
+  through the real chain-provider, or — absent one — returns the assembled unsigned tx
+  (HTTP `409`) for an external signer. Ownership is then read back from
+  `hasAccessByContentId`, never the ledger.
+
+Prove the whole offline loop (denied → buy → allowed) against the real capsules:
+
+```bash
+cargo build --manifest-path capsules/chain-provider/Cargo.toml
+cargo build --manifest-path capsules/rights-provider/Cargo.toml --features chain-rights
+cargo test -p elastos-server buy_then_open_loop -- --ignored
 ```
 
 ### Overrides (optional)
@@ -262,7 +297,10 @@ cargo test -p elastos-server rights_authority::tests -- --include-ignored
 | `ELASTOS_DDRM_RIGHTS_SELECTOR` | `hasAccessByContentId` 4-byte selector, e.g. `0x........` (`chain` mode) |
 | `ELASTOS_DDRM_RIGHTS_NETWORK` / `ELASTOS_DDRM_CHAIN_ID` | Network id (default `base`) / chain id (default `8453`) |
 | `ELASTOS_DDRM_SUBJECT` | Pin the on-chain wallet `subject` (else the principal's linked EVM account) |
-| `ELASTOS_DDRM_CHAIN_ACCESS` | `chain-mock` only: `denied` flips the mock to not-owned |
+| `ELASTOS_DDRM_CHAIN_ACCESS` | `chain-mock` only: `denied` (not-owned) / `owned` / `ledger` (owned-token ledger) |
+| `ELASTOS_DDRM_OWNED_LEDGER` | Path to the local owned-token ledger (buy flow); default `<temp>/elastos-ddrm-owned-tokens.json` |
+| `ELASTOS_DDRM_BUY_SELECTOR` / `ELASTOS_DDRM_BUY_TO` / `ELASTOS_DDRM_BUY_VALUE` | Operator-pinned `buyAccess` selector / contract / payable value |
+| `ELASTOS_DDRM_BUY_SIGNED_TX` | `chain` mode: an externally-signed buy tx to broadcast |
 
 ### dDRM troubleshooting
 
@@ -270,7 +308,9 @@ cargo test -p elastos-server rights_authority::tests -- --include-ignored
 | ------- | ----- | --- |
 | `could not open owned media: … decrypt-provider did not configure` | decrypt-provider built as the fail-closed stub (no rail features) | Rebuild with `--features rail-stream,rail-mint` |
 | `rights provider unavailable; cannot authorize open` (503) | `rights-provider` not built with `chain-rights`, or wrong path | Build step 3 above, or set `ELASTOS_RIGHTS_PROVIDER_BIN` |
-| `no valid access token for this content (rights provider denied)` (403) | The CID is in `ELASTOS_DDRM_DENY_CIDS`, or (future) the chain says no token | Expected fail-closed behaviour; remove the CID from the deny list to allow |
+| `no valid access token for this content (rights provider denied)` (403) | No access token for this `(content_id, subject)` — the dev deny list, the chain-mock ledger, or the real chain says no | Expected fail-closed behaviour; the Home shell auto-buys + retries, or call `POST /api/market/buy { uri }` |
+| `link an EVM wallet to buy access` (403) | Buy attempted in a chain mode with no linked wallet | Link an EVM account, or set `ELASTOS_DDRM_SUBJECT` |
+| `live buy needs a signed transaction …` (409) | `chain` mode has no `ELASTOS_DDRM_BUY_SIGNED_TX` | Sign the returned `unsigned_tx` externally and resubmit via `ELASTOS_DDRM_BUY_SIGNED_TX` |
 | `media-authority helper not found at …` | helper not built, or running a gateway from a different tree | Build step 2 above, run gateway from this repo, or set `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` |
 | `could not open owned media: … ffmpeg` | `ffmpeg`/`ffprobe` not on `PATH` | `brew install ffmpeg` |
 | Tile missing from launcher | gateway built/run from a different `capsules/` tree | Build + run the gateway from this repo on `feat/ddrm-home-playback` |

@@ -8,12 +8,14 @@
 pub mod auth_gateway;
 pub mod browser_capsules;
 pub mod browser_sessions;
+pub mod buy_authority;
 pub(crate) mod capsule_inventory;
 pub mod gateway;
 pub mod handlers;
 pub mod media_authority;
 pub mod middleware;
 pub mod object_authority;
+pub mod owned_ledger;
 pub mod rights_authority;
 pub mod routes;
 pub mod server;
