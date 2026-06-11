@@ -13,10 +13,12 @@
 //!     decrypt-provider boundary), registers a principal-bound session, mints the
 //!     viewer's launch token, and returns { viewer, session, play_url }.
 //!
-//! Ownership today is the local-sovereign gate (the principal's own root). The chain
-//! rights-provider (`has_access_by_content_id`) is the production gate for *purchased*
-//! access and lands with the live-chain slice; this seam already passes the object's
-//! content CID through the transcript so that gate slots in without a contract change.
+//! Ownership has TWO gates, both enforced before anything is sealed: the local-sovereign
+//! gate (the principal's own root — a not-owned/traversal URI never resolves) AND the
+//! live-chain rights gate (`rights-provider.decide_access_from_chain` over a
+//! `chain-provider.has_access_by_content_id` answer — dev, real Base RPC, or in-process
+//! mock per `ELASTOS_DDRM_RIGHTS`). The minted rights-receipt hash is welded into the
+//! decrypt transcript, so a seal is bound to the exact decision that authorized it.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -162,20 +164,28 @@ pub async fn open_owned_in_viewer(
     let ext = extension_for(&owned.name, &owned.mime);
 
     // Live-chain gate: the rights-provider capsule decides access (Anders' rule —
-    // the DECISION lives in the capsule, not here). On this host the on-chain
-    // attestation is a dev local-attestation; deny -> fail closed. The minted receipt
-    // hash is welded into the decrypt transcript by the authority (replay binding).
+    // the DECISION lives in the capsule, not here). The on-chain ownership answer comes
+    // from ELASTOS_DDRM_RIGHTS: dev (local attestation), chain (real chain-provider vs
+    // Base RPC), or chain-mock (real chain-provider vs in-process mock). Deny -> fail
+    // closed. The minted receipt hash is welded into the decrypt transcript (replay
+    // binding). The gateway never does chain RPC itself.
     let now = now_unix();
     let session_id = random_session_id();
+    // The on-chain subject is the principal's linked EVM wallet (or ELASTOS_DDRM_SUBJECT
+    // override). Empty in dev mode is fine (a placeholder is derived); chain mode fails
+    // closed without it.
+    let subject = resolve_subject_address(&state, &context.principal_id).await;
     let rights = {
         let principal_id = context.principal_id.clone();
         let content_id = object_cid.clone();
         let session = session_id.clone();
+        let subject = subject.clone();
         tokio::task::spawn_blocking(move || {
             super::rights_authority::decide_owned_access(
                 &principal_id,
                 &session,
                 &content_id,
+                &subject,
                 "view",
                 "owned object render",
                 None,
@@ -188,6 +198,13 @@ pub async fn open_owned_in_viewer(
     let rights = match rights {
         Ok(Ok(decision)) => decision,
         Ok(Err(err)) => {
+            // A missing wallet linkage is an authorization fail-closed (403), not an
+            // outage; a missing/misconfigured provider is a 503.
+            if err.contains("wallet not linked") {
+                tracing::info!("owned open denied: {err}");
+                return (StatusCode::FORBIDDEN, "link an EVM wallet to open protected content")
+                    .into_response();
+            }
             tracing::warn!("rights gate unavailable: {err}");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -380,4 +397,38 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Resolve the on-chain `subject` for the rights check: the principal's linked EVM
+/// wallet address. `ELASTOS_DDRM_SUBJECT` overrides (operator-pinned wallet for testing);
+/// otherwise the wallet-provider is asked for the principal's accounts and the first
+/// `eip155:` address is used. Returns empty if none is linked (dev mode derives a
+/// placeholder; chain mode fails closed).
+async fn resolve_subject_address(state: &GatewayState, principal_id: &str) -> String {
+    if let Ok(pinned) = std::env::var("ELASTOS_DDRM_SUBJECT") {
+        if !pinned.trim().is_empty() {
+            return pinned;
+        }
+    }
+    let accounts = super::auth_gateway::wallet_provider_data(
+        state,
+        json!({ "op": "accounts", "principal_id": principal_id }),
+    )
+    .await;
+    let Ok(data) = accounts else {
+        return String::new();
+    };
+    data.get("accounts")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|acct| {
+            acct.get("chain_namespace")
+                .and_then(|v| v.as_str())
+                .map(|ns| ns.starts_with("eip155:"))
+                .unwrap_or(false)
+        })
+        .and_then(|acct| acct.get("address").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_default()
 }

@@ -178,7 +178,10 @@ cargo build --manifest-path scripts/dev/ddrm-media-authority/Cargo.toml
 # 3. rights-provider capsule WITH the chain-rights dev profile (the live-chain gate)
 cargo build --manifest-path capsules/rights-provider/Cargo.toml --features chain-rights
 
-# 4. the gateway itself
+# 4. chain-provider capsule (the REAL on-chain ownership read; needed for chain modes)
+cargo build --manifest-path capsules/chain-provider/Cargo.toml
+
+# 5. the gateway itself
 cargo build --manifest-path elastos/Cargo.toml -p elastos-server
 ```
 
@@ -218,9 +221,30 @@ Anders specified — the DECISION lives in the `rights-provider` capsule, not th
    THIS rights decision — a seal made under one decision cannot be replayed under another
    (the AEAD open fails closed at the decrypt boundary).
 
-To exercise the **fail-closed** path locally (simulate a not-owned / no-access-token
-object), list its content CID in `ELASTOS_DDRM_DENY_CIDS` (comma-separated) before
-launching the gateway; that CID then returns `403` from the open endpoint.
+The on-chain ownership answer comes from one of three sources, selected by
+`ELASTOS_DDRM_RIGHTS` (the gateway itself NEVER does chain RPC — the real
+`chain-provider` capsule does):
+
+| `ELASTOS_DDRM_RIGHTS` | Ownership source | Use |
+| --------------------- | ---------------- | --- |
+| `dev` (default) | Local attestation: owned unless the CID is in `ELASTOS_DDRM_DENY_CIDS` | Offline work, no chain |
+| `chain-mock` | REAL `chain-provider` `eth_call` against an in-process JSON-RPC mock (no network) | Prove owned→opens / not-owned→fail-closed locally on a Mac |
+| `chain` | REAL `chain-provider` `eth_call` against the configured Base RPC + contract | Production: actual access-token ownership |
+
+- **dev fail-closed:** list a CID in `ELASTOS_DDRM_DENY_CIDS` → that open returns `403`.
+- **chain-mock:** set `ELASTOS_DDRM_RIGHTS=chain-mock`; `ELASTOS_DDRM_CHAIN_ACCESS=denied`
+  flips the mock to not-owned so the open fails closed — the calldata is still really
+  ABI-encoded, sent, and decoded through the real `chain-provider`.
+- **chain:** set `ELASTOS_DDRM_RIGHTS=chain` plus `ELASTOS_CHAIN_BASE_RPC`,
+  `ELASTOS_DDRM_RIGHTS_CONTRACT`, and `ELASTOS_DDRM_RIGHTS_SELECTOR`. The `subject` is the
+  signed-in principal's linked EVM wallet (or `ELASTOS_DDRM_SUBJECT` override); chain mode
+  with no linked wallet fails closed (`403 link an EVM wallet…`).
+
+Verify the chain path end to end (real chain-provider + mock + real rights-provider):
+
+```bash
+cargo test -p elastos-server rights_authority::tests -- --include-ignored
+```
 
 ### Overrides (optional)
 
@@ -231,6 +255,14 @@ launching the gateway; that CID then returns `403` from the open endpoint.
 | `ELASTOS_DDRM_SAMPLE_VIDEO` | Use your own source clip instead of the synthesized one |
 | `ELASTOS_RIGHTS_PROVIDER_BIN` | Path to the `chain-rights` rights-provider binary (the live-chain gate) |
 | `ELASTOS_DDRM_DENY_CIDS` | Comma-separated content CIDs the dev attestation should DENY (fail-closed testing) |
+| `ELASTOS_DDRM_RIGHTS` | Ownership source: `dev` (default), `chain-mock`, or `chain` |
+| `ELASTOS_CHAIN_PROVIDER_BIN` | Path to the chain-provider binary (chain modes) |
+| `ELASTOS_CHAIN_BASE_RPC` | Base RPC URL (`chain` mode) |
+| `ELASTOS_DDRM_RIGHTS_CONTRACT` | Rights/AuthorityGateway contract address (`chain` mode) |
+| `ELASTOS_DDRM_RIGHTS_SELECTOR` | `hasAccessByContentId` 4-byte selector, e.g. `0x........` (`chain` mode) |
+| `ELASTOS_DDRM_RIGHTS_NETWORK` / `ELASTOS_DDRM_CHAIN_ID` | Network id (default `base`) / chain id (default `8453`) |
+| `ELASTOS_DDRM_SUBJECT` | Pin the on-chain wallet `subject` (else the principal's linked EVM account) |
+| `ELASTOS_DDRM_CHAIN_ACCESS` | `chain-mock` only: `denied` flips the mock to not-owned |
 
 ### dDRM troubleshooting
 

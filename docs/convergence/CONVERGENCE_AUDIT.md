@@ -157,5 +157,41 @@ demoable increment → honest status + next-slice prompt (per `CONVERGENCE_PLAYB
 
 ---
 
+## 7. Chain access (PC2 fidelity) — how ownership is queried
+
+PC2 gates a viewer on **on-chain access-token ownership** (the predicate Lit's
+access-control-conditions wrapped). The runtime reproduces that predicate natively via the
+`chain-provider` capsule, so the answer is owned by us, not Lit.
+
+- **Contract method:** `hasAccessByContentId(string contentId, address subject, string right)
+  → bool` — the AuthorityGateway read. Encoded by `chain-provider/src/abi.rs::
+  encode_has_access_by_content_id_call` and decoded by `decode_evm_bool` (exactly 32 bytes,
+  high bytes zero, last byte 0/1). The selector is **supplied by config**, never computed
+  in-capsule.
+- **`contentId`:** the asset's on-chain content identity == the **bytes16 KID** the producer
+  minted (see `abi.rs::abi_word_bytes16`, "`contentId == KID`", and `mint()` `opRawData`),
+  surfaced as the `string` the read keys on. Must match byte-for-byte or the read fails
+  closed. Local owned files (not real Elacity mints) use the object CID as the identifier;
+  a real purchased asset uses its minted KID/contentId.
+- **`right`:** `view` for render/playback (the same set chain-provider validates:
+  view/stream/download/execute).
+- **`subject`:** the buyer's EVM wallet address. In Home this is the signed-in principal's
+  linked `eip155:` account (`wallet-provider` `accounts`), or `ELASTOS_DDRM_SUBJECT`.
+- **Network/RPC:** Base (chain id 8453) via `ELASTOS_CHAIN_BASE_RPC`; the contract +
+  selector are configured, never hard-coded into product paths.
+
+**Where it runs.** The canonical CLI vertical (`scripts/dev/ddrm-runtime-open`) has driven
+this real path since Day 136–140 with a `ChainRpcMock` for offline proof. As of
+`feat/ddrm-home-playback`, the **Home gateway** open path (`/api/viewers/open`) drives the
+SAME real `chain-provider` read behind the rights gate (`ELASTOS_DDRM_RIGHTS=chain` /
+`chain-mock`), feeds the typed `ChainAccessAttestationV1` into `rights-provider.
+decide_access_from_chain`, and welds the minted receipt hash into the decrypt transcript.
+Owned → opens; not-owned → `403`, nothing sealed; no wallet in chain mode → fail closed.
+
+**Still open:** the live *purchase* flow (buyAccess tx) that puts a token in the wallet in
+the first place, and wiring a real Base RPC + the production Elacity contract/selector.
+
+---
+
 *Living document. Update as slices land and the live chain / dKMS deployment / Lit adapter
 come online.*
