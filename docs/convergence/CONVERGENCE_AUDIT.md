@@ -6,9 +6,11 @@
 > ElastOS-native version of PC2."
 >
 > Read alongside `PRODUCT_VISION.md` (the why), `CONVERGENCE_PLAYBOOK.md` (the how),
-> `SYSTEM_ARCHITECTURE_MAP.md` (the detailed map), `DDRM_STATUS.md` (the day-by-day ladder),
-> and `PRINCIPLES.md` (the constitution). Where those disagree, `DDRM_STATUS.md` is the most
-> current on crypto state and this doc is the most current on product-loop state.
+> `STRATEGIC_ROADMAP.md` (**sequencing + timing** for the portals, Lit bridge, and 3‑node dKMS,
+> grounded in a real `~/.pc2` source audit), `SYSTEM_ARCHITECTURE_MAP.md` (the detailed map),
+> `DDRM_STATUS.md` (the day-by-day ladder), and `PRINCIPLES.md` (the constitution). Where those
+> disagree, `DDRM_STATUS.md` is the most current on crypto state and this doc is the most current
+> on product-loop state.
 >
 > **Date:** 2026-06-11 · **Branch:** `feat/ddrm-home-playback`
 
