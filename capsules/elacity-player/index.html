@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Player · ElastOS</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <script>
+    const accessMode = new URLSearchParams(window.location.search).has("home_token")
+      ? "shell"
+      : "gateway";
+    const hostMode = window.self === window.top ? "standalone" : "embedded";
+    document.body.setAttribute("data-player-access-mode", accessMode);
+    document.body.setAttribute("data-player-host-mode", hostMode);
+  </script>
+  <main id="app-shell" class="shell">
+    <section class="player-card">
+      <div class="video-frame">
+        <video id="video" playsinline controls preload="metadata"></video>
+        <div id="overlay" class="overlay" aria-live="polite">
+          <div class="overlay-copy">
+            <div class="icon" aria-hidden="true">&#9654;</div>
+            <p id="overlay-text">Opening protected stream…</p>
+          </div>
+        </div>
+      </div>
+      <p id="status" class="status" aria-live="polite" hidden></p>
+    </section>
+  </main>
+  <script type="module" src="player.js"></script>
+</body>
+</html>

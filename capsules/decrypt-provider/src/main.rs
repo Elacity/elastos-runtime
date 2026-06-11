@@ -89,6 +89,19 @@ enum Request {
         material: SealedDecryptMaterialV1,
         now_unix: u64,
     },
+    // Session-scoped media STREAM read (feature `rail-stream`, B2 of the viewer
+    // seam). Given an opened media session's sealed material + a segment index, the
+    // boundary unwraps the CEK in-VM, decrypts, and returns ONLY that segment's
+    // already-decrypted bytes as the `stream` output kind — never the CEK/IV. The
+    // runtime relays the (CEK-free) sealed material per request and never holds
+    // plaintext; the elacity-player viewer feeds the returned segments into MSE.
+    #[cfg(feature = "rail-stream")]
+    StreamSegment {
+        request: Box<DecryptSessionRequestV1>,
+        material: SealedDecryptMaterialV1,
+        index: usize,
+        now_unix: u64,
+    },
     Shutdown,
 }
 
@@ -310,6 +323,10 @@ impl DecryptProvider {
             #[cfg(feature = "rail-material")]
             Request::OpenSessionV1 { request, material, now_unix } => {
                 self.open_session_v1(*request, material, now_unix)
+            }
+            #[cfg(feature = "rail-stream")]
+            Request::StreamSegment { request, material, index, now_unix } => {
+                self.stream_segment(*request, material, index, now_unix)
             }
             Request::Shutdown => Response::empty_ok(),
         }
@@ -761,6 +778,123 @@ impl DecryptProvider {
             extra_segments_b64: material.extra_segments_b64,
         };
         self.open_session_audited(request, &bound, now_unix)
+    }
+
+    /// Session-scoped media STREAM read (feature `rail-stream`, B2 of the viewer
+    /// seam). Given an opened media session's sealed material + a segment `index`,
+    /// the boundary unwraps the CEK in-VM (`Zeroizing`), decrypts the transcript-
+    /// bound asset, and returns ONLY that one segment's already-decrypted fMP4 bytes
+    /// as the scoped `stream` output. The CEK/IV NEVER cross the boundary; only one
+    /// segment's plaintext is ever produced per call (the others are dropped
+    /// immediately); and the runtime relays only the CEK-free sealed material per
+    /// request, holding no plaintext between segments. Because the read reuses the
+    /// transcript-bound unwrap, a reordered/substituted/expired set fails CLOSED
+    /// before any byte is returned. Single-node rail only for now — a threshold/
+    /// quorum material (or a threshold-provisioned boundary) is refused pending the
+    /// streaming wiring of those rails (the existing `open_session_v1` counts path
+    /// already proves they decrypt; only the per-segment read is deferred).
+    #[cfg(feature = "rail-stream")]
+    fn stream_segment(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: SealedDecryptMaterialV1,
+        index: usize,
+        now_unix: u64,
+    ) -> Response {
+        // The stream read is media-only: it serves the scoped `stream` output kind.
+        if request.output_kind != "stream" {
+            return Response::error(
+                "invalid_request",
+                "stream_segment serves the `stream` output kind only",
+            );
+        }
+        match parse_decrypt_suite(&material.suite) {
+            Some(DecryptSuite::PqHybridThreshold) => {}
+            Some(DecryptSuite::P256ClassicalCompat) => {
+                return Response::error(
+                    "invalid_request",
+                    "the p256-classical-compat suite is migration-only; the transcript-bound stream requires the PQ-hybrid suite",
+                )
+            }
+            None => return Response::error("invalid_request", "unsupported decrypt suite"),
+        }
+        // Threshold/quorum per-segment streaming is not yet wired — refuse rather
+        // than silently treat a split material as single-node.
+        if material.sealed_cek_share2_b64.is_some() || self.authority_vk2.is_some() {
+            return Response::error(
+                "not_configured",
+                "threshold/quorum media streaming is not yet wired; single-node stream only",
+            );
+        }
+
+        let bound = BoundRailMaterial {
+            sealed_cek_b64: material.sealed_cek_b64,
+            ciphertext_b64: material.ciphertext_b64,
+            init_segment_b64: material.init_segment_b64,
+            nonce_b64: material.nonce_b64,
+            content_hash_b64: material.content_hash_b64,
+            extra_segments_b64: material.extra_segments_b64,
+        };
+        let prepared = match self.prepare_bound_open(&request, &bound, None) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+        // Short-expiry enforcement — before any crypto (mirrors the audited path).
+        if now_unix > request.expires_at || now_unix > request.release_receipt.expires_at {
+            return Response::error("invalid_request", "the decrypt grant has expired");
+        }
+
+        // Unwrap ONCE and decrypt the AAD-bound asset in-VM. A reordered/substituted
+        // set recomputes a different segment-digest AAD and fails the unwrap closed,
+        // so we never return a byte of a tampered asset.
+        let decrypt_result = if prepared.extra_segments.is_empty() {
+            rail_shim::decrypt_from_carrier_bound(
+                prepared.session,
+                &prepared.carrier,
+                &prepared.aad,
+                &prepared.verifier,
+            )
+            .map(|(plaintext, meta)| (vec![plaintext], meta))
+        } else {
+            rail_shim::decrypt_from_carrier_bound_segments(
+                prepared.session,
+                &prepared.carrier,
+                &prepared.extra_segments,
+                &prepared.aad,
+                &prepared.verifier,
+            )
+        };
+        let (plaintexts, _meta) = match decrypt_result {
+            Ok(v) => v,
+            Err(_) => return Response::error("invalid_request", "the decrypt session could not be opened"),
+        };
+
+        let segment_count = plaintexts.len();
+        let segment = match plaintexts.get(index) {
+            Some(s) => s,
+            None => {
+                return Response::error(
+                    "invalid_request",
+                    "segment index is past the end of the asset",
+                )
+            }
+        };
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        // The scoped `stream` payload: ONLY this segment's decrypted bytes — no CEK,
+        // no IV, no other segment. The runtime decodes `segment_b64` and relays the
+        // raw bytes to the viewer's MSE SourceBuffer at /media/{session}/segment/{i}.
+        Response::ok(json!({
+            "schema": "elastos.decrypt.stream-segment/v1",
+            "session_id": request.session_id,
+            "object_cid": request.object_cid,
+            "viewer_interface": request.viewer_interface,
+            "output_kind": "stream",
+            "segment_index": index,
+            "segment_count": segment_count,
+            "segment_b64": b64.encode(segment),
+        }))
     }
 
     /// 2-of-2 threshold open (Day 97–98): the CEK was XOR-split across two dKMS nodes
@@ -2466,6 +2600,128 @@ mod tests {
             json!("opened"),
             "a substituted fragment must fail the whole open closed: {v_bad}"
         );
+    }
+
+    /// B2 viewer seam — the media STREAM read. A 2-fragment media session yields each
+    /// segment's ALREADY-DECRYPTED fMP4 bytes addressed by index (what elacity-player
+    /// feeds into MSE), in order, with NO CEK and no OTHER segment's plaintext on the
+    /// per-segment response. Fail-closed surfaces: an out-of-range index, a substituted
+    /// fragment (transcript-bound unwrap mismatch), and a non-`stream` request are all
+    /// refused — never a partial or tampered byte stream.
+    #[cfg(feature = "rail-stream")]
+    #[test]
+    fn stream_segment_yields_decrypted_segments_in_order_and_fails_closed() {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let req = media_decrypt_request();
+        let cek = [0x5Au8; 16];
+        let nonce = b"nonce-stream-1";
+        let content_hash = [0xABu8; 32];
+
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let (signer, authority_vk) = mldsa_seal_keypair([0xB7u8; 32]);
+
+        let pt0 = b"stream-fragment-zero-plaintext!!";
+        let pt1 = b"stream-fragment-one-plaintext!!!";
+        let seg0 = build_encrypted_segment(pt0, &cek, &[0x01u8; 8]);
+        let seg1 = build_encrypted_segment(pt1, &cek, &[0x02u8; 8]);
+
+        // Seal the CEK BOUND to the transcript welding BOTH segments (presentation order).
+        let digests = ddrm_envelope::segment_digests(&[seg0.as_slice(), seg1.as_slice()]);
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &req.principal_id,
+            session_id: &req.session_id,
+            object_cid: &req.object_cid,
+            content_hash: &content_hash,
+            action: &req.action,
+            viewer_interface: &req.viewer_interface,
+            output_kind: &req.output_kind,
+            expires_at: req.expires_at,
+            release_receipt_hash: release_receipt_hash(&req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+            node_set_id: None,
+        }
+        .to_aad_with_segments(Some(&digests));
+        let sealed = seal_bound(&public, &cek, &aad, &signer).to_bytes();
+
+        let make_material = |extra: Vec<String>| SealedDecryptMaterialV1 {
+            suite: DECRYPT_SUITE_ID.to_string(),
+            sealed_cek_b64: b64.encode(&sealed),
+            sealed_cek_share2_b64: None,
+            ciphertext_b64: b64.encode(&seg0),
+            init_segment_b64: None,
+            nonce_b64: b64.encode(nonce),
+            content_hash_b64: b64.encode(content_hash),
+            extra_segments_b64: Some(extra),
+        };
+
+        let mut provider = DecryptProvider {
+            session: Some(crate::rail_shim::SessionSecret::PqHybrid(secret)),
+            authority_vk: Some(authority_vk),
+            session_pub: Some(pub_bytes),
+            authority_vk2: None,
+            authority_vk3: None,
+        };
+
+        // Each index returns ITS decrypted segment (plaintext at the tail of the fMP4),
+        // reports segment_count == 2, and leaks neither the CEK nor the other fragment.
+        for (index, pt, other) in [(0usize, pt0.as_slice(), pt1.as_slice()), (1, pt1, pt0)] {
+            let resp = provider.handle(Request::StreamSegment {
+                request: Box::new(req.clone()),
+                material: make_material(vec![b64.encode(&seg1)]),
+                index,
+                now_unix: 1_850_000_000,
+            });
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v["data"]["segment_index"], json!(index), "segment index echoed: {v}");
+            assert_eq!(v["data"]["segment_count"], json!(2), "both fragments counted: {v}");
+            let bytes = b64.decode(v["data"]["segment_b64"].as_str().unwrap()).unwrap();
+            assert_eq!(&bytes[bytes.len() - pt.len()..], pt, "segment {index} decrypts to its plaintext");
+            let s = serde_json::to_string(&resp).unwrap();
+            assert!(!s.contains(&b64.encode(cek)), "CEK must not appear in a stream response");
+            assert!(
+                !s.contains(std::str::from_utf8(other).unwrap()),
+                "no OTHER segment's plaintext crosses on a per-segment read"
+            );
+        }
+
+        // Out-of-range index fails closed (no byte returned).
+        let resp_oob = provider.stream_segment(
+            req.clone(),
+            make_material(vec![b64.encode(&seg1)]),
+            2,
+            1_850_000_000,
+        );
+        assert_eq!(error_code(resp_oob), "invalid_request", "an out-of-range index is refused");
+
+        // Substituted fragment: valid sealed CEK, but the extra segment's bytes are swapped.
+        // The recomputed segment-digest AAD no longer matches the seal → unwrap fails closed.
+        let mut bad_seg1 = seg1.clone();
+        let last = bad_seg1.len() - 1;
+        bad_seg1[last] ^= 0x01;
+        let resp_bad = provider.stream_segment(
+            req.clone(),
+            make_material(vec![b64.encode(&bad_seg1)]),
+            0,
+            1_850_000_000,
+        );
+        assert_eq!(error_code(resp_bad), "invalid_request", "a substituted fragment is refused");
+
+        // A non-`stream` request is refused before any crypto.
+        let resp_kind = provider.stream_segment(
+            decrypt_request(),
+            make_material(vec![b64.encode(&seg1)]),
+            0,
+            1_850_000_000,
+        );
+        assert_eq!(error_code(resp_kind), "invalid_request", "stream serves the stream output kind only");
     }
 
     #[cfg(feature = "rail-material")]

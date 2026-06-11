@@ -9,6 +9,7 @@ These are the main active docs for outside readers and contributors.
 - [../README.md](../README.md) — repo front door
 - [state.md](../state.md) — factual current-state summary
 - [GETTING_STARTED.md](GETTING_STARTED.md) — developer build/run path
+- [RUN_HOME_MACOS.md](RUN_HOME_MACOS.md) — repeatable runbook for the browser Home shell + passkey login on macOS (host lock + WebAuthn gotchas)
 - [COMMAND_MATRIX.md](COMMAND_MATRIX.md) — command/runtime contract
 - [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) — release-facing test matrix and manual runbook
 - [SITES.md](SITES.md) — current site and public-edge model

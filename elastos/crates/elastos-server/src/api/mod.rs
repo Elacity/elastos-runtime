@@ -15,3 +15,4 @@ pub mod middleware;
 pub mod routes;
 pub mod server;
 pub mod viewer_gateway;
+pub mod viewer_media;

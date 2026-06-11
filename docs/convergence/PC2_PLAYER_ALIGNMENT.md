@@ -1,8 +1,10 @@
 # PC2 Players & dDRM Decrypt — Architecture Alignment
 
-**Status:** Validated against PC2 `main` + runtime principles. Live wiring of the
-decrypt rail remains gated on Anders' Option A + tier confirmation.
-**Date:** 2026-06-08
+**Status:** Validated against PC2 `main` + runtime principles. The downstream viewer
+seam (B1–B3: `elacity-player` + runtime media routes + decrypt-provider
+`stream_segment`) is **built and gate-green**; only the upstream live CEK producer
+remains gated on Anders (local KMS / dKMS). See "Viewer seam — implemented" below.
+**Date:** 2026-06-08 (viewer seam added 2026-06-11)
 **Branch:** `feat/decrypt-provider-cenc`
 **Sources:** PC2 `pc2-node/wasm-apps/{ddrm-decrypt,ddrm-renderer}`,
 `pc2-node/wasm-renderer`, `pc2-node/crates/*`,
@@ -140,6 +142,45 @@ queued — not changed unilaterally here.
    (pixel-lock / html-lock + watermark) as a `viewer` capsule.
 4. **encrypt/creator path** (`cenc-encrypt`): CEK/KID-in-wasm packaging
    (Invariant 1), when the creator flow opens.
+
+## Viewer seam — implemented (B1–B3, 2026-06-11)
+
+The downstream (player) seam is now built end-to-end and gate-green; only the
+upstream live CEK producer remains gated (the same Anders dependency as the rail).
+
+- **B1 — `elacity-player` capsule** (`capsules/elacity-player/`): a `viewer` capsule
+  that plays fMP4/CENC via **Media Source Extensions**, fetching an init segment +
+  ordered media segments over an opaque session handle. It satisfies
+  `elastos.viewer/media@1` and proactively **fails closed** if any forbidden key
+  field (`cek/iv/wrapped_cek/...`) appears in what it receives.
+- **B2a — decrypt-provider `stream_segment` op** (feature `rail-stream`): given an
+  opened session's sealed material + a segment index, the boundary unwraps the CEK
+  **once in-VM** (`Zeroizing`), decrypts **only that segment**, and returns its bytes
+  as the scoped `stream` output. CEK/IV never cross the boundary; only one segment's
+  plaintext exists per call; a reordered/substituted/expired set fails closed before
+  any byte is returned. Ladder rung pinned at **79** + wasm build green.
+- **B2b — runtime scoped media routes** (`elastos-server`
+  `api/viewer_media.rs`): `GET /api/viewers/:viewer/media/:session` (manifest,
+  metadata-only), `/init` (clear init bytes), `/segment/:index` (decrypted bytes
+  relayed per-request via `stream_segment`). The runtime holds **only** the CEK-free
+  sealed material + clear init bytes + public metadata — never the CEK, never
+  decrypted media. Range/expiry are enforced before any relay; the provider response
+  is scanned for forbidden key fields (defense in depth); auth is the
+  `x-elastos-home-token` launch token scoped to the viewer, and the token principal
+  must own the session.
+- **B3 — routing decision**: `viewer_for_required_interface("elastos.viewer/media@1")
+  → "elacity-player"` + the player launch route builder. The **live session
+  creation** (populating a `MediaSession` from the `drm→rights→key→decrypt` open
+  chain) is **backend-gated**: the open chain bails at `key.release` =
+  `not_configured` until a real CEK producer (local KMS / dKMS / Lit adapter) is
+  wired behind `key-provider`. No additional player-side engineering is required —
+  it is the A2/A3 flag-flip.
+
+**What "until the backend lands" means:** the player ⇄ runtime ⇄ decrypt-provider
+seam is complete and tested. Playback goes live when (a) the shipped decrypt-provider
+is built with `rail-stream` and (b) `key-provider` seals a real CEK to the published
+decrypt-session key. For a single owner on one machine this is a **local** producer +
+config flip — **not** a server deployment.
 
 ## Non-goals here
 
