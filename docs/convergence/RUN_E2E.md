@@ -219,8 +219,10 @@ scripts/ddrm-ladder-check.sh    # just the test-count ladder (per-feature rungs)
 - Publish an owned asset → open it: `drm/open → rights (real chain query) → key → decrypt`.
 - Content-addressed payloads of **any size**: raw leaf, single dag-pb root, and a balanced dag-pb
   **tree** above the fan-out — all Helia-byte-compatible, fail-closed at every block and tree level.
-- **Multi-segment** assets through the LIVE rail: each fragment fetched by its CID, the key
-  released once, all segments decrypted in-VM, a substituted fragment failing closed.
+- **Multi-segment** assets through the LIVE rail on **every** rail — single-node AND the
+  2-of-2 threshold / 2-of-3 quorum split rails: each fragment fetched by its CID, the key
+  reconstructed once in-VM, all segments decrypted, a substituted fragment failing the whole
+  open closed (the `[28]` split-rail gate runs in both the threshold and quorum smokes).
 - Real secret-holding dKMS nodes: single, 2-of-2 threshold, 2-of-3 quorum (survives a dead
   node), and off-localhost over TCP with an authenticated channel.
 - The full key lifecycle: rotation, revocation, reconfiguration, DKG, and offline-verifiable
@@ -228,13 +230,11 @@ scripts/ddrm-ladder-check.sh    # just the test-count ladder (per-feature rungs)
 
 **Out of the runnable happy path (explicitly deferred):**
 
-- **Multi-segment on the threshold/quorum rails** — single-node multi-segment is live; the
-  quorum rail is single-segment by design today (a multi-segment threshold material is
-  refused up front).
-- Upstream: folding the consolidated `SealedDecryptMaterialV1` into the shared
+- Upstream only: folding the consolidated `SealedDecryptMaterialV1` into the shared
   `elastos-common` contract (needs push access) and a dKMS-direct sealing producer.
 
-**Where we are, as a %:** ~**98%** of the original goal — "download and run a video I own,
-on owned dDRM, in the runtime." The full happy path is live and fail-closed, and the content
-plane is now size-unbounded (balanced dag-pb tree, Helia-byte-compatible). What remains is
-multi-segment on the quorum rail and upstream contract folding.
+**Where we are, as a %:** ~**99%** of the original goal — "download and run a video I own,
+on owned dDRM, in the runtime." The full happy path is live and fail-closed: the content
+plane is size-unbounded (balanced dag-pb tree, Helia-byte-compatible) and every rail —
+single-node, threshold, and quorum — is multi-segment-capable. What remains is upstream
+contract folding (needs push access / Anders), not runnable-vertical work.

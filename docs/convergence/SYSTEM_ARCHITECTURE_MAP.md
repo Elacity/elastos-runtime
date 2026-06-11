@@ -218,15 +218,30 @@ held in `Zeroizing` across the loop). A reorder/drop/add/**substitute** changes 
 AAD no longer matches the seal, and the unwrap fails closed BEFORE any byte is decrypted — proven
 LIVE by `multisegment_live_gate` (3 fragments → `segment_count==3`, `sample_count==5` summed; a
 substituted fragment fails the whole open closed; no CEK/plaintext crosses out), which runs in every
-verify-mode `ddrm-consumer-smoke.sh`. The threshold/quorum rails stay single-segment (a multi-segment
-threshold material is refused up front).
+verify-mode `ddrm-consumer-smoke.sh`.
+
+**Multi-segment on the THRESHOLD + QUORUM rails (Day 166–170).** The split rails are now at full
+parity. They already reconstruct the CEK **once** in-boundary (XOR for 2-of-2, Lagrange at x=0 for
+2-of-3), so multi-segment is the SAME reconstruct-once-then-loop: `rail_shim` gained
+`decrypt_from_carrier_threshold_segments` / `decrypt_from_carrier_quorum_segments` (factored over the
+shared `reconstruct_threshold_cek` / `reconstruct_quorum_two_cek`), and `open_session_threshold`
+threads `extra_segments_b64` through `prepare_bound_open` — which binds the ordered digests
+**alongside** the `node_set_id`, so every dKMS node seals its share to the segment-bound transcript.
+The dKMS node needs NO change (it seals its share to a runtime-supplied `aad_b64`); the only wiring
+was `key-provider::merge_threshold_material` carrying the extras into the merged material so the
+boundary rebuilds that exact AAD. A substituted fragment changes the digests → the share unwrap fails
+closed before a byte is decrypted. Proven LIVE by the `[28]` split-rail gate (a 2-fragment asset:
+seg0 = published golden, seg1 = a second fragment under the same CEK with a distinct per-sample IV;
+key reconstructed once, `segment_count==2`, substituted fragment fails closed) which runs on BOTH
+`ddrm-consumer-dkms-threshold-smoke.sh` (2-of-2) and `ddrm-consumer-dkms-quorum-smoke.sh` (2-of-3).
 
 **The runnable-E2E ladder is COMPLETE:** a content-addressed, multi-segment, owned asset of ANY size
 opens end-to-end with a real distributed key — fetched by CID (raw leaf, single dag-pb root, or
-balanced tree), released once, decrypted in-VM, fail-closed at every seam, no CEK/plaintext on any
-wire. The content plane is now size-unbounded (balanced dag-pb tree, Helia-byte-compatible). The one
-remaining item, explicitly out of the runnable path: multi-segment on the **threshold/quorum** rails
-(single-node multi-segment is live; the quorum rail is single-segment by design today).
+balanced tree), released once, decrypted in-VM on the single-node **and** the threshold/quorum rails,
+fail-closed at every seam, no CEK/plaintext on any wire. The content plane is size-unbounded (balanced
+dag-pb tree, Helia-byte-compatible) and every rail is multi-segment-capable. Remaining work is
+**upstream only**: fold `SealedDecryptMaterialV1` into the shared `elastos-common` contract (needs
+push access) and a dKMS-direct sealing producer (needs Anders).
 
 **Operator runbook:** [`RUN_E2E.md`](./RUN_E2E.md) walks a fresh operator zero → provision dKMS
 node(s) → publish an owned multi-segment asset → open it through the live rail, with the exact

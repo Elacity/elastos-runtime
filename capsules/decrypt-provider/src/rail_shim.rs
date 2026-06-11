@@ -159,6 +159,84 @@ pub fn decrypt_from_carrier_bound_segments(
     }
 }
 
+/// base64(cek) for the in-VM segment decrypt, in `Zeroizing` so the encoded key is scrubbed on drop.
+fn cek_to_b64(cek: &[u8]) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        cek,
+    ))
+}
+
+/// The presentation-ordered segment list for a multi-segment open: the primary segment (segment 0)
+/// FIRST, then the extras in order — the exact sequence welded into the transcript `aad`.
+fn ordered_segments(primary: &[u8], extra: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut segments = Vec::with_capacity(1 + extra.len());
+    segments.push(primary.to_vec());
+    segments.extend_from_slice(extra);
+    segments
+}
+
+/// Reconstruct the 2-of-2 XOR CEK (Day 97–98) INSIDE the boundary: unwrap BOTH node-sealed shares
+/// (each bound to the SAME transcript `aad`; only the verifying key differs) and `share1 ⊕ share2`,
+/// held in `Zeroizing`. Fails closed on a malformed / wrong-session / wrong-node / length-mismatched
+/// share. The CEK never materializes whole anywhere but here, in the sandbox.
+fn reconstruct_threshold_cek(
+    secret: &SessionKemSecret,
+    sealed_share1: &[u8],
+    sealed_share2: &[u8],
+    aad: &[u8],
+    verifier1: &impl CekSealVerifier,
+    verifier2: &impl CekSealVerifier,
+) -> Result<zeroize::Zeroizing<String>, String> {
+    let env1 = PqSealedEnvelope::from_bytes(sealed_share1).map_err(|e| format!("{e:?}"))?;
+    let share1 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env1, aad, verifier1)
+        .map_err(|e| format!("{e:?}"))?;
+    let env2 = PqSealedEnvelope::from_bytes(sealed_share2).map_err(|e| format!("{e:?}"))?;
+    let share2 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env2, aad, verifier2)
+        .map_err(|e| format!("{e:?}"))?;
+    let cek = ddrm_envelope::combine_cek_xor(share1.as_slice(), share2.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(cek_to_b64(cek.as_slice()))
+}
+
+/// Reconstruct a 2-of-3 QUORUM CEK (Day 113–116) INSIDE the boundary: unwrap each sealed INDEXED
+/// share against the pinned node identity that verifies it, REQUIRE the inside-x to equal that
+/// node's coordinate (so node j cannot impersonate node i), and Lagrange-combine the two at x=0 over
+/// GF(256) (the combine refuses duplicate / zero x — a sub-quorum can never slip through). Held in
+/// `Zeroizing`. Fails closed on no verifying identity, an x/identity mismatch, or malformed payloads.
+fn reconstruct_quorum_two_cek<V: CekSealVerifier>(
+    secret: &SessionKemSecret,
+    sealed_share_a: &[u8],
+    sealed_share_b: &[u8],
+    aad: &[u8],
+    node_verifiers: &[V],
+) -> Result<zeroize::Zeroizing<String>, String> {
+    let unwrap_indexed = |sealed: &[u8]| -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
+        let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
+        for (i, verifier) in node_verifiers.iter().enumerate() {
+            let expected_x = (i + 1) as u8;
+            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
+            {
+                let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
+                    .ok_or("sealed quorum share carries no valid x-coordinate")?;
+                if x != expected_x {
+                    return Err(
+                        "quorum share x-coordinate does not match the node identity that sealed it"
+                            .to_string(),
+                    );
+                }
+                return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
+            }
+        }
+        Err("no pinned node identity verifies this sealed quorum share".to_string())
+    };
+    let (x_a, share_a) = unwrap_indexed(sealed_share_a)?;
+    let (x_b, share_b) = unwrap_indexed(sealed_share_b)?;
+    let cek = ddrm_envelope::combine_cek_shamir2(x_a, share_a.as_slice(), x_b, share_b.as_slice())
+        .map_err(|e| e.to_string())?;
+    Ok(cek_to_b64(cek.as_slice()))
+}
+
 /// Transcript-bound **2-of-2 threshold** carrier open (Day 97–98): the CEK was
 /// XOR-split across two dKMS nodes at publish, so NO single node ever held the whole
 /// content key. This is the runtime's explicit, owned analogue of Lit's opaque
@@ -190,24 +268,40 @@ pub fn decrypt_from_carrier_threshold(
             return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
         }
     };
-
-    // Unwrap each sealed share to its plaintext share bytes (each is a node-sealed
-    // `PqSealedEnvelope` bound to this transcript; only the verifying key differs).
-    let env1 = PqSealedEnvelope::from_bytes(sealed_share1).map_err(|e| format!("{e:?}"))?;
-    let share1 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env1, aad, verifier1)
-        .map_err(|e| format!("{e:?}"))?;
-    let env2 = PqSealedEnvelope::from_bytes(sealed_share2).map_err(|e| format!("{e:?}"))?;
-    let share2 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env2, aad, verifier2)
-        .map_err(|e| format!("{e:?}"))?;
-
-    // Reconstruct the CEK INSIDE the boundary; held in `Zeroizing`, scrubbed on drop.
-    let cek = ddrm_envelope::combine_cek_xor(share1.as_slice(), share2.as_slice())
-        .map_err(|e| e.to_string())?;
-    let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        cek.as_slice(),
-    ));
+    let cek_b64 =
+        reconstruct_threshold_cek(secret, sealed_share1, sealed_share2, aad, verifier1, verifier2)?;
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
+/// Multi-SEGMENT **2-of-2 threshold** open: reconstruct the XOR CEK ONCE in-boundary (exactly as
+/// [`decrypt_from_carrier_threshold`]) and decrypt the WHOLE ordered asset — the primary
+/// `ciphertext_segment` then `extra_segments`, in order — under that one presentation CEK. The
+/// ordered set is welded into `aad` by the caller (the transcript's `segment_digests`), so any
+/// reorder/drop/add/substitute fails the share unwrap closed BEFORE a byte is decrypted. The CEK
+/// still materializes only here, in the sandbox, and is held in `Zeroizing` across the loop. Returns
+/// each segment's plaintext + aggregate metadata (`segment_count`, summed `sample_count`).
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_from_carrier_threshold_segments(
+    session: &SessionSecret,
+    sealed_share1: &[u8],
+    sealed_share2: &[u8],
+    aad: &[u8],
+    verifier1: &impl CekSealVerifier,
+    verifier2: &impl CekSealVerifier,
+    ciphertext_segment: &[u8],
+    extra_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+    let cek_b64 =
+        reconstruct_threshold_cek(secret, sealed_share1, sealed_share2, aad, verifier1, verifier2)?;
+    let segments = ordered_segments(ciphertext_segment, extra_segments);
+    crate::decrypt_session_segments(&cek_b64, &segments, init_segment)
 }
 
 /// Transcript-bound **2-of-3 QUORUM** carrier open (Day 113–116): the CEK was
@@ -243,41 +337,39 @@ pub fn decrypt_from_carrier_quorum<V: CekSealVerifier>(
             return Err("quorum reconstruction requires the PQ-hybrid session".to_string())
         }
     };
-
-    // Unwrap ONE sealed indexed share: find the pinned node identity that verifies it,
-    // and bind that identity to the x-coordinate carried inside the sealed payload.
-    let unwrap_indexed = |sealed: &[u8]| -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
-        let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
-        for (i, verifier) in node_verifiers.iter().enumerate() {
-            let expected_x = (i + 1) as u8;
-            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
-            {
-                let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
-                    .ok_or("sealed quorum share carries no valid x-coordinate")?;
-                if x != expected_x {
-                    return Err(
-                        "quorum share x-coordinate does not match the node identity that sealed it"
-                            .to_string(),
-                    );
-                }
-                return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
-            }
-        }
-        Err("no pinned node identity verifies this sealed quorum share".to_string())
-    };
-
-    let (x_a, share_a) = unwrap_indexed(sealed_share_a)?;
-    let (x_b, share_b) = unwrap_indexed(sealed_share_b)?;
-
-    // Reconstruct the CEK INSIDE the boundary (Lagrange at x=0 over GF(256)); the
-    // combine itself refuses duplicate/zero x's — a sub-quorum can never slip through.
-    let cek = ddrm_envelope::combine_cek_shamir2(x_a, share_a.as_slice(), x_b, share_b.as_slice())
-        .map_err(|e| e.to_string())?;
-    let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        cek.as_slice(),
-    ));
+    let cek_b64 =
+        reconstruct_quorum_two_cek(secret, sealed_share_a, sealed_share_b, aad, node_verifiers)?;
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+}
+
+/// Multi-SEGMENT **2-of-3 QUORUM** open: reconstruct the Shamir CEK ONCE in-boundary from any two of
+/// three sealed indexed shares (exactly as [`decrypt_from_carrier_quorum`] — each share's inside-x
+/// bound to the pinned node that sealed it, Lagrange-combined at x=0), then decrypt the WHOLE ordered
+/// asset (primary `ciphertext_segment` then `extra_segments`) under that one CEK. The ordered set is
+/// welded into `aad`, so any reorder/drop/add/substitute fails closed before a byte is decrypted; the
+/// CEK stays in `Zeroizing` and never leaves the sandbox. The rail still survives a dead node (any
+/// two of three reconstruct). Returns each segment's plaintext + aggregate metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_from_carrier_quorum_segments<V: CekSealVerifier>(
+    session: &SessionSecret,
+    sealed_share_a: &[u8],
+    sealed_share_b: &[u8],
+    aad: &[u8],
+    node_verifiers: &[V],
+    ciphertext_segment: &[u8],
+    extra_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("quorum reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+    let cek_b64 =
+        reconstruct_quorum_two_cek(secret, sealed_share_a, sealed_share_b, aad, node_verifiers)?;
+    let segments = ordered_segments(ciphertext_segment, extra_segments);
+    crate::decrypt_session_segments(&cek_b64, &segments, init_segment)
 }
 
 /// Reconstruct a CEK from a RECONFIGURABLE **k-of-m** quorum and decrypt — the
@@ -1118,5 +1210,90 @@ mod tests {
             ),
             Err(ddrm_envelope::QuorumProofError::BadSignature { .. })
         ));
+    }
+
+    /// MULTI-SEGMENT on the threshold AND quorum rails at the shim layer: the CEK is reconstructed
+    /// ONCE (XOR for 2-of-2, Lagrange for 2-of-3) and drives EVERY ordered segment, returning each
+    /// fragment's plaintext + `segment_count` / summed `sample_count`. A wrong / below-quorum share
+    /// still fails the WHOLE multi-segment open closed BEFORE any decrypt — never a partial asset.
+    #[cfg(all(feature = "rail-material", not(feature = "gen-vectors")))]
+    #[test]
+    fn threshold_and_quorum_multi_segment_reconstruct_once_and_decrypt_all() {
+        use crate::pq_envelope::mldsa::MlDsa65Verifier;
+        use crate::pq_envelope::seal_support::{mldsa_seal_keypair, seal_bound};
+
+        let cek = [0x42u8; 16];
+        let plaintext0 = b"shim-multiseg-zero!!";
+        let plaintext1 = b"shim-multiseg-one!!!";
+        let seg0 = build_encrypted_segment(plaintext0, &cek, &[0x01u8; 8]);
+        let seg1 = build_encrypted_segment(plaintext1, &cek, &[0x02u8; 8]);
+        let extras = vec![seg1.clone()];
+        let off0 = seg0.len() - plaintext0.len();
+        let off1 = seg1.len() - plaintext1.len();
+        let aad = b"shim-multiseg-aad/v1";
+
+        // --- 2-of-3 quorum: split, seal three indexed shares, open with any two ---
+        let (qsecret, qpublic) = gen_session();
+        let coeff = [0x3Bu8; 16];
+        let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("shamir split");
+        let mut qverifiers: Vec<MlDsa65Verifier> = Vec::new();
+        let mut qsealed: Vec<Vec<u8>> = Vec::new();
+        for (i, share) in shares.iter().enumerate() {
+            let x = (i as u8) + 1;
+            let payload = ddrm_envelope::indexed_share(x, share);
+            let (signer, vk) = mldsa_seal_keypair([(i as u8) + 1; 32]);
+            qsealed.push(seal_bound(&qpublic, &payload, aad, &signer).to_bytes());
+            qverifiers.push(MlDsa65Verifier::from_encoded(&vk).expect("vk decodes"));
+        }
+        let qsession = SessionSecret::PqHybrid(qsecret);
+
+        let (plaintexts, meta) = decrypt_from_carrier_quorum_segments(
+            &qsession, &qsealed[0], &qsealed[2], aad, &qverifiers, &seg0, &extras, None,
+        )
+        .expect("any 2-of-3 shares open the multi-segment asset");
+        assert_eq!(meta["segment_count"], serde_json::json!(2), "both fragments reported");
+        assert_eq!(plaintexts.len(), 2, "each segment yields its plaintext");
+        assert_eq!(&plaintexts[0][off0..], plaintext0, "segment 0 decrypts");
+        assert_eq!(&plaintexts[1][off1..], plaintext1, "segment 1 decrypts under the same CEK");
+
+        // Below quorum: one node's share twice fails the WHOLE open closed.
+        assert!(
+            decrypt_from_carrier_quorum_segments(
+                &qsession, &qsealed[0], &qsealed[0], aad, &qverifiers, &seg0, &extras, None,
+            )
+            .is_err(),
+            "the same node share twice is not a quorum — fail closed"
+        );
+
+        // --- 2-of-2 threshold: XOR-split, seal both shares, open ---
+        let (tsecret, tpublic) = gen_session();
+        let mask = [0x9Au8; 16];
+        let (share1, share2) = ddrm_envelope::split_cek_xor(&cek, &mask).expect("xor split");
+        let (signer_a, vk_a) = mldsa_seal_keypair([0x71u8; 32]);
+        let (signer_b, vk_b) = mldsa_seal_keypair([0x72u8; 32]);
+        let sealed1 = seal_bound(&tpublic, &share1, aad, &signer_a).to_bytes();
+        let sealed2 = seal_bound(&tpublic, &share2, aad, &signer_b).to_bytes();
+        let v_a = MlDsa65Verifier::from_encoded(&vk_a).expect("vk_a decodes");
+        let v_b = MlDsa65Verifier::from_encoded(&vk_b).expect("vk_b decodes");
+        let tsession = SessionSecret::PqHybrid(tsecret);
+
+        let (tplain, tmeta) = decrypt_from_carrier_threshold_segments(
+            &tsession, &sealed1, &sealed2, aad, &v_a, &v_b, &seg0, &extras, None,
+        )
+        .expect("2-of-2 opens the multi-segment asset");
+        assert_eq!(tmeta["segment_count"], serde_json::json!(2));
+        assert_eq!(&tplain[0][off0..], plaintext0, "segment 0 decrypts");
+        assert_eq!(&tplain[1][off1..], plaintext1, "segment 1 decrypts under the same CEK");
+
+        // A second share NOT sealed by node B fails the whole threshold open closed.
+        let (rogue_signer, _rogue_vk) = mldsa_seal_keypair([0x99u8; 32]);
+        let rogue2 = seal_bound(&tpublic, &share2, aad, &rogue_signer).to_bytes();
+        assert!(
+            decrypt_from_carrier_threshold_segments(
+                &tsession, &sealed1, &rogue2, aad, &v_a, &v_b, &seg0, &extras, None,
+            )
+            .is_err(),
+            "a second share not sealed by node B fails closed"
+        );
     }
 }

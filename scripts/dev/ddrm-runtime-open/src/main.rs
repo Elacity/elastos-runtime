@@ -614,6 +614,7 @@ fn transcript_aad_with_segments(
     session_pub: &[u8],
     content_hash: &[u8],
     nonce: &[u8],
+    node_set_id: Option<&[u8]>,
     segment_digests: Option<&[u8]>,
 ) -> Vec<u8> {
     let c = cid();
@@ -643,7 +644,10 @@ fn transcript_aad_with_segments(
         release_receipt_hash: receipt_hash,
         decrypt_session_pub: session_pub,
         nonce,
-        node_set_id: None,
+        // `None` on the single-node rail (byte-identical to the legacy AAD); on the threshold/quorum
+        // rail the node-set identity is welded ALONGSIDE the segment digests, so a multi-segment
+        // release is bound to BOTH the exact secret-holders AND the exact ordered asset.
+        node_set_id,
     }
     .to_aad_with_segments(segment_digests)
 }
@@ -744,7 +748,7 @@ fn multisegment_live_gate(
     // Weld the WHOLE ordered, content-addressed segment set into the transcript AAD.
     let ordered: Vec<&[u8]> = fetched.iter().map(|s| s.as_slice()).collect();
     let digests = ddrm_envelope::segment_digests(&ordered);
-    let aad = transcript_aad_with_segments(&session_pub, &content_hash, &nonce, Some(&digests));
+    let aad = transcript_aad_with_segments(&session_pub, &content_hash, &nonce, None, Some(&digests));
 
     // RELEASE ONCE: segment 0 → `ciphertext_b64`, the rest → `extra_segments_b64`.
     let extra_b64: Vec<String> = fetched[1..].iter().map(|s| B64.encode(s)).collect();
@@ -5796,6 +5800,136 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             ));
         }
         step(22, "key-provider (2-of-2): a 3-of-N threshold descriptor failed closed at init — the runtime never silently downgrades a stronger threshold");
+
+        // --- MULTI-SEGMENT on the SPLIT rail (live, Day 166–...): a genuinely 2-FRAGMENT asset opens
+        // END TO END through the live threshold/quorum `release` + decrypt `open_session_v1` — the CEK
+        // reconstructed ONCE from the re-sealed shares (every secret-holder alive) drives BOTH
+        // fragments, and a SUBSTITUTED fragment fails the whole open closed. seg0 is the published
+        // golden CENC fragment; seg1 is a SECOND fragment under the SAME CEK with a DISTINCT per-sample
+        // IV (CENC requires globally-unique IVs across an asset), so its content digest genuinely
+        // differs — this is a real multi-fragment asset, not a replay. The runtime welds the ordered
+        // segment digests ALONGSIDE the node-set identity into the transcript, every node seals its
+        // share to that exact AAD, and `merge_threshold_material` carries the extras into the material.
+        {
+            let seg0 = B64.decode(GOLDEN_CIPHERTEXT_B64).map_err(|e| e.to_string())?;
+            let mut seg1 = seg0.clone();
+            let iv_pos = seg1
+                .windows(8)
+                .position(|w| w == [0x22u8; 8])
+                .ok_or("golden fragment is missing its expected per-sample IV")?;
+            seg1[iv_pos..iv_pos + 8].copy_from_slice(&[0x33u8; 8]);
+            if seg1 == seg0 {
+                return Err("the second fragment did not differ from the first".to_string());
+            }
+
+            let ordered: [&[u8]; 2] = [seg0.as_slice(), seg1.as_slice()];
+            let ms_digests = ddrm_envelope::segment_digests(&ordered);
+            let ms_aad = transcript_aad_with_segments(
+                &session_pub,
+                &content_hash,
+                &nonce,
+                live_node_set.as_ref().map(|i| i.as_slice()),
+                Some(&ms_digests),
+            );
+
+            let mut ms_req = key_release_request_base(&kid_hex, &wrapped_cek_b64);
+            ms_req
+                .as_object_mut()
+                .expect("key release request is an object")
+                .insert("rights_receipt".to_string(), fallback_rights_receipt());
+            let mut ms_session = json!({
+                "decrypt_session_pub_b64": session_pub_b64,
+                "producer_vk_b64": producer_vk_b64,
+                "aad_b64": B64.encode(&ms_aad),
+                "ciphertext_b64": B64.encode(&seg0),
+                "content_hash_b64": B64.encode(&content_hash),
+                "nonce_b64": B64.encode(&nonce),
+                "extra_segments_b64": [B64.encode(&seg1)],
+                "now_unix": NOW_UNIX,
+            });
+            // Supply EVERY escrowed share so the split-rail release reconstructs the candidate set in
+            // full (share-2 for the 2-of-2 rail; share-2 + share-3 for the 2-of-3 quorum).
+            if let Some(share2) = &escrow.wrapped_cek_share2_b64 {
+                ms_session["wrapped_cek_share2_b64"] = json!(share2);
+            }
+            if let Some(share3) = &escrow.wrapped_cek_share3_b64 {
+                ms_session["wrapped_cek_share3_b64"] = json!(share3);
+            }
+            let ms_release = ok_data(
+                &key_cell
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or("key capsule torn down before the multi-segment split-rail gate")?
+                    .call(&json!({ "op": "release", "request": ms_req, "session": ms_session }))?,
+                "multi-segment split-rail release",
+            )?;
+            if serde_json::to_string(&ms_release).unwrap_or_default().contains(GOLDEN_CEK_B64) {
+                return Err("the raw CEK leaked from the multi-segment split-rail release".to_string());
+            }
+
+            let mut ms_open_req = decrypt_request_base();
+            ms_open_req
+                .as_object_mut()
+                .expect("decrypt request is an object")
+                .insert("release_receipt".to_string(), release_receipt_json());
+            ms_open_req["object_cid"] = json!(cid());
+            ms_open_req["viewer_interface"] = json!(VIEWER);
+            let ms_open = decrypt_cell
+                .borrow_mut()
+                .as_mut()
+                .ok_or("decrypt capsule torn down before the multi-segment split-rail gate")?
+                .call(&json!({
+                    "op": "open_session_v1",
+                    "request": ms_open_req.clone(),
+                    "material": ms_release["material"].clone(),
+                    "now_unix": NOW_UNIX,
+                }))?;
+            let ms_data = ok_data(&ms_open, "multi-segment split-rail open")?;
+            if ms_data["decision"].as_str() != Some("opened") {
+                return Err(format!("the multi-segment split-rail open did not open: {ms_open}"));
+            }
+            if ms_data["session"]["segment_count"].as_u64() != Some(2) {
+                return Err(format!(
+                    "the multi-segment split-rail open did not report 2 segments: {ms_open}"
+                ));
+            }
+
+            // SUBSTITUTED fragment: keep the SAME valid sealed shares but swap seg1's bytes in the
+            // material → the boundary recomputes the ordered segment digests → AAD mismatch → the
+            // share unwrap fails closed for the WHOLE open (never a partial asset).
+            let mut bad_seg1 = seg1.clone();
+            *bad_seg1.last_mut().expect("fragment is non-empty") ^= 0x01;
+            let mut bad_material = ms_release["material"].clone();
+            bad_material["extra_segments_b64"] = json!([B64.encode(&bad_seg1)]);
+            let bad_ms_open = decrypt_cell
+                .borrow_mut()
+                .as_mut()
+                .ok_or("decrypt capsule torn down before the multi-segment substitution gate")?
+                .call(&json!({
+                    "op": "open_session_v1",
+                    "request": ms_open_req,
+                    "material": bad_material,
+                    "now_unix": NOW_UNIX,
+                }))?;
+            if bad_ms_open.get("data").and_then(|d| d.get("decision")).and_then(Value::as_str)
+                == Some("opened")
+            {
+                return Err(format!(
+                    "a SUBSTITUTED fragment opened on the split rail — the multi-segment AAD binding failed open: {bad_ms_open}"
+                ));
+            }
+
+            let rail = if escrow.wrapped_cek_share3_b64.is_some() {
+                "2-of-3 quorum"
+            } else {
+                "2-of-2 threshold"
+            };
+            step(28, &format!(
+                "decrypt-provider ({rail}): a 2-FRAGMENT asset opened LIVE through the split-rail release + open — \
+                 the CEK reconstructed ONCE from the re-sealed shares drove BOTH fragments (segment_count=2, key \
+                 released once); a SUBSTITUTED fragment failed the whole open closed; no raw CEK crossed the boundary"
+            ));
+        }
 
         // --- fail-closed #5 + #6 (NODE FAULT, Day 101–102) / QUORUM AVAILABILITY (Day 113–116).
         //

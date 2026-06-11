@@ -62,7 +62,7 @@ LADDER=(
   "decrypt-provider rail-bind|decrypt-provider|rail-bind|63"
   "decrypt-provider rail-mint|decrypt-provider|rail-mint|65"
   "decrypt-provider rail-audit|decrypt-provider|rail-audit|65"
-  "decrypt-provider rail-material|decrypt-provider|rail-material|76"
+  "decrypt-provider rail-material|decrypt-provider|rail-material|78"
 )
 
 bold "== dDRM ladder (1/2): test suites + asserted counts =="

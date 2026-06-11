@@ -1389,7 +1389,7 @@ impl KeyProvider {
 
         // Merge the two re-sealed shares into ONE threshold material WITHOUT combining them — the CEK is
         // reconstructed only inside the decrypt boundary. The key-provider never holds the whole key.
-        match merge_threshold_material(material_a, &material_b) {
+        match merge_threshold_material(material_a, &material_b, session.extra_segments_b64.as_deref()) {
             Ok(merged) => Response::ok(merged),
             Err(err) => Response::error("not_configured", err),
         }
@@ -1580,7 +1580,7 @@ impl KeyProvider {
         }
         let material_b = materials.pop().expect("two materials checked above");
         let material_a = materials.pop().expect("two materials checked above");
-        match merge_threshold_material(material_a, &material_b) {
+        match merge_threshold_material(material_a, &material_b, session.extra_segments_b64.as_deref()) {
             Ok(merged) => Response::ok(merged),
             Err(err) => Response::error("not_configured", err),
         }
@@ -1839,7 +1839,11 @@ fn build_dkms_client(
 /// identical (not a real split), or the two nodes disagree on the content/transcript binding (a sign
 /// one node sealed for a different object). NO XOR happens here — `key-provider` never holds the CEK.
 #[cfg(all(feature = "key-authority-ref", unix))]
-fn merge_threshold_material(mut data_a: Value, data_b: &Value) -> Result<Value, String> {
+fn merge_threshold_material(
+    mut data_a: Value,
+    data_b: &Value,
+    extra_segments_b64: Option<&[String]>,
+) -> Result<Value, String> {
     // Each node returns its full recover `data` — `{ suite, material: { sealed_cek_b64, ... }, ... }`
     // — so the sealed share + content binding live INSIDE the nested `material` object. Node A's `data`
     // is the base (its `material` carries share-1 as `sealed_cek_b64`); node B contributes ONLY its
@@ -1877,6 +1881,14 @@ fn merge_threshold_material(mut data_a: Value, data_b: &Value) -> Result<Value, 
     // Weld node B's re-sealed share into node A's nested material (the shape the decrypt boundary
     // consumes: `material.sealed_cek_share2_b64`). The CEK is reconstructed ONLY in the boundary.
     data_a["material"]["sealed_cek_share2_b64"] = json!(share2);
+    // MULTI-SEGMENT on the threshold/quorum rail: the runtime already welded the ORDERED segment set
+    // into `aad_b64` (so every node sealed its share to the SAME segment-bound transcript). Carry the
+    // extras into the merged material so the decrypt boundary REBUILDS that exact segment-bound AAD,
+    // reconstructs the split CEK ONCE, and drives the whole ordered asset — a substituted segment then
+    // fails the share unwrap closed. Absent ⇒ single-segment (the material is byte-identical to before).
+    if let Some(extra) = extra_segments_b64.filter(|e| !e.is_empty()) {
+        data_a["material"]["extra_segments_b64"] = json!(extra);
+    }
     Ok(data_a)
 }
 
@@ -2743,19 +2755,30 @@ mod tests {
                 })
             };
             // Happy: two distinct shares for the same content merge into a two-share material.
-            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2")).expect("merge");
+            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None).expect("merge");
             assert_eq!(merged["material"]["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
             assert_eq!(merged["material"]["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
             assert_eq!(merged["material"]["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
+            // Single-segment merge carries NO extras (byte-identical to the pre-multi-segment material).
+            assert!(merged["material"].get("extra_segments_b64").is_none(), "no extras on a single-segment merge");
+
+            // MULTI-SEGMENT: the extras are stamped into the merged material so the decrypt boundary
+            // rebuilds the segment-bound AAD and reconstructs the split CEK once for the whole asset.
+            let extras = ["SEG1".to_string(), "SEG2".to_string()];
+            let multi = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&extras)).expect("merge");
+            assert_eq!(multi["material"]["extra_segments_b64"], json!(["SEG1", "SEG2"]), "extras carried into the merged material");
+            // An empty extras list is treated as single-segment (no field added).
+            let none_extra = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&[])).expect("merge");
+            assert!(none_extra["material"].get("extra_segments_b64").is_none(), "empty extras ⇒ single-segment");
 
             // Identical shares → not a real split → fail closed.
-            assert!(merge_threshold_material(base("SAME"), &base("SAME")).is_err());
+            assert!(merge_threshold_material(base("SAME"), &base("SAME"), None).is_err());
             // A content/transcript mismatch between nodes → fail closed.
             let mut other = base("SHARE2");
             other["material"]["content_hash_b64"] = json!("DIFFERENT");
-            assert!(merge_threshold_material(base("SHARE1"), &other).is_err());
+            assert!(merge_threshold_material(base("SHARE1"), &other, None).is_err());
             // A node missing its sealed share → fail closed.
-            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2")).is_err());
+            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2"), None).is_err());
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in

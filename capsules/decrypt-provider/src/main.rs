@@ -731,22 +731,12 @@ impl DecryptProvider {
             None => return Response::error("invalid_request", "unsupported decrypt suite"),
         }
 
-        // 2-of-2 threshold (Day 97–98): a SECOND sealed share present means the CEK
-        // was split across two dKMS nodes at publish. Route through the reconstruction
-        // path that unwraps BOTH shares and XORs them INSIDE the boundary — the whole
-        // CEK never exists in `key-provider`. Absent → the legacy single-CEK path.
-        // Multi-segment is wired on the single-node audited rail; the threshold/quorum rails take
-        // a single segment today. Refuse a multi-segment threshold material rather than silently
-        // dropping the extra segments (defense-in-depth; the AAD mismatch would also fail closed).
-        if material.extra_segments_b64.as_ref().is_some_and(|s| !s.is_empty())
-            && material.sealed_cek_share2_b64.is_some()
-        {
-            return Response::error(
-                "invalid_request",
-                "multi-segment open is not supported on the threshold rail",
-            );
-        }
-
+        // 2-of-2 threshold (Day 97–98) / 2-of-3 quorum (Day 113–116): a SECOND sealed share present
+        // means the CEK was split across dKMS nodes at publish. Route through the reconstruction
+        // path that unwraps the shares and recombines them INSIDE the boundary — the whole CEK never
+        // exists in `key-provider`. Absent → the legacy single-CEK audited path. Multi-segment is
+        // wired on BOTH the single-node and the threshold/quorum rails: the CEK is reconstructed ONCE
+        // and drives the whole ordered asset, which is welded into the transcript AAD.
         if let Some(share2_b64) = material.sealed_cek_share2_b64.clone() {
             return self.open_session_threshold(request, &material, &share2_b64, now_unix);
         }
@@ -834,9 +824,11 @@ impl DecryptProvider {
             init_segment_b64: material.init_segment_b64.clone(),
             nonce_b64: material.nonce_b64.clone(),
             content_hash_b64: material.content_hash_b64.clone(),
-            // The threshold rail is single-segment (a multi-segment threshold material is refused
-            // up front in `open_session_v1`); keep its transcript AAD node-set-bound, not segment-bound.
-            extra_segments_b64: None,
+            // MULTI-SEGMENT on the threshold/quorum rail: when extras are present, the WHOLE ordered
+            // asset is welded into the transcript AAD (node-set-bound AND segment-bound) by
+            // `prepare_bound_open`, and the reconstructed CEK drives every segment. Absent ⇒ a
+            // single-segment, node-set-bound open (byte-identical to the historical behaviour).
+            extra_segments_b64: material.extra_segments_b64.clone(),
         };
         let prepared = match self.prepare_bound_open(&request, &bound, Some(&node_set_id)) {
             Ok(p) => p,
@@ -872,7 +864,12 @@ impl DecryptProvider {
         // 2-of-3 QUORUM (Day 113–116): with a third pinned identity, the two arriving
         // shares are INDEXED Shamir shares from ANY TWO of the three nodes — unwrap each
         // under the pinned identity its x names and Lagrange-combine in `Zeroizing`.
-        let opened = if let Some(vk3) = self.authority_vk3.as_ref() {
+        // Single segment (default) vs MULTI-SEGMENT asset: both reconstruct the ONE split CEK
+        // in-VM; the multi-segment path loops the in-VM decrypt over the whole ordered asset
+        // (already welded into the AAD), surfacing `segment_count` + the summed `sample_count`.
+        let opened: Result<(Vec<Vec<u8>>, Value), String> = if let Some(vk3) =
+            self.authority_vk3.as_ref()
+        {
             let verifier3 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(vk3) {
                 Some(v) => v,
                 None => {
@@ -892,16 +889,30 @@ impl DecryptProvider {
                         )
                     }
                 };
-            rail_shim::decrypt_from_carrier_quorum(
-                prepared.session,
-                &prepared.carrier.sealed_cek,
-                &sealed_share2,
-                &prepared.aad,
-                &[verifier1, verifier2, verifier3],
-                &prepared.carrier.ciphertext_segment,
-                prepared.carrier.init_segment.as_deref(),
-            )
-        } else {
+            if prepared.extra_segments.is_empty() {
+                rail_shim::decrypt_from_carrier_quorum(
+                    prepared.session,
+                    &prepared.carrier.sealed_cek,
+                    &sealed_share2,
+                    &prepared.aad,
+                    &[verifier1, verifier2, verifier3],
+                    &prepared.carrier.ciphertext_segment,
+                    prepared.carrier.init_segment.as_deref(),
+                )
+                .map(|(plaintext, meta)| (vec![plaintext], meta))
+            } else {
+                rail_shim::decrypt_from_carrier_quorum_segments(
+                    prepared.session,
+                    &prepared.carrier.sealed_cek,
+                    &sealed_share2,
+                    &prepared.aad,
+                    &[verifier1, verifier2, verifier3],
+                    &prepared.carrier.ciphertext_segment,
+                    &prepared.extra_segments,
+                    prepared.carrier.init_segment.as_deref(),
+                )
+            }
+        } else if prepared.extra_segments.is_empty() {
             rail_shim::decrypt_from_carrier_threshold(
                 prepared.session,
                 &prepared.carrier.sealed_cek,
@@ -912,9 +923,22 @@ impl DecryptProvider {
                 &prepared.carrier.ciphertext_segment,
                 prepared.carrier.init_segment.as_deref(),
             )
+            .map(|(plaintext, meta)| (vec![plaintext], meta))
+        } else {
+            rail_shim::decrypt_from_carrier_threshold_segments(
+                prepared.session,
+                &prepared.carrier.sealed_cek,
+                &sealed_share2,
+                &prepared.aad,
+                &prepared.verifier,
+                &verifier2,
+                &prepared.carrier.ciphertext_segment,
+                &prepared.extra_segments,
+                prepared.carrier.init_segment.as_deref(),
+            )
         };
         match opened {
-            Ok((_plaintext, meta)) => {
+            Ok((_plaintexts, meta)) => {
                 let scoped = match scoped_session_response(&request, &meta) {
                     Response::Ok { data: Some(data) } => data,
                     other => return other,
@@ -2911,5 +2935,126 @@ mod tests {
         // (c) ORDER-FREE: (node2, node1) opens exactly like (node1, node2).
         let v = drive(&|sealed, _forged| (sealed[1].clone(), sealed[0].clone()));
         assert_eq!(v["data"]["decision"], json!("opened"), "the quorum is order-free: {v}");
+    }
+
+    /// MULTI-SEGMENT on the 2-of-3 QUORUM rail: a 2-fragment asset under ONE Shamir-split CEK opens
+    /// in-VM — the CEK reconstructed ONCE from any two of three sealed indexed shares (here skipping
+    /// node B), then driving the WHOLE ordered asset — reporting `segment_count == 2` and a SUMMED
+    /// `sample_count` with no CEK/share/plaintext leak. A SUBSTITUTED fragment fails the WHOLE open
+    /// closed: the boundary's transcript welds the ordered segment digests ALONGSIDE the node-set
+    /// identity, so the per-share unwrap fails before a byte is decrypted (never a partial asset).
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_quorum_multi_segment_opens_and_substituted_segment_fails_closed() {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let req = decrypt_request();
+        let cek = [0x5Au8; 16];
+        let coeff = [0x9Du8; 16];
+        let nonce = b"nonce-qrm-multiseg";
+        let content_hash = [0xABu8; 32];
+
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let keys: Vec<_> = [[0xE1u8; 32], [0xE2u8; 32], [0xE3u8; 32]]
+            .into_iter()
+            .map(mldsa_seal_keypair)
+            .collect();
+        let vks: Vec<Vec<u8>> = keys.iter().map(|(_, vk)| vk.clone()).collect();
+
+        // Two REAL CENC fragments under the ONE split CEK (distinct IVs → distinct fragments).
+        let seg0 = build_encrypted_segment(b"quorum-multi-seg-zero!!", &cek, &[0x01u8; 8]);
+        let seg1 = build_encrypted_segment(b"quorum-multi-seg-one!!!", &cek, &[0x02u8; 8]);
+        assert_ne!(seg0, seg1, "the fragments are distinct");
+
+        // The quorum transcript binds BOTH the node-set identity (all three members) AND the ordered
+        // segment set — exactly what `open_session_threshold` rebuilds from the boundary's own state.
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &[&vks[0], &vks[1], &vks[2]]);
+        let digests = ddrm_envelope::segment_digests(&[seg0.as_slice(), seg1.as_slice()]);
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &req.principal_id,
+            session_id: &req.session_id,
+            object_cid: &req.object_cid,
+            content_hash: &content_hash,
+            action: &req.action,
+            viewer_interface: &req.viewer_interface,
+            output_kind: &req.output_kind,
+            expires_at: req.expires_at,
+            release_receipt_hash: release_receipt_hash(&req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+            node_set_id: Some(&node_set_id),
+        }
+        .to_aad_with_segments(Some(&digests));
+
+        let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("shamir split");
+        let sealed: Vec<String> = shares
+            .iter()
+            .enumerate()
+            .map(|(i, share)| {
+                let payload = ddrm_envelope::indexed_share((i + 1) as u8, share);
+                b64.encode(seal_bound(&public, &payload, &aad, &keys[i].0).to_bytes())
+            })
+            .collect();
+
+        let make_material = |extra: Vec<String>| SealedDecryptMaterialV1 {
+            suite: DECRYPT_SUITE_ID.to_string(),
+            // Open with nodes {0, 2} — a real quorum that SKIPS node B (the rail survives a dead node).
+            sealed_cek_b64: sealed[0].clone(),
+            sealed_cek_share2_b64: Some(sealed[2].clone()),
+            ciphertext_b64: b64.encode(&seg0),
+            init_segment_b64: None,
+            nonce_b64: b64.encode(nonce),
+            content_hash_b64: b64.encode(content_hash),
+            extra_segments_b64: Some(extra),
+        };
+
+        let mut provider = DecryptProvider {
+            session: Some(crate::rail_shim::SessionSecret::PqHybrid(secret)),
+            authority_vk: Some(vks[0].clone()),
+            session_pub: Some(pub_bytes),
+            authority_vk2: Some(vks[1].clone()),
+            authority_vk3: Some(vks[2].clone()),
+        };
+
+        // Happy path: the whole 2-segment asset opens under the ONE reconstructed quorum CEK.
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req.clone()),
+            material: make_material(vec![b64.encode(&seg1)]),
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("opened"), "quorum multi-segment opens: {v}");
+        assert_eq!(v["data"]["session"]["segment_count"], json!(2), "both fragments reported");
+        assert!(
+            v["data"]["session"]["sample_count"].as_u64().unwrap() >= 2,
+            "sample_count summed across segments: {v}"
+        );
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+        assert!(!s.contains("quorum-multi-seg"), "no fragment plaintext crosses the boundary");
+
+        // Substituted fragment: same valid sealed shares, but the extra segment's bytes are swapped.
+        // The boundary recomputes the segment digests over the tampered set → AAD mismatch → the
+        // share unwrap fails closed for the WHOLE open (never a partial asset).
+        let mut bad_seg1 = seg1.clone();
+        let last = bad_seg1.len() - 1;
+        bad_seg1[last] ^= 0x01;
+        let resp_bad = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(req),
+            material: make_material(vec![b64.encode(&bad_seg1)]),
+            now_unix: 1_850_000_000,
+        });
+        let v_bad = serde_json::to_value(&resp_bad).unwrap();
+        assert_ne!(
+            v_bad["data"]["decision"],
+            json!("opened"),
+            "a substituted fragment must fail the whole quorum open closed: {v_bad}"
+        );
     }
 }
