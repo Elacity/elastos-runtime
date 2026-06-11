@@ -297,6 +297,26 @@ cargo build --manifest-path capsules/chain-provider/Cargo.toml
 cargo test -p elastos-server chain_mock_wallet_signs -- --ignored
 ```
 
+### Create flow — mint a dDRM asset on chain (`POST /api/create/mint`)
+
+The **mint** runs on the same managed-key rail as buy. `mint_authority` assembles the real
+`mint(string,uint16,bytes,bytes)` calldata (selector `0x47cbeeb4`) via `chain-provider`
+(pure: no RPC, no keys), signs it with the principal's managed account inside
+`wallet-provider` (key never leaves the capsule), and broadcasts through `chain-provider`.
+The body is a `chain-provider` MintAssembly (`to`, `token_uri`, `op_type_code`,
+`content_id`, optional `value_wei`/`op_raw`/`sell`); the selector is pinned by the runtime.
+Mode follows `ELASTOS_DDRM_RIGHTS` (`dev` → synthetic hash; `chain-mock` → real
+sign + mock broadcast; `chain` → real nonce/gas + live broadcast to Base).
+
+Prove the **real mint rail** offline (real `mint()` calldata, managed-key signature, real
+broadcast op against the in-process RPC mock):
+
+```bash
+cargo build --manifest-path capsules/wallet-provider/Cargo.toml
+cargo build --manifest-path capsules/chain-provider/Cargo.toml
+cargo test -p elastos-server chain_mock_mint -- --ignored
+```
+
 ### Overrides (optional)
 
 | Env var | Purpose |
@@ -318,6 +338,7 @@ cargo test -p elastos-server chain_mock_wallet_signs -- --ignored
 | `ELASTOS_DDRM_BUY_SELECTOR` / `ELASTOS_DDRM_BUY_TO` / `ELASTOS_DDRM_BUY_VALUE` | Operator-pinned `buyAccess` selector / contract / payable value |
 | `ELASTOS_DDRM_BUY_SIGN` | `wallet` → sign the buy inside `wallet-provider` with a managed account (key never leaves the capsule); else use `ELASTOS_DDRM_BUY_SIGNED_TX` |
 | `ELASTOS_DDRM_BUY_SIGNED_TX` | `chain` mode (no runtime signing): an externally-signed buy tx to broadcast |
+| `ELASTOS_DDRM_MINT_SELECTOR` | Operator-pinned `mint(string,uint16,bytes,bytes)` 4-byte selector; default `0x47cbeeb4` (the real Base selector) |
 | `ELASTOS_WALLET_PROVIDER_BIN` | Path to the `wallet-provider` binary (runtime signing) |
 | `ELASTOS_DDRM_WALLET_BASE` | Where `wallet-provider` keeps its managed-key store; default `$HOME/.elastos-ddrm-wallet` |
 

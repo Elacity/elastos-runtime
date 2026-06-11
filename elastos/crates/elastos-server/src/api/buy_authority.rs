@@ -37,9 +37,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::rights_authority::{
-    env_nonempty, resolve_chain_bin, run_chain_capsule, ChainRpcMock, RightsMode,
-};
+use super::rights_authority::{env_nonempty, RightsMode};
 
 /// The outcome of a buy-access orchestration.
 #[derive(Debug)]
@@ -133,7 +131,8 @@ pub fn buy_access(
                         intent_seen = intent.clone();
                         Ok(intent)
                     })?;
-                let tx_hash = broadcast_mock_signed(&intent_seen, &sig.signed_transaction)?;
+                let tx_hash =
+                    super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)?;
                 super::owned_ledger::record(content_id, &sig.signer)?;
                 return Ok(BuyOutcome {
                     tx_hash,
@@ -170,7 +169,7 @@ pub fn buy_access(
                         intent_seen = intent.clone();
                         Ok(intent)
                     })?;
-                let tx_hash = broadcast_live(&sig.signed_transaction)?;
+                let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)?;
                 // Ownership is read back from `hasAccessByContentId` once the tx confirms,
                 // not from the local ledger; owned_now reflects "broadcast accepted".
                 return Ok(BuyOutcome {
@@ -190,7 +189,7 @@ pub fn buy_access(
                      ELASTOS_DDRM_BUY_SIGNED_TX. unsigned_tx={unsigned_tx}"
                 ));
             };
-            let tx_hash = broadcast_live(&signed)?;
+            let tx_hash = super::chain_tx::broadcast_signed_live(&signed)?;
             // On real chain, ownership is read back from `hasAccessByContentId` once the
             // tx confirms — NOT from the local ledger. owned_now reflects "broadcast
             // accepted", not "confirmed"; the open re-reads the chain.
@@ -261,9 +260,9 @@ fn mock_transaction_intent(from: &str, content_id: &str, chain_id: u64) -> Value
     })
 }
 
-/// Source real nonce/gas and assemble the live `unsigned_transaction_intent/v1` via the
-/// REAL `chain-provider.prepare_transaction` op against the configured Base RPC. The
-/// returned intent is exactly what the wallet capsule's `transaction_intent` consumes.
+/// Source real nonce/gas and assemble the live `unsigned_transaction_intent/v1` for the
+/// buy via the shared chain plumbing. The returned intent is exactly what the wallet
+/// capsule's `transaction_intent` consumes.
 fn prepare_live_intent(from: &str, content_id: &str) -> Result<Value, String> {
     let tx = assemble_buy_tx(content_id, from);
     let to = tx
@@ -274,103 +273,14 @@ fn prepare_live_intent(from: &str, content_id: &str) -> Result<Value, String> {
         .to_string();
     let value = tx.get("value").and_then(Value::as_str).unwrap_or("0x0").to_string();
     let data = tx.get("data").and_then(Value::as_str).unwrap_or("0x").to_string();
-
-    let (network, init) = live_chain_init()?;
-    let prepare = json!({
-        "op": "prepare_transaction",
-        "network": network,
-        "from": from,
-        "to": to,
-        "value": value,
-        "data": data,
-    });
-    let chain_bin = resolve_chain_bin();
-    run_chain_capsule(&chain_bin, &init, &prepare)
+    super::chain_tx::prepare_intent_live(from, &to, &value, &data)
 }
 
-/// Broadcast through the REAL chain-provider against an in-process JSON-RPC mock that
-/// answers `eth_sendRawTransaction` with a canned 32-byte tx hash. Exercises the real
-/// `broadcast_transaction` op (validation + RPC plumbing) with no external network.
+/// Broadcast through the REAL chain-provider against the in-process RPC mock. The mock
+/// ignores calldata; a minimal even-length-hex signed tx satisfies the real
+/// `validate_signed_transaction` so the broadcast op actually runs.
 fn broadcast_mock(unsigned_tx: &Value) -> Result<String, String> {
-    // The mock ignores calldata; a minimal even-length-hex signed tx satisfies the real
-    // `validate_signed_transaction` so the broadcast op actually runs.
-    broadcast_mock_signed(unsigned_tx, &representative_signed_tx(unsigned_tx))
-}
-
-/// Broadcast a SPECIFIC signed tx (e.g. a genuine wallet-capsule signature) through the
-/// REAL chain-provider against the in-process RPC mock. The signed bytes are really
-/// validated and sent; the mock echoes a canned, deterministic tx hash.
-fn broadcast_mock_signed(unsigned_tx: &Value, signed_tx: &str) -> Result<String, String> {
-    let chain_bin = resolve_chain_bin();
-    if !std::path::Path::new(&chain_bin).is_file() {
-        return Err(format!(
-            "chain-provider not found at {chain_bin}; build it with \
-             `cargo build --manifest-path capsules/chain-provider/Cargo.toml` \
-             or set ELASTOS_CHAIN_PROVIDER_BIN"
-        ));
-    }
-    let tx_word = mock_tx_hash(unsigned_tx);
-    let guard = ChainRpcMock::start_with_word(tx_word)?;
-    let init = mock_init(&guard.url);
-    let broadcast = json!({
-        "op": "broadcast_transaction",
-        "network": "base-local-mock",
-        "signed_transaction": signed_tx,
-    });
-    let resp = run_chain_capsule(&chain_bin, &init, &broadcast);
-    drop(guard);
-    let data = resp?;
-    data.get("transaction_hash")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "chain-provider broadcast missing transaction_hash".to_string())
-}
-
-/// Broadcast an already-signed tx through the REAL chain-provider against the configured
-/// Base RPC (production path).
-fn broadcast_live(signed_tx: &str) -> Result<String, String> {
-    let (network, init) = live_chain_init()?;
-    let broadcast = json!({
-        "op": "broadcast_transaction",
-        "network": network,
-        "signed_transaction": signed_tx,
-    });
-    let chain_bin = resolve_chain_bin();
-    let data = run_chain_capsule(&chain_bin, &init, &broadcast)?;
-    data.get("transaction_hash")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "chain-provider broadcast missing transaction_hash".to_string())
-}
-
-/// The shared `init` for the live Base RPC (used by both prepare and broadcast), so the
-/// network definition can never drift between the two ops. Returns `(network_id, init)`.
-fn live_chain_init() -> Result<(String, Value), String> {
-    let chain_bin = resolve_chain_bin();
-    if !std::path::Path::new(&chain_bin).is_file() {
-        return Err(format!("chain-provider not found at {chain_bin}"));
-    }
-    let network = env_nonempty("ELASTOS_DDRM_RIGHTS_NETWORK").unwrap_or_else(|| "base".to_string());
-    let rpc_url = env_nonempty("ELASTOS_CHAIN_BASE_RPC")
-        .ok_or("ELASTOS_CHAIN_BASE_RPC (Base RPC URL) is required for live buy")?;
-    let chain_id: i64 = env_nonempty("ELASTOS_DDRM_CHAIN_ID")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8453);
-    let init = json!({
-        "op": "init",
-        "config": { "networks": [{
-            "id": network,
-            "display_name": network,
-            "kind": "evm_json_rpc",
-            "chain_id": chain_id,
-            "native_symbol": "ETH",
-            "provider": "elastos-gateway",
-            "mainnet": true,
-            "explorer_url": null,
-            "rpc_url": rpc_url,
-        }]}
-    });
-    Ok((network, init))
+    super::chain_tx::broadcast_signed_mock(unsigned_tx, &representative_signed_tx(unsigned_tx))
 }
 
 /// A non-secret audit view of a wallet-signed buy: the assembled call plus the recovered
@@ -384,23 +294,6 @@ fn buy_audit_view(intent: &Value, sig: &super::wallet_signer::ManagedSignature) 
         "signer": sig.signer,
         "signed_tx_hash": sig.transaction_hash,
         "account_id": sig.account_id,
-    })
-}
-
-fn mock_init(rpc_url: &str) -> Value {
-    json!({
-        "op": "init",
-        "config": { "networks": [{
-            "id": "base-local-mock",
-            "display_name": "base-local-mock",
-            "kind": "evm_json_rpc",
-            "chain_id": 8453,
-            "native_symbol": "ETH",
-            "provider": "elastos-gateway",
-            "mainnet": true,
-            "explorer_url": null,
-            "rpc_url": rpc_url,
-        }]}
     })
 }
 
@@ -426,14 +319,6 @@ fn word_from_address(addr: &str) -> String {
 fn word_from_uint(dec: &str) -> String {
     let n: u128 = dec.trim().parse().unwrap_or(1);
     format!("{n:064x}")
-}
-
-/// A deterministic, well-formed 32-byte hash for the mock to echo as the tx hash.
-fn mock_tx_hash(unsigned_tx: &Value) -> String {
-    let mut h = Sha256::new();
-    h.update(b"elastos-ddrm/buy-mock-tx/v1");
-    h.update(serde_json::to_string(unsigned_tx).unwrap_or_default().as_bytes());
-    format!("0x{}", hex::encode(h.finalize()))
 }
 
 /// A minimal, even-length-hex "signed tx" that satisfies the real broadcast validator in

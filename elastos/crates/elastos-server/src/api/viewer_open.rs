@@ -331,6 +331,64 @@ pub async fn buy_owned_access(
     }
 }
 
+/// POST /api/create/mint — mint a dDRM content asset on chain (PC2 "Create" stage 2).
+///
+/// The body is a `chain-provider` MintAssembly (publish-provider `UnsignedMintV1`: `to`,
+/// `token_uri`, `op_type_code`, `content_id`, optional `value_wei`/`op_raw`/`sell`); the
+/// mint selector is pinned by the runtime. The orchestration (assemble → sign with a
+/// managed account → broadcast) lives in `mint_authority`; here we only authenticate and
+/// forward. The minter is the principal's managed account — the key never leaves
+/// `wallet-provider`.
+pub async fn mint_create_asset(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(assembly): Json<serde_json::Value>,
+) -> Response {
+    let context = match require_home_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
+    };
+    let principal_id = context.principal_id.clone();
+    let now = now_unix();
+
+    let minted = tokio::task::spawn_blocking(move || {
+        super::mint_authority::mint_asset(&principal_id, assembly, now)
+    })
+    .await;
+
+    match minted {
+        Ok(Ok(outcome)) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "schema": "elastos.create.mint/v1",
+                "transaction_hash": outcome.tx_hash,
+                "mode": outcome.mode,
+                "to": outcome.to,
+                "content_id": outcome.content_id,
+                "signer": outcome.signer,
+                "assembled": outcome.assembled,
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => {
+            // A malformed mint is the caller's fault (400); a missing capsule binary or a
+            // broadcast failure is an upstream/outage condition (502).
+            if err.contains("invalid_mint")
+                || err.contains("JSON object")
+                || err.contains("must not be empty")
+                || err.contains("MintAssembly")
+            {
+                tracing::info!("mint rejected (bad request): {err}");
+                return (StatusCode::BAD_REQUEST, err).into_response();
+            }
+            tracing::warn!("mint failed: {err}");
+            (StatusCode::BAD_GATEWAY, "could not complete mint").into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "mint task panicked").into_response(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_media(
     state: GatewayState,

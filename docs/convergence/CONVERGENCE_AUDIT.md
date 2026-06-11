@@ -22,10 +22,12 @@ The **cryptographic engine and provider contracts are essentially built and are 
 superior to PC2** — born-distributed threshold keys, PQ-hybrid sealing, in-VM decrypt with
 CEK containment, IPFS/Helia-byte-compatible content addressing, on-chain mint calldata, a
 marketplace indexer, and (as of 2026-06-11) **real video playback inside Home**. What is
-**not** done is the **product skin and the live plumbing** around that engine: a
-creator/packaging UI, the live wallet-signed mint broadcast, live IPFS pinning, the
-buy/trade purchase flow, a **non-media viewer** (documents/images/3D), a shipped **Lit
-compat adapter**, and **production multi-node dKMS deployment**.
+**not** done is the **product skin and the remaining live plumbing** around that engine: a
+creator/packaging UI (Create portal) + Market portal, live IPFS pinning, the real
+**operative/paymentProcessor** buy path, a **non-media viewer** (documents/images/3D), a
+shipped **Lit compat adapter**, and **production multi-node dKMS deployment**. The
+wallet-signed **mint** broadcast is now wired (assemble → sign → broadcast) via
+`mint_authority`, on the same managed-key rail as buy.
 
 **The hard part (the trustworthy core) is done. The remaining work is wiring it to
 chain/IPFS/UI for real, and adding the surfaces.**
@@ -42,7 +44,8 @@ chain/IPFS/UI for real, and adding the surfaces.**
 | 1 | Content addressing | importer (`ddrm-runtime-open`), `ipfs-provider` | 🟢 | CIDv1 raw leaves + dag-pb balanced tree, **byte-identical to Helia**, fail-closed | live Kubo pin/serve at scale |
 | 1 | Packaging (non-media) | — | 🔴 | decrypt is content-agnostic | render-tier packaging for pdf/img/epub/3D |
 | 2 | Mint intent + calldata | `publish-provider`, `chain-provider` | 🟢 | `UnsignedMintV1`, PC2-faithful `mint()` ABI calldata, payee/royalty arrays | — |
-| 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🟢 | **live `prepare→sign→broadcast` wired** via `wallet_signer`: real EIP-155 RLP+secp256k1 signing inside `wallet-provider` (key never leaves the capsule), nonce/gas from `chain-provider.prepare_transaction`, broadcast through `chain-provider`; proven offline (`chain_mock_wallet_signs`) | EIP-1559 (type-2) txs; mint reuse |
+| 2 | **Mint sign + broadcast** | `mint_authority`, `wallet-provider`, `chain-provider` | 🟢 | **live mint wired**: `assemble_mint` (real selector `0x47cbeeb4`) → managed-key sign → broadcast, via `/api/create/mint`; shares the `chain_tx` rail with buy; proven offline (`chain_mock_mint`) | drive from a Create portal UI (B4) |
+| 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🟢 | **live `prepare→sign→broadcast` wired** via `wallet_signer`: real EIP-155 RLP+secp256k1 signing inside `wallet-provider` (key never leaves the capsule), nonce/gas from `chain-provider.prepare_transaction`, broadcast through `chain-provider`; proven offline (`chain_mock_wallet_signs`) | EIP-1559 (type-2) txs |
 | 2 | IPFS pin | `ipfs-provider` | 🟡 | contract + addressing | live pin wired into publish |
 | 3 | Marketplace / discovery | `content-market` | 🟢 (offline) | listing from calldata + chain event + metadata | live `eth_getLogs` |
 | 3 | Buy / trade access | `buy_authority`, `wallet_signer`, `wallet-provider`, `chain-provider` | 🟡 | **buy assemble→SIGN→broadcast→record→re-check wired**; `ELASTOS_DDRM_BUY_SIGN=wallet` signs inside `wallet-provider` (real signature, key contained); offline `denied→buy→owned→open` loop proven (chain-mock + ledger); Home auto-buys on a rights-denied open | real `buyAccess` ABI (operator-pinned config today); live Base broadcast needs a funded managed account + user-consent approval UI |

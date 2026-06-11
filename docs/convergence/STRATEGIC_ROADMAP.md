@@ -86,9 +86,11 @@ Two tracks run **in parallel**: **make it REAL** (protocol/infra) and **make it 
 
 ### Track A — make it REAL (do first / start now)
 
-1. **Live mint via `wallet_signer`** *(now, 1 slice).* The signing rail just shipped; mint is
-   the same rail. Closes the **Create backend** so an asset actually lands on Base. Highest
-   leverage, lowest effort.
+1. **Live mint via `wallet_signer`** ✅ *(done).* `mint_authority` assembles the real
+   `mint()` calldata (selector `0x47cbeeb4`) → signs with a managed account (key never
+   leaves `wallet-provider`) → broadcasts via `chain-provider`, exposed at
+   `POST /api/create/mint` and sharing the new `chain_tx` rail with buy. Proven offline
+   (`chain_mock_mint`). Closes the **Create backend**; a Create portal UI (B4) drives it.
 2. **Align `chain-provider` to the real Base ABIs** *(now, 1 slice).* Swap the guessed
    `hasAccessByContentId` shape for `(address holder, bytes16 contentId)`; wire the
    **operative/paymentProcessor** buy path; pin the real addresses from `abis.ts`. Replaces
