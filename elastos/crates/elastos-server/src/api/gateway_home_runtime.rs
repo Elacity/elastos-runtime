@@ -576,6 +576,7 @@ fn app_shell_title(name: &str) -> String {
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
         "gba-emulator" => "GBA Emulator".to_string(),
+        "elacity-player" => "Owned Video".to_string(),
         _ if is_wallet_connector_capsule_id(name) => wallet_connector_label(name).to_string(),
         _ => title_case_capsule_name(name),
     }
@@ -606,6 +607,10 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
             wallet_connector_label(name)
         ),
         "gba-emulator" => "Launch the browser-based mGBA frontend.".to_string(),
+        "elacity-player" => {
+            "Play an owned, protected video end-to-end through the local dDRM decrypt boundary."
+                .to_string()
+        }
         _ => manifest_description
             .unwrap_or_else(|| format!("Open {} from Home.", app_shell_title(name))),
     }

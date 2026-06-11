@@ -149,6 +149,68 @@ To get those working on macOS you need the Apple Virtualization.framework backen
 
 ---
 
+## Playing an owned video (dDRM viewer seam)
+
+The **Owned Video** tile in the launcher plays a real CENC-encrypted clip end-to-end
+through the local dDRM rail: the gateway spawns a `ddrm-media-authority` helper (the
+"local test KMS" adapter), which CENC-packs the clip, launches a **separate**
+`decrypt-provider` boundary, and seals the CEK to that boundary's in-VM session key.
+The browser only ever receives already-decrypted segment bytes — the CEK never reaches
+the helper, the gateway, or the player.
+
+> ⚠️ **You must build and run the gateway from THIS repo / branch, not the `/tmp`
+> worktree above.** The dev-tree capsule path is baked in at **compile time**
+> (`DEV_CAPSULES_ROOT = <repo>/capsules`, see `capsule_inventory.rs`). A gateway built
+> elsewhere serves a different `capsules/` tree and won't have the tile, the
+> `/media/open` route, or the helper.
+
+### Build the three binaries (from the repo root)
+
+```bash
+# 1. decrypt boundary — MUST include the rail features, or it builds as the
+#    canonical fail-closed stub and refuses to play.
+cargo build --manifest-path capsules/decrypt-provider/Cargo.toml \
+  --features rail-stream,rail-mint
+
+# 2. local key-authority helper (isolated PQ-crypto workspace)
+cargo build --manifest-path scripts/dev/ddrm-media-authority/Cargo.toml
+
+# 3. the gateway itself
+cargo build --manifest-path elastos/Cargo.toml -p elastos-server
+```
+
+`ffmpeg` + `ffprobe` must be on `PATH` (the helper synthesizes the test clip). On
+macOS: `brew install ffmpeg`.
+
+### Run + play
+
+```bash
+# release the host lock (see gotcha #1), then:
+./elastos/target/debug/elastos gateway --addr 127.0.0.1:8090
+```
+
+Open **http://localhost:8090/apps/home/**, sign in, and click the **Owned Video** tile.
+A player window opens and the clip plays.
+
+### Overrides (optional)
+
+| Env var | Purpose |
+| ------- | ------- |
+| `ELASTOS_DDRM_DECRYPT_BIN` | Path to the `rail-stream,rail-mint` decrypt-provider binary |
+| `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` | Path to the `ddrm-media-authority` helper |
+| `ELASTOS_DDRM_SAMPLE_VIDEO` | Use your own source clip instead of the synthesized one |
+
+### dDRM troubleshooting
+
+| Symptom | Cause | Fix |
+| ------- | ----- | --- |
+| `could not open owned media: … decrypt-provider did not configure` | decrypt-provider built as the fail-closed stub (no rail features) | Rebuild with `--features rail-stream,rail-mint` |
+| `media-authority helper not found at …` | helper not built, or running a gateway from a different tree | Build step 2 above, run gateway from this repo, or set `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` |
+| `could not open owned media: … ffmpeg` | `ffmpeg`/`ffprobe` not on `PATH` | `brew install ffmpeg` |
+| Tile missing from launcher | gateway built/run from a different `capsules/` tree | Build + run the gateway from this repo on `feat/ddrm-home-playback` |
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

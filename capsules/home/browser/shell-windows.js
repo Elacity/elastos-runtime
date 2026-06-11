@@ -596,6 +596,24 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  // elacity-player launched standalone (from the launcher) means "play an owned
+  // video": it has no bound object, so we mint a decrypt session via the gateway
+  // and open the player at the returned play URL instead of the generic route.
+  if (targetId === "elacity-player") {
+    if (ignoreRepeatedAction(launchActionKey(targetId, options.query))) {
+      return;
+    }
+    launchOwnedMediaWindow(options).catch((error) => {
+      const status = Number(error && error.status);
+      if (status === 401 || status === 403) {
+        requireWindowHooks().requestHomeUnlock?.();
+        return;
+      }
+      console.error("failed to open owned media", error);
+      renderTargetLaunchError(targetId, error);
+    });
+    return;
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;
@@ -687,6 +705,12 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     );
   }
 
+  return openLaunchedWindow(launched, options);
+}
+
+// Open a window for an already-resolved launch descriptor (route + title +
+// attach_kind). Shared by the generic Home launch and the owned-media launch.
+function openLaunchedWindow(launched, options = {}) {
   const offset = browserWindowEntries().length;
   const restoredPlacement = options.restoredPlacement || null;
   const windowSpec = restoredPlacement || browserWindowSpec(launched, offset);
@@ -738,6 +762,27 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     persistBrowserSession();
   }
   return entry;
+}
+
+// Owned-media: ask the gateway to stand up a decrypt session through the local
+// key-authority + a SEPARATE decrypt-provider boundary, then open elacity-player
+// at the returned play URL (session + scoped launch token baked in). The CEK
+// never reaches the browser — only already-decrypted segment bytes are loaded.
+async function launchOwnedMediaWindow(options = {}) {
+  const opened = await fetchJson("/api/viewers/elacity-player/media/open", {
+    method: "POST",
+  });
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("media open did not return a play URL");
+  }
+  const launched = {
+    target: "elacity-player",
+    title: "Owned video",
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return openLaunchedWindow(launched, options);
 }
 
 function launchDidFail(launched) {
