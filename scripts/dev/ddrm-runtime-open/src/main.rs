@@ -983,10 +983,11 @@ fn base32_lower_nopad(data: &[u8]) -> String {
 /// Helia fixed-size chunk (1 MiB). Matches `encrypt-provider::UNIXFS_SINGLE_CHUNK_MAX`.
 const UNIXFS_CHUNK_SIZE: usize = 1_048_576;
 
-/// `@helia/unixfs` balanced-layout default fan-out. Our multi-MiB media fits a SINGLE dag-pb root
-/// over up to this many leaves; above it a balanced TREE of intermediate nodes is required, which
-/// we DO NOT guess without an oracle vector — fail closed instead.
-const UNIXFS_MAX_LEAVES_SINGLE_ROOT: usize = 174;
+/// `@helia/unixfs` balanced-layout fan-out (`add.js` pins `maxChildrenPerNode: 1024`). Up to this
+/// many children fit under a SINGLE dag-pb node; above it the importer batches the children into
+/// groups of this size, reduces each group to an intermediate node, and recurses until one root
+/// remains — the balanced TREE `unixfs_import` reproduces byte-for-byte.
+const UNIXFS_MAX_CHILDREN_PER_NODE: usize = 1024;
 
 /// The raw 36-byte CIDv1 binary of `chunk` (`0x01 0x55 0x12 0x20 ‖ sha2-256`) — the bytes a dag-pb
 /// `PBLink` carries as its `Hash`, the same identity `payload_cid_v1_raw` renders as a string.
@@ -995,6 +996,18 @@ fn raw_cid_binary(chunk: &[u8]) -> Vec<u8> {
     let digest = Sha256::digest(chunk);
     let mut out = Vec::with_capacity(36);
     out.extend_from_slice(&[0x01, 0x55, 0x12, 0x20]);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// The dag-pb 36-byte CIDv1 binary of `block` (`0x01 0x70 0x12 0x20 ‖ sha2-256`) — the bytes a
+/// PARENT dag-pb `PBLink` carries as its `Hash` when its child is an INTERMEDIATE node (codec
+/// 0x70), the binary form of `dag_pb_cid_v1`.
+fn dag_pb_cid_binary(block: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(block);
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&[0x01, 0x70, 0x12, 0x20]);
     out.extend_from_slice(&digest);
     out
 }
@@ -1075,39 +1088,94 @@ fn dag_pb_file_node(links: &[(Vec<u8>, u64)], unixfs_data: &[u8]) -> Vec<u8> {
 /// A content-addressed block graph: `(CID, block bytes)` pairs (raw leaves + a dag-pb root).
 type ContentBlocks = Vec<(String, Vec<u8>)>;
 
+/// One node in the balanced-tree build: its CID (string + 36-byte binary the parent links), the
+/// UnixFS file CONTENT size it covers (the `fileSize` a parent records as its `blocksize`), and the
+/// cumulative dag size (the `Tsize` a parent records: this node's own block length + every
+/// descendant's dag size; for a raw leaf, simply the leaf byte length).
+struct UnixfsNode {
+    cid_str: String,
+    cid_binary: Vec<u8>,
+    content_size: u64,
+    dag_size: u64,
+}
+
 /// Import `bytes` as Helia-compatible UnixFS → `(root_cid, blocks)` where `blocks` is every
-/// content-addressed block (raw leaves + the dag-pb root) keyed by CID. Mirrors `@helia/unixfs`
-/// `addBytes` defaults (1 MiB fixed-size raw leaves, single dag-pb root, single-chunk collapse to
-/// the raw leaf). Fails closed above one root's fan-out (no guessed intermediate-node tree).
+/// content-addressed block (raw leaves + every intermediate dag-pb node + the root) keyed by CID.
+/// Mirrors `@helia/unixfs` `addBytes` defaults: 1 MiB fixed-size raw leaves, single-chunk collapse
+/// to the raw leaf, and a BALANCED dag-pb tree above the fan-out.
 fn unixfs_import(bytes: &[u8]) -> Result<(String, ContentBlocks), String> {
-    // Empty input is one empty leaf (Helia's empty-file CID); else chunk into <=1 MiB leaves.
+    unixfs_import_with(bytes, UNIXFS_CHUNK_SIZE, UNIXFS_MAX_CHILDREN_PER_NODE)
+}
+
+/// As [`unixfs_import`], parameterized by the chunk size + fan-out. Production uses Helia's real
+/// defaults (1 MiB / 1024); the oracle-pinned TREE goldens use a reduced chunk size + fan-out so a
+/// multi-level tree forms with a tiny input — the dag-pb block encoding is independent of both, so
+/// the same code path is exercised byte-for-byte. Reproduces the importer's balanced layout
+/// (`ipfs-unixfs-importer` `layout/balanced.js` + `dag-builder/file.js` `reduce`): batch the child
+/// stream into groups of `max_children`, reduce each group to a parent dag-pb file node, and
+/// recurse until one root remains.
+fn unixfs_import_with(
+    bytes: &[u8],
+    chunk_size: usize,
+    max_children: usize,
+) -> Result<(String, ContentBlocks), String> {
+    if chunk_size == 0 || max_children < 2 {
+        return Err("unixfs import requires chunk_size > 0 and max_children >= 2".to_string());
+    }
+    let mut blocks: ContentBlocks = Vec::new();
+
+    // Leaves: empty input is one empty raw leaf (Helia's empty-file CID); else <=chunk_size raw leaves.
     let chunks: Vec<&[u8]> =
-        if bytes.is_empty() { vec![bytes] } else { bytes.chunks(UNIXFS_CHUNK_SIZE).collect() };
-    // Single chunk collapses to the raw leaf (Helia `reduceSingleLeafToSelf`): root == leaf CID.
-    if chunks.len() == 1 {
-        let cid = payload_cid_v1_raw(chunks[0]);
-        return Ok((cid.clone(), vec![(cid, chunks[0].to_vec())]));
-    }
-    if chunks.len() > UNIXFS_MAX_LEAVES_SINGLE_ROOT {
-        return Err(format!(
-            "{} leaves exceeds the {UNIXFS_MAX_LEAVES_SINGLE_ROOT}-leaf single-root fan-out; a \
-             balanced dag-pb TREE is required and is not built without an oracle vector",
-            chunks.len()
-        ));
-    }
-    let mut blocks: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunks.len() + 1);
-    let mut links: Vec<(Vec<u8>, u64)> = Vec::with_capacity(chunks.len());
-    let mut blocksizes: Vec<u64> = Vec::with_capacity(chunks.len());
+        if bytes.is_empty() { vec![bytes] } else { bytes.chunks(chunk_size).collect() };
+    let mut level: Vec<UnixfsNode> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        blocks.push((payload_cid_v1_raw(chunk), chunk.to_vec()));
-        links.push((raw_cid_binary(chunk), chunk.len() as u64));
-        blocksizes.push(chunk.len() as u64);
+        let cid_str = payload_cid_v1_raw(chunk);
+        blocks.push((cid_str.clone(), chunk.to_vec()));
+        level.push(UnixfsNode {
+            cid_str,
+            cid_binary: raw_cid_binary(chunk),
+            content_size: chunk.len() as u64,
+            dag_size: chunk.len() as u64,
+        });
     }
-    let unixfs_data = unixfs_file_data(bytes.len() as u64, &blocksizes);
-    let root_block = dag_pb_file_node(&links, &unixfs_data);
-    let root_cid = dag_pb_cid_v1(&root_block);
-    blocks.push((root_cid.clone(), root_block));
-    Ok((root_cid, blocks))
+
+    // A single leaf that IS the whole file collapses to the raw leaf (Helia `reduceSingleLeafToSelf`).
+    if level.len() == 1 {
+        let root = level.pop().expect("one leaf");
+        return Ok((root.cid_str, blocks));
+    }
+
+    // Balanced reduce: group the level into runs of `max_children`, reduce each run to an
+    // intermediate dag-pb file node, recurse until one root node remains.
+    loop {
+        let mut next: Vec<UnixfsNode> = Vec::with_capacity(level.len().div_ceil(max_children));
+        for group in level.chunks(max_children) {
+            let mut links: Vec<(Vec<u8>, u64)> = Vec::with_capacity(group.len());
+            let mut blocksizes: Vec<u64> = Vec::with_capacity(group.len());
+            let mut content_size: u64 = 0;
+            let mut children_dag_size: u64 = 0;
+            for child in group {
+                // PBLink Tsize is the child's CUMULATIVE dag size; the UnixFS blocksize is its
+                // CONTENT size (matching `dag-builder/file.js`: `Tsize: leaf.size`, `addBlockSize`).
+                links.push((child.cid_binary.clone(), child.dag_size));
+                blocksizes.push(child.content_size);
+                content_size += child.content_size;
+                children_dag_size += child.dag_size;
+            }
+            let unixfs_data = unixfs_file_data(content_size, &blocksizes);
+            let block = dag_pb_file_node(&links, &unixfs_data);
+            let cid_str = dag_pb_cid_v1(&block);
+            let cid_binary = dag_pb_cid_binary(&block);
+            let dag_size = block.len() as u64 + children_dag_size;
+            blocks.push((cid_str.clone(), block));
+            next.push(UnixfsNode { cid_str, cid_binary, content_size, dag_size });
+        }
+        if next.len() == 1 {
+            let root = next.pop().expect("one root");
+            return Ok((root.cid_str, blocks));
+        }
+        level = next;
+    }
 }
 
 /// Read a protobuf base-128 varint at `*pos`, advancing it. Fail-closed on truncation/overflow.
@@ -1299,13 +1367,15 @@ fn content_capability_fetch(
     ))
 }
 
-/// The content capability for a (possibly multi-MiB, chunked) UnixFS root: fetch by ROOT CID and
-/// reassemble the file with per-BLOCK content-addressing integrity. A raw root (`bafkrei…`,
-/// single-chunk) returns its bytes directly; a dag-pb root (`bafybei…`) is verified to hash to the
-/// requested CID, parsed, and each raw leaf is fetched + verified to hash to its link, concatenated,
-/// and checked against the UnixFS filesize + per-leaf blocksizes. Fails CLOSED on a missing block, a
-/// TAMPERED block (hash mismatch), or any length/structure mismatch — a corrupt or malicious backend
-/// can never substitute, reorder, or truncate content under a root the runtime trusts.
+/// The content capability for a (possibly multi-MiB, chunked, multi-level) UnixFS root: fetch by
+/// ROOT CID and reassemble the file with per-BLOCK content-addressing integrity at EVERY level of
+/// the tree. A raw root (`bafkrei…`, single-chunk) returns its bytes directly; a dag-pb root
+/// (`bafybei…`) is verified to hash to the requested CID, parsed, and each child is fetched +
+/// reassembled RECURSIVELY (a child is itself either a raw leaf or another dag-pb node), with each
+/// node's UnixFS filesize + per-child blocksizes checked. Fails CLOSED on a missing block, a
+/// TAMPERED block at any level (hash mismatch), or any length/structure mismatch — a corrupt or
+/// malicious backend can never substitute, reorder, or truncate content under a root the runtime
+/// trusts, no matter how deep the tree.
 fn content_capability_fetch_dag(
     store: &ContentStore,
     root_cid: &str,
@@ -1325,51 +1395,70 @@ fn content_capability_fetch_dag(
             },
         ));
     }
-    // Otherwise it must be a dag-pb root that hashes to the requested CID (root integrity FIRST).
-    if dag_pb_cid_v1(root_block) != root_cid {
-        return Err(format!(
-            "content-address integrity failure: root block hashes to neither the raw nor the dag-pb \
-             form of {root_cid} — fail closed rather than serve a substituted root"
-        ));
-    }
-    let root = parse_dag_pb_file_root(root_block)?;
-    let mut content = Vec::with_capacity(root.filesize as usize);
-    for (i, (leaf_cid, tsize)) in root.leaves.iter().enumerate() {
-        let leaf = store
-            .blocks
-            .get(leaf_cid)
-            .ok_or_else(|| format!("leaf {leaf_cid} (chunk {i}) is not available — fail closed"))?;
-        // Per-leaf content-addressing integrity: the served leaf MUST hash to its link CID.
-        if payload_cid_v1_raw(leaf) != *leaf_cid {
-            return Err(format!(
-                "content-address integrity failure: chunk {i} served bytes do not hash to {leaf_cid} \
-                 — a tampered leaf can never be substituted"
-            ));
-        }
-        if leaf.len() as u64 != *tsize || leaf.len() as u64 != root.blocksizes[i] {
-            return Err(format!(
-                "chunk {i} length {} mismatches its link Tsize {tsize} / blocksize {}",
-                leaf.len(),
-                root.blocksizes[i]
-            ));
-        }
-        content.extend_from_slice(leaf);
-    }
-    if content.len() as u64 != root.filesize {
-        return Err(format!(
-            "reassembled {} bytes != the UnixFS filesize {} — fail closed",
-            content.len(),
-            root.filesize
-        ));
-    }
+    let content = fetch_dag_node(store, root_cid, 0)?;
+    let size = content.len();
     Ok((
         content,
         AvailabilityReceiptV1 {
             cid: root_cid.to_string(),
-            size: root.filesize as usize,
+            size,
             backend: "in-process-content-addressed (dag-pb)",
         },
     ))
+}
+
+/// Cap the dag-pb tree recursion so a maliciously deep/cyclic block graph can never blow the stack —
+/// far beyond any real balanced tree's depth (1 MiB leaves, 1024 fan-out: depth 4 already covers
+/// ~1 PiB).
+const UNIXFS_MAX_TREE_DEPTH: usize = 64;
+
+/// Fetch + reassemble the UnixFS subtree rooted at `cid`, verifying content-addressing integrity at
+/// every block. A block that hashes to `cid` as a raw leaf returns its bytes; one that hashes as a
+/// dag-pb node is parsed and each child is reassembled RECURSIVELY, with each child's reassembled
+/// CONTENT length checked against the parent's recorded blocksize and the node's total against its
+/// UnixFS filesize. Fails closed on any miss, tamper, structure, or depth violation.
+fn fetch_dag_node(store: &ContentStore, cid: &str, depth: usize) -> Result<Vec<u8>, String> {
+    if depth > UNIXFS_MAX_TREE_DEPTH {
+        return Err(format!("dag-pb tree exceeds max depth {UNIXFS_MAX_TREE_DEPTH} — fail closed"));
+    }
+    let block = store
+        .blocks
+        .get(cid)
+        .ok_or_else(|| format!("block {cid} is not available — fail closed"))?;
+    // A raw leaf: the served bytes ARE the content and MUST hash to the requested CID.
+    if payload_cid_v1_raw(block) == cid {
+        return Ok(block.clone());
+    }
+    // Otherwise it must be a dag-pb node that hashes to the requested CID (node integrity FIRST).
+    if dag_pb_cid_v1(block) != cid {
+        return Err(format!(
+            "content-address integrity failure: block served for {cid} hashes to neither its raw \
+             nor its dag-pb form — a tampered block can never be substituted"
+        ));
+    }
+    let node = parse_dag_pb_file_root(block)?;
+    let mut content = Vec::with_capacity(node.filesize as usize);
+    for (i, (child_cid, _tsize)) in node.leaves.iter().enumerate() {
+        let child = fetch_dag_node(store, child_cid, depth + 1)?;
+        // The child's reassembled CONTENT length must equal the parent's recorded blocksize (the
+        // UnixFS fileSize the parent welded in) — holds for raw AND intermediate children.
+        if child.len() as u64 != node.blocksizes[i] {
+            return Err(format!(
+                "child {i} ({child_cid}) reassembled to {} bytes != its recorded blocksize {} — fail closed",
+                child.len(),
+                node.blocksizes[i]
+            ));
+        }
+        content.extend_from_slice(&child);
+    }
+    if content.len() as u64 != node.filesize {
+        return Err(format!(
+            "node {cid} reassembled {} bytes != its UnixFS filesize {} — fail closed",
+            content.len(),
+            node.filesize
+        ));
+    }
+    Ok(content)
 }
 
 // Canned inputs the local-mock chain query uses when the operator did not pin a real
@@ -5409,6 +5498,45 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
             media.len(), root, media_avail.size, media_avail.backend
         );
 
+        // --- CONTENT PLANE (balanced TREE): above one node's fan-out, `@helia/unixfs` builds a
+        // BALANCED dag-pb tree of intermediate nodes. At Helia's real defaults (1 MiB / 1024) the
+        // first tree needs > 1 GiB, so we exercise the SAME tree-building code with a reduced chunk
+        // size + fan-out (the dag-pb encoding is parameter-independent; the root CID is pinned
+        // byte-for-byte against the oracle in unit tests). Publish a multi-LEVEL tree, fetch it back
+        // BY ROOT CID with per-node integrity at every level, and prove a tampered INTERMEDIATE node
+        // (not a leaf) fails the whole fetch closed.
+        const TREE_CHUNK: usize = 256;
+        const TREE_FANOUT: usize = 4;
+        let tree_bytes: Vec<u8> = (0..(17 * TREE_CHUNK - 9)).map(|i| ((i / 256 + i) & 0xff) as u8).collect();
+        let (tree_root, tree_blocks) = unixfs_import_with(&tree_bytes, TREE_CHUNK, TREE_FANOUT)?;
+        let mut tree_store = ContentStore::new();
+        for (cid, block) in tree_blocks {
+            tree_store.blocks.insert(cid, block);
+        }
+        let levels = tree_store.blocks.keys().filter(|c| c.starts_with("bafybei")).count();
+        let (tree_reassembled, tree_avail) = content_capability_fetch_dag(&tree_store, &tree_root)?;
+        if tree_reassembled != tree_bytes {
+            return Err("balanced-tree content did not reassemble to the published bytes".to_string());
+        }
+        let intermediate = tree_store
+            .blocks
+            .keys()
+            .find(|c| c.starts_with("bafybei") && **c != tree_root)
+            .cloned()
+            .ok_or("a multi-level tree must have intermediate nodes besides the root")?;
+        let mut tampered = tree_store.blocks.get(&intermediate).unwrap().clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        tree_store.blocks.insert(intermediate, tampered);
+        if content_capability_fetch_dag(&tree_store, &tree_root).is_ok() {
+            return Err("a tampered intermediate node was served — tree integrity failed open".to_string());
+        }
+        println!(
+            "  [content-plane/tree] {}-byte media published as a BALANCED dag-pb tree ({} dag-pb \
+             nodes incl. root {}), fetched back BY ROOT CID + reassembled ({} bytes via {}); a \
+             tampered INTERMEDIATE node failed closed",
+            tree_bytes.len(), levels, tree_root, tree_avail.size, tree_avail.backend
+        );
+
         // --- DECRYPT RAIL (multi-segment): carry a genuinely MULTI-SEGMENT asset through the LIVE
         // key-provider `release` + decrypt-provider `open_session_v1` rail — the key released once,
         // every segment fetched by its CIDv1, the whole ordered set welded into the transcript AAD,
@@ -6365,6 +6493,110 @@ mod content_plane_tests {
         store.blocks.insert(root.clone(), tampered);
         let err = content_capability_fetch_dag(&store, &root).expect_err("tampered root must fail");
         assert!(err.contains("integrity"), "fail-closed names the integrity failure: {err}");
+    }
+
+    // --- balanced dag-pb TREE (above one node's fan-out) -----------------------------------------
+
+    /// The oracle's `tree_vectors` chunk size + fan-out: reduced from Helia's production defaults
+    /// (1 MiB / 1024) so a multi-LEVEL tree forms with a tiny input. The dag-pb block encoding is
+    /// independent of both, so this exercises the SAME tree-building code as production.
+    const TREE_CHUNK: usize = 256;
+    const TREE_FANOUT: usize = 4;
+
+    /// Bytes whose every 256-byte chunk is DISTINCT (`(i/256 + i) & 0xff`), so leaves + intermediate
+    /// nodes do not content-dedupe — used by the round-trip/structure/tamper tests (NOT the oracle
+    /// pin, which must use the oracle's exact `det_bytes` generator).
+    fn distinct_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i / 256 + i) & 0xff) as u8).collect()
+    }
+
+    /// Build a content store from a reduced-param tree import → `(store, root_cid, bytes)`.
+    fn build_tree_store(bytes: Vec<u8>) -> (ContentStore, String) {
+        let (root, blocks) =
+            unixfs_import_with(&bytes, TREE_CHUNK, TREE_FANOUT).expect("tree import");
+        let mut store = ContentStore::new();
+        for (cid, block) in blocks {
+            store.blocks.insert(cid, block);
+        }
+        (store, root)
+    }
+
+    /// The multi-LEVEL balanced-tree root CID our importer mints ABOVE one node's fan-out is
+    /// BYTE-FOR-BYTE what the REAL `@helia/unixfs` produces — pinned against the oracle's
+    /// `tree_vectors` (generated with a reduced chunk size + fan-out so the tree forms with a tiny
+    /// input). The root CID is a Merkle root: equality transitively proves EVERY intermediate dag-pb
+    /// node block is byte-identical to Helia's, so the balanced layout, the cumulative `Tsize`, and
+    /// the per-level `blocksizes`/`filesize` all match. Covers a 2-level partial tree, a fully
+    /// balanced 2-level tree, and 3-level trees (so a recursive intermediate level is pinned).
+    #[test]
+    fn unixfs_tree_root_cid_matches_helia_oracle() {
+        // (total_size, seed, expected_root) from scripts/dev/unixfs-oracle (`tree_vectors`).
+        let cases: &[(usize, usize, &str)] = &[
+            (1273, 0x511, "bafybeiaspydtuf5jhtliko4mu7jbj3v32qcgfxgbj6behdzvl7hl24d5ym"),
+            (4089, 0x16a, "bafybeiemnibqgexp44x5yk6rtfw7nsjbzgpgqvzhxtbhenehm34exis7ka"),
+            (4345, 0x173, "bafybeieaocb4j44qk5j3webw5tzt4vyq753tdnxrwdffltkttkskcioiju"),
+            (5369, 0x215, "bafybeigwdpwfr4buhsixepflahhrhsngykctab55czwqjh3magk4o5i2xe"),
+        ];
+        for (size, seed, expected_root) in cases {
+            let bytes = det_bytes(*size, *seed);
+            let (root, _blocks) =
+                unixfs_import_with(&bytes, TREE_CHUNK, TREE_FANOUT).expect("tree import");
+            assert!(root.starts_with("bafybei"), "multi-level tree => dag-pb root: {root}");
+            assert_eq!(&root, expected_root, "tree root CID for {size} bytes");
+        }
+    }
+
+    /// A multi-level tree publishes → fetches BY ITS ROOT CID → reassembles to exactly the original
+    /// bytes, recursing through the intermediate dag-pb nodes (each verified to hash to its link).
+    /// Asserts the store actually grew an intermediate level (more than one dag-pb node).
+    #[test]
+    fn unixfs_tree_round_trips_by_root_cid() {
+        // 17 leaves at fan-out 4 => a 3-level tree (root -> 2 nodes -> 5 nodes -> 17 leaves).
+        let bytes = distinct_bytes(17 * TREE_CHUNK - 9);
+        let (store, root) = build_tree_store(bytes.clone());
+        let dagpb_nodes = store.blocks.keys().filter(|c| c.starts_with("bafybei")).count();
+        assert!(dagpb_nodes > 1, "a multi-level tree has intermediate nodes besides the root: {dagpb_nodes}");
+        let (fetched, receipt) =
+            content_capability_fetch_dag(&store, &root).expect("fetch tree by root");
+        assert_eq!(fetched, bytes, "multi-level reassembly equals the published file");
+        assert_eq!(receipt.size, bytes.len());
+        assert_eq!(receipt.cid, root);
+    }
+
+    /// A TAMPERED INTERMEDIATE node (not the root, not a leaf) no longer hashes to its link CID, so
+    /// the recursive fetch refuses it before reassembling — integrity holds at EVERY tree level, not
+    /// just the leaves.
+    #[test]
+    fn unixfs_tree_fails_closed_on_tampered_intermediate_node() {
+        let (mut store, root) = build_tree_store(distinct_bytes(17 * TREE_CHUNK - 9));
+        let intermediate = store
+            .blocks
+            .keys()
+            .find(|c| c.starts_with("bafybei") && **c != root)
+            .cloned()
+            .expect("a 3-level tree has intermediate nodes besides the root");
+        let mut tampered = store.blocks.get(&intermediate).unwrap().clone();
+        *tampered.last_mut().unwrap() ^= 0xff;
+        store.blocks.insert(intermediate, tampered);
+        let err = content_capability_fetch_dag(&store, &root)
+            .expect_err("tampered intermediate node must fail");
+        assert!(err.contains("integrity"), "fail-closed names the integrity failure: {err}");
+    }
+
+    /// A MISSING INTERMEDIATE node fails closed — a partial subtree is never served.
+    #[test]
+    fn unixfs_tree_fails_closed_on_missing_intermediate_node() {
+        let (mut store, root) = build_tree_store(distinct_bytes(17 * TREE_CHUNK - 9));
+        let intermediate = store
+            .blocks
+            .keys()
+            .find(|c| c.starts_with("bafybei") && **c != root)
+            .cloned()
+            .expect("intermediate node");
+        store.blocks.remove(&intermediate);
+        let err = content_capability_fetch_dag(&store, &root)
+            .expect_err("missing intermediate node must fail");
+        assert!(err.contains("not available"), "fail-closed names the miss: {err}");
     }
 }
 

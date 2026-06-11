@@ -12,6 +12,8 @@
 // Output is JSON on stdout, one object per vector under `vectors`. Deterministic.
 
 import { unixfs } from '@helia/unixfs'
+import { fixedSize } from 'ipfs-unixfs-importer/chunker'
+import { balanced } from 'ipfs-unixfs-importer/layout'
 import { MemoryBlockstore } from 'blockstore-core'
 import { CID } from 'multiformats/cid'
 
@@ -76,4 +78,48 @@ for (const { name, bytes } of inputs) {
   }
 }
 
-process.stdout.write(JSON.stringify({ chunk_size: MiB, vectors }, null, 2) + '\n')
+// Balanced-TREE vectors: above one root's fan-out, @helia/unixfs builds a BALANCED tree of
+// intermediate dag-pb nodes (it batches the leaf stream into groups of `maxChildrenPerNode`,
+// reduces each to a parent node, and recurses until one root remains). At Helia's real defaults
+// (1 MiB leaves, 1024-child fan-out) the first tree needs > 1 GiB of input — impractical to pin.
+// The dag-pb block encoding is INDEPENDENT of the chunk size and the fan-out, so we exercise the
+// EXACT same multi-level tree-building code byte-for-byte with a REDUCED chunk size + fan-out and
+// tiny inputs. Equality of the tree ROOT CID (a Merkle root) transitively proves every
+// intermediate node block is byte-identical to Helia's.
+const treeChunkSize = 256
+const treeFanOut = 4
+const treeImporterSettings = {
+  chunker: fixedSize({ chunkSize: treeChunkSize }),
+  layout: balanced({ maxChildrenPerNode: treeFanOut })
+}
+const treeInputs = [
+  // 5 leaves > fan-out 4 -> 2 levels: root links [node(4 leaves), node(1 leaf)].
+  { name: 'tree_5_leaves', leaves: 5, seed: 0x511 },
+  // 16 leaves -> 2 levels, fully balanced: root links 4 nodes of 4 leaves each.
+  { name: 'tree_16_leaves', leaves: 16, seed: 0x16a },
+  // 17 leaves -> 3 levels: 5 first-level nodes -> batched [4,1] -> 2 second-level nodes -> root.
+  { name: 'tree_17_leaves', leaves: 17, seed: 0x173 },
+  // A non-multiple, partially-filled deep tree.
+  { name: 'tree_21_leaves', leaves: 21, seed: 0x215 }
+]
+const treeVectors = []
+for (const { name, leaves, seed } of treeInputs) {
+  const totalSize = leaves * treeChunkSize - 7 // last leaf partial, so blocksizes vary
+  const bytes = detBytes(totalSize, seed)
+  const rootCid = await fs.addBytes(bytes, treeImporterSettings)
+  treeVectors.push({
+    name,
+    total_size: totalSize,
+    seed,
+    chunk_size: treeChunkSize,
+    max_children: treeFanOut,
+    leaves,
+    root_cid: rootCid.toString(),
+    root_codec: rootCid.code
+  })
+  for await (const { cid } of blockstore.getAll()) {
+    await blockstore.delete(cid)
+  }
+}
+
+process.stdout.write(JSON.stringify({ chunk_size: MiB, vectors, tree_vectors: treeVectors }, null, 2) + '\n')

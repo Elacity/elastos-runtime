@@ -151,18 +151,29 @@ multi-MiB, so the content plane now chunks beyond a single block exactly as `@he
 leaves** under a **dag-pb root** (`bafybei…`), with a single chunk collapsing to its raw leaf
 (`bafkrei…`, Helia `reduceSingleLeafToSelf`). `ContentStore::put_chunked` stores the full block
 graph (leaves + root); `content_capability_fetch_dag` fetches by the **root CID**, verifies the
-root hashes to the requested CID, parses the dag-pb links, fetches + **per-leaf hash-verifies**
-each chunk, and reassembles — checking the UnixFS `filesize` + per-leaf `blocksizes`. It **fails
-closed** on a missing leaf, a tampered leaf or root (hash mismatch), or any length/structure
-mismatch — a corrupt or malicious backend can never substitute, reorder, or truncate content
-under a root the runtime trusts. The dag-pb encoding + root CIDs are pinned **byte-for-byte**
-against the **real Helia importer** by `scripts/dev/unixfs-oracle` (a Node ground-truth oracle
-using `@helia/unixfs` directly) — so a runtime-minted root CID is the SAME identity any IPFS/Helia
-peer resolves to the same bytes. Proven by harness unit tests (oracle goldens for single-chunk
-collapse + 2-/3-leaf dag-pb roots, round-trip, tampered-leaf / missing-leaf / tampered-root
-fail-closed) and a live multi-MiB content-plane gate in the consumer smoke. Remaining: a balanced
-**tree** above one root's fan-out (≈174 leaves / ~174 MiB) — fail-closed today, not guessed
-without an oracle vector.
+root hashes to the requested CID, parses the dag-pb links, fetches + **per-block hash-verifies**
+each child RECURSIVELY, and reassembles — checking the UnixFS `filesize` + per-child `blocksizes`.
+It **fails closed** on a missing block, a tampered block or root (hash mismatch) at ANY tree level,
+or any length/structure mismatch — a corrupt or malicious backend can never substitute, reorder, or
+truncate content under a root the runtime trusts. The dag-pb encoding + root CIDs are pinned
+**byte-for-byte** against the **real Helia importer** by `scripts/dev/unixfs-oracle` (a Node
+ground-truth oracle using `@helia/unixfs` directly) — so a runtime-minted root CID is the SAME
+identity any IPFS/Helia peer resolves to the same bytes.
+
+**Above one node's fan-out (`maxChildrenPerNode` = 1024 in `@helia/unixfs`), the importer builds a
+BALANCED dag-pb TREE** of intermediate nodes over the raw leaves — `unixfs_import` reproduces it
+byte-for-byte (batch the child stream into groups of the fan-out, reduce each to a parent node,
+recurse to one root), with the cumulative `Tsize` (own block + all descendants) and per-level
+`blocksizes` (each child's content `fileSize`) exactly as `ipfs-unixfs-importer` emits them. Because
+the dag-pb encoding is independent of the chunk size + fan-out (and Helia's real first tree needs
+> 1 GiB), the multi-LEVEL tree is pinned byte-for-byte against the oracle at a REDUCED chunk size +
+fan-out — the root CID is a Merkle root, so equality proves every intermediate node block. `fetch`
+recurses through the tree with per-node integrity at every level. Proven by harness unit tests
+(single-chunk collapse + 2-/3-leaf single-root + multi-LEVEL tree oracle goldens, tree round-trip,
+tampered-leaf / missing-leaf / tampered-root / **tampered-intermediate** / **missing-intermediate**
+fail-closed) and LIVE multi-MiB + balanced-tree content-plane gates in the consumer smoke. **The
+content plane is COMPLETE: a file of any size is Helia-byte-compatible end-to-end, fail-closed at
+every block and every tree level.**
 
 **Ownership plane (real-by-default) — the open REALLY asks the chain.** The wallet-ownership
 gate is no longer a static `has_access: true`. The canonical open now drives the **real
@@ -210,12 +221,12 @@ substituted fragment fails the whole open closed; no CEK/plaintext crosses out),
 verify-mode `ddrm-consumer-smoke.sh`. The threshold/quorum rails stay single-segment (a multi-segment
 threshold material is refused up front).
 
-**The runnable-E2E ladder is COMPLETE:** a content-addressed, multi-segment, owned asset opens
-end-to-end with a real distributed key — fetched by CID, released once, decrypted in-VM, fail-closed
-at every seam, no CEK/plaintext on any wire. Remaining (explicitly out of the runnable path): a
-balanced dag-pb **tree** above ~174 leaves (the only fail-closed content-plane gap), and
-multi-segment on the **threshold/quorum** rails (single-node multi-segment is live; the quorum rail
-is single-segment by design today).
+**The runnable-E2E ladder is COMPLETE:** a content-addressed, multi-segment, owned asset of ANY size
+opens end-to-end with a real distributed key — fetched by CID (raw leaf, single dag-pb root, or
+balanced tree), released once, decrypted in-VM, fail-closed at every seam, no CEK/plaintext on any
+wire. The content plane is now size-unbounded (balanced dag-pb tree, Helia-byte-compatible). The one
+remaining item, explicitly out of the runnable path: multi-segment on the **threshold/quorum** rails
+(single-node multi-segment is live; the quorum rail is single-segment by design today).
 
 **Operator runbook:** [`RUN_E2E.md`](./RUN_E2E.md) walks a fresh operator zero → provision dKMS
 node(s) → publish an owned multi-segment asset → open it through the live rail, with the exact
