@@ -40,10 +40,10 @@ chain/IPFS/UI for real, and adding the surfaces.**
 | 1 | Content addressing | importer (`ddrm-runtime-open`), `ipfs-provider` | 🟢 | CIDv1 raw leaves + dag-pb balanced tree, **byte-identical to Helia**, fail-closed | live Kubo pin/serve at scale |
 | 1 | Packaging (non-media) | — | 🔴 | decrypt is content-agnostic | render-tier packaging for pdf/img/epub/3D |
 | 2 | Mint intent + calldata | `publish-provider`, `chain-provider` | 🟢 | `UnsignedMintV1`, PC2-faithful `mint()` ABI calldata, payee/royalty arrays | — |
-| 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🔴 | signing + `eth_sendRawTransaction` exist | live assemble→sign→broadcast flow |
+| 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🟢 | **live `prepare→sign→broadcast` wired** via `wallet_signer`: real EIP-155 RLP+secp256k1 signing inside `wallet-provider` (key never leaves the capsule), nonce/gas from `chain-provider.prepare_transaction`, broadcast through `chain-provider`; proven offline (`chain_mock_wallet_signs`) | EIP-1559 (type-2) txs; mint reuse |
 | 2 | IPFS pin | `ipfs-provider` | 🟡 | contract + addressing | live pin wired into publish |
 | 3 | Marketplace / discovery | `content-market` | 🟢 (offline) | listing from calldata + chain event + metadata | live `eth_getLogs` |
-| 3 | Buy / trade access | `buy_authority`, `wallet-provider`, `chain-provider` | 🟡 | **buy ORCHESTRATION wired** (assemble→broadcast→record→re-check); offline `denied→buy→owned→open` loop proven (chain-mock + ledger); Home auto-buys on a rights-denied open | real `buyAccess` ABI (operator-pinned config today) + live EVM tx signing (same seam as mint) |
+| 3 | Buy / trade access | `buy_authority`, `wallet_signer`, `wallet-provider`, `chain-provider` | 🟡 | **buy assemble→SIGN→broadcast→record→re-check wired**; `ELASTOS_DDRM_BUY_SIGN=wallet` signs inside `wallet-provider` (real signature, key contained); offline `denied→buy→owned→open` loop proven (chain-mock + ledger); Home auto-buys on a rights-denied open | real `buyAccess` ABI (operator-pinned config today); live Base broadcast needs a funded managed account + user-consent approval UI |
 | 4 | Rights check | `rights-provider`, `chain-provider` | 🟢 | real `has_access_by_content_id` (owned→open, not-owned→fail-closed) | — |
 | 4 | Key authority (dKMS) | `key-provider`, `dkms-authority` | 🟢 built | born-distributed DKG, 2-of-2 + 2-of-3, rotatable/reconfigurable, authenticated PQ channel over TCP, quorum attestation | **production multi-node deployment** (ops) |
 | 4 | Lit compat backend | `key-provider` | 🟡 seam-only | operator-selectable slot, fails closed honestly | ship a Lit proxy adapter |
@@ -214,15 +214,28 @@ resolve object + listing/price → assemble buyAccess tx { to, value, data }
   **not-owned → buy → owned → open** end to end, offline, exercising the production
   broadcast path. (`buy_then_open_loop` integration test.)
 - **dev** records the purchase in the ledger and returns a synthetic hash.
-- **chain** assembles the unsigned tx and broadcasts an externally-signed tx
-  (`ELASTOS_DDRM_BUY_SIGNED_TX`), or returns the unsigned tx (`409`) for an external
-  signer. Ownership is read back from `hasAccessByContentId`, never the ledger.
+- **chain** with `ELASTOS_DDRM_BUY_SIGN=wallet` is **genuinely live**: the gateway sources
+  real nonce/gas via `chain-provider.prepare_transaction`, signs inside `wallet-provider`
+  (managed account, key never leaves the capsule), and broadcasts the signed bytes through
+  `chain-provider`. Absent the opt-in it broadcasts an externally-signed tx
+  (`ELASTOS_DDRM_BUY_SIGNED_TX`) or returns the unsigned tx (`409`). Ownership is read back
+  from `hasAccessByContentId`, never the ledger.
+- **Live EVM signing is wired** (`elastos-server/src/api/wallet_signer.rs`): it drives the
+  wallet capsule's own `create → request_signature(transaction_intent) → approve →
+  sign_approved` flow. The real RLP + secp256k1 + keccak signer already lived in
+  `wallet-provider` (`sign_eip155_legacy_transaction`); the gateway only orchestrates it,
+  and `chain-provider.prepare_transaction` emits the exact `unsigned_transaction_intent/v1`
+  the wallet consumes — the two providers compose with no invented fields. Proven offline
+  by the `chain_mock_wallet_signs` integration test (genuine signature → real broadcast).
 - The **Home shell auto-recovers**: a rights-denied open calls `POST /api/market/buy`
   and retries the open once, so a click goes `denied → buy → owned → plays`.
 
-**Still open:** the real Elacity `buyAccess` ABI (config-driven today) and live EVM
-transaction signing — the SAME seam the live mint broadcast is waiting on (no signer in
-the repo yet) — plus wiring a real Base RPC + the production contract/selector.
+**Still open:** the real Elacity `buyAccess` ABI (config-driven today); EIP-1559 (type-2)
+txs (legacy EIP-155 today, accepted by Base); a **funded** managed account + a user-consent
+**approval UI** for live spends (the gateway grants approval inline today, gated behind the
+operator's `ELASTOS_DDRM_BUY_SIGN=wallet` opt-in); and pointing it at a real Base RPC +
+the production contract/selector. The same `wallet_signer` rail now unblocks the live
+**mint** broadcast (stage 2).
 
 ---
 

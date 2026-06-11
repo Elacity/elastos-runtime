@@ -23,3 +23,4 @@ pub mod viewer_gateway;
 pub mod viewer_media;
 pub mod viewer_object;
 pub mod viewer_open;
+pub mod wallet_signer;

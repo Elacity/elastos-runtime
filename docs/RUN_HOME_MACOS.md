@@ -266,12 +266,20 @@ Three modes (shared with `ELASTOS_DDRM_RIGHTS`):
   mock (the production broadcast path runs), then records the purchase in the ledger.
   Pair with the rights gate's `ELASTOS_DDRM_CHAIN_ACCESS=ledger` so a fresh object is
   **not owned → 403**, and **owned → opens** right after the buy. Fully offline.
-- **chain** — assembles the unsigned `{ to, value, data }` against the configured Base
-  contract. EVM transaction signing is the same seam the live mint broadcast is waiting
-  on, so this path broadcasts an **externally-signed** tx (`ELASTOS_DDRM_BUY_SIGNED_TX`)
-  through the real chain-provider, or — absent one — returns the assembled unsigned tx
-  (HTTP `409`) for an external signer. Ownership is then read back from
-  `hasAccessByContentId`, never the ledger.
+- **chain** — assembles the `{ to, value, data }` against the configured Base contract.
+  With **`ELASTOS_DDRM_BUY_SIGN=wallet`** (recommended) the gateway sources real nonce/gas
+  via `chain-provider.prepare_transaction`, signs inside **`wallet-provider`** with a
+  managed secp256k1 account (the key never leaves the capsule), and broadcasts the signed
+  bytes through the real chain-provider — genuinely live, no external signer. Absent that
+  opt-in it broadcasts an **externally-signed** tx (`ELASTOS_DDRM_BUY_SIGNED_TX`), or —
+  absent one — returns the assembled unsigned tx (HTTP `409`). Ownership is then read back
+  from `hasAccessByContentId`, never the ledger.
+
+> **Runtime signing (`ELASTOS_DDRM_BUY_SIGN=wallet`)** also works in **chain-mock**: the
+> wallet capsule signs a well-formed buyAccess tx and the *genuine* signed bytes are
+> broadcast through the in-process RPC mock — proving the whole `prepare → sign → broadcast`
+> rail offline, with the key contained in `wallet-provider`. The managed account is the
+> authoritative buyer, so ownership is recorded under its address.
 
 Prove the whole offline loop (denied → buy → allowed) against the real capsules:
 
@@ -279,6 +287,14 @@ Prove the whole offline loop (denied → buy → allowed) against the real capsu
 cargo build --manifest-path capsules/chain-provider/Cargo.toml
 cargo build --manifest-path capsules/rights-provider/Cargo.toml --features chain-rights
 cargo test -p elastos-server buy_then_open_loop -- --ignored
+```
+
+Prove the **real signing rail** offline (wallet capsule signs, chain-provider broadcasts):
+
+```bash
+cargo build --manifest-path capsules/wallet-provider/Cargo.toml
+cargo build --manifest-path capsules/chain-provider/Cargo.toml
+cargo test -p elastos-server chain_mock_wallet_signs -- --ignored
 ```
 
 ### Overrides (optional)
@@ -300,7 +316,10 @@ cargo test -p elastos-server buy_then_open_loop -- --ignored
 | `ELASTOS_DDRM_CHAIN_ACCESS` | `chain-mock` only: `denied` (not-owned) / `owned` / `ledger` (owned-token ledger) |
 | `ELASTOS_DDRM_OWNED_LEDGER` | Path to the local owned-token ledger (buy flow); default `<temp>/elastos-ddrm-owned-tokens.json` |
 | `ELASTOS_DDRM_BUY_SELECTOR` / `ELASTOS_DDRM_BUY_TO` / `ELASTOS_DDRM_BUY_VALUE` | Operator-pinned `buyAccess` selector / contract / payable value |
-| `ELASTOS_DDRM_BUY_SIGNED_TX` | `chain` mode: an externally-signed buy tx to broadcast |
+| `ELASTOS_DDRM_BUY_SIGN` | `wallet` → sign the buy inside `wallet-provider` with a managed account (key never leaves the capsule); else use `ELASTOS_DDRM_BUY_SIGNED_TX` |
+| `ELASTOS_DDRM_BUY_SIGNED_TX` | `chain` mode (no runtime signing): an externally-signed buy tx to broadcast |
+| `ELASTOS_WALLET_PROVIDER_BIN` | Path to the `wallet-provider` binary (runtime signing) |
+| `ELASTOS_DDRM_WALLET_BASE` | Where `wallet-provider` keeps its managed-key store; default `$HOME/.elastos-ddrm-wallet` |
 
 ### dDRM troubleshooting
 
@@ -310,7 +329,8 @@ cargo test -p elastos-server buy_then_open_loop -- --ignored
 | `rights provider unavailable; cannot authorize open` (503) | `rights-provider` not built with `chain-rights`, or wrong path | Build step 3 above, or set `ELASTOS_RIGHTS_PROVIDER_BIN` |
 | `no valid access token for this content (rights provider denied)` (403) | No access token for this `(content_id, subject)` — the dev deny list, the chain-mock ledger, or the real chain says no | Expected fail-closed behaviour; the Home shell auto-buys + retries, or call `POST /api/market/buy { uri }` |
 | `link an EVM wallet to buy access` (403) | Buy attempted in a chain mode with no linked wallet | Link an EVM account, or set `ELASTOS_DDRM_SUBJECT` |
-| `live buy needs a signed transaction …` (409) | `chain` mode has no `ELASTOS_DDRM_BUY_SIGNED_TX` | Sign the returned `unsigned_tx` externally and resubmit via `ELASTOS_DDRM_BUY_SIGNED_TX` |
+| `live buy needs a signature …` (409) | `chain` mode with no runtime signing and no `ELASTOS_DDRM_BUY_SIGNED_TX` | Opt into runtime signing with `ELASTOS_DDRM_BUY_SIGN=wallet`, or sign the returned `unsigned_tx` externally and resubmit via `ELASTOS_DDRM_BUY_SIGNED_TX` |
+| `wallet-provider not found at …` | runtime signing opted in but the wallet capsule isn't built | `cargo build --manifest-path capsules/wallet-provider/Cargo.toml`, or set `ELASTOS_WALLET_PROVIDER_BIN` |
 | `media-authority helper not found at …` | helper not built, or running a gateway from a different tree | Build step 2 above, run gateway from this repo, or set `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN` |
 | `could not open owned media: … ffmpeg` | `ffmpeg`/`ffprobe` not on `PATH` | `brew install ffmpeg` |
 | Tile missing from launcher | gateway built/run from a different `capsules/` tree | Build + run the gateway from this repo on `feat/ddrm-home-playback` |

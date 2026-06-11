@@ -320,7 +320,7 @@ pub async fn buy_owned_access(
             }
             // A live buy that needs an external signer is a precondition (409), not an
             // outage — surface the assembled tx so the caller can sign it.
-            if err.contains("needs a signed transaction") {
+            if err.contains("needs a signature") || err.contains("needs a signed transaction") {
                 tracing::info!("buy requires external signature: {err}");
                 return (StatusCode::CONFLICT, err).into_response();
             }
