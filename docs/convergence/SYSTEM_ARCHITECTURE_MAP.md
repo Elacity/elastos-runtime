@@ -11,6 +11,11 @@ patterns, conforming to Anders' principles.
 status), `DDRM_DECRYPT_RAIL.md` (the decrypt boundary, now complete behind flags),
 `HANDOVER.md` (day log). This file is the *system* view; those are the *boundary* views.
 
+> **Want the visual, digestible version (birds-eye + diagrams + macOS-vz vs
+> Linux-crosvm)?** See [`ELASTOS_ARCHITECTURE_VISUAL.md`](ELASTOS_ARCHITECTURE_VISUAL.md)
+> — the Mermaid map on top of this dense, line-referenced file. Good for sharing with
+> the team.
+
 ---
 
 ## 1. The PC2 reference journey (what we are replicating the PATTERNS of)
