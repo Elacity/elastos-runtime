@@ -735,6 +735,18 @@ impl ChainProvider {
             Err(response) => return response,
         };
         let data = match method.abi {
+            RightsMethodAbi::HasAccessByContentIdAddressBytes16 => {
+                // Real Base ABI: `hasAccessByContentId(address holder, bytes16 contentId)`.
+                // `right` is gateway-only (binary access on-chain), so it is not encoded.
+                match encode_has_access_by_content_id_address_bytes16(
+                    &method.selector,
+                    subject,
+                    content_id,
+                ) {
+                    Ok(data) => data,
+                    Err(err) => return Response::error("invalid_rights_method", &err),
+                }
+            }
             RightsMethodAbi::HasAccessByContentIdStringAddressString => {
                 match encode_has_access_by_content_id_call(
                     &method.selector,

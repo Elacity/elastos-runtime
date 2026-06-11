@@ -91,10 +91,15 @@ Two tracks run **in parallel**: **make it REAL** (protocol/infra) and **make it 
    leaves `wallet-provider`) → broadcasts via `chain-provider`, exposed at
    `POST /api/create/mint` and sharing the new `chain_tx` rail with buy. Proven offline
    (`chain_mock_mint`). Closes the **Create backend**; a Create portal UI (B4) drives it.
-2. **Align `chain-provider` to the real Base ABIs** *(now, 1 slice).* Swap the guessed
-   `hasAccessByContentId` shape for `(address holder, bytes16 contentId)`; wire the
-   **operative/paymentProcessor** buy path; pin the real addresses from `abis.ts`. Replaces
-   placeholders with truth and de‑risks everything downstream.
+2. **Align `chain-provider` to the real Base ABIs** ✅ *(done).* Added the real
+   `hasAccessByContentId(address holder, bytes16 contentId)` read variant (selector
+   `0x54d42821`) and made the live `chain` path use it (chain‑mock keeps the tolerant
+   string shape for local CIDs); reshaped the buy to the **real `buyAccess(address seller,
+   address ledger, uint256 tokenId, uint256 quantity, uint256 pricePerToken[, address
+   payToken])`** sent to the AuthorityGateway (native `0xf7580ad9` / ERC‑20 USDC
+   `0x0ede2294`, with the `approve(paymentProcessor)` prerequisite flagged); pinned the real
+   Base addresses (AuthorityGateway, USDC) as defaults. All from the `~/.pc2` source. Live
+   listing resolution (seller/price/tokenId) is sourced by the Market portal (B5).
 3. **dKMS 3‑node deployment** *(start NOW — long lead time; runs in parallel).* Stand the PQ
    threshold daemons up on **interserver + contabo + a 3rd** node (you can spin the 3rd when
    ready). This is the **headline "the quantum CEK is real and owned by us"** milestone and

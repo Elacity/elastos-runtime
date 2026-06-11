@@ -48,8 +48,8 @@ chain/IPFS/UI for real, and adding the surfaces.**
 | 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🟢 | **live `prepare→sign→broadcast` wired** via `wallet_signer`: real EIP-155 RLP+secp256k1 signing inside `wallet-provider` (key never leaves the capsule), nonce/gas from `chain-provider.prepare_transaction`, broadcast through `chain-provider`; proven offline (`chain_mock_wallet_signs`) | EIP-1559 (type-2) txs |
 | 2 | IPFS pin | `ipfs-provider` | 🟡 | contract + addressing | live pin wired into publish |
 | 3 | Marketplace / discovery | `content-market` | 🟢 (offline) | listing from calldata + chain event + metadata | live `eth_getLogs` |
-| 3 | Buy / trade access | `buy_authority`, `wallet_signer`, `wallet-provider`, `chain-provider` | 🟡 | **buy assemble→SIGN→broadcast→record→re-check wired**; `ELASTOS_DDRM_BUY_SIGN=wallet` signs inside `wallet-provider` (real signature, key contained); offline `denied→buy→owned→open` loop proven (chain-mock + ledger); Home auto-buys on a rights-denied open | real `buyAccess` ABI (operator-pinned config today); live Base broadcast needs a funded managed account + user-consent approval UI |
-| 4 | Rights check | `rights-provider`, `chain-provider` | 🟢 | real `has_access_by_content_id` (owned→open, not-owned→fail-closed) | — |
+| 3 | Buy / trade access | `buy_authority`, `wallet_signer`, `wallet-provider`, `chain-provider` | 🟡 | **buy assemble→SIGN→broadcast→record→re-check wired** on the **real `buyAccess` ABI** (`buyAccess(address seller,address ledger,uint256 tokenId,uint256 qty,uint256 price[,address payToken])` → AuthorityGateway; native `0xf7580ad9` / ERC‑20 USDC `0x0ede2294`); `ELASTOS_DDRM_BUY_SIGN=wallet` signs inside `wallet-provider`; offline `denied→buy→owned→open` loop proven | live listing resolution (seller/price/tokenId) + the USDC `approve(paymentProcessor)` batch (Market portal B5); funded account + consent UI |
+| 4 | Rights check | `rights-provider`, `chain-provider` | 🟢 | **real Base ABI** `hasAccessByContentId(address holder, bytes16 contentId)` (selector `0x54d42821`) on the live path; defaults to the real AuthorityGateway; chain-mock keeps the tolerant string shape for local CIDs (owned→open, not-owned→fail-closed) | — |
 | 4 | Key authority (dKMS) | `key-provider`, `dkms-authority` | 🟢 built | born-distributed DKG, 2-of-2 + 2-of-3, rotatable/reconfigurable, authenticated PQ channel over TCP, quorum attestation | **production multi-node deployment** (ops) |
 | 4 | Lit compat backend | `key-provider` | 🟡 seam-only | operator-selectable slot, fails closed honestly | ship a Lit proxy adapter |
 | 4 | Decrypt boundary | `decrypt-provider` | 🟢 | in-VM unwrap, multi-segment, single+threshold+quorum rails, `Zeroizing` | — |
@@ -168,18 +168,20 @@ PC2 gates a viewer on **on-chain access-token ownership** (the predicate Lit's
 access-control-conditions wrapped). The runtime reproduces that predicate natively via the
 `chain-provider` capsule, so the answer is owned by us, not Lit.
 
-- **Contract method:** `hasAccessByContentId(string contentId, address subject, string right)
-  → bool` — the AuthorityGateway read. Encoded by `chain-provider/src/abi.rs::
-  encode_has_access_by_content_id_call` and decoded by `decode_evm_bool` (exactly 32 bytes,
-  high bytes zero, last byte 0/1). The selector is **supplied by config**, never computed
-  in-capsule.
-- **`contentId`:** the asset's on-chain content identity == the **bytes16 KID** the producer
-  minted (see `abi.rs::abi_word_bytes16`, "`contentId == KID`", and `mint()` `opRawData`),
-  surfaced as the `string` the read keys on. Must match byte-for-byte or the read fails
-  closed. Local owned files (not real Elacity mints) use the object CID as the identifier;
-  a real purchased asset uses its minted KID/contentId.
-- **`right`:** `view` for render/playback (the same set chain-provider validates:
-  view/stream/download/execute).
+- **Contract method (real Base ABI):** `hasAccessByContentId(address holder, bytes16
+  contentId) → bool` — the AuthorityGateway read, confirmed against `~/.pc2`
+  `contracts/abis.ts` (selector `0x54d42821`). Encoded by `chain-provider/src/abi.rs::
+  encode_has_access_by_content_id_address_bytes16` and decoded by `decode_evm_bool` (exactly
+  32 bytes, high bytes zero, last byte 0/1). The selector + AuthorityGateway address default
+  to the real Base values and are config-overridable; never keccak'd in-capsule. The earlier
+  guessed `(string,address,string)` shape is retained only as a config-selectable fallback
+  (used by the chain-mock loop, where local CIDs aren't `bytes16` KIDs).
+- **`contentId` (`bytes16`):** the asset's on-chain content identity == the **KID** the
+  producer minted (see `abi.rs::abi_word_bytes16`, "`contentId == KID`", and `mint()`
+  `opRawData`). Must be `0x` + 32 hex or the live read fails closed. Local owned files (not
+  real Elacity mints) use the object CID and so route through chain-mock, not the live read.
+- **`right`:** access is **binary per contentId** on-chain, so `right` (view/stream/…) is
+  NOT an on-chain parameter — the gateway keeps it only in the signed decision receipt.
 - **`subject`:** the buyer's EVM wallet address. In Home this is the signed-in principal's
   linked `eip155:` account (`wallet-provider` `accounts`), or `ELASTOS_DDRM_SUBJECT`.
 - **Network/RPC:** Base (chain id 8453) via `ELASTOS_CHAIN_BASE_RPC`; the contract +
@@ -207,11 +209,14 @@ resolve object + listing/price → assemble buyAccess tx { to, value, data }
   → await/record → the rights gate's hasAccessByContentId now reads owned
 ```
 
-- The `buyAccess` **calldata is operator-pinned config** (`ELASTOS_DDRM_BUY_SELECTOR` /
-  `_TO` / `_VALUE`), exactly like the `has_access` and `mint` selectors are pinned from
-  real PC2 source. The arg layout the gateway assembles is a documented, overridable demo
-  default — **no contract signature is guessed as product truth** (the real Elacity
-  AuthorityGateway ABI is not in-repo; it slots in via config when available).
+- The `buyAccess` **calldata is now the real Elacity ABI** (confirmed against `~/.pc2`
+  `wallet.js`): `buyAccess(address seller, address ledger, uint256 tokenId, uint256
+  quantity, uint256 pricePerToken[, address payToken])` sent to the **AuthorityGateway**
+  (default `0x09dBe…`). The 5-arg form pays the native token (`value = price`, selector
+  `0xf7580ad9`); the 6-arg form pays an ERC-20 (USDC default, selector `0x0ede2294`) and
+  requires a prior `approve(paymentProcessor, price)` — the gateway flags this via
+  `requires_erc20_approve`. Listing terms (seller/ledger/tokenId/price/payToken) are
+  overridable via env and are sourced from the real listing by the Market portal (B5).
 - **chain-mock** broadcasts a representative signed tx through the REAL
   `chain-provider.broadcast_transaction` op against an in-process RPC mock, then records
   the purchase in a local owned-token ledger; the chain-mock rights read
@@ -235,7 +240,8 @@ resolve object + listing/price → assemble buyAccess tx { to, value, data }
 - The **Home shell auto-recovers**: a rights-denied open calls `POST /api/market/buy`
   and retries the open once, so a click goes `denied → buy → owned → plays`.
 
-**Still open:** the real Elacity `buyAccess` ABI (config-driven today); EIP-1559 (type-2)
+**Still open:** live listing resolution + the USDC `approve(paymentProcessor)` batch (Market
+portal B5); EIP-1559 (type-2)
 txs (legacy EIP-155 today, accepted by Base); a **funded** managed account + a user-consent
 **approval UI** for live spends (the gateway grants approval inline today, gated behind the
 operator's `ELASTOS_DDRM_BUY_SIGN=wallet` opt-in); and pointing it at a real Base RPC +

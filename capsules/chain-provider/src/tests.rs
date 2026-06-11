@@ -870,6 +870,59 @@ fn has_access_by_content_id_calls_configured_typed_rights_abi() {
 }
 
 #[test]
+fn has_access_by_content_id_address_bytes16_encodes_the_real_base_abi() {
+    // Real Base ABI: hasAccessByContentId(address holder, bytes16 contentId). Two static
+    // words: [holder address][bytes16 KID]. `right` is NOT encoded (binary access on-chain).
+    let selector = "0x54d42821";
+    let subject = "0x0000000000000000000000000000000000000002";
+    let content_id = "0x38691296765e76a331f5d5630bddf9f5"; // 16-byte KID
+
+    let expected_data =
+        encode_has_access_by_content_id_address_bytes16(selector, subject, content_id).unwrap();
+    // selector(4) + 2 words(64) = 68 bytes => 136 hex + "0x".
+    assert_eq!(expected_data.len(), 2 + 2 * 68);
+    assert!(expected_data.starts_with("0x54d42821"));
+
+    let rpc_url = spawn_eth_call_server(
+        expected_data,
+        json!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+    );
+
+    let mut provider = ChainProvider::new();
+    let init = provider.handle(Request::Init {
+        config: json!({
+            "networks": [{
+                "id": "esc-local",
+                "display_name": "ESC Local",
+                "kind": "evm_json_rpc",
+                "chain_id": 20,
+                "native_symbol": "ELA",
+                "provider": "test",
+                "mainnet": false,
+                "explorer_url": null,
+                "rpc_url": rpc_url,
+                "rights_methods": [{
+                    "id": "has_access_by_content_id",
+                    "contract": "0x0000000000000000000000000000000000000001",
+                    "abi": "has_access_by_content_id_address_bytes16",
+                    "selector": selector
+                }]
+            }]
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+
+    let data = ok_data(provider.handle(Request::HasAccessByContentId {
+        network: "esc-local".to_string(),
+        contract: "0x0000000000000000000000000000000000000001".to_string(),
+        content_id: content_id.to_string(),
+        subject: subject.to_string(),
+        right: "view".to_string(),
+    }));
+    assert_eq!(data["has_access"], true);
+}
+
+#[test]
 fn has_access_by_content_id_decodes_unowned_as_false() {
     // The AuthorityGateway returns ABI-encoded `false` for content the subject does
     // NOT own — the rights step must surface that as a real `has_access: false`

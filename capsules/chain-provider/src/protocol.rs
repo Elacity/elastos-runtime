@@ -68,6 +68,11 @@ impl RightsMethod {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RightsMethodAbi {
+    /// Real Base ABI: `hasAccessByContentId(address holder, bytes16 contentId)`
+    /// (selector `0x54d42821`). The production rights read.
+    HasAccessByContentIdAddressBytes16,
+    /// Legacy/guessed `(string,address,string)` shape — kept for config flexibility and
+    /// the local CID-keyed mock loop, but NOT the real Base ABI.
     HasAccessByContentIdStringAddressString,
 }
 

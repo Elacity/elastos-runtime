@@ -24,6 +24,25 @@ pub(super) fn rights_method<'a>(
     Ok(configured)
 }
 
+/// Real Base ABI: `hasAccessByContentId(address holder, bytes16 contentId) -> bool`
+/// (selector `0x54d42821`, confirmed against `~/.pc2` `contracts/abis.ts`). Two static
+/// words: the holder address, then the `bytes16` contentId (KID) left-aligned. PURE: no
+/// RPC, no keys. `right` is NOT an on-chain parameter here — access is binary per
+/// contentId — so the gateway keeps `right` only in the signed decision receipt.
+pub(super) fn encode_has_access_by_content_id_address_bytes16(
+    selector: &str,
+    subject: &str,
+    content_id: &str,
+) -> Result<String, String> {
+    let mut bytes = decode_hex(selector, Some(4), "EVM function selector")?;
+    bytes.extend_from_slice(&abi_word_address(subject)?);
+    bytes.extend_from_slice(&abi_word_bytes16(content_id)?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// Legacy/guessed `hasAccessByContentId(string,address,string)` shape — kept because the
+/// typed ABI is config-selectable, but NOT the real Base ABI. Prefer
+/// `encode_has_access_by_content_id_address_bytes16`.
 pub(super) fn encode_has_access_by_content_id_call(
     selector: &str,
     content_id: &str,

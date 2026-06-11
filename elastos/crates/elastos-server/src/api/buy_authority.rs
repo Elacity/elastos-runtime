@@ -53,14 +53,19 @@ pub struct BuyOutcome {
     pub unsigned_tx: Value,
 }
 
-/// The default demo `buyAccess` selector when none is pinned. NOT a real signature —
-/// only a placeholder so the assembled calldata is well-formed in the offline loop.
-const DEMO_BUY_SELECTOR: &str = "0xb0a00000";
+/// Real Base AuthorityGateway — `buyAccess` is sent here (from `~/.pc2` `wallet.js` /
+/// `abis.ts`), NOT to the operative directly. Default `to` for the buy; overridable.
+const BASE_AUTHORITY_GATEWAY: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
 
-/// A valid placeholder `to` address for the offline (`chain-mock`) signing path when no
-/// real contract address is pinned. The mock never executes the call; this only keeps the
-/// assembled intent well-formed so the wallet capsule's address validation passes.
-const DEMO_BUY_TO: &str = "0x00000000000000000000000000000000000000aa";
+/// Real `buyAccess` selectors (`keccak256(sig)[..4]`, confirmed via `~/.pc2` ethers):
+/// the 5-arg form is paid in the chain's native token (`value = price`); the 6-arg form
+/// adds an ERC-20 `payToken` (USDC on Base) and requires a prior `approve` of the
+/// operative's `paymentProcessor`.
+const BUY_ACCESS_NATIVE_SELECTOR: &str = "0xf7580ad9"; // buyAccess(address,address,uint256,uint256,uint256)
+const BUY_ACCESS_ERC20_SELECTOR: &str = "0x0ede2294"; // + address payToken
+
+/// USDC on Base (6 decimals) — the default Elacity payment token.
+const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 /// Default offline fees for the `chain-mock` wallet-signing path (no RPC to source them).
 /// The mock does not execute the transaction, so these only need to be well-formed.
@@ -203,24 +208,61 @@ pub fn buy_access(
     }
 }
 
-/// Assemble the `buyAccess` transaction the wallet signs. `to`/`value` come from config
-/// (the channel/AuthorityGateway address + the price the listing carries); `data` is the
-/// pinned selector followed by the documented demo arg layout. Pure: no RPC, no keys.
+/// Assemble the REAL `buyAccess` transaction the wallet signs, matching PC2's
+/// `wallet.js`:
+///   `buyAccess(address seller, address ledger, uint256 tokenId, uint256 quantity,
+///              uint256 pricePerToken[, address payToken])`
+/// sent to the AuthorityGateway. The ERC-20 form (default, USDC on Base) carries a
+/// `payToken` and `value = 0` and requires a prior `approve` of the operative's
+/// `paymentProcessor`; the native form omits `payToken` and pays `value = price`.
+///
+/// Listing terms (seller / ledger / tokenId / price / payToken) are sourced from the
+/// marketplace listing in production (the Market portal, B5); here they're overridable via
+/// env so a live buy is byte-correct once a listing is pinned. The `tokenId` defaults to a
+/// 32-byte word derived from `content_id` (the ledger's content-hash tokenId); pin the
+/// real value with `ELASTOS_DDRM_BUY_TOKEN_ID`. Pure: no RPC, no keys.
 fn assemble_buy_tx(content_id: &str, subject: &str) -> Value {
-    let selector = env_nonempty("ELASTOS_DDRM_BUY_SELECTOR").unwrap_or_else(|| DEMO_BUY_SELECTOR.to_string());
-    let to = env_nonempty("ELASTOS_DDRM_BUY_TO").unwrap_or_default();
-    let value = env_nonempty("ELASTOS_DDRM_BUY_VALUE").unwrap_or_else(|| "0x0".to_string());
+    let to = env_nonempty("ELASTOS_DDRM_BUY_TO").unwrap_or_else(|| BASE_AUTHORITY_GATEWAY.to_string());
+    // Default ledger to the AuthorityGateway is wrong; default it to the (overridable)
+    // channel. With no channel pinned we fall back to `to` so calldata stays well-formed.
+    let ledger = env_nonempty("ELASTOS_DDRM_BUY_LEDGER").unwrap_or_else(|| to.clone());
+    let seller = env_nonempty("ELASTOS_DDRM_BUY_SELLER").unwrap_or_else(|| subject.to_string());
+    let quantity = env_nonempty("ELASTOS_DDRM_BUY_QUANTITY").unwrap_or_else(|| "1".to_string());
+    let price = env_nonempty("ELASTOS_DDRM_BUY_PRICE").unwrap_or_else(|| "0".to_string());
+    let pay_token = env_nonempty("ELASTOS_DDRM_BUY_PAYTOKEN").unwrap_or_else(|| BASE_USDC.to_string());
+    let native = pay_token.is_empty() || pay_token.eq_ignore_ascii_case("native");
 
-    // Demo arg layout (documented + overridable; NOT the real ABI): the 4-byte selector,
-    // then three 32-byte words — contentId, subject, amount.
-    let amount = env_nonempty("ELASTOS_DDRM_BUY_AMOUNT").unwrap_or_else(|| "1".to_string());
-    let data = format!(
-        "{}{}{}{}",
-        selector.trim_start_matches("0x"),
-        word_from_id(content_id),
-        word_from_address(subject),
-        word_from_uint(&amount),
-    );
+    // tokenId: a pinned decimal/hex, else derived from content_id.
+    let token_id_word = match env_nonempty("ELASTOS_DDRM_BUY_TOKEN_ID") {
+        Some(t) => word_from_uint(&t),
+        None => word_from_id(content_id),
+    };
+
+    let (selector, value, mut data) = if native {
+        (
+            BUY_ACCESS_NATIVE_SELECTOR.to_string(),
+            // Native payment: value carries the price (decimal wei → hex quantity).
+            price.parse::<u128>().map(|n| format!("0x{n:x}")).unwrap_or_else(|_| "0x0".to_string()),
+            BUY_ACCESS_NATIVE_SELECTOR.trim_start_matches("0x").to_string(),
+        )
+    } else {
+        (
+            BUY_ACCESS_ERC20_SELECTOR.to_string(),
+            "0x0".to_string(),
+            BUY_ACCESS_ERC20_SELECTOR.trim_start_matches("0x").to_string(),
+        )
+    };
+
+    // Args: seller, ledger, tokenId, quantity, pricePerToken[, payToken].
+    data.push_str(&word_from_address(&seller));
+    data.push_str(&word_from_address(&ledger));
+    data.push_str(&token_id_word);
+    data.push_str(&word_from_uint(&quantity));
+    data.push_str(&word_from_uint(&price));
+    if !native {
+        data.push_str(&word_from_address(&pay_token));
+    }
+
     json!({
         "to": to,
         "value": value,
@@ -228,6 +270,12 @@ fn assemble_buy_tx(content_id: &str, subject: &str) -> Value {
         "selector": selector,
         "content_id": content_id,
         "subject": subject,
+        "seller": seller,
+        "ledger": ledger,
+        "pay_token": if native { Value::Null } else { json!(pay_token) },
+        // Production prerequisite for the ERC-20 path (the Market portal batches it):
+        // approve(paymentProcessor, price) on payToken before buyAccess.
+        "requires_erc20_approve": !native,
     })
 }
 
@@ -241,7 +289,7 @@ fn mock_transaction_intent(from: &str, content_id: &str, chain_id: u64) -> Value
         .get("to")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEMO_BUY_TO);
+        .unwrap_or(BASE_AUTHORITY_GATEWAY);
     let value = tx.get("value").and_then(Value::as_str).unwrap_or("0x0");
     let data = tx.get("data").and_then(Value::as_str).unwrap_or("0x");
     json!({
@@ -381,10 +429,15 @@ mod tests {
     #[test]
     fn mock_intent_is_well_formed_for_the_wallet_capsule() {
         let _g = ENV_LOCK.lock().unwrap();
-        // DEMO defaults: no pinned contract -> `to` falls back to the valid placeholder.
-        std::env::remove_var("ELASTOS_DDRM_BUY_TO");
-        std::env::remove_var("ELASTOS_DDRM_BUY_SELECTOR");
-        std::env::remove_var("ELASTOS_DDRM_BUY_VALUE");
+        // No pinned overrides -> `to` defaults to the real AuthorityGateway and the
+        // calldata uses the real ERC-20 `buyAccess` selector (USDC default).
+        for k in [
+            "ELASTOS_DDRM_BUY_TO", "ELASTOS_DDRM_BUY_LEDGER", "ELASTOS_DDRM_BUY_SELLER",
+            "ELASTOS_DDRM_BUY_QUANTITY", "ELASTOS_DDRM_BUY_PRICE", "ELASTOS_DDRM_BUY_PAYTOKEN",
+            "ELASTOS_DDRM_BUY_TOKEN_ID",
+        ] {
+            std::env::remove_var(k);
+        }
 
         let from = "0x00000000000000000000000000000000000000bb";
         let intent = mock_transaction_intent(from, "bafyX", 8453);
@@ -398,11 +451,12 @@ mod tests {
         assert_eq!(intent["wallet_intent"], "transaction_intent");
         assert_eq!(intent["requires_wallet_approval"], true);
         assert_eq!(intent["from"], from);
-        assert_eq!(intent["to"], DEMO_BUY_TO);
+        assert_eq!(intent["to"], BASE_AUTHORITY_GATEWAY);
         assert_eq!(intent["chain_id"], 8453);
         let to = intent["to"].as_str().unwrap().trim_start_matches("0x");
         assert!(to.len() == 40 && to.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(intent["data"].as_str().unwrap().starts_with("0x"));
+        // Real ERC-20 buyAccess selector (default USDC payment).
+        assert!(intent["data"].as_str().unwrap().starts_with("0x0ede2294"));
         assert!(intent["gas_price"].as_str().unwrap().starts_with("0x"));
     }
 

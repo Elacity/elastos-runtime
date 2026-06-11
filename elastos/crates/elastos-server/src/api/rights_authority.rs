@@ -11,10 +11,12 @@
 //! The attestation has three sources, selected by `ELASTOS_DDRM_RIGHTS`:
 //!   - `dev` (default) — a local attestation: owned (the caller already proved local
 //!     ownership) unless the CID is in `ELASTOS_DDRM_DENY_CIDS`. Offline, no chain.
-//!   - `chain` — the REAL `chain-provider` capsule does an `eth_call` of
-//!     `hasAccessByContentId(string,address,string)` against the configured Base
-//!     contract (`ELASTOS_CHAIN_BASE_RPC` + `ELASTOS_DDRM_RIGHTS_CONTRACT` +
-//!     `ELASTOS_DDRM_RIGHTS_SELECTOR`). This is the production path.
+//!   - `chain` — the REAL `chain-provider` capsule does an `eth_call` of the real Base
+//!     `hasAccessByContentId(address holder, bytes16 contentId)` (selector `0x54d42821`)
+//!     against the AuthorityGateway. Network/contract/selector default to the real Base
+//!     values (`~/.pc2` `contracts/abis.ts`) and are overridable via
+//!     `ELASTOS_DDRM_RIGHTS_NETWORK` / `_CONTRACT` / `_SELECTOR`; only
+//!     `ELASTOS_CHAIN_BASE_RPC` is required. This is the production path.
 //!   - `chain-mock` — the REAL `chain-provider` path, but pointed at an in-process
 //!     JSON-RPC mock (no external network) so owned→opens / not-owned→fail-closed can
 //!     be proven locally on a Mac. `ELASTOS_DDRM_CHAIN_ACCESS=denied` flips it to
@@ -51,6 +53,17 @@ const DEV_CHAIN_PROVIDER_BIN: &str = concat!(
 const MOCK_CONTRACT: &str = "0x00000000000000000000000000000000000000aa";
 const MOCK_SELECTOR: &str = "0x12345678";
 const MOCK_NETWORK: &str = "base-local-mock";
+
+/// Real Base mainnet defaults (from `~/.pc2` `packages/access/src/contracts/abis.ts`),
+/// used in `chain` mode when not overridden. The AuthorityGateway is the rights contract;
+/// the selector is `keccak256("hasAccessByContentId(address,bytes16)")[..4]`.
+const BASE_AUTHORITY_GATEWAY: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+const BASE_HAS_ACCESS_SELECTOR: &str = "0x54d42821";
+
+/// The real Base ABI shape for the rights read (`hasAccessByContentId(address,bytes16)`);
+/// `chain-mock` keeps the tolerant string shape because local CIDs aren't `bytes16` KIDs.
+const LIVE_RIGHTS_ABI: &str = "has_access_by_content_id_address_bytes16";
+const MOCK_RIGHTS_ABI: &str = "has_access_by_content_id_string_address_string";
 
 /// The outcome of a rights decision for an owned-object open.
 #[derive(Debug)]
@@ -235,7 +248,7 @@ fn chain_attestation(
 
     // Resolve network/contract/selector/rpc. Real chain REQUIRES all of them; the mock
     // supplies canned contract/selector and stands up its own loopback RPC.
-    let (network, contract, selector, rpc_url, mock_guard) = if mock {
+    let (network, contract, selector, abi, rpc_url, mock_guard) = if mock {
         // The mock's ownership answer, by precedence:
         //   - `ELASTOS_DDRM_CHAIN_ACCESS=denied` -> not owned (force the fail-closed path)
         //   - `ELASTOS_DDRM_CHAIN_ACCESS=owned`  -> owned
@@ -253,18 +266,21 @@ fn chain_attestation(
             MOCK_NETWORK.to_string(),
             MOCK_CONTRACT.to_string(),
             MOCK_SELECTOR.to_string(),
+            MOCK_RIGHTS_ABI.to_string(),
             guard.url.clone(),
             Some(guard),
         )
     } else {
+        // Real Base ABI by default; all three pinnable. Only the RPC URL has no sane
+        // default (it's deployment-specific), so it stays required.
         let network = env_nonempty("ELASTOS_DDRM_RIGHTS_NETWORK").unwrap_or_else(|| "base".to_string());
         let contract = env_nonempty("ELASTOS_DDRM_RIGHTS_CONTRACT")
-            .ok_or("ELASTOS_DDRM_RIGHTS_CONTRACT (rights contract address) is required for chain mode")?;
+            .unwrap_or_else(|| BASE_AUTHORITY_GATEWAY.to_string());
         let selector = env_nonempty("ELASTOS_DDRM_RIGHTS_SELECTOR")
-            .ok_or("ELASTOS_DDRM_RIGHTS_SELECTOR (has_access selector, e.g. 0x........) is required for chain mode")?;
+            .unwrap_or_else(|| BASE_HAS_ACCESS_SELECTOR.to_string());
         let rpc_url = env_nonempty("ELASTOS_CHAIN_BASE_RPC")
             .ok_or("ELASTOS_CHAIN_BASE_RPC (Base RPC URL) is required for chain mode")?;
-        (network, contract, selector, rpc_url, None)
+        (network, contract, selector, LIVE_RIGHTS_ABI.to_string(), rpc_url, None)
     };
     let chain_id: i64 = env_nonempty("ELASTOS_DDRM_CHAIN_ID")
         .and_then(|s| s.parse().ok())
@@ -285,7 +301,7 @@ fn chain_attestation(
             "rights_methods": [{
                 "id": "has_access_by_content_id",
                 "contract": contract,
-                "abi": "has_access_by_content_id_string_address_string",
+                "abi": abi,
                 "selector": selector,
             }]
         }]}

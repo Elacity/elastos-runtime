@@ -329,13 +329,14 @@ cargo test -p elastos-server chain_mock_mint -- --ignored
 | `ELASTOS_DDRM_RIGHTS` | Ownership source: `dev` (default), `chain-mock`, or `chain` |
 | `ELASTOS_CHAIN_PROVIDER_BIN` | Path to the chain-provider binary (chain modes) |
 | `ELASTOS_CHAIN_BASE_RPC` | Base RPC URL (`chain` mode) |
-| `ELASTOS_DDRM_RIGHTS_CONTRACT` | Rights/AuthorityGateway contract address (`chain` mode) |
-| `ELASTOS_DDRM_RIGHTS_SELECTOR` | `hasAccessByContentId` 4-byte selector, e.g. `0x........` (`chain` mode) |
+| `ELASTOS_DDRM_RIGHTS_CONTRACT` | Rights/AuthorityGateway contract address (`chain` mode); default real Base AuthorityGateway `0x09dBe…` |
+| `ELASTOS_DDRM_RIGHTS_SELECTOR` | `hasAccessByContentId(address,bytes16)` 4-byte selector (`chain` mode); default `0x54d42821` (the real Base selector) |
 | `ELASTOS_DDRM_RIGHTS_NETWORK` / `ELASTOS_DDRM_CHAIN_ID` | Network id (default `base`) / chain id (default `8453`) |
 | `ELASTOS_DDRM_SUBJECT` | Pin the on-chain wallet `subject` (else the principal's linked EVM account) |
 | `ELASTOS_DDRM_CHAIN_ACCESS` | `chain-mock` only: `denied` (not-owned) / `owned` / `ledger` (owned-token ledger) |
 | `ELASTOS_DDRM_OWNED_LEDGER` | Path to the local owned-token ledger (buy flow); default `<temp>/elastos-ddrm-owned-tokens.json` |
-| `ELASTOS_DDRM_BUY_SELECTOR` / `ELASTOS_DDRM_BUY_TO` / `ELASTOS_DDRM_BUY_VALUE` | Operator-pinned `buyAccess` selector / contract / payable value |
+| `ELASTOS_DDRM_BUY_TO` | `buyAccess` target; default real Base AuthorityGateway `0x09dBe…` |
+| `ELASTOS_DDRM_BUY_LEDGER` / `_SELLER` / `_TOKEN_ID` / `_QUANTITY` / `_PRICE` / `_PAYTOKEN` | Real `buyAccess(seller,ledger,tokenId,quantity,pricePerToken[,payToken])` listing terms; `_PAYTOKEN` defaults to USDC on Base (set `native`/empty for native-token payment). Sourced from the live listing by the Market portal in production |
 | `ELASTOS_DDRM_BUY_SIGN` | `wallet` → sign the buy inside `wallet-provider` with a managed account (key never leaves the capsule); else use `ELASTOS_DDRM_BUY_SIGNED_TX` |
 | `ELASTOS_DDRM_BUY_SIGNED_TX` | `chain` mode (no runtime signing): an externally-signed buy tx to broadcast |
 | `ELASTOS_DDRM_MINT_SELECTOR` | Operator-pinned `mint(string,uint16,bytes,bytes)` 4-byte selector; default `0x47cbeeb4` (the real Base selector) |
