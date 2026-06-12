@@ -190,7 +190,12 @@ fn key_release_request() -> Value {
 
 /// Rebuild the canonical decrypt-transcript AAD exactly as the decrypt boundary will,
 /// using the SHARED `ddrm-envelope` encoder (no parallel definition).
-fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<u8> {
+fn transcript_aad(
+    session_pub: &[u8],
+    content_hash: &[u8],
+    nonce: &[u8],
+    node_set_id: Option<&[u8]>,
+) -> Vec<u8> {
     let receipt_hash = release_receipt_hash(
         RR_SCHEMA,
         RR_REQUEST_ID,
@@ -217,9 +222,10 @@ fn transcript_aad(session_pub: &[u8], content_hash: &[u8], nonce: &[u8]) -> Vec<
         release_receipt_hash: receipt_hash,
         decrypt_session_pub: session_pub,
         nonce,
-        // Single-node producer rail — no threshold node-set to bind (the encoding stays
-        // byte-identical to the pre-threshold transcript).
-        node_set_id: None,
+        // On the LIVE quorum rail this binds the 2-of-3 node-set identity into the transcript
+        // (the decrypt boundary recomputes the identical AAD from the material); `None` keeps
+        // the single-node rail byte-identical to the pre-threshold transcript.
+        node_set_id,
     }
     .to_aad()
 }
@@ -381,7 +387,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // --- authority: recover the escrowed CEK + re-seal it to the published key. ------
     let content_hash = b"producer-smoke-content-hash-0001".to_vec(); // 32 bytes
     let nonce = b"producer-smoke-nonce-1".to_vec();
-    let aad = transcript_aad(&session_pub, &content_hash, &nonce);
+    let aad = transcript_aad(&session_pub, &content_hash, &nonce, None);
 
     let release = ok_data(
         &key.call(&json!({
@@ -446,9 +452,237 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// A complete `KeyReleaseRequestV1` carrying the REAL minted KID + the producer's escrowed
+/// share-1 (the live quorum recover keys on these). Mirrors [`key_release_request`] but with
+/// the values seal_inline_threshold actually produced.
+fn key_release_request_live(kid_hex: &str, wrapped_cek_b64: &str, scheme: &str) -> Value {
+    json!({
+        "schema": "elastos.key_release.request/v1",
+        "request_id": RR_REQUEST_ID,
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "object_cid": OBJECT_CID,
+        "action": ACTION,
+        "rights_receipt": fallback_rights_receipt(),
+        "key_envelope": {
+            "scheme": scheme,
+            "kid": kid_hex,
+            "wrapped_cek": wrapped_cek_b64,
+            "policy_hash": "sha256:producer-live",
+            "algorithms": {
+                "cipher": "aes-256-gcm",
+                "signature": ["ed25519", "ml-dsa-65"],
+                "kem": ["x25519", "ml-kem-768"],
+                "share_scheme": "shamir-t-of-n",
+            },
+        },
+        "reason": "open content sealed in this run",
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+/// LIVE producer vertical: mint a CEK NOW, escrow it to the REAL 2-of-3 dKMS quorum (the
+/// shares sealed to the nodes' published recipients, the CEK never assembled in the producer
+/// boundary), then drive the REAL `key-provider` (dkms backend) to recover 2-of-3 from the
+/// LIVE nodes over the authenticated PQ channel and re-seal to the decrypt boundary, which
+/// decrypts the segment sealed in THIS run. The runtime spawns NO daemons and performs NO
+/// destructive op — it only READS the public descriptor and uses the allow-listed caller seed.
+fn run_live(
+    encrypt_bin: &str,
+    key_bin: &str,
+    decrypt_bin: &str,
+    descriptor_path: &str,
+    caller_seed_b64: &str,
+) -> Result<(), String> {
+    println!("== dDRM producer-half LIVE smoke (encrypt[threshold-escrow] -> key[dkms 2-of-3 recover] -> decrypt) ==");
+
+    // --- read the PUBLIC-ONLY dkms descriptor: the 3 quorum nodes, in node-set order. ---
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("read descriptor {descriptor_path}: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor: {e}"))?;
+    if desc.get("authority_master_seed_b64").is_some() {
+        return Err("descriptor carries a master seed — it must be PUBLIC-ONLY (the secret stays in the node)".to_string());
+    }
+    let nodes_v = desc
+        .get("threshold")
+        .and_then(|t| t.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or("descriptor has no threshold.nodes array")?;
+    if nodes_v.len() != 3 {
+        return Err(format!(
+            "the live producer vertical requires a 3-node 2-of-3 descriptor; got {}",
+            nodes_v.len()
+        ));
+    }
+    let mut node_vks: Vec<String> = Vec::with_capacity(3);
+    let mut node_json: Vec<Value> = Vec::with_capacity(3);
+    for (i, n) in nodes_v.iter().enumerate() {
+        let vk = n
+            .get("verifying_key_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("node {i} missing verifying_key_b64"))?
+            .to_string();
+        let recipient = n
+            .get("recipient_pub_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("node {i} missing recipient_pub_b64"))?
+            .to_string();
+        node_json.push(json!({ "verifying_key_b64": vk, "recipient_pub_b64": recipient }));
+        node_vks.push(vk);
+    }
+    step(1, "descriptor: PUBLIC-ONLY 2-of-3 dkms quorum read (3 node identities + recipients, in node-set order)");
+
+    // --- producer: mint a CEK NOW, CENC-encrypt, SPLIT + escrow each share to its LIVE node. ---
+    let mut encrypt = Capsule::spawn("encrypt-provider", encrypt_bin)?;
+    let enc_init = ok_data(&encrypt.call(&json!({ "op": "init" }))?, "encrypt init")?;
+    let producer_vk_b64 = enc_init["producer_verifying_key_b64"]
+        .as_str()
+        .ok_or("encrypt-provider published no producer vk (build --features escrow)")?
+        .to_string();
+    let sealed = ok_data(
+        &encrypt.call(&json!({
+            "op": "seal_inline_threshold",
+            "plaintext_b64": B64.encode(PLAINTEXT),
+            "nodes": node_json,
+        }))?,
+        "encrypt seal_inline_threshold",
+    )?;
+    encrypt.shutdown();
+
+    let kid_hex = sealed["kid_hex"].as_str().ok_or("no kid_hex")?.to_string();
+    let scheme = sealed["scheme"].as_str().ok_or("no scheme")?.to_string();
+    let segment_b64 = sealed["segment_b64"].as_str().ok_or("no segment")?.to_string();
+    let node_set_id_b64 = sealed["node_set_id_b64"].as_str().ok_or("no node_set_id")?.to_string();
+    let node_set_id = B64.decode(&node_set_id_b64).map_err(|e| e.to_string())?;
+    let shares = sealed["shares"].as_array().ok_or("no shares")?;
+    if shares.len() != 3 {
+        return Err("expected 3 sealed shares".to_string());
+    }
+    // shares are ordered x=1,2,3 == node1,node2,node3 (the descriptor's node-set order).
+    let share_wrapped = |i: usize| -> Result<String, String> {
+        shares[i]["wrapped_share_b64"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("share {i} missing wrapped_share_b64"))
+    };
+    let share1 = share_wrapped(0)?;
+    let share2 = share_wrapped(1)?;
+    let share3 = share_wrapped(2)?;
+    if serde_json::to_string(&sealed).unwrap_or_default().contains(&B64.encode(PLAINTEXT)) {
+        return Err("plaintext leaked in the seal_inline_threshold response".to_string());
+    }
+    step(2, &format!(
+        "encrypt-provider: minted CEK in-boundary, CENC-encrypted, SHAMIR-split + sealed 3 shares to the live nodes; kid={kid_hex} (CEK never whole, no plaintext on the wire)"
+    ));
+
+    // --- decrypt boundary: pin ALL THREE node identities, mint + publish a session key. ---
+    let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
+    let dec_init = ok_data(
+        &decrypt.call(&json!({
+            "op": "init",
+            "config": {
+                "authority_vk_b64": node_vks[0],
+                "authority_vk2_b64": node_vks[1],
+                "authority_vk3_b64": node_vks[2],
+            }
+        }))?,
+        "decrypt init",
+    )?;
+    let session_pub_b64 = dec_init["decrypt_session_public_key_b64"]
+        .as_str()
+        .ok_or("decrypt-provider published no session key (build --features rail-material)")?
+        .to_string();
+    let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
+    step(3, "decrypt-provider: pinned all 3 node identities; minted + published an in-sandbox session key");
+
+    // --- key-provider (dkms backend): recover 2-of-3 from the LIVE nodes + re-seal. ---
+    let content_hash = b"producer-live-content-hash-0001".to_vec(); // 32 bytes
+    let nonce = b"producer-live-nonce-1".to_vec();
+    let aad = transcript_aad(&session_pub, &content_hash, &nonce, Some(&node_set_id));
+
+    let mut key = Capsule::spawn("key-provider", key_bin)?;
+    ok_data(
+        &key.call(&json!({
+            "op": "init",
+            "config": {
+                "backend": "dkms",
+                "dkms_authority_descriptor": descriptor_path,
+                "dkms_caller_seed_b64": caller_seed_b64,
+            }
+        }))?,
+        "key init (dkms)",
+    )?;
+    let request = key_release_request_live(&kid_hex, &share1, &scheme);
+    let session_ctx = json!({
+        "decrypt_session_pub_b64": session_pub_b64,
+        // All three shares were signed by the SAME in-boundary producer identity.
+        "producer_vk_b64": producer_vk_b64,
+        "producer_vk2_b64": producer_vk_b64,
+        "producer_vk3_b64": producer_vk_b64,
+        "aad_b64": B64.encode(&aad),
+        "ciphertext_b64": segment_b64,
+        "content_hash_b64": B64.encode(&content_hash),
+        "nonce_b64": B64.encode(&nonce),
+        "wrapped_cek_share2_b64": share2,
+        "wrapped_cek_share3_b64": share3,
+        "now_unix": NOW_UNIX,
+    });
+    let release = ok_data(
+        &key.call(&json!({ "op": "release", "request": request, "session": session_ctx }))?,
+        "key release (dkms 2-of-3)",
+    )?;
+    key.shutdown();
+    let material = release["material"].clone();
+    if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
+        return Err(format!("key-provider returned no sealed material: {release}"));
+    }
+    let release_str = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+    if release_str.contains(&share1) || release_str.contains(&share2) || release_str.contains(&share3) {
+        return Err("an escrowed share blob was echoed by the key authority".to_string());
+    }
+    step(4, "key-provider(dkms): recovered the CEK from ANY TWO live nodes over the authenticated PQ channel + re-sealed it to the session (no raw CEK, no escrow echo; no single node ever saw the whole key)");
+
+    // --- decrypt: reconstruct the CEK in-VM from the 2-of-3 re-sealed shares + decrypt. ---
+    let open = decrypt.call(&json!({
+        "op": "open_session_v1",
+        "request": decrypt_request(),
+        "material": material,
+        "now_unix": NOW_UNIX,
+    }))?;
+    let open_data = ok_data(&open, "decrypt open_session_v1")?;
+    if open_data["decision"].as_str() != Some("opened") {
+        return Err(format!("decrypt did not open the session: {open}"));
+    }
+    if open_data["session"]["sample_count"].as_u64() != Some(EXPECTED_SAMPLE_COUNT) {
+        return Err(format!("decrypt sample_count mismatch: {open}"));
+    }
+    if serde_json::to_string(&open).unwrap_or_default().contains(&B64.encode(PLAINTEXT)) {
+        return Err("plaintext leaked in the decrypt-provider response".to_string());
+    }
+    decrypt.shutdown();
+    step(5, "decrypt-provider: reconstructed the CEK in-VM from the 2-of-3 re-sealed shares and DECRYPTED the freshly-sealed segment");
+
+    println!();
+    println!("RESULT: a CEK minted NOW, escrowed to the LIVE 2-of-3 dKMS quorum, recovered 2-of-3, re-sealed and used to decrypt the segment sealed in THIS run.");
+    println!("        No raw CEK, no share blob, and no plaintext crossed a process boundary. No golden, no Lit.");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let result = if let Some(pos) = args.iter().position(|a| a == "--live") {
+        let pre = &args[..pos];
+        let post = &args[pos + 1..];
+        if pre.len() < 3 || post.len() < 2 {
+            Err("usage: ddrm-producer-smoke <encrypt-bin> <key-bin> <decrypt-bin> --live <descriptor.json> <caller_seed_b64>".to_string())
+        } else {
+            run_live(&pre[0], &pre[1], &pre[2], &post[0], &post[1])
+        }
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("ddrm-producer-smoke: {e}");

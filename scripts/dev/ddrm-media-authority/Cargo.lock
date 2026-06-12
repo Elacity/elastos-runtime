@@ -184,6 +184,7 @@ dependencies = [
  "ctr",
  "ddrm-envelope",
  "rand",
+ "serde",
  "serde_json",
 ]
 

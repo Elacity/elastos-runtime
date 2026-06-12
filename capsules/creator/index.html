@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Create</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --surface: #ffffff;
+        --line: #e4e7ec;
+        --text: #14181f;
+        --muted: #5b6472;
+        --accent: #2f6bff;
+        --accent-weak: #eaf0ff;
+        --ok: #1f9d57;
+        --err: #d23b3b;
+        --radius: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+      }
+      main {
+        width: 100%;
+        max-width: 560px;
+        padding: 28px 22px 56px;
+      }
+      header h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -0.01em; }
+      header p { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+      input[type="text"], input[type="number"], textarea, select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 14px;
+        background: #fff;
+        color: var(--text);
+      }
+      textarea { resize: vertical; min-height: 64px; }
+      .row { display: flex; gap: 12px; }
+      .row > div { flex: 1; }
+      .field { margin-bottom: 14px; }
+      .field:last-child { margin-bottom: 0; }
+      .drop {
+        border: 1.5px dashed var(--line);
+        border-radius: var(--radius);
+        padding: 26px 18px;
+        text-align: center;
+        color: var(--muted);
+        cursor: pointer;
+        transition: border-color .15s, background .15s;
+      }
+      .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-weak); }
+      .drop strong { color: var(--text); display: block; font-size: 14px; }
+      .drop .meta { font-size: 12px; margin-top: 4px; }
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: var(--accent-weak);
+        color: var(--accent);
+        margin-left: 6px;
+      }
+      button.primary {
+        width: 100%;
+        border: 0;
+        border-radius: 10px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 13px;
+        cursor: pointer;
+      }
+      button.primary:disabled { background: #b9c6e8; cursor: not-allowed; }
+      .steps { list-style: none; padding: 0; margin: 0; }
+      .steps li {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        padding: 7px 0;
+      }
+      .steps li .dot {
+        width: 16px; height: 16px; border-radius: 50%;
+        border: 2px solid var(--line); flex: none;
+      }
+      .steps li.active { color: var(--text); }
+      .steps li.active .dot { border-color: var(--accent); }
+      .steps li.done .dot { border-color: var(--ok); background: var(--ok); }
+      .steps li.err { color: var(--err); }
+      .steps li.err .dot { border-color: var(--err); background: var(--err); }
+      .status { font-size: 13px; margin-top: 14px; min-height: 18px; }
+      .status.err { color: var(--err); }
+      .status.ok { color: var(--ok); }
+      .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+      .hidden { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Create</h1>
+        <p>Mint an asset to your own quorum &mdash; PQ custody, no Lit.</p>
+      </header>
+
+      <section class="card">
+        <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a file">
+          <strong id="drop-title">Choose a file</strong>
+          <div class="meta" id="drop-meta">media or any document &middot; click or drop</div>
+          <input id="file" type="file" class="hidden" />
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="field">
+          <label for="title">Title</label>
+          <input id="title" type="text" placeholder="My asset" />
+        </div>
+        <div class="field">
+          <label for="desc">Description</label>
+          <textarea id="desc" placeholder="What is it?"></textarea>
+        </div>
+        <div class="field row">
+          <div>
+            <label for="price">Price</label>
+            <input id="price" type="number" min="0" step="0.0001" value="0" />
+          </div>
+          <div>
+            <label for="currency">Currency</label>
+            <select id="currency">
+              <option value="ELA">ELA</option>
+              <option value="USDC">USDC</option>
+              <option value="ETH">ETH</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="channel">Channel</label>
+          <input id="channel" type="text" placeholder="dev channel address (0x...)" />
+          <div class="hint">Leave blank to use the runtime's default dev channel.</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <button id="mint" class="primary" disabled>Mint</button>
+        <ul class="steps" id="steps">
+          <li data-step="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
+          <li data-step="publish"><span class="dot"></span> Assemble mint</li>
+          <li data-step="sign"><span class="dot"></span> Sign with wallet</li>
+          <li data-step="broadcast"><span class="dot"></span> Broadcast</li>
+        </ul>
+        <div id="status" class="status"></div>
+      </section>
+    </main>
+    <script src="creator.js"></script>
+  </body>
+</html>

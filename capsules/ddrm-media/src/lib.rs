@@ -20,6 +20,7 @@
 //! decrypt-provider sandbox, and only one segment's plaintext is ever in flight.
 
 pub mod mp4;
+pub mod mpd;
 pub mod rail;
 pub mod seal;
 

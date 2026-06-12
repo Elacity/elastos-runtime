@@ -1894,6 +1894,7 @@ fn publish_escrow(
     nodes: u8,
     node3_store_path: &str,
     node3_endpoint: &str,
+    live_descriptor: Option<&Value>,
 ) -> Result<PublishEscrow, String> {
     // PROVISION the selected authority and read its PUBLISHED identity (stable vk + recipient).
     //
@@ -1925,6 +1926,32 @@ fn publish_escrow(
                 .to_string();
             key.shutdown();
             (recipient, None)
+        }
+        AuthorityBackend::Dkms if live_descriptor.is_some() => {
+            // LIVE AUTHORITIES: provision NOTHING. Read each node's PINNED public identity + endpoint
+            // from the already-published descriptor and escrow to those recipients. The descriptor is
+            // copied verbatim to `descriptor_path` so the open path (and its public-only/threshold
+            // assertions) consume the exact bytes the operator published for the live quorum.
+            let desc = live_descriptor.unwrap();
+            let live_nodes = desc["threshold"]["nodes"].as_array()
+                .ok_or("live descriptor has no threshold.nodes")?;
+            if live_nodes.len() != 3 {
+                return Err(format!("live descriptor must list exactly 3 quorum nodes, found {}", live_nodes.len()));
+            }
+            let field = |n: &Value, k: &str| -> Result<String, String> {
+                n.get(k).and_then(Value::as_str).map(str::to_string)
+                    .ok_or_else(|| format!("live descriptor node missing `{k}`"))
+            };
+            let vk_a = field(&live_nodes[0], "verifying_key_b64")?;
+            let recipient_a = field(&live_nodes[0], "recipient_pub_b64")?;
+            let extras = vec![
+                (field(&live_nodes[1], "verifying_key_b64")?, field(&live_nodes[1], "recipient_pub_b64")?),
+                (field(&live_nodes[2], "verifying_key_b64")?, field(&live_nodes[2], "recipient_pub_b64")?),
+            ];
+            let bytes = serde_json::to_vec_pretty(desc).map_err(|e| e.to_string())?;
+            std::fs::write(descriptor_path, bytes)
+                .map_err(|e| format!("write live dkms authority descriptor: {e}"))?;
+            (recipient_a, Some((vk_a, extras)))
         }
         AuthorityBackend::Dkms => {
             let node_bin = dkms_node_bin.ok_or("dkms backend requires a dkms_authority_bin in the config")?;
@@ -5035,6 +5062,20 @@ struct OpenConfig {
     /// endpoints in the published descriptor) and drives the whole rail — including the encrypted
     /// channel + the network adversarial gates — over TCP. Requires `backend == dkms`.
     dkms_transport: DkmsTransport,
+    /// LIVE AUTHORITIES MODE (`authority.live_descriptor`): a path to an EXISTING PUBLIC-ONLY v2
+    /// descriptor naming ALREADY-RUNNING remote authority daemons (the production quorum). When set,
+    /// the runtime does NOT provision or spawn any node — it reads each node's pinned identity +
+    /// endpoint from the descriptor, escrows the CEK shares to those PUBLISHED recipients, and
+    /// delegates recovery to the live nodes over their real endpoints. Requires `backend == dkms`,
+    /// `transport == tcp`, `threshold == true`, `nodes == 3` (the 2-of-3 quorum), and `mode == open`
+    /// — it is STRICTLY NON-DESTRUCTIVE (no daemon kill/restart, no rotation/revocation/reshare), so
+    /// the verify-mode adversarial gates (which mutate/kill nodes) are refused against production.
+    live_descriptor: Option<String>,
+    /// The runtime's ALLOW-LISTED caller seed for live mode (`authority.dkms_caller_seed_path`): a
+    /// path to a file holding the base64 of the 32-byte seed whose ML-DSA identity every live node
+    /// allow-lists. Read by PATH (never inlined) so the secret never lands in the config or in Debug.
+    /// Required when `live_descriptor` is set.
+    dkms_caller_seed_path: Option<String>,
 }
 
 impl OpenConfig {
@@ -5056,8 +5097,8 @@ impl OpenConfig {
         // `backend` tag + (for dkms) the node binary + optional `threshold`/`transport` knobs are
         // read. Absent → reference (back-compat). Fail-closed on an unknown tag or a non-object
         // `authority`.
-        let (authority, dkms_authority_bin, threshold, nodes, dkms_transport) = match obj.get("authority") {
-            None => (AuthorityBackend::Reference, None, false, 2u8, DkmsTransport::Unix),
+        let (authority, dkms_authority_bin, threshold, nodes, dkms_transport, live_descriptor, dkms_caller_seed_path) = match obj.get("authority") {
+            None => (AuthorityBackend::Reference, None, false, 2u8, DkmsTransport::Unix, None, None),
             Some(Value::Object(auth)) => {
                 let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
                     "reference" => AuthorityBackend::Reference,
@@ -5066,8 +5107,22 @@ impl OpenConfig {
                     other => return Err(format!("config `authority.backend` must be \"reference\", \"dkms\", or \"lit\", got {other:?}")),
                 };
                 let node_bin = auth.get("dkms_authority_bin").and_then(Value::as_str).map(str::to_string);
-                if backend == AuthorityBackend::Dkms && node_bin.as_deref().map(str::trim).unwrap_or("").is_empty() {
-                    return Err("config `authority.dkms_authority_bin` is required when authority.backend is \"dkms\"".to_string());
+                // LIVE AUTHORITIES MODE: the nodes already run remotely, so the node BINARY is not
+                // needed (nothing is spawned). The caller seed PATH is.
+                let live_descriptor = auth.get("live_descriptor").and_then(Value::as_str).map(str::to_string);
+                let dkms_caller_seed_path = auth.get("dkms_caller_seed_path").and_then(Value::as_str).map(str::to_string);
+                let is_live = live_descriptor.as_deref().map(str::trim).map(|s| !s.is_empty()).unwrap_or(false);
+                if backend == AuthorityBackend::Dkms
+                    && !is_live
+                    && node_bin.as_deref().map(str::trim).unwrap_or("").is_empty()
+                {
+                    return Err("config `authority.dkms_authority_bin` is required when authority.backend is \"dkms\" (unless authority.live_descriptor is set)".to_string());
+                }
+                if is_live && backend != AuthorityBackend::Dkms {
+                    return Err("config `authority.live_descriptor` requires `authority.backend` == \"dkms\"".to_string());
+                }
+                if is_live && dkms_caller_seed_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    return Err("config `authority.dkms_caller_seed_path` is required when authority.live_descriptor is set (the runtime's allow-listed caller identity)".to_string());
                 }
                 let threshold = match auth.get("threshold") {
                     None => false,
@@ -5103,7 +5158,21 @@ impl OpenConfig {
                 if dkms_transport == DkmsTransport::Tcp && backend != AuthorityBackend::Dkms {
                     return Err("config `authority.transport` == \"tcp\" requires `authority.backend` == \"dkms\" (it addresses the external node daemons)".to_string());
                 }
-                (backend, node_bin, threshold, nodes, dkms_transport)
+                // LIVE AUTHORITIES MODE constraints — the production quorum is reached over TCP, is a
+                // 2-of-3 threshold, and the flow is STRICTLY NON-DESTRUCTIVE. Reject anything that would
+                // mutate or kill the live nodes (verify-mode gates) — fail closed.
+                if is_live {
+                    if dkms_transport != DkmsTransport::Tcp {
+                        return Err("config `authority.live_descriptor` requires `authority.transport` == \"tcp\" (live nodes listen on tcp endpoints)".to_string());
+                    }
+                    if !threshold || nodes != 3 {
+                        return Err("config `authority.live_descriptor` requires `authority.threshold` == true and `authority.nodes` == 3 (the live 2-of-3 quorum)".to_string());
+                    }
+                    if mode != OpenMode::Open {
+                        return Err("config `authority.live_descriptor` requires `mode` == \"open\": live mode is strictly non-destructive, so the verify-mode gates (which kill/rotate/revoke nodes) are refused against the production quorum".to_string());
+                    }
+                }
+                (backend, node_bin, threshold, nodes, dkms_transport, live_descriptor, dkms_caller_seed_path)
             }
             Some(_) => return Err("config `authority` must be an object".to_string()),
         };
@@ -5121,6 +5190,8 @@ impl OpenConfig {
             threshold,
             nodes,
             dkms_transport,
+            live_descriptor,
+            dkms_caller_seed_path,
         })
     }
 }
@@ -5168,38 +5239,89 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     let key_store_path = work_dir.join("authority-key-store.json").to_string_lossy().into_owned();
     let descriptor_path = work_dir.join("dkms-authority.json");
     let fixture_path = work_dir.join("publish-escrow.json");
+    // LIVE AUTHORITIES MODE: load the EXISTING public-only descriptor naming the already-running
+    // remote quorum. Nothing is provisioned or spawned — the runtime reads each node's pinned
+    // identity + real endpoint from here, escrows to those PUBLISHED recipients, and delegates
+    // recovery to the live nodes. The master never exists on this host.
+    let live_descriptor: Option<Value> = match cfg.live_descriptor.as_deref() {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("read live descriptor {path}: {e}"))?;
+            let desc: Value = serde_json::from_slice(&bytes).map_err(|e| format!("parse live descriptor {path}: {e}"))?;
+            if desc.get("authority_master_seed_b64").is_some() {
+                return Err("the live descriptor carries a master seed — it must be PUBLIC-ONLY (the secret stays in each node)".to_string());
+            }
+            let live_nodes = desc["threshold"]["nodes"].as_array()
+                .ok_or("live descriptor has no threshold.nodes block (expected the 2-of-3 quorum)")?;
+            if live_nodes.len() != 3 {
+                return Err(format!("live descriptor must list exactly 3 quorum nodes, found {}", live_nodes.len()));
+            }
+            Some(desc)
+        }
+        None => None,
+    };
+    let is_live = live_descriptor.is_some();
+    // In live mode the endpoints come from the descriptor (the real remote nodes); otherwise they are
+    // freshly picked local listeners for the to-be-spawned daemons.
+    let live_endpoint = |i: usize| -> Result<String, String> {
+        live_descriptor.as_ref().unwrap()["threshold"]["nodes"][i]["authority_endpoint"]
+            .as_str().map(str::to_string)
+            .ok_or_else(|| format!("live descriptor node {i} has no authority_endpoint"))
+    };
     // The dKMS NODE's master store — node-local, the SECRET stays here. The runtime creates it via
     // the node at provision time + names it in the env the node reads, but NEVER reads it itself.
+    // (Unused in live mode — no node is provisioned here.)
     let node_store_path = work_dir.join("dkms-node-master.json").to_string_lossy().into_owned();
     // The node's listening ENDPOINT — the runtime CONNECTS here (it does not own the node's
     // process). Published as the descriptor `authority_endpoint`. Day 105–108: on the `tcp`
     // transport this is a REAL loopback network address (`tcp:127.0.0.1:PORT`) instead of a
     // Unix-domain socket path — the node taken off localhost's filesystem boundary.
-    let node_sock_path = match cfg.dkms_transport {
-        DkmsTransport::Unix => work_dir.join("dkms-authority.sock").to_string_lossy().into_owned(),
-        DkmsTransport::Tcp => pick_tcp_endpoint()?,
+    let node_sock_path = match (is_live, cfg.dkms_transport) {
+        (true, _) => live_endpoint(0)?,
+        (false, DkmsTransport::Unix) => work_dir.join("dkms-authority.sock").to_string_lossy().into_owned(),
+        (false, DkmsTransport::Tcp) => pick_tcp_endpoint()?,
     };
     // 2-of-2 THRESHOLD (Day 99–100): node B's OWN node-local master store + listening endpoint
     // (distinct from node A's). Used only when `cfg.threshold` — each node holds ONLY its own share.
     let node2_store_path = work_dir.join("dkms-node-b-master.json").to_string_lossy().into_owned();
-    let node2_sock_path = match cfg.dkms_transport {
-        DkmsTransport::Unix => work_dir.join("dkms-authority-b.sock").to_string_lossy().into_owned(),
-        DkmsTransport::Tcp => pick_tcp_endpoint()?,
+    let node2_sock_path = match (is_live, cfg.dkms_transport) {
+        (true, _) => live_endpoint(1)?,
+        (false, DkmsTransport::Unix) => work_dir.join("dkms-authority-b.sock").to_string_lossy().into_owned(),
+        (false, DkmsTransport::Tcp) => pick_tcp_endpoint()?,
     };
     // 2-of-3 QUORUM (Day 113–116): node C's OWN node-local master store + listening endpoint.
     // Used only when `cfg.nodes == 3` — the third secret-holder the rail can survive losing.
     let node3_store_path = work_dir.join("dkms-node-c-master.json").to_string_lossy().into_owned();
-    let node3_sock_path = match cfg.dkms_transport {
-        DkmsTransport::Unix => work_dir.join("dkms-authority-c.sock").to_string_lossy().into_owned(),
-        DkmsTransport::Tcp => pick_tcp_endpoint()?,
+    let node3_sock_path = match (is_live, cfg.dkms_transport) {
+        (true, _) => live_endpoint(2)?,
+        (false, DkmsTransport::Unix) => work_dir.join("dkms-authority-c.sock").to_string_lossy().into_owned(),
+        (false, DkmsTransport::Tcp) => pick_tcp_endpoint()?,
     };
     // The runtime's OWN stable caller identity (Day 95–96): a per-run seed → a KNOWN ML-DSA identity
     // the node's allow-list recognizes. The same seed is handed to the key-provider (so the RAIL
     // connects as this known caller) AND to the adversarial probe (so its happy path is allow-listed);
     // the node's allow-list is provisioned with this identity's PUBLIC key. NOT a secret the node
     // holds — the runtime legitimately holds its own identity key (never the dKMS master or a CEK).
-    let caller_seed = ddrm_envelope::random_seed();
-    let caller_seed_b64 = B64.encode(caller_seed);
+    // LIVE MODE: the caller identity is NOT freshly minted — it must be the seed the live nodes
+    // already allow-list, read by PATH so the secret never lands in the config. Otherwise (local
+    // provisioning) a per-run seed is fine: the runtime allow-lists it on the daemons it spawns.
+    let caller_seed_b64 = match cfg.dkms_caller_seed_path.as_deref() {
+        Some(path) if is_live => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("read caller seed {path}: {e}"))?;
+            let seed_b64 = raw.trim().to_string();
+            let seed = B64.decode(seed_b64.as_bytes())
+                .map_err(|e| format!("caller seed at {path} is not valid base64: {e}"))?;
+            if seed.len() != 32 {
+                return Err(format!("caller seed at {path} decoded to {} bytes, expected 32", seed.len()));
+            }
+            seed_b64
+        }
+        _ => B64.encode(ddrm_envelope::random_seed()),
+    };
+    let caller_seed: [u8; 32] = B64.decode(caller_seed_b64.as_bytes())
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "caller seed must be 32 bytes".to_string())?;
     let (_caller_signer, caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
     let caller_vk_b64 = B64.encode(&caller_vk);
     // The OPERATOR identity (Day 109–112): a per-run ML-DSA keypair PINNED into every node daemon at
@@ -5208,9 +5330,10 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // way a real deployment's operator console would; the NODES hold only the public identity.
     let (operator_signer, operator_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
     let operator_vk_b64 = B64.encode(&operator_vk);
-    if cfg.authority == AuthorityBackend::Dkms {
+    if cfg.authority == AuthorityBackend::Dkms && !is_live {
         // Grant the node DAEMON its store via the env it resolves — the key-provider client that
         // connects to the node never passes or sees this path; it's the node's own concern.
+        // (Live mode spawns no daemon, so there is no store to grant.)
         std::env::set_var("DKMS_AUTHORITY_KEY_STORE", &node_store_path);
     }
     let escrow = publish_escrow(
@@ -5228,6 +5351,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         cfg.nodes,
         &node3_store_path,
         &node3_sock_path,
+        live_descriptor.as_ref(),
     )?;
     // For `dkms`, START the external NODE DAEMON listening on its socket BEFORE the rail comes up, so
     // the key-provider can CONNECT to it (rather than spawn it). The guard kills + reaps it on any
@@ -5235,7 +5359,9 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     // `mut` (and no leading underscore): the node-fault gates KILL + RESTART these guards to prove the
     // live rail fails closed when a secret-holder goes down. On non-threshold/reference paths they are
     // held only for their Drop (teardown) — referenced via the gates below so no unused warning.
-    let mut dkms_daemon = if cfg.authority == AuthorityBackend::Dkms {
+    // LIVE MODE: the nodes already run remotely — the runtime spawns NOTHING and holds no daemon
+    // guard (it must never kill a production node). Otherwise it brings up local daemons it owns.
+    let mut dkms_daemon = if cfg.authority == AuthorityBackend::Dkms && !is_live {
         let node_bin = cfg
             .dkms_authority_bin
             .as_deref()
@@ -5248,7 +5374,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
     };
     // 2-of-2 THRESHOLD: ALSO start node B's daemon (its own store/socket, the SAME known caller
     // allow-listed) so the key-provider's dual-recover can reach BOTH secret-holders.
-    let mut dkms_daemon_b = if cfg.authority == AuthorityBackend::Dkms && cfg.threshold {
+    let mut dkms_daemon_b = if cfg.authority == AuthorityBackend::Dkms && cfg.threshold && !is_live {
         let node_bin = cfg
             .dkms_authority_bin
             .as_deref()
@@ -5258,7 +5384,7 @@ fn run(cfg: &OpenConfig) -> Result<(), String> {
         None
     };
     // 2-of-3 QUORUM: ALSO start node C's daemon — the third secret-holder the quorum gates kill.
-    let mut dkms_daemon_c = if cfg.authority == AuthorityBackend::Dkms && cfg.nodes == 3 {
+    let mut dkms_daemon_c = if cfg.authority == AuthorityBackend::Dkms && cfg.nodes == 3 && !is_live {
         let node_bin = cfg
             .dkms_authority_bin
             .as_deref()

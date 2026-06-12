@@ -106,6 +106,32 @@ async fn setup_server_infrastructure_impl(
     let device_key_hex = hex::encode(device_key.as_ref());
     let mut provider_cid = "sha256:unavailable".to_string();
     let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
+        // OPERATOR/DEV OVERRIDE (Principle #6 — explicit operator boundary): when the
+        // operator EXPLICITLY points at a provider binary via `ELASTOS_<NAME>_BIN`, that
+        // env is itself an explicit trust decision, so we honor it WITHOUT the signed
+        // installed-manifest check. That check only covers verified install platforms
+        // (currently linux); a macOS dev host has no manifest entry. This stays principled
+        // because it is narrow (one named binary the operator chose), loud (warns), and
+        // NON-AMBIENT (#3) — with no env set, the default install path still fails closed.
+        let env_name = format!(
+            "ELASTOS_{}_BIN",
+            name.to_ascii_uppercase().replace('-', "_")
+        );
+        if let Some(override_path) = std::env::var_os(&env_name) {
+            let same = std::fs::canonicalize(&override_path)
+                .ok()
+                .zip(std::fs::canonicalize(path).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+            if same {
+                tracing::warn!(
+                    "{name}: trusting operator-provided binary from {env_name} WITHOUT manifest \
+                     verification (explicit dev override) — {}",
+                    path.display()
+                );
+                return Ok(());
+            }
+        }
         let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
         tracing::info!(
             "{} binary verified against installed manifest ({})",
@@ -518,6 +544,89 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
             }
         }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("encrypt-provider") {
+        if let Err(e) = verify_provider_binary("encrypt-provider", &path) {
+            tracing::warn!("Skipping encrypt-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let encrypt_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "encrypt"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("encrypt", encrypt_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://encrypt sub-provider: {}", e);
+                    }
+                    tracing::info!("encrypt-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn encrypt-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "encrypt-provider binary is not installed; the Create portal mint path will fail closed"
+        );
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("publish-provider") {
+        if let Err(e) = verify_provider_binary("publish-provider", &path) {
+            tracing::warn!("Skipping publish-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let publish_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "publish"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("publish", publish_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://publish sub-provider: {}", e);
+                    }
+                    tracing::info!("publish-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn publish-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "publish-provider binary is not installed; the Create portal mint path will fail closed"
+        );
+    }
+
+    // media-provider (Create portal, video/audio): the runtime-native analogue of PC2's
+    // ffmpeg transcode + DASH fragmentation. Holds NO key material — it returns PLAINTEXT
+    // segments + track metadata; CENC + dKMS escrow happen in encrypt-provider. ffmpeg path
+    // + scratch dir come from the operator config `ELASTOS_MEDIA_PROVIDER_CONFIG` (inherited
+    // by the spawned child); unconfigured ⇒ the provider's `package` op fails closed.
+    if let Some(path) = crate::find_installed_provider_binary("media-provider") {
+        if let Err(e) = verify_provider_binary("media-provider", &path) {
+            tracing::warn!("Skipping media-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let media_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "media"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("media", media_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://media sub-provider: {}", e);
+                    }
+                    tracing::info!("media-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn media-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "media-provider binary is not installed; the Create portal media (video/audio) path will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("net-provider") {

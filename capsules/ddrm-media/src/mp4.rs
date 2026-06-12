@@ -20,6 +20,8 @@
 
 use aes::cipher::{KeyIvInit, StreamCipher};
 
+use crate::mpd::{SegmentInfo, TrackInfo, TrackKind};
+
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 #[derive(Debug, Clone, Copy)]
@@ -430,4 +432,666 @@ pub fn avc_codec_string(init: &[u8]) -> String {
 
 fn find_bytes(buf: &[u8], needle: &[u8; 4]) -> Option<usize> {
     buf.windows(4).position(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// fMP4 metadata extraction — a faithful port of PC2
+// `pc2-node/src/services/media/mp4split.ts` (`extractTrackInfo` / `parseTrak` /
+// `parseCodecString` / `parseMoofTrackId` / `parseMoofDuration` + the
+// `splitFragmentedMP4` driver). Produces the exact [`TrackInfo`]/[`SegmentInfo`]
+// the [`crate::mpd`] generator consumes, so the emitted MPD matches PC2's.
+//
+// Visual/audio SampleEntry fixed-byte prefixes (ISO/IEC 14496-12 §8.5.2), copied
+// from PC2's constants so codec-string offsets line up byte-for-byte.
+// ---------------------------------------------------------------------------
+const VISUAL_SAMPLE_ENTRY_FIXED_BYTES: usize = 78;
+const AUDIO_SAMPLE_ENTRY_FIXED_BYTES: usize = 28;
+
+/// The result of parsing a fragmented MP4's structure: tracks (with bandwidth
+/// computed), the ordered media segments, and the presentation duration (seconds).
+#[derive(Debug, Clone)]
+pub struct FragmentMetadata {
+    pub tracks: Vec<TrackInfo>,
+    pub segments: Vec<SegmentInfo>,
+    pub total_duration: f64,
+}
+
+fn read_u32(d: &[u8], at: usize) -> Option<u32> {
+    d.get(at..at + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u16(d: &[u8], at: usize) -> Option<u16> {
+    d.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+}
+
+/// `splitFragmentedMP4` (metadata half): walk the boxes, extract tracks from
+/// `moov`, accumulate per-segment timing from each `moof`, then compute each
+/// track's bandwidth and the overall presentation duration exactly like PC2.
+pub fn parse_fragment_metadata(data: &[u8]) -> Result<FragmentMetadata, String> {
+    let mut tracks: Vec<TrackInfo> = Vec::new();
+    let mut segments: Vec<SegmentInfo> = Vec::new();
+    // Parallel to `segments`: each segment's byte length, for bandwidth math.
+    let mut seg_bytes: Vec<(u32, u64)> = Vec::new();
+
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let Some(h) = read_box_header(data, pos) else { break };
+        if h.size < 8 || pos + h.size > data.len() {
+            break;
+        }
+        match &h.box_type {
+            b"ftyp" | b"moov" | b"free" | b"skip" => {
+                if &h.box_type == b"moov" {
+                    tracks = extract_track_info(data, pos, h.size);
+                }
+                pos += h.size;
+            }
+            b"moof" => {
+                let moof_end = pos + h.size;
+                let next = read_box_header(data, moof_end);
+                let seg_end = match next {
+                    Some(n) if &n.box_type == b"mdat" => moof_end + n.size,
+                    _ => moof_end,
+                };
+                let content_start = pos + h.header_size;
+                let track_id = parse_moof_track_id(data, content_start, moof_end);
+                let (duration, _sample_count) = parse_moof_duration(data, content_start, moof_end);
+                segments.push(SegmentInfo { track_id, duration });
+                seg_bytes.push((track_id, (seg_end - pos) as u64));
+                pos = seg_end;
+            }
+            _ => pos += h.size,
+        }
+    }
+
+    // Per-track byte + duration totals → bandwidth = round(bytes*8*timescale/dur).
+    for track in tracks.iter_mut() {
+        let total_bytes: u64 = seg_bytes
+            .iter()
+            .filter(|(tid, _)| *tid == track.track_id)
+            .map(|(_, b)| *b)
+            .sum();
+        let total_dur: u64 = segments
+            .iter()
+            .filter(|s| s.track_id == track.track_id)
+            .map(|s| s.duration)
+            .sum();
+        if total_dur > 0 {
+            let bw = (total_bytes as f64 * 8.0 * track.timescale as f64) / total_dur as f64;
+            track.bandwidth = bw.round() as u64;
+        }
+    }
+
+    // Presentation duration follows the primary (video, else first) track.
+    let mut total_duration = 0.0f64;
+    let primary = tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Video)
+        .or_else(|| tracks.first());
+    if let Some(p) = primary {
+        let dur: u64 = segments
+            .iter()
+            .filter(|s| s.track_id == p.track_id)
+            .map(|s| s.duration)
+            .sum();
+        if p.timescale > 0 {
+            total_duration = dur as f64 / p.timescale as f64;
+        }
+    }
+
+    Ok(FragmentMetadata {
+        tracks,
+        segments,
+        total_duration,
+    })
+}
+
+/// `extractTrackInfo` — parse every `trak` under a `moov`.
+fn extract_track_info(data: &[u8], moov_off: usize, moov_size: usize) -> Vec<TrackInfo> {
+    let mut tracks = Vec::new();
+    let moov_end = moov_off + moov_size;
+    let mut pos = moov_off + 8;
+    while pos < moov_end {
+        let Some(h) = read_box_header(data, pos) else { break };
+        if h.size < 8 || pos + h.size > moov_end {
+            break;
+        }
+        if &h.box_type == b"trak" {
+            if let Some(track) = parse_trak(data, pos + h.header_size, pos + h.size) {
+                tracks.push(track);
+            }
+        }
+        pos += h.size;
+    }
+    tracks
+}
+
+/// `parseTrak` — `tkhd` (id/dims), `mdhd` (timescale), `hdlr` (kind), `stsd`
+/// (codec + audio params). Version-dependent offsets mirror PC2 exactly.
+fn parse_trak(data: &[u8], start: usize, end: usize) -> Option<TrackInfo> {
+    let (tkhd_off, tkhd_h) = find_box(data, start, end, b"tkhd")?;
+    let tkhd_content = tkhd_off + tkhd_h.header_size;
+    let version = *data.get(tkhd_content)?;
+    let (track_id, width, height) = if version == 1 {
+        (
+            read_u32(data, tkhd_content + 20)?,
+            read_u32(data, tkhd_content + 84)? >> 16,
+            read_u32(data, tkhd_content + 88)? >> 16,
+        )
+    } else {
+        (
+            read_u32(data, tkhd_content + 12)?,
+            read_u32(data, tkhd_content + 76)? >> 16,
+            read_u32(data, tkhd_content + 80)? >> 16,
+        )
+    };
+
+    let (mdia_off, mdia_h) = find_box(data, start, end, b"mdia")?;
+    let mdia_content = mdia_off + mdia_h.header_size;
+    let mdia_end = mdia_off + mdia_h.size;
+
+    let mut timescale = 90000u32;
+    if let Some((mdhd_off, mdhd_h)) = find_box(data, mdia_content, mdia_end, b"mdhd") {
+        let mdhd_content = mdhd_off + mdhd_h.header_size;
+        let mdhd_version = *data.get(mdhd_content)?;
+        timescale = if mdhd_version == 1 {
+            read_u32(data, mdhd_content + 20)?
+        } else {
+            read_u32(data, mdhd_content + 12)?
+        };
+    }
+
+    let mut handler_type = *b"vide";
+    if let Some((hdlr_off, hdlr_h)) = find_box(data, mdia_content, mdia_end, b"hdlr") {
+        let h_at = hdlr_off + hdlr_h.header_size + 8;
+        if let Some(slice) = data.get(h_at..h_at + 4) {
+            handler_type.copy_from_slice(slice);
+        }
+    }
+    let kind = match &handler_type {
+        b"vide" => TrackKind::Video,
+        b"soun" => TrackKind::Audio,
+        _ => return None,
+    };
+
+    let (minf_off, minf_h) = find_box(data, mdia_content, mdia_end, b"minf")?;
+    let (stbl_off, stbl_h) = find_box(
+        data,
+        minf_off + minf_h.header_size,
+        minf_off + minf_h.size,
+        b"stbl",
+    )?;
+    let stsd = find_box(
+        data,
+        stbl_off + stbl_h.header_size,
+        stbl_off + stbl_h.size,
+        b"stsd",
+    );
+
+    let mut codec = "unknown".to_string();
+    let mut audio_sample_rate: Option<u32> = None;
+    let mut audio_channels: Option<u32> = None;
+    if let Some((stsd_off, stsd_h)) = stsd {
+        codec = parse_codec_string(data, stsd_off, stsd_h.size);
+        if kind == TrackKind::Audio {
+            let entry_start = stsd_off + 16;
+            if let Some(entry_box) = read_box_header(data, entry_start) {
+                let base = entry_start + entry_box.header_size;
+                audio_channels = read_u16(data, base + 16).map(u32::from);
+                audio_sample_rate = read_u32(data, base + 24).map(|v| v >> 16);
+            }
+        }
+    }
+
+    let (width, height) = if kind == TrackKind::Video && width > 0 {
+        (Some(width), Some(height))
+    } else {
+        (None, None)
+    };
+    // PC2 only records audio params when a sample rate was found.
+    let (audio_sample_rate, audio_channels) = match audio_sample_rate {
+        Some(rate) => (Some(rate), audio_channels),
+        None => (None, None),
+    };
+
+    Some(TrackInfo {
+        track_id,
+        kind,
+        codec,
+        timescale,
+        width,
+        height,
+        bandwidth: 0,
+        audio_sample_rate,
+        audio_channels,
+    })
+}
+
+/// `parseCodecString` — emit MSE-valid codec strings (`avc1.640028`, `mp4a.40.2`,
+/// `av01.0.05M.08`, …) from the first sample entry, byte-faithful to PC2.
+fn parse_codec_string(data: &[u8], stsd_off: usize, stsd_size: usize) -> String {
+    let content_start = stsd_off + 16;
+    if content_start >= stsd_off + stsd_size {
+        return "unknown".to_string();
+    }
+    let Some(entry) = read_box_header(data, content_start) else {
+        return "unknown".to_string();
+    };
+    let fourcc = entry.box_type;
+    let is_audio_entry = matches!(&fourcc, b"mp4a" | b"Opus" | b"fLaC" | b"enca");
+    let child_start = content_start
+        + entry.header_size
+        + if is_audio_entry {
+            AUDIO_SAMPLE_ENTRY_FIXED_BYTES
+        } else {
+            VISUAL_SAMPLE_ENTRY_FIXED_BYTES
+        };
+    let child_end = content_start + entry.size;
+
+    match &fourcc {
+        b"avc1" | b"avc3" => {
+            if let Some((avc_c_off, avc_c_h)) = find_box(data, child_start, child_end, b"avcC") {
+                let p = avc_c_off + avc_c_h.header_size;
+                if let (Some(&profile), Some(&compat), Some(&level)) =
+                    (data.get(p + 1), data.get(p + 2), data.get(p + 3))
+                {
+                    return format!("avc1.{profile:02x}{compat:02x}{level:02x}");
+                }
+            }
+            String::from_utf8_lossy(&fourcc).into_owned()
+        }
+        b"hev1" | b"hvc1" => String::from_utf8_lossy(&fourcc).into_owned(),
+        b"av01" => {
+            if let Some((av1_c_off, av1_c_h)) = find_box(data, child_start, child_end, b"av1C") {
+                let p = av1_c_off + av1_c_h.header_size;
+                if let (Some(&b1), Some(&b2)) = (data.get(p + 1), data.get(p + 2)) {
+                    let profile = (b1 >> 5) & 0x7;
+                    let level = b1 & 0x1f;
+                    let tier = (b2 >> 7) & 0x1;
+                    let high_bitdepth = (b2 >> 6) & 0x1;
+                    let twelve_bit = (b2 >> 5) & 0x1;
+                    let bit_depth = if twelve_bit == 1 {
+                        12
+                    } else if high_bitdepth == 1 {
+                        10
+                    } else {
+                        8
+                    };
+                    let tier_ch = if tier == 1 { 'H' } else { 'M' };
+                    return format!("av01.{profile}.{level:02}{tier_ch}.{bit_depth:02}");
+                }
+            }
+            "av01.0.01M.08".to_string()
+        }
+        b"mp4a" => "mp4a.40.2".to_string(),
+        b"Opus" => "opus".to_string(),
+        b"fLaC" => "flac".to_string(),
+        _ => String::from_utf8_lossy(&fourcc).into_owned(),
+    }
+}
+
+/// `parseMoofTrackId` — the `tfhd.track_ID`.
+fn parse_moof_track_id(data: &[u8], moof_content_start: usize, moof_end: usize) -> u32 {
+    let Some((traf_off, traf_h)) = find_box(data, moof_content_start, moof_end, b"traf") else {
+        return 0;
+    };
+    let Some((tfhd_off, tfhd_h)) =
+        find_box(data, traf_off + traf_h.header_size, traf_off + traf_h.size, b"tfhd")
+    else {
+        return 0;
+    };
+    read_u32(data, tfhd_off + tfhd_h.header_size + 4).unwrap_or(0)
+}
+
+/// `parseMoofDuration` — sum the `trun` per-sample durations (falling back to the
+/// `tfhd` default_sample_duration), returning `(duration, sample_count)`.
+fn parse_moof_duration(data: &[u8], moof_content_start: usize, moof_end: usize) -> (u64, u32) {
+    let Some((traf_off, traf_h)) = find_box(data, moof_content_start, moof_end, b"traf") else {
+        return (0, 0);
+    };
+    let traf_inner = traf_off + traf_h.header_size;
+    let traf_box_end = traf_off + traf_h.size;
+
+    let mut default_duration = 0u32;
+    if let Some((tfhd_off, tfhd_h)) = find_box(data, traf_inner, traf_box_end, b"tfhd") {
+        let tfhd_content = tfhd_off + tfhd_h.header_size;
+        if let Some(flags) = read_u32(data, tfhd_content) {
+            let flags = flags & 0x00FF_FFFF;
+            let mut o = tfhd_content + 8;
+            if flags & 0x1 != 0 {
+                o += 8;
+            }
+            if flags & 0x2 != 0 {
+                o += 4;
+            }
+            if flags & 0x8 != 0 {
+                default_duration = read_u32(data, o).unwrap_or(0);
+            }
+        }
+    }
+
+    let Some((trun_off, trun_h)) = find_box(data, traf_inner, traf_box_end, b"trun") else {
+        return (0, 0);
+    };
+    let trun_content = trun_off + trun_h.header_size;
+    let Some(flags) = read_u32(data, trun_content) else {
+        return (0, 0);
+    };
+    let flags = flags & 0x00FF_FFFF;
+    let sample_count = read_u32(data, trun_content + 4).unwrap_or(0);
+
+    let has_duration = flags & 0x100 != 0;
+    let has_size = flags & 0x200 != 0;
+    let has_flags = flags & 0x400 != 0;
+    let has_cto = flags & 0x800 != 0;
+
+    let mut offset = trun_content + 8;
+    if flags & 0x1 != 0 {
+        offset += 4;
+    }
+    if flags & 0x4 != 0 {
+        offset += 4;
+    }
+    let entry_size = (has_duration as usize + has_size as usize + has_flags as usize + has_cto as usize) * 4;
+
+    let mut total_duration = 0u64;
+    for _ in 0..sample_count {
+        if has_duration {
+            total_duration += read_u32(data, offset).unwrap_or(default_duration) as u64;
+        } else {
+            total_duration += default_duration as u64;
+        }
+        offset += entry_size;
+    }
+
+    (total_duration, sample_count)
+}
+
+/// A single demuxed track ready for the DASH directory layout: its descriptor, a
+/// STANDALONE init segment (`ftyp` + a `moov` carrying ONLY this `trak` + its `trex`),
+/// and the ordered PLAINTEXT media fragments (`moof`+`mdat`) belonging to this track.
+#[derive(Debug, Clone)]
+pub struct TrackStream {
+    pub info: TrackInfo,
+    pub init: Vec<u8>,
+    pub segments: Vec<Vec<u8>>,
+}
+
+/// Demux a fragmented MP4 into PER-TRACK streams — the runtime analogue of PC2
+/// `mp4split`'s track separation. Each stream gets its OWN init (a `moov` reduced to a
+/// single `trak` + matching `trex`) and the fragments whose `moof.tfhd.track_ID` matches.
+///
+/// This is what separate DASH video/audio `AdaptationSet`s require: a player attaches
+/// each `Representation`'s init to its own MSE `SourceBuffer`, so a combined (multi-`trak`)
+/// init would mis-initialize the buffer. The fragments are returned UNENCRYPTED — CENC +
+/// dKMS escrow remain the encrypt-provider's job (PRINCIPLE #15).
+pub fn demux_tracks(data: &[u8]) -> Result<Vec<TrackStream>, String> {
+    let boxes = top_level_boxes(data)?;
+    let (moov_off, moov_h) = boxes
+        .iter()
+        .copied()
+        .find(|(_, h)| &h.box_type == b"moov")
+        .ok_or("no moov box — input is not an initialized fragmented MP4")?;
+    let ftyp_bytes: Vec<u8> = match boxes.iter().copied().find(|(_, h)| &h.box_type == b"ftyp") {
+        Some((off, h)) => data[off..off + h.size].to_vec(),
+        None => Vec::new(),
+    };
+
+    let tracks = extract_track_info(data, moov_off, moov_h.size);
+    if tracks.is_empty() {
+        return Err("moov has no video/audio tracks".into());
+    }
+
+    // Collect the flat media fragments once, tagged by their moof's track_id.
+    let mut frags: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut i = 0usize;
+    while i < boxes.len() {
+        let (off, h) = boxes[i];
+        if &h.box_type == b"moof" {
+            let moof_end = off + h.size;
+            let Some((mdat_off, mdat_h)) = boxes.get(i + 1).copied() else {
+                return Err(format!("moof at {off} has no following box"));
+            };
+            if &mdat_h.box_type != b"mdat" {
+                return Err(format!(
+                    "expected mdat after moof at {off}, found {}",
+                    String::from_utf8_lossy(&mdat_h.box_type)
+                ));
+            }
+            let end = mdat_off + mdat_h.size;
+            let tid = parse_moof_track_id(data, off + h.header_size, moof_end);
+            frags.push((tid, data[off..end].to_vec()));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut out: Vec<TrackStream> = Vec::with_capacity(tracks.len());
+    for info in &tracks {
+        let moov = build_per_track_moov(data, moov_off, moov_h, info.track_id);
+        let mut init = ftyp_bytes.clone();
+        init.extend_from_slice(&moov);
+        let segments: Vec<Vec<u8>> = frags
+            .iter()
+            .filter(|(tid, _)| *tid == info.track_id)
+            .map(|(_, f)| f.clone())
+            .collect();
+
+        // Per-track bandwidth = round(bytes·8·timescale / duration), over THIS track's
+        // fragments (the same formula parse_fragment_metadata uses, scoped to the track).
+        let mut stream = TrackStream {
+            info: info.clone(),
+            init,
+            segments,
+        };
+        let timescale = stream.info.timescale.max(1) as f64;
+        let total_bytes: u64 = stream.segments.iter().map(|f| f.len() as u64).sum();
+        let total_dur: u64 = stream
+            .segments
+            .iter()
+            .map(|f| match read_box_header(f, 0) {
+                Some(h) => parse_moof_duration(f, h.header_size, h.size).0,
+                None => 0,
+            })
+            .sum();
+        if total_dur > 0 {
+            stream.info.bandwidth =
+                ((total_bytes as f64 * 8.0 * timescale) / total_dur as f64).round() as u64;
+        }
+        out.push(stream);
+    }
+    Ok(out)
+}
+
+/// Rebuild a `moov` carrying only the `trak` for `target_id` (+ its `trex`), so the
+/// resulting init initializes a single-track MSE SourceBuffer. `mvhd` and any other
+/// moov-level boxes are carried through unchanged; `mvex` is filtered to the matching
+/// `trex`; non-matching `trak`s are dropped.
+fn build_per_track_moov(data: &[u8], moov_off: usize, moov_h: BoxHeader, target_id: u32) -> Vec<u8> {
+    let moov_end = moov_off + moov_h.size;
+    let mut content: Vec<u8> = Vec::new();
+    let mut pos = moov_off + moov_h.header_size;
+    while pos < moov_end {
+        let Some(h) = read_box_header(data, pos) else { break };
+        if h.size < 8 || pos + h.size > moov_end {
+            break;
+        }
+        let child = &data[pos..pos + h.size];
+        match &h.box_type {
+            b"trak" => {
+                if tkhd_track_id(data, pos + h.header_size, pos + h.size) == Some(target_id) {
+                    content.extend_from_slice(child);
+                }
+            }
+            b"mvex" => content.extend_from_slice(&build_per_track_mvex(data, pos, h, target_id)),
+            // mvhd / iods / udta / etc. — carried through unchanged.
+            _ => content.extend_from_slice(child),
+        }
+        pos += h.size;
+    }
+    make_box(b"moov", &content)
+}
+
+/// Rebuild an `mvex` keeping only the `trex` for `target_id` (plus any non-`trex`
+/// children such as `mehd`).
+fn build_per_track_mvex(data: &[u8], mvex_off: usize, mvex_h: BoxHeader, target_id: u32) -> Vec<u8> {
+    let mvex_end = mvex_off + mvex_h.size;
+    let mut content: Vec<u8> = Vec::new();
+    let mut pos = mvex_off + mvex_h.header_size;
+    while pos < mvex_end {
+        let Some(h) = read_box_header(data, pos) else { break };
+        if h.size < 8 || pos + h.size > mvex_end {
+            break;
+        }
+        let child = &data[pos..pos + h.size];
+        if &h.box_type == b"trex" {
+            // trex: fullbox (version+flags, 4 bytes) then track_ID (4 bytes).
+            if read_u32(data, pos + h.header_size + 4) == Some(target_id) {
+                content.extend_from_slice(child);
+            }
+        } else {
+            content.extend_from_slice(child);
+        }
+        pos += h.size;
+    }
+    make_box(b"mvex", &content)
+}
+
+/// `tkhd.track_ID` for a `trak` spanning `[start, end)` (version-dependent offset).
+fn tkhd_track_id(data: &[u8], trak_start: usize, trak_end: usize) -> Option<u32> {
+    let (tkhd_off, tkhd_h) = find_box(data, trak_start, trak_end, b"tkhd")?;
+    let content = tkhd_off + tkhd_h.header_size;
+    let version = *data.get(content)?;
+    if version == 1 {
+        read_u32(data, content + 20)
+    } else {
+        read_u32(data, content + 12)
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+
+    /// stsd → avc1 sample entry → avcC(profile=0x64,compat=0x00,level=0x28).
+    #[test]
+    fn parse_codec_string_avc1() {
+        let avc_c = make_box(b"avcC", &[0x01, 0x64, 0x00, 0x28]);
+        let mut avc1_content = vec![0u8; VISUAL_SAMPLE_ENTRY_FIXED_BYTES];
+        avc1_content.extend_from_slice(&avc_c);
+        let avc1 = make_box(b"avc1", &avc1_content);
+
+        let mut stsd_content = vec![0, 0, 0, 0, 0, 0, 0, 1]; // version/flags + entry_count=1
+        stsd_content.extend_from_slice(&avc1);
+        let stsd = make_box(b"stsd", &stsd_content);
+
+        assert_eq!(parse_codec_string(&stsd, 0, stsd.len()), "avc1.640028");
+    }
+
+    #[test]
+    fn parse_codec_string_mp4a() {
+        let mut entry_content = vec![0u8; AUDIO_SAMPLE_ENTRY_FIXED_BYTES];
+        entry_content.extend_from_slice(&make_box(b"esds", &[0u8; 4]));
+        let mp4a = make_box(b"mp4a", &entry_content);
+        let mut stsd_content = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd_content.extend_from_slice(&mp4a);
+        let stsd = make_box(b"stsd", &stsd_content);
+        assert_eq!(parse_codec_string(&stsd, 0, stsd.len()), "mp4a.40.2");
+    }
+
+    /// moof → traf → { tfhd(track_ID=1), trun(2 samples, dur 1000 each) }.
+    #[test]
+    fn parse_moof_duration_and_track_id() {
+        let tfhd = make_box(b"tfhd", &[0, 0, 0, 0, 0, 0, 0, 1]); // flags=0, track_ID=1
+
+        // trun: version0, flags=0x000301 (data_offset|duration|size), count=2.
+        let mut trun_content = vec![0x00, 0x00, 0x03, 0x01];
+        trun_content.extend_from_slice(&2u32.to_be_bytes()); // sample_count
+        trun_content.extend_from_slice(&0i32.to_be_bytes()); // data_offset
+        for _ in 0..2 {
+            trun_content.extend_from_slice(&1000u32.to_be_bytes()); // duration
+            trun_content.extend_from_slice(&500u32.to_be_bytes()); // size
+        }
+        let trun = make_box(b"trun", &trun_content);
+
+        let mut traf_content = tfhd.clone();
+        traf_content.extend_from_slice(&trun);
+        let traf = make_box(b"traf", &traf_content);
+        let moof = make_box(b"moof", &traf);
+
+        let (dur, count) = parse_moof_duration(&moof, 8, moof.len());
+        assert_eq!((dur, count), (2000, 2));
+        assert_eq!(parse_moof_track_id(&moof, 8, moof.len()), 1);
+    }
+
+    // ── per-track demux (P3a) ────────────────────────────────────────────────
+    // Driven by a REAL ffmpeg video+audio fragmented MP4 (+separate_moof), so the
+    // track separation is exercised against the exact shape media-provider emits.
+    fn av_fixture() -> Vec<u8> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let text = include_str!("../tests/vectors/tiny_av_fragmented.mp4.b64");
+        b64.decode(text.trim()).expect("decode av fixture")
+    }
+
+    #[test]
+    fn demux_separates_video_and_audio_streams() {
+        let data = av_fixture();
+        let flat = split_fragmented(&data).expect("flat split");
+        let streams = demux_tracks(&data).expect("demux");
+
+        // Exactly one video + one audio track.
+        assert_eq!(streams.len(), 2, "expected 2 tracks");
+        assert!(streams.iter().any(|s| s.info.kind == TrackKind::Video));
+        assert!(streams.iter().any(|s| s.info.kind == TrackKind::Audio));
+
+        // Every flat fragment lands in exactly one track stream (a partition).
+        let demuxed: usize = streams.iter().map(|s| s.segments.len()).sum();
+        assert_eq!(
+            demuxed,
+            flat.fragments.len(),
+            "per-track fragments must partition the flat fragment list"
+        );
+        for s in &streams {
+            assert!(!s.segments.is_empty(), "a track must have fragments");
+            assert!(s.info.bandwidth > 0, "per-track bandwidth must be computed");
+        }
+    }
+
+    #[test]
+    fn per_track_init_is_standalone_single_track() {
+        let data = av_fixture();
+        let streams = demux_tracks(&data).expect("demux");
+        for s in &streams {
+            // Reassemble this track as its own fragmented MP4 and re-parse it: the
+            // init must describe EXACTLY one track (its own), and the fragment count
+            // and track_id must match — proving the init is a valid standalone moov.
+            let mut whole = s.init.clone();
+            for frag in &s.segments {
+                whole.extend_from_slice(frag);
+            }
+            let meta = parse_fragment_metadata(&whole)
+                .unwrap_or_else(|e| panic!("re-parse track {}: {e}", s.info.track_id));
+            assert_eq!(
+                meta.tracks.len(),
+                1,
+                "per-track init must carry exactly one trak (track {})",
+                s.info.track_id
+            );
+            assert_eq!(meta.tracks[0].track_id, s.info.track_id);
+            assert_eq!(meta.tracks[0].kind, s.info.kind);
+            assert_eq!(
+                meta.segments.len(),
+                s.segments.len(),
+                "re-parsed fragment count must match (track {})",
+                s.info.track_id
+            );
+            assert!(
+                meta.segments.iter().all(|seg| seg.track_id == s.info.track_id),
+                "every re-parsed segment belongs to this track"
+            );
+        }
+    }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "encrypt-threshold-proof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Self-contained proof of encrypt-provider's THRESHOLD escrow (the "mint to the dKMS quorum"
+# keystone). Drives the real encrypt-provider (escrow build) over its stdin/stdout JSON wire,
+# escrows a freshly-minted CEK to THREE ephemeral node recipients (stand-ins for the live
+# quorum), then proves: each producer-signed share unwraps ONLY under its node recipient, ANY
+# TWO reconstruct the SAME CEK, that CEK DECRYPTS the segment sealed in this run, a single
+# share is useless, and the node-set pin matches. No daemons, no network. Reuses ddrm-envelope
+# (no private crypto) and the same aes/ctr core as the CENC cipher so "sealed now decrypts now".
+
+[[bin]]
+name = "encrypt-threshold-proof"
+path = "src/main.rs"
+
+[dependencies]
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+serde_json = "1.0"
+base64 = "0.22"
+aes = "0.8"
+ctr = "0.9"
+
+[workspace]

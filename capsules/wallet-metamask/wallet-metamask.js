@@ -39,10 +39,39 @@ function configureMetaMaskDiscovery() {
   window.dispatchEvent(new Event("eip6963:requestProvider"));
 }
 
+// Re-request EIP-6963 announcements and wait briefly for them to arrive. Resolves as
+// soon as a MetaMask provider is seen, or after a short timeout. Makes connect robust
+// to a slow injection or a co-installed wallet that grabbed window.ethereum.
+function ensureWalletDiscovery(timeoutMs = 400) {
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      const haveMetaMask = discoveredWalletProviders.some(({ info, provider }) => {
+        const rdns = readText(info && info.rdns).toLowerCase();
+        return rdns.includes("metamask") || Boolean(provider && provider.isMetaMask && !provider.isPhantom);
+      });
+      if (haveMetaMask || Date.now() - start >= timeoutMs) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
 async function onConnect() {
+  // Re-run EIP-6963 discovery and give announcements a tick to arrive, so a slow
+  // MetaMask injection doesn't fall through to a window.ethereum a co-installed wallet
+  // (e.g. Phantom) has overridden. Discovery is the authoritative, per-wallet source.
+  await ensureWalletDiscovery();
   const provider = metaMaskProvider();
   if (!provider) {
-    showStatus("No compatible wallet found.", "error");
+    showStatus(
+      "MetaMask not found. If another wallet (e.g. Phantom) is set as your default Ethereum wallet, MetaMask may not announce — disable that wallet's Ethereum default, or unlock MetaMask, and retry.",
+      "error",
+    );
     return;
   }
   setButtonBusy(connectButton, true);
@@ -403,14 +432,21 @@ function metaMaskProvider() {
 
 function selectedMetaMaskProvider(entries) {
   const list = Array.isArray(entries) ? entries : [];
-  const metamask = list.find(({ info, provider }) => {
-    const rdns = readText(info && info.rdns).toLowerCase();
-    return Boolean(provider && provider.isMetaMask) || rdns.includes("metamask");
-  });
-  if (metamask && metamask.provider && typeof metamask.provider.request === "function") {
-    return metamask.provider;
+  const usable = ({ provider }) =>
+    provider && typeof provider.request === "function" && !provider.isPhantom;
+  // Prefer the authoritative EIP-6963 identity (rdns), which a wallet cannot spoof as
+  // another wallet's. Only then fall back to the isMetaMask flag — and never trust it
+  // on a provider that also identifies as Phantom (Phantom sets isMetaMask for compat).
+  const byRdns = list.find(
+    (entry) => usable(entry) && readText(entry.info && entry.info.rdns).toLowerCase().includes("metamask"),
+  );
+  if (byRdns) {
+    return byRdns.provider;
   }
-  return null;
+  const byFlag = list.find(
+    (entry) => usable(entry) && Boolean(entry.provider.isMetaMask),
+  );
+  return byFlag ? byFlag.provider : null;
 }
 
 function walletIntentLabel(intent) {

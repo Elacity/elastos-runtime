@@ -656,6 +656,14 @@ pub fn gateway_router(state: GatewayState) -> Router {
             axum::routing::post(super::viewer_open::mint_create_asset),
         )
         .route(
+            "/api/apps/creator/status",
+            get(super::creator::creator_status),
+        )
+        .route(
+            "/api/apps/creator/prepare-mint",
+            axum::routing::post(super::creator::creator_prepare_mint),
+        )
+        .route(
             "/api/viewers/elacity-player/media/open",
             axum::routing::post(super::media_authority::open_demo_media),
         )

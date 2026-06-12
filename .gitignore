@@ -42,6 +42,9 @@ elastos/storage/
 artifacts/
 artifacts-aarch64/
 
+# Local scratch build tree (vendored linux kernel source, cargo output, etc.)
+build/
+
 # Secrets and credentials
 .env
 *.pem

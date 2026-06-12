@@ -116,7 +116,52 @@ enum Request {
         plaintext_b64: String,
         recipient_pub_b64: String,
     },
+    /// THRESHOLD producer op (feature `escrow`): the dKMS-quorum analogue of `seal_inline`.
+    /// Mint a CEK+KID in-boundary, CENC-encrypt the inline plaintext, then SHAMIR-split the
+    /// CEK over GF(256) and seal each INDEXED share (`x ‖ p(x)`) to ITS node's published
+    /// recipient key — so the CEK is escrowed to the whole 2-of-3 quorum WITHOUT ever
+    /// leaving this boundary whole (no node, and not the caller, ever sees the CEK). This is
+    /// the "switch the CEK custody to dKMS at mint" seam: the producer half of the live
+    /// quorum the consumer half already recovers from. Returns only public material
+    /// (ciphertext + per-node sealed shares + the node-set pin) — never a raw CEK or share.
+    #[cfg(feature = "escrow")]
+    SealInlineThreshold {
+        plaintext_b64: String,
+        /// The quorum's secret-holding nodes (the 2-of-3 set): each node's published escrow
+        /// recipient key + its verifying key (the vk pins the node-set id). Exactly 3.
+        nodes: Vec<ThresholdNode>,
+    },
+    /// MEDIA producer op (feature `escrow`): the DASH analogue of `seal_inline_threshold`.
+    /// Take the PLAINTEXT fragmented-MP4 segments produced by `media-provider.package`
+    /// (real ffmpeg `moof`/`mdat` fragments — NOT inline samples), mint ONE CEK+KID for
+    /// the whole asset, CENC-encrypt EACH fragment under that single KID (one continuous
+    /// IV counter across segments, exactly as PC2's dashPackager does), then SHAMIR-split
+    /// the CEK and seal each indexed share to its node — identical custody to the single
+    /// path. Returns only public material (encrypted segments + per-node sealed shares +
+    /// node-set pin) — never a raw CEK or share, and never any plaintext. The KID is the
+    /// asset's single `default_KID` / on-chain bytes16 contentId.
+    #[cfg(feature = "escrow")]
+    SealSegmentsThreshold {
+        /// The ordered PLAINTEXT media fragments (base64), as returned by media-provider.
+        segments_b64: Vec<String>,
+        /// The init segment (base64), used only to content-address the asset (payload CID).
+        #[serde(default)]
+        init_b64: Option<String>,
+        /// The quorum's 2-of-3 secret-holding node set (recipient + verifying keys). Exactly 3.
+        nodes: Vec<ThresholdNode>,
+    },
     Shutdown,
+}
+
+/// One node of the threshold quorum a producer escrows to (feature `escrow`): the public
+/// identity the runtime reads from the dKMS authority descriptor — recipient key (where the
+/// share is sealed) + verifying key (pins the node-set the open must match). No secrets.
+#[cfg(feature = "escrow")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThresholdNode {
+    verifying_key_b64: String,
+    recipient_pub_b64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +226,16 @@ impl EncryptProvider {
                 plaintext_b64,
                 recipient_pub_b64,
             } => self.seal_inline(&plaintext_b64, &recipient_pub_b64),
+            #[cfg(feature = "escrow")]
+            Request::SealInlineThreshold { plaintext_b64, nodes } => {
+                self.seal_inline_threshold(&plaintext_b64, &nodes)
+            }
+            #[cfg(feature = "escrow")]
+            Request::SealSegmentsThreshold {
+                segments_b64,
+                init_b64,
+                nodes,
+            } => self.seal_segments_threshold(&segments_b64, init_b64.as_deref(), &nodes),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -204,7 +259,13 @@ impl EncryptProvider {
             let (signer, verifying_key) = ddrm_envelope::seal::mldsa_seal_keypair(seed);
             data["producer_verifying_key_b64"] =
                 json!(base64::engine::general_purpose::STANDARD.encode(&verifying_key));
-            data["supported_operations"] = json!(["status", "seal", "seal_inline"]);
+            data["supported_operations"] = json!([
+                "status",
+                "seal",
+                "seal_inline",
+                "seal_inline_threshold",
+                "seal_segments_threshold"
+            ]);
             self.producer = Some(ProducerKey {
                 signer,
                 verifying_key,
@@ -420,6 +481,301 @@ impl EncryptProvider {
         })
         // `minted` (Zeroizing CEK) drops here — the CEK is scrubbed before return.
     }
+
+    /// THRESHOLD seal (feature `escrow`): the producer half of the live dKMS quorum. Mint a
+    /// CEK in-boundary, CENC-encrypt the bytes, then SHAMIR-split the CEK and seal each
+    /// indexed share to ITS node recipient. The CEK + the split coefficient live in
+    /// `Zeroizing` and are scrubbed on drop; only ciphertext + per-node SEALED shares + the
+    /// node-set pin leave. Mirrors the orchestrator's proven 2-of-3 escrow, but performed
+    /// INSIDE the producer boundary so the raw CEK is never known to the orchestrator/caller.
+    #[cfg(feature = "escrow")]
+    fn seal_inline_threshold(&self, plaintext_b64: &str, nodes: &[ThresholdNode]) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        if nodes.len() != 3 {
+            return Response::error(
+                "invalid_request",
+                "threshold seal requires exactly 3 quorum nodes (the 2-of-3 set)",
+            );
+        }
+        let plaintext = match b64.decode(plaintext_b64) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => return Response::error("invalid_request", "plaintext_b64 is empty"),
+            Err(_) => return Response::error("invalid_request", "plaintext_b64 is not valid base64"),
+        };
+        let mut recipients: Vec<Vec<u8>> = Vec::with_capacity(3);
+        let mut vks: Vec<Vec<u8>> = Vec::with_capacity(3);
+        for (i, n) in nodes.iter().enumerate() {
+            match b64.decode(&n.recipient_pub_b64) {
+                Ok(b) => recipients.push(b),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("node {i} recipient_pub_b64 is not valid base64"),
+                    )
+                }
+            }
+            match b64.decode(&n.verifying_key_b64) {
+                Ok(b) => vks.push(b),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("node {i} verifying_key_b64 is not valid base64"),
+                    )
+                }
+            }
+        }
+        // A t-of-n split needs DISTINCT secret-holders — refuse a duplicate identity.
+        for i in 0..vks.len() {
+            for j in (i + 1)..vks.len() {
+                if vks[i] == vks[j] {
+                    return Response::error(
+                        "invalid_request",
+                        "two quorum nodes share an identity — a 2-of-3 split needs DISTINCT secret-holders",
+                    );
+                }
+            }
+        }
+        let out = match self.run_seal_pipeline_threshold(&plaintext, &recipients, &vks) {
+            Ok(out) => out,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        Response::ok(json!({
+            "kid_hex": out.kid_hex,
+            // The KID hex IS the on-chain bytes16 contentId (Day 58 identity join).
+            "content_id_hex": out.kid_hex,
+            "scheme": SUPPORTED_SCHEMES[0],
+            "segment_b64": b64.encode(&out.segment),
+            "payload_cid": out.payload_cid,
+            // PUBLIC ciphertext + IV of the single CENC sample (NOT secret) — lets the open path
+            // (or a proof) decrypt with the RECOVERED CEK without re-muxing the fMP4 segment.
+            "ciphertext_b64": b64.encode(&out.ciphertext),
+            "iv8_b64": b64.encode(out.iv8),
+            // The node-set pin (hash over all 3 vks + t=2) the open must match — detects a node swap.
+            "node_set_id_b64": b64.encode(out.node_set_id),
+            // Each node's SEALED indexed share (`x ‖ p(x)` under its recipient) — never a raw share.
+            "shares": out.shares,
+        }))
+    }
+
+    /// The in-boundary THRESHOLD seal pipeline (feature `escrow`): mint CEK+KID, CENC-encrypt,
+    /// SHAMIR-split the CEK over GF(256), and seal each indexed share to its node recipient.
+    /// The CEK and the polynomial coefficient never leave (both `Zeroizing`, scrubbed on drop).
+    #[cfg(feature = "escrow")]
+    fn run_seal_pipeline_threshold(
+        &self,
+        plaintext: &[u8],
+        recipients: &[Vec<u8>],
+        vks: &[Vec<u8>],
+    ) -> Result<ThresholdSealOutput, String> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| "seal requires init to have minted the producer key".to_string())?;
+        let minted = mint_cek_and_kid()?;
+        let mut iv_seed = [0u8; 8];
+        getrandom::getrandom(&mut iv_seed).map_err(|_| "csprng iv seed failed".to_string())?;
+        let sizes = [plaintext.len() as u32];
+        let (ciphertext, ivs, _subs) =
+            cenc::encrypt_samples(plaintext, &minted.cek, &sizes, &iv_seed, 0)?;
+        let iv8 = ivs[0];
+        let segment = mux_single_sample_segment(&ciphertext, &iv8);
+        let payload_cid = payload_cid_v1_raw(&segment)?;
+        let kid16 = kid_to_content_id_bytes16(&minted.kid_hex)?;
+        // Uniform random degree-1 coefficient hides the CEK information-theoretically in any single
+        // share; only the t=2 quorum reconstructs. Held in Zeroizing alongside the CEK.
+        let mut coeff = zeroize::Zeroizing::new(vec![0u8; minted.cek.len()]);
+        getrandom::getrandom(&mut coeff).map_err(|_| "csprng split coeff failed".to_string())?;
+        let shares_raw = ddrm_envelope::split_cek_shamir2(&minted.cek[..], &coeff)?;
+        let mut shares = Vec::with_capacity(3);
+        for (i, recipient) in recipients.iter().enumerate() {
+            // Node i holds `(i+1) ‖ p(i+1)` — the coordinate is sealed INSIDE the escrow.
+            let payload = ddrm_envelope::indexed_share((i + 1) as u8, &shares_raw[i]);
+            let wrapped = seal_cek_to_authority(&payload, &kid16, recipient, &producer.signer)?;
+            shares.push(json!({
+                "x": (i + 1) as u8,
+                "verifying_key_b64": b64.encode(&vks[i]),
+                "wrapped_share_b64": wrapped,
+            }));
+        }
+        let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &vk_refs);
+        Ok(ThresholdSealOutput {
+            kid_hex: minted.kid_hex.clone(),
+            segment,
+            payload_cid,
+            ciphertext,
+            iv8,
+            node_set_id,
+            shares,
+        })
+        // `minted` (Zeroizing CEK) + `coeff` drop here — both scrubbed before return.
+    }
+
+    /// MEDIA threshold seal (feature `escrow`): CENC-encrypt a whole DASH asset's worth of
+    /// real fragmented-MP4 segments under ONE CEK/KID, then escrow that CEK to the 2-of-3
+    /// quorum — identical custody to `seal_inline_threshold`, but over many real fragments
+    /// instead of one synthetic sample. The plaintext segments are consumed in-boundary and
+    /// never re-emitted; only the encrypted segments + sealed shares leave.
+    #[cfg(feature = "escrow")]
+    fn seal_segments_threshold(
+        &self,
+        segments_b64: &[String],
+        init_b64: Option<&str>,
+        nodes: &[ThresholdNode],
+    ) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        if nodes.len() != 3 {
+            return Response::error(
+                "invalid_request",
+                "threshold seal requires exactly 3 quorum nodes (the 2-of-3 set)",
+            );
+        }
+        if segments_b64.is_empty() {
+            return Response::error("invalid_request", "no segments to seal");
+        }
+        let mut recipients: Vec<Vec<u8>> = Vec::with_capacity(3);
+        let mut vks: Vec<Vec<u8>> = Vec::with_capacity(3);
+        for (i, n) in nodes.iter().enumerate() {
+            match b64.decode(&n.recipient_pub_b64) {
+                Ok(b) => recipients.push(b),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("node {i} recipient_pub_b64 is not valid base64"),
+                    )
+                }
+            }
+            match b64.decode(&n.verifying_key_b64) {
+                Ok(b) => vks.push(b),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("node {i} verifying_key_b64 is not valid base64"),
+                    )
+                }
+            }
+        }
+        for i in 0..vks.len() {
+            for j in (i + 1)..vks.len() {
+                if vks[i] == vks[j] {
+                    return Response::error(
+                        "invalid_request",
+                        "two quorum nodes share an identity — a 2-of-3 split needs DISTINCT secret-holders",
+                    );
+                }
+            }
+        }
+        let mut segments: Vec<Vec<u8>> = Vec::with_capacity(segments_b64.len());
+        for (i, s) in segments_b64.iter().enumerate() {
+            match b64.decode(s) {
+                Ok(b) if !b.is_empty() => segments.push(b),
+                Ok(_) => {
+                    return Response::error("invalid_request", format!("segment {i} is empty"))
+                }
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        format!("segment {i} is not valid base64"),
+                    )
+                }
+            }
+        }
+        let init = match init_b64 {
+            Some(s) => match b64.decode(s) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Response::error("invalid_request", "init_b64 is not valid base64")
+                }
+            },
+            None => Vec::new(),
+        };
+        let out = match self.run_seal_pipeline_segments(&segments, &init, &recipients, &vks) {
+            Ok(out) => out,
+            Err(e) => return Response::error("invalid_request", e),
+        };
+        Response::ok(json!({
+            "kid_hex": out.kid_hex,
+            // The KID hex IS the on-chain bytes16 contentId / the asset's single default_KID.
+            "content_id_hex": out.kid_hex,
+            "scheme": SUPPORTED_SCHEMES[0],
+            // The CENC-encrypted media fragments, in order (NOT secret — encrypted under the
+            // escrowed CEK). The decrypt rail opens these with the RECOVERED CEK.
+            "segments_b64": out.encrypted_segments.iter().map(|s| b64.encode(s)).collect::<Vec<_>>(),
+            "segment_count": out.encrypted_segments.len(),
+            "payload_cid": out.payload_cid,
+            "node_set_id_b64": b64.encode(out.node_set_id),
+            "shares": out.shares,
+        }))
+    }
+
+    /// The in-boundary MEDIA threshold pipeline (feature `escrow`): mint ONE CEK+KID, CENC each
+    /// real fMP4 fragment under a single continuous IV counter (via the canonical
+    /// `ddrm_media::mp4::encrypt_fragment`), then SHAMIR-split the CEK and seal each indexed
+    /// share to its node. The CEK + coefficient are `Zeroizing` and scrubbed before return.
+    #[cfg(feature = "escrow")]
+    fn run_seal_pipeline_segments(
+        &self,
+        segments: &[Vec<u8>],
+        init: &[u8],
+        recipients: &[Vec<u8>],
+        vks: &[Vec<u8>],
+    ) -> Result<SegmentsSealOutput, String> {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| "seal requires init to have minted the producer key".to_string())?;
+        let minted = mint_cek_and_kid()?;
+        let kid16 = kid_to_content_id_bytes16(&minted.kid_hex)?;
+
+        // One continuous IV counter across ALL segments so every sample of the whole asset
+        // gets a unique IV under the single CEK — exactly PC2's dashPackager CENC contract.
+        let mut iv_counter: u64 = 0;
+        let mut encrypted: Vec<Vec<u8>> = Vec::with_capacity(segments.len());
+        for (i, frag) in segments.iter().enumerate() {
+            let enc = ddrm_media::mp4::encrypt_fragment(frag, &minted.cek, &mut iv_counter)
+                .map_err(|e| format!("segment {i} CENC failed: {e}"))?;
+            encrypted.push(enc);
+        }
+
+        // Content-address the asset by its init segment (the stable identity of the MSE
+        // source); fall back to the first encrypted fragment if no init was supplied.
+        let cid_src: &[u8] = if !init.is_empty() {
+            init
+        } else {
+            encrypted.first().map(|v| v.as_slice()).unwrap_or(&[])
+        };
+        let payload_cid = payload_cid_v1_raw(cid_src)?;
+
+        let mut coeff = zeroize::Zeroizing::new(vec![0u8; minted.cek.len()]);
+        getrandom::getrandom(&mut coeff).map_err(|_| "csprng split coeff failed".to_string())?;
+        let shares_raw = ddrm_envelope::split_cek_shamir2(&minted.cek[..], &coeff)?;
+        let mut shares = Vec::with_capacity(3);
+        for (i, recipient) in recipients.iter().enumerate() {
+            let payload = ddrm_envelope::indexed_share((i + 1) as u8, &shares_raw[i]);
+            let wrapped = seal_cek_to_authority(&payload, &kid16, recipient, &producer.signer)?;
+            shares.push(json!({
+                "x": (i + 1) as u8,
+                "verifying_key_b64": b64.encode(&vks[i]),
+                "wrapped_share_b64": wrapped,
+            }));
+        }
+        let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &vk_refs);
+        Ok(SegmentsSealOutput {
+            kid_hex: minted.kid_hex.clone(),
+            encrypted_segments: encrypted,
+            payload_cid,
+            node_set_id,
+            shares,
+        })
+        // `minted` (Zeroizing CEK) + `coeff` drop here — both scrubbed before return.
+    }
 }
 
 /// The non-secret output of [`EncryptProvider::run_seal_pipeline`]. Carries only
@@ -431,6 +787,32 @@ struct SealPipelineOutput {
     segment: Vec<u8>,
     payload_cid: String,
     wrapped_cek_b64: String,
+}
+
+/// The non-secret output of [`EncryptProvider::run_seal_pipeline_threshold`]. Carries only
+/// ciphertext + KID + content address + the per-node SEALED shares + the node-set pin —
+/// no CEK field and no raw share, so invariant #1's output half holds for the quorum seal.
+#[cfg(feature = "escrow")]
+struct ThresholdSealOutput {
+    kid_hex: String,
+    segment: Vec<u8>,
+    payload_cid: String,
+    ciphertext: Vec<u8>,
+    iv8: [u8; 8],
+    node_set_id: [u8; 32],
+    shares: Vec<Value>,
+}
+
+/// The non-secret output of [`EncryptProvider::run_seal_pipeline_segments`] (the MEDIA
+/// threshold seal). Carries only the CENC-encrypted fragments + KID + content address +
+/// the per-node sealed shares + node-set pin — no CEK, no raw share, no plaintext.
+#[cfg(feature = "escrow")]
+struct SegmentsSealOutput {
+    kid_hex: String,
+    encrypted_segments: Vec<Vec<u8>>,
+    payload_cid: String,
+    node_set_id: [u8; 32],
+    shares: Vec<Value>,
 }
 
 /// Minimal ISO-BMFF box: `size(u32 BE) ‖ type(4) ‖ content`.
@@ -1182,6 +1564,163 @@ mod tests {
             assert!(
                 ddrm_envelope::hybrid_unwrap_bound(&other_secret, &env, &aad, &verifier).is_err(),
                 "wrong recipient must fail closed"
+            );
+        }
+
+        /// MEDIA path, end to end on a REAL fragmented-MP4: the producer CENC-encrypts
+        /// every fragment under ONE CEK (continuous IV counter) and escrows that CEK to a
+        /// 2-of-3 quorum. We then recover the CEK from TWO of the three sealed shares and
+        /// PROVE it is the exact key used by re-encrypting the original fragments under it
+        /// from counter 0 — the bytes must match the producer's output for EVERY segment.
+        /// (No decrypt impl needed: encrypt_fragment is deterministic, so a byte match
+        /// proves both the single-CEK custody and the continuous cross-segment counter.)
+        #[test]
+        fn media_segments_seal_recovers_one_cek_across_all_fragments() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+
+            // A REAL ffmpeg fragmented MP4 (+frag_keyframe+empty_moov+default_base_moof
+            // +separate_moof) — the exact shape media-provider emits.
+            let fixture_b64 = include_str!("../tests/vectors/tiny_fragmented.mp4.b64");
+            let fixture = b64.decode(fixture_b64.trim()).expect("decode fixture");
+            let split = ddrm_media::mp4::split_fragmented(&fixture).expect("split");
+            assert!(
+                split.fragments.len() >= 2,
+                "fixture must have multiple fragments to exercise the continuous IV counter"
+            );
+            let plaintext_frags: Vec<String> =
+                split.fragments.iter().map(|f| b64.encode(f)).collect();
+
+            // A 3-node quorum: each node a REAL hybrid recipient + a DISTINCT verifying key.
+            let mut secrets: Vec<(ddrm_envelope::SessionKemSecret, Vec<u8>)> = Vec::new();
+            let mut nodes: Vec<ThresholdNode> = Vec::new();
+            for k in 0..3u8 {
+                let (sec, pubk) = ddrm_envelope::mint_session();
+                let recipient = ddrm_envelope::session_public_bytes(&pubk);
+                let (_s, vk) = ddrm_envelope::seal::mldsa_seal_keypair([10 + k; 32]);
+                secrets.push((sec, recipient.clone()));
+                nodes.push(ThresholdNode {
+                    recipient_pub_b64: b64.encode(&recipient),
+                    verifying_key_b64: b64.encode(&vk),
+                });
+            }
+
+            // Init mints the producer signing key and publishes its verifying key.
+            let mut provider = EncryptProvider::default();
+            let producer_vk = match provider.init(json!({})) {
+                Response::Ok { data: Some(d) } => b64
+                    .decode(d["producer_verifying_key_b64"].as_str().unwrap())
+                    .unwrap(),
+                _ => panic!("init must publish the producer verifying key"),
+            };
+
+            // Seal every fragment under one CEK; escrow to the quorum.
+            let data = match provider.seal_segments_threshold(
+                &plaintext_frags,
+                Some(&b64.encode(&split.init)),
+                &nodes,
+            ) {
+                Response::Ok { data: Some(d) } => d,
+                Response::Ok { data: None } => panic!("expected data"),
+                Response::Error { code, message } => panic!("seal failed {code}: {message}"),
+            };
+
+            let kid_hex = data["kid_hex"].as_str().unwrap().to_string();
+            let kid16 = kid_to_content_id_bytes16(&kid_hex).unwrap();
+            let enc_segs: Vec<Vec<u8>> = data["segments_b64"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| b64.decode(s.as_str().unwrap()).unwrap())
+                .collect();
+            assert_eq!(enc_segs.len(), split.fragments.len());
+
+            // Recover the CEK from TWO of the three sealed shares (nodes x=1 and x=3).
+            let shares = data["shares"].as_array().unwrap();
+            let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&producer_vk).unwrap();
+            let mut indexed: Vec<(u8, Vec<u8>)> = Vec::new();
+            for idx in [0usize, 2usize] {
+                let wrapped = b64
+                    .decode(shares[idx]["wrapped_share_b64"].as_str().unwrap())
+                    .unwrap();
+                let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&wrapped).unwrap();
+                let (sec, recipient) = &secrets[idx];
+                let aad =
+                    ddrm_envelope::transcript::escrow_aad(SUPPORTED_SCHEMES[0], &kid16, recipient);
+                let payload =
+                    ddrm_envelope::hybrid_unwrap_bound(sec, &env, &aad, &verifier).unwrap();
+                indexed.push((payload[0], payload[1..].to_vec()));
+            }
+            let cek = ddrm_envelope::combine_cek_shamir2(
+                indexed[0].0,
+                &indexed[0].1,
+                indexed[1].0,
+                &indexed[1].1,
+            )
+            .expect("2-of-3 combine");
+            assert_eq!(cek.len(), 16, "recovered CEK is a 16-byte AES-128 key");
+            let cek16: [u8; 16] = cek[..].try_into().unwrap();
+
+            // PROOF: re-encrypt the ORIGINAL fragments with the RECOVERED CEK under the
+            // SAME continuous counter — must byte-match the producer's encrypted segments.
+            let mut counter: u64 = 0;
+            for (i, frag) in split.fragments.iter().enumerate() {
+                let re = ddrm_media::mp4::encrypt_fragment(frag, &cek16, &mut counter).unwrap();
+                assert_eq!(
+                    re, enc_segs[i],
+                    "segment {i} reproduces under the recovered CEK + continuous counter"
+                );
+            }
+        }
+
+        /// Fail-closed guards on the media seal op (no ffmpeg/quorum needed).
+        #[test]
+        fn media_seal_fails_closed_on_bad_input() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let mut provider = EncryptProvider::default();
+            let _ = provider.init(json!({}));
+
+            // Three syntactically-valid (base64) but distinct node identities.
+            let node = |seed: u8| ThresholdNode {
+                recipient_pub_b64: b64.encode([seed; 32]),
+                verifying_key_b64: b64.encode([seed.wrapping_add(100); 32]),
+            };
+            let good_nodes = vec![node(1), node(2), node(3)];
+
+            let code = |r: Response| match r {
+                Response::Error { code, .. } => code,
+                Response::Ok { .. } => panic!("expected error"),
+            };
+
+            // < 3 nodes.
+            assert_eq!(
+                code(provider.seal_segments_threshold(
+                    &[b64.encode(b"x")],
+                    None,
+                    &good_nodes[..2]
+                )),
+                "invalid_request"
+            );
+            // no segments.
+            assert_eq!(
+                code(provider.seal_segments_threshold(&[], None, &good_nodes)),
+                "invalid_request"
+            );
+            // duplicate node identity.
+            let dup = vec![node(1), node(1), node(3)];
+            assert_eq!(
+                code(provider.seal_segments_threshold(&[b64.encode(b"x")], None, &dup)),
+                "invalid_request"
+            );
+            // segment that is not valid base64.
+            assert_eq!(
+                code(provider.seal_segments_threshold(
+                    &["!!!notb64!!!".to_string()],
+                    None,
+                    &good_nodes
+                )),
+                "invalid_request"
             );
         }
 
