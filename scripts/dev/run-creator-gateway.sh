@@ -85,6 +85,9 @@ build_capsule ipfs-provider
 # local media-authority helper. Not needed to MINT, built so the open path is ready too.
 build_capsule rights-provider --features chain-rights
 build_capsule decrypt-provider --features rail-stream,rail-mint
+# Library object plane (v0.4.0): the provider-backed object model the new Library/Home use.
+# Without it the gateway boots but Library object operations fail closed.
+build_capsule object-provider
 
 echo "building media-authority helper ..."
 cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/ddrm-media-authority/Cargo.toml" \
@@ -126,6 +129,8 @@ export ELASTOS_RIGHTS_PROVIDER_BIN="$(cap_bin rights-provider)"
 # spawned directly by the open route). Same binary, two lookups — set both.
 export ELASTOS_DECRYPT_PROVIDER_BIN="$(cap_bin decrypt-provider)"
 export ELASTOS_DDRM_DECRYPT_BIN="$(cap_bin decrypt-provider)"
+# v0.4.0 Library object plane.
+export ELASTOS_OBJECT_PROVIDER_BIN="$(cap_bin object-provider)"
 MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/debug/ddrm-media-authority"
 [[ -x "$MEDIA_AUTH_BIN" ]] && export ELASTOS_DDRM_MEDIA_AUTHORITY_BIN="$MEDIA_AUTH_BIN"
 # The Create portal reads the quorum here (also the default <data_dir>/dkms/quorum.json).
@@ -136,7 +141,7 @@ export ELASTOS_DDRM_RIGHTS="${ELASTOS_DDRM_RIGHTS:-dev}"
 echo "provider overrides:"
 for v in ELASTOS_ENCRYPT_PROVIDER_BIN ELASTOS_MEDIA_PROVIDER_BIN ELASTOS_PUBLISH_PROVIDER_BIN \
          ELASTOS_CHAIN_PROVIDER_BIN ELASTOS_WALLET_PROVIDER_BIN ELASTOS_IPFS_PROVIDER_BIN \
-         ELASTOS_RIGHTS_PROVIDER_BIN ELASTOS_DDRM_DECRYPT_BIN; do
+         ELASTOS_RIGHTS_PROVIDER_BIN ELASTOS_DDRM_DECRYPT_BIN ELASTOS_OBJECT_PROVIDER_BIN; do
   printf '  %s=%s\n' "$v" "${!v}"
 done
 echo "  ELASTOS_DDRM_RIGHTS=${ELASTOS_DDRM_RIGHTS}"
