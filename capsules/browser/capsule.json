@@ -5,8 +5,8 @@
   "description": "Browse web sites through the ElastOS Browser boundary",
   "author": "elastos",
   "role": "app",
-  "type": "data",
-  "entrypoint": "index.html",
+  "type": "wasm",
+  "entrypoint": "browser.wasm",
   "capabilities": [
     "elastos://wallet/*",
     "elastos://net/resolve",

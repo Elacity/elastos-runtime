@@ -867,14 +867,20 @@ async fn setup_server_infrastructure_impl(
     // Identity is DID (derived from device_key), not raw device_key.
     let (carrier_signing_key, carrier_did) = elastos_identity::derive_did(&device_key);
     {
-        match elastos_server::carrier::start_carrier_node(
+        match elastos_server::carrier::start_carrier_node_with_registry(
             &carrier_signing_key,
             &carrier_did,
             data_dir.clone(),
+            Some(Arc::downgrade(&provider_registry)),
         )
         .await
         {
             Ok(carrier_node) => {
+                provider_registry
+                    .set_carrier_invoker(Arc::new(
+                        elastos_server::carrier::CarrierProviderInvoker::new(),
+                    ))
+                    .await;
                 let gossip_provider: Arc<dyn provider::Provider> =
                     Arc::new(elastos_server::carrier::CarrierGossipProvider::new(
                         carrier_node.gossip_state.clone(),
@@ -886,9 +892,20 @@ async fn setup_server_infrastructure_impl(
                     tracing::warn!("Failed to register Carrier gossip provider: {}", e);
                 }
                 if !external_availability_registered {
-                    tracing::info!(
-                        "Carrier availability provider not registered; install/configure availability-provider for remote availability proofs"
-                    );
+                    let availability_provider: Arc<dyn provider::Provider> =
+                        Arc::new(
+                            elastos_server::carrier::CarrierAvailabilityProvider::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
+                            carrier_node.gossip_state.clone(),
+                            Arc::downgrade(&provider_registry),
+                            data_dir.clone(),
+                            carrier_peer_attestation_exchange_config_from_env(),
+                        ));
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("availability", availability_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register Carrier availability provider: {}", e);
+                    }
                 }
                 // Hold the carrier node alive. Dropping it kills the endpoint.
                 tokio::spawn(async move {
@@ -1136,6 +1153,39 @@ fn availability_provider_config_from_env() -> Option<serde_json::Value> {
     Some(serde_json::json!({
         "targets": [target]
     }))
+}
+
+fn carrier_peer_attestation_exchange_config_from_env() -> Option<serde_json::Value> {
+    if let Ok(raw) = std::env::var("ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG") {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => return Some(value),
+            Err(err) => {
+                tracing::warn!(
+                    "Ignoring invalid ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG JSON: {}",
+                    err
+                );
+                return None;
+            }
+        }
+    }
+
+    let url = std::env::var("ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let mut config = serde_json::json!({ "url": url });
+    if let Ok(value) = std::env::var("ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_AUTHORIZATION") {
+        let value = value.trim();
+        if !value.is_empty() {
+            config["authorization"] = serde_json::Value::String(value.to_string());
+        }
+    }
+    if let Ok(value) = std::env::var("ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_TIMEOUT_SECS") {
+        if let Ok(timeout_secs) = value.trim().parse::<u64>() {
+            config["timeout_secs"] = serde_json::Value::from(timeout_secs);
+        }
+    }
+    Some(config)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1387,6 +1437,55 @@ mod tests {
             "https://example.invalid/ensure"
         );
         assert_eq!(config["targets"][0]["authorization"], "Bearer secret");
+    }
+
+    #[test]
+    fn carrier_peer_attestation_exchange_config_uses_explicit_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG",
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_URL",
+        ]);
+        std::env::set_var(
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG",
+            r#"{"url":"https://attest.example.invalid/exchange","authorization":"Bearer attest","timeout_secs":8}"#,
+        );
+
+        let config = carrier_peer_attestation_exchange_config_from_env().unwrap();
+        assert_eq!(config["url"], "https://attest.example.invalid/exchange");
+        assert_eq!(config["authorization"], "Bearer attest");
+        assert_eq!(config["timeout_secs"], 8);
+    }
+
+    #[test]
+    fn carrier_peer_attestation_exchange_config_uses_env_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG",
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_URL",
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_AUTHORIZATION",
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_TIMEOUT_SECS",
+        ]);
+        std::env::set_var(
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_URL",
+            "http://127.0.0.1:9799/peer-attestation/exchange",
+        );
+        std::env::set_var(
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_AUTHORIZATION",
+            "Bearer local-attest",
+        );
+        std::env::set_var(
+            "ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_TIMEOUT_SECS",
+            "10",
+        );
+
+        let config = carrier_peer_attestation_exchange_config_from_env().unwrap();
+        assert_eq!(
+            config["url"],
+            "http://127.0.0.1:9799/peer-attestation/exchange"
+        );
+        assert_eq!(config["authorization"], "Bearer local-attest");
+        assert_eq!(config["timeout_secs"], 10);
     }
 
     #[test]

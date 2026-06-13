@@ -122,6 +122,19 @@ semantics and availability receipts. Carrier owns secure peer discovery,
 messaging, relay, and peer/object transport. IPLD gives the traversable CID graph
 shape. Rights/decryption remain in the access provider and dDRM layer.
 
+Provider-to-provider Carrier invocation follows the same boundary. Runtime adds
+an `elastos.provider.invocation/v1` envelope, selects `carrier-provider-plane`,
+and sends a generic Carrier `provider_invoke` message only between service
+providers such as `content`, `availability`, `rights`, `key`, `decrypt`, and
+`drm`. Raw connect tickets stay inside Runtime transport state and are not
+returned in app-visible receipts. Raw backend providers such as `ipfs` or
+`localhost` remain local implementation details, not remote Carrier authorities.
+If the provider transfer is `stream`, the Carrier side also validates the
+target-visible `elastos.provider.stream/v1` base64-chunk contract before
+dispatching the request. Carrier availability fetches use that path for remote
+`content/fetch` calls and decode the returned stream envelope inside the
+availability provider.
+
 See [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md).
 
 ### Where HTTP Fits

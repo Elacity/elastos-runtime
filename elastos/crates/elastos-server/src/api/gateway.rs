@@ -559,6 +559,11 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
         .route("/api/capsules/catalog", get(capsule_catalog))
+        .route("/api/capsules/interfaces", get(capsule_interfaces))
+        .route(
+            "/api/capsules/interfaces/invoke",
+            post(capsule_interface_invoke),
+        )
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
@@ -706,6 +711,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route("/s/:cid", get(redirect_cid_root))
         .route("/s/:cid/", get(serve_cid_root))
         .route("/s/:cid/*path", get(serve_cid_file))
+        .route("/content/:cid", get(serve_ipfs_cid_root))
         // IPFS-compatible paths so install.sh can use this gateway like ipfs.io
         .route("/ipfs/:cid", get(serve_ipfs_cid_root))
         .route("/ipfs/:cid/", get(serve_cid_root))

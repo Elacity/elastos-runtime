@@ -15,9 +15,9 @@
 # Prerequisites: jq, sha256sum or shasum, ipfs-provider capsule binary, elastos binary
 #
 # Flow:
-#   1. Build the elastos binary (and capsules only when rootfs artifacts are being rebuilt)
-#   2. Build rootfs for each capsule (scripts/build/build-rootfs.sh)
-#   3. Package each: capsule.json + rootfs.ext4 → <name>.capsule.tar.gz
+#   1. Build the elastos binary and selected capsule artifacts
+#   2. Build rootfs only for microVM capsules (scripts/build/build-rootfs.sh)
+#   3. Package each capsule: microVM rootfs, WASM entrypoint, or data entrypoint → <name>.capsule.tar.gz
 #   4. ipfs-provider add each capsule artifact → get CIDs + sha256 + size
 #   5. Build and publish direct share/open support assets
 #   6. Generate components.json with CIDs + checksums
@@ -38,24 +38,62 @@ RED='\033[0;31m'
 DIM='\033[2m'
 NC='\033[0m'
 
-# Default publish scope: runtime core + chat demo (3 modes: native, microVM, WASM).
-# ipfs-provider, availability-provider, wallet-provider, drm-provider, rights-provider, key-provider, decrypt-provider, and tunnel-provider are supported direct command assets.
+# Default publish scope: runtime core + first-party Home app surface.
+# ipfs-provider, availability-provider, wallet-provider, object-provider,
+# content-block-graph-provider, drm-provider, rights-provider, key-provider,
+# decrypt-provider, and tunnel-provider are supported direct command assets.
 # They are not part of the managed user runtime, but fresh installs must
 # provision them for share/open/public-share.
 DEFAULT_CAPSULES=(
     shell
     localhost-provider
+    did-provider
+    net-provider
+    exit-provider
+    browser-engine-adapter
+    webspace-provider
+    object-provider
+    home-cli
+    home
+    system
+    wallet-metamask
+    wallet-unisat
+    wallet-walletconnect
+    wallet
+    browser
+    documents
+    library
+    marketplace
+    inbox
     chat
     chat-wasm
-    did-provider
+    gba-emulator
+    gba-ucity
+    chat-room
     tunnel-provider
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
     shell
     localhost-provider
-    chat
     did-provider
+    net-provider
+    exit-provider
+    browser-engine-adapter
+    webspace-provider
+    object-provider
+    home-cli
+    home
+    system
+    wallet-metamask
+    wallet-unisat
+    wallet-walletconnect
+    wallet
+    browser
+    documents
+    library
+    marketplace
+    inbox
 )
 SUPPORT_BINARY_ASSETS=(
     shell
@@ -72,12 +110,15 @@ SUPPORT_BINARY_ASSETS=(
     object-provider
     chain-provider
     wallet-provider
+    object-provider
+    content-block-graph-provider
     drm-provider
     rights-provider
     key-provider
     decrypt-provider
     ipfs-provider
     availability-provider
+    operator-drive-adapter
     site-provider
     tunnel-provider
 )
@@ -498,94 +539,119 @@ build_support_binary() {
 build_packaged_capsule_archive() {
     local platform="$1"
     local capsule_name="$2"
-    local capsule_dir stage_root archive
-    local required_files=()
+    local capsule_dir capsule_type entrypoint stage_root archive
 
     capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
     [[ -n "$capsule_dir" ]] || die "${capsule_name} source directory not found"
     [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
 
-    case "$capsule_name" in
-        documents|library|marketplace|inbox)
-            required_files=(capsule.json index.html)
-            ;;
-        chat-wasm)
-            required_files=(chat-stdio.wasm)
-            ;;
-        gba-emulator)
-            required_files=(index.html emulator.js favicon.svg mgba.js mgba.wasm style.css)
-            ;;
-        gba-ucity)
-            required_files=(ucity.gba)
-            ;;
-        *)
-            die "Unsupported static capsule archive request: ${capsule_name}"
-            ;;
-    esac
-
-    for file in "${required_files[@]}"; do
-        [[ -f "${capsule_dir}/${file}" ]] || die "${capsule_name} asset missing at ${capsule_dir}/${file}"
-    done
-
+    capsule_type=$(capsule_manifest_field "$capsule_name" "type")
+    entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
     stage_root="${TMPDIR}/support-assets-${platform}-${capsule_name}"
     archive="${TMPDIR}/support-assets-${platform}/${capsule_name}.tar.gz"
     rm -rf "$stage_root"
     mkdir -p "${stage_root}/${capsule_name}" "$(dirname "$archive")"
-    for file in "${required_files[@]}"; do
-        mkdir -p "${stage_root}/${capsule_name}/$(dirname "$file")"
-        cp "${capsule_dir}/${file}" "${stage_root}/${capsule_name}/${file}"
-    done
-    tar -czf "$archive" -C "$stage_root" "$capsule_name"
+
+    case "$capsule_type" in
+        data)
+            copy_clean_capsule_tree "$capsule_dir" "${stage_root}/${capsule_name}"
+            [[ -f "${stage_root}/${capsule_name}/${entrypoint}" ]] || die "${capsule_name} data entrypoint missing after packaging: ${entrypoint}"
+            ;;
+        wasm)
+            stage_wasm_capsule "$capsule_name" "$capsule_dir" "${stage_root}/${capsule_name}"
+            ;;
+        *)
+            die "Unsupported packaged app capsule type for ${capsule_name}: ${capsule_type}"
+            ;;
+    esac
+
+    create_capsule_tar "$archive" "$stage_root" "$capsule_name"
     echo "$archive"
 }
 
-build_home_cli_archive() {
-    local platform="$1"
-    local home_cli_dir stage_root archive
-    home_cli_dir=$(resolve_capsule_dir "home-cli" || true)
-    [[ -n "$home_cli_dir" ]] || die "home-cli source directory not found"
-    [[ -f "${home_cli_dir}/capsule.json" ]] || die "home-cli capsule manifest not found at ${home_cli_dir}/capsule.json"
-
-    ensure_rust_target_installed "wasm32-wasip1"
-    info "  Building home-cli (wasm32-wasip1)..." >&2
-    (cd "$home_cli_dir" && cargo build --target wasm32-wasip1 --release) >&2
-    [[ -f "${home_cli_dir}/target/wasm32-wasip1/release/home-cli.wasm" ]] || die "home-cli.wasm missing after build"
-
-    stage_root="${TMPDIR}/support-assets-${platform}"
-    archive="${stage_root}/home-cli.tar.gz"
-    rm -rf "${stage_root}/home-cli"
-    mkdir -p "${stage_root}/home-cli"
-    cp "${home_cli_dir}/capsule.json" "${stage_root}/home-cli/"
-    cp "${home_cli_dir}/target/wasm32-wasip1/release/home-cli.wasm" "${stage_root}/home-cli/"
-    tar -czf "$archive" -C "$stage_root" home-cli
-    echo "$archive"
-}
-
-build_browser_wasm_capsule_archive() {
-    local platform="$1"
-    local capsule_name="$2"
-    local capsule_dir wasm_name stage_root archive
-
+capsule_manifest_field() {
+    local capsule_name="$1"
+    local field="$2"
+    local capsule_dir
     capsule_dir=$(resolve_capsule_dir "$capsule_name" || true)
     [[ -n "$capsule_dir" ]] || die "${capsule_name} source directory not found"
-    [[ -f "${capsule_dir}/capsule.json" ]] || die "${capsule_name} capsule manifest not found at ${capsule_dir}/capsule.json"
-    [[ -d "${capsule_dir}/browser" ]] || die "${capsule_name} browser assets missing at ${capsule_dir}/browser"
+    python3 - "$capsule_dir/capsule.json" "$field" <<'PY'
+import json
+import sys
+path, field = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    value = json.load(f).get(field, "")
+print(value if isinstance(value, str) else "")
+PY
+}
 
-    wasm_name="${capsule_name}.wasm"
-    ensure_rust_target_installed "wasm32-wasip1"
-    info "  Building ${capsule_name} (wasm32-wasip1)..." >&2
-    (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release) >&2
-    [[ -f "${capsule_dir}/target/wasm32-wasip1/release/${wasm_name}" ]] || die "${wasm_name} missing after build"
+copy_clean_capsule_tree() {
+    local src="$1"
+    local dest="$2"
+    mkdir -p "$dest"
+    tar \
+        --exclude='./target' \
+        --exclude='./node_modules' \
+        --exclude='./.git' \
+        --exclude='./.DS_Store' \
+        -cf - -C "$src" . | tar -xf - -C "$dest"
+}
 
-    stage_root="${TMPDIR}/support-assets-${platform}"
-    archive="${stage_root}/${capsule_name}.tar.gz"
-    rm -rf "${stage_root}/${capsule_name}"
-    mkdir -p "${stage_root}/${capsule_name}"
-    cp "${capsule_dir}/capsule.json" "${stage_root}/${capsule_name}/"
-    cp "${capsule_dir}/target/wasm32-wasip1/release/${wasm_name}" "${stage_root}/${capsule_name}/"
-    cp -R "${capsule_dir}/browser" "${stage_root}/${capsule_name}/browser"
-    tar -czf "$archive" -C "$stage_root" "$capsule_name"
-    echo "$archive"
+create_capsule_tar() {
+    local archive="$1"
+    local stage_root="$2"
+    local capsule_name="$3"
+    tar --sort=name \
+        --mtime='UTC 1970-01-01' \
+        --owner=0 \
+        --group=0 \
+        --numeric-owner \
+        -czf "$archive" -C "$stage_root" "$capsule_name"
+}
+
+stage_wasm_capsule() {
+    local capsule_name="$1"
+    local capsule_dir="$2"
+    local dest="$3"
+    local entrypoint built_wasm candidates candidate
+
+    entrypoint=$(capsule_manifest_field "$capsule_name" "entrypoint")
+    [[ -n "$entrypoint" ]] || die "${capsule_name} capsule manifest missing entrypoint"
+
+    if [[ -f "${capsule_dir}/Cargo.toml" ]]; then
+        ensure_rust_target_installed "wasm32-wasip1"
+        info "  Building ${capsule_name} (wasm32-wasip1)..." >&2
+        (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release) >&2
+    fi
+
+    if [[ -f "${capsule_dir}/Cargo.toml" ]]; then
+        candidates=(
+            "${capsule_dir}/target/wasm32-wasip1/release/${entrypoint}"
+            "elastos/target/wasm32-wasip1/release/${entrypoint}"
+        )
+        if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+            candidates+=("${CARGO_TARGET_DIR}/wasm32-wasip1/release/${entrypoint}")
+        fi
+        candidates+=("${capsule_dir}/${entrypoint}")
+    else
+        candidates=("${capsule_dir}/${entrypoint}")
+    fi
+    built_wasm=""
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            built_wasm="$candidate"
+            break
+        fi
+    done
+    [[ -n "$built_wasm" ]] || die "${capsule_name} wasm entrypoint missing after build: ${entrypoint}"
+
+    mkdir -p "$dest"
+    cp "${capsule_dir}/capsule.json" "$dest/"
+    cp "$built_wasm" "${dest}/${entrypoint}"
+    if [[ -d "${capsule_dir}/browser" ]]; then
+        mkdir -p "${dest}/browser"
+        copy_clean_capsule_tree "${capsule_dir}/browser" "${dest}/browser"
+    fi
 }
 
 build_chat_archive() {
@@ -714,23 +780,28 @@ build_platform_independent_direct_assets() {
     mkdir -p "$stage_dir"
     updates_json='{}'
 
-    for capsule in documents library marketplace inbox chat-wasm gba-emulator gba-ucity; do
-        archive=$(build_packaged_capsule_archive "$platform" "$capsule")
-        release_path="${capsule}.tar.gz"
-        staged="${stage_dir}/${release_path}"
-        cp "$archive" "$staged"
-        updates_json=$(record_direct_asset "$updates_json" "$capsule" "$staged" "capsules/${capsule}" "$release_path" "$capsule")
-    done
-
-    local home_cli_archive home_cli_staged
-    home_cli_archive=$(build_home_cli_archive "$platform")
-    release_path="home-cli.tar.gz"
-    home_cli_staged="${stage_dir}/${release_path}"
-    cp "$home_cli_archive" "$home_cli_staged"
-    updates_json=$(record_direct_asset "$updates_json" "home-cli" "$home_cli_staged" "capsules/home-cli" "$release_path" "home-cli")
-
-    for capsule in home system chat-room; do
-        archive=$(build_browser_wasm_capsule_archive "$platform" "$capsule")
+    for capsule in \
+        home-cli \
+        home \
+        system \
+        wallet-metamask \
+        wallet-unisat \
+        wallet-walletconnect \
+        wallet \
+        browser \
+        documents \
+        library \
+        marketplace \
+        inbox \
+        chat-wasm \
+        gba-emulator \
+        gba-ucity \
+        chat-room; do
+        if [[ -n "${ARTIFACTS_DIR:-}" && -f "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" ]]; then
+            archive="${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz"
+        else
+            archive=$(build_packaged_capsule_archive "$platform" "$capsule")
+        fi
         release_path="${capsule}.tar.gz"
         staged="${stage_dir}/${release_path}"
         cp "$archive" "$staged"
@@ -901,8 +972,26 @@ else
                 warn "No Cargo.toml for ${capsule}; skipping explicit build step"
                 continue
             fi
-            info "  Building ${capsule}..."
-            (cd "$capsule_dir" && cargo build --release 2>&1)
+            capsule_type="$(python3 - "$capsule_dir/capsule.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("")
+else:
+    print(json.loads(path.read_text(encoding="utf-8")).get("type", ""))
+PY
+)"
+            if [[ "$capsule_type" == "wasm" ]]; then
+                info "  Building ${capsule} (wasm32-wasip1)..."
+                ensure_rust_target_installed "wasm32-wasip1"
+                (cd "$capsule_dir" && cargo build --target wasm32-wasip1 --release 2>&1)
+            else
+                info "  Building ${capsule}..."
+                (cd "$capsule_dir" && cargo build --release 2>&1)
+            fi
         done
     fi
 fi
@@ -1265,7 +1354,11 @@ else
     info "  Compiling capsule binaries (${HOST_RUST_TARGET})..."
     for capsule in "${CAPSULES[@]}"; do
         capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
-        if [[ -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
+        capsule_type=""
+        if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
+            capsule_type=$(capsule_manifest_field "$capsule" "type")
+        fi
+        if [[ "$capsule_type" == "microvm" && -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
             info "    ${capsule} (host)..."
             (cd "$capsule_dir" && cargo build --release --target "$HOST_RUST_TARGET" 2>&1) \
                 || die "Compile failed for ${capsule}"
@@ -1290,12 +1383,20 @@ else
     mkdir -p "$ROOTFS_LOGS_DIR"
     for capsule in "${CAPSULES[@]}"; do
         capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
-        # WASM capsule: package directly (no rootfs needed)
+        capsule_type=""
         if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
-            capsule_type=$(python3 -c "import json; print(json.load(open('${capsule_dir}/capsule.json')).get('type',''))" 2>/dev/null || true)
+            capsule_type=$(capsule_manifest_field "$capsule" "type")
             if [[ "$capsule_type" == "wasm" ]]; then
                 info "    ${capsule} (wasm package)..."
-                tar -czf "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" -C "$capsule_dir" . \
+                archive=$(build_packaged_capsule_archive "$PLATFORM" "$capsule")
+                cp "$archive" "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" \
+                    >"${ROOTFS_LOGS_DIR}/${capsule}.log" 2>&1
+                continue
+            fi
+            if [[ "$capsule_type" == "data" ]]; then
+                info "    ${capsule} (data package)..."
+                archive=$(build_packaged_capsule_archive "$PLATFORM" "$capsule")
+                cp "$archive" "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" \
                     >"${ROOTFS_LOGS_DIR}/${capsule}.log" 2>&1
                 continue
             fi
@@ -1328,7 +1429,11 @@ else
         info "Compiling capsule binaries (${CROSS_PLATFORM})..."
         for capsule in "${CAPSULES[@]}"; do
             capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
-            if [[ -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
+            capsule_type=""
+            if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
+                capsule_type=$(capsule_manifest_field "$capsule" "type")
+            fi
+            if [[ "$capsule_type" == "microvm" && -n "$capsule_dir" && -f "${capsule_dir}/Cargo.toml" ]]; then
                 info "    ${capsule} (${CROSS_RUST_TARGET})..."
                 if command -v cross >/dev/null 2>&1; then
                     (cd "$capsule_dir" && "${CROSS_ENV[@]}" cross build --release --target "$CROSS_RUST_TARGET" 2>&1) \
@@ -1357,12 +1462,12 @@ else
         mkdir -p "$CROSS_LOGS_DIR"
         for capsule in "${CAPSULES[@]}"; do
             capsule_dir="$(resolve_capsule_dir "$capsule" || true)"
-            # WASM capsules are platform-independent: package capsule.json + .wasm directly.
+            capsule_type=""
             if [[ -n "$capsule_dir" && -f "${capsule_dir}/capsule.json" ]]; then
-                capsule_type=$(python3 -c "import json; print(json.load(open('${capsule_dir}/capsule.json')).get('type',''))" 2>/dev/null || true)
-                if [[ "$capsule_type" == "wasm" ]]; then
-                    info "    ${capsule} (wasm package, ${CROSS_PLATFORM})..."
-                    tar -czf "${CROSS_ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" -C "$capsule_dir" . \
+                capsule_type=$(capsule_manifest_field "$capsule" "type")
+                if [[ "$capsule_type" == "wasm" || "$capsule_type" == "data" ]]; then
+                    info "    ${capsule} (${capsule_type} package, ${CROSS_PLATFORM})..."
+                    cp "${ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" "${CROSS_ARTIFACTS_DIR}/${capsule}.capsule.tar.gz" \
                         >"${CROSS_LOGS_DIR}/${capsule}.log" 2>&1
                     continue
                 fi

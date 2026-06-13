@@ -18,12 +18,13 @@
 //!
 //! See `docs/CARRIER_TRUST_DECISION.md` for the rationale.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, SecretKey, Watcher};
@@ -44,13 +45,48 @@ use elastos_common::localhost::{
     publisher_artifacts_path, publisher_install_script_path, publisher_publish_state_path,
     publisher_release_head_path, publisher_release_manifest_path,
 };
-use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
+use elastos_runtime::provider::{
+    Provider, ProviderCarrierInvoker, ProviderCarrierRoute, ProviderError, ProviderInvocation,
+    ProviderInvocationTransport, ProviderRegistry, ProviderTransfer, ResourceRequest,
+    ResourceResponse,
+};
 
+use crate::content::{ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH};
 use crate::operator_control::{OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN};
 use crate::sources::TrustedSource;
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
 const CHAT_DISCOVERY_TOPIC_GENERAL: &str = "__elastos_internal/chat-presence-v1/#general";
+const CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA: &str =
+    "elastos.content.availability.announcement/v1";
+const CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN: &str =
+    "elastos.content.availability.announcement.v1";
+const CONTENT_ADMISSION_DOMAIN: &str = "elastos.content.admission.v1";
+const CONTENT_REPAIR_GRAPH_SCHEMA: &str = "elastos.content.repair-graph/v1";
+const CONTENT_BLOCK_GRAPH_SCHEMA: &str = "elastos.content.block-graph/v1";
+const CONTENT_FEDERATED_QUOTA_LEDGER_POLICY_SCHEMA: &str =
+    "elastos.content.federated-quota-ledger-policy/v1";
+const CONTENT_STORAGE_MARKET_ADMISSION_POLICY_SCHEMA: &str =
+    "elastos.content.storage-market-admission-policy/v1";
+const CONTENT_BLOCK_GRAPH_PROVIDER: &str = "content-block-graph-provider";
+const CONTENT_BLOCK_GRAPH_TARGET: &str = "block-graph";
+const CARRIER_PEER_REPUTATION_SCHEMA: &str = "elastos.carrier.peer-reputation/v1";
+const CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA: &str =
+    "elastos.carrier.peer-attestation-exchange-policy/v1";
+const CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA: &str =
+    "elastos.carrier.peer-attestation.exchange-request/v1";
+const CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_DOMAIN: &str =
+    "elastos.carrier.peer-attestation.exchange-request.v1";
+const CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA: &str =
+    "elastos.carrier.peer-attestation.exchange-receipt/v1";
+const CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_DOMAIN: &str =
+    "elastos.carrier.peer-attestation.exchange-receipt.v1";
+const MAX_CARRIER_REPLICATION_CANDIDATES: usize = 8;
+const MAX_CARRIER_AVAILABILITY_TICKET_LEN: usize = 8192;
+const MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN: usize = 256;
+const MAX_CARRIER_OBJECT_IMPORT_FILES: usize = 512;
+const MAX_CARRIER_OBJECT_IMPORT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS: usize = 5;
 
 /// Well-known secret for topic discovery. Any Carrier node with this secret
 /// can discover peers on the same topic via DHT.
@@ -482,6 +518,15 @@ pub async fn start_carrier_node(
     did: &str,
     data_dir: PathBuf,
 ) -> Result<CarrierNode> {
+    start_carrier_node_with_registry(signing_key, did, data_dir, None).await
+}
+
+pub async fn start_carrier_node_with_registry(
+    signing_key: &ed25519_dalek::SigningKey,
+    did: &str,
+    data_dir: PathBuf,
+    provider_registry: Option<Weak<ProviderRegistry>>,
+) -> Result<CarrierNode> {
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
     // Build endpoint. Uses iroh default relays unless ELASTOS_RELAY_URL is set.
@@ -538,6 +583,7 @@ pub async fn start_carrier_node(
 
     let file_handler = FileHandler {
         data_dir: data_dir.clone(),
+        provider_registry,
     };
     let operator_handler = OperatorHandler::new(OperatorRuntimeContext {
         data_dir: data_dir.clone(),
@@ -616,6 +662,7 @@ pub async fn start_carrier_node(
 #[derive(Debug, Clone)]
 struct FileHandler {
     data_dir: PathBuf,
+    provider_registry: Option<Weak<ProviderRegistry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,8 +681,9 @@ impl ProtocolHandler for FileHandler {
         conn: iroh::endpoint::Connection,
     ) -> futures_lite::future::Boxed<std::result::Result<(), AcceptError>> {
         let data_dir = self.data_dir.clone();
+        let provider_registry = self.provider_registry.clone();
         Box::pin(async move {
-            handle_file_connection(conn, &data_dir)
+            handle_file_connection(conn, &data_dir, provider_registry)
                 .await
                 .map_err(|e| AcceptError::from(std::io::Error::other(e.to_string())))
         })
@@ -645,6 +693,7 @@ impl ProtocolHandler for FileHandler {
 async fn handle_file_connection(
     conn: iroh::endpoint::Connection,
     data_dir: &std::path::Path,
+    provider_registry: Option<Weak<ProviderRegistry>>,
 ) -> Result<()> {
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
@@ -652,8 +701,10 @@ async fn handle_file_connection(
             Err(_) => break,
         };
         let data_dir = data_dir.to_path_buf();
+        let provider_registry = provider_registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_file_stream(&mut send, recv, &data_dir).await {
+            if let Err(e) = handle_file_stream(&mut send, recv, &data_dir, provider_registry).await
+            {
                 debug!("carrier file stream error: {:#}", e);
             }
         });
@@ -665,6 +716,7 @@ async fn handle_file_stream(
     send: &mut iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
     data_dir: &std::path::Path,
+    provider_registry: Option<Weak<ProviderRegistry>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(recv);
     let mut line = String::new();
@@ -752,12 +804,299 @@ async fn handle_file_stream(
             send.stopped().await.ok();
             info!("carrier: served file {} ({} bytes)", path, len);
         }
+        "content_fetch" => {
+            let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {
+                send_json(
+                    send,
+                    &serde_json::json!({
+                        "ok": false,
+                        "error": "content provider registry unavailable"
+                    }),
+                )
+                .await?;
+                return Ok(());
+            };
+            let cid = msg
+                .data
+                .get("cid")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let path = msg
+                .data
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            match carrier_content_fetch_bytes(&registry, cid, path).await {
+                Ok(content) => {
+                    let len = content.len() as u64;
+                    send.write_all(&len.to_be_bytes()).await?;
+                    send.write_all(&content).await?;
+                    send.finish()?;
+                    send.stopped().await.ok();
+                    info!(
+                        "carrier: served content {}{}{} ({} bytes)",
+                        cid,
+                        if path.is_empty() { "" } else { "/" },
+                        path,
+                        len
+                    );
+                }
+                Err(err) => {
+                    send_json(
+                        send,
+                        &serde_json::json!({
+                            "ok": false,
+                            "error": err.to_string(),
+                        }),
+                    )
+                    .await?;
+                }
+            }
+        }
+        "provider_invoke" => {
+            let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {
+                send_json(
+                    send,
+                    &serde_json::json!({
+                        "ok": false,
+                        "code": "provider_registry_unavailable",
+                        "error": "provider registry unavailable"
+                    }),
+                )
+                .await?;
+                return Ok(());
+            };
+            let response = carrier_provider_invoke_registry(&registry, &msg.data).await?;
+            send_json(send, &response).await?;
+        }
         _ => {
             send_json(
                 send,
                 &serde_json::json!({ "ok": false, "error": "unknown op" }),
             )
             .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn carrier_content_fetch_bytes(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
+    validate_content_cid(cid).map_err(anyhow::Error::msg)?;
+    validate_carrier_content_path(path).map_err(anyhow::Error::msg)?;
+    let mut request = serde_json::json!({
+        "op": "cat",
+        "cid": cid,
+    });
+    if !path.is_empty() {
+        request["path"] = serde_json::Value::String(path.to_string());
+    }
+    let response = registry
+        .send_raw("ipfs", &request)
+        .await
+        .map_err(|err| anyhow::anyhow!("ipfs-provider unavailable: {err}"))?;
+    if response.get("status").and_then(|status| status.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("ipfs-provider fetch failed: {message}");
+    }
+    let data = response
+        .get("data")
+        .and_then(|data| data.get("data"))
+        .and_then(|data| data.as_str())
+        .ok_or_else(|| anyhow::anyhow!("ipfs-provider response missing data"))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|err| anyhow::anyhow!("ipfs-provider returned invalid base64: {err}"))
+}
+
+async fn carrier_provider_invoke_registry(
+    registry: &ProviderRegistry,
+    data: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let source = data
+        .get("source")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provider_invoke missing source"))?;
+    let target = data
+        .get("target")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provider_invoke missing target"))?;
+    let operation = data
+        .get("operation")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provider_invoke missing operation"))?;
+    let transfer = data
+        .get("transfer")
+        .and_then(|value| value.as_str())
+        .unwrap_or("json");
+    let request = data
+        .get("request")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("provider_invoke missing request"))?;
+
+    if !carrier_provider_target_allowed(target) {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "code": "unauthorized_provider_target",
+            "error": "Carrier provider invocation must target an ElastOS service provider, not a raw backend",
+        }));
+    }
+    if let Err(message) =
+        validate_carrier_provider_invocation(source, target, operation, transfer, &request)
+    {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "code": "invalid_provider_invocation",
+            "error": message,
+        }));
+    }
+
+    match registry.send_raw(target, &request).await {
+        Ok(result) => Ok(serde_json::json!({
+            "ok": true,
+            "result": result,
+        })),
+        Err(err) => Ok(serde_json::json!({
+            "ok": false,
+            "code": "provider_error",
+            "error": err.to_string(),
+        })),
+    }
+}
+
+fn carrier_provider_target_allowed(target: &str) -> bool {
+    matches!(
+        target,
+        "content" | "availability" | "rights" | "key" | "decrypt" | "drm"
+    )
+}
+
+fn validate_carrier_provider_invocation(
+    source: &str,
+    target: &str,
+    operation: &str,
+    transfer: &str,
+    request: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    if !matches!(transfer, "json" | "bytes" | "stream") {
+        return Err(format!(
+            "provider_invoke transfer must be json, bytes, or stream, got {transfer}"
+        ));
+    }
+    if request.get("_runtime_transfer").is_some() {
+        return Err("provider_invoke request must not predeclare _runtime_transfer".to_string());
+    }
+    let request_op = request
+        .get("op")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if request_op != operation {
+        return Err(format!(
+            "provider_invoke op mismatch: envelope={operation}, request={request_op}"
+        ));
+    }
+    let runtime = request
+        .get("_runtime_invocation")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "provider_invoke requires _runtime_invocation".to_string())?;
+    let expected_capability = format!("provider:{source}->{target}:{operation}");
+    for (field, expected) in [
+        ("schema", "elastos.provider.invocation/v1"),
+        ("source", source),
+        ("target", target),
+        ("op", operation),
+        ("capability", expected_capability.as_str()),
+        ("transport", "carrier-provider-plane"),
+        ("transfer", transfer),
+    ] {
+        let actual = runtime
+            .get(field)
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(format!(
+                "provider_invoke runtime field {field} mismatch: expected {expected}, got {actual}"
+            ));
+        }
+    }
+    let carrier = runtime
+        .get("carrier")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "provider_invoke requires carrier route metadata".to_string())?;
+    if carrier
+        .get("route")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        != "connect_ticket"
+    {
+        return Err("provider_invoke carrier route must be connect_ticket".to_string());
+    }
+    if carrier.contains_key("connect_ticket") {
+        return Err("provider_invoke carrier metadata must not expose connect_ticket".to_string());
+    }
+    if transfer == "stream" {
+        validate_carrier_provider_stream_contract(runtime)?;
+    }
+    Ok(())
+}
+
+fn validate_carrier_provider_stream_contract(
+    runtime: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let stream = runtime
+        .get("stream")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| "provider_invoke stream transfer requires stream metadata".to_string())?;
+    let schema = stream
+        .get("schema")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if schema != "elastos.provider.stream/v1" {
+        return Err(format!(
+            "provider_invoke stream schema mismatch: expected elastos.provider.stream/v1, got {schema}"
+        ));
+    }
+    let encoding = stream
+        .get("encoding")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if encoding != "base64-chunks" {
+        return Err(format!(
+            "provider_invoke stream encoding mismatch: expected base64-chunks, got {encoding}"
+        ));
+    }
+    let chunk_size = stream
+        .get("chunk_size")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    if chunk_size == 0 {
+        return Err("provider_invoke stream chunk_size must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_carrier_content_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err("content fetch path must be relative".to_string());
+    }
+    if path.contains('\\') || path.contains('\0') {
+        return Err("content fetch path contains invalid characters".to_string());
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err("content fetch path contains an invalid segment".to_string());
         }
     }
     Ok(())
@@ -770,6 +1109,3356 @@ async fn send_json(send: &mut iroh::endpoint::SendStream, value: &serde_json::Va
     send.finish()?;
     send.stopped().await.ok();
     Ok(())
+}
+
+/// Runtime content availability provider backed by Carrier gossip.
+///
+/// `content-provider` still owns CID policy, receipts, and local Kubo/IPFS
+/// backend use. This provider only announces content availability through the
+/// Carrier plane so apps keep using `elastos://content/*` instead of raw
+/// peer/topic/IPFS authority.
+pub struct CarrierAvailabilityProvider {
+    state: Arc<Mutex<GossipState>>,
+    provider_registry: Option<Weak<ProviderRegistry>>,
+    peer_reputation: Arc<Mutex<HashMap<String, CarrierPeerReputation>>>,
+    data_dir: Option<PathBuf>,
+    peer_attestation_exchange: Option<CarrierPeerAttestationExchangeClient>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CarrierPeerAttestationExchangeClient {
+    endpoints: Vec<CarrierPeerAttestationExchangeEndpoint>,
+    quorum: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CarrierPeerAttestationExchangeEndpoint {
+    id: String,
+    url: String,
+    authorization: Option<String>,
+    timeout_secs: u64,
+}
+
+impl CarrierAvailabilityProvider {
+    pub fn new(state: Arc<Mutex<GossipState>>) -> Self {
+        Self {
+            state,
+            provider_registry: None,
+            peer_reputation: Arc::new(Mutex::new(HashMap::new())),
+            data_dir: None,
+            peer_attestation_exchange: None,
+        }
+    }
+
+    pub fn with_provider_registry(
+        state: Arc<Mutex<GossipState>>,
+        provider_registry: Weak<ProviderRegistry>,
+    ) -> Self {
+        Self {
+            state,
+            provider_registry: Some(provider_registry),
+            peer_reputation: Arc::new(Mutex::new(HashMap::new())),
+            data_dir: None,
+            peer_attestation_exchange: None,
+        }
+    }
+
+    pub fn with_provider_registry_and_data_dir(
+        state: Arc<Mutex<GossipState>>,
+        provider_registry: Weak<ProviderRegistry>,
+        data_dir: PathBuf,
+    ) -> Self {
+        Self::with_provider_registry_data_dir_and_peer_attestation_exchange_config(
+            state,
+            provider_registry,
+            data_dir,
+            None,
+        )
+    }
+
+    pub fn with_provider_registry_data_dir_and_peer_attestation_exchange_config(
+        state: Arc<Mutex<GossipState>>,
+        provider_registry: Weak<ProviderRegistry>,
+        data_dir: PathBuf,
+        peer_attestation_exchange_config: Option<serde_json::Value>,
+    ) -> Self {
+        let peer_reputation = load_carrier_peer_reputation(&data_dir);
+        let peer_attestation_exchange = peer_attestation_exchange_config.and_then(|config| {
+            match CarrierPeerAttestationExchangeClient::from_config(config) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::warn!("carrier peer-attestation exchange disabled: {}", err);
+                    None
+                }
+            }
+        });
+        Self {
+            state,
+            provider_registry: Some(provider_registry),
+            peer_reputation: Arc::new(Mutex::new(peer_reputation)),
+            data_dir: Some(data_dir),
+            peer_attestation_exchange,
+        }
+    }
+
+    async fn record_peer_reputation(&self, node_did: &str, success: bool) {
+        let snapshot = {
+            let mut reputation = self.peer_reputation.lock().await;
+            let entry = reputation.entry(node_did.to_string()).or_default();
+            if success {
+                entry.successes = entry.successes.saturating_add(1);
+            } else {
+                entry.failures = entry.failures.saturating_add(1);
+            }
+            reputation.clone()
+        };
+        if let Some(data_dir) = &self.data_dir {
+            if let Err(err) = save_carrier_peer_reputation(data_dir, &snapshot) {
+                tracing::debug!("carrier peer reputation save failed: {}", err);
+            }
+        }
+    }
+
+    async fn exchange_peer_attestations(
+        &self,
+        exchange_request: CarrierPeerAttestationExchangeRequest<'_>,
+    ) -> Option<serde_json::Value> {
+        let Some(exchange) = &self.peer_attestation_exchange else {
+            return None;
+        };
+        if exchange_request.remote_proofs.is_empty() {
+            return None;
+        }
+        let request = match carrier_peer_attestation_exchange_request(
+            exchange_request.signing_key,
+            exchange_request.cid,
+            exchange_request.topic_uri,
+            exchange_request.local_node_did,
+            exchange_request.remote_proofs,
+            exchange_request.live_multi_peer_proof,
+            exchange_request.requested_at,
+        ) {
+            Ok(request) => request,
+            Err(err) => {
+                return Some(serde_json::json!({
+                    "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+                    "provider": "carrier-availability",
+                    "scope": "content-availability",
+                    "configured": true,
+                    "accepted": false,
+                    "status": "failed",
+                    "reason": format!("peer-attestation exchange request build failed: {err}"),
+                    "exchange": exchange.redacted_status_json(),
+                    "credential_exposed": false,
+                }))
+            }
+        };
+        match exchange.exchange(&request).await {
+            Ok(receipt) => Some(receipt),
+            Err(err) => Some(serde_json::json!({
+                "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+                "provider": "carrier-availability",
+                "scope": "content-availability",
+                "configured": true,
+                "accepted": false,
+                "status": "failed",
+                "reason": err,
+                "exchange": exchange.redacted_status_json(),
+                "credential_exposed": false,
+            })),
+        }
+    }
+}
+
+impl std::fmt::Debug for CarrierAvailabilityProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierAvailabilityProvider").finish()
+    }
+}
+
+impl CarrierPeerAttestationExchangeClient {
+    pub fn from_config(config: serde_json::Value) -> Result<Self, String> {
+        let payload = config
+            .get("extra")
+            .filter(|extra| !extra.is_null())
+            .unwrap_or(&config);
+        let default_authorization = payload
+            .get("authorization")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(value) = &default_authorization {
+            validate_carrier_authorization_header_value(value)?;
+        }
+        let default_timeout_secs = payload
+            .get("timeout_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 60);
+        let endpoints = match payload.get("endpoints").and_then(|value| value.as_array()) {
+            Some(values) if !values.is_empty() => values
+                .iter()
+                .enumerate()
+                .map(|(index, endpoint)| {
+                    CarrierPeerAttestationExchangeEndpoint::from_config(
+                        endpoint,
+                        index,
+                        default_authorization.as_deref(),
+                        default_timeout_secs,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => vec![CarrierPeerAttestationExchangeEndpoint::from_config(
+                payload,
+                0,
+                default_authorization.as_deref(),
+                default_timeout_secs,
+            )?],
+        };
+        if endpoints.len() > 5 {
+            return Err(
+                "carrier peer-attestation exchange supports at most 5 endpoints".to_string(),
+            );
+        }
+        let quorum = payload
+            .get("quorum")
+            .or_else(|| payload.get("required_quorum"))
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(endpoints.len());
+        if quorum == 0 || quorum > endpoints.len() {
+            return Err(format!(
+                "carrier peer-attestation exchange quorum must be between 1 and {}",
+                endpoints.len()
+            ));
+        }
+        Ok(Self { endpoints, quorum })
+    }
+
+    fn redacted_status_json(&self) -> serde_json::Value {
+        let first = self.endpoints.first();
+        let parsed = first.and_then(|endpoint| url::Url::parse(&endpoint.url).ok());
+        serde_json::json!({
+            "configured": true,
+            "delivery": "carrier_peer_attestation_exchange",
+            "endpoint_count": self.endpoints.len(),
+            "multi_endpoint": self.endpoints.len() > 1,
+            "quorum_required": self.quorum,
+            "endpoints": self
+                .endpoints
+                .iter()
+                .map(CarrierPeerAttestationExchangeEndpoint::redacted_status_json)
+                .collect::<Vec<_>>(),
+            "scheme": parsed.as_ref().map(|url| url.scheme()).unwrap_or("unknown"),
+            "host": parsed
+                .as_ref()
+                .and_then(|url| url.host_str())
+                .unwrap_or("unknown"),
+            "port": parsed.as_ref().and_then(|url| url.port()),
+            "path_configured": parsed
+                .as_ref()
+                .map(|url| !url.path().trim_matches('/').is_empty())
+                .unwrap_or(false),
+            "authorization_configured": self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.authorization.is_some()),
+            "timeout_secs": first.map(|endpoint| endpoint.timeout_secs).unwrap_or(0),
+            "credential_exposed": false,
+        })
+    }
+
+    async fn exchange(
+        &self,
+        request_payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let mut endpoint_receipts = Vec::new();
+        let mut accepted_receipts = 0_usize;
+        let mut rejected_receipts = 0_usize;
+        let mut failed_receipts = 0_usize;
+        let mut verified_receipts = 0_usize;
+        let mut first_verified_signed_receipt = None;
+        let mut reasons = Vec::new();
+
+        for endpoint in &self.endpoints {
+            let receipt = endpoint
+                .exchange(request_payload)
+                .await
+                .unwrap_or_else(|err| {
+                    failed_receipts = failed_receipts.saturating_add(1);
+                    carrier_peer_attestation_endpoint_unavailable(err, endpoint)
+                });
+            if receipt
+                .get("accepted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                accepted_receipts = accepted_receipts.saturating_add(1);
+            } else if receipt
+                .get("status")
+                .and_then(|value| value.as_str())
+                .is_some_and(|status| status == "rejected")
+            {
+                rejected_receipts = rejected_receipts.saturating_add(1);
+            }
+            if receipt
+                .get("signed_receipt")
+                .and_then(|value| value.get("verified"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                verified_receipts = verified_receipts.saturating_add(1);
+                if first_verified_signed_receipt.is_none() {
+                    first_verified_signed_receipt = receipt.get("signed_receipt").cloned();
+                }
+            }
+            if let Some(reason) = receipt.get("reason").and_then(|value| value.as_str()) {
+                reasons.push(reason.to_string());
+            }
+            endpoint_receipts.push(receipt);
+        }
+
+        let accepted = accepted_receipts >= self.quorum;
+        let reason = if accepted {
+            format!(
+                "carrier peer-attestation quorum accepted: {accepted_receipts}/{} verified endpoints accepted",
+                self.endpoints.len()
+            )
+        } else if reasons.is_empty() {
+            format!(
+                "carrier peer-attestation quorum rejected: {accepted_receipts}/{} accepted, quorum {}",
+                self.endpoints.len(),
+                self.quorum
+            )
+        } else {
+            format!(
+                "carrier peer-attestation quorum rejected: {accepted_receipts}/{} accepted, quorum {}; {}",
+                self.endpoints.len(),
+                self.quorum,
+                reasons.join("; ")
+            )
+        };
+        let mut signed_receipt = first_verified_signed_receipt.unwrap_or_else(|| {
+            serde_json::json!({
+                "verified": false,
+            })
+        });
+        signed_receipt["verified"] = serde_json::Value::Bool(verified_receipts > 0);
+        signed_receipt["verified_receipts"] = serde_json::Value::from(verified_receipts);
+
+        Ok(serde_json::json!({
+            "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+            "provider": "carrier-availability",
+            "scope": "content-availability",
+            "configured": true,
+            "accepted": accepted,
+            "status": if accepted { "accepted" } else { "rejected" },
+            "exchange": self.redacted_status_json(),
+            "quorum": {
+                "required": self.quorum,
+                "endpoint_count": self.endpoints.len(),
+                "accepted": accepted_receipts,
+                "rejected": rejected_receipts,
+                "failed": failed_receipts,
+                "verified": verified_receipts,
+            },
+            "endpoint_receipts": endpoint_receipts,
+            "signed_receipt": signed_receipt,
+            "reason": reason,
+            "credential_exposed": false,
+        }))
+    }
+}
+
+impl CarrierPeerAttestationExchangeEndpoint {
+    fn from_config(
+        payload: &serde_json::Value,
+        index: usize,
+        default_authorization: Option<&str>,
+        default_timeout_secs: u64,
+    ) -> Result<Self, String> {
+        let url = payload
+            .get("url")
+            .or_else(|| payload.get("exchange_url"))
+            .or_else(|| payload.get("endpoint_url"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "carrier peer-attestation exchange endpoint requires url".to_string())?;
+        validate_carrier_external_endpoint_url(url)?;
+        let authorization = payload
+            .get("authorization")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(default_authorization)
+            .map(str::to_string);
+        if let Some(value) = &authorization {
+            validate_carrier_authorization_header_value(value)?;
+        }
+        let timeout_secs = payload
+            .get("timeout_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(default_timeout_secs)
+            .clamp(1, 60);
+        let id = payload
+            .get("id")
+            .or_else(|| payload.get("provider_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("peer-attestation-{}", index + 1));
+        Ok(Self {
+            id,
+            url: url.to_string(),
+            authorization,
+            timeout_secs,
+        })
+    }
+
+    fn redacted_status_json(&self) -> serde_json::Value {
+        let parsed = url::Url::parse(&self.url).ok();
+        serde_json::json!({
+            "id": self.id,
+            "scheme": parsed.as_ref().map(|url| url.scheme()).unwrap_or("unknown"),
+            "host": parsed
+                .as_ref()
+                .and_then(|url| url.host_str())
+                .unwrap_or("unknown"),
+            "port": parsed.as_ref().and_then(|url| url.port()),
+            "path_configured": parsed
+                .as_ref()
+                .map(|url| !url.path().trim_matches('/').is_empty())
+                .unwrap_or(false),
+            "authorization_configured": self.authorization.is_some(),
+            "timeout_secs": self.timeout_secs,
+            "credential_exposed": false,
+        })
+    }
+
+    async fn exchange(
+        &self,
+        request_payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .build()
+            .map_err(|err| format!("peer-attestation exchange client build failed: {err}"))?;
+        let mut request = client.post(&self.url).json(request_payload);
+        if let Some(authorization) = &self.authorization {
+            request = request.header("Authorization", authorization);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|err| format!("peer-attestation exchange request failed: {err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "peer-attestation exchange returned HTTP {}",
+                status.as_u16()
+            ));
+        }
+        let response_json = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|err| format!("peer-attestation exchange response decode failed: {err}"))?;
+        carrier_peer_attestation_exchange_receipt_from_response(
+            &response_json,
+            self.redacted_status_json(),
+            status.as_u16(),
+        )
+    }
+}
+
+fn content_availability_topic_name(cid: &str) -> String {
+    let digest = Sha256::digest(cid.as_bytes());
+    format!("__elastos_content/v1/{}", hex::encode(digest))
+}
+
+fn content_availability_topic_uri(cid: &str) -> String {
+    let digest = Sha256::digest(cid.as_bytes());
+    format!(
+        "elastos://carrier/content/{}/availability",
+        hex::encode(digest)
+    )
+}
+
+fn carrier_availability_error(code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "code": code,
+        "message": message.into(),
+    })
+}
+
+fn validate_content_cid(cid: &str) -> Result<(), String> {
+    let cid = cid.trim();
+    if cid.len() < 8 || cid.len() > 128 {
+        return Err("content availability requires a valid CID".to_string());
+    }
+    if !cid
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("content availability CID contains unsupported characters".to_string());
+    }
+    Ok(())
+}
+
+fn validate_carrier_external_endpoint_url(raw: &str) -> Result<(), String> {
+    let url = url::Url::parse(raw)
+        .map_err(|err| format!("invalid carrier external endpoint URL: {err}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "carrier external endpoint URL must not contain inline credentials".to_string(),
+        );
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) => Ok(()),
+        _ => Err("carrier external endpoint URL must use https or local loopback http".to_string()),
+    }
+}
+
+fn validate_carrier_authorization_header_value(value: &str) -> Result<(), String> {
+    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        return Err("carrier authorization header contains invalid newline".to_string());
+    }
+    Ok(())
+}
+
+fn local_replica_count(request: &serde_json::Value) -> u32 {
+    request
+        .get("local")
+        .and_then(|value| value.get("replicas"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+fn carrier_peer_attestation_remote_proofs_json(
+    remote_proofs: &[CarrierReplicationProof],
+) -> Vec<serde_json::Value> {
+    remote_proofs
+        .iter()
+        .map(|proof| {
+            serde_json::json!({
+                "node_did": proof.node_did.clone(),
+                "endpoint_id": proof.endpoint_id.clone(),
+                "announced_at": proof.announced_at,
+                "score": proof.score,
+                "selection_reason": proof.selection_reason.clone(),
+                "local_reputation": {
+                    "scope": "local_runtime",
+                    "score_delta": proof.reputation_score,
+                    "reason": proof.reputation_reason.clone(),
+                },
+                "admission": proof.admission.clone(),
+                "ensure_status": proof.ensure_status.clone(),
+                "status": proof
+                    .status_availability
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                "remote_receipt": proof.remote_receipt.as_ref().map(|receipt| {
+                    serde_json::json!({
+                        "schema": receipt.get("schema").cloned().unwrap_or(serde_json::Value::Null),
+                        "cid": receipt.get("cid").cloned().unwrap_or(serde_json::Value::Null),
+                        "status": receipt.get("status").cloned().unwrap_or(serde_json::Value::Null),
+                        "signer_did": receipt.get("signer_did").cloned().unwrap_or(serde_json::Value::Null),
+                        "verified": receipt.get("verified").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                    })
+                }),
+                "checked_at": proof.checked_at,
+            })
+        })
+        .collect()
+}
+
+fn carrier_peer_attestation_exchange_request(
+    signing_key: &ed25519_dalek::SigningKey,
+    cid: &str,
+    topic_uri: &str,
+    local_node_did: &str,
+    remote_proofs: &[CarrierReplicationProof],
+    live_multi_peer_proof: bool,
+    requested_at: u64,
+) -> Result<serde_json::Value, ProviderError> {
+    let payload = serde_json::json!({
+        "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA,
+        "provider": "carrier-availability",
+        "scope": "content-availability",
+        "cid": cid,
+        "topic": topic_uri,
+        "local_node_did": local_node_did,
+        "live_multi_peer_proof": live_multi_peer_proof,
+        "remote_provider_proofs": remote_proofs.len(),
+        "remote_proofs": carrier_peer_attestation_remote_proofs_json(remote_proofs),
+        "requested_at": requested_at,
+        "authority": {
+            "runtime_invocation_required": true,
+            "provider_owned_exchange": true,
+            "raw_carrier_ticket_exposed": false,
+            "raw_backend_access": false,
+        },
+    });
+    let canonical = serde_json::to_string(&payload).map_err(|err| {
+        ProviderError::Provider(format!(
+            "Carrier peer-attestation request serialization failed: {err}"
+        ))
+    })?;
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        signing_key,
+        CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_DOMAIN,
+        canonical.as_bytes(),
+    );
+    Ok(serde_json::json!({
+        "payload": payload,
+        "signature": signature,
+        "signer_did": signer_did,
+    }))
+}
+
+fn carrier_peer_attestation_exchange_receipt_from_response(
+    response: &serde_json::Value,
+    exchange: serde_json::Value,
+    http_status: u16,
+) -> Result<serde_json::Value, String> {
+    let accepted = response
+        .get("accepted")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            "peer-attestation exchange response requires accepted boolean".to_string()
+        })?;
+    let signed_receipt = response.get("receipt").cloned();
+    let verified_receipt = match signed_receipt.as_ref() {
+        Some(receipt) => {
+            let signer_did = receipt
+                .get("signer_did")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "peer-attestation exchange signed receipt requires signer_did".to_string()
+                })?;
+            let receipt_bytes = serde_json::to_vec(receipt)
+                .map_err(|err| format!("peer-attestation exchange receipt encode failed: {err}"))?;
+            let expected_signers = [signer_did.to_string()];
+            crate::crypto::verify_signed_json_envelope_against_dids(
+                &receipt_bytes,
+                CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_DOMAIN,
+                &expected_signers,
+            )
+            .map_err(|err| {
+                format!("peer-attestation exchange receipt verification failed: {err}")
+            })?;
+            let payload = receipt
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            Some(serde_json::json!({
+                "verified": true,
+                "signer_did": signer_did,
+                "payload_schema": payload
+                    .get("schema")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "exchange_id": payload
+                    .get("exchange_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "receipt_id": payload
+                    .get("receipt_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+        }
+        None if accepted => {
+            return Err(
+                "peer-attestation exchange accepted response requires signed receipt".to_string(),
+            )
+        }
+        None => None,
+    };
+    Ok(serde_json::json!({
+        "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+        "provider": "carrier-availability",
+        "scope": "content-availability",
+        "configured": true,
+        "accepted": accepted,
+        "status": if accepted { "accepted" } else { "rejected" },
+        "http_status": http_status,
+        "exchange": exchange,
+        "remote_schema": response.get("schema").cloned().unwrap_or(serde_json::Value::Null),
+        "remote_exchange_id": response.get("exchange_id").cloned().unwrap_or(serde_json::Value::Null),
+        "remote_receipt_id": response.get("receipt_id").cloned().unwrap_or(serde_json::Value::Null),
+        "signed_receipt": verified_receipt.unwrap_or_else(|| {
+            serde_json::json!({
+                "verified": false,
+                "reason": "no signed receipt returned",
+            })
+        }),
+        "reason": response.get("reason").cloned().unwrap_or(serde_json::Value::Null),
+        "credential_exposed": false,
+    }))
+}
+
+fn carrier_peer_attestation_endpoint_unavailable(
+    reason: String,
+    endpoint: &CarrierPeerAttestationExchangeEndpoint,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+        "provider": "carrier-availability",
+        "scope": "content-availability",
+        "configured": true,
+        "accepted": false,
+        "status": "failed",
+        "exchange": endpoint.redacted_status_json(),
+        "signed_receipt": {
+            "verified": false,
+            "reason": reason,
+        },
+        "reason": reason,
+        "credential_exposed": false,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CarrierAvailabilityRequirements {
+    min_replicas: u32,
+    max_replicas: Option<u32>,
+    require_live_multi_peer_proof: bool,
+    repair_graph_kind: CarrierRepairGraphKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrierRepairGraphKind {
+    Auto,
+    ObjectManifest,
+    ExactBytes,
+    IpldDag,
+}
+
+impl CarrierAvailabilityRequirements {
+    fn from_request(request: &serde_json::Value) -> Self {
+        let requirements = request
+            .get("requirements")
+            .or_else(|| request.get("availability_requirements"));
+        let min_replicas = requirements
+            .and_then(|value| value.get("min_replicas"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(1)
+            .max(1);
+        let max_replicas = requirements
+            .and_then(|value| value.get("max_replicas"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0);
+        let require_live_multi_peer_proof = requirements
+            .and_then(|value| value.get("require_live_multi_peer_proof"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let repair_graph_kind = CarrierRepairGraphKind::from_requirements(requirements);
+        Self {
+            min_replicas,
+            max_replicas,
+            require_live_multi_peer_proof,
+            repair_graph_kind,
+        }
+    }
+
+    fn effective_max(self) -> u32 {
+        self.max_replicas
+            .unwrap_or(MAX_CARRIER_REPLICATION_CANDIDATES as u32 + 1)
+            .min(MAX_CARRIER_REPLICATION_CANDIDATES as u32 + 1)
+            .max(1)
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "min_replicas": self.min_replicas,
+            "max_replicas": self.max_replicas,
+            "require_live_multi_peer_proof": self.require_live_multi_peer_proof,
+            "repair_graph_kind": self.repair_graph_kind.as_str(),
+        })
+    }
+}
+
+impl CarrierRepairGraphKind {
+    fn from_requirements(requirements: Option<&serde_json::Value>) -> Self {
+        let raw = requirements
+            .and_then(|value| {
+                value
+                    .get("repair_graph_kind")
+                    .or_else(|| value.get("content_graph_kind"))
+                    .or_else(|| value.get("graph_kind"))
+                    .or_else(|| {
+                        value
+                            .get("repair_graph")
+                            .and_then(|graph| graph.get("kind"))
+                    })
+                    .or_else(|| {
+                        value
+                            .get("content_graph")
+                            .and_then(|graph| graph.get("kind"))
+                    })
+            })
+            .and_then(|value| value.as_str())
+            .unwrap_or("auto");
+        match raw {
+            "object_manifest" | "manifest" => Self::ObjectManifest,
+            "exact_bytes" | "exact" | "single_block" | "file" => Self::ExactBytes,
+            "ipld_dag" | "block_dag" | "dag" | "arbitrary_dag" => Self::IpldDag,
+            _ => Self::Auto,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ObjectManifest => "object_manifest",
+            Self::ExactBytes => "exact_bytes",
+            Self::IpldDag => "ipld_dag",
+        }
+    }
+
+    fn supports_current_import_fallback(self) -> bool {
+        !matches!(self, Self::IpldDag)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CarrierAvailabilityReplica {
+    node_did: String,
+    endpoint_id: Option<String>,
+    connect_ticket: String,
+    announced_at: u64,
+    score: u32,
+    selection_reason: String,
+    reputation_score: i32,
+    reputation_reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct CarrierReplicationProof {
+    node_did: String,
+    endpoint_id: Option<String>,
+    announced_at: u64,
+    score: u32,
+    selection_reason: String,
+    reputation_score: i32,
+    reputation_reason: String,
+    ensure_status: String,
+    admission: Option<serde_json::Value>,
+    status_availability: serde_json::Value,
+    remote_receipt: Option<serde_json::Value>,
+    transfer: Option<serde_json::Value>,
+    checked_at: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CarrierPeerAttestationExchangeView<'a> {
+    configured: bool,
+    receipt: Option<&'a serde_json::Value>,
+}
+
+struct CarrierPeerAttestationExchangeRequest<'a> {
+    signing_key: &'a ed25519_dalek::SigningKey,
+    cid: &'a str,
+    topic_uri: &'a str,
+    local_node_did: &'a str,
+    remote_proofs: &'a [CarrierReplicationProof],
+    live_multi_peer_proof: bool,
+    requested_at: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CarrierPeerReputation {
+    successes: u32,
+    failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CarrierPeerReputationStore {
+    schema: String,
+    peers: BTreeMap<String, CarrierPeerReputation>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CarrierAvailabilityProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "use send_raw for typed content availability operations".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["availability"]
+    }
+
+    fn name(&self) -> &'static str {
+        "carrier-availability"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("ensure") | Some("repair") => self.announce_availability(request).await,
+            Some("fetch") => self.fetch_from_announced_carrier_peers(request).await,
+            Some("status") => {
+                let state = self.state.lock().await;
+                let node_did = state
+                    .did
+                    .clone()
+                    .unwrap_or_else(|| state.endpoint.id().to_string());
+                Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "provider": "carrier-availability",
+                        "node_did": node_did,
+                        "transport": "carrier-gossip",
+                        "joined_topic_count": state.joined_topics.len(),
+                    }
+                }))
+            }
+            _ => Ok(carrier_availability_error(
+                "unsupported_op",
+                "unsupported Carrier availability operation",
+            )),
+        }
+    }
+}
+
+impl CarrierAvailabilityProvider {
+    async fn announce_availability(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let cid = match request.get("cid").and_then(|value| value.as_str()) {
+            Some(cid) => cid.trim(),
+            None => {
+                return Ok(carrier_availability_error(
+                    "invalid_request",
+                    "Carrier availability requires cid",
+                ))
+            }
+        };
+        if let Err(err) = validate_content_cid(cid) {
+            return Ok(carrier_availability_error("invalid_cid", err));
+        }
+        let uri = request
+            .get("uri")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("elastos://{cid}"));
+        let policy = request
+            .get("policy")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("carrier_default");
+        let local = request
+            .get("local")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let replicas = local_replica_count(request);
+        let requirements = CarrierAvailabilityRequirements::from_request(request);
+        let desired_replicas = requirements
+            .min_replicas
+            .max(if replicas > 0 { 2 } else { 1 })
+            .min(requirements.effective_max());
+        let topic_name = content_availability_topic_name(cid);
+        let topic_uri = content_availability_topic_uri(cid);
+        let announced_at = now_secs();
+        let mut state = self.state.lock().await;
+
+        if !state.joined_topics.contains(&topic_name) {
+            if state.joined_topics.len() >= MAX_TOPICS {
+                return Ok(carrier_availability_error(
+                    "too_many_topics",
+                    "Carrier availability topic limit reached",
+                ));
+            }
+            if let Err(err) = join_gossip_topic(&mut state, &topic_name, false).await {
+                return Ok(carrier_availability_error(
+                    "join_failed",
+                    format!("Carrier availability topic join failed: {err}"),
+                ));
+            }
+        }
+
+        let node_did = state
+            .did
+            .clone()
+            .unwrap_or_else(|| state.endpoint.id().to_string());
+        let existing_messages = {
+            let buffers = state.buffers.lock().await;
+            buffers
+                .get(&topic_name)
+                .map(|buffer| buffer.messages.iter().rev().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let reputation_snapshot = self.peer_reputation.lock().await.clone();
+        let remote_candidate_limit =
+            carrier_remote_candidate_limit(requirements, replicas, desired_replicas);
+        let remote_candidate_pool = content_availability_replicas_with_reputation(
+            &existing_messages,
+            cid,
+            &reputation_snapshot,
+        )
+        .into_iter()
+        .filter(|replica| replica.node_did != node_did)
+        .collect::<Vec<_>>();
+        let remote_candidate_count = remote_candidate_pool.len();
+        let remote_candidate_limit_applied = remote_candidate_count > remote_candidate_limit;
+        let remote_candidates = remote_candidate_pool
+            .into_iter()
+            .take(remote_candidate_limit)
+            .collect::<Vec<_>>();
+        let fetch_descriptor = if replicas > 0 {
+            Some(serde_json::json!({
+                "transport": "carrier-file",
+                "endpoint_id": state.endpoint.id().to_string(),
+                "connect_ticket": carrier_connect_ticket(&state.endpoint),
+            }))
+        } else {
+            None
+        };
+        let signing_key = match state.signing_key.as_ref() {
+            Some(signing_key) => signing_key,
+            None => {
+                return Ok(carrier_availability_error(
+                    "signer_unavailable",
+                    "Carrier availability signer unavailable",
+                ))
+            }
+        };
+        let mut payload = serde_json::json!({
+            "schema": CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA,
+            "cid": cid,
+            "uri": uri,
+            "policy": policy,
+            "provider": "carrier-availability",
+            "node_did": node_did,
+            "topic": topic_uri,
+            "local": local,
+            "announced_at": announced_at,
+        });
+        if let Some(fetch_descriptor) = fetch_descriptor {
+            payload["fetch"] = fetch_descriptor;
+        }
+        if let Some(object_did) = request.get("object_did").and_then(|value| value.as_str()) {
+            payload["object_did"] = serde_json::Value::String(object_did.to_string());
+        }
+        if let Some(publisher_did) = request
+            .get("publisher_did")
+            .and_then(|value| value.as_str())
+        {
+            payload["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
+        }
+        let canonical = serde_json::to_string(&payload).map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier availability announcement serialization failed: {err}"
+            ))
+        })?;
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            signing_key,
+            CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN,
+            canonical.as_bytes(),
+        );
+        let peer_attestation_signing_key = signing_key.clone();
+        let announcement = serde_json::json!({
+            "payload": payload,
+            "signature": signature,
+            "signer_did": signer_did,
+        });
+        let content = serde_json::to_string(&announcement).map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier availability announcement envelope failed: {err}"
+            ))
+        })?;
+        let msg = GossipMessage {
+            sender_id: signer_did.clone(),
+            sender_nick: "content-provider".to_string(),
+            content,
+            ts: announced_at,
+            nonce: random_gossip_nonce(),
+            signature: Some(signature.clone()),
+            sender_session_id: request
+                .get("publisher_did")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        };
+
+        {
+            let mut buffers = state.buffers.lock().await;
+            if let Some(buffer) = buffers.get_mut(&topic_name) {
+                if buffer.messages.len() >= MAX_BUFFER {
+                    buffer.messages.pop_front();
+                    buffer.base_index += 1;
+                }
+                buffer.messages.push_back(msg.clone());
+            }
+        }
+
+        let delivery = match state.senders.get(&topic_name) {
+            Some(sender) => {
+                let bytes = serde_json::to_vec(&msg).unwrap_or_default();
+                match sender.broadcast(bytes).await {
+                    Ok(_) => "carrier",
+                    Err(err) => {
+                        tracing::debug!("Carrier availability broadcast failed: {}", err);
+                        "local_only"
+                    }
+                }
+            }
+            None => "local_only",
+        };
+        drop(state);
+
+        let mut remote_proofs = Vec::new();
+        let mut replication_errors = Vec::new();
+        let mut attempted_remote_invocations = 0_u32;
+        if !remote_candidates.is_empty() {
+            match self
+                .provider_registry
+                .as_ref()
+                .and_then(|registry| registry.upgrade())
+            {
+                Some(registry) => {
+                    for candidate in remote_candidates {
+                        attempted_remote_invocations =
+                            attempted_remote_invocations.saturating_add(1);
+                        match ensure_content_via_carrier_provider_invocation(
+                            &registry, &candidate, cid, request,
+                        )
+                        .await
+                        {
+                            Ok(proof) => {
+                                self.record_peer_reputation(&candidate.node_did, true).await;
+                                remote_proofs.push(proof)
+                            }
+                            Err(err) => {
+                                self.record_peer_reputation(&candidate.node_did, false)
+                                    .await;
+                                replication_errors.push(format!("{}: {err}", candidate.node_did))
+                            }
+                        }
+                    }
+                }
+                None => replication_errors
+                    .push("Carrier replication requires Runtime provider registry".to_string()),
+            }
+        }
+
+        let proven_remote_replicas = remote_proofs.len() as u32;
+        let total_replicas = replicas.saturating_add(proven_remote_replicas);
+        let live_multi_peer_proof = proven_remote_replicas > 0;
+        let peer_attestation_exchange_receipt = self
+            .exchange_peer_attestations(CarrierPeerAttestationExchangeRequest {
+                signing_key: &peer_attestation_signing_key,
+                cid,
+                topic_uri: &topic_uri,
+                local_node_did: &node_did,
+                remote_proofs: &remote_proofs,
+                live_multi_peer_proof,
+                requested_at: announced_at,
+            })
+            .await;
+        let meets_replica_requirement = total_replicas >= requirements.min_replicas;
+        let meets_live_requirement =
+            !requirements.require_live_multi_peer_proof || live_multi_peer_proof;
+        let status = if meets_replica_requirement && meets_live_requirement && live_multi_peer_proof
+        {
+            "network_available"
+        } else if meets_replica_requirement && meets_live_requirement {
+            "carrier_announced"
+        } else {
+            "repair_needed"
+        };
+        let repair_scheduled = status == "repair_needed"
+            || total_replicas < desired_replicas
+            || (requirements.require_live_multi_peer_proof && !live_multi_peer_proof);
+        let mut availability = serde_json::json!({
+            "status": status,
+            "provider": "carrier-availability",
+            "policy": policy,
+            "replicas": total_replicas,
+            "transport": "carrier-gossip",
+            "delivery": delivery,
+            "topic": topic_uri,
+            "peer_selection": carrier_peer_selection_json(
+                &topic_uri,
+                &node_did,
+                replicas,
+                &remote_proofs,
+                live_multi_peer_proof,
+                CarrierPeerAttestationExchangeView {
+                    configured: self.peer_attestation_exchange.is_some(),
+                    receipt: peer_attestation_exchange_receipt.as_ref(),
+                },
+            ),
+            "quota": carrier_quota_json(requirements, total_replicas, desired_replicas),
+            "repair_worker": carrier_repair_worker_json(repair_scheduled, status),
+            "repair_graph": carrier_repair_graph_policy_json(requirements),
+            "storage_market": carrier_storage_market_policy_json(
+                total_replicas,
+                live_multi_peer_proof,
+            ),
+            "abuse_controls": carrier_abuse_controls_json(
+                remote_candidate_count,
+                remote_candidate_limit,
+                attempted_remote_invocations,
+                replication_errors.len() as u32,
+                remote_candidate_limit_applied,
+            ),
+            "checked_at": announced_at,
+        });
+        if status == "repair_needed" {
+            availability["reason"] = serde_json::Value::String(carrier_repair_reason(
+                requirements,
+                total_replicas,
+                live_multi_peer_proof,
+                &replication_errors,
+            ));
+        } else if delivery == "local_only" && remote_proofs.is_empty() {
+            availability["reason"] = serde_json::Value::String(
+                "Carrier announcement was recorded locally; no remote peer delivery was observed"
+                    .to_string(),
+            );
+        }
+        Ok(serde_json::json!({
+            "status": "ok",
+            "data": {
+                "availability": availability,
+            }
+        }))
+    }
+
+    async fn fetch_from_announced_carrier_peers(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let cid = match request.get("cid").and_then(|value| value.as_str()) {
+            Some(cid) => cid.trim(),
+            None => {
+                return Ok(carrier_availability_error(
+                    "invalid_request",
+                    "Carrier availability fetch requires cid",
+                ))
+            }
+        };
+        if let Err(err) = validate_content_cid(cid) {
+            return Ok(carrier_availability_error("invalid_cid", err));
+        }
+        let path = request
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if let Err(err) = validate_carrier_content_path(path) {
+            return Ok(carrier_availability_error("invalid_path", err));
+        }
+        let topic_name = content_availability_topic_name(cid);
+        let messages = {
+            let mut state = self.state.lock().await;
+            if !state.joined_topics.contains(&topic_name) {
+                if state.joined_topics.len() >= MAX_TOPICS {
+                    return Ok(carrier_availability_error(
+                        "too_many_topics",
+                        "Carrier availability topic limit reached",
+                    ));
+                }
+                if let Err(err) = join_gossip_topic(&mut state, &topic_name, false).await {
+                    return Ok(carrier_availability_error(
+                        "join_failed",
+                        format!("Carrier availability topic join failed: {err}"),
+                    ));
+                }
+            }
+            let buffers = state.buffers.clone();
+            drop(state);
+            let buffers = buffers.lock().await;
+            buffers
+                .get(&topic_name)
+                .map(|buffer| buffer.messages.iter().rev().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let tickets = content_availability_fetch_tickets(&messages, cid);
+        if tickets.is_empty() {
+            return Ok(carrier_availability_error(
+                "carrier_fetch_unavailable",
+                "no Carrier availability announcement with a fetch ticket is available for this CID",
+            ));
+        }
+
+        let Some(registry) = self
+            .provider_registry
+            .as_ref()
+            .and_then(|registry| registry.upgrade())
+        else {
+            return Ok(carrier_availability_error(
+                "carrier_provider_invocation_unavailable",
+                "Carrier availability fetch requires Runtime provider registry",
+            ));
+        };
+
+        let mut errors = Vec::new();
+        for ticket in tickets {
+            match fetch_content_via_carrier_provider_invocation(&registry, &ticket, cid, path).await
+            {
+                Ok((bytes, remote_transfer)) => {
+                    return Ok(serde_json::json!({
+                        "status": "ok",
+                        "data": {
+                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                            "availability": {
+                                "status": "network_available",
+                                "provider": "carrier-availability",
+                                "policy": "carrier_provider_invoke",
+                                "replicas": 1,
+                                "transport": "carrier-provider-plane",
+                                "remote_transfer": remote_transfer,
+                                "checked_at": now_secs(),
+                            }
+                        }
+                    }))
+                }
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+
+        Ok(carrier_availability_error(
+            "carrier_fetch_failed",
+            format!("Carrier content fetch failed: {}", errors.join(" | ")),
+        ))
+    }
+}
+
+async fn fetch_content_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    ticket: &str,
+    cid: &str,
+    path: &str,
+) -> Result<(Vec<u8>, Option<serde_json::Value>)> {
+    validate_content_cid(cid).map_err(anyhow::Error::msg)?;
+    validate_carrier_content_path(path).map_err(anyhow::Error::msg)?;
+
+    let mut request = serde_json::json!({
+        "op": "fetch",
+        "cid": cid,
+        "local_only": true,
+        "transfer": "stream",
+    });
+    if !path.is_empty() {
+        request["path"] = serde_json::Value::String(path.to_string());
+    }
+
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request,
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+                connect_ticket: ticket.to_string(),
+                peer_did: None,
+                timeout_ms: Some(5_000),
+            }),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Carrier provider invocation failed: {err}"))?;
+
+    if response.get("status").and_then(|status| status.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("remote content provider fetch failed: {message}");
+    }
+    let remote_transfer = response.get("_runtime_transfer").cloned();
+    let bytes = remote_content_provider_response_bytes(&response)?;
+    Ok((bytes, remote_transfer))
+}
+
+async fn ensure_content_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    replica: &CarrierAvailabilityReplica,
+    cid: &str,
+    source_request: &serde_json::Value,
+) -> Result<CarrierReplicationProof> {
+    validate_content_cid(cid).map_err(anyhow::Error::msg)?;
+    let route = ProviderCarrierRoute {
+        connect_ticket: replica.connect_ticket.clone(),
+        peer_did: Some(replica.node_did.clone()),
+        timeout_ms: Some(5_000),
+    };
+    let admission =
+        content_admission_via_carrier_provider_invocation(registry, &route, cid, source_request)
+            .await?;
+    let mut ensure_request = serde_json::json!({
+        "op": "ensure",
+        "cid": cid,
+        "availability_policy": "carrier_replica",
+        "availability_requirements": {
+            "min_replicas": 1,
+            "max_replicas": 1,
+            "require_live_multi_peer_proof": false,
+        },
+    });
+    if let Some(object_did) = source_request
+        .get("object_did")
+        .and_then(|value| value.as_str())
+    {
+        ensure_request["object_did"] = serde_json::Value::String(object_did.to_string());
+    }
+    if let Some(publisher_did) = source_request
+        .get("publisher_did")
+        .and_then(|value| value.as_str())
+    {
+        ensure_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
+    }
+
+    let mut ensure_response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "ensure".to_string(),
+            request: ensure_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route.clone()),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote content ensure failed: {err}"))?;
+    if ensure_response
+        .get("status")
+        .and_then(|value| value.as_str())
+        == Some("error")
+    {
+        let message = ensure_response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        ensure_response = import_content_via_carrier_provider_invocation(
+            registry,
+            replica,
+            cid,
+            source_request,
+            Some(message),
+        )
+        .await?;
+    }
+    let ensure_status = ensure_response
+        .get("data")
+        .and_then(|data| data.get("availability"))
+        .and_then(|availability| availability.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    if matches!(
+        ensure_status.as_str(),
+        "repair_needed" | "local_unpinned" | "unknown"
+    ) {
+        ensure_response = import_content_via_carrier_provider_invocation(
+            registry,
+            replica,
+            cid,
+            source_request,
+            Some(&ensure_status),
+        )
+        .await?;
+    }
+    let ensure_status = ensure_response
+        .get("data")
+        .and_then(|data| data.get("availability"))
+        .and_then(|availability| availability.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    if matches!(
+        ensure_status.as_str(),
+        "repair_needed" | "local_unpinned" | "unknown"
+    ) {
+        anyhow::bail!(
+            "remote content import/ensure did not prove a pinned replica: {ensure_status}"
+        );
+    }
+    let remote_receipt = remote_content_receipt_summary(&ensure_response, cid)?;
+
+    let status_response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "status".to_string(),
+            request: serde_json::json!({
+                "op": "status",
+                "cid": cid,
+            }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote content status failed: {err}"))?;
+    if status_response
+        .get("status")
+        .and_then(|value| value.as_str())
+        == Some("error")
+    {
+        let message = status_response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("remote content status returned error: {message}");
+    }
+    let status_cid = status_response
+        .get("data")
+        .and_then(|data| data.get("cid"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if status_cid != cid {
+        anyhow::bail!("remote content status CID mismatch");
+    }
+    let status_availability = status_response
+        .get("data")
+        .and_then(|data| data.get("availability"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("remote content status missing availability"))?;
+    let status = status_availability
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    if matches!(status, "repair_needed" | "local_unpinned" | "unknown") {
+        anyhow::bail!("remote content status did not prove a live replica: {status}");
+    }
+
+    Ok(CarrierReplicationProof {
+        node_did: replica.node_did.clone(),
+        endpoint_id: replica.endpoint_id.clone(),
+        announced_at: replica.announced_at,
+        score: replica.score,
+        selection_reason: replica.selection_reason.clone(),
+        reputation_score: replica.reputation_score,
+        reputation_reason: replica.reputation_reason.clone(),
+        ensure_status,
+        admission: Some(admission),
+        status_availability,
+        remote_receipt,
+        transfer: status_response.get("_runtime_transfer").cloned(),
+        checked_at: now_secs(),
+    })
+}
+
+async fn content_admission_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    route: &ProviderCarrierRoute,
+    cid: &str,
+    source_request: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut admission_request = serde_json::json!({
+        "op": "admission",
+        "cid": cid,
+        "availability_policy": "carrier_replica",
+        "availability_requirements": carrier_source_requirements_json(source_request),
+    });
+    if let Some(estimated_content_bytes) = carrier_admission_estimated_content_bytes(source_request)
+    {
+        admission_request["estimated_content_bytes"] =
+            serde_json::Value::from(estimated_content_bytes);
+    }
+    if let Some(accounting) = source_request
+        .get("accounting")
+        .filter(|value| value.is_object())
+    {
+        admission_request["accounting"] = accounting.clone();
+    }
+    if let Some(object_did) = source_request
+        .get("object_did")
+        .and_then(|value| value.as_str())
+    {
+        admission_request["object_did"] = serde_json::Value::String(object_did.to_string());
+    }
+    if let Some(publisher_did) = source_request
+        .get("publisher_did")
+        .and_then(|value| value.as_str())
+    {
+        admission_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
+    }
+
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "admission".to_string(),
+            request: admission_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route.clone()),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote content admission failed: {err}"))?;
+    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("remote content admission returned error: {message}");
+    }
+    let mut admission = response
+        .get("data")
+        .and_then(|data| data.get("admission"))
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("remote content admission missing admission receipt"))?;
+    let receipt_summary = remote_content_admission_receipt_summary(&response, &admission, cid)?;
+    if let Some(admission) = admission.as_object_mut() {
+        admission.insert("receipt".to_string(), receipt_summary);
+    }
+    if admission.get("accepted").and_then(|value| value.as_bool()) != Some(true) {
+        let status = admission
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("rejected");
+        let reason = admission
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("remote content provider rejected admission");
+        anyhow::bail!("remote content admission rejected: {status}: {reason}");
+    }
+    Ok(admission)
+}
+
+fn remote_content_admission_receipt_summary(
+    response: &serde_json::Value,
+    admission: &serde_json::Value,
+    cid: &str,
+) -> Result<serde_json::Value> {
+    let receipt = response
+        .get("data")
+        .and_then(|data| data.get("receipt"))
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("remote content admission missing signed receipt"))?;
+    let payload = receipt
+        .get("payload")
+        .ok_or_else(|| anyhow::anyhow!("remote content admission receipt missing payload"))?;
+    if payload != admission {
+        anyhow::bail!("remote content admission receipt payload mismatch");
+    }
+    let payload_cid = payload
+        .get("cid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if payload_cid != cid {
+        anyhow::bail!("remote content admission receipt CID mismatch");
+    }
+    let signer_did = receipt
+        .get("signer_did")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("remote content admission receipt missing signer_did"))?;
+    let receipt_bytes = serde_json::to_vec(receipt)
+        .map_err(|err| anyhow::anyhow!("remote content admission receipt encode failed: {err}"))?;
+    let expected_signers = [signer_did.to_string()];
+    crate::crypto::verify_signed_json_envelope_against_dids(
+        &receipt_bytes,
+        CONTENT_ADMISSION_DOMAIN,
+        &expected_signers,
+    )
+    .map_err(|err| {
+        anyhow::anyhow!("remote content admission receipt verification failed: {err}")
+    })?;
+    Ok(serde_json::json!({
+        "schema": payload
+            .get("schema")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "signer_did": signer_did,
+        "verified": true,
+    }))
+}
+
+fn carrier_source_requirements_json(source_request: &serde_json::Value) -> serde_json::Value {
+    source_request
+        .get("requirements")
+        .or_else(|| source_request.get("availability_requirements"))
+        .or_else(|| source_request.get("replication_requirements"))
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "min_replicas": 1,
+                "max_replicas": 1,
+                "require_live_multi_peer_proof": false,
+            })
+        })
+}
+
+fn carrier_admission_estimated_content_bytes(source_request: &serde_json::Value) -> Option<u64> {
+    ["estimated_content_bytes", "incoming_content_bytes"]
+        .into_iter()
+        .find_map(|field| source_request.get(field).and_then(|value| value.as_u64()))
+        .or_else(|| {
+            source_request
+                .get("accounting")
+                .and_then(|accounting| accounting.get("content_bytes"))
+                .and_then(|value| value.as_u64())
+        })
+        .or_else(|| {
+            source_request
+                .get("local")
+                .and_then(|local| local.get("accounting"))
+                .and_then(|accounting| accounting.get("content_bytes"))
+                .and_then(|value| value.as_u64())
+        })
+}
+
+fn remote_content_receipt_summary(
+    response: &serde_json::Value,
+    cid: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(receipt) = response.get("data").and_then(|data| data.get("receipt")) else {
+        return Ok(None);
+    };
+    let payload = receipt
+        .get("payload")
+        .ok_or_else(|| anyhow::anyhow!("remote content receipt missing payload"))?;
+    let receipt_cid = payload
+        .get("cid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if receipt_cid != cid {
+        anyhow::bail!("remote content receipt CID mismatch");
+    }
+    let signer_did = receipt
+        .get("signer_did")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("remote content receipt missing signer_did"))?;
+    let receipt_bytes = serde_json::to_vec(receipt)
+        .map_err(|err| anyhow::anyhow!("remote content receipt encode failed: {err}"))?;
+    let expected_signers = [signer_did.to_string()];
+    crate::crypto::verify_signed_json_envelope_against_dids(
+        &receipt_bytes,
+        "elastos.content.availability.receipt.v1",
+        &expected_signers,
+    )
+    .map_err(|err| anyhow::anyhow!("remote content receipt verification failed: {err}"))?;
+    Ok(Some(serde_json::json!({
+        "schema": payload.get("schema").cloned().unwrap_or(serde_json::Value::Null),
+        "cid": receipt_cid,
+        "status": payload.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "provider": payload.get("provider").cloned().unwrap_or(serde_json::Value::Null),
+        "policy": payload.get("policy").cloned().unwrap_or(serde_json::Value::Null),
+        "replicas": payload.get("replicas").cloned().unwrap_or(serde_json::Value::Null),
+        "peer_selection": remote_content_receipt_peer_selection_summary(payload.get("peer_selection")),
+        "quota": remote_content_receipt_quota_summary(payload.get("quota")),
+        "repair_worker": remote_content_receipt_repair_worker_summary(payload.get("repair_worker")),
+        "repair_graph": remote_content_receipt_repair_graph_summary(payload.get("repair_graph")),
+        "storage_market": remote_content_receipt_storage_market_summary(payload.get("storage_market")),
+        "accounting": remote_content_receipt_accounting_summary(payload.get("accounting")),
+        "abuse_controls": remote_content_receipt_abuse_controls_summary(payload.get("abuse_controls")),
+        "checked_at": payload.get("checked_at").cloned().unwrap_or(serde_json::Value::Null),
+        "signer_did": signer_did,
+        "verified": true,
+    })))
+}
+
+fn remote_content_receipt_peer_selection_summary(
+    peer_selection: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(peer_selection) = peer_selection else {
+        return serde_json::json!({"mode": "unknown"});
+    };
+    let replicas = remote_content_receipt_peer_selection_replicas_summary(peer_selection);
+    let replica_count = peer_selection
+        .get("replicas")
+        .and_then(|value| value.as_array())
+        .map(|replicas| replicas.len())
+        .unwrap_or(0);
+    let remote_replicas = peer_selection
+        .get("replicas")
+        .and_then(|value| value.as_array())
+        .map(|replicas| {
+            replicas
+                .iter()
+                .filter(|replica| {
+                    replica.get("role").and_then(|value| value.as_str()) == Some("remote")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "mode": peer_selection
+            .get("mode")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "strategy": peer_selection
+            .get("strategy")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "live_multi_peer_proof": peer_selection
+            .get("live_multi_peer_proof")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "peer_reputation_policy": peer_selection
+            .get("peer_reputation_policy")
+            .cloned()
+            .unwrap_or_else(default_carrier_peer_reputation_policy_json),
+        "peer_attestation_exchange_policy": peer_selection
+            .get("peer_attestation_exchange_policy")
+            .cloned()
+            .unwrap_or_else(default_carrier_peer_attestation_exchange_policy_json),
+        "replica_count": replica_count,
+        "remote_replicas": remote_replicas,
+        "replica_summary_limit": MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS,
+        "replicas_truncated": replica_count > replicas.len(),
+        "replicas": replicas,
+    })
+}
+
+fn default_carrier_peer_reputation_policy_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": CARRIER_PEER_REPUTATION_SCHEMA,
+        "policy": "not_reported",
+        "scope": "content-availability",
+        "status": "not_reported",
+        "federation": {
+            "configured": false,
+            "cross_runtime_reputation": false,
+        },
+    })
+}
+
+fn default_carrier_peer_attestation_exchange_policy_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA,
+        "policy": "not_reported",
+        "scope": "content-availability",
+        "status": "not_reported",
+        "attestation_exchange": {
+            "configured": false,
+            "signed_reputation_receipts": false,
+            "third_party_attestations": false,
+            "cross_runtime_trust_policy": false,
+        },
+    })
+}
+
+fn remote_content_receipt_peer_selection_replicas_summary(
+    peer_selection: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    peer_selection
+        .get("replicas")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .take(MAX_REMOTE_RECEIPT_REPLICA_SUMMARY_ROWS)
+        .map(|replica| {
+            serde_json::json!({
+                "role": replica
+                    .get("role")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "node_did": replica
+                    .get("node_did")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "endpoint_id": replica
+                    .get("endpoint_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "score": replica
+                    .get("score")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "selection_reason": replica
+                    .get("selection_reason")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "local_reputation": replica
+                    .get("local_reputation")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "status": replica
+                    .get("status")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn remote_content_receipt_quota_summary(quota: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(quota) = quota else {
+        return serde_json::json!({"policy": "unknown"});
+    };
+    serde_json::json!({
+        "policy": quota.get("policy").cloned().unwrap_or(serde_json::Value::Null),
+        "status": quota.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "enforced": quota
+            .get("enforced")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "used_replicas": quota
+            .get("used_replicas")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "effective_max_replicas": quota
+            .get("effective_max_replicas")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "federated_quota_ledger_policy": quota
+            .get("federated_quota_ledger_policy")
+            .cloned()
+            .unwrap_or_else(default_carrier_federated_quota_ledger_policy_json),
+    })
+}
+
+fn remote_content_receipt_repair_worker_summary(
+    repair_worker: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(repair_worker) = repair_worker else {
+        return serde_json::json!({"status": "unknown"});
+    };
+    serde_json::json!({
+        "scheduled": repair_worker
+            .get("scheduled")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "status": repair_worker
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "worker": repair_worker
+            .get("worker")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn remote_content_receipt_storage_market_summary(
+    storage_market: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(storage_market) = storage_market else {
+        return serde_json::json!({
+            "schema": "elastos.content.storage-market/v1",
+            "status": "not_reported",
+            "settlement": "not_configured",
+            "admission_policy": default_carrier_storage_market_admission_policy_json(),
+        });
+    };
+    serde_json::json!({
+        "schema": storage_market
+            .get("schema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("elastos.content.storage-market/v1".to_string())),
+        "mode": storage_market
+            .get("mode")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "status": storage_market
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "settlement": storage_market
+            .get("settlement")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("not_configured".to_string())),
+        "escrow": storage_market
+            .get("escrow")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("not_configured".to_string())),
+        "quota_enforced": storage_market
+            .get("quota_enforced")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "admission_policy": storage_market
+            .get("admission_policy")
+            .cloned()
+            .unwrap_or_else(default_carrier_storage_market_admission_policy_json),
+        "settlement_policy": storage_market
+            .get("settlement_policy")
+            .cloned()
+            .unwrap_or_else(default_carrier_storage_settlement_policy_json),
+    })
+}
+
+fn carrier_storage_market_admission_policy_json(
+    mode: &str,
+    market_status: &str,
+    quota_enforced: bool,
+    live_multi_peer_proof: bool,
+    remote_admission_preflight: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": CONTENT_STORAGE_MARKET_ADMISSION_POLICY_SCHEMA,
+        "policy": "proof_path_admission_no_production_market",
+        "scope": "content-availability",
+        "status": if remote_admission_preflight {
+            "remote_admission_preflight_no_market_admission"
+        } else if quota_enforced {
+            "local_quota_admission_no_market_admission"
+        } else {
+            "production_storage_market_admission_not_configured"
+        },
+        "market": {
+            "mode": mode,
+            "status": market_status,
+            "quota_enforced": quota_enforced,
+            "live_multi_peer_proof": live_multi_peer_proof,
+        },
+        "current_admission": {
+            "local_principal_quota_ledger": quota_enforced,
+            "remote_content_admission_preflight": remote_admission_preflight,
+            "signed_admission_receipts": remote_admission_preflight,
+            "content_admission_schema": "elastos.content.admission/v1",
+            "content_admission_receipt_domain": CONTENT_ADMISSION_DOMAIN,
+            "provider_invocation_required": true,
+            "signed_availability_receipts": true,
+        },
+        "production_market": {
+            "configured": false,
+            "provider_admission_network": false,
+            "provider_offer_receipts": false,
+            "price_discovery": false,
+            "sla_admission": false,
+            "abuse_economic_controls": false,
+            "reason": "Carrier verifies signed remote content/admission receipts in this branch; production storage-market admission needs provider offers, pricing, SLA, and trust policy receipts",
+        },
+    })
+}
+
+fn default_carrier_storage_market_admission_policy_json() -> serde_json::Value {
+    carrier_storage_market_admission_policy_json(
+        "not_reported",
+        "not_reported",
+        false,
+        false,
+        false,
+    )
+}
+
+fn carrier_storage_settlement_policy_json(
+    mode: &str,
+    market_status: &str,
+    quota_enforced: bool,
+    live_multi_peer_proof: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "elastos.content.storage-settlement-policy/v1",
+        "policy": "no_settlement_receipt_policy",
+        "scope": "content-availability",
+        "status": "settlement_not_configured",
+        "market": {
+            "mode": mode,
+            "status": market_status,
+            "quota_enforced": quota_enforced,
+            "live_multi_peer_proof": live_multi_peer_proof,
+        },
+        "settlement": {
+            "pricing": "not_configured",
+            "escrow": "not_configured",
+            "payment_settlement": "not_configured",
+            "sla_enforcement": "not_configured",
+        },
+        "production_federation": {
+            "configured": false,
+            "storage_market_admission": false,
+            "cross_provider_escrow": false,
+            "settlement_receipts": false,
+            "reason": "Carrier can prove provider replicas in this branch; pricing, escrow, settlement, and SLA policy require production storage-market providers",
+        },
+    })
+}
+
+fn default_carrier_storage_settlement_policy_json() -> serde_json::Value {
+    carrier_storage_settlement_policy_json("not_reported", "not_reported", false, false)
+}
+
+fn remote_content_receipt_repair_graph_summary(
+    repair_graph: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(repair_graph) = repair_graph else {
+        return serde_json::json!({
+            "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
+            "status": "not_reported",
+        });
+    };
+    serde_json::json!({
+        "schema": repair_graph
+            .get("schema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(CONTENT_REPAIR_GRAPH_SCHEMA.to_string())),
+        "policy": repair_graph
+            .get("policy")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "requested_kind": repair_graph
+            .get("requested_kind")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "status": repair_graph
+            .get("status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "refuses_exact_fallback_for_arbitrary_dag": repair_graph
+            .get("refuses_exact_fallback_for_arbitrary_dag")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+    })
+}
+
+fn remote_content_receipt_accounting_summary(
+    accounting: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(accounting) = accounting else {
+        return serde_json::json!({"observed": false});
+    };
+    serde_json::json!({
+        "schema": accounting
+            .get("schema")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "observed": accounting
+            .get("observed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "files": accounting
+            .get("files")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "content_bytes": accounting
+            .get("content_bytes")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "replica_bytes_estimate": accounting
+            .get("replica_bytes_estimate")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "storage_quota_status": accounting
+            .get("storage_quota")
+            .and_then(|quota| quota.get("status"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn remote_content_receipt_abuse_controls_summary(
+    abuse_controls: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let Some(abuse_controls) = abuse_controls else {
+        return serde_json::json!({"policy": "unknown", "enforced": false});
+    };
+    serde_json::json!({
+        "schema": abuse_controls
+            .get("schema")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "policy": abuse_controls
+            .get("policy")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "enforced": abuse_controls
+            .get("enforced")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+        "candidate_count": abuse_controls
+            .get("candidate_count")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "attempt_limit": abuse_controls
+            .get("attempt_limit")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "attempted_operations": abuse_controls
+            .get("attempted_operations")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "failed_operations": abuse_controls
+            .get("failed_operations")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "throttled": abuse_controls
+            .get("throttled")
+            .cloned()
+            .unwrap_or(serde_json::Value::Bool(false)),
+    })
+}
+
+async fn import_content_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    replica: &CarrierAvailabilityReplica,
+    cid: &str,
+    source_request: &serde_json::Value,
+    ensure_failure: Option<&str>,
+) -> Result<serde_json::Value> {
+    let requirements = CarrierAvailabilityRequirements::from_request(source_request);
+    if !requirements
+        .repair_graph_kind
+        .supports_current_import_fallback()
+    {
+        return import_ipld_dag_content_via_carrier_block_graph_provider(
+            registry,
+            replica,
+            cid,
+            source_request,
+            ensure_failure,
+            requirements,
+        )
+        .await;
+    }
+    match import_object_content_via_carrier_provider_invocation(
+        registry,
+        replica,
+        cid,
+        source_request,
+        ensure_failure,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(object_err) => import_exact_content_via_carrier_provider_invocation(
+            registry,
+            replica,
+            cid,
+            source_request,
+            ensure_failure,
+        )
+        .await
+        .map_err(|exact_err| {
+            anyhow::anyhow!(
+                "remote content object import failed: {object_err}; exact import fallback failed: {exact_err}"
+            )
+        }),
+    }
+}
+
+async fn import_ipld_dag_content_via_carrier_block_graph_provider(
+    registry: &ProviderRegistry,
+    replica: &CarrierAvailabilityReplica,
+    cid: &str,
+    source_request: &serde_json::Value,
+    ensure_failure: Option<&str>,
+    requirements: CarrierAvailabilityRequirements,
+) -> Result<serde_json::Value> {
+    let mut export_request = serde_json::json!({
+        "op": "export_graph",
+        "cid": cid,
+        "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
+        "repair_graph_kind": requirements.repair_graph_kind.as_str(),
+        "availability_requirements": requirements.to_json(),
+        "policy": "carrier_block_graph_repair",
+    });
+    copy_optional_content_identity(source_request, &mut export_request);
+
+    let export_response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: CONTENT_BLOCK_GRAPH_TARGET.to_string(),
+            op: "export_graph".to_string(),
+            request: export_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "local block-graph export failed for arbitrary DAG repair: {err}; Carrier refused object/exact fallback"
+            )
+        })?;
+    ensure_provider_ok(&export_response, "local block-graph export")?;
+    let graph = exported_block_graph(&export_response, cid)?;
+
+    let route = ProviderCarrierRoute {
+        connect_ticket: replica.connect_ticket.clone(),
+        peer_did: Some(replica.node_did.clone()),
+        timeout_ms: Some(5_000),
+    };
+    let mut import_request = serde_json::json!({
+        "op": "import_graph",
+        "cid": cid,
+        "graph": graph,
+        "availability_policy": "carrier_block_graph_import",
+        "availability_requirements": requirements.to_json(),
+        "ensure_failure": ensure_failure,
+    });
+    copy_optional_content_identity(source_request, &mut import_request);
+
+    let import_response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: CONTENT_BLOCK_GRAPH_TARGET.to_string(),
+            op: "import_graph".to_string(),
+            request: import_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote block-graph import failed: {err}"))?;
+    ensure_provider_ok(&import_response, "remote block-graph import")?;
+
+    let mut ensure_request = serde_json::json!({
+        "op": "ensure",
+        "cid": cid,
+        "availability_policy": "carrier_block_graph_import",
+        "availability_requirements": requirements.to_json(),
+    });
+    copy_optional_content_identity(source_request, &mut ensure_request);
+    let route = ProviderCarrierRoute {
+        connect_ticket: replica.connect_ticket.clone(),
+        peer_did: Some(replica.node_did.clone()),
+        timeout_ms: Some(5_000),
+    };
+    let ensure_response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "ensure".to_string(),
+            request: ensure_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(route),
+        })
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("remote content ensure after block-graph import failed: {err}")
+        })?;
+    ensure_provider_ok(
+        &ensure_response,
+        "remote content ensure after block-graph import",
+    )?;
+    Ok(ensure_response)
+}
+
+fn ensure_provider_ok(response: &serde_json::Value, label: &str) -> Result<()> {
+    if response.get("status").and_then(|status| status.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("{label} returned error: {message}");
+    }
+    Ok(())
+}
+
+fn exported_block_graph(response: &serde_json::Value, cid: &str) -> Result<serde_json::Value> {
+    let graph = response
+        .get("data")
+        .and_then(|data| data.get("graph"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("local block-graph export missing data.graph"))?;
+    if graph.get("schema").and_then(|value| value.as_str()) != Some(CONTENT_BLOCK_GRAPH_SCHEMA) {
+        anyhow::bail!("local block-graph export returned unsupported graph schema");
+    }
+    let root_cid = graph
+        .get("root_cid")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if root_cid != cid {
+        anyhow::bail!("local block-graph export root CID mismatch");
+    }
+    Ok(graph)
+}
+
+fn copy_optional_content_identity(source: &serde_json::Value, target: &mut serde_json::Value) {
+    for key in ["object_did", "publisher_did"] {
+        if let Some(value) = source.get(key).cloned() {
+            target[key] = value;
+        }
+    }
+}
+
+async fn local_content_fetch_bytes_for_import(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut request = serde_json::json!({
+        "op": "fetch",
+        "cid": cid,
+        "local_only": true,
+        "transfer": "stream",
+    });
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        request["path"] = serde_json::Value::String(path.to_string());
+    }
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request,
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("local content fetch for object import failed: {err}"))?;
+    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("local content fetch for object import returned error: {message}");
+    }
+    remote_content_provider_response_bytes(&response)
+}
+
+async fn import_object_content_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    replica: &CarrierAvailabilityReplica,
+    cid: &str,
+    source_request: &serde_json::Value,
+    ensure_failure: Option<&str>,
+) -> Result<serde_json::Value> {
+    let manifest_bytes =
+        local_content_fetch_bytes_for_import(registry, cid, Some(CONTENT_OBJECT_MANIFEST_PATH))
+            .await?;
+    let manifest: ContentObjectManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            anyhow::anyhow!("local content object manifest decode failed for {cid}: {err}")
+        })?;
+    if manifest.files.is_empty() {
+        anyhow::bail!("local content object manifest has no files");
+    }
+    if manifest.files.len() > MAX_CARRIER_OBJECT_IMPORT_FILES {
+        anyhow::bail!(
+            "local content object manifest exceeds {} files",
+            MAX_CARRIER_OBJECT_IMPORT_FILES
+        );
+    }
+    let mut files = Vec::with_capacity(manifest.files.len());
+    let mut total_bytes = 0_usize;
+    for file in &manifest.files {
+        let bytes = local_content_fetch_bytes_for_import(registry, cid, Some(&file.path)).await?;
+        if bytes.len() as u64 != file.size {
+            anyhow::bail!(
+                "local content object file {} size mismatch: manifest {}, fetched {}",
+                file.path,
+                file.size,
+                bytes.len()
+            );
+        }
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if sha256 != file.sha256 {
+            anyhow::bail!(
+                "local content object file {} digest mismatch: manifest {}, fetched {}",
+                file.path,
+                file.sha256,
+                sha256
+            );
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_CARRIER_OBJECT_IMPORT_BYTES {
+            anyhow::bail!(
+                "local content object import exceeds {} bytes",
+                MAX_CARRIER_OBJECT_IMPORT_BYTES
+            );
+        }
+        files.push(serde_json::json!({
+            "path": file.path.clone(),
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }));
+    }
+    let file_count = files.len();
+    let mut import_request = serde_json::json!({
+        "op": "import_object",
+        "cid": cid,
+        "object_kind": manifest.kind.clone(),
+        "files": files,
+    });
+    if let Some(reason) = ensure_failure {
+        import_request["ensure_failure"] = serde_json::Value::String(reason.to_string());
+    }
+    if !manifest.links.is_empty() {
+        import_request["links"] = serde_json::to_value(&manifest.links)
+            .map_err(|err| anyhow::anyhow!("content object links encode failed: {err}"))?;
+    }
+    if let Some(object_did) = manifest.object_did.or_else(|| {
+        source_request
+            .get("object_did")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }) {
+        import_request["object_did"] = serde_json::Value::String(object_did);
+    }
+    if let Some(publisher_did) = manifest.publisher_did.or_else(|| {
+        source_request
+            .get("publisher_did")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }) {
+        import_request["publisher_did"] = serde_json::Value::String(publisher_did);
+    }
+    import_request["import_summary"] = serde_json::json!({
+        "schema": "elastos.content.import-object.request-summary/v1",
+        "files": file_count,
+        "bytes": total_bytes,
+        "source": "local-object-manifest",
+    });
+
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "import_object".to_string(),
+            request: import_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+                connect_ticket: replica.connect_ticket.clone(),
+                peer_did: Some(replica.node_did.clone()),
+                timeout_ms: Some(5_000),
+            }),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote content object import failed: {err}"))?;
+    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("remote content object import returned error: {message}");
+    }
+    Ok(response)
+}
+
+async fn import_exact_content_via_carrier_provider_invocation(
+    registry: &ProviderRegistry,
+    replica: &CarrierAvailabilityReplica,
+    cid: &str,
+    source_request: &serde_json::Value,
+    ensure_failure: Option<&str>,
+) -> Result<serde_json::Value> {
+    let local_fetch = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: serde_json::json!({
+                "op": "fetch",
+                "cid": cid,
+                "local_only": true,
+                "transfer": "stream",
+            }),
+            transfer: ProviderTransfer::Stream,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("local content fetch for exact import failed: {err}"))?;
+    if local_fetch.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let message = local_fetch
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("local content fetch for exact import returned error: {message}");
+    }
+    let stream = local_fetch
+        .get("data")
+        .and_then(|data| data.get("stream"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("local content fetch missing stream payload"))?;
+    let mut import_request = serde_json::json!({
+        "op": "import_exact",
+        "cid": cid,
+        "stream": stream,
+        "filename": "content.bin",
+    });
+    if let Some(reason) = ensure_failure {
+        import_request["ensure_failure"] = serde_json::Value::String(reason.to_string());
+    }
+    if let Some(object_did) = source_request
+        .get("object_did")
+        .and_then(|value| value.as_str())
+    {
+        import_request["object_did"] = serde_json::Value::String(object_did.to_string());
+    }
+    if let Some(publisher_did) = source_request
+        .get("publisher_did")
+        .and_then(|value| value.as_str())
+    {
+        import_request["publisher_did"] = serde_json::Value::String(publisher_did.to_string());
+    }
+
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: "carrier-availability".to_string(),
+            target: "content".to_string(),
+            op: "import_exact".to_string(),
+            request: import_request,
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
+                connect_ticket: replica.connect_ticket.clone(),
+                peer_did: Some(replica.node_did.clone()),
+                timeout_ms: Some(5_000),
+            }),
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("remote content exact import failed: {err}"))?;
+    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
+        let message = response
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown provider error");
+        anyhow::bail!("remote content exact import returned error: {message}");
+    }
+    Ok(response)
+}
+
+fn remote_content_provider_response_bytes(response: &serde_json::Value) -> Result<Vec<u8>> {
+    let data = response
+        .get("data")
+        .and_then(|data| data.as_object())
+        .ok_or_else(|| anyhow::anyhow!("remote content provider response missing data"))?;
+    if let Some(stream) = data.get("stream") {
+        return decode_carrier_provider_stream_payload(stream);
+    }
+    let data_value = data
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("remote content provider response missing data"))?;
+    let encoded = data_value
+        .as_str()
+        .or_else(|| data_value.get("data").and_then(|value| value.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("remote content provider response missing base64 data"))?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| anyhow::anyhow!("remote content provider returned invalid base64: {err}"))
+}
+
+fn decode_carrier_provider_stream_payload(stream: &serde_json::Value) -> Result<Vec<u8>> {
+    let object = stream
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("remote content provider stream must be an object"))?;
+    let schema = object
+        .get("schema")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if schema != "elastos.provider.stream/v1" {
+        anyhow::bail!(
+            "remote content provider stream schema mismatch: expected elastos.provider.stream/v1, got {schema}"
+        );
+    }
+    let encoding = object
+        .get("encoding")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if encoding != "base64-chunks" {
+        anyhow::bail!(
+            "remote content provider stream encoding mismatch: expected base64-chunks, got {encoding}"
+        );
+    }
+    let chunks = object
+        .get("chunks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow::anyhow!("remote content provider stream missing chunks"))?;
+    let mut bytes = Vec::new();
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        let chunk = chunk.as_object().ok_or_else(|| {
+            anyhow::anyhow!("remote content provider stream chunk must be an object")
+        })?;
+        let index = chunk
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("remote content provider stream chunk missing index"))?;
+        if index != expected_index as u64 {
+            anyhow::bail!(
+                "remote content provider stream chunk index mismatch: expected {expected_index}, got {index}"
+            );
+        }
+        let offset = chunk
+            .get("offset")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote content provider stream chunk missing offset")
+            })?;
+        if offset != bytes.len() as u64 {
+            anyhow::bail!(
+                "remote content provider stream chunk {index} offset mismatch: expected {}, got {offset}",
+                bytes.len()
+            );
+        }
+        let encoded = chunk
+            .get("data")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("remote content provider stream chunk missing data"))?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| {
+                anyhow::anyhow!("remote content provider stream chunk has invalid base64: {err}")
+            })?;
+        if let Some(length) = chunk.get("length").and_then(|value| value.as_u64()) {
+            if length != decoded.len() as u64 {
+                anyhow::bail!(
+                    "remote content provider stream chunk {index} length {length} does not match decoded length {}",
+                    decoded.len()
+                );
+            }
+        }
+        bytes.extend_from_slice(&decoded);
+    }
+    if let Some(total_bytes) = object.get("total_bytes").and_then(|value| value.as_u64()) {
+        if total_bytes != bytes.len() as u64 {
+            anyhow::bail!(
+                "remote content provider stream total_bytes {total_bytes} does not match decoded length {}",
+                bytes.len()
+            );
+        }
+    }
+    Ok(bytes)
+}
+
+fn carrier_connect_ticket(endpoint: &Endpoint) -> String {
+    let mut watcher = endpoint.watch_addr();
+    let addr = watcher.get();
+    let ticket_json = serde_json::json!({
+        "topic": null,
+        "endpoints": [addr],
+    });
+    let ticket_bytes = serde_json::to_vec(&ticket_json).unwrap_or_default();
+    let mut ticket_str = data_encoding::BASE32_NOPAD.encode(&ticket_bytes);
+    ticket_str.make_ascii_lowercase();
+    ticket_str
+}
+
+fn carrier_peer_selection_json(
+    topic_uri: &str,
+    local_node_did: &str,
+    local_replicas: u32,
+    remote_proofs: &[CarrierReplicationProof],
+    live_multi_peer_proof: bool,
+    peer_attestation_exchange: CarrierPeerAttestationExchangeView<'_>,
+) -> serde_json::Value {
+    let mut replicas = Vec::new();
+    if local_replicas > 0 {
+        replicas.push(serde_json::json!({
+            "role": "local",
+            "node_did": local_node_did,
+            "status": "local_pinned",
+        }));
+    }
+    replicas.extend(remote_proofs.iter().map(|proof| {
+        serde_json::json!({
+            "role": "remote",
+            "node_did": proof.node_did.clone(),
+            "endpoint_id": proof.endpoint_id.clone(),
+            "announced_at": proof.announced_at,
+            "score": proof.score,
+            "selection_reason": proof.selection_reason.clone(),
+            "local_reputation": {
+                "scope": "local_runtime",
+                "score_delta": proof.reputation_score,
+                "reason": proof.reputation_reason.clone(),
+            },
+            "admission": proof.admission.clone(),
+            "ensure_status": proof.ensure_status.clone(),
+            "status": proof
+                .status_availability
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown"),
+            "remote_receipt": proof.remote_receipt.clone(),
+            "transfer": proof.transfer.clone(),
+            "checked_at": proof.checked_at,
+        })
+    }));
+    serde_json::json!({
+        "mode": if live_multi_peer_proof {
+            "carrier_provider_replication"
+        } else {
+            "carrier_topic"
+        },
+        "strategy": "signed_announcement_then_provider_invoke",
+        "topic": topic_uri,
+        "live_multi_peer_proof": live_multi_peer_proof,
+        "peer_reputation_policy": carrier_peer_reputation_policy_json(
+            remote_proofs,
+            live_multi_peer_proof,
+        ),
+        "peer_attestation_exchange_policy": carrier_peer_attestation_exchange_policy_json(
+            remote_proofs,
+            live_multi_peer_proof,
+            peer_attestation_exchange,
+        ),
+        "replicas": replicas,
+    })
+}
+
+fn carrier_peer_reputation_policy_json(
+    remote_proofs: &[CarrierReplicationProof],
+    live_multi_peer_proof: bool,
+) -> serde_json::Value {
+    let scored_remote_peers = remote_proofs
+        .iter()
+        .filter(|proof| proof.reputation_reason != "no_local_history")
+        .count();
+    serde_json::json!({
+        "schema": CARRIER_PEER_REPUTATION_SCHEMA,
+        "policy": "local_runtime_reputation",
+        "scope": "content-availability",
+        "status": if scored_remote_peers > 0 {
+            "local_history_applied"
+        } else if live_multi_peer_proof {
+            "live_peer_proof_without_local_history"
+        } else {
+            "no_remote_peer_proof"
+        },
+        "local_runtime": {
+            "used_for_candidate_score": true,
+            "history_store": "carrier-peer-reputation.json",
+            "scored_remote_peers": scored_remote_peers,
+            "max_positive_score_delta": 20,
+            "max_negative_score_delta": -30,
+        },
+        "federation": {
+            "configured": false,
+            "cross_runtime_reputation": false,
+            "signed_reputation_receipts": false,
+            "third_party_attestations": false,
+            "reason": "this branch uses local Runtime success/failure history only; federated peer reputation needs signed cross-provider reputation receipts and trust policy",
+        },
+    })
+}
+
+fn carrier_peer_attestation_exchange_policy_json(
+    remote_proofs: &[CarrierReplicationProof],
+    live_multi_peer_proof: bool,
+    exchange: CarrierPeerAttestationExchangeView<'_>,
+) -> serde_json::Value {
+    let remote_provider_proofs = remote_proofs.len();
+    let verified_remote_content_receipts = remote_proofs
+        .iter()
+        .filter(|proof| {
+            proof
+                .remote_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.get("verified"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
+    let exchange_status = exchange
+        .receipt
+        .and_then(|receipt| receipt.get("status"))
+        .and_then(|value| value.as_str());
+    let exchange_accepted = exchange
+        .receipt
+        .and_then(|receipt| receipt.get("accepted"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    serde_json::json!({
+        "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA,
+        "policy": if exchange.configured {
+            "configured_peer_attestation_exchange"
+        } else {
+            "no_cross_runtime_attestation_exchange"
+        },
+        "scope": "content-availability",
+        "status": if exchange_accepted {
+            "attestation_exchange_accepted"
+        } else if exchange.configured && exchange.receipt.is_some() {
+            exchange_status.unwrap_or("attestation_exchange_failed")
+        } else if exchange.configured && live_multi_peer_proof {
+            "attestation_exchange_configured_without_receipt"
+        } else if exchange.configured {
+            "attestation_exchange_configured_no_remote_peer_proof"
+        } else if live_multi_peer_proof {
+            "live_peer_proof_without_attestation_exchange"
+        } else {
+            "no_remote_peer_proof"
+        },
+        "local_proof": {
+            "signed_availability_announcements": true,
+            "verified_remote_content_receipts": verified_remote_content_receipts,
+            "remote_provider_proofs": remote_provider_proofs,
+            "local_runtime_reputation": true,
+            "peer_reputation_schema": CARRIER_PEER_REPUTATION_SCHEMA,
+        },
+        "attestation_exchange": {
+            "configured": exchange.configured,
+            "signed_reputation_receipts": exchange_accepted,
+            "third_party_attestations": false,
+            "cross_runtime_trust_policy": if exchange.configured {
+                "configured_endpoint"
+            } else {
+                "not_configured"
+            },
+            "revocation": "not_configured",
+            "receipt": exchange.receipt.cloned().unwrap_or(serde_json::Value::Null),
+            "reason": if exchange_accepted {
+                "configured peer-attestation exchange accepted a signed Carrier proof receipt"
+            } else if exchange.configured {
+                "a peer-attestation exchange endpoint is configured, but this proof has no accepted signed exchange receipt"
+            } else {
+                "this branch verifies signed availability announcements and remote content receipts only; signed cross-runtime reputation attestations need a federated trust policy and receipt exchange"
+            },
+        },
+    })
+}
+
+fn carrier_quota_json(
+    requirements: CarrierAvailabilityRequirements,
+    replicas: u32,
+    desired_replicas: u32,
+) -> serde_json::Value {
+    let effective_max_replicas = requirements.effective_max();
+    let requirements_exceed_quota = requirements.min_replicas > effective_max_replicas;
+    let quota_status = if requirements_exceed_quota {
+        "requirements_exceed_quota"
+    } else if replicas >= effective_max_replicas {
+        "at_quota"
+    } else {
+        "within_quota"
+    };
+    serde_json::json!({
+        "policy": "carrier_provider_quota",
+        "scope": "content-availability",
+        "enforced": true,
+        "status": quota_status,
+        "min_replicas": requirements.min_replicas,
+        "desired_replicas": desired_replicas,
+        "max_replicas": requirements.max_replicas.unwrap_or(MAX_CARRIER_REPLICATION_CANDIDATES as u32 + 1),
+        "effective_max_replicas": effective_max_replicas,
+        "used_replicas": replicas,
+        "candidate_limit": MAX_CARRIER_REPLICATION_CANDIDATES,
+        "requirements_exceed_quota": requirements_exceed_quota,
+        "requirements": requirements.to_json(),
+        "federated_quota_ledger_policy": carrier_federated_quota_ledger_policy_json(
+            "carrier_provider_quota",
+            quota_status,
+            true,
+            true,
+        ),
+    })
+}
+
+fn carrier_federated_quota_ledger_policy_json(
+    mode: &str,
+    quota_status: &str,
+    local_principal_ledger: bool,
+    remote_admission_preflight: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": CONTENT_FEDERATED_QUOTA_LEDGER_POLICY_SCHEMA,
+        "policy": "local_principal_ledger_plus_remote_admission_preflight",
+        "scope": "content-availability",
+        "status": "federated_quota_ledger_not_configured",
+        "quota": {
+            "mode": mode,
+            "status": quota_status,
+            "enforced": true,
+        },
+        "local": {
+            "principal_storage_ledger": local_principal_ledger,
+            "ledger_schema": "elastos.content.storage-accounting.ledger/v1",
+        },
+        "remote": {
+            "admission_preflight": remote_admission_preflight,
+            "signed_admission_receipts": remote_admission_preflight,
+            "admission_schema": "elastos.content.admission/v1",
+            "admission_receipt_domain": CONTENT_ADMISSION_DOMAIN,
+        },
+        "federation": {
+            "configured": false,
+            "cross_provider_quota_ledger": false,
+            "storage_admission_network": false,
+            "signed_admission_receipt_exchange": remote_admission_preflight,
+            "quota_receipt_exchange": false,
+            "production_quota_receipt_exchange": false,
+            "reason": if remote_admission_preflight {
+                "Carrier verifies signed remote content/admission receipts for this proof path; federated quota ledgers and production storage-admission networks remain unconfigured"
+            } else {
+                "Carrier local quota exists, but remote signed admission and federated quota ledgers are not configured for this path"
+            },
+        },
+    })
+}
+
+fn default_carrier_federated_quota_ledger_policy_json() -> serde_json::Value {
+    carrier_federated_quota_ledger_policy_json("not_reported", "not_reported", false, false)
+}
+
+fn carrier_repair_worker_json(scheduled: bool, availability_status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "scheduled": scheduled,
+        "status": if scheduled { "queued" } else { "healthy" },
+        "worker": "carrier-availability",
+        "reason": if scheduled {
+            format!("availability status is {availability_status}")
+        } else {
+            "replica requirements satisfied".to_string()
+        },
+    })
+}
+
+fn carrier_repair_graph_policy_json(
+    requirements: CarrierAvailabilityRequirements,
+) -> serde_json::Value {
+    let current_modes = ["object_manifest", "exact_bytes"];
+    let requested_kind = requirements.repair_graph_kind.as_str();
+    let supported = requirements
+        .repair_graph_kind
+        .supports_current_import_fallback();
+    serde_json::json!({
+        "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
+        "policy": "carrier_provider_bounded_graph_repair",
+        "requested_kind": requested_kind,
+        "status": if supported {
+            "bounded_import_supported"
+        } else {
+            "unsupported_without_block_graph_provider"
+        },
+        "supported_import_fallbacks": current_modes,
+        "refuses_exact_fallback_for_arbitrary_dag": true,
+        "block_graph_contract": {
+            "provider": CONTENT_BLOCK_GRAPH_PROVIDER,
+            "target": CONTENT_BLOCK_GRAPH_TARGET,
+            "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
+            "operations": ["export_graph", "import_graph", "status"]
+        },
+        "requires_provider": if supported {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(CONTENT_BLOCK_GRAPH_PROVIDER.to_string())
+        },
+    })
+}
+
+fn carrier_storage_market_policy_json(
+    replicas: u32,
+    live_multi_peer_proof: bool,
+) -> serde_json::Value {
+    let status = if live_multi_peer_proof {
+        "receipt_proven_no_market_settlement"
+    } else {
+        "local_or_announced_no_market_settlement"
+    };
+    serde_json::json!({
+        "schema": "elastos.content.storage-market/v1",
+        "mode": "carrier_provider_receipts",
+        "status": status,
+        "settlement": "not_configured",
+        "escrow": "not_configured",
+        "quota_enforced": true,
+        "replicas": replicas,
+        "live_multi_peer_proof": live_multi_peer_proof,
+        "remote_admission_preflight": live_multi_peer_proof,
+        "admission_policy": carrier_storage_market_admission_policy_json(
+            "carrier_provider_receipts",
+            status,
+            true,
+            live_multi_peer_proof,
+            live_multi_peer_proof,
+        ),
+        "settlement_policy": carrier_storage_settlement_policy_json(
+            "carrier_provider_receipts",
+            status,
+            true,
+            live_multi_peer_proof,
+        ),
+        "next": "Production storage markets need pricing, escrow/settlement, storage-market admission, and cross-peer SLA policy before enabling."
+    })
+}
+
+fn carrier_abuse_controls_json(
+    candidate_count: usize,
+    attempt_limit: usize,
+    attempted_operations: u32,
+    failed_operations: u32,
+    candidate_limit_applied: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "elastos.content.abuse-controls/v1",
+        "policy": "carrier_provider_invocation_guardrail",
+        "scope": "content-availability",
+        "enforced": true,
+        "candidate_limit": MAX_CARRIER_REPLICATION_CANDIDATES,
+        "candidate_count": candidate_count,
+        "attempt_limit": attempt_limit,
+        "attempted_operations": attempted_operations,
+        "failed_operations": failed_operations,
+        "throttled": candidate_limit_applied,
+        "reason": if candidate_limit_applied {
+            "candidate attempt limit applied"
+        } else {
+            "candidate attempts within bounded provider-invocation budget"
+        },
+    })
+}
+
+fn carrier_remote_candidate_limit(
+    requirements: CarrierAvailabilityRequirements,
+    local_replicas: u32,
+    desired_replicas: u32,
+) -> usize {
+    let replica_shortfall = desired_replicas.saturating_sub(local_replicas);
+    let remaining_quota = requirements.effective_max().saturating_sub(local_replicas);
+    let live_remote_required =
+        u32::from(requirements.require_live_multi_peer_proof && remaining_quota > 0);
+    replica_shortfall
+        .max(live_remote_required)
+        .min(remaining_quota)
+        .min(MAX_CARRIER_REPLICATION_CANDIDATES as u32) as usize
+}
+
+fn carrier_repair_reason(
+    requirements: CarrierAvailabilityRequirements,
+    replicas: u32,
+    live_multi_peer_proof: bool,
+    errors: &[String],
+) -> String {
+    let mut reasons = Vec::new();
+    if replicas < requirements.min_replicas {
+        reasons.push(format!(
+            "only {replicas} replica(s) proven; {} required",
+            requirements.min_replicas
+        ));
+    }
+    if requirements.require_live_multi_peer_proof && !live_multi_peer_proof {
+        reasons.push(
+            "live multi-peer proof is required but no independent remote replica was proven"
+                .to_string(),
+        );
+    }
+    if !errors.is_empty() {
+        reasons.push(format!("replication errors: {}", errors.join(" | ")));
+    }
+    if reasons.is_empty() {
+        "Carrier availability repair is required".to_string()
+    } else {
+        reasons.join("; ")
+    }
+}
+
+fn content_availability_replicas(
+    messages: &[GossipMessage],
+    cid: &str,
+) -> Vec<CarrierAvailabilityReplica> {
+    content_availability_replicas_with_reputation(messages, cid, &HashMap::new())
+}
+
+fn content_availability_replicas_with_reputation(
+    messages: &[GossipMessage],
+    cid: &str,
+    reputation: &HashMap<String, CarrierPeerReputation>,
+) -> Vec<CarrierAvailabilityReplica> {
+    let mut replicas = Vec::new();
+    for message in messages {
+        let Ok((envelope, signer_did)) = crate::crypto::verify_signed_json_envelope_against_dids(
+            message.content.as_bytes(),
+            CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN,
+            &[],
+        ) else {
+            continue;
+        };
+        let Some(payload) = envelope.get("payload") else {
+            continue;
+        };
+        if payload.get("schema").and_then(|value| value.as_str())
+            != Some(CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA)
+        {
+            continue;
+        }
+        if payload.get("cid").and_then(|value| value.as_str()) != Some(cid) {
+            continue;
+        }
+        if payload.get("node_did").and_then(|value| value.as_str()) != Some(signer_did.as_str()) {
+            continue;
+        }
+        let Some(ticket) = payload
+            .get("fetch")
+            .and_then(|value| value.get("connect_ticket"))
+            .and_then(|value| value.as_str())
+            .filter(|value| {
+                let value = value.trim();
+                !value.is_empty() && value.len() <= MAX_CARRIER_AVAILABILITY_TICKET_LEN
+            })
+        else {
+            continue;
+        };
+        let raw_endpoint_id = payload
+            .get("fetch")
+            .and_then(|value| value.get("endpoint_id"))
+            .and_then(|value| value.as_str());
+        if raw_endpoint_id
+            .map(|value| value.len() > MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let endpoint_id = raw_endpoint_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
+        let node_did = signer_did.to_string();
+        if replicas
+            .iter()
+            .any(|replica: &CarrierAvailabilityReplica| replica.node_did == node_did)
+        {
+            continue;
+        }
+        let announced_at = payload
+            .get("announced_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(message.ts);
+        let (score, selection_reason, reputation_score, reputation_reason) =
+            carrier_replica_candidate_score(
+                endpoint_id.as_deref(),
+                announced_at,
+                message.ts,
+                reputation.get(&node_did),
+            );
+        replicas.push(CarrierAvailabilityReplica {
+            node_did,
+            endpoint_id,
+            connect_ticket: ticket.to_string(),
+            announced_at,
+            score,
+            selection_reason,
+            reputation_score,
+            reputation_reason,
+        });
+    }
+    replicas.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.announced_at.cmp(&a.announced_at))
+            .then_with(|| a.node_did.cmp(&b.node_did))
+    });
+    replicas
+}
+
+fn carrier_replica_candidate_score(
+    endpoint_id: Option<&str>,
+    announced_at: u64,
+    message_ts: u64,
+    reputation: Option<&CarrierPeerReputation>,
+) -> (u32, String, i32, String) {
+    let mut score = 50_u32;
+    let mut reasons = vec!["signed_announcement"];
+    if endpoint_id
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        score = score.saturating_add(20);
+        reasons.push("endpoint_advertised");
+    }
+    if announced_at >= message_ts.saturating_sub(60 * 60) {
+        score = score.saturating_add(20);
+        reasons.push("fresh");
+    } else {
+        reasons.push("stale");
+    }
+    let (reputation_score, reputation_reason) = carrier_reputation_score(reputation);
+    if reputation_score > 0 {
+        score = score.saturating_add(reputation_score as u32);
+        reasons.push("local_reputation_positive");
+    } else if reputation_score < 0 {
+        score = score.saturating_sub(reputation_score.unsigned_abs());
+        reasons.push("local_reputation_negative");
+    } else {
+        reasons.push("local_reputation_neutral");
+    }
+    (
+        score.min(100),
+        reasons.join("+"),
+        reputation_score,
+        reputation_reason,
+    )
+}
+
+fn carrier_reputation_score(reputation: Option<&CarrierPeerReputation>) -> (i32, String) {
+    let Some(reputation) = reputation else {
+        return (0, "no_local_history".to_string());
+    };
+    let successes = reputation.successes.min(5) as i32;
+    let failures = reputation.failures.min(5) as i32;
+    let score = (successes * 4 - failures * 8).clamp(-30, 20);
+    (
+        score,
+        format!(
+            "local_runtime_successes:{};failures:{}",
+            reputation.successes, reputation.failures
+        ),
+    )
+}
+
+fn carrier_peer_reputation_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir
+        .join("ElastOS")
+        .join("SystemServices")
+        .join("Content")
+        .join("carrier-peer-reputation.json")
+}
+
+fn load_carrier_peer_reputation(
+    data_dir: &std::path::Path,
+) -> HashMap<String, CarrierPeerReputation> {
+    let path = carrier_peer_reputation_path(data_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return HashMap::new();
+    };
+    let Ok(store) = serde_json::from_slice::<CarrierPeerReputationStore>(&bytes) else {
+        tracing::debug!("carrier peer reputation decode failed: {}", path.display());
+        return HashMap::new();
+    };
+    if store.schema != CARRIER_PEER_REPUTATION_SCHEMA {
+        tracing::debug!(
+            "carrier peer reputation schema mismatch at {}: {}",
+            path.display(),
+            store.schema
+        );
+        return HashMap::new();
+    }
+    store.peers.into_iter().collect()
+}
+
+fn save_carrier_peer_reputation(
+    data_dir: &std::path::Path,
+    reputation: &HashMap<String, CarrierPeerReputation>,
+) -> Result<()> {
+    let path = carrier_peer_reputation_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = CarrierPeerReputationStore {
+        schema: CARRIER_PEER_REPUTATION_SCHEMA.to_string(),
+        peers: reputation
+            .iter()
+            .map(|(node_did, reputation)| (node_did.clone(), reputation.clone()))
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&store)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn content_availability_fetch_tickets(messages: &[GossipMessage], cid: &str) -> Vec<String> {
+    content_availability_replicas(messages, cid)
+        .into_iter()
+        .map(|replica| replica.connect_ticket)
+        .collect()
 }
 
 // ── Gossip Provider (implements Provider trait) ──────────────────
@@ -1224,7 +4913,76 @@ async fn recv_loop(
     }
 }
 
-// ── Client (for updates) ─────────────────────────────────────────
+// ── Client and provider-plane invocation ─────────────────────────
+
+pub struct CarrierProviderInvoker;
+
+impl CarrierProviderInvoker {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for CarrierProviderInvoker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderCarrierInvoker for CarrierProviderInvoker {
+    async fn invoke_carrier_provider(
+        &self,
+        route: &ProviderCarrierRoute,
+        invocation: &ProviderInvocation,
+        request: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, ProviderError> {
+        let timeout_secs = carrier_route_timeout_secs(route);
+        let mut endpoints = decode_ticket_endpoints(&route.connect_ticket);
+        if let Some(peer_did) = route.peer_did.as_deref() {
+            endpoints.retain(|endpoint| carrier_endpoint_matches_peer(endpoint, peer_did));
+            if endpoints.is_empty() {
+                return Err(ProviderError::Provider(
+                    "Carrier provider invocation peer_did does not match connect_ticket"
+                        .to_string(),
+                ));
+            }
+        }
+        if endpoints.is_empty() {
+            return Err(ProviderError::Provider(
+                "Carrier provider invocation connect_ticket has no endpoints".to_string(),
+            ));
+        }
+
+        let mut errors = Vec::new();
+        for (index, endpoint) in endpoints.into_iter().enumerate() {
+            match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
+                Ok(client) => match client.invoke_provider(invocation, request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(err) => errors.push(format!("ticket[{index}] invoke failed: {err}")),
+                },
+                Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
+            }
+        }
+
+        Err(ProviderError::Provider(format!(
+            "Carrier provider invocation failed: {}",
+            errors.join(" | ")
+        )))
+    }
+}
+
+fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
+    let timeout_ms = route.timeout_ms.unwrap_or(5_000).clamp(1, 60_000);
+    timeout_ms.div_ceil(1_000)
+}
+
+fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) -> bool {
+    if let Some(public_key) = did_to_public_key(peer_did) {
+        return endpoint.id == public_key;
+    }
+    endpoint.id.to_string() == peer_did
+}
 
 pub struct CarrierClient {
     conn: iroh::endpoint::Connection,
@@ -1334,33 +5092,97 @@ impl CarrierClient {
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
         send.finish()?;
-        let mut len_buf = [0u8; 8];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u64::from_be_bytes(len_buf) as usize;
-        if len > 200 * 1024 * 1024 {
-            let mut error_bytes = len_buf.to_vec();
-            let tail = recv.read_to_end(16 * 1024).await?;
-            error_bytes.extend_from_slice(&tail);
-            if let Ok(text) = String::from_utf8(error_bytes) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                    if json["ok"].as_bool() == Some(false) {
-                        let msg = json["error"]
-                            .as_str()
-                            .unwrap_or("trusted source returned an unknown file error");
-                        anyhow::bail!("trusted source file fetch failed for {}: {}", path, msg);
-                    }
+        read_carrier_len_prefixed_bytes(&mut recv, &format!("trusted source file fetch for {path}"))
+            .await
+    }
+
+    pub async fn fetch_content(&self, cid: &str, path: Option<&str>) -> Result<Vec<u8>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        let mut msg = serde_json::json!({
+            "op": "content_fetch",
+            "cid": cid,
+        });
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            msg["path"] = serde_json::Value::String(path.to_string());
+        }
+        let mut bytes = serde_json::to_vec(&msg)?;
+        bytes.push(b'\n');
+        send.write_all(&bytes).await?;
+        send.finish()?;
+        read_carrier_len_prefixed_bytes(&mut recv, "content fetch").await
+    }
+
+    pub async fn invoke_provider(
+        &self,
+        invocation: &ProviderInvocation,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (mut send, recv) = self.conn.open_bi().await?;
+        let msg = serde_json::json!({
+            "op": "provider_invoke",
+            "source": invocation.source.as_str(),
+            "target": invocation.target.as_str(),
+            "operation": invocation.op.as_str(),
+            "transfer": invocation.transfer.as_str(),
+            "range": invocation.range.map(|range| serde_json::json!({
+                "start": range.start,
+                "end": range.end,
+            })),
+            "progress": invocation.progress.as_ref().map(|progress| serde_json::json!({
+                "request_id": progress.request_id.as_str(),
+                "expected_bytes": progress.expected_bytes,
+            })),
+            "request": request,
+        });
+        let mut bytes = serde_json::to_vec(&msg)?;
+        bytes.push(b'\n');
+        send.write_all(&bytes).await?;
+        send.finish()?;
+
+        let mut reader = BufReader::new(recv);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        let response: serde_json::Value = serde_json::from_str(line.trim())?;
+        if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+            return Ok(response
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+        let message = response
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Carrier provider invocation failed");
+        anyhow::bail!("{message}");
+    }
+}
+
+async fn read_carrier_len_prefixed_bytes(
+    recv: &mut iroh::endpoint::RecvStream,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 8];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u64::from_be_bytes(len_buf) as usize;
+    if len > 200 * 1024 * 1024 {
+        let mut error_bytes = len_buf.to_vec();
+        let tail = recv.read_to_end(16 * 1024).await?;
+        error_bytes.extend_from_slice(&tail);
+        if let Ok(text) = String::from_utf8(error_bytes) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                if json["ok"].as_bool() == Some(false) {
+                    let msg = json["error"]
+                        .as_str()
+                        .unwrap_or("Carrier returned an unknown error");
+                    anyhow::bail!("{operation} failed: {msg}");
                 }
             }
-            anyhow::bail!(
-                "invalid trusted source file reply for {} (declared {} bytes)",
-                path,
-                len
-            );
         }
-        let mut content = vec![0u8; len];
-        recv.read_exact(&mut content).await?;
-        Ok(content)
+        anyhow::bail!("{operation} returned invalid byte reply ({len} bytes declared)");
     }
+    let mut content = vec![0u8; len];
+    recv.read_exact(&mut content).await?;
+    Ok(content)
 }
 
 async fn fetch_file_with_timeout(
@@ -1442,6 +5264,563 @@ pub async fn try_p2p_discovery(
 mod tests {
     use super::*;
 
+    struct MockCarrierIpfsProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for MockCarrierIpfsProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "mock ipfs provider only supports raw operations".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-carrier-ipfs-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            if request.get("op").and_then(|value| value.as_str()) != Some("cat") {
+                return Ok(serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported",
+                    "message": "unsupported mock ipfs operation"
+                }));
+            }
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"carrier content")
+                }
+            }))
+        }
+    }
+
+    struct MockCarrierContentProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for MockCarrierContentProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "mock content provider only supports raw operations".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-carrier-content-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> Result<serde_json::Value, ProviderError> {
+            if request.get("op").and_then(|op| op.as_str()) == Some("fetch")
+                && request
+                    .get("local_only")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "stream": {
+                            "schema": "elastos.provider.stream/v1",
+                            "encoding": "base64-chunks",
+                            "total_bytes": 22,
+                            "completed": true,
+                            "chunks": [
+                                {
+                                    "index": 0,
+                                    "offset": 0,
+                                    "length": 22,
+                                    "data": base64::engine::general_purpose::STANDARD.encode(
+                                        b"carrier provider bytes",
+                                    ),
+                                }
+                            ],
+                        }
+                    }
+                }));
+            }
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "op": request.get("op").cloned().unwrap_or(serde_json::Value::Null),
+                    "runtime_invocation": request
+                        .get("_runtime_invocation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                }
+            }))
+        }
+    }
+
+    struct MockCarrierObjectContentProvider;
+    struct MockCarrierBlockGraphProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for MockCarrierObjectContentProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "mock content provider only supports raw operations".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-carrier-object-content-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            if request.get("op").and_then(|op| op.as_str()) != Some("fetch")
+                || !request
+                    .get("local_only")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            {
+                return Ok(serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported",
+                    "message": "mock object content provider only supports local fetch"
+                }));
+            }
+            let path = request
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let bytes = match path {
+                CONTENT_OBJECT_MANIFEST_PATH => carrier_test_object_manifest_bytes(),
+                "index.md" => carrier_test_object_file_bytes(),
+                _ => {
+                    return Ok(serde_json::json!({
+                        "status": "error",
+                        "code": "not_found",
+                        "message": "mock object path not found"
+                    }))
+                }
+            };
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "cid": request
+                        .get("cid")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "stream": carrier_test_stream_payload(&bytes)
+                }
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockCarrierBlockGraphProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "mock block-graph provider only supports raw operations".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-block-graph-provider"
+        }
+
+        async fn send_raw(
+            &self,
+            request: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            if request.get("op").and_then(|op| op.as_str()) != Some("export_graph") {
+                return Ok(serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported",
+                    "message": "mock block-graph provider only supports export_graph"
+                }));
+            }
+            let cid = request
+                .get("cid")
+                .and_then(|value| value.as_str())
+                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi");
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "graph": {
+                        "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
+                        "root_cid": cid,
+                        "kind": "ipld_dag",
+                        "blocks": [
+                            {
+                                "cid": cid,
+                                "codec": "dag-pb",
+                                "size": 22,
+                                "data": base64::engine::general_purpose::STANDARD.encode(
+                                    b"carrier provider bytes",
+                                )
+                            }
+                        ],
+                        "links": [],
+                        "bytes": 22
+                    }
+                }
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct MockCarrierProviderPlaneInvoker {
+        requests: Mutex<Vec<serde_json::Value>>,
+        fail_ensure: bool,
+        reject_admission: bool,
+        omit_admission_receipt: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderCarrierInvoker for MockCarrierProviderPlaneInvoker {
+        async fn invoke_carrier_provider(
+            &self,
+            route: &ProviderCarrierRoute,
+            invocation: &ProviderInvocation,
+            request: serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, ProviderError> {
+            self.requests.lock().await.push(serde_json::json!({
+                "ticket": route.connect_ticket.as_str(),
+                "source": invocation.source.as_str(),
+                "target": invocation.target.as_str(),
+                "op": invocation.op.as_str(),
+                "request": request,
+            }));
+            if invocation.transfer == ProviderTransfer::Stream {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                        "stream": {
+                            "schema": "elastos.provider.stream/v1",
+                            "encoding": "base64-chunks",
+                            "total_bytes": 22,
+                            "completed": true,
+                            "chunks": [
+                                {
+                                    "index": 0,
+                                    "offset": 0,
+                                    "length": 22,
+                                    "data": base64::engine::general_purpose::STANDARD.encode(
+                                        b"carrier provider bytes",
+                                    ),
+                                }
+                            ],
+                        }
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "admission" {
+                let admission = serde_json::json!({
+                    "schema": "elastos.content.admission/v1",
+                    "policy": "content_provider_principal_quota_preflight",
+                    "scope": "content-availability",
+                    "accepted": !self.reject_admission,
+                    "status": if self.reject_admission { "rejected" } else { "accepted" },
+                    "reason": if self.reject_admission {
+                        Some("mock remote quota exceeded")
+                    } else {
+                        None
+                    },
+                    "cid": request
+                        .get("cid")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "publisher_did": request
+                        .get("publisher_did")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "estimated_content_bytes": request
+                        .get("estimated_content_bytes")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "quota": {
+                        "policy": "principal_storage_quota",
+                        "status": if self.reject_admission {
+                            "quota_exceeded"
+                        } else {
+                            "within_quota"
+                        },
+                        "enforced": true
+                    },
+                    "checked_at": 1_700_000_000,
+                    "app_visible": false
+                });
+                let receipt = if self.omit_admission_receipt {
+                    serde_json::Value::Null
+                } else {
+                    signed_remote_admission_receipt(&admission)
+                };
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "admission": admission,
+                        "receipt": receipt
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "ensure" {
+                let ensure_attempts = self
+                    .requests
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|request| request["op"] == "ensure")
+                    .count();
+                if self.fail_ensure && ensure_attempts == 1 {
+                    return Ok(serde_json::json!({
+                        "status": "error",
+                        "code": "pin_failed",
+                        "message": "mock remote pin failed"
+                    }));
+                }
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "receipt": signed_remote_content_receipt(
+                            request
+                                .get("cid")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+                        ),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": "content-provider",
+                            "policy": "carrier_replica",
+                            "replicas": 1,
+                            "peer_selection": {
+                                "mode": "single_local",
+                                "live_multi_peer_proof": false
+                            },
+                            "quota": {
+                                "policy": "not_enforced"
+                            },
+                            "repair_worker": {
+                                "scheduled": false,
+                                "status": "not_scheduled"
+                            }
+                        }
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_exact" {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "receipt": signed_remote_content_receipt(
+                            request
+                                .get("cid")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+                        ),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": "content-provider",
+                            "policy": "carrier_exact_import",
+                            "replicas": 1,
+                            "peer_selection": {
+                                "mode": "single_local",
+                                "live_multi_peer_proof": false
+                            },
+                            "quota": {
+                                "policy": "not_enforced"
+                            },
+                            "repair_worker": {
+                                "scheduled": false,
+                                "status": "not_scheduled"
+                            }
+                        },
+                        "import": {
+                            "schema": "elastos.content.import-exact/v1",
+                            "verified_cid": true,
+                            "bytes": 22
+                        }
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_object" {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "receipt": signed_remote_content_receipt(
+                            request
+                                .get("cid")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+                        ),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": "content-provider",
+                            "policy": "carrier_object_import",
+                            "replicas": 1,
+                            "peer_selection": {
+                                "mode": "single_local",
+                                "live_multi_peer_proof": false
+                            },
+                            "quota": {
+                                "policy": "not_enforced"
+                            },
+                            "repair_worker": {
+                                "scheduled": false,
+                                "status": "not_scheduled"
+                            }
+                        },
+                        "import": {
+                            "schema": "elastos.content.import-object/v1",
+                            "verified_cid": true,
+                            "files": request
+                                .get("files")
+                                .and_then(|value| value.as_array())
+                                .map(|files| files.len())
+                                .unwrap_or(0)
+                        }
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "import_graph" {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "receipt": signed_remote_content_receipt(
+                            request
+                                .get("cid")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi")
+                        ),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": CONTENT_BLOCK_GRAPH_PROVIDER,
+                            "policy": "carrier_block_graph_import",
+                            "replicas": 1,
+                            "peer_selection": {
+                                "mode": "single_local",
+                                "live_multi_peer_proof": false
+                            },
+                            "quota": {
+                                "policy": "not_enforced"
+                            },
+                            "repair_worker": {
+                                "scheduled": false,
+                                "status": "not_scheduled"
+                            },
+                            "repair_graph": {
+                                "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
+                                "policy": "carrier_provider_bounded_graph_repair",
+                                "requested_kind": "ipld_dag",
+                                "status": "block_graph_provider_imported"
+                            }
+                        },
+                        "import": {
+                            "schema": CONTENT_BLOCK_GRAPH_SCHEMA,
+                            "verified_cid": true,
+                            "blocks": request
+                                .get("graph")
+                                .and_then(|graph| graph.get("blocks"))
+                                .and_then(|value| value.as_array())
+                                .map(|blocks| blocks.len())
+                                .unwrap_or(0)
+                        }
+                    }
+                }));
+            }
+            if invocation.transfer == ProviderTransfer::Json && invocation.op == "status" {
+                return Ok(serde_json::json!({
+                    "status": "ok",
+                    "data": {
+                        "cid": request
+                            .get("cid")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        "availability": {
+                            "status": "local_pinned",
+                            "provider": "content-provider",
+                            "policy": "local_repair_pin",
+                            "replicas": 1,
+                            "peer_selection": {
+                                "mode": "single_local",
+                                "live_multi_peer_proof": false
+                            },
+                            "quota": {
+                                "policy": "not_enforced"
+                            },
+                            "repair_worker": {
+                                "scheduled": false,
+                                "status": "not_scheduled"
+                            }
+                        }
+                    }
+                }));
+            }
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "data": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(
+                            b"carrier provider bytes",
+                        )
+                    }
+                }
+            }))
+        }
+    }
+
     #[test]
     fn test_topic_hash_deterministic() {
         let h1 = topic_hash("#general");
@@ -1489,6 +5868,2076 @@ mod tests {
 
         let decoded: GossipMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.signature, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn test_content_availability_topic_is_deterministic_and_does_not_embed_raw_cid() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic = content_availability_topic_name(cid);
+        let topic_again = content_availability_topic_name(cid);
+        let uri = content_availability_topic_uri(cid);
+
+        assert_eq!(topic, topic_again);
+        assert!(topic.starts_with("__elastos_content/v1/"));
+        assert!(uri.starts_with("elastos://carrier/content/"));
+        assert!(uri.ends_with("/availability"));
+        assert!(!topic.contains(cid));
+        assert!(!uri.contains(cid));
+    }
+
+    #[test]
+    fn test_content_availability_cid_validation_is_fail_closed() {
+        assert!(validate_content_cid(
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+        )
+        .is_ok());
+        assert!(validate_content_cid("QmRSEtAyq7Xgr5YCFVWuYsBdqbR5X9fJDsdpNQuvm9yaic").is_ok());
+        assert!(validate_content_cid("short").is_err());
+        assert!(validate_content_cid("cid/with/slashes").is_err());
+        assert!(validate_content_cid("cid with spaces").is_err());
+    }
+
+    #[test]
+    fn test_content_availability_fetch_tickets_require_signed_matching_announcement() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (signed_message, _) = signed_content_availability_message(
+            cid,
+            [19u8; 32],
+            "ticket:test",
+            "endpoint:test",
+            1_700_000_000,
+        );
+        let unsigned_message = GossipMessage {
+            content: serde_json::json!({
+                "payload": {
+                    "schema": CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA,
+                    "cid": cid,
+                    "node_did": "did:key:z6Mkuntrusted",
+                    "fetch": {"connect_ticket": "ticket:unsigned"}
+                },
+                "signature": "00",
+                "signer_did": "did:key:z6Mkuntrusted"
+            })
+            .to_string(),
+            ..signed_message.clone()
+        };
+
+        let tickets = content_availability_fetch_tickets(&[unsigned_message, signed_message], cid);
+
+        assert_eq!(tickets, vec!["ticket:test".to_string()]);
+    }
+
+    #[test]
+    fn test_content_availability_replicas_ignore_signed_repair_only_announcements() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (sk, did) = elastos_identity::derive_did(&[23u8; 32]);
+        let payload = serde_json::json!({
+            "schema": CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA,
+            "cid": cid,
+            "uri": format!("elastos://{cid}"),
+            "policy": "network_default",
+            "provider": "carrier-availability",
+            "node_did": did,
+            "topic": content_availability_topic_uri(cid),
+            "local": {
+                "status": "local_unpinned",
+                "provider": "ipfs-provider",
+                "replicas": 0
+            },
+            "announced_at": 1_700_000_000u64
+        });
+        let canonical = serde_json::to_string(&payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN,
+            canonical.as_bytes(),
+        );
+        let message = GossipMessage {
+            sender_id: signer_did.clone(),
+            sender_nick: "content-provider".to_string(),
+            content: serde_json::json!({
+                "payload": payload,
+                "signature": signature,
+                "signer_did": signer_did,
+            })
+            .to_string(),
+            ts: 1_700_000_000,
+            nonce: 1,
+            signature: None,
+            sender_session_id: None,
+        };
+
+        assert!(
+            content_availability_replicas(&[message], cid).is_empty(),
+            "repair-only announcements must not become fetch/replication candidates"
+        );
+    }
+
+    #[test]
+    fn test_content_availability_replicas_ignore_oversized_candidate_metadata() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (oversized_ticket, _) = signed_content_availability_message(
+            cid,
+            [24u8; 32],
+            &"x".repeat(MAX_CARRIER_AVAILABILITY_TICKET_LEN + 1),
+            "remote-endpoint",
+            1_700_000_000,
+        );
+        let (oversized_endpoint, _) = signed_content_availability_message(
+            cid,
+            [25u8; 32],
+            "ticket:test",
+            &"e".repeat(MAX_CARRIER_AVAILABILITY_ENDPOINT_ID_LEN + 1),
+            1_700_000_000,
+        );
+
+        let replicas = content_availability_replicas(&[oversized_ticket, oversized_endpoint], cid);
+
+        assert!(
+            replicas.is_empty(),
+            "oversized candidate metadata must not be used for Carrier provider invocation"
+        );
+    }
+
+    #[test]
+    fn test_content_availability_replicas_are_scored_and_sorted() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (mut stale, stale_did) =
+            signed_content_availability_message(cid, [26u8; 32], "ticket:stale", "", 10);
+        stale.ts = 1_700_000_000;
+        let (fresh, fresh_did) = signed_content_availability_message(
+            cid,
+            [27u8; 32],
+            "ticket:fresh",
+            "remote-endpoint",
+            1_700_000_000,
+        );
+
+        let replicas = content_availability_replicas(&[stale, fresh], cid);
+
+        assert_eq!(replicas.len(), 2);
+        assert_eq!(replicas[0].node_did, fresh_did);
+        assert_eq!(replicas[0].connect_ticket, "ticket:fresh");
+        assert_eq!(replicas[0].score, 90);
+        assert_eq!(
+            replicas[0].selection_reason,
+            "signed_announcement+endpoint_advertised+fresh+local_reputation_neutral"
+        );
+        assert_eq!(replicas[0].reputation_score, 0);
+        assert_eq!(replicas[0].reputation_reason, "no_local_history");
+        assert_eq!(replicas[1].node_did, stale_did);
+        assert_eq!(replicas[1].score, 50);
+        assert_eq!(
+            replicas[1].selection_reason,
+            "signed_announcement+stale+local_reputation_neutral"
+        );
+    }
+
+    #[test]
+    fn test_content_availability_replicas_apply_local_runtime_reputation() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let (preferred, preferred_did) = signed_content_availability_message(
+            cid,
+            [28u8; 32],
+            "ticket:preferred",
+            "remote-endpoint",
+            1_700_000_000,
+        );
+        let (penalized, penalized_did) = signed_content_availability_message(
+            cid,
+            [29u8; 32],
+            "ticket:penalized",
+            "remote-endpoint",
+            1_700_000_000,
+        );
+        let mut reputation = HashMap::new();
+        reputation.insert(
+            preferred_did.clone(),
+            CarrierPeerReputation {
+                successes: 2,
+                failures: 0,
+            },
+        );
+        reputation.insert(
+            penalized_did.clone(),
+            CarrierPeerReputation {
+                successes: 0,
+                failures: 2,
+            },
+        );
+
+        let replicas = content_availability_replicas_with_reputation(
+            &[penalized, preferred],
+            cid,
+            &reputation,
+        );
+
+        assert_eq!(replicas.len(), 2);
+        assert_eq!(replicas[0].node_did, preferred_did);
+        assert_eq!(replicas[0].score, 98);
+        assert_eq!(replicas[0].reputation_score, 8);
+        assert_eq!(
+            replicas[0].reputation_reason,
+            "local_runtime_successes:2;failures:0"
+        );
+        assert_eq!(replicas[1].node_did, penalized_did);
+        assert_eq!(replicas[1].score, 74);
+        assert_eq!(replicas[1].reputation_score, -16);
+    }
+
+    #[test]
+    fn test_carrier_peer_reputation_persists_local_history() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut reputation = HashMap::new();
+        reputation.insert(
+            "did:key:zDurablePeer".to_string(),
+            CarrierPeerReputation {
+                successes: 3,
+                failures: 1,
+            },
+        );
+
+        save_carrier_peer_reputation(data_dir.path(), &reputation).unwrap();
+        let loaded = load_carrier_peer_reputation(data_dir.path());
+
+        let peer = loaded.get("did:key:zDurablePeer").unwrap();
+        assert_eq!(peer.successes, 3);
+        assert_eq!(peer.failures, 1);
+        assert!(carrier_peer_reputation_path(data_dir.path()).is_file());
+    }
+
+    fn signed_content_availability_message(
+        cid: &str,
+        key_seed: [u8; 32],
+        connect_ticket: &str,
+        endpoint_id: &str,
+        announced_at: u64,
+    ) -> (GossipMessage, String) {
+        let (sk, did) = elastos_identity::derive_did(&key_seed);
+        let payload = serde_json::json!({
+            "schema": CONTENT_AVAILABILITY_ANNOUNCEMENT_SCHEMA,
+            "cid": cid,
+            "uri": format!("elastos://{cid}"),
+            "policy": "network_default",
+            "provider": "carrier-availability",
+            "node_did": did,
+            "topic": content_availability_topic_uri(cid),
+            "fetch": {
+                "transport": "carrier-file",
+                "endpoint_id": endpoint_id,
+                "connect_ticket": connect_ticket
+            },
+            "local": {
+                "status": "local_pinned",
+                "provider": "ipfs-provider",
+                "replicas": 1
+            },
+            "announced_at": announced_at
+        });
+        let canonical = serde_json::to_string(&payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            CONTENT_AVAILABILITY_ANNOUNCEMENT_DOMAIN,
+            canonical.as_bytes(),
+        );
+        (
+            GossipMessage {
+                sender_id: signer_did.clone(),
+                sender_nick: "content-provider".to_string(),
+                content: serde_json::json!({
+                    "payload": payload,
+                    "signature": signature,
+                    "signer_did": signer_did,
+                })
+                .to_string(),
+                ts: announced_at,
+                nonce: 1,
+                signature: None,
+                sender_session_id: None,
+            },
+            did,
+        )
+    }
+
+    fn signed_remote_content_receipt(cid: &str) -> serde_json::Value {
+        let (sk, _) = elastos_identity::derive_did(&[44u8; 32]);
+        let checked_at = 1_700_000_123u64;
+        let payload = serde_json::json!({
+            "schema": "elastos.content.availability.receipt/v1",
+            "cid": cid,
+            "uri": format!("elastos://{cid}"),
+            "provider": "content-provider",
+            "policy": "carrier_exact_import",
+            "status": "local_pinned",
+            "replicas": 1,
+            "peer_selection": {
+                "mode": "single_local",
+                "live_multi_peer_proof": false
+            },
+            "quota": {
+                "policy": "carrier_provider_quota",
+                "status": "within_quota",
+                "enforced": true,
+                "used_replicas": 1,
+                "effective_max_replicas": 3
+            },
+            "repair_worker": {
+                "scheduled": false,
+                "status": "not_scheduled",
+                "worker": "content-provider"
+            },
+            "repair_graph": {
+                "schema": CONTENT_REPAIR_GRAPH_SCHEMA,
+                "policy": "carrier_provider_bounded_graph_repair",
+                "requested_kind": "auto",
+                "status": "bounded_import_supported",
+                "refuses_exact_fallback_for_arbitrary_dag": true
+            },
+            "storage_market": {
+                "schema": "elastos.content.storage-market/v1",
+                "mode": "carrier_provider_receipts",
+                "status": "receipt_proven_no_market_settlement",
+                "settlement": "not_configured",
+                "quota_enforced": true
+            },
+            "accounting": {
+                "schema": "elastos.content.accounting/v1",
+                "observed": true,
+                "files": 1,
+                "content_bytes": 22,
+                "replica_bytes_estimate": 22,
+                "storage_quota": {
+                    "status": "observed_not_enforced"
+                }
+            },
+            "abuse_controls": {
+                "schema": "elastos.content.abuse-controls/v1",
+                "policy": "carrier_provider_invocation_guardrail",
+                "enforced": true,
+                "candidate_count": 1,
+                "attempt_limit": 1,
+                "attempted_operations": 1,
+                "failed_operations": 0,
+                "throttled": false
+            },
+            "checked_at": checked_at,
+        });
+        let canonical = serde_json::to_string(&payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            "elastos.content.availability.receipt.v1",
+            canonical.as_bytes(),
+        );
+        serde_json::json!({
+            "payload": payload,
+            "signature": signature,
+            "signer_did": signer_did,
+        })
+    }
+
+    fn signed_remote_admission_receipt(payload: &serde_json::Value) -> serde_json::Value {
+        let (sk, _) = elastos_identity::derive_did(&[45u8; 32]);
+        let canonical = serde_json::to_string(payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            CONTENT_ADMISSION_DOMAIN,
+            canonical.as_bytes(),
+        );
+        serde_json::json!({
+            "payload": payload,
+            "signature": signature,
+            "signer_did": signer_did,
+        })
+    }
+
+    fn signed_peer_attestation_exchange_receipt(payload: serde_json::Value) -> serde_json::Value {
+        let (sk, _) = elastos_identity::derive_did(&[46u8; 32]);
+        let canonical = serde_json::to_string(&payload).unwrap();
+        let (signature, signer_did) = crate::crypto::domain_separated_sign(
+            &sk,
+            CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_DOMAIN,
+            canonical.as_bytes(),
+        );
+        serde_json::json!({
+            "payload": payload,
+            "signature": signature,
+            "signer_did": signer_did,
+        })
+    }
+
+    fn carrier_peer_attestation_test_proof() -> CarrierReplicationProof {
+        CarrierReplicationProof {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 4,
+            reputation_reason: "local_runtime_successes:1;failures:0".to_string(),
+            ensure_status: "ok".to_string(),
+            admission: Some(serde_json::json!({
+                "accepted": true,
+                "quota": {"status": "within_quota"}
+            })),
+            status_availability: serde_json::json!({
+                "status": "local_pinned",
+                "replicas": 1,
+            }),
+            remote_receipt: Some(serde_json::json!({
+                "schema": "elastos.content.availability.receipt/v1",
+                "cid": "bafyattest",
+                "status": "network_available",
+                "signer_did": "did:key:zRemoteContentProvider",
+                "verified": true,
+            })),
+            transfer: Some(serde_json::json!({
+                "transport": "carrier-provider-plane",
+                "carrier": {
+                    "route": "connect_ticket",
+                    "connect_ticket": "ticket:internal-secret",
+                }
+            })),
+            checked_at: 1_700_000_001,
+        }
+    }
+
+    fn spawn_peer_attestation_exchange_endpoint(
+        response: serde_json::Value,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = response.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = std::io::Read::read(&mut stream, &mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if http_request_complete(&request) {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{addr}/peer-attestation/exchange"), handle)
+    }
+
+    fn http_request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + 4 + content_length
+    }
+
+    fn carrier_test_stream_payload(bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "elastos.provider.stream/v1",
+            "encoding": "base64-chunks",
+            "total_bytes": bytes.len(),
+            "completed": true,
+            "chunks": [{
+                "index": 0,
+                "offset": 0,
+                "length": bytes.len(),
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }],
+        })
+    }
+
+    fn carrier_test_object_file_bytes() -> Vec<u8> {
+        b"# Carrier Object\n".to_vec()
+    }
+
+    fn carrier_test_object_manifest_bytes() -> Vec<u8> {
+        let bytes = carrier_test_object_file_bytes();
+        let file_sha = format!("{:x}", Sha256::digest(&bytes));
+        let mut hasher = Sha256::new();
+        hasher.update(b"index.md");
+        hasher.update(b"\0");
+        hasher.update(file_sha.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        let manifest = serde_json::json!({
+            "schema": "elastos.content.object.manifest/v1",
+            "kind": "document",
+            "content_digest": format!("sha256:{:x}", hasher.finalize()),
+            "files": [{
+                "path": "index.md",
+                "sha256": file_sha,
+                "size": bytes.len()
+            }],
+            "links": [],
+            "object_did": "did:key:zObject",
+            "publisher_did": "did:key:zPublisher"
+        });
+        serde_json::to_vec(&manifest).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_dispatches_runtime_enveloped_request() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "fetch",
+            "transfer": "bytes",
+            "request": {
+                "op": "fetch",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "fetch",
+                    "capability": "provider:carrier-availability->content:fetch",
+                    "transport": "carrier-provider-plane",
+                    "carrier": {
+                        "route": "connect_ticket",
+                        "peer_did": "did:key:zRemote",
+                        "timeout_ms": 5000
+                    },
+                    "transfer": "bytes",
+                    "range": null,
+                    "progress": null
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["status"], "ok");
+        assert_eq!(response["result"]["data"]["op"], "fetch");
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert!(!response.to_string().contains("\"connect_ticket\":"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_accepts_stream_contract_metadata() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "fetch",
+            "transfer": "stream",
+            "request": {
+                "op": "fetch",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "fetch",
+                    "capability": "provider:carrier-availability->content:fetch",
+                    "transport": "carrier-provider-plane",
+                    "carrier": {
+                        "route": "connect_ticket",
+                        "peer_did": "did:key:zRemote",
+                        "timeout_ms": 5000
+                    },
+                    "transfer": "stream",
+                    "stream": {
+                        "schema": "elastos.provider.stream/v1",
+                        "encoding": "base64-chunks",
+                        "chunk_size": 65536
+                    },
+                    "range": null,
+                    "progress": null
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["stream"]["schema"],
+            "elastos.provider.stream/v1"
+        );
+        assert_eq!(
+            response["result"]["data"]["runtime_invocation"]["stream"]["encoding"],
+            "base64-chunks"
+        );
+        assert!(!response.to_string().contains("\"connect_ticket\":"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_rejects_stream_without_contract_metadata() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "fetch",
+            "transfer": "stream",
+            "request": {
+                "op": "fetch",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "fetch",
+                    "capability": "provider:carrier-availability->content:fetch",
+                    "transport": "carrier-provider-plane",
+                    "carrier": {
+                        "route": "connect_ticket"
+                    },
+                    "transfer": "stream"
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "invalid_provider_invocation");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("stream transfer requires stream metadata"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_rejects_raw_backend_target() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("ipfs", Arc::new(MockCarrierIpfsProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "content-provider",
+            "target": "ipfs",
+            "operation": "cat",
+            "transfer": "bytes",
+            "request": {
+                "op": "cat",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "content-provider",
+                    "target": "ipfs",
+                    "op": "cat",
+                    "capability": "provider:content-provider->ipfs:cat",
+                    "transport": "carrier-provider-plane",
+                    "carrier": {
+                        "route": "connect_ticket"
+                    },
+                    "transfer": "bytes"
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "unauthorized_provider_target");
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_fetch_uses_provider_invocation_transport() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+
+        let (bytes, remote_transfer) = fetch_content_via_carrier_provider_invocation(
+            &registry,
+            "ticket:internal-secret",
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "docs/readme.md",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, b"carrier provider bytes");
+        let remote_transfer = remote_transfer.expect("Carrier invocation must emit transfer");
+        assert_eq!(remote_transfer["transport"], "carrier-provider-plane");
+        assert_eq!(remote_transfer["source"], "carrier-availability");
+        assert_eq!(remote_transfer["target"], "content");
+        assert_eq!(remote_transfer["op"], "fetch");
+        assert_eq!(remote_transfer["transfer"], "stream");
+        assert_eq!(
+            remote_transfer["stream"]["schema"],
+            "elastos.provider.stream/v1"
+        );
+        assert!(!remote_transfer
+            .to_string()
+            .contains("ticket:internal-secret"));
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["ticket"], "ticket:internal-secret");
+        assert_eq!(requests[0]["target"], "content");
+        assert_eq!(requests[0]["request"]["local_only"], true);
+        assert_eq!(requests[0]["request"]["transfer"], "stream");
+        assert_eq!(requests[0]["request"]["path"], "docs/readme.md");
+        assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["transfer"],
+            "stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_proof_uses_remote_content_provider_invocation() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let proof = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher",
+                "accounting": {
+                    "schema": "elastos.content.accounting/v1",
+                    "content_bytes": 22
+                },
+                "requirements": {
+                    "max_storage_bytes_per_principal": 1024
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proof.node_did, "did:key:zRemote");
+        assert_eq!(proof.endpoint_id.as_deref(), Some("remote-endpoint"));
+        assert_eq!(proof.ensure_status, "local_pinned");
+        assert_eq!(proof.status_availability["status"], "local_pinned");
+        assert_eq!(proof.announced_at, 1_700_000_000);
+        assert_eq!(proof.admission.as_ref().unwrap()["accepted"], true);
+        assert_eq!(
+            proof.admission.as_ref().unwrap()["estimated_content_bytes"],
+            22
+        );
+        assert_eq!(proof.remote_receipt.as_ref().unwrap()["verified"], true);
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["status"],
+            "local_pinned"
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["policy"],
+            "carrier_exact_import"
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["quota"]["status"],
+            "within_quota"
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["quota"]["enforced"],
+            true
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["repair_worker"]["worker"],
+            "content-provider"
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["accounting"]["content_bytes"],
+            22
+        );
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["accounting"]["storage_quota_status"],
+            "observed_not_enforced"
+        );
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["target"], "content");
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(
+            requests[0]["request"]["availability_requirements"]["max_storage_bytes_per_principal"],
+            1024
+        );
+        assert_eq!(requests[0]["request"]["estimated_content_bytes"], 22);
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(
+            requests[1]["request"]["availability_policy"],
+            "carrier_replica"
+        );
+        assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[2]["op"], "status");
+        assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            reject_admission: false,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let proof = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proof.ensure_status, "local_pinned");
+        assert_eq!(proof.status_availability["status"], "local_pinned");
+        assert_eq!(proof.remote_receipt.as_ref().unwrap()["verified"], true);
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(requests[2]["op"], "import_exact");
+        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(
+            requests[2]["request"]["stream"]["schema"],
+            "elastos.provider.stream/v1"
+        );
+        assert_eq!(requests[3]["op"], "status");
+        assert!(!requests[2]["request"]
+            .to_string()
+            .contains("ticket:internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_refuses_object_exact_fallback_without_block_graph_provider() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            reject_admission: false,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let err = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "availability_requirements": {
+                    "repair_graph_kind": "ipld_dag"
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("local block-graph export failed for arbitrary DAG repair"));
+        assert!(err.to_string().contains("refused object/exact fallback"));
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_exact"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_object"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_uses_block_graph_provider_for_arbitrary_dag() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            reject_admission: false,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("block-graph", Arc::new(MockCarrierBlockGraphProvider))
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let proof = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher",
+                "availability_requirements": {
+                    "repair_graph_kind": "ipld_dag"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proof.ensure_status, "local_pinned");
+        assert_eq!(
+            proof.remote_receipt.as_ref().unwrap()["verified"],
+            serde_json::Value::Bool(true)
+        );
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(requests[2]["target"], CONTENT_BLOCK_GRAPH_TARGET);
+        assert_eq!(requests[2]["op"], "import_graph");
+        assert_eq!(
+            requests[2]["request"]["graph"]["schema"],
+            CONTENT_BLOCK_GRAPH_SCHEMA
+        );
+        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(
+            requests[2]["request"]["publisher_did"],
+            "did:key:zPublisher"
+        );
+        assert_eq!(requests[3]["target"], "content");
+        assert_eq!(requests[3]["op"], "ensure");
+        assert_eq!(
+            requests[3]["request"]["availability_policy"],
+            "carrier_block_graph_import"
+        );
+        assert_eq!(requests[4]["op"], "status");
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_exact"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_object"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_prefers_object_import_when_manifest_exists() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: true,
+            reject_admission: false,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierObjectContentProvider))
+            .await
+            .unwrap();
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let proof = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "object_did": "did:key:zIgnoredSourceObject",
+                "publisher_did": "did:key:zIgnoredSourcePublisher"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(proof.ensure_status, "local_pinned");
+        assert_eq!(proof.status_availability["status"], "local_pinned");
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(requests[2]["op"], "import_object");
+        assert_eq!(requests[2]["request"]["object_kind"], "document");
+        assert_eq!(requests[2]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(
+            requests[2]["request"]["publisher_did"],
+            "did:key:zPublisher"
+        );
+        assert_eq!(requests[2]["request"]["files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            requests[2]["request"]["files"][0]["path"],
+            serde_json::Value::String("index.md".to_string())
+        );
+        assert!(requests[2]["request"].get("stream").is_none());
+        assert_eq!(requests[3]["op"], "status");
+        assert!(!requests[2]["request"]
+            .to_string()
+            .contains("ticket:internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_stops_when_remote_admission_rejects() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: false,
+            reject_admission: true,
+            omit_admission_receipt: false,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let err = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "publisher_did": "did:key:zPublisher",
+                "estimated_content_bytes": 22,
+                "requirements": {
+                    "max_storage_bytes_per_principal": 1
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("remote content admission rejected"));
+        assert!(err.to_string().contains("mock remote quota exceeded"));
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[0]["request"]["estimated_content_bytes"], 22);
+        assert!(!requests.iter().any(|request| request["op"] == "ensure"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_exact"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_object"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_graph"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_replication_rejects_unsigned_remote_admission() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker {
+            requests: Mutex::new(Vec::new()),
+            fail_ensure: false,
+            reject_admission: false,
+            omit_admission_receipt: true,
+        });
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let replica = CarrierAvailabilityReplica {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            connect_ticket: "ticket:internal-secret".to_string(),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 0,
+            reputation_reason: "no_local_history".to_string(),
+        };
+
+        let err = ensure_content_via_carrier_provider_invocation(
+            &registry,
+            &replica,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            &serde_json::json!({
+                "publisher_did": "did:key:zPublisher",
+                "estimated_content_bytes": 22,
+                "requirements": {
+                    "max_storage_bytes_per_principal": 1024
+                }
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("remote content admission missing signed receipt"));
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["op"], "admission");
+        assert!(!requests.iter().any(|request| request["op"] == "ensure"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_exact"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_object"));
+        assert!(!requests
+            .iter()
+            .any(|request| request["op"] == "import_graph"));
+    }
+
+    #[test]
+    fn test_carrier_peer_selection_proof_redacts_connect_tickets() {
+        let proof = CarrierReplicationProof {
+            node_did: "did:key:zRemote".to_string(),
+            endpoint_id: Some("remote-endpoint".to_string()),
+            announced_at: 1_700_000_000,
+            score: 90,
+            selection_reason: "signed_announcement+endpoint_advertised+fresh".to_string(),
+            reputation_score: 4,
+            reputation_reason: "local_runtime_successes:1;failures:0".to_string(),
+            ensure_status: "local_pinned".to_string(),
+            admission: Some(serde_json::json!({
+                "schema": "elastos.content.admission/v1",
+                "accepted": true,
+                "status": "accepted",
+                "quota": {
+                    "status": "within_quota",
+                    "enforced": true
+                }
+            })),
+            status_availability: serde_json::json!({"status": "local_pinned"}),
+            remote_receipt: Some(serde_json::json!({
+                "schema": "elastos.content.availability.receipt/v1",
+                "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                "status": "local_pinned",
+                "replicas": 1,
+                "quota": {
+                    "status": "within_quota",
+                    "enforced": true
+                },
+                "accounting": {
+                    "observed": true,
+                    "content_bytes": 22,
+                    "storage_quota_status": "observed_not_enforced"
+                },
+                "signer_did": "did:key:zRemoteContentProvider",
+                "verified": true
+            })),
+            transfer: Some(serde_json::json!({
+                "transport": "carrier-provider-plane",
+                "carrier": {
+                    "route": "connect_ticket",
+                    "peer_did": "did:key:zRemote"
+                }
+            })),
+            checked_at: 1_700_000_001,
+        };
+
+        let peer_selection = carrier_peer_selection_json(
+            "elastos://carrier/content/test/availability",
+            "did:key:zLocal",
+            1,
+            &[proof],
+            true,
+            CarrierPeerAttestationExchangeView {
+                configured: false,
+                receipt: None,
+            },
+        );
+
+        assert_eq!(peer_selection["mode"], "carrier_provider_replication");
+        assert_eq!(peer_selection["live_multi_peer_proof"], true);
+        assert_eq!(
+            peer_selection["peer_reputation_policy"]["schema"],
+            CARRIER_PEER_REPUTATION_SCHEMA
+        );
+        assert_eq!(
+            peer_selection["peer_reputation_policy"]["status"],
+            "local_history_applied"
+        );
+        assert_eq!(
+            peer_selection["peer_reputation_policy"]["federation"]["configured"],
+            false
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["schema"],
+            CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["status"],
+            "live_peer_proof_without_attestation_exchange"
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["local_proof"]
+                ["verified_remote_content_receipts"],
+            1
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["attestation_exchange"]
+                ["configured"],
+            false
+        );
+        assert_eq!(peer_selection["replicas"].as_array().unwrap().len(), 2);
+        assert_eq!(peer_selection["replicas"][1]["score"], 90);
+        assert_eq!(
+            peer_selection["replicas"][1]["selection_reason"],
+            "signed_announcement+endpoint_advertised+fresh"
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["local_reputation"]["scope"],
+            "local_runtime"
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["local_reputation"]["score_delta"],
+            4
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["local_reputation"]["reason"],
+            "local_runtime_successes:1;failures:0"
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["remote_receipt"]["quota"]["status"],
+            "within_quota"
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["remote_receipt"]["accounting"]["content_bytes"],
+            22
+        );
+        assert_eq!(
+            peer_selection["replicas"][1]["remote_receipt"]["accounting"]["storage_quota_status"],
+            "observed_not_enforced"
+        );
+        assert_eq!(peer_selection["replicas"][1]["admission"]["accepted"], true);
+        assert_eq!(
+            peer_selection["replicas"][1]["admission"]["quota"]["status"],
+            "within_quota"
+        );
+        assert!(!peer_selection
+            .to_string()
+            .contains("ticket:internal-secret"));
+        assert!(!peer_selection
+            .to_string()
+            .contains("connect_ticket\": \"ticket"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_peer_attestation_exchange_posts_signed_request_and_verifies_receipt() {
+        let signed_receipt = signed_peer_attestation_exchange_receipt(serde_json::json!({
+            "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+            "exchange_id": "peer-attestation:test",
+            "receipt_id": "peer-attestation-receipt:123",
+            "accepted": true,
+        }));
+        let (url, handle) = spawn_peer_attestation_exchange_endpoint(serde_json::json!({
+            "accepted": true,
+            "status": "accepted",
+            "exchange_id": "peer-attestation:test",
+            "receipt_id": "peer-attestation-receipt:123",
+            "receipt": signed_receipt,
+        }));
+        let client = CarrierPeerAttestationExchangeClient::from_config(serde_json::json!({
+            "url": url,
+            "authorization": "Bearer peer-attestation-test",
+            "timeout_secs": 5,
+        }))
+        .unwrap();
+        let (signing_key, _) = elastos_identity::derive_did(&[47u8; 32]);
+        let proof = carrier_peer_attestation_test_proof();
+        let request = carrier_peer_attestation_exchange_request(
+            &signing_key,
+            "bafyattest",
+            "elastos://carrier/content/test/availability",
+            "did:key:zLocal",
+            std::slice::from_ref(&proof),
+            true,
+            1_700_000_002,
+        )
+        .unwrap();
+
+        let receipt = client.exchange(&request).await.unwrap();
+
+        assert_eq!(
+            receipt["schema"],
+            CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA
+        );
+        assert_eq!(receipt["status"], "accepted");
+        assert_eq!(receipt["accepted"], true);
+        assert_eq!(receipt["signed_receipt"]["verified"], true);
+        assert_eq!(
+            receipt["signed_receipt"]["payload_schema"],
+            CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA
+        );
+        assert_eq!(receipt["exchange"]["credential_exposed"], false);
+        let peer_selection = carrier_peer_selection_json(
+            "elastos://carrier/content/test/availability",
+            "did:key:zLocal",
+            1,
+            &[proof],
+            true,
+            CarrierPeerAttestationExchangeView {
+                configured: true,
+                receipt: Some(&receipt),
+            },
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["status"],
+            "attestation_exchange_accepted"
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["attestation_exchange"]
+                ["configured"],
+            true
+        );
+        assert_eq!(
+            peer_selection["peer_attestation_exchange_policy"]["attestation_exchange"]
+                ["signed_reputation_receipts"],
+            true
+        );
+
+        let request_text = handle.join().unwrap();
+        assert!(request_text.starts_with("POST /peer-attestation/exchange HTTP/1.1"));
+        assert!(request_text
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer peer-attestation-test")));
+        assert!(request_text.contains(CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA));
+        assert!(request_text.contains("\"signature\""));
+        assert!(request_text.contains("\"signer_did\""));
+        assert!(!request_text
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .contains("peer-attestation-test"));
+        assert!(!request_text.contains("ticket:internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_peer_attestation_exchange_accepts_endpoint_quorum() {
+        let signed_receipt_a = signed_peer_attestation_exchange_receipt(serde_json::json!({
+            "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+            "exchange_id": "peer-attestation:a",
+            "receipt_id": "peer-attestation-receipt:a",
+            "accepted": true,
+        }));
+        let (url_a, handle_a) = spawn_peer_attestation_exchange_endpoint(serde_json::json!({
+            "accepted": true,
+            "status": "accepted",
+            "exchange_id": "peer-attestation:a",
+            "receipt_id": "peer-attestation-receipt:a",
+            "receipt": signed_receipt_a,
+        }));
+        let signed_receipt_b = signed_peer_attestation_exchange_receipt(serde_json::json!({
+            "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+            "exchange_id": "peer-attestation:b",
+            "receipt_id": "peer-attestation-receipt:b",
+            "accepted": true,
+        }));
+        let (url_b, handle_b) = spawn_peer_attestation_exchange_endpoint(serde_json::json!({
+            "accepted": true,
+            "status": "accepted",
+            "exchange_id": "peer-attestation:b",
+            "receipt_id": "peer-attestation-receipt:b",
+            "receipt": signed_receipt_b,
+        }));
+        let client = CarrierPeerAttestationExchangeClient::from_config(serde_json::json!({
+            "quorum": 2,
+            "endpoints": [
+                {
+                    "id": "peer-attestation-a",
+                    "url": url_a,
+                    "authorization": "Bearer peer-attestation-secret-a",
+                    "timeout_secs": 5
+                },
+                {
+                    "id": "peer-attestation-b",
+                    "url": url_b,
+                    "authorization": "Bearer peer-attestation-secret-b",
+                    "timeout_secs": 5
+                }
+            ]
+        }))
+        .unwrap();
+        let (signing_key, _) = elastos_identity::derive_did(&[47u8; 32]);
+        let proof = carrier_peer_attestation_test_proof();
+        let request = carrier_peer_attestation_exchange_request(
+            &signing_key,
+            "bafyattest",
+            "elastos://carrier/content/test/availability",
+            "did:key:zLocal",
+            std::slice::from_ref(&proof),
+            true,
+            1_700_000_002,
+        )
+        .unwrap();
+
+        let receipt = client.exchange(&request).await.unwrap();
+
+        assert_eq!(receipt["status"], "accepted");
+        assert_eq!(receipt["accepted"], true);
+        assert_eq!(receipt["quorum"]["required"], 2);
+        assert_eq!(receipt["quorum"]["endpoint_count"], 2);
+        assert_eq!(receipt["quorum"]["accepted"], 2);
+        assert_eq!(receipt["signed_receipt"]["verified"], true);
+        assert_eq!(receipt["exchange"]["multi_endpoint"], true);
+        assert_eq!(receipt["exchange"]["endpoint_count"], 2);
+        assert!(!receipt.to_string().contains("peer-attestation-secret-a"));
+        assert!(!receipt.to_string().contains("peer-attestation-secret-b"));
+
+        let request_a = handle_a.join().unwrap();
+        let request_b = handle_b.join().unwrap();
+        assert!(request_a.lines().any(
+            |line| line.eq_ignore_ascii_case("authorization: Bearer peer-attestation-secret-a")
+        ));
+        assert!(request_b.lines().any(
+            |line| line.eq_ignore_ascii_case("authorization: Bearer peer-attestation-secret-b")
+        ));
+        assert!(!request_a
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .contains("peer-attestation-secret-a"));
+        assert!(!request_b
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .contains("peer-attestation-secret-b"));
+        assert!(!request_a.contains("ticket:internal-secret"));
+        assert!(!request_b.contains("ticket:internal-secret"));
+    }
+
+    #[tokio::test]
+    async fn test_carrier_peer_attestation_exchange_rejects_endpoint_quorum_failure() {
+        let signed_receipt = signed_peer_attestation_exchange_receipt(serde_json::json!({
+            "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_RECEIPT_SCHEMA,
+            "exchange_id": "peer-attestation:a",
+            "receipt_id": "peer-attestation-receipt:a",
+            "accepted": true,
+        }));
+        let (accepted_url, accepted_handle) =
+            spawn_peer_attestation_exchange_endpoint(serde_json::json!({
+                "accepted": true,
+                "status": "accepted",
+                "receipt": signed_receipt,
+            }));
+        let (rejected_url, rejected_handle) =
+            spawn_peer_attestation_exchange_endpoint(serde_json::json!({
+                "accepted": false,
+                "status": "rejected",
+                "reason": "reputation trust policy rejected peer",
+            }));
+        let client = CarrierPeerAttestationExchangeClient::from_config(serde_json::json!({
+            "quorum": 2,
+            "endpoints": [
+                {"id": "peer-attestation-a", "url": accepted_url, "timeout_secs": 5},
+                {"id": "peer-attestation-b", "url": rejected_url, "timeout_secs": 5}
+            ]
+        }))
+        .unwrap();
+        let (signing_key, _) = elastos_identity::derive_did(&[47u8; 32]);
+        let proof = carrier_peer_attestation_test_proof();
+        let request = carrier_peer_attestation_exchange_request(
+            &signing_key,
+            "bafyattest",
+            "elastos://carrier/content/test/availability",
+            "did:key:zLocal",
+            std::slice::from_ref(&proof),
+            true,
+            1_700_000_002,
+        )
+        .unwrap();
+
+        let receipt = client.exchange(&request).await.unwrap();
+
+        assert_eq!(receipt["status"], "rejected");
+        assert_eq!(receipt["accepted"], false);
+        assert_eq!(receipt["quorum"]["required"], 2);
+        assert_eq!(receipt["quorum"]["accepted"], 1);
+        assert_eq!(receipt["quorum"]["rejected"], 1);
+        assert_eq!(receipt["signed_receipt"]["verified"], true);
+        assert!(receipt["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reputation trust policy rejected peer"));
+
+        let accepted_request = accepted_handle.join().unwrap();
+        let rejected_request = rejected_handle.join().unwrap();
+        assert!(accepted_request.contains(CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA));
+        assert!(rejected_request.contains(CARRIER_PEER_ATTESTATION_EXCHANGE_REQUEST_SCHEMA));
+    }
+
+    #[test]
+    fn test_remote_content_receipt_peer_selection_summary_redacts_replica_rows() {
+        let summary = remote_content_receipt_peer_selection_summary(Some(&serde_json::json!({
+            "mode": "carrier_provider_replication",
+            "strategy": "signed_announcement_then_provider_invoke",
+            "live_multi_peer_proof": true,
+            "peer_reputation_policy": {
+                "schema": CARRIER_PEER_REPUTATION_SCHEMA,
+                "policy": "local_runtime_reputation",
+                "status": "local_history_applied",
+                "federation": {
+                    "configured": false,
+                    "cross_runtime_reputation": false
+                }
+            },
+            "peer_attestation_exchange_policy": {
+                "schema": CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA,
+                "policy": "no_cross_runtime_attestation_exchange",
+                "status": "live_peer_proof_without_attestation_exchange",
+                "attestation_exchange": {
+                    "configured": false,
+                    "signed_reputation_receipts": false
+                }
+            },
+            "replicas": [
+                {
+                    "role": "local",
+                    "node_did": "did:key:zLocal",
+                    "status": "local_pinned"
+                },
+                {
+                    "role": "remote",
+                    "node_did": "did:key:zRemote",
+                    "endpoint_id": "remote-endpoint",
+                    "score": 94,
+                    "selection_reason": "signed_announcement+endpoint_advertised+fresh+local_reputation_positive",
+                    "local_reputation": {
+                        "scope": "local_runtime",
+                        "score_delta": 4,
+                        "reason": "local_runtime_successes:1;failures:0"
+                    },
+                    "status": "local_pinned",
+                    "transfer": {
+                        "transport": "carrier-provider-plane",
+                        "carrier": {
+                            "route": "connect_ticket",
+                            "connect_ticket": "ticket:internal-secret"
+                        }
+                    },
+                    "remote_receipt": {
+                        "signer_did": "did:key:zRemoteContentProvider"
+                    }
+                }
+            ]
+        })));
+
+        assert_eq!(summary["mode"], "carrier_provider_replication");
+        assert_eq!(
+            summary["peer_reputation_policy"]["status"],
+            "local_history_applied"
+        );
+        assert_eq!(
+            summary["peer_reputation_policy"]["federation"]["configured"],
+            false
+        );
+        assert_eq!(
+            summary["peer_attestation_exchange_policy"]["schema"],
+            CARRIER_PEER_ATTESTATION_EXCHANGE_POLICY_SCHEMA
+        );
+        assert_eq!(
+            summary["peer_attestation_exchange_policy"]["attestation_exchange"]["configured"],
+            false
+        );
+        assert_eq!(summary["replica_count"], 2);
+        assert_eq!(summary["remote_replicas"], 1);
+        assert_eq!(summary["replica_summary_limit"], 5);
+        assert_eq!(summary["replicas_truncated"], false);
+        assert_eq!(summary["replicas"].as_array().unwrap().len(), 2);
+        assert_eq!(summary["replicas"][1]["node_did"], "did:key:zRemote");
+        assert_eq!(summary["replicas"][1]["score"], 94);
+        assert_eq!(
+            summary["replicas"][1]["local_reputation"]["scope"],
+            "local_runtime"
+        );
+        assert!(!summary.to_string().contains("ticket:internal-secret"));
+        assert!(!summary.to_string().contains("connect_ticket"));
+        assert!(!summary.to_string().contains("remote_receipt"));
+    }
+
+    #[test]
+    fn test_remote_content_receipt_peer_selection_summary_marks_truncated_rows() {
+        let replicas = (0..6)
+            .map(|index| {
+                serde_json::json!({
+                    "role": "remote",
+                    "node_did": format!("did:key:zRemote{index}"),
+                    "score": 80 + index,
+                    "transfer": {
+                        "carrier": {
+                            "route": "connect_ticket",
+                            "connect_ticket": format!("ticket:secret-{index}")
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary = remote_content_receipt_peer_selection_summary(Some(&serde_json::json!({
+            "mode": "carrier_provider_replication",
+            "live_multi_peer_proof": true,
+            "replicas": replicas
+        })));
+
+        assert_eq!(summary["replica_count"], 6);
+        assert_eq!(summary["remote_replicas"], 6);
+        assert_eq!(summary["replica_summary_limit"], 5);
+        assert_eq!(summary["replicas_truncated"], true);
+        assert_eq!(summary["replicas"].as_array().unwrap().len(), 5);
+        assert!(!summary.to_string().contains("ticket:secret"));
+        assert!(!summary.to_string().contains("connect_ticket"));
+    }
+
+    #[test]
+    fn test_carrier_quota_marks_impossible_replica_requirements() {
+        let requirements = CarrierAvailabilityRequirements {
+            min_replicas: 4,
+            max_replicas: Some(2),
+            require_live_multi_peer_proof: true,
+            repair_graph_kind: CarrierRepairGraphKind::Auto,
+        };
+
+        let quota = carrier_quota_json(requirements, 2, 2);
+
+        assert_eq!(quota["policy"], "carrier_provider_quota");
+        assert_eq!(quota["enforced"], true);
+        assert_eq!(quota["status"], "requirements_exceed_quota");
+        assert_eq!(quota["effective_max_replicas"], 2);
+        assert_eq!(quota["requirements_exceed_quota"], true);
+    }
+
+    #[test]
+    fn test_carrier_remote_candidate_limit_keeps_live_multi_peer_requirement() {
+        let requirements = CarrierAvailabilityRequirements {
+            min_replicas: 2,
+            max_replicas: None,
+            require_live_multi_peer_proof: true,
+            repair_graph_kind: CarrierRepairGraphKind::Auto,
+        };
+
+        assert_eq!(carrier_remote_candidate_limit(requirements, 2, 2), 1);
+
+        let quota_blocked = CarrierAvailabilityRequirements {
+            min_replicas: 2,
+            max_replicas: Some(2),
+            require_live_multi_peer_proof: true,
+            repair_graph_kind: CarrierRepairGraphKind::Auto,
+        };
+        assert_eq!(carrier_remote_candidate_limit(quota_blocked, 2, 2), 0);
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_ensure_proves_remote_replica_via_provider_plane() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (remote_message, remote_did) = signed_content_availability_message(
+            cid,
+            [22u8; 32],
+            "ticket:remote-secret",
+            "remote-endpoint",
+            1_700_000_000,
+        );
+        let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard.buffers.lock().await.insert(
+                topic_name,
+                TopicBuffer {
+                    messages: VecDeque::from([remote_message]),
+                    base_index: 0,
+                },
+            );
+        }
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider =
+            CarrierAvailabilityProvider::with_provider_registry(state, Arc::downgrade(&registry));
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 1
+                },
+                "requirements": {
+                    "min_replicas": 2,
+                    "max_replicas": 2,
+                    "require_live_multi_peer_proof": true
+                },
+                "object_did": "did:key:zObject",
+                "publisher_did": "did:key:zPublisher"
+            }))
+            .await
+            .unwrap();
+
+        let availability = &response["data"]["availability"];
+        assert_eq!(response["status"], "ok");
+        assert_eq!(availability["status"], "network_available");
+        assert_eq!(availability["replicas"], 2);
+        assert_eq!(
+            availability["peer_selection"]["mode"],
+            "carrier_provider_replication"
+        );
+        assert_eq!(
+            availability["peer_selection"]["live_multi_peer_proof"],
+            true
+        );
+        assert_eq!(availability["quota"]["policy"], "carrier_provider_quota");
+        assert_eq!(availability["quota"]["enforced"], true);
+        assert_eq!(availability["quota"]["status"], "at_quota");
+        assert_eq!(availability["quota"]["effective_max_replicas"], 2);
+        assert_eq!(availability["quota"]["requirements_exceed_quota"], false);
+        assert_eq!(availability["quota"]["used_replicas"], 2);
+        assert_eq!(
+            availability["abuse_controls"]["policy"],
+            "carrier_provider_invocation_guardrail"
+        );
+        assert_eq!(availability["abuse_controls"]["enforced"], true);
+        assert_eq!(availability["abuse_controls"]["candidate_count"], 1);
+        assert_eq!(availability["abuse_controls"]["attempt_limit"], 1);
+        assert_eq!(availability["abuse_controls"]["attempted_operations"], 1);
+        assert_eq!(availability["abuse_controls"]["failed_operations"], 0);
+        assert_eq!(availability["abuse_controls"]["throttled"], false);
+        assert_eq!(
+            availability["peer_selection"]["replicas"][1]["remote_receipt"]["abuse_controls"]
+                ["policy"],
+            "carrier_provider_invocation_guardrail"
+        );
+        assert_eq!(
+            availability["peer_selection"]["replicas"][1]["remote_receipt"]["abuse_controls"]
+                ["attempted_operations"],
+            1
+        );
+        assert_eq!(availability["repair_worker"]["status"], "healthy");
+        assert_eq!(
+            availability["repair_graph"]["schema"],
+            CONTENT_REPAIR_GRAPH_SCHEMA
+        );
+        assert_eq!(
+            availability["repair_graph"]["status"],
+            "bounded_import_supported"
+        );
+        assert_eq!(
+            availability["repair_graph"]["refuses_exact_fallback_for_arbitrary_dag"],
+            true
+        );
+        assert_eq!(
+            availability["peer_selection"]["replicas"][1]["remote_receipt"]["repair_graph"]
+                ["status"],
+            "bounded_import_supported"
+        );
+        assert_eq!(
+            availability["storage_market"]["mode"],
+            "carrier_provider_receipts"
+        );
+        assert_eq!(
+            availability["quota"]["federated_quota_ledger_policy"]["schema"],
+            CONTENT_FEDERATED_QUOTA_LEDGER_POLICY_SCHEMA
+        );
+        assert_eq!(
+            availability["quota"]["federated_quota_ledger_policy"]["remote"]["admission_preflight"],
+            true
+        );
+        assert_eq!(
+            availability["quota"]["federated_quota_ledger_policy"]["remote"]
+                ["signed_admission_receipts"],
+            true
+        );
+        assert_eq!(
+            availability["quota"]["federated_quota_ledger_policy"]["federation"]["configured"],
+            false
+        );
+        assert_eq!(
+            availability["quota"]["federated_quota_ledger_policy"]["federation"]
+                ["signed_admission_receipt_exchange"],
+            true
+        );
+        assert_eq!(
+            availability["peer_selection"]["replicas"][1]["admission"]["receipt"]["verified"],
+            true
+        );
+        assert_eq!(
+            availability["storage_market"]["settlement"],
+            "not_configured"
+        );
+        assert_eq!(availability["storage_market"]["escrow"], "not_configured");
+        assert_eq!(
+            availability["storage_market"]["status"],
+            "receipt_proven_no_market_settlement"
+        );
+        assert_eq!(
+            availability["storage_market"]["settlement_policy"]["schema"],
+            "elastos.content.storage-settlement-policy/v1"
+        );
+        assert_eq!(
+            availability["storage_market"]["settlement_policy"]["production_federation"]
+                ["configured"],
+            false
+        );
+        assert_eq!(
+            availability["storage_market"]["admission_policy"]["schema"],
+            CONTENT_STORAGE_MARKET_ADMISSION_POLICY_SCHEMA
+        );
+        assert_eq!(
+            availability["storage_market"]["admission_policy"]["status"],
+            "remote_admission_preflight_no_market_admission"
+        );
+        assert_eq!(
+            availability["storage_market"]["admission_policy"]["current_admission"]
+                ["remote_content_admission_preflight"],
+            true
+        );
+        assert_eq!(
+            availability["storage_market"]["admission_policy"]["current_admission"]
+                ["signed_admission_receipts"],
+            true
+        );
+        assert_eq!(
+            availability["storage_market"]["admission_policy"]["production_market"]["configured"],
+            false
+        );
+        assert!(availability
+            .to_string()
+            .contains(&format!("\"node_did\":\"{remote_did}\"")));
+        assert!(!availability.to_string().contains("ticket:remote-secret"));
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["ticket"], "ticket:remote-secret");
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[0]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
+        assert_eq!(requests[2]["op"], "status");
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_carrier_availability_requires_remote_attempt_for_live_proof_when_min_met() {
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let topic_name = content_availability_topic_name(cid);
+        let (remote_message, _remote_did) = signed_content_availability_message(
+            cid,
+            [23u8; 32],
+            "ticket:remote-secret",
+            "remote-endpoint",
+            1_700_000_000,
+        );
+        let (local_sk, local_did) = elastos_identity::derive_did(&[24u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        {
+            let mut guard = state.lock().await;
+            guard.joined_topics.insert(topic_name.clone());
+            guard.buffers.lock().await.insert(
+                topic_name,
+                TopicBuffer {
+                    messages: VecDeque::from([remote_message]),
+                    base_index: 0,
+                },
+            );
+        }
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let invoker = Arc::new(MockCarrierProviderPlaneInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+        let provider =
+            CarrierAvailabilityProvider::with_provider_registry(state, Arc::downgrade(&registry));
+        let response = provider
+            .send_raw(&serde_json::json!({
+                "op": "ensure",
+                "cid": cid,
+                "uri": format!("elastos://{cid}"),
+                "policy": "network_default",
+                "local": {
+                    "status": "local_pinned",
+                    "provider": "ipfs-provider",
+                    "replicas": 2
+                },
+                "requirements": {
+                    "min_replicas": 2,
+                    "require_live_multi_peer_proof": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        let availability = &response["data"]["availability"];
+        assert_eq!(availability["status"], "network_available");
+        assert_eq!(availability["replicas"], 3);
+        assert_eq!(
+            availability["peer_selection"]["live_multi_peer_proof"],
+            true
+        );
+        assert_eq!(availability["abuse_controls"]["attempt_limit"], 1);
+        assert_eq!(availability["abuse_controls"]["attempted_operations"], 1);
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["op"], "admission");
+        assert_eq!(requests[1]["op"], "ensure");
+        assert_eq!(requests[2]["op"], "status");
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_carrier_content_fetch_reads_from_internal_ipfs_provider() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("ipfs", Arc::new(MockCarrierIpfsProvider))
+            .await
+            .unwrap();
+
+        let bytes = carrier_content_fetch_bytes(
+            &registry,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "docs/readme.md",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, b"carrier content");
+        let err = carrier_content_fetch_bytes(
+            &registry,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "../secret",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid segment"));
     }
 
     #[test]

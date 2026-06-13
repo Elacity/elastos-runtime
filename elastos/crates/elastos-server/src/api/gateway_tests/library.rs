@@ -1,0 +1,5624 @@
+use super::*;
+
+fn provider_body(value: serde_json::Value) -> Body {
+    Body::from(serde_json::to_vec(&value).unwrap())
+}
+
+async fn post_library(
+    app: axum::Router,
+    token: &str,
+    op: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/provider/object/{op}"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(provider_body(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, payload)
+}
+
+async fn put_library_upload(
+    app: axum::Router,
+    token: &str,
+    uri: &str,
+    body: &'static [u8],
+) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, headers, payload)
+}
+
+async fn post_library_upload_start(
+    app: axum::Router,
+    token: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/upload/start")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(provider_body(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, payload)
+}
+
+async fn put_library_upload_chunk(
+    app: axum::Router,
+    token: &str,
+    upload_id: &str,
+    offset: u64,
+    body: &'static [u8],
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/provider/object/upload/{upload_id}/chunk"))
+                .header("x-elastos-home-token", token)
+                .header("x-elastos-upload-offset", offset.to_string())
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, payload)
+}
+
+async fn post_library_upload_finish(
+    app: axum::Router,
+    token: &str,
+    upload_id: &str,
+) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/provider/object/upload/{upload_id}/finish"))
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, headers, payload)
+}
+
+async fn get_library_download(
+    app: axum::Router,
+    token: &str,
+    uri: &str,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    get_library_download_with_range(app, token, uri, None).await
+}
+
+async fn get_library_download_with_range(
+    app: axum::Router,
+    token: &str,
+    uri: &str,
+    range: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+    let mut request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/provider/object/download/raw?uri={encoded_uri}"
+        ))
+        .header("x-elastos-home-token", token);
+    if let Some(range) = range {
+        request = request.header(axum::http::header::RANGE, range);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+async fn get_library_download_many(
+    app: axum::Router,
+    token: &str,
+    uris: &[String],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    get_library_download_many_with_archive(app, token, uris, None).await
+}
+
+async fn get_library_download_many_with_archive(
+    app: axum::Router,
+    token: &str,
+    uris: &[String],
+    archive: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut query_parts = uris
+        .iter()
+        .map(|uri| {
+            let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+            format!("uri={encoded_uri}")
+        })
+        .collect::<Vec<_>>();
+    if let Some(archive) = archive {
+        query_parts.push(format!("archive={archive}"));
+    }
+    let query = query_parts.join("&");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/provider/object/download/raw?{query}"))
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+fn transfer_receipt(headers: &HeaderMap) -> serde_json::Value {
+    serde_json::from_str(
+        headers
+            .get("x-elastos-transfer-receipt")
+            .and_then(|value| value.to_str().ok())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn zip_text_files(bytes: &[u8]) -> std::collections::BTreeMap<String, String> {
+    use std::io::Read as _;
+
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        files.insert(name, body);
+    }
+    files
+}
+
+#[tokio::test]
+async fn test_library_provider_requires_library_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/roots")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let documents_token = issue_home_launch_token(dir.path(), DOCUMENTS_CAPSULE_ID).unwrap();
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/roots")
+                .header("x-elastos-home-token", documents_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_library_download_route_requires_library_token_and_streams_download_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/raw-download.txt");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"raw download body"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/provider/object/download/raw?uri={encoded_uri}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let (rejected_status, _headers, _bytes) =
+        get_library_download(app.clone(), &documents_token, &uri).await;
+    assert_eq!(rejected_status, StatusCode::FORBIDDEN);
+
+    let (download_status, headers, bytes) = get_library_download(app.clone(), &token, &uri).await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(bytes, b"raw download body");
+    assert_eq!(
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"raw-download.txt\""),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes"),
+    );
+    assert!(headers
+        .get("x-elastos-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .starts_with("object:download:"));
+    let receipt = transfer_receipt(&headers);
+    assert_eq!(receipt["schema"], "elastos.object.transfer.receipt/v1");
+    assert_eq!(receipt["op"], "download");
+    assert_eq!(receipt["status"], "completed");
+    assert_eq!(receipt["bytes"], 17);
+    assert_eq!(receipt["total_bytes"], 17);
+    assert_eq!(receipt["transport"], "http-body-stream");
+    assert_eq!(
+        receipt["stream"]["schema"],
+        "elastos.object.download-stream/v1"
+    );
+    assert_eq!(receipt["stream"]["mode"], "response_body_chunks");
+    assert_eq!(receipt["stream"]["backpressure"], "http_body_poll");
+    assert_eq!(receipt["stream"]["cancel"], "drop_body");
+
+    let (range_status, range_headers, range_bytes) =
+        get_library_download_with_range(app, &token, &uri, Some("bytes=4-11")).await;
+    assert_eq!(range_status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(range_bytes, b"download");
+    assert_eq!(
+        range_headers
+            .get(axum::http::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 4-11/17"),
+    );
+    assert_eq!(
+        range_headers
+            .get(axum::http::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes"),
+    );
+    let range_receipt = transfer_receipt(&range_headers);
+    assert_eq!(
+        range_receipt["schema"],
+        "elastos.object.transfer.receipt/v1"
+    );
+    assert_eq!(range_receipt["op"], "download");
+    assert_eq!(range_receipt["status"], "completed");
+    assert_eq!(range_receipt["bytes"], 8);
+    assert_eq!(range_receipt["total_bytes"], 17);
+    assert_eq!(range_receipt["range"]["start"], 4);
+    assert_eq!(range_receipt["range"]["end"], 11);
+    assert_eq!(range_receipt["transport"], "http-body-stream");
+    assert_eq!(range_receipt["stream"]["mode"], "response_body_chunks");
+}
+
+#[tokio::test]
+async fn test_library_upload_route_requires_library_token_and_writes_raw_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/raw-upload.txt");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from("no token"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
+                .header("x-elastos-home-token", documents_token)
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::from("wrong app"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let (upload_status, upload_headers, upload) =
+        put_library_upload(app.clone(), &token, &uri, b"raw upload body").await;
+    assert_eq!(upload_status, StatusCode::OK);
+    assert_eq!(upload["status"], "ok");
+    assert_eq!(upload["data"]["transport"], "raw-body");
+    assert_eq!(upload["data"]["object"]["uri"], uri);
+    assert!(upload["data"]["object"]["content_cid"]
+        .as_str()
+        .unwrap()
+        .starts_with("bafkrei"));
+    assert_eq!(upload["data"]["object"].get("published_cid"), None);
+    assert_eq!(upload["data"]["object"]["published"], false);
+    assert!(upload["data"]["request_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("object:upload:"));
+    assert_eq!(
+        upload["data"]["receipt"]["schema"],
+        "elastos.object.transfer.receipt/v1"
+    );
+    assert_eq!(upload["data"].get("provider_receipt"), None);
+    assert_eq!(upload["data"]["receipt"]["op"], "upload");
+    assert_eq!(upload["data"]["receipt"]["status"], "completed");
+    assert_eq!(upload["data"]["receipt"]["bytes"], 15);
+    assert_eq!(upload["data"]["receipt"]["total_bytes"], 15);
+    assert_eq!(
+        upload_headers
+            .get("x-elastos-request-id")
+            .and_then(|value| value.to_str().ok()),
+        upload["data"]["request_id"].as_str()
+    );
+    assert_eq!(
+        transfer_receipt(&upload_headers)["schema"],
+        "elastos.object.transfer.receipt/v1"
+    );
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let data = read["data"]["data"].as_str().unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        b"raw upload body"
+    );
+}
+
+#[tokio::test]
+async fn test_library_chunked_upload_session_writes_object_and_emits_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/chunked-upload.txt");
+    let body = b"chunked upload body";
+
+    let (start_status, start) = post_library_upload_start(
+        app.clone(),
+        &token,
+        json!({
+            "uri": uri,
+            "mime": "text/plain",
+            "size_bytes": body.len(),
+        }),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::OK);
+    assert_eq!(start["status"], "ok");
+    assert_eq!(start["data"]["schema"], "elastos.object.upload-session/v1");
+    assert_eq!(start["data"]["transport"], "http-chunk-session");
+    assert_eq!(start["data"]["received_bytes"], 0);
+    assert!(start["data"]["chunk_size"].as_u64().unwrap() < 1024 * 1024);
+    let upload_id = start["data"]["upload_id"].as_str().unwrap();
+
+    let (first_status, first_chunk) =
+        put_library_upload_chunk(app.clone(), &token, upload_id, 0, b"chunked ").await;
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first_chunk["data"]["received_bytes"], 8);
+    assert_eq!(first_chunk["data"]["chunk_count"], 1);
+
+    let (second_status, second_chunk) =
+        put_library_upload_chunk(app.clone(), &token, upload_id, 8, b"upload body").await;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_chunk["data"]["received_bytes"], body.len());
+    assert_eq!(second_chunk["data"]["chunk_count"], 2);
+
+    let (finish_status, finish_headers, finish) =
+        post_library_upload_finish(app.clone(), &token, upload_id).await;
+    assert_eq!(finish_status, StatusCode::OK);
+    assert_eq!(finish["status"], "ok");
+    assert_eq!(finish["data"]["object"]["uri"], uri);
+    assert!(finish["data"]["object"]["content_cid"]
+        .as_str()
+        .unwrap()
+        .starts_with("bafkrei"));
+    assert_eq!(finish["data"]["object"].get("published_cid"), None);
+    assert_eq!(finish["data"]["object"]["published"], false);
+    assert_eq!(finish["data"]["transport"], "raw-body");
+    assert_eq!(finish["data"]["browser_transport"], "http-chunk-session");
+    assert_eq!(finish["data"]["upload_session"]["chunk_count"], 2);
+    assert_eq!(finish["data"]["receipt"]["op"], "upload");
+    assert_eq!(finish["data"]["receipt"]["transport"], "http-chunk-session");
+    assert_eq!(
+        finish["data"]["receipt"]["stream"]["backpressure"],
+        "client_waits_for_chunk_ack"
+    );
+    assert_eq!(
+        transfer_receipt(&finish_headers)["transport"],
+        "http-chunk-session"
+    );
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let data = read["data"]["data"].as_str().unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let library_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/from-library.md");
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &library_token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"# From Library"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let direct_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/read")
+                .header("x-elastos-home-token", documents_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "uri": uri,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_read.status(), StatusCode::FORBIDDEN);
+
+    let read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/documents/library-object?uri={encoded_uri}"
+                ))
+                .header("x-elastos-home-token", documents_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read_body = axum::body::to_bytes(read.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let read: serde_json::Value = serde_json::from_slice(&read_body).unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, b"# From Library");
+
+    let revision = read["data"]["object"]["revision"].as_str().unwrap();
+    let save = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/viewers/documents/library-object?uri={encoded_uri}"
+                ))
+                .header("x-elastos-home-token", documents_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "if_revision": revision,
+                        "data": base64::engine::general_purpose::STANDARD
+                            .encode(b"# Saved From Documents"),
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save.status(), StatusCode::OK);
+    let save_body = axum::body::to_bytes(save.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let save: serde_json::Value = serde_json::from_slice(&save_body).unwrap();
+    assert_eq!(save["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_library_provider_rejects_unknown_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), LIBRARY_CAPSULE_ID).unwrap();
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/raw_host_path")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_library_provider_object_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+
+    let (roots_status, roots) = post_library(app.clone(), &token, "roots", json!({})).await;
+    assert_eq!(roots_status, StatusCode::OK);
+    assert_eq!(roots["status"], "ok");
+    assert!(roots["data"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| root["id"] == "documents" && root["label"] == "Documents"));
+    assert!(roots["data"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| root["id"] == "desktop" && root["label"] == "Desktop"));
+    assert!(roots["data"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| {
+            root["id"] == "webspaces"
+                && root["label"] == "Spaces"
+                && root["uri"] == "localhost://WebSpaces"
+        }));
+    assert!(roots["data"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["id"] == "trash"
+                && entry["label"] == "Trash"
+                && entry["uri"] == format!("{root}/.Trash")
+                && entry["metadata"]["empty"] == true
+        }));
+
+    let (mkdir_status, mkdir) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    assert_eq!(mkdir["status"], "ok");
+    assert_eq!(mkdir["data"]["object"]["uri"], documents_uri);
+
+    let notes_uri = format!("{documents_uri}/notes.txt");
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": notes_uri,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"hello library"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(write["data"]["object"]["name"], "notes.txt");
+
+    let (list_status, list) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": documents_uri,
+        }),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["name"] == "notes.txt" && object["kind"] == "file"));
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": notes_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let data = read["data"]["data"].as_str().unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+        b"hello library"
+    );
+
+    let (rename_status, rename) = post_library(
+        app.clone(),
+        &token,
+        "rename",
+        json!({
+            "uri": notes_uri,
+            "name": "renamed.txt",
+        }),
+    )
+    .await;
+    assert_eq!(rename_status, StatusCode::OK);
+    let renamed_uri = rename["data"]["object"]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(renamed_uri.ends_with("/Documents/renamed.txt"));
+
+    let (trash_status, trash) = post_library(
+        app.clone(),
+        &token,
+        "trash",
+        json!({
+            "uri": renamed_uri,
+        }),
+    )
+    .await;
+    assert_eq!(trash_status, StatusCode::OK);
+    let trash_uri = trash["data"]["object"]["uri"].as_str().unwrap().to_string();
+    assert!(trash_uri.contains("/.Trash/"));
+    assert_eq!(
+        trash["data"]["object"]["metadata"]["trash"]["original_uri"],
+        renamed_uri
+    );
+
+    let (restore_status, restore) = post_library(
+        app.clone(),
+        &token,
+        "restore",
+        json!({
+            "uri": trash_uri,
+        }),
+    )
+    .await;
+    assert_eq!(restore_status, StatusCode::OK);
+    assert_eq!(restore["data"]["object"]["uri"], renamed_uri);
+
+    let (trash_again_status, trash_again) = post_library(
+        app.clone(),
+        &token,
+        "trash",
+        json!({
+            "uri": renamed_uri,
+        }),
+    )
+    .await;
+    assert_eq!(trash_again_status, StatusCode::OK);
+    let deleted_uri = trash_again["data"]["object"]["uri"].as_str().unwrap();
+    let (delete_status, deleted) = post_library(
+        app.clone(),
+        &token,
+        "delete_permanently",
+        json!({
+            "uri": deleted_uri,
+        }),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(deleted["data"]["deleted_uri"], deleted_uri);
+
+    let cleanup_uri = format!("{documents_uri}/cleanup.txt");
+    let (cleanup_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": cleanup_uri,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"cleanup"),
+        }),
+    )
+    .await;
+    assert_eq!(cleanup_status, StatusCode::OK);
+    let (trash_cleanup_status, _) = post_library(
+        app.clone(),
+        &token,
+        "trash",
+        json!({
+            "uri": cleanup_uri,
+        }),
+    )
+    .await;
+    assert_eq!(trash_cleanup_status, StatusCode::OK);
+    let (empty_status, empty) = post_library(app, &token, "empty_trash", json!({})).await;
+    assert_eq!(empty_status, StatusCode::OK);
+    assert_eq!(empty["data"]["deleted_count"], 1);
+}
+
+#[tokio::test]
+async fn test_library_provider_separates_public_placement_from_publish_visibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let public_uri = format!("{root}/Public");
+
+    let (mkdir_status, mkdir) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Public",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    assert_eq!(
+        mkdir["data"]["object"]["metadata"]["visibility"]["schema"],
+        "elastos.library.visibility/v1"
+    );
+    assert_eq!(
+        mkdir["data"]["object"]["metadata"]["visibility"]["placement"],
+        "public_folder"
+    );
+    assert_eq!(
+        mkdir["data"]["object"]["metadata"]["visibility"]["effective_access"],
+        "principal_private"
+    );
+
+    let file_uri = format!("{public_uri}/draft.txt");
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": file_uri,
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"public placement draft"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(
+        write["data"]["object"]["metadata"]["visibility"]["schema"],
+        "elastos.library.visibility/v1"
+    );
+    assert_eq!(
+        write["data"]["object"]["metadata"]["visibility"]["placement"],
+        "public_folder"
+    );
+    assert_eq!(
+        write["data"]["object"]["metadata"]["visibility"]["effective_access"],
+        "principal_private"
+    );
+    assert_eq!(
+        write["data"]["object"]["metadata"]["visibility"]["publish_required_for_public_link"],
+        true
+    );
+    assert_eq!(write["data"]["object"]["published"], false);
+    assert!(write["data"]["object"]["published_cid"].is_null());
+    assert!(write["data"]["object"]["metadata"]["visibility"]["published_cid"].is_null());
+
+    let (publish_status, publish) = post_library(
+        app,
+        &token,
+        "publish",
+        json!({
+            "uri": file_uri,
+            "if_revision": write["data"]["object"]["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(publish["data"]["cid"], TEST_CIDV1);
+    assert_eq!(publish["data"]["uri"], format!("elastos://{TEST_CIDV1}"));
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["visibility"]["placement"],
+        "public_folder"
+    );
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["visibility"]["effective_access"],
+        "public_content_link"
+    );
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["visibility"]["publish_required_for_public_link"],
+        false
+    );
+    assert_eq!(publish["data"]["object"]["published"], true);
+    assert_eq!(publish["data"]["object"]["published_cid"], TEST_CIDV1);
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["visibility"]["published_cid"],
+        TEST_CIDV1
+    );
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["visibility"]["published_link"],
+        format!("elastos://{TEST_CIDV1}")
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_downloads_directory_archive() {
+    use std::io::Read as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let nested_uri = format!("{documents_uri}/Nested");
+
+    let (mkdir_status, mkdir) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    assert!(mkdir["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "download"));
+
+    let (root_stat_status, root_stat) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": root,
+        }),
+    )
+    .await;
+    assert_eq!(root_stat_status, StatusCode::OK);
+    assert!(!root_stat["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "download"));
+
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (
+            format!("{documents_uri}/notes.txt"),
+            b"folder archive".as_slice(),
+        ),
+        (
+            format!("{nested_uri}/deep.txt"),
+            b"nested archive".as_slice(),
+        ),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+    }
+
+    let (download_status, download) = post_library(
+        app,
+        &token,
+        "download",
+        json!({
+            "uri": documents_uri,
+        }),
+    )
+    .await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(download["data"]["filename"], "Documents.tar.gz");
+    assert_eq!(download["data"]["object"]["mime"], "application/gzip");
+    let archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(download["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let decoder = flate2::read::GzDecoder::new(archive_bytes.as_slice());
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().unwrap().to_string_lossy().to_string();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        files.insert(path, body);
+    }
+    assert_eq!(
+        files.get("Documents/notes.txt").map(String::as_str),
+        Some("folder archive")
+    );
+    assert_eq!(
+        files.get("Documents/Nested/deep.txt").map(String::as_str),
+        Some("nested archive")
+    );
+}
+
+#[tokio::test]
+async fn test_library_download_route_archives_selected_objects() {
+    use std::io::Read as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let nested_uri = format!("{documents_uri}/Nested");
+    let alpha_uri = format!("{documents_uri}/alpha.txt");
+    let deep_uri = format!("{nested_uri}/deep.txt");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (alpha_uri.clone(), b"selected alpha".as_slice()),
+        (deep_uri, b"selected nested".as_slice()),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+    }
+
+    let selected = vec![alpha_uri, nested_uri];
+    let (download_status, headers, archive_bytes) =
+        get_library_download_many(app, &token, &selected).await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/gzip"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"Documents Selection.tar.gz\""),
+    );
+    let receipt = transfer_receipt(&headers);
+    assert_eq!(receipt["schema"], "elastos.object.transfer.receipt/v1");
+    assert_eq!(receipt["op"], "download");
+    assert_eq!(receipt["status"], "completed");
+    assert_eq!(receipt["uri"], "selection:2");
+
+    let decoder = flate2::read::GzDecoder::new(archive_bytes.as_slice());
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path().unwrap().to_string_lossy().to_string();
+        let mut body = String::new();
+        entry.read_to_string(&mut body).unwrap();
+        files.insert(path, body);
+    }
+    assert_eq!(
+        files.get("alpha.txt").map(String::as_str),
+        Some("selected alpha")
+    );
+    assert_eq!(
+        files.get("Nested/deep.txt").map(String::as_str),
+        Some("selected nested")
+    );
+}
+
+#[tokio::test]
+async fn test_library_download_route_archives_directory_as_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let nested_uri = format!("{documents_uri}/Nested");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (
+            format!("{documents_uri}/alpha.txt"),
+            b"zip alpha".as_slice(),
+        ),
+        (format!("{nested_uri}/deep.txt"), b"zip nested".as_slice()),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+    }
+
+    let (download_status, headers, archive_bytes) =
+        get_library_download_many_with_archive(app, &token, &[documents_uri], Some("zip")).await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"Documents.zip\""),
+    );
+    let files = zip_text_files(&archive_bytes);
+    assert_eq!(
+        files.get("Documents/alpha.txt").map(String::as_str),
+        Some("zip alpha")
+    );
+    assert_eq!(
+        files.get("Documents/Nested/deep.txt").map(String::as_str),
+        Some("zip nested")
+    );
+}
+
+#[tokio::test]
+async fn test_library_download_route_archives_selected_objects_as_zip() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let nested_uri = format!("{documents_uri}/Nested");
+    let alpha_uri = format!("{documents_uri}/alpha.txt");
+    let deep_uri = format!("{nested_uri}/deep.txt");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (alpha_uri.clone(), b"selected zip alpha".as_slice()),
+        (deep_uri, b"selected zip nested".as_slice()),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+    }
+
+    let selected = vec![alpha_uri, nested_uri];
+    let (download_status, headers, archive_bytes) =
+        get_library_download_many_with_archive(app, &token, &selected, Some("zip")).await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip"),
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"Documents Selection.zip\""),
+    );
+    let receipt = transfer_receipt(&headers);
+    assert_eq!(receipt["schema"], "elastos.object.transfer.receipt/v1");
+    assert_eq!(receipt["op"], "download");
+    assert_eq!(receipt["status"], "completed");
+    assert_eq!(receipt["uri"], "selection:2");
+
+    let files = zip_text_files(&archive_bytes);
+    assert_eq!(
+        files.get("alpha.txt").map(String::as_str),
+        Some("selected zip alpha")
+    );
+    assert_eq!(
+        files.get("Nested/deep.txt").map(String::as_str),
+        Some("selected zip nested")
+    );
+}
+
+#[tokio::test]
+async fn test_library_download_route_rejects_unknown_archive_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let (download_status, _headers, body) =
+        get_library_download_many_with_archive(app, &token, &[documents_uri], Some("rar")).await;
+    assert_eq!(download_status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("unsupported Library archive format: rar"));
+}
+
+#[tokio::test]
+async fn test_library_provider_marks_generic_archive_families_policy_gated() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let archive_token = app_token_for_authority(dir.path(), "archive-manager", &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/Bundle.7z");
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+    write_test_static_capsule(
+        dir.path(),
+        "archive-manager",
+        "viewer",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
+    );
+    write_test_static_capsule(
+        dir.path(),
+        "documents",
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents</title>",
+    );
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"not a real 7z archive"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (stat_status, stat) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(stat_status, StatusCode::OK);
+    let object = &stat["data"]["object"];
+    assert_eq!(
+        object["metadata"]["archive_support"]["schema"],
+        "elastos.library.archive-support/v1"
+    );
+    assert_eq!(object["metadata"]["archive_support"]["family"], "7z");
+    assert_eq!(
+        object["metadata"]["archive_support"]["status"],
+        "policy_gated_unsupported_archive_family"
+    );
+    assert!(!object["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "extract_archive"));
+    assert_eq!(object["viewer"], "archive-manager");
+    assert_eq!(object["viewers"][0]["id"], "archive-manager");
+
+    let direct_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/read")
+                .header("x-elastos-home-token", archive_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "uri": uri,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_read.status(), StatusCode::FORBIDDEN);
+
+    let viewer_stat = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_uri}&stat_only=true"
+                ))
+                .header("x-elastos-home-token", archive_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_stat.status(), StatusCode::OK);
+    let viewer_body = axum::body::to_bytes(viewer_stat.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let viewer_stat: serde_json::Value = serde_json::from_slice(&viewer_body).unwrap();
+    assert_eq!(
+        viewer_stat["data"]["object"]["metadata"]["archive_support"]["status"],
+        "policy_gated_unsupported_archive_family"
+    );
+    assert!(viewer_stat["data"].get("data").is_none());
+
+    let viewer_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_uri}"
+                ))
+                .header(
+                    "x-elastos-home-token",
+                    app_token_for_authority(dir.path(), "archive-manager", &authority),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_read.status(), StatusCode::FORBIDDEN);
+
+    let (extract_status, extract) = post_library(
+        app.clone(),
+        &token,
+        "extract_archive",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    assert_eq!(extract["status"], "error");
+    assert!(extract["message"]
+        .as_str()
+        .unwrap()
+        .contains("only supports .tar, .tar.gz, .tgz, and .zip"));
+
+    let (entries_status, entries) = post_library(
+        app,
+        &token,
+        "archive_entries",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(entries_status, StatusCode::OK);
+    assert_eq!(entries["status"], "error");
+    assert!(entries["message"]
+        .as_str()
+        .unwrap()
+        .contains("archive listing only supports .tar, .tar.gz, .tgz, and .zip"));
+}
+
+#[tokio::test]
+async fn test_library_provider_compresses_folder_to_zip_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let projects_uri = format!("{documents_uri}/Projects");
+    let nested_uri = format!("{projects_uri}/Nested");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (projects_status, projects) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Projects",
+        }),
+    )
+    .await;
+    assert_eq!(projects_status, StatusCode::OK);
+    assert!(projects["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "compress_archive"));
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": projects_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (format!("{projects_uri}/alpha.txt"), b"zip alpha".as_slice()),
+        (format!("{nested_uri}/deep.txt"), b"zip nested".as_slice()),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+        assert!(write["data"]["object"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "compress_archive"));
+    }
+
+    let (compress_status, compressed) = post_library(
+        app.clone(),
+        &token,
+        "compress_archive",
+        json!({
+            "uri": projects_uri,
+        }),
+    )
+    .await;
+    assert_eq!(compress_status, StatusCode::OK);
+    assert_eq!(compressed["status"], "ok");
+    assert_eq!(
+        compressed["data"]["object"]["uri"],
+        format!("{documents_uri}/Projects.zip")
+    );
+    assert_eq!(compressed["data"]["object"]["mime"], "application/zip");
+    assert!(compressed["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "extract_archive"));
+
+    let (compress_again_status, compressed_again) = post_library(
+        app.clone(),
+        &token,
+        "compress_archive",
+        json!({
+            "uri": projects_uri,
+        }),
+    )
+    .await;
+    assert_eq!(compress_again_status, StatusCode::OK);
+    let second_zip_uri = compressed_again["data"]["object"]["uri"].as_str().unwrap();
+    assert_ne!(second_zip_uri, format!("{documents_uri}/Projects.zip"));
+    assert!(second_zip_uri.starts_with(&format!("{documents_uri}/Projects (")));
+    assert!(second_zip_uri.ends_with(").zip"));
+
+    let zip_uri = compressed["data"]["object"]["uri"].as_str().unwrap();
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let files = zip_text_files(&archive_bytes);
+    assert_eq!(
+        files.get("Projects/alpha.txt").map(String::as_str),
+        Some("zip alpha")
+    );
+    assert_eq!(
+        files.get("Projects/Nested/deep.txt").map(String::as_str),
+        Some("zip nested")
+    );
+
+    let (events_status, events) = post_library(
+        app,
+        &token,
+        "events",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(events_status, StatusCode::OK);
+    assert!(events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["op"] == "compress_archive"));
+}
+
+#[tokio::test]
+async fn test_library_provider_stores_incompressible_zip_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let video_uri = format!("{documents_uri}/Screen Recording.mp4");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let video_bytes = vec![0x5a; 2048];
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": video_uri,
+            "mime": "video/mp4",
+            "data": base64::engine::general_purpose::STANDARD.encode(&video_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let (compress_status, compressed) = post_library(
+        app.clone(),
+        &token,
+        "compress_archive",
+        json!({
+            "uri": video_uri,
+        }),
+    )
+    .await;
+    assert_eq!(compress_status, StatusCode::OK);
+    let zip_uri = compressed["data"]["object"]["uri"].as_str().unwrap();
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive_bytes)).unwrap();
+    let mut entry = archive.by_name("Screen Recording.mp4").unwrap();
+    assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+    let mut roundtrip = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut roundtrip).unwrap();
+    assert_eq!(roundtrip, video_bytes);
+}
+
+#[tokio::test]
+async fn test_library_provider_compresses_selected_objects_to_zip_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let nested_uri = format!("{documents_uri}/Nested");
+    let alpha_uri = format!("{documents_uri}/alpha.txt");
+    let deep_uri = format!("{nested_uri}/deep.txt");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    for (uri, bytes) in [
+        (alpha_uri.clone(), b"selected zip alpha".as_slice()),
+        (deep_uri, b"selected zip nested".as_slice()),
+    ] {
+        let (write_status, write) = post_library(
+            app.clone(),
+            &token,
+            "write",
+            json!({
+                "uri": uri,
+                "mime": "text/plain",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::OK);
+        assert_eq!(write["status"], "ok");
+    }
+
+    let (compress_status, compressed) = post_library(
+        app.clone(),
+        &token,
+        "compress_archive",
+        json!({
+            "uris": [alpha_uri, nested_uri],
+        }),
+    )
+    .await;
+    assert_eq!(compress_status, StatusCode::OK);
+    assert_eq!(compressed["status"], "ok");
+    assert_eq!(
+        compressed["data"]["object"]["uri"],
+        format!("{documents_uri}/Documents Selection.zip")
+    );
+    assert_eq!(compressed["data"]["object"]["mime"], "application/zip");
+
+    let zip_uri = compressed["data"]["object"]["uri"].as_str().unwrap();
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let archive_bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let files = zip_text_files(&archive_bytes);
+    assert_eq!(
+        files.get("alpha.txt").map(String::as_str),
+        Some("selected zip alpha")
+    );
+    assert_eq!(
+        files.get("Nested/deep.txt").map(String::as_str),
+        Some("selected zip nested")
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_extracts_tar_gz_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let archive_uri = format!("{documents_uri}/Bundle.tar.gz");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    let mut alpha = b"extracted alpha".as_slice();
+    let mut alpha_header = tar::Header::new_gnu();
+    alpha_header.set_size(alpha.len() as u64);
+    alpha_header.set_mode(0o644);
+    alpha_header.set_cksum();
+    builder
+        .append_data(&mut alpha_header, "alpha.txt", &mut alpha)
+        .unwrap();
+    let mut deep = b"extracted nested".as_slice();
+    let mut deep_header = tar::Header::new_gnu();
+    deep_header.set_size(deep.len() as u64);
+    deep_header.set_mode(0o644);
+    deep_header.set_cksum();
+    builder
+        .append_data(&mut deep_header, "Nested/deep.txt", &mut deep)
+        .unwrap();
+    let archive_bytes = builder.into_inner().unwrap().finish().unwrap();
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": archive_uri,
+            "mime": "application/gzip",
+            "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["data"]["object"]["mime"], "application/gzip");
+    assert!(write["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "extract_archive"));
+
+    let (extract_status, extract) = post_library(
+        app.clone(),
+        &token,
+        "extract_archive",
+        json!({
+            "uri": archive_uri,
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    let extracted_uri = extract["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(extracted_uri, format!("{documents_uri}/Bundle"));
+
+    for (path, expected) in [
+        ("alpha.txt", "extracted alpha"),
+        ("Nested/deep.txt", "extracted nested"),
+    ] {
+        let (read_status, read) = post_library(
+            app.clone(),
+            &token,
+            "read",
+            json!({
+                "uri": format!("{extracted_uri}/{path}"),
+            }),
+        )
+        .await;
+        assert_eq!(read_status, StatusCode::OK);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        let body = String::from_utf8(bytes).unwrap();
+        assert_eq!(body, expected);
+    }
+}
+
+#[tokio::test]
+async fn test_library_provider_extracts_plain_tar_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let archive_uri = format!("{documents_uri}/Bundle.tar");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut alpha = b"plain tar alpha".as_slice();
+    let mut alpha_header = tar::Header::new_gnu();
+    alpha_header.set_size(alpha.len() as u64);
+    alpha_header.set_mode(0o644);
+    alpha_header.set_cksum();
+    builder
+        .append_data(&mut alpha_header, "alpha.txt", &mut alpha)
+        .unwrap();
+    let archive_bytes = builder.into_inner().unwrap();
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": archive_uri,
+            "mime": "application/x-tar",
+            "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["data"]["object"]["mime"], "application/x-tar");
+    assert!(write["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "extract_archive"));
+
+    let (extract_status, extract) = post_library(
+        app.clone(),
+        &token,
+        "extract_archive",
+        json!({
+            "uri": archive_uri,
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    let extracted_uri = extract["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(extracted_uri, format!("{documents_uri}/Bundle"));
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": format!("{extracted_uri}/alpha.txt"),
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let body = String::from_utf8(bytes).unwrap();
+    assert_eq!(body, "plain tar alpha");
+}
+
+#[tokio::test]
+async fn test_library_gateway_lists_webspaces_through_runtime_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let (root_status, root) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": "localhost://WebSpaces",
+        }),
+    )
+    .await;
+    assert_eq!(root_status, StatusCode::OK);
+    assert_eq!(root["status"], "ok");
+    assert_eq!(root["data"]["uri"], "localhost://WebSpaces");
+    let root_objects = root["data"]["objects"].as_array().unwrap();
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    assert!(root_objects.iter().any(|object| {
+        object["uri"] == localhost_root
+            && object["name"] == "Localhost"
+            && object["kind"] == "directory"
+            && object["availability"] == "local-principal"
+            && object["metadata"]["schema"] == "elastos.library.space-pointer/v1"
+            && object["metadata"]["space"] == "localhost"
+            && object["metadata"]["target_uri"] == localhost_root
+            && object["metadata"]["provider"] == "object-provider"
+            && object["metadata"]["authority"] == "signed-principal-root"
+            && object["metadata"]["writable"] == true
+            && object["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "list")
+    }));
+    assert!(root_objects.iter().any(|object| {
+        object["uri"] == "localhost://WebSpaces/Elastos"
+            && object["kind"] == "directory"
+            && object["availability"] == "resolver-owned"
+            && object["metadata"]["schema"] == "elastos.library.webspace-object/v1"
+            && object["metadata"]["mount"] == "Elastos"
+            && object["metadata"]["resolver"] == "builtin"
+            && object["metadata"]["cache_policy"] == "metadata-only"
+            && object["metadata"]["sync_policy"] == "manual"
+            && object["metadata"]["object_id"] == "object:webspace:elastos"
+            && object["metadata"]["head_id"] == "head:webspace:elastos"
+            && object["metadata"]["cache_state"] == "metadata_cached"
+            && object["metadata"]["sync_state"] == "manual_idle"
+            && object["metadata"]["webspace_kind"] == "dynamic-webspace"
+            && object["metadata"]["readonly"] == true
+            && object["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == "list")
+    }));
+    let cloud = root_objects
+        .iter()
+        .find(|object| object["uri"] == "localhost://WebSpaces/Cloud")
+        .expect("indexed Cloud WebSpace mount should be listed");
+    assert_eq!(cloud["kind"], "directory");
+    assert_eq!(cloud["metadata"]["target_uri"], "cloud://drive");
+    assert_eq!(cloud["metadata"]["resolver"], "cloud-drive");
+    assert_eq!(cloud["metadata"]["cache_policy"], "metadata-and-thumbnails");
+    assert_eq!(cloud["metadata"]["webspace_kind"], "mounted-webspace");
+
+    let (elastos_status, elastos) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": "localhost://WebSpaces/Elastos",
+        }),
+    )
+    .await;
+    assert_eq!(elastos_status, StatusCode::OK);
+    assert_eq!(elastos["status"], "ok");
+    let names: Vec<&str> = elastos["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|object| object["name"].as_str())
+        .collect();
+    for expected in ["_meta.json", "content", "peer", "did", "ai"] {
+        assert!(
+            names.contains(&expected),
+            "missing WebSpace child {expected}"
+        );
+    }
+    let content = elastos["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["name"] == "content")
+        .expect("content WebSpace child should be listed");
+    assert_eq!(content["metadata"]["target_uri"], "elastos://<cid>");
+    assert_eq!(content["metadata"]["resolver"], "builtin");
+    assert_eq!(content["metadata"]["object_id"], "object:webspace:content");
+    assert_eq!(content["metadata"]["head_id"], "head:webspace:content");
+    assert_eq!(content["metadata"]["cache_state"], "metadata_cached");
+    assert_eq!(content["metadata"]["sync_state"], "manual_idle");
+    assert_eq!(content["metadata"]["webspace_kind"], "folder-handle");
+
+    let (cloud_status, cloud_list) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": "localhost://WebSpaces/Cloud",
+        }),
+    )
+    .await;
+    assert_eq!(cloud_status, StatusCode::OK);
+    let cloud_names: Vec<&str> = cloud_list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|object| object["name"].as_str())
+        .collect();
+    for expected in ["_meta.json", "Drive", "Shared"] {
+        assert!(
+            cloud_names.contains(&expected),
+            "missing indexed Cloud child {expected}"
+        );
+    }
+
+    let (project_status, project) = post_library(
+        app,
+        &token,
+        "list",
+        json!({
+            "uri": "localhost://WebSpaces/Cloud/Drive/Project X",
+        }),
+    )
+    .await;
+    assert_eq!(project_status, StatusCode::OK);
+    let file = project["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["name"] == "file.pdf")
+        .expect("indexed Cloud file should be listed");
+    assert_eq!(
+        file["metadata"]["target_uri"],
+        "cloud://drive/Drive/Project X/file.pdf"
+    );
+    assert_eq!(file["metadata"]["resolver"], "cloud-drive");
+    assert_eq!(file["metadata"]["webspace_kind"], "indexed-file");
+    assert_eq!(file["availability"], "resolver-owned");
+}
+
+#[tokio::test]
+async fn test_library_provider_extracts_zip_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let zip_uri = format!("{documents_uri}/Bundle.zip");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let archive_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("alpha.txt", options).unwrap();
+        writer.write_all(b"zip alpha").unwrap();
+        writer.add_directory("Nested/", options).unwrap();
+        writer.start_file("Nested/deep.txt", options).unwrap();
+        writer.write_all(b"zip nested").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(write["data"]["object"]["mime"], "application/zip");
+    assert!(write["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "extract_archive"));
+
+    let (extract_status, extracted) = post_library(
+        app.clone(),
+        &token,
+        "extract_archive",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    assert_eq!(extracted["status"], "ok");
+    let extracted_uri = extracted["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(extracted_uri, format!("{documents_uri}/Bundle"));
+
+    for (path, expected) in [
+        ("alpha.txt", "zip alpha"),
+        ("Nested/deep.txt", "zip nested"),
+    ] {
+        let (read_status, read) = post_library(
+            app.clone(),
+            &token,
+            "read",
+            json!({
+                "uri": format!("{extracted_uri}/{path}"),
+            }),
+        )
+        .await;
+        assert_eq!(read_status, StatusCode::OK);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn test_library_provider_lists_supported_archive_entries_through_viewer_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let archive_token = app_token_for_authority(dir.path(), "archive-manager", &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let zip_uri = format!("{documents_uri}/Bundle.zip");
+    let tar_uri = format!("{documents_uri}/Bundle.tar");
+    let encoded_zip_uri = zip_uri.replace(':', "%3A").replace('/', "%2F");
+    write_test_static_capsule(
+        dir.path(),
+        "archive-manager",
+        "viewer",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
+    );
+    write_test_static_capsule(
+        dir.path(),
+        "documents",
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents</title>",
+    );
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let zip_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("alpha.txt", options).unwrap();
+        writer.write_all(b"zip alpha").unwrap();
+        writer.add_directory("Nested/", options).unwrap();
+        writer.start_file("Nested/deep.txt", options).unwrap();
+        writer.write_all(b"zip nested").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+    let (zip_write_status, zip_write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(zip_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(zip_write_status, StatusCode::OK);
+    assert_eq!(zip_write["data"]["object"]["viewer"], "archive-manager");
+
+    let (entries_status, entries) = post_library(
+        app.clone(),
+        &token,
+        "archive_entries",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(entries_status, StatusCode::OK);
+    assert_eq!(entries["status"], "ok");
+    assert_eq!(
+        entries["data"]["schema"],
+        "elastos.library.archive-entries/v1"
+    );
+    assert_eq!(entries["data"]["family"], "zip");
+    assert_eq!(entries["data"]["limits"]["truncated"], false);
+    let entry_rows = entries["data"]["entries"].as_array().unwrap();
+    assert!(entry_rows.iter().any(|entry| {
+        entry["path"] == "alpha.txt"
+            && entry["kind"] == "file"
+            && entry["safety"]["status"] == "safe"
+            && entry["size"] == 9
+            && entry["compressed_size"].as_u64().is_some()
+    }));
+    assert!(entry_rows
+        .iter()
+        .any(|entry| { entry["path"] == "Nested" && entry["kind"] == "directory" }));
+    assert!(entry_rows.iter().any(|entry| {
+        entry["path"] == "Nested/deep.txt" && entry["safety"]["status"] == "safe"
+    }));
+
+    let direct_entries = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/archive_entries")
+                .header("x-elastos-home-token", archive_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "uri": zip_uri,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_entries.status(), StatusCode::FORBIDDEN);
+
+    let direct_preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/archive_preview_entry")
+                .header("x-elastos-home-token", archive_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "uri": zip_uri,
+                        "entry": "Nested/deep.txt",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_preview.status(), StatusCode::FORBIDDEN);
+
+    let direct_roots = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/roots")
+                .header("x-elastos-home-token", archive_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_roots.status(), StatusCode::FORBIDDEN);
+
+    let viewer_entries = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}&entries=true"
+                ))
+                .header("x-elastos-home-token", archive_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_status = viewer_entries.status();
+    let viewer_body = axum::body::to_bytes(viewer_entries.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_body)
+    );
+    let viewer_entries: serde_json::Value = serde_json::from_slice(&viewer_body).unwrap();
+    assert_eq!(
+        viewer_entries["data"]["schema"],
+        "elastos.library.archive-entries/v1"
+    );
+    assert!(viewer_entries["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "Nested/deep.txt"));
+
+    let viewer_preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}&preview_entry=Nested%2Fdeep.txt"
+                ))
+                .header("x-elastos-home-token", archive_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_preview_status = viewer_preview.status();
+    let viewer_preview_body = axum::body::to_bytes(viewer_preview.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_preview_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_preview_body)
+    );
+    let viewer_preview: serde_json::Value = serde_json::from_slice(&viewer_preview_body).unwrap();
+    assert_eq!(
+        viewer_preview["data"]["schema"],
+        "elastos.library.archive-preview-entry/v1"
+    );
+    assert_eq!(viewer_preview["data"]["entry"]["path"], "Nested/deep.txt");
+    assert_eq!(viewer_preview["data"]["entry"]["mime"], "text/plain");
+    assert_eq!(
+        viewer_preview["data"]["entry"]["viewers"][0]["id"],
+        "documents"
+    );
+    assert_eq!(viewer_preview["data"]["preview"]["text"], "zip nested");
+    assert_eq!(viewer_preview["data"]["preview"]["truncated"], false);
+
+    let viewer_roots = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/viewers/archive-manager/library-roots")
+                .header("x-elastos-home-token", archive_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_roots_status = viewer_roots.status();
+    let viewer_roots_body = axum::body::to_bytes(viewer_roots.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_roots_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_roots_body)
+    );
+    let viewer_roots: serde_json::Value = serde_json::from_slice(&viewer_roots_body).unwrap();
+    assert!(viewer_roots["data"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| root["label"] == "Documents" && root["uri"] == documents_uri));
+
+    let tar_bytes = {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut alpha = b"tar alpha".as_slice();
+        let mut alpha_header = tar::Header::new_gnu();
+        alpha_header.set_size(alpha.len() as u64);
+        alpha_header.set_mode(0o644);
+        alpha_header.set_mtime(1_780_000_000);
+        alpha_header.set_cksum();
+        builder
+            .append_data(&mut alpha_header, "alpha.txt", &mut alpha)
+            .unwrap();
+        builder.into_inner().unwrap()
+    };
+    let (tar_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": tar_uri,
+            "mime": "application/x-tar",
+            "data": base64::engine::general_purpose::STANDARD.encode(tar_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(tar_write_status, StatusCode::OK);
+    let (tar_entries_status, tar_entries) = post_library(
+        app,
+        &token,
+        "archive_entries",
+        json!({
+            "uri": tar_uri,
+        }),
+    )
+    .await;
+    assert_eq!(tar_entries_status, StatusCode::OK);
+    assert_eq!(tar_entries["data"]["family"], "tar");
+    assert!(tar_entries["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["path"] == "alpha.txt"
+                && entry["size"] == 9
+                && entry["modified_at"] == 1_780_000_000u64
+                && entry["safety"]["status"] == "safe"
+        }));
+}
+
+#[tokio::test]
+async fn test_library_provider_lists_unsafe_archive_entries_as_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let zip_uri = format!("{documents_uri}/Unsafe.zip");
+    let tar_uri = format!("{documents_uri}/Unsafe.tar");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let zip_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("../escape.txt", options).unwrap();
+        writer.write_all(b"escape").unwrap();
+        writer.start_file("/absolute.txt", options).unwrap();
+        writer.write_all(b"absolute").unwrap();
+        writer.start_file("safe.txt", options).unwrap();
+        writer.write_all(b"safe").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+    let (zip_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(zip_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(zip_write_status, StatusCode::OK);
+    let (zip_entries_status, zip_entries) = post_library(
+        app.clone(),
+        &token,
+        "archive_entries",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(zip_entries_status, StatusCode::OK);
+    assert_eq!(zip_entries["status"], "ok");
+    let zip_rows = zip_entries["data"]["entries"].as_array().unwrap();
+    assert!(zip_rows.iter().any(|entry| {
+        entry["path"] == "../escape.txt"
+            && entry["kind"] == "blocked"
+            && entry["safety"]["status"] == "blocked"
+            && entry["safety"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("relative and safe")
+    }));
+    assert!(zip_rows
+        .iter()
+        .any(|entry| entry["path"] == "safe.txt" && entry["safety"]["status"] == "safe"));
+    assert!(zip_rows.iter().any(|entry| {
+        entry["path"] == "/absolute.txt"
+            && entry["kind"] == "blocked"
+            && entry["safety"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("relative and safe")
+    }));
+
+    let tar_bytes = {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut alpha = b"tar safe".as_slice();
+        let mut alpha_header = tar::Header::new_gnu();
+        alpha_header.set_size(alpha.len() as u64);
+        alpha_header.set_mode(0o644);
+        alpha_header.set_cksum();
+        builder
+            .append_data(&mut alpha_header, "safe.txt", &mut alpha)
+            .unwrap();
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        link_header.set_cksum();
+        builder
+            .append_link(&mut link_header, "link.txt", "safe.txt")
+            .unwrap();
+        builder.into_inner().unwrap()
+    };
+    let (tar_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": tar_uri,
+            "mime": "application/x-tar",
+            "data": base64::engine::general_purpose::STANDARD.encode(tar_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(tar_write_status, StatusCode::OK);
+    let (tar_entries_status, tar_entries) = post_library(
+        app,
+        &token,
+        "archive_entries",
+        json!({
+            "uri": tar_uri,
+        }),
+    )
+    .await;
+    assert_eq!(tar_entries_status, StatusCode::OK);
+    let tar_rows = tar_entries["data"]["entries"].as_array().unwrap();
+    assert!(tar_rows
+        .iter()
+        .any(|entry| entry["path"] == "safe.txt" && entry["safety"]["status"] == "safe"));
+    assert!(tar_rows.iter().any(|entry| {
+        entry["path"] == "link.txt"
+            && entry["kind"] == "blocked"
+            && entry["safety"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("non-file")
+    }));
+}
+
+#[tokio::test]
+async fn test_library_provider_selectively_extracts_archive_entries_through_viewer_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let archive_token = app_token_for_authority(dir.path(), "archive-manager", &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+    let nested_imports_uri = format!("{imports_uri}/Nested");
+    let zip_uri = format!("{documents_uri}/Bundle.zip");
+    let encoded_zip_uri = zip_uri.replace(':', "%3A").replace('/', "%2F");
+    write_test_static_capsule(
+        dir.path(),
+        "archive-manager",
+        "viewer",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
+    );
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (imports_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Imports",
+        }),
+    )
+    .await;
+    assert_eq!(imports_status, StatusCode::OK);
+    let (nested_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": imports_uri,
+            "name": "Nested",
+        }),
+    )
+    .await;
+    assert_eq!(nested_status, StatusCode::OK);
+
+    let zip_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("alpha.txt", options).unwrap();
+        writer.write_all(b"zip alpha").unwrap();
+        writer.start_file("Nested/deep.txt", options).unwrap();
+        writer.write_all(b"zip nested").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+    let (zip_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(zip_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(zip_write_status, StatusCode::OK);
+    let (existing_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": format!("{nested_imports_uri}/deep.txt"),
+            "mime": "text/plain",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"existing"),
+        }),
+    )
+    .await;
+    assert_eq!(existing_status, StatusCode::OK);
+
+    let direct_extract = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/archive_extract_entries")
+                .header("x-elastos-home-token", archive_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "uri": zip_uri,
+                        "destination_uri": imports_uri,
+                        "entries": ["Nested/deep.txt"],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_extract.status(), StatusCode::FORBIDDEN);
+
+    let viewer_extract = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}"
+                ))
+                .header("x-elastos-home-token", archive_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "destination_uri": imports_uri,
+                        "entries": ["Nested/deep.txt"],
+                        "conflict_policy": "replace",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_status = viewer_extract.status();
+    let viewer_body = axum::body::to_bytes(viewer_extract.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_body)
+    );
+    let viewer_extract: serde_json::Value = serde_json::from_slice(&viewer_body).unwrap();
+    assert_eq!(viewer_extract["status"], "ok");
+    assert_eq!(
+        viewer_extract["data"]["schema"],
+        "elastos.library.archive-extract-entries/v1"
+    );
+    assert_eq!(viewer_extract["data"]["receipt"]["status"], "completed");
+    assert_eq!(
+        viewer_extract["data"]["receipt"]["progress"]["requested_entries"],
+        1
+    );
+    assert_eq!(
+        viewer_extract["data"]["receipt"]["progress"]["written_entries"],
+        1
+    );
+    assert_eq!(
+        viewer_extract["data"]["receipt"]["cancel"]["status"],
+        "not_requested"
+    );
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": format!("{nested_imports_uri}/deep.txt"),
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "zip nested");
+
+    let (cancel_status, cancel) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": zip_uri,
+            "destination_uri": imports_uri,
+            "entries": ["alpha.txt"],
+            "cancel": true,
+        }),
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::OK);
+    assert_eq!(cancel["status"], "ok");
+    assert_eq!(cancel["data"]["receipt"]["status"], "cancelled");
+    assert_eq!(
+        cancel["data"]["receipt"]["cancel"]["status"],
+        "cancelled_before_write"
+    );
+
+    let (list_status, list) = post_library(
+        app,
+        &token,
+        "list",
+        json!({
+            "uri": imports_uri,
+        }),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(!list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["name"] == "alpha.txt"));
+}
+
+#[tokio::test]
+async fn test_library_provider_selective_extract_blocks_unsafe_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+    let tar_uri = format!("{documents_uri}/Unsafe.tar");
+    let zip_uri = format!("{documents_uri}/Unsafe.zip");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (imports_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Imports",
+        }),
+    )
+    .await;
+    assert_eq!(imports_status, StatusCode::OK);
+
+    let tar_bytes = {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        link_header.set_cksum();
+        builder
+            .append_link(&mut link_header, "link.txt", "safe.txt")
+            .unwrap();
+        builder.into_inner().unwrap()
+    };
+    let (tar_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": tar_uri,
+            "mime": "application/x-tar",
+            "data": base64::engine::general_purpose::STANDARD.encode(tar_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(tar_write_status, StatusCode::OK);
+    let (extract_status, extract) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": tar_uri,
+            "destination_uri": imports_uri,
+            "entries": ["link.txt"],
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    assert_eq!(extract["status"], "ok");
+    assert_eq!(
+        extract["data"]["receipt"]["status"],
+        "completed_with_blocked_entries"
+    );
+    assert_eq!(extract["data"]["receipt"]["progress"]["blocked_entries"], 1);
+    assert!(extract["data"]["blocked"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("non-file"));
+
+    let zip_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("../escape.txt", options).unwrap();
+        writer.write_all(b"escape").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+    let (zip_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(zip_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(zip_write_status, StatusCode::OK);
+    let (unsafe_select_status, unsafe_select) = post_library(
+        app,
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": zip_uri,
+            "destination_uri": imports_uri,
+            "entries": ["../escape.txt"],
+        }),
+    )
+    .await;
+    assert_eq!(unsafe_select_status, StatusCode::OK);
+    assert_eq!(unsafe_select["status"], "error");
+    assert!(unsafe_select["message"]
+        .as_str()
+        .unwrap()
+        .contains("relative and safe"));
+}
+
+#[tokio::test]
+async fn test_library_provider_rejects_unsafe_zip_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let zip_uri = format!("{documents_uri}/Unsafe.zip");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let archive_bytes = {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("../escape.txt", options).unwrap();
+        writer.write_all(b"escape").unwrap();
+        writer.finish().unwrap().into_inner()
+    };
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": zip_uri,
+            "mime": "application/zip",
+            "data": base64::engine::general_purpose::STANDARD.encode(archive_bytes),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (extract_status, extracted) = post_library(
+        app,
+        &token,
+        "extract_archive",
+        json!({
+            "uri": zip_uri,
+        }),
+    )
+    .await;
+    assert_eq!(extract_status, StatusCode::OK);
+    assert_eq!(extracted["status"], "error");
+    assert!(extracted["message"]
+        .as_str()
+        .unwrap()
+        .contains("relative and safe"));
+}
+
+#[tokio::test]
+async fn test_library_gateway_reads_webspace_files_through_runtime_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let uri = format!("localhost://WebSpaces/Elastos/content/{TEST_CIDV1}");
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["status"], "ok");
+    assert_eq!(read["data"]["object"]["kind"], "file");
+    assert_eq!(
+        read["data"]["object"]["metadata"]["target_uri"],
+        format!("elastos://{TEST_CIDV1}")
+    );
+    assert_eq!(
+        read["data"]["object"]["metadata"]["provider"],
+        "content-provider"
+    );
+    assert_eq!(
+        read["data"]["object"]["metadata"]["webspace_kind"],
+        "file-endpoint"
+    );
+    assert_eq!(read["data"]["object"]["metadata"]["resolver"], "builtin");
+    assert_eq!(read["data"]["encoding"], "base64");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["target_uri"], format!("elastos://{TEST_CIDV1}"));
+
+    let (download_status, headers, download_bytes) = get_library_download(app, &token, &uri).await;
+    assert_eq!(download_status, StatusCode::OK);
+    assert_eq!(download_bytes, bytes);
+    assert_eq!(
+        headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+    );
+    let expected_disposition = format!("attachment; filename=\"{TEST_CIDV1}\"");
+    assert_eq!(
+        headers
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_disposition.as_str()),
+    );
+}
+
+#[tokio::test]
+async fn test_library_gateway_reads_external_webspace_file_through_adapter_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let uri = "localhost://WebSpaces/Cloud/Drive/Project X/file.pdf";
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["status"], "ok");
+    assert_eq!(read["data"]["object"]["kind"], "file");
+    assert_eq!(
+        read["data"]["object"]["metadata"]["resolver"],
+        "cloud-drive"
+    );
+    assert_eq!(
+        read["data"]["object"]["metadata"]["target_uri"],
+        "cloud://drive/Drive/Project X/file.pdf"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, b"cloud adapter bytes");
+}
+
+#[tokio::test]
+async fn test_library_gateway_operator_webspace_adapter_caches_bytes_and_viewer() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+
+    let uri = "localhost://WebSpaces/Operator/Projects/Brief.md";
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["status"], "ok");
+    let object = &read["data"]["object"];
+    assert_eq!(object["kind"], "file");
+    assert_eq!(object["mime"], "text/plain");
+    assert_eq!(object["viewer"], "documents");
+    assert_eq!(object["viewers"][0]["id"], "documents");
+    assert_eq!(object["metadata"]["resolver"], "operator-drive");
+    assert_eq!(
+        object["metadata"]["target_uri"],
+        "operator://drive/Projects/Brief.md"
+    );
+    assert_eq!(object["metadata"]["cache_state"], "content_cached");
+    assert_eq!(object["metadata"]["resolver_state"], "materialized-local");
+    assert_eq!(object["metadata"]["webspace_kind"], "materialized-file");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, b"# Operator Brief\n\nAdapter-backed bytes.\n");
+
+    let (stat_status, stat) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(stat_status, StatusCode::OK);
+    assert_eq!(stat["status"], "ok");
+    assert_eq!(
+        stat["data"]["object"]["metadata"]["cache_state"],
+        "content_cached"
+    );
+    assert_eq!(stat["data"]["object"]["viewer"], "documents");
+
+    let (second_read_status, second_read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(second_read_status, StatusCode::OK);
+    let second_bytes = base64::engine::general_purpose::STANDARD
+        .decode(second_read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(second_bytes, bytes);
+    assert_eq!(
+        second_read["data"]["object"]["metadata"]["cache_state"],
+        "content_cached"
+    );
+}
+
+#[tokio::test]
+async fn test_library_gateway_lists_external_webspace_archive_entries_without_resolver_leak() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let archive_token = app_token_for_authority(dir.path(), "archive-manager", &authority);
+    write_test_static_capsule(
+        dir.path(),
+        "archive-manager",
+        "viewer",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
+    );
+
+    let uri = "localhost://WebSpaces/Operator/Projects/Bundle.zip";
+    let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
+    let viewer_entries = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_uri}&entries=true"
+                ))
+                .header("x-elastos-home-token", archive_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_entries_status = viewer_entries.status();
+    let viewer_body = axum::body::to_bytes(viewer_entries.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_entries_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_body)
+    );
+    let viewer_entries: serde_json::Value = serde_json::from_slice(&viewer_body).unwrap();
+    assert_eq!(viewer_entries["status"], "ok");
+    assert_eq!(
+        viewer_entries["data"]["schema"],
+        "elastos.library.archive-entries/v1"
+    );
+    assert_eq!(viewer_entries["data"]["family"], "zip");
+    assert_eq!(
+        viewer_entries["data"]["object"]["metadata"]["resolver_target_redacted"],
+        true
+    );
+    assert_eq!(
+        viewer_entries["data"]["object"]["metadata"]["target_uri"],
+        serde_json::Value::Null
+    );
+    assert!(viewer_entries["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "Nested/deep.txt" && entry["safety"]["status"] == "safe"));
+    assert!(!serde_json::to_string(&viewer_entries)
+        .unwrap()
+        .contains("operator://"));
+
+    let viewer_preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_uri}&preview_entry=Nested%2Fdeep.txt"
+                ))
+                .header("x-elastos-home-token", archive_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_preview_status = viewer_preview.status();
+    let viewer_preview_body = axum::body::to_bytes(viewer_preview.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_preview_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_preview_body)
+    );
+    let viewer_preview: serde_json::Value = serde_json::from_slice(&viewer_preview_body).unwrap();
+    assert_eq!(
+        viewer_preview["data"]["schema"],
+        "elastos.library.archive-preview-entry/v1"
+    );
+    assert_eq!(viewer_preview["data"]["preview"]["text"], "zip nested");
+    assert!(!serde_json::to_string(&viewer_preview)
+        .unwrap()
+        .contains("operator://"));
+
+    let (provider_status, provider_entries) = post_library(
+        app,
+        &token,
+        "archive_entries",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(provider_status, StatusCode::OK);
+    assert_eq!(provider_entries["status"], "ok");
+    assert!(!serde_json::to_string(&provider_entries)
+        .unwrap()
+        .contains("operator://"));
+}
+
+#[tokio::test]
+async fn test_library_gateway_imports_external_webspace_archive_entries_to_local_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let archive_token = app_token_for_authority(dir.path(), "archive-manager", &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let imports_uri = format!("{documents_uri}/Imports");
+    let source_uri = "localhost://WebSpaces/Operator/Projects/Bundle.zip";
+    let encoded_source_uri = source_uri.replace(':', "%3A").replace('/', "%2F");
+    write_test_static_capsule(
+        dir.path(),
+        "archive-manager",
+        "viewer",
+        "Test Archive viewer",
+        "<!doctype html><title>Archive</title>",
+    );
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Documents",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    let (imports_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Imports",
+        }),
+    )
+    .await;
+    assert_eq!(imports_status, StatusCode::OK);
+
+    let viewer_extract = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/viewers/archive-manager/library-object?uri={encoded_source_uri}"
+                ))
+                .header("x-elastos-home-token", archive_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "destination_uri": imports_uri,
+                        "entries": ["Nested/deep.txt"],
+                        "conflict_policy": "replace",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_extract_status = viewer_extract.status();
+    let viewer_body = axum::body::to_bytes(viewer_extract.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        viewer_extract_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&viewer_body)
+    );
+    let viewer_extract: serde_json::Value = serde_json::from_slice(&viewer_body).unwrap();
+    assert_eq!(viewer_extract["status"], "ok");
+    assert_eq!(
+        viewer_extract["data"]["schema"],
+        "elastos.library.archive-extract-entries/v1"
+    );
+    assert_eq!(viewer_extract["data"]["receipt"]["status"], "completed");
+    assert_eq!(
+        viewer_extract["data"]["written"][0]["uri"],
+        format!("{imports_uri}/Nested/deep.txt")
+    );
+    assert!(!serde_json::to_string(&viewer_extract)
+        .unwrap()
+        .contains("operator://"));
+
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": format!("{imports_uri}/Nested/deep.txt"),
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "zip nested");
+}
+
+#[tokio::test]
+async fn test_library_gateway_webspace_archive_writeback_requires_mutable_write_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let source_uri = "localhost://WebSpaces/Operator/Projects/Bundle.zip";
+
+    let (readonly_status, readonly) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": source_uri,
+            "destination_uri": "localhost://WebSpaces/Operator/Projects",
+            "entries": ["alpha.txt"],
+            "conflict_policy": "replace",
+        }),
+    )
+    .await;
+    assert_eq!(readonly_status, StatusCode::OK);
+    assert_eq!(readonly["status"], "error");
+    assert!(
+        readonly["message"]
+            .as_str()
+            .unwrap()
+            .contains("mutable destination Space"),
+        "{readonly}"
+    );
+
+    let (writeback_status, writeback) = post_library(
+        app.clone(),
+        &token,
+        "archive_extract_entries",
+        json!({
+            "uri": source_uri,
+            "destination_uri": "localhost://WebSpaces/OperatorMutable/Folder",
+            "entries": ["alpha.txt"],
+            "conflict_policy": "replace",
+        }),
+    )
+    .await;
+    assert_eq!(writeback_status, StatusCode::OK);
+    assert_eq!(writeback["status"], "ok");
+    assert_eq!(writeback["data"]["receipt"]["status"], "completed");
+    assert_eq!(
+        writeback["data"]["written"][0]["webspace"]["write_back"],
+        "resolver_synced"
+    );
+    assert_eq!(
+        writeback["data"]["written"][0]["uri"],
+        "localhost://WebSpaces/OperatorMutable/Folder/alpha.txt"
+    );
+    assert!(!serde_json::to_string(&writeback)
+        .unwrap()
+        .contains("operator://"));
+
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": "localhost://WebSpaces/OperatorMutable/Folder/alpha.txt",
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "zip alpha");
+}
+
+#[tokio::test]
+async fn test_library_gateway_webspace_sync_caches_adapter_bytes_without_foreground_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+
+    let uri = "localhost://WebSpaces/Operator/Projects/Brief.md";
+    let expected = b"# Operator Brief\n\nAdapter-backed bytes.\n";
+    let (sync_status, sync) = post_library(
+        app.clone(),
+        &token,
+        "sync",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(sync_status, StatusCode::OK);
+    assert_eq!(sync["status"], "ok");
+    let receipt = &sync["data"]["receipt"];
+    assert_eq!(receipt["schema"], "elastos.webspace.byte-sync-receipt/v1");
+    assert_eq!(receipt["action"], "bytes_cached_from_adapter");
+    assert_eq!(receipt["foreground_read"], false);
+    assert_eq!(receipt["bytes_exposed"], false);
+    assert_eq!(receipt["content_synced"], true);
+    assert_eq!(receipt["bytes_cached"], expected.len());
+    assert_eq!(
+        receipt["availability_hint"]["schema"],
+        "elastos.webspace.availability-hint/v1"
+    );
+    assert_eq!(receipt["availability_hint"]["status"], "resolver_cached");
+    assert_eq!(
+        receipt["availability_hint"]["target_uri"],
+        "operator://drive/Projects/Brief.md"
+    );
+    assert_eq!(
+        receipt["availability_hint"]["not_content_availability"],
+        true
+    );
+    assert!(receipt.get("data").is_none());
+    assert_eq!(sync["data"]["object"]["availability"], "resolver-cached");
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["cache_state"],
+        "content_cached"
+    );
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["availability_hint"]["status"],
+        "resolver_cached"
+    );
+    assert_eq!(sync["data"]["object"]["viewer"], "documents");
+
+    let (stat_status, stat) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(stat_status, StatusCode::OK);
+    assert_eq!(
+        stat["data"]["object"]["metadata"]["cache_state"],
+        "content_cached"
+    );
+    assert_eq!(
+        stat["data"]["object"]["metadata"]["webspace_kind"],
+        "materialized-file"
+    );
+    assert_eq!(stat["data"]["object"]["availability"], "resolver-cached");
+    assert_eq!(
+        stat["data"]["object"]["metadata"]["availability_hint"]["scope"],
+        "resolver"
+    );
+
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, expected);
+    assert_eq!(
+        read["data"]["object"]["metadata"]["cache_state"],
+        "content_cached"
+    );
+    assert_eq!(read["data"]["object"]["availability"], "resolver-cached");
+}
+
+#[tokio::test]
+async fn test_library_gateway_syncs_operator_mutable_webspace_file_to_resolver() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let uri = "localhost://WebSpaces/OperatorMutable/Folder/note.txt";
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"operator mutable bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(
+        write["data"]["object"]["metadata"]["sync_state"],
+        "manual_pending"
+    );
+    assert_eq!(
+        write["data"]["object"]["metadata"]["target_uri"],
+        "operator://drive/Writable/Folder/note.txt"
+    );
+
+    let (sync_status, sync) = post_library(
+        app.clone(),
+        &token,
+        "sync",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(sync_status, StatusCode::OK);
+    assert_eq!(sync["status"], "ok");
+    let receipt = &sync["data"]["receipt"];
+    assert_eq!(
+        receipt["schema"],
+        "elastos.webspace.resolver-sync-receipt/v1"
+    );
+    assert_eq!(receipt["action"], "resolver_write_synced");
+    assert_eq!(receipt["resolver_synced"], true);
+    assert_eq!(receipt["content_synced"], true);
+    assert_eq!(receipt["fail_closed"], false);
+    assert_eq!(receipt["conflict"], false);
+    assert_eq!(receipt["bytes_exposed"], false);
+    assert_eq!(receipt["bytes_synced"], b"operator mutable bytes".len());
+    assert_eq!(receipt["provider"], "operator-drive-adapter");
+    assert_eq!(
+        receipt["availability_hint"]["schema"],
+        "elastos.webspace.availability-hint/v1"
+    );
+    assert_eq!(receipt["availability_hint"]["status"], "resolver_synced");
+    assert_eq!(
+        receipt["availability_hint"]["not_content_availability"],
+        true
+    );
+    assert_eq!(
+        receipt["target_uri"],
+        "operator://drive/Writable/Folder/note.txt"
+    );
+    assert_eq!(
+        receipt["adapter_receipt"]["schema"],
+        "elastos.webspace.adapter.write-bytes-receipt/v1"
+    );
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["sync_state"],
+        "manual_synced"
+    );
+    assert_eq!(sync["data"]["object"]["availability"], "resolver-synced");
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["availability_hint"]["status"],
+        "resolver_synced"
+    );
+
+    let (stat_status, stat) = post_library(
+        app,
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(stat_status, StatusCode::OK);
+    assert_eq!(
+        stat["data"]["object"]["metadata"]["sync_state"],
+        "manual_synced"
+    );
+    assert_eq!(stat["data"]["object"]["availability"], "resolver-synced");
+}
+
+#[tokio::test]
+async fn test_library_gateway_webspace_sync_fails_closed_without_write_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let uri = "localhost://WebSpaces/Mutable/Folder/no-adapter.txt";
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"local mutable bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(
+        write["data"]["object"]["metadata"]["sync_state"],
+        "manual_pending"
+    );
+
+    let (sync_status, sync) = post_library(
+        app,
+        &token,
+        "sync",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(sync_status, StatusCode::OK);
+    assert_eq!(sync["status"], "ok");
+    let receipt = &sync["data"]["receipt"];
+    assert_eq!(
+        receipt["schema"],
+        "elastos.webspace.resolver-sync-receipt/v1"
+    );
+    assert_eq!(receipt["action"], "resolver_write_unavailable");
+    assert_eq!(receipt["resolver_synced"], false);
+    assert_eq!(receipt["content_synced"], false);
+    assert_eq!(receipt["fail_closed"], true);
+    assert_eq!(receipt["conflict"], false);
+    assert_eq!(receipt["bytes_exposed"], false);
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["sync_state"],
+        "manual_pending"
+    );
+}
+
+#[tokio::test]
+async fn test_library_gateway_webspace_sync_reports_resolver_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let uri = "localhost://WebSpaces/OperatorMutable/Conflict/stale.txt";
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"stale fork bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (sync_status, sync) = post_library(
+        app,
+        &token,
+        "sync",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(sync_status, StatusCode::OK);
+    assert_eq!(sync["status"], "ok");
+    let receipt = &sync["data"]["receipt"];
+    assert_eq!(
+        receipt["schema"],
+        "elastos.webspace.resolver-sync-receipt/v1"
+    );
+    assert_eq!(receipt["action"], "resolver_write_conflict");
+    assert_eq!(receipt["resolver_synced"], false);
+    assert_eq!(receipt["content_synced"], false);
+    assert_eq!(receipt["fail_closed"], true);
+    assert_eq!(receipt["conflict"], true);
+    assert_eq!(receipt["provider"], "operator-drive-adapter");
+    assert_eq!(
+        receipt["adapter_response"]["data"]["schema"],
+        "elastos.webspace.adapter.write-conflict/v1"
+    );
+    assert_eq!(
+        sync["data"]["object"]["metadata"]["sync_state"],
+        "manual_pending"
+    );
+}
+
+#[tokio::test]
+async fn test_library_gateway_rejects_webspace_mutation_as_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let (write_status, write) = post_library(
+        app,
+        &token,
+        "write",
+        json!({
+            "uri": "localhost://WebSpaces/Elastos/not-allowed.txt",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"must fail"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "error");
+    assert!(write["message"]
+        .as_str()
+        .unwrap()
+        .contains("resolver-owned and read-only"));
+}
+
+#[tokio::test]
+async fn test_library_gateway_mutates_writable_webspace_through_runtime_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_webspace_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let (list_status, list) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": "localhost://WebSpaces/Mutable",
+        }),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list["status"], "ok");
+    assert_eq!(list["data"]["object"]["metadata"]["readonly"], false);
+    assert_eq!(
+        list["data"]["object"]["metadata"]["access_policy"],
+        "owner-writable"
+    );
+
+    let (mkdir_status, mkdir) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": "localhost://WebSpaces/Mutable",
+            "name": "Folder",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    assert_eq!(mkdir["status"], "ok");
+    assert_eq!(
+        mkdir["data"]["receipt"]["schema"],
+        "elastos.webspace.mkdir-receipt/v1"
+    );
+    assert_eq!(mkdir["data"]["object"]["metadata"]["readonly"], false);
+
+    let note_uri = "localhost://WebSpaces/Mutable/Folder/note.txt";
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": note_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"mutable bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+    assert_eq!(
+        write["data"]["receipt"]["schema"],
+        "elastos.webspace.write-receipt/v1"
+    );
+    assert_eq!(
+        write["data"]["object"]["metadata"]["webspace_kind"],
+        "materialized-file"
+    );
+    assert_eq!(write["data"]["object"]["metadata"]["readonly"], false);
+    assert!(write["data"]["object"]["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "delete_permanently"));
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": note_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["status"], "ok");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(bytes, b"mutable bytes");
+
+    let upload_uri = "localhost://WebSpaces/Mutable/Folder/upload.txt";
+    let (upload_status, _upload_headers, upload) =
+        put_library_upload(app.clone(), &token, upload_uri, b"uploaded bytes").await;
+    assert_eq!(upload_status, StatusCode::OK);
+    assert_eq!(upload["status"], "ok");
+    assert_eq!(
+        upload["data"]["receipt"]["schema"],
+        "elastos.object.transfer.receipt/v1"
+    );
+    assert_eq!(
+        upload["data"]["provider_receipt"]["schema"],
+        "elastos.webspace.write-receipt/v1"
+    );
+    assert_eq!(
+        upload["data"]["object"]["metadata"]["webspace_kind"],
+        "materialized-file"
+    );
+
+    let (delete_status, deleted) = post_library(
+        app,
+        &token,
+        "delete_permanently",
+        json!({
+            "uri": note_uri,
+        }),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(deleted["status"], "ok");
+    assert_eq!(
+        deleted["data"]["receipt"]["schema"],
+        "elastos.webspace.delete-receipt/v1"
+    );
+    assert_eq!(deleted["data"]["deleted_uri"], note_uri);
+}
+
+#[tokio::test]
+async fn test_library_provider_move_is_principal_scoped_and_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let target_uri = format!("{documents_uri}/Moved");
+    let source_uri = format!("{documents_uri}/move-me.txt");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Moved",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": source_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"moved bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let revision = write["data"]["object"]["revision"].as_str().unwrap();
+
+    let (move_status, moved) = post_library(
+        app.clone(),
+        &token,
+        "move",
+        json!({
+            "uri": source_uri,
+            "target_parent_uri": target_uri,
+            "if_revision": revision,
+        }),
+    )
+    .await;
+    assert_eq!(move_status, StatusCode::OK);
+    let moved_uri = moved["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(moved_uri, format!("{target_uri}/move-me.txt"));
+
+    let (read_status, read) = post_library(
+        app.clone(),
+        &token,
+        "read",
+        json!({
+            "uri": moved_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(read["data"]["data"].as_str().unwrap())
+            .unwrap(),
+        b"moved bytes"
+    );
+
+    let (events_status, events) = post_library(
+        app,
+        &token,
+        "events",
+        json!({
+            "uri": target_uri,
+        }),
+    )
+    .await;
+    assert_eq!(events_status, StatusCode::OK);
+    assert!(events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["op"] == "move" && event["details"]["old_uri"] == source_uri));
+}
+
+#[tokio::test]
+async fn test_library_provider_copy_preserves_source_and_audits() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let target_uri = format!("{documents_uri}/Copied");
+    let source_uri = format!("{documents_uri}/copy-me.txt");
+
+    let (mkdir_status, _) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": documents_uri,
+            "name": "Copied",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": source_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"copied bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let revision = write["data"]["object"]["revision"].as_str().unwrap();
+
+    let (copy_status, copied) = post_library(
+        app.clone(),
+        &token,
+        "copy",
+        json!({
+            "uri": source_uri,
+            "target_parent_uri": target_uri,
+            "if_revision": revision,
+        }),
+    )
+    .await;
+    assert_eq!(copy_status, StatusCode::OK);
+    let copied_uri = copied["data"]["object"]["uri"].as_str().unwrap();
+    assert_eq!(copied_uri, format!("{target_uri}/copy-me.txt"));
+
+    for uri in [&source_uri, copied_uri] {
+        let (read_status, read) = post_library(
+            app.clone(),
+            &token,
+            "read",
+            json!({
+                "uri": uri,
+            }),
+        )
+        .await;
+        assert_eq!(read_status, StatusCode::OK);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(read["data"]["data"].as_str().unwrap())
+                .unwrap(),
+            b"copied bytes"
+        );
+    }
+
+    let (events_status, events) = post_library(
+        app,
+        &token,
+        "events",
+        json!({
+            "uri": target_uri,
+        }),
+    )
+    .await;
+    assert_eq!(events_status, StatusCode::OK);
+    assert!(events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["op"] == "copy" && event["details"]["source_uri"] == source_uri));
+}
+
+#[tokio::test]
+async fn test_library_provider_events_returns_typed_object_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let notes_uri = format!("{root}/Documents/events.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": notes_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"evented"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (mkdir_status, mkdir) = post_library(
+        app.clone(),
+        &token,
+        "mkdir",
+        json!({
+            "parent_uri": root,
+            "name": "Event Folder",
+        }),
+    )
+    .await;
+    assert_eq!(mkdir_status, StatusCode::OK);
+    assert_eq!(mkdir["status"], "ok");
+
+    let (events_status, events) = post_library(app.clone(), &token, "events", json!({})).await;
+    assert_eq!(events_status, StatusCode::OK);
+    assert_eq!(events["status"], "ok");
+    assert_eq!(events["data"]["schema"], "elastos.library.events/v1");
+    let events = events["data"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| {
+        event["schema"] == "elastos.library.event/v1"
+            && event["event_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("library:event:")
+    }));
+    assert_eq!(events[0]["op"], "write");
+    assert_eq!(events[0]["uri"], notes_uri);
+    assert_eq!(events[0]["details"]["object"]["name"], "events.txt");
+    assert_eq!(events[1]["op"], "mkdir");
+
+    let (filtered_status, filtered) = post_library(
+        app.clone(),
+        &token,
+        "events",
+        json!({
+            "uri": notes_uri,
+        }),
+    )
+    .await;
+    assert_eq!(filtered_status, StatusCode::OK);
+    let filtered_events = filtered["data"]["events"].as_array().unwrap();
+    assert_eq!(filtered_events.len(), 1);
+    assert_eq!(filtered_events[0]["op"], "write");
+
+    let (limited_status, limited) = post_library(
+        app,
+        &token,
+        "events",
+        json!({
+            "limit": 1,
+        }),
+    )
+    .await;
+    assert_eq!(limited_status, StatusCode::OK);
+    let limited_events = limited["data"]["events"].as_array().unwrap();
+    assert_eq!(limited_events.len(), 1);
+    assert_eq!(limited_events[0]["op"], "mkdir");
+}
+
+#[tokio::test]
+async fn test_library_provider_events_stream_requires_library_token_and_serves_sse() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/provider/object/events/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/provider/object/events/stream?home_token={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    assert!(
+        authorized
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "Library event stream should be served as SSE"
+    );
+    assert_eq!(
+        authorized
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache, no-transform"),
+        "Library SSE must not be cached or transformed by proxies"
+    );
+    assert_eq!(
+        authorized
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|value| value.to_str().ok()),
+        Some("no"),
+        "nginx must not buffer realtime Library events"
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_viewers_only_include_installed_viewer_capsules() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/view-me.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"viewer routing"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (without_viewer_status, without_viewer) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(without_viewer_status, StatusCode::OK);
+    assert!(without_viewer["data"]["object"]["viewer"].is_null());
+    assert!(without_viewer["data"]["object"]["viewers"].is_null());
+
+    write_test_static_capsule(
+        dir.path(),
+        DOCUMENTS_CAPSULE_ID,
+        "viewer",
+        "Test Documents viewer",
+        "<!doctype html><title>Documents Viewer</title>",
+    );
+
+    let (with_viewer_status, with_viewer) = post_library(
+        app.clone(),
+        &token,
+        "stat",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(with_viewer_status, StatusCode::OK);
+    assert_eq!(
+        with_viewer["data"]["object"]["viewer"],
+        DOCUMENTS_CAPSULE_ID
+    );
+    assert_eq!(
+        with_viewer["data"]["object"]["viewers"][0]["id"],
+        DOCUMENTS_CAPSULE_ID
+    );
+    assert_eq!(
+        with_viewer["data"]["object"]["viewers"][0]["label"],
+        "Documents"
+    );
+
+    let rom_uri = format!("{root}/Documents/game.gba");
+    let (rom_write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": rom_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"rom bytes"),
+        }),
+    )
+    .await;
+    assert_eq!(rom_write_status, StatusCode::OK);
+
+    write_test_static_capsule(
+        dir.path(),
+        GBA_EMULATOR_CAPSULE_ID,
+        "viewer",
+        "Test GBA emulator",
+        "<!doctype html><title>GBA Emulator</title>",
+    );
+
+    let (rom_viewer_status, rom_viewer) = post_library(
+        app,
+        &token,
+        "stat",
+        json!({
+            "uri": rom_uri,
+        }),
+    )
+    .await;
+    assert_eq!(rom_viewer_status, StatusCode::OK);
+    assert_eq!(
+        rom_viewer["data"]["object"]["viewer"],
+        GBA_EMULATOR_CAPSULE_ID
+    );
+    assert_eq!(
+        rom_viewer["data"]["object"]["viewers"][0]["label"],
+        "GBA Emulator"
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_rejects_traversal_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": format!("{root}/Documents/../Secrets.txt"),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert!(payload["message"].as_str().unwrap().contains("traversal"));
+}
+
+#[tokio::test]
+async fn test_library_provider_scopes_to_launch_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let admin = passkey_authority_with_name(dir.path(), Some("admin"));
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let admin_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &admin);
+    let guest_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &guest);
+    let admin_root = crate::auth::principal_localhost_root(&admin.principal_id);
+    let guest_root = crate::auth::principal_localhost_root(&guest.principal_id);
+    let admin_uri = format!("{admin_root}/Documents/private.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &admin_token,
+        "write",
+        json!({
+            "uri": admin_uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"admin only"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (guest_status, guest_read) = post_library(
+        app,
+        &guest_token,
+        "read",
+        json!({
+            "uri": admin_uri,
+        }),
+    )
+    .await;
+    assert_eq!(guest_status, StatusCode::OK);
+    assert_eq!(guest_read["status"], "error");
+    assert!(guest_read["message"]
+        .as_str()
+        .unwrap()
+        .contains("outside the active principal root"));
+    assert_ne!(admin_root, guest_root);
+}
+
+#[tokio::test]
+async fn test_library_provider_audits_provider_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+
+    let (status, payload) = post_library(app, &token, "roots", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let library_events: Vec<_> = auth_state
+        .audit
+        .iter()
+        .filter(|event| event.event_type.starts_with("object.provider."))
+        .collect();
+    assert_eq!(library_events.len(), 2);
+    assert_eq!(library_events[0].event_type, "object.provider.requested");
+    assert_eq!(library_events[0].result, "requested");
+    assert_eq!(library_events[1].event_type, "object.provider.completed");
+    assert_eq!(library_events[1].result, "completed");
+    assert_eq!(
+        library_events[0].challenge_id,
+        library_events[1].challenge_id
+    );
+    assert_eq!(
+        library_events[0].capsule_id.as_deref(),
+        Some(LIBRARY_CAPSULE_ID)
+    );
+    assert!(library_events[0].reason.contains("roots"));
+}
+
+#[tokio::test]
+async fn test_library_provider_writes_protected_principal_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protected.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"encrypted object"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let raw_path = rooted_localhost_fs_path(dir.path(), &uri).unwrap();
+    let raw = std::fs::read_to_string(raw_path).unwrap();
+    assert!(!raw.contains("encrypted object"));
+    assert!(raw.contains("elastos.principal-root.object/v1"));
+
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, b"encrypted object");
+}
+
+#[tokio::test]
+async fn test_library_provider_auto_protects_plaintext_legacy_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let documents_uri = format!("{root}/Documents");
+    let secret_uri = format!("{documents_uri}/secret.md");
+    let secret_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &secret_uri).unwrap();
+    std::fs::create_dir_all(secret_path.parent().unwrap()).unwrap();
+    std::fs::write(&secret_path, b"plaintext from an older runtime").unwrap();
+
+    let (list_status, list) = post_library(
+        app.clone(),
+        &token,
+        "list",
+        json!({
+            "uri": documents_uri,
+        }),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list["status"], "ok");
+    let object = list["data"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["uri"] == secret_uri)
+        .expect("legacy object should still appear in folder listing");
+    assert!(object["blocked_reason"].is_null());
+    assert_eq!(object["availability"], "local-only");
+    assert!(object["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability == "read"));
+    assert_ne!(
+        std::fs::read(&secret_path).unwrap(),
+        b"plaintext from an older runtime",
+        "listing should migrate protected-root plaintext to encrypted storage",
+    );
+
+    let (read_status, read) = post_library(
+        app,
+        &token,
+        "read",
+        json!({
+            "uri": secret_uri,
+        }),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["status"], "ok");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(read["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, b"plaintext from an older runtime");
+}
+
+#[tokio::test]
+async fn test_library_provider_publish_fails_closed_without_content_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/no-content.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"publish me"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (publish_status, publish) = post_library(
+        app,
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "error");
+    assert!(publish["message"]
+        .as_str()
+        .unwrap()
+        .contains("content provider unavailable"));
+}
+
+#[tokio::test]
+async fn test_library_provider_publish_uses_content_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/publish.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"publish me"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    let local_cid = write["data"]["object"]["content_cid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(local_cid.starts_with("bafkrei"));
+    assert_eq!(write["data"]["object"].get("published_cid"), None);
+    assert_eq!(write["data"]["object"]["published"], false);
+
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(publish["data"]["cid"], TEST_CIDV1);
+    assert_eq!(publish["data"]["uri"], format!("elastos://{TEST_CIDV1}"));
+    assert_eq!(publish["data"]["object"]["content_cid"], local_cid);
+    assert_eq!(publish["data"]["object"]["published_cid"], TEST_CIDV1);
+
+    let (status_code, status) = post_library(
+        app,
+        &token,
+        "status",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status["data"]["object"]["published"], true);
+    assert_eq!(status["data"]["object"]["content_cid"], local_cid);
+    assert_eq!(status["data"]["object"]["published_cid"], TEST_CIDV1);
+    assert_eq!(status["data"]["published"]["cid"], TEST_CIDV1);
+}
+
+#[tokio::test]
+async fn test_library_gateway_coordinates_content_for_external_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_external_provider_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/external-publish.txt");
+
+    let (write_status, write) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"publish me externally"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+    assert_eq!(write["status"], "ok");
+
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(publish["data"]["cid"], TEST_CIDV1);
+
+    let (status_code, status) = post_library(
+        app,
+        &token,
+        "status",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status["status"], "ok");
+    assert_eq!(status["data"]["object"]["published"], true);
+    assert_eq!(status["data"]["published"]["cid"], TEST_CIDV1);
+}
+
+#[tokio::test]
+async fn test_library_provider_share_requires_active_publish_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/share.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"share me"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (share_draft_status, share_draft) = post_library(
+        app.clone(),
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(share_draft_status, StatusCode::OK);
+    assert_eq!(share_draft["status"], "error");
+    assert!(share_draft["message"]
+        .as_str()
+        .unwrap()
+        .contains("published object"));
+
+    let (publish_status, _) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+
+    let (share_status, share) = post_library(
+        app.clone(),
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK);
+    assert_eq!(share["status"], "ok");
+    assert_eq!(share["data"]["schema"], "elastos.library.share/v1");
+    assert_eq!(share["data"]["uri"], format!("elastos://{TEST_CIDV1}"));
+    assert_eq!(share["data"]["policy"], "public_link");
+    assert!(share["data"]["recipients"].as_array().unwrap().is_empty());
+    assert!(share["data"]["grants"].as_array().unwrap().is_empty());
+    assert_eq!(share["data"]["object"]["shared"], true);
+}
+
+#[tokio::test]
+async fn test_library_provider_records_recipient_scoped_share_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/scoped-share.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"share me to a recipient"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (publish_status, _) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+
+    let (share_status, share) = post_library(
+        app.clone(),
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+            "recipients": [
+                authority.principal_id,
+                "did:key:z6MkRecipient111111111111111111111111111111111",
+                "did:key:z6MkRecipient111111111111111111111111111111111",
+                "person:local:alice"
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK);
+    assert_eq!(share["status"], "ok");
+    assert_eq!(share["data"]["policy"], "recipient_scoped");
+    assert_eq!(share["data"]["recipients"].as_array().unwrap().len(), 3);
+    assert_eq!(share["data"]["grants"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        share["data"]["grants"][0]["schema"],
+        "elastos.library.share-grant/v1"
+    );
+    assert_eq!(share["data"]["grants"][0]["cid"], TEST_CIDV1);
+    assert_eq!(share["data"]["grants"][0]["policy"], "recipient_scoped");
+    assert_eq!(
+        share["data"]["content_security"]["schema"],
+        "elastos.library.published-content-security/v1"
+    );
+    assert_eq!(
+        share["data"]["content_security"]["published_payload"],
+        "plain_content"
+    );
+    assert_eq!(
+        share["data"]["key_release"]["schema"],
+        "elastos.library.key-release/v1"
+    );
+    assert_eq!(share["data"]["key_release"]["required"], false);
+    assert_eq!(
+        share["data"]["grants"][0]["key_release"]["status"],
+        "not_required_for_plain_published_content"
+    );
+    assert_eq!(
+        share["data"]["remote_enforcement"]["required_providers"]["schema"],
+        "elastos.library.protected-content-provider-requirements/v1"
+    );
+    assert_eq!(
+        share["data"]["remote_enforcement"]["provider_invocation"]["drm"],
+        "drm-provider.open"
+    );
+    assert_eq!(
+        share["data"]["remote_enforcement"]["provider_invocation"]["rights"],
+        "rights-provider.has_access_by_content_id"
+    );
+    assert_eq!(
+        share["data"]["protected_content"]["schema"],
+        "elastos.library.protected-content-provider-status/v1"
+    );
+    assert_eq!(
+        share["data"]["protected_content"]["encrypted_recipient_sharing"]["status"],
+        "blocked_until_drm_rights_key_decrypt_providers_configured"
+    );
+    assert_eq!(
+        share["data"]["protected_content"]["required_provider_count"],
+        4
+    );
+
+    let (status_status, status) = post_library(
+        app.clone(),
+        &token,
+        "status",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(status_status, StatusCode::OK);
+    assert_eq!(status["status"], "ok");
+    assert_eq!(
+        status["data"]["protected_content"]["schema"],
+        "elastos.library.protected-content-provider-status/v1"
+    );
+    assert_eq!(
+        status["data"]["published"]["protected_content"]["encrypted_recipient_sharing"]["status"],
+        "blocked_until_drm_rights_key_decrypt_providers_configured"
+    );
+
+    let (access_status, access) = post_library(
+        app.clone(),
+        &token,
+        "shared_access",
+        json!({
+            "uri": uri,
+            "recipient": authority.principal_id,
+        }),
+    )
+    .await;
+    assert_eq!(access_status, StatusCode::OK);
+    assert_eq!(access["status"], "ok");
+    assert_eq!(access["data"]["schema"], "elastos.library.shared-access/v1");
+    assert_eq!(access["data"]["uri"], format!("elastos://{TEST_CIDV1}"));
+    assert_eq!(access["data"]["access"]["policy"], "recipient_scoped");
+    assert_eq!(
+        access["data"]["access"]["recipient"],
+        authority.principal_id
+    );
+    assert_eq!(
+        access["data"]["access"]["recipient_proof"]["schema"],
+        "elastos.library.recipient-proof-state/v1"
+    );
+    assert_eq!(
+        access["data"]["access"]["recipient_proof"]["verified"],
+        true
+    );
+    assert_eq!(
+        access["data"]["access"]["recipient_proof"]["source"],
+        "runtime-launch-grant"
+    );
+    assert_eq!(
+        access["data"]["access"]["recipient_proof"]["proof_binding_id"],
+        authority.proof_binding_id
+    );
+    assert_eq!(access["data"]["access"]["decision"]["allowed"], true);
+    assert_eq!(
+        access["data"]["access"]["decision"]["schema"],
+        "elastos.library.access-decision/v1"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["schema"],
+        "elastos.library.shared-open/v1"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["provider"],
+        "content-provider"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["transport"],
+        "runtime-provider-fetch"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["status"],
+        "ready_for_plain_content_fetch"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["key_release_required"],
+        false
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["drm_provider_required"],
+        false
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["recipient_proof_verified"],
+        true
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["rights_provider_required"],
+        false
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["key_provider_required"],
+        false
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["decrypt_provider_required"],
+        false
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["required_providers"]["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        access["data"]["protected_content"]["schema"],
+        "elastos.library.protected-content-provider-status/v1"
+    );
+    assert_eq!(
+        access["data"]["access"]["key_release"]["status"],
+        "not_required_for_plain_published_content"
+    );
+    assert_eq!(
+        access["data"]["access"]["content_security"]["published_payload"],
+        "plain_content"
+    );
+
+    let (missing_proof_status, missing_proof) = post_library(
+        app.clone(),
+        &token,
+        "shared_access",
+        json!({
+            "uri": uri,
+            "recipient": "person:local:alice",
+            "recipient_proof": {
+                "schema": "elastos.library.recipient-proof/v1",
+                "source": "runtime-launch-grant",
+                "recipient": "person:local:alice"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(missing_proof_status, StatusCode::OK);
+    assert_eq!(missing_proof["status"], "error");
+    assert!(missing_proof["message"]
+        .as_str()
+        .unwrap()
+        .contains("requires Runtime recipient_proof"));
+
+    let (blocked_status, blocked) = post_library(
+        app.clone(),
+        &token,
+        "shared_access",
+        json!({
+            "uri": uri,
+            "recipient": "person:local:bob",
+        }),
+    )
+    .await;
+    assert_eq!(blocked_status, StatusCode::OK);
+    assert_eq!(blocked["status"], "error");
+    assert!(blocked["message"]
+        .as_str()
+        .unwrap()
+        .contains("not authorized"));
+
+    let (events_status, events) = post_library(
+        app.clone(),
+        &token,
+        "events",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(events_status, StatusCode::OK);
+    assert_eq!(events["status"], "ok");
+    let shared_access_events = events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["op"] == "shared_access")
+        .collect::<Vec<_>>();
+    assert!(shared_access_events.iter().any(|event| {
+        event["details"]["recipient"] == authority.principal_id
+            && event["details"]["allowed"] == true
+            && event["details"]["open"]["status"] == "ready_for_plain_content_fetch"
+            && event["details"]["open"]["recipient_proof_verified"] == true
+            && event["details"]["key_release"]["required"] == false
+    }));
+    assert!(shared_access_events.iter().any(|event| {
+        event["details"]["recipient"] == "person:local:bob"
+            && event["details"]["allowed"] == false
+            && event["details"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not authorized")
+    }));
+    assert!(shared_access_events.iter().any(|event| {
+        event["details"]["recipient"] == "person:local:alice"
+            && event["details"]["allowed"] == false
+            && event["details"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("requires Runtime recipient_proof")
+    }));
+
+    let (status_code, status) = post_library(
+        app,
+        &token,
+        "status",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status["status"], "ok");
+    assert_eq!(
+        status["data"]["published"]["share_policy"],
+        "recipient_scoped"
+    );
+    assert_eq!(
+        status["data"]["published"]["share_grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_rejects_key_release_policy_until_provider_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protected-share.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"share with key release"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (publish_status, _) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+
+    let (share_status, share) = post_library(
+        app,
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+            "recipients": ["person:local:alice"],
+            "key_release_policy": "recipient_key_release",
+        }),
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK);
+    assert_eq!(share["status"], "error");
+    assert!(share["message"]
+        .as_str()
+        .unwrap()
+        .contains("drm/rights/key/decrypt providers"));
+}
+
+#[tokio::test]
+async fn test_library_provider_runs_protected_content_receipt_chain_for_recipient() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_protected_content_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protected-fixture.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protected_content_fixture": true,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "ok");
+    assert_eq!(
+        publish["data"]["content_security"]["published_payload"],
+        "protected_content_fixture"
+    );
+    assert_eq!(
+        publish["data"]["content_security"]["key_release_required"],
+        true
+    );
+    assert_eq!(
+        publish["data"]["content_security"]["production_encryption"],
+        false
+    );
+    assert_eq!(
+        publish["data"]["content_security"]["sealed_object"]["schema"],
+        "elastos.sealed.object/v1"
+    );
+
+    let (share_status, share) = post_library(
+        app.clone(),
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+            "recipients": [authority.principal_id],
+            "key_release_policy": "recipient_key_release",
+        }),
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK);
+    assert_eq!(share["status"], "ok");
+    assert_eq!(share["data"]["policy"], "recipient_scoped");
+    assert_eq!(share["data"]["key_release"]["required"], true);
+    assert_eq!(
+        share["data"]["key_release"]["status"],
+        "provider_receipt_chain_required"
+    );
+    assert_eq!(
+        share["data"]["protected_content"]["configured_provider_count"],
+        4
+    );
+    assert_eq!(
+        share["data"]["protected_content"]["encrypted_recipient_sharing"]["status"],
+        "provider_chain_ready"
+    );
+
+    let (access_status, access) = post_library(
+        app.clone(),
+        &token,
+        "shared_access",
+        json!({
+            "uri": uri,
+            "recipient": authority.principal_id,
+        }),
+    )
+    .await;
+    assert_eq!(access_status, StatusCode::OK);
+    assert_eq!(
+        access["status"], "ok",
+        "protected access response: {access}"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["status"],
+        "ready_for_protected_viewer_session"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["provider"],
+        "decrypt-provider"
+    );
+    assert_eq!(
+        access["data"]["access"]["open"]["transport"],
+        "runtime-protected-provider-chain"
+    );
+    let protected = &access["data"]["access"]["open"]["protected_content"];
+    assert_eq!(protected["schema"], "elastos.library.protected-open/v1");
+    assert_eq!(
+        protected["drm_receipt"]["schema"],
+        "elastos.drm.open.receipt/v1"
+    );
+    assert_eq!(
+        protected["rights_receipt"]["schema"],
+        "elastos.rights.decision.receipt/v1"
+    );
+    assert_eq!(protected["rights_receipt"]["allowed"], true);
+    assert_eq!(
+        protected["key_release_receipt"]["schema"],
+        "elastos.release.receipt/v1"
+    );
+    assert_eq!(protected["key_release_receipt"]["provider"], "key-provider");
+    assert_eq!(
+        protected["decrypt_session"]["schema"],
+        "elastos.decrypt.session/v1"
+    );
+    assert_eq!(
+        protected["viewer"]["required_interface"],
+        "elastos.viewer/document@1"
+    );
+    assert_eq!(protected["raw_cek_exposed"], false);
+    assert_eq!(protected["raw_plaintext_exposed"], false);
+    let protected_text = protected.to_string();
+    assert!(!protected_text.contains("fixture-wrapped"));
+    assert!(!protected_text.contains("provider_credentials"));
+}
+
+#[tokio::test]
+async fn test_library_protected_shared_access_fails_closed_without_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/protected-missing-providers.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protected_content_fixture": true,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "ok");
+
+    let (share_status, share) = post_library(
+        app.clone(),
+        &token,
+        "share",
+        json!({
+            "uri": uri,
+            "recipients": [authority.principal_id],
+            "key_release_policy": "recipient_key_release",
+        }),
+    )
+    .await;
+    assert_eq!(share_status, StatusCode::OK);
+    assert_eq!(share["status"], "ok");
+    assert_eq!(share["data"]["key_release"]["required"], true);
+
+    let (access_status, access) = post_library(
+        app,
+        &token,
+        "shared_access",
+        json!({
+            "uri": uri,
+            "recipient": authority.principal_id,
+        }),
+    )
+    .await;
+    assert_eq!(access_status, StatusCode::OK);
+    assert_eq!(access["status"], "error");
+    assert!(access["message"]
+        .as_str()
+        .unwrap()
+        .contains("drm provider unavailable"));
+}
+
+#[tokio::test]
+async fn test_library_provider_unpublish_and_repair_update_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let uri = format!("{root}/Documents/availability.txt");
+
+    let (write_status, _) = post_library(
+        app.clone(),
+        &token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(b"availability"),
+        }),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::OK);
+
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        &token,
+        "publish",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    let revision = publish["data"]["object"]["revision"].as_str().unwrap();
+
+    let (unpublish_status, unpublish) = post_library(
+        app.clone(),
+        &token,
+        "unpublish",
+        json!({
+            "uri": uri,
+            "if_revision": revision,
+        }),
+    )
+    .await;
+    assert_eq!(unpublish_status, StatusCode::OK);
+    assert_eq!(unpublish["status"], "ok");
+    assert_eq!(unpublish["data"]["object"]["published"], false);
+    assert!(unpublish["data"]["object"]["content_cid"]
+        .as_str()
+        .unwrap()
+        .starts_with("bafkrei"));
+    assert_eq!(unpublish["data"]["object"].get("published_cid"), None);
+    assert_eq!(
+        unpublish["data"]["object"]["availability"],
+        "local_unpinned"
+    );
+
+    let (repair_status, repair) = post_library(
+        app.clone(),
+        &token,
+        "repair",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(repair_status, StatusCode::OK);
+    assert_eq!(repair["status"], "ok");
+    assert_eq!(repair["data"]["object"]["published"], true);
+    assert_eq!(repair["data"]["object"]["availability"], "local_pinned");
+
+    let (status_code, status) = post_library(
+        app,
+        &token,
+        "status",
+        json!({
+            "uri": uri,
+        }),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status["data"]["object"]["published"], true);
+    assert_eq!(
+        status["data"]["published"]["availability"]["status"],
+        "local_pinned"
+    );
+}

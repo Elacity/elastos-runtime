@@ -20,7 +20,8 @@ const CACHED_ARTIFACT_SHA_FILE: &str = ".elastos-artifact-sha256";
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ComponentsManifest {
-    /// External tools (kubo, cloudflared, llama-server, models).
+    /// Setup-materialized artifacts: external tools, provider binaries, and
+    /// first-party app bundles installed into the runtime data directory.
     pub external: HashMap<String, Component>,
 
     /// Capsule registry (CID-based entries). Defaults empty when a manifest has no capsules.
@@ -31,9 +32,9 @@ pub struct ComponentsManifest {
     pub profiles: HashMap<String, Profile>,
 }
 
-/// An external tool component.
+/// A setup-materialized component.
 ///
-/// First-party components should be CID-backed and resolved as `elastos://...`.
+/// First-party app bundles should resolve through trusted Elastos sources.
 /// Explicit vendor URLs remain allowed only for specific approved external tools.
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Component {
@@ -565,6 +566,204 @@ enum InstallState {
     Missing,
     Installed,
     Stale(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapsuleComponentEnsure {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+pub(crate) async fn ensure_capsule_component_for_home_launch(
+    data_dir: &Path,
+    name: &str,
+) -> anyhow::Result<CapsuleComponentEnsure> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("capsule component name is required");
+    }
+
+    let manifest_path = data_dir.join("components.json");
+    let manifest_bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(CapsuleComponentEnsure {
+                name: name.to_string(),
+                status: "skipped".to_string(),
+                detail: Some(
+                    "installed components manifest unavailable; using local capsule tree"
+                        .to_string(),
+                ),
+            })
+        }
+    };
+    let manifest: ComponentsManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| anyhow::anyhow!("invalid {}: {}", manifest_path.display(), err))?;
+
+    let Some(component) = manifest.external.get(name) else {
+        return Ok(CapsuleComponentEnsure {
+            name: name.to_string(),
+            status: "skipped".to_string(),
+            detail: Some("not a setup-managed capsule component".to_string()),
+        });
+    };
+    let Some(capsule_entry) = manifest.capsules.get(name) else {
+        return Ok(CapsuleComponentEnsure {
+            name: name.to_string(),
+            status: "skipped".to_string(),
+            detail: Some("component has no verified app registry entry".to_string()),
+        });
+    };
+
+    let platform = detect_platform();
+    let platform_info = resolve_platform_info(component, &platform).ok_or_else(|| {
+        anyhow::anyhow!("capsule component '{name}' is not available for {platform}")
+    })?;
+    let install_path = resolve_install_path(component, Some(platform_info))
+        .ok_or_else(|| anyhow::anyhow!("capsule component '{name}' is missing install_path"))?;
+    validate_capsule_component_install_path(name, install_path)?;
+
+    let install_state =
+        component_install_state_for_name(&manifest, data_dir, name, component, Some(platform_info));
+    if matches!(install_state, InstallState::Installed) {
+        return Ok(CapsuleComponentEnsure {
+            name: name.to_string(),
+            status: "installed".to_string(),
+            detail: None,
+        });
+    }
+
+    validate_capsule_package_identity(name, capsule_entry, platform_info)?;
+    if platform_info.strategy.as_deref() == Some("source-build") {
+        anyhow::bail!(
+            "capsule component '{name}' requires a source build and cannot be JIT materialized"
+        );
+    }
+    if platform_info.strategy.as_deref() == Some("local-copy") {
+        anyhow::bail!("capsule component '{name}' uses local-copy and cannot be JIT materialized");
+    }
+
+    let resolved_url = resolve_component_download_url(platform_info).ok_or_else(|| {
+        anyhow::anyhow!("capsule component '{name}' has no Carrier/content release path")
+    })?;
+    let dest = data_dir.join(install_path);
+    let gateways = build_gateway_list(data_dir);
+    download_component(
+        data_dir,
+        name,
+        &resolved_url,
+        platform_info,
+        &dest,
+        &gateways,
+    )
+    .await?;
+    maybe_write_component_cache_metadata(&manifest, Some(platform_info), name, &dest)?;
+
+    let installed_manifest = dest.join("capsule.json");
+    let manifest_bytes = fs::read(&installed_manifest).map_err(|err| {
+        anyhow::anyhow!("materialized capsule '{name}' is missing capsule.json: {err}")
+    })?;
+    let manifest: elastos_common::CapsuleManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|err| {
+            anyhow::anyhow!("materialized capsule '{name}' has invalid capsule.json: {err}")
+        })?;
+    manifest.validate().map_err(|err| {
+        anyhow::anyhow!("materialized capsule '{name}' failed manifest validation: {err}")
+    })?;
+    if manifest.name != name {
+        anyhow::bail!(
+            "materialized capsule name mismatch: requested '{}', package declared '{}'",
+            name,
+            manifest.name
+        );
+    }
+
+    Ok(CapsuleComponentEnsure {
+        name: name.to_string(),
+        status: "materialized".to_string(),
+        detail: match install_state {
+            InstallState::Missing => Some("installed package was missing".to_string()),
+            InstallState::Stale(reason) => Some(format!("installed package was stale: {reason}")),
+            InstallState::Installed => None,
+        },
+    })
+}
+
+fn validate_capsule_package_identity(
+    name: &str,
+    entry: &CapsuleEntry,
+    platform_info: &PlatformInfo,
+) -> anyhow::Result<()> {
+    let cid = entry.cid.trim();
+    if cid.is_empty() {
+        anyhow::bail!("capsule component '{name}' is missing package CID");
+    }
+    if cid::Cid::try_from(cid).is_err() {
+        anyhow::bail!("capsule component '{name}' has invalid package CID");
+    }
+    if let Some(platform_cid) = platform_info
+        .cid
+        .as_deref()
+        .map(str::trim)
+        .filter(|platform_cid| !platform_cid.is_empty())
+    {
+        if platform_cid != cid {
+            anyhow::bail!(
+                "capsule component '{name}' platform package CID does not match registry CID"
+            );
+        }
+    }
+    if entry.sha256.trim().is_empty() {
+        anyhow::bail!("capsule component '{name}' is missing package archive sha256");
+    }
+    let platform_checksum = platform_info
+        .checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("capsule component '{name}' is missing platform archive checksum")
+        })?;
+    let Some(platform_sha256) = platform_checksum.strip_prefix("sha256:") else {
+        anyhow::bail!("capsule component '{name}' platform archive checksum must be sha256");
+    };
+    let registry_sha256 = entry
+        .sha256
+        .trim()
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| entry.sha256.trim());
+    if registry_sha256 != platform_sha256 {
+        anyhow::bail!(
+            "capsule component '{name}' package sha256 does not match platform archive checksum"
+        );
+    }
+    Ok(())
+}
+
+fn validate_capsule_component_install_path(name: &str, install_path: &str) -> anyhow::Result<()> {
+    let path = Path::new(install_path);
+    if path.is_absolute() {
+        anyhow::bail!("capsule component '{name}' install_path must be relative");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        anyhow::bail!("capsule component '{name}' install_path must not escape data_dir");
+    }
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::Normal("capsules".as_ref())) {
+        anyhow::bail!("capsule component '{name}' install_path must be under capsules/");
+    }
+    if path.file_name().and_then(|value| value.to_str()) != Some(name) {
+        anyhow::bail!("capsule component '{name}' install_path must end with the capsule name");
+    }
+    Ok(())
 }
 
 fn component_install_state_for_name(
@@ -1155,7 +1354,7 @@ fn trusted_gateway_overrides(data_dir: &Path) -> Vec<ElastosFetchPath> {
 }
 
 fn resolve_cid_display_url(cid: &str) -> String {
-    // Display-only identity string for CID-backed components.
+    // Display-only identity string for content-addressed components.
     // Actual downloads use the configured Elastos fetch paths above.
     format!("elastos://{}", cid)
 }
@@ -2046,6 +2245,171 @@ mod tests {
             ),
             InstallState::Stale("extracted bundle CID metadata missing or stale".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_capsule_component_rejects_missing_package_cid_when_materialization_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "marketplace": {
+                        "install_path": "capsules/marketplace",
+                        "platforms": {
+                            "*": {
+                                "release_path": "marketplace.tar.gz",
+                                "extract_path": "marketplace",
+                                "install_path": "capsules/marketplace",
+                                "checksum": "sha256:archive"
+                            }
+                        }
+                    }
+                },
+                "capsules": {
+                    "marketplace": {
+                        "cid": "",
+                        "sha256": "sha256:archive"
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = ensure_capsule_component_for_home_launch(tmp.path(), "marketplace")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing package CID"));
+    }
+
+    #[tokio::test]
+    async fn ensure_capsule_component_rejects_registry_checksum_mismatch_before_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "marketplace": {
+                        "install_path": "capsules/marketplace",
+                        "platforms": {
+                            "*": {
+                                "release_path": "marketplace.tar.gz",
+                                "extract_path": "marketplace",
+                                "install_path": "capsules/marketplace",
+                                "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                            }
+                        }
+                    }
+                },
+                "capsules": {
+                    "marketplace": {
+                        "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                        "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = ensure_capsule_component_for_home_launch(tmp.path(), "marketplace")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn ensure_capsule_component_rejects_platform_cid_mismatch_before_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "marketplace": {
+                        "install_path": "capsules/marketplace",
+                        "platforms": {
+                            "*": {
+                                "cid": "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                                "release_path": "marketplace.tar.gz",
+                                "extract_path": "marketplace",
+                                "install_path": "capsules/marketplace",
+                                "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                            }
+                        }
+                    }
+                },
+                "capsules": {
+                    "marketplace": {
+                        "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = ensure_capsule_component_for_home_launch(tmp.path(), "marketplace")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("platform package CID"));
+    }
+
+    #[tokio::test]
+    async fn ensure_capsule_component_keeps_installed_source_capsule_without_registry_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("capsules/marketplace");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(
+            install_root.join("capsule.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": "marketplace",
+                "version": "0.1.0",
+                "description": "Marketplace",
+                "author": "elastos",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "marketplace.wasm"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "marketplace": {
+                        "install_path": "capsules/marketplace",
+                        "platforms": {
+                            "*": {
+                                "release_path": "marketplace.tar.gz",
+                                "extract_path": "marketplace",
+                                "install_path": "capsules/marketplace"
+                            }
+                        }
+                    }
+                },
+                "capsules": {
+                    "marketplace": {
+                        "cid": "",
+                        "sha256": ""
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let ensure = ensure_capsule_component_for_home_launch(tmp.path(), "marketplace")
+            .await
+            .unwrap();
+        assert_eq!(ensure.status, "installed");
     }
 
     #[test]

@@ -14,7 +14,7 @@ This document is the reference point for capsule language in this repo. It exist
 
 - the trusted **Node Core**
 - the decentralized **Carrier** substrate
-- the per-capsule **Capsule Runtime** (Rong Chen's "AppCapsule Runtime")
+- the per-capsule **Capsule Runtime** / AppCapsule Runtime
 - the **Digital Capsule** as the portable signed package model
 
 ## Core Model
@@ -87,7 +87,7 @@ The important point is that these are all capsules. They differ by role, not by 
 
 ## Capsule Runtime (AppCapsule Runtime)
 
-Rong Chen's "AppCapsule Runtime" should be understood as the common execution substrate for executable capsules.
+AppCapsule Runtime should be understood as the common execution substrate for executable capsules.
 
 It is:
 
@@ -275,9 +275,9 @@ So the long-term rule is:
 - **Carrier-only by default**
 - **guest network only when explicitly requested and justified**
 
-## Rong Chen Alignment
+## SmartWeb Alignment
 
-Two Rong Chen insights are central here:
+Two SmartWeb capsule principles are central here:
 
 1. **URI as named data / syscall surface**
    - WebSpace URIs are Named Data Network representations
@@ -294,6 +294,9 @@ This implies:
 - providers should implement URI semantics
 - the Capsule Runtime should make execution portable
 - Carrier should stay below app semantics
+- `localhost://WebSpaces/<mount>/...` is the local mounted view; raw provider
+  targets such as `cloud://drive/...` or backing `elastos://content/...`
+  handles remain provider-resolved authority, not ordinary app storage
 
 ## Current Repo Mapping
 

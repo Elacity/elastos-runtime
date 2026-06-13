@@ -7,8 +7,8 @@ without becoming immediate dependencies.
 
 Source: <https://gitee.com/tjopenlab/como>
 
-Rong Chen described COMO as related to the Android-compatible C/C++ smartphone
-work from 2016 and as a possible default WCI framework reference. The public
+COMO is related to Android-compatible C/C++ smartphone work from 2016 and has
+been considered as a possible World Computer framework reference. The public
 university repo currently presents COMO as a C++ Component Model with:
 
 - `cdlc`: component description compiler

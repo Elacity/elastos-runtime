@@ -9,10 +9,16 @@ SOURCE_HOME_CLI_DIR="$ROOT/capsules/home-cli"
 SOURCE_HOME_CLI_WASM="$SOURCE_HOME_CLI_DIR/target/wasm32-wasip1/release/home-cli.wasm"
 SOURCE_HOME_DIR="$ROOT/capsules/home"
 SOURCE_SYSTEM_DIR="$ROOT/capsules/system"
+SOURCE_BROWSER_DIR="$ROOT/capsules/browser"
 SOURCE_DOCUMENTS_DIR="$ROOT/capsules/documents"
+SOURCE_GBA_EMULATOR_DIR="$ROOT/capsules/gba-emulator"
 SOURCE_LIBRARY_DIR="$ROOT/capsules/library"
 SOURCE_MARKETPLACE_DIR="$ROOT/capsules/marketplace"
 SOURCE_INBOX_DIR="$ROOT/capsules/inbox"
+SOURCE_WALLET_DIR="$ROOT/capsules/wallet"
+SOURCE_WALLET_METAMASK_DIR="$ROOT/capsules/wallet-metamask"
+SOURCE_WALLET_UNISAT_DIR="$ROOT/capsules/wallet-unisat"
+SOURCE_WALLET_WALLETCONNECT_DIR="$ROOT/capsules/wallet-walletconnect"
 SOURCE_COMPONENTS_MANIFEST="$ROOT/components.json"
 SOURCE_RUNTIME_HOME="${HOME_DIR}/source-runtime"
 SOURCE_RUNTIME_XDG="${SOURCE_RUNTIME_HOME}/xdg-data"
@@ -122,9 +128,23 @@ echo "[home-frontdoor] build Home CLI wasm"
 cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
 cp "$SOURCE_HOME_CLI_WASM" "$SOURCE_HOME_CLI_DIR/home-cli.wasm"
 
-echo "[home-frontdoor] build Home and System browser capsule wasm"
-cargo build --manifest-path "$ROOT/capsules/home/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
-cargo build --manifest-path "$ROOT/capsules/system/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
+echo "[home-frontdoor] build first-party browser capsule wasm"
+for capsule in \
+    home \
+    system \
+    browser \
+    documents \
+    gba-emulator \
+    inbox \
+    library \
+    marketplace \
+    wallet \
+    wallet-metamask \
+    wallet-unisat \
+    wallet-walletconnect
+do
+    cargo build --manifest-path "$ROOT/capsules/${capsule}/Cargo.toml" --target wasm32-wasip1 --release >/dev/null
+done
 
 echo "[home-frontdoor] stage source-local trusted source"
 SOURCE_API_PORT="$(free_port)"
@@ -132,7 +152,7 @@ SETUP_PLATFORM="$(host_platform)"
 mkdir -p "$SOURCE_RUNTIME_DATA_DIR/bin"
 install -m 755     "$ROOT/elastos/target/release/localhost-provider"     "$SOURCE_RUNTIME_DATA_DIR/bin/localhost-provider"
 
-COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" python3 - <<'PY2'
+COMPONENTS_SRC="$SOURCE_COMPONENTS_MANIFEST" COMPONENTS_DEST="$SOURCE_RUNTIME_DATA_DIR/components.json" DATA_DIR="$SOURCE_RUNTIME_DATA_DIR" PUBLISHER_ROOT="$SOURCE_RUNTIME_DATA_DIR/ElastOS/SystemServices/Publisher" SETUP_PLATFORM="$SETUP_PLATFORM" SHELL_BIN="$ROOT/elastos/target/release/shell" LOCALHOST_PROVIDER_BIN="$ROOT/elastos/target/release/localhost-provider" DID_PROVIDER_BIN="$ROOT/capsules/did-provider/target/release/did-provider" WEBSPACE_PROVIDER_BIN="$ROOT/capsules/webspace-provider/target/release/webspace-provider" OBJECT_PROVIDER_BIN="$ROOT/capsules/object-provider/target/release/object-provider" HOME_CLI_DIR="$SOURCE_HOME_CLI_DIR" HOME_CAPSULE_DIR="$SOURCE_HOME_DIR" SYSTEM_CAPSULE_DIR="$SOURCE_SYSTEM_DIR" BROWSER_CAPSULE_DIR="$SOURCE_BROWSER_DIR" DOCUMENTS_CAPSULE_DIR="$SOURCE_DOCUMENTS_DIR" GBA_EMULATOR_CAPSULE_DIR="$SOURCE_GBA_EMULATOR_DIR" LIBRARY_CAPSULE_DIR="$SOURCE_LIBRARY_DIR" MARKETPLACE_CAPSULE_DIR="$SOURCE_MARKETPLACE_DIR" INBOX_CAPSULE_DIR="$SOURCE_INBOX_DIR" WALLET_CAPSULE_DIR="$SOURCE_WALLET_DIR" WALLET_METAMASK_CAPSULE_DIR="$SOURCE_WALLET_METAMASK_DIR" WALLET_UNISAT_CAPSULE_DIR="$SOURCE_WALLET_UNISAT_DIR" WALLET_WALLETCONNECT_CAPSULE_DIR="$SOURCE_WALLET_WALLETCONNECT_DIR" python3 - <<'PY2'
 import hashlib
 import json
 import os
@@ -196,6 +216,16 @@ home_cli_manifest["size"] = len(home_cli_data)
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+    "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
+    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
+    "gba-emulator": pathlib.Path(os.environ["GBA_EMULATOR_CAPSULE_DIR"]),
+    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
+    "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
+    "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
+    "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
+    "wallet-walletconnect": pathlib.Path(os.environ["WALLET_WALLETCONNECT_CAPSULE_DIR"]),
 }
 for name, capsule_dir in browser_capsules.items():
     info = platform_info(name)
@@ -210,28 +240,6 @@ for name, capsule_dir in browser_capsules.items():
             arcname=f"{name}/{name}.wasm",
         )
         tar.add(capsule_dir / "browser", arcname=f"{name}/browser")
-    data = archive.read_bytes()
-    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
-    info["size"] = len(data)
-
-data_capsules = {
-    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
-    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
-    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
-    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
-}
-for name, capsule_dir in data_capsules.items():
-    info = platform_info(name)
-    release_path = info.get("release_path")
-    if not release_path:
-        raise SystemExit(f"{name} missing release_path for {platform}")
-    archive = artifacts_dir / release_path
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        for asset in sorted(capsule_dir.rglob("*")):
-            if not asset.is_file() or asset.name == "capsule.json":
-                continue
-            tar.add(asset, arcname=f"{name}/{asset.relative_to(capsule_dir)}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -292,16 +300,32 @@ for installed in \
     "$HOME_DIR/xdg-data/elastos/capsules/home/browser/index.html" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/system.wasm" \
     "$HOME_DIR/xdg-data/elastos/capsules/system/browser/index.html" \
-    "$HOME_DIR/xdg-data/elastos/bin/object-provider" \
-    "$HOME_DIR/xdg-data/elastos/capsules/documents/index.html" \
-    "$HOME_DIR/xdg-data/elastos/capsules/library/index.html" \
-    "$HOME_DIR/xdg-data/elastos/capsules/library/library.css" \
-    "$HOME_DIR/xdg-data/elastos/capsules/library/src/app.js" \
-    "$HOME_DIR/xdg-data/elastos/capsules/library/icons/folder.svg" \
-    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/index.html" \
-    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/marketplace.css" \
-    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/marketplace.js" \
-    "$HOME_DIR/xdg-data/elastos/capsules/inbox/index.html"
+    "$HOME_DIR/xdg-data/elastos/capsules/browser/browser.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/browser/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/documents/documents.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/documents/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/gba-emulator/gba-emulator.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/gba-emulator/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/inbox/inbox.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/inbox/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/library.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/browser/library.css" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/browser/src/app.js" \
+    "$HOME_DIR/xdg-data/elastos/capsules/library/browser/icons/folder.svg" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/marketplace.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/browser/marketplace.css" \
+    "$HOME_DIR/xdg-data/elastos/capsules/marketplace/browser/marketplace.js" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet/wallet.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-metamask/wallet-metamask.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-metamask/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-unisat/wallet-unisat.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-unisat/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-walletconnect/wallet-walletconnect.wasm" \
+    "$HOME_DIR/xdg-data/elastos/capsules/wallet-walletconnect/browser/index.html" \
+    "$HOME_DIR/xdg-data/elastos/bin/object-provider"
 do
     if [[ ! -f "$installed" ]]; then
         echo "[home-frontdoor] installed first-party browser capsule asset missing after setup: $installed" >&2

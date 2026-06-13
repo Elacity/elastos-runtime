@@ -1083,6 +1083,36 @@ impl KeyProvider {
                 "rights-provider",
                 "decrypt-provider"
             ],
+            "contract": {
+                "schema": "elastos.protected-content.key-provider/v1",
+                "authority_boundary": "typed key-release receipts only",
+                "denied_to_apps": [
+                    "raw_cek",
+                    "kms_node_credentials",
+                    "chain_rpc",
+                    "wallet_rpc",
+                    "provider_credentials"
+                ],
+                "operations": {
+                    "release": {
+                        "input_schema": KEY_RELEASE_REQUEST_SCHEMA,
+                        "input": [
+                            "request_id",
+                            "principal_id",
+                            "session_id",
+                            "object_cid",
+                            "action",
+                            "rights_receipt",
+                            "key_envelope",
+                            "reason",
+                            "expires_at"
+                        ],
+                        "output": "key-release receipt or provider-scoped decrypt capability after an allowed rights receipt, never a raw CEK"
+                    }
+                },
+                "supported_schemes": SUPPORTED_SCHEMES,
+                "status": "fail_closed_until_dkms_backend_configured"
+            },
         }))
     }
 
@@ -2063,7 +2093,7 @@ fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), Str
     require_non_empty(&request.session_id, "session_id")?;
     require_identifier(&request.object_cid, "object_cid")?;
     validate_action(&request.action)?;
-    validate_rights_receipt(request)?;
+    validate_rights_receipt_binding(request)?;
     require_non_empty(&request.reason, "reason")?;
     require_non_empty(&request.key_envelope.scheme, "key_envelope.scheme")?;
     require_supported_scheme(&request.key_envelope.scheme)?;
@@ -2089,26 +2119,43 @@ fn validate_key_release_request(request: &KeyReleaseRequestV1) -> Result<(), Str
 /// bound to a different principal/session/object/right. This is the `rights -> key`
 /// link of the dDRM chain: rights authority lives in rights-provider; key-provider
 /// fails closed unless it is handed a matching, allowed decision.
-fn validate_rights_receipt(request: &KeyReleaseRequestV1) -> Result<(), String> {
+fn validate_rights_receipt_binding(request: &KeyReleaseRequestV1) -> Result<(), String> {
     let receipt = &request.rights_receipt;
     if receipt.schema != RIGHTS_DECISION_RECEIPT_SCHEMA {
         return Err("rights receipt schema is unsupported".to_string());
     }
-    require_non_empty(&receipt.request_id, "rights_receipt.request_id")?;
+    require_identifier(&receipt.request_id, "rights_receipt.request_id")?;
+    require_identifier(&receipt.content_id, "rights_receipt.content_id")?;
+    require_non_empty(&receipt.principal_id, "rights_receipt.principal_id")?;
+    require_non_empty(&receipt.session_id, "rights_receipt.session_id")?;
+    validate_action(&receipt.right)?;
+    require_non_empty(&receipt.provider, "rights_receipt.provider")?;
+    if receipt.provider != "rights-provider" {
+        return Err("rights receipt provider must be rights-provider".to_string());
+    }
     if !receipt.allowed {
-        return Err("rights receipt does not authorize this action".to_string());
-    }
-    if receipt.principal_id != request.principal_id {
-        return Err("rights receipt principal does not match request".to_string());
-    }
-    if receipt.session_id != request.session_id {
-        return Err("rights receipt session does not match request".to_string());
+        return Err("rights receipt must allow the requested action".to_string());
     }
     if receipt.content_id != request.object_cid {
-        return Err("rights receipt content does not match request object".to_string());
+        return Err("rights receipt content_id must match object_cid".to_string());
+    }
+    if receipt.principal_id != request.principal_id {
+        return Err("rights receipt principal_id must match key release principal_id".to_string());
+    }
+    if receipt.session_id != request.session_id {
+        return Err("rights receipt session_id must match key release session_id".to_string());
     }
     if receipt.right != request.action {
-        return Err("rights receipt right does not match requested action".to_string());
+        return Err("rights receipt right must match key release action".to_string());
+    }
+    if receipt.issued_at == 0 {
+        return Err("rights receipt issued_at is required".to_string());
+    }
+    if receipt.expires_at == 0 {
+        return Err("rights receipt expires_at is required".to_string());
+    }
+    if receipt.expires_at < request.expires_at {
+        return Err("rights receipt must cover the key release expiry".to_string());
     }
     Ok(())
 }
@@ -2284,6 +2331,14 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("raw_cek")));
+        assert_eq!(
+            data["contract"]["schema"],
+            "elastos.protected-content.key-provider/v1"
+        );
+        assert_eq!(
+            data["contract"]["status"],
+            "fail_closed_until_dkms_backend_configured"
+        );
     }
 
     #[test]
@@ -3657,5 +3712,23 @@ mod tests {
                 "a replayed/altered transcript must fail closed across the capsule boundary"
             );
         }
+    }
+
+    #[test]
+    fn release_rejects_denied_rights_receipt() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.rights_receipt.allowed = false;
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
+    }
+
+    #[test]
+    fn release_rejects_mismatched_rights_receipt() {
+        let provider = KeyProvider;
+        let mut request = key_release_request();
+        request.rights_receipt.principal_id = "person:local:other".to_string();
+
+        assert_eq!(error_code(provider.release(request)), "invalid_request");
     }
 }

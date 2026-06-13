@@ -27,7 +27,7 @@ work log.
 - Put temporary investigation notes in the active issue, PR, review comment, or
   untracked working note.
 - Put release truth in `state.md` or `elastos/CHANGELOG.md`.
-- Put active branch coordination in `TODAY.md`.
+- Put active branch coordination in the active issue, PR, or review thread.
 - Put durable architecture or operator guidance in the relevant `docs/` file.
 
 ## Provider Bridge Invariant
@@ -145,3 +145,12 @@ The Home bell regression was caused by replacing frequent summary polling with e
 ## Fix - 2026-05-26 Home Bell And ela.city Balance Regression
 
 Home now refreshes shell summary for wallet/inbox events even when they arrive in the first long-poll payload after SSE fallback. Wallet EVM default updates now also set a `browser_connect` default, and Browser uses that default before generic transaction defaults.
+
+## External Provider Deploy Invariant
+
+When code inside a standalone external provider changes, deployed Home or app
+assets are not enough. Rebuild the provider binary, install it under the active
+`XDG_DATA_HOME/elastos/bin`, update the provider entry in `components.json` with
+the new sha256 and size, and restart the gateway so the provider process is
+respawned. Otherwise Home/Library can serve current JavaScript while the running
+provider still returns stale roots, operations, or schemas.

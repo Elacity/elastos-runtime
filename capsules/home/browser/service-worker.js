@@ -1,4 +1,4 @@
-const CACHE_NAME = "elastos-home-20260526d";
+const CACHE_NAME = "elastos-home-20260607e";
 const CACHE_PREFIX = "elastos-home-";
 
 self.addEventListener("install", (event) => {
@@ -10,36 +10,12 @@ self.addEventListener("activate", (event) => {
     caches.keys()
       .then((keys) => Promise.all(
         keys
-          .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+          .filter((key) => key.startsWith(CACHE_PREFIX))
           .map((key) => caches.delete(key)),
       ))
-      .then(() => self.clients.claim()),
+      .then(() => self.clients.claim())
+      .then(() => self.registration.unregister()),
   );
 });
 
-self.addEventListener("fetch", (event) => {
-  const request = event.request;
-  if (request.method !== "GET") {
-    return;
-  }
-
-  const url = new URL(request.url);
-  if (url.origin !== self.location.origin || !url.pathname.includes("/apps/home/")) {
-    return;
-  }
-
-  event.respondWith(
-    fetch(request)
-      .then((response) => {
-        if (response.ok) {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
-        }
-        return response;
-      })
-      .catch(() => caches.match(request).then((cached) => cached || new Response("", {
-        status: 504,
-        statusText: "Offline",
-      }))),
-  );
-});
+self.addEventListener("fetch", () => {});

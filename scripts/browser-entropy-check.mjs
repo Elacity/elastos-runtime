@@ -49,20 +49,20 @@ function assertNoForbidden(source, label, forbidden) {
 }
 
 const browserManifest = read("capsules/browser/capsule.json");
-const browser = read("capsules/browser/index.html");
+const browser = read("capsules/browser/browser/index.html");
 const browserJs = readAll([
-  "capsules/browser/browser.js",
-  "capsules/browser/browser-clipboard.js",
-  "capsules/browser/browser-history.js",
-  "capsules/browser/browser-input.js",
-  "capsules/browser/browser-input-surface.js",
-  "capsules/browser/browser-location.js",
-  "capsules/browser/browser-remote-display.js",
-  "capsules/browser/browser-runtime-api.js",
-  "capsules/browser/browser-status.js",
-  "capsules/browser/browser-webrtc.js",
+  "capsules/browser/browser/browser.js",
+  "capsules/browser/browser/browser-clipboard.js",
+  "capsules/browser/browser/browser-history.js",
+  "capsules/browser/browser/browser-input.js",
+  "capsules/browser/browser/browser-input-surface.js",
+  "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-remote-display.js",
+  "capsules/browser/browser/browser-runtime-api.js",
+  "capsules/browser/browser/browser-status.js",
+  "capsules/browser/browser/browser-webrtc.js",
 ]);
-const browserStyle = read("capsules/browser/style.css");
+const browserStyle = read("capsules/browser/browser/style.css");
 const homeShellWindows = read("capsules/home/browser/shell-windows.js");
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
@@ -586,8 +586,10 @@ assert(
     browserObjectiveAudit.includes("manual UX evidence") &&
     browserObjectiveAudit.includes("audio_product_proven") &&
     browserObjectiveAudit.includes("manual_user_acceptance") &&
-    !browserObjectiveAudit.includes("TODAY.md"),
-  "Browser completion gates must produce durable machine artifacts and must not depend on ignored TODAY.md evidence",
+    browserObjectiveAudit.includes("TASKS.md") &&
+    browserObjectiveAudit.includes("ROADMAP.md") &&
+    browserObjectiveAudit.includes("docs/BROWSER_PROVIDER_BAKEOFF.md"),
+  "Browser completion gates must produce durable machine artifacts and planning evidence",
 );
 
 assert(

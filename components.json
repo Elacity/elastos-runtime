@@ -91,6 +91,33 @@
         "aarch64-linux"
       ]
     },
+    "object-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    "wallet-walletconnect": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "any"
+      ],
+      "note": "WASM capsule (wasm32-wasip1) - platform-independent, runs via runtime bridge"
+    },
+    "content-block-graph-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
     "drm-provider": {
       "cid": "",
       "sha256": "",
@@ -423,6 +450,46 @@
         }
       }
     },
+    "object-provider": {
+      "install_path": "bin/object-provider",
+      "description": "Host object provider binary for principal-root Library object authority",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "object-provider-linux-amd64",
+          "install_path": "bin/object-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "object-provider-linux-arm64",
+          "install_path": "bin/object-provider"
+        }
+      }
+    },
+    "content-block-graph-provider": {
+      "install_path": "bin/content-block-graph-provider",
+      "description": "Host block graph provider binary for Runtime-mediated arbitrary DAG repair",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "content-block-graph-provider-linux-amd64",
+          "install_path": "bin/content-block-graph-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "content-block-graph-provider-linux-arm64",
+          "install_path": "bin/content-block-graph-provider"
+        }
+      }
+    },
     "drm-provider": {
       "install_path": "bin/drm-provider",
       "description": "Host DRM provider binary for Runtime-mediated protected content requests",
@@ -505,7 +572,7 @@
     },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
-      "description": "Host WebSpace resolver binary required for localhost://WebSpaces/<moniker>/... handles",
+      "description": "Host WebSpace resolver binary for mounted localhost://WebSpaces/<moniker>/... handles",
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -523,24 +590,23 @@
         }
       }
     },
-    "object-provider": {
-      "install_path": "bin/object-provider",
-      "source_path": "capsules/object-provider",
-      "description": "Principal-root object provider binary required for Library file and folder authority",
+    "operator-drive-adapter": {
+      "install_path": "bin/operator-drive-adapter",
+      "description": "Runtime-only operator WebSpace resolver adapter for metadata, byte reads, and mutable write-back",
       "platforms": {
         "linux-amd64": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "object-provider-linux-amd64",
-          "install_path": "bin/object-provider"
+          "release_path": "operator-drive-adapter-linux-amd64",
+          "install_path": "bin/operator-drive-adapter"
         },
         "linux-arm64": {
           "cid": "",
           "checksum": "",
           "size": 0,
-          "release_path": "object-provider-linux-arm64",
-          "install_path": "bin/object-provider"
+          "release_path": "operator-drive-adapter-linux-arm64",
+          "install_path": "bin/operator-drive-adapter"
         }
       }
     },
@@ -611,6 +677,20 @@
           "release_path": "wallet-unisat.tar.gz",
           "extract_path": "wallet-unisat",
           "install_path": "capsules/wallet-unisat"
+        }
+      }
+    },
+    "wallet-walletconnect": {
+      "install_path": "capsules/wallet-walletconnect",
+      "description": "Optional WalletConnect approval-method connector capsule",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "wallet-walletconnect.tar.gz",
+          "extract_path": "wallet-walletconnect",
+          "install_path": "capsules/wallet-walletconnect"
         }
       }
     },
@@ -774,7 +854,7 @@
     },
     "library": {
       "install_path": "capsules/library",
-      "description": "Library capsule for browsing local document objects",
+      "description": "Library capsule for Runtime-mediated file and object management",
       "platforms": {
         "*": {
           "cid": "",
@@ -997,7 +1077,10 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
+        "object-provider",
+        "content-block-graph-provider",
         "browser",
         "documents",
         "library",
@@ -1025,7 +1108,10 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
+        "object-provider",
+        "content-block-graph-provider",
         "browser",
         "chat",
         "chat-wasm",
@@ -1096,7 +1182,10 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
+        "object-provider",
+        "content-block-graph-provider",
         "browser",
         "kubo",
         "ipfs-provider",
@@ -1130,7 +1219,10 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
+        "object-provider",
+        "content-block-graph-provider",
         "browser",
         "kubo",
         "ipfs-provider",
@@ -1160,6 +1252,8 @@
         "browser-stream-bridge",
         "browser-local-exit",
         "wallet-provider",
+        "object-provider",
+        "content-block-graph-provider",
         "drm-provider",
         "rights-provider",
         "key-provider",
@@ -1170,6 +1264,7 @@
         "system",
         "wallet-metamask",
         "wallet-unisat",
+        "wallet-walletconnect",
         "wallet",
         "browser",
         "chat",

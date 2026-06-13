@@ -100,8 +100,10 @@ async fn test_home_static_route_serves_browser_surface() {
 async fn test_home_summary_reports_identity_and_launch_targets() {
     let dir = tempfile::tempdir().unwrap();
 
-    let app = gateway_router(test_state(dir.path()));
+    let state = library_test_state(dir.path()).await;
+    let app = gateway_router(state);
     let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let library_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
     let public = app
         .clone()
         .oneshot(
@@ -125,6 +127,15 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert!(public_payload["identity"]["device_did"].is_null());
     assert_eq!(public_payload["browser_state"]["principal_id"], "");
     assert_eq!(public_payload["browser_state"]["localhost_root"], "");
+    assert_eq!(
+        public_payload["desktop_objects"]["schema"],
+        "elastos.home.desktop-objects/v1"
+    );
+    assert_eq!(public_payload["desktop_objects"]["uri"], "");
+    assert!(public_payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(public_payload["browser_state"]["layout"].is_null());
     assert!(public_payload["browser_state"]["session"].is_null());
     assert!(public_payload["browser_state"]["recent_targets"]
@@ -143,6 +154,27 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
         .unwrap()
         .iter()
         .any(|target| target["target"] == "system"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/object/mkdir")
+                .header("x-elastos-home-token", library_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "parent_uri": format!("{}/Desktop", crate::auth::principal_localhost_root(&authority.principal_id)),
+                        "name": "Test Folder",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let resp = app
         .oneshot(
@@ -172,6 +204,30 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     assert_eq!(payload["site"]["root_uri"], MY_WEBSITE_URI);
     assert_eq!(payload["room"]["pending_count"], 0);
     assert_eq!(payload["notifications"]["unread_count"], 0);
+    assert_eq!(
+        payload["desktop_objects"]["schema"],
+        "elastos.home.desktop-objects/v1"
+    );
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    assert_eq!(
+        payload["desktop_objects"]["uri"],
+        format!("{localhost_root}/Desktop")
+    );
+    assert!(payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| object["name"] == "Test Folder" && object["kind"] == "directory"));
+    assert!(payload["desktop_objects"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| {
+            object["name"] == "Trash"
+                && object["kind"] == "directory"
+                && object["uri"] == format!("{localhost_root}/.Trash")
+                && object["metadata"]["system_kind"] == "trash"
+        }));
     let targets = payload["targets"].as_array().unwrap();
     let system = targets
         .iter()
@@ -1464,6 +1520,29 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
 async fn test_home_browser_state_drops_unknown_targets() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let localhost_root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let desktop_object_entry = format!("object:{localhost_root}/Desktop/Test Folder");
+    let trash_entry = format!("object:{localhost_root}/.Trash");
+    let foreign_object_entry = "object:localhost://Users/foreign/Desktop/Bad".to_string();
+    let mut layout = json!({
+        "desktop": {
+            "system": { "x": 12, "y": 12 },
+            "obsolete-wallet": { "x": 24, "y": 24 }
+        },
+        "desktopHidden": ["system", "obsolete-wallet"],
+        "desktopLabels": {
+            "system": "System",
+            "obsolete-wallet": "Old Wallet"
+        },
+        "taskbar": ["system", "obsolete-wallet"],
+        "desktopIconsVisible": true
+    });
+    {
+        let desktop = layout["desktop"].as_object_mut().unwrap();
+        desktop.insert(desktop_object_entry.clone(), json!({ "x": 36, "y": 36 }));
+        desktop.insert(trash_entry.clone(), json!({ "x": 48, "y": 48 }));
+        desktop.insert(foreign_object_entry.clone(), json!({ "x": 60, "y": 60 }));
+    }
     let app = gateway_router(test_state(dir.path()));
 
     let updated = app
@@ -1476,19 +1555,7 @@ async fn test_home_browser_state_drops_unknown_targets() {
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
-                        "layout": {
-                            "desktop": {
-                                "system": { "x": 12, "y": 12 },
-                                "obsolete-wallet": { "x": 24, "y": 24 }
-                            },
-                            "desktopHidden": ["system", "obsolete-wallet"],
-                            "desktopLabels": {
-                                "system": "System",
-                                "obsolete-wallet": "Old Wallet"
-                            },
-                            "taskbar": ["system", "obsolete-wallet"],
-                            "desktopIconsVisible": true
-                        },
+                        "layout": layout,
                         "session": {
                             "browser_context_id": "browser:test",
                             "windows": [
@@ -1510,6 +1577,15 @@ async fn test_home_browser_state_drops_unknown_targets() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["layout"]["desktop"].get("obsolete-wallet").is_none());
+    assert!(json["layout"]["desktop"]
+        .get(desktop_object_entry.as_str())
+        .is_some());
+    assert!(json["layout"]["desktop"]
+        .get(trash_entry.as_str())
+        .is_some());
+    assert!(json["layout"]["desktop"]
+        .get(foreign_object_entry.as_str())
+        .is_none());
     assert!(json["layout"]["desktopLabels"]
         .get("obsolete-wallet")
         .is_none());
@@ -1759,6 +1835,65 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
                 .as_str()
                 .unwrap_or_default()
                 .contains("chat-room")));
+}
+
+#[tokio::test]
+async fn test_home_launch_materializes_source_wasm_capsule_before_runtime_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    write_test_browser_capsule(
+        dir.path(),
+        MARKETPLACE_CAPSULE_ID,
+        "app",
+        "Marketplace test capsule",
+        None,
+    );
+    let marketplace_dir = dir.path().join("capsules").join(MARKETPLACE_CAPSULE_ID);
+    let built_wasm = marketplace_dir
+        .join("target")
+        .join("wasm32-wasip1")
+        .join("release")
+        .join("marketplace.wasm");
+    std::fs::create_dir_all(built_wasm.parent().unwrap()).unwrap();
+    std::fs::write(&built_wasm, b"\0asm").unwrap();
+    assert!(!marketplace_dir.join("marketplace.wasm").exists());
+
+    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
+    let runtime = start_fake_runtime(dir.path(), bus, "marketplace-peer").await;
+    let app = gateway_router(test_state(dir.path()));
+
+    let launch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"marketplace"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(launch.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["launch_status"], "launched");
+
+    let launch_requests = runtime.launch_requests.lock().await;
+    let launch_path = launch_requests
+        .last()
+        .and_then(|request| request["path"].as_str())
+        .expect("runtime launch path");
+    assert!(launch_path.ends_with("/dev-capsules/marketplace"));
+    let launch_bundle = std::path::Path::new(launch_path);
+    assert!(launch_bundle.join("capsule.json").is_file());
+    assert!(launch_bundle.join("marketplace.wasm").is_file());
+    assert!(
+        !marketplace_dir.join("marketplace.wasm").exists(),
+        "source tree should not be dirtied with generated wasm"
+    );
 }
 
 #[tokio::test]

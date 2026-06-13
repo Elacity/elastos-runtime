@@ -18,7 +18,7 @@ use k256::ecdsa::SigningKey as EvmSigningKey;
 use serde_json::json;
 use sha2::Sha256;
 use sha3::Keccak256;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(unix)]
 use tokio::io::AsyncReadExt as _;
 use tokio::net::TcpListener;
@@ -47,6 +47,110 @@ async fn documents_test_state(cache_dir: &std::path::Path) -> GatewayState {
     let registry = Arc::new(ProviderRegistry::new());
     registry
         .register(Arc::new(crate::documents::DocumentsProvider::new(
+            cache_dir.to_path_buf(),
+            Arc::downgrade(&registry),
+        )))
+        .await;
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn library_test_state(cache_dir: &std::path::Path) -> GatewayState {
+    library_test_state_with_content(cache_dir, true).await
+}
+
+async fn library_test_state_without_content(cache_dir: &std::path::Path) -> GatewayState {
+    library_test_state_with_content(cache_dir, false).await
+}
+
+async fn library_protected_content_test_state(cache_dir: &std::path::Path) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry.register(Arc::new(MockDrmProvider)).await;
+    registry.register(Arc::new(MockRightsProvider)).await;
+    registry.register(Arc::new(MockKeyProvider)).await;
+    registry.register(Arc::new(MockDecryptProvider)).await;
+    registry
+        .register(Arc::new(crate::library::ObjectProvider::new(
+            cache_dir.to_path_buf(),
+            Arc::downgrade(&registry),
+        )))
+        .await;
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    registry
+        .register(Arc::new(MockExternalObjectProvider {
+            data_dir: cache_dir.to_path_buf(),
+        }))
+        .await;
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn library_webspace_test_state(cache_dir: &std::path::Path) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register(Arc::new(MockExternalObjectProvider {
+            data_dir: cache_dir.to_path_buf(),
+        }))
+        .await;
+    registry
+        .register(Arc::new(MockWebSpaceProvider::default()))
+        .await;
+    registry
+        .register(Arc::new(MockWebSpaceAdapterProvider))
+        .await;
+    registry
+        .register(Arc::new(MockOperatorWebSpaceAdapterProvider))
+        .await;
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn library_test_state_with_content(
+    cache_dir: &std::path::Path,
+    with_content: bool,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    if with_content {
+        registry
+            .register_sub_provider("content", Arc::new(MockContentProvider))
+            .await
+            .unwrap();
+    }
+    registry
+        .register(Arc::new(crate::library::ObjectProvider::new(
             cache_dir.to_path_buf(),
             Arc::downgrade(&registry),
         )))
@@ -273,6 +377,7 @@ mod documents;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod home_system;
+mod library;
 mod marketplace;
 mod recovery;
 mod room;

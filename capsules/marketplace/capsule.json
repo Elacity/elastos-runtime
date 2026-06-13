@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "description": "Marketplace for browsing apps, viewers, providers, and content installed on this Runtime",
   "role": "app",
-  "type": "data",
+  "type": "wasm",
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "marketplace.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false

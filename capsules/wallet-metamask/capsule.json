@@ -5,8 +5,8 @@
   "description": "Connect MetaMask as an optional approval method",
   "author": "elastos",
   "role": "app",
-  "type": "data",
-  "entrypoint": "index.html",
+  "type": "wasm",
+  "entrypoint": "wallet-metamask.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false

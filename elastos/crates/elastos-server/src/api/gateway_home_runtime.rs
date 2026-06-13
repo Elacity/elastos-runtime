@@ -20,7 +20,20 @@ pub(super) async fn home_launch(
         ));
     }
 
-    let Some(target_summary) = home_launch_target(&state.data_dir, target) else {
+    let mut target_summary = home_launch_target(&state.data_dir, target);
+    if target_summary.is_none() || state.data_dir.join("capsules").join(target).exists() {
+        ensure_home_target_package(&state.data_dir, target, target_summary.is_none())
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": err })),
+                )
+            })?;
+        target_summary = home_launch_target(&state.data_dir, target);
+    }
+
+    let Some(target_summary) = target_summary else {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Home target not found" })),
@@ -55,7 +68,7 @@ pub(super) async fn home_launch(
     }))
 }
 
-fn append_home_launch_token(
+pub(super) fn append_home_launch_token(
     data_dir: &std::path::Path,
     route: &str,
     target: &str,
@@ -202,16 +215,36 @@ pub(super) fn apply_room_access(
     summary.browser_access_block_reason = access.block_reason;
 }
 
-async fn launch_runtime_backed_home_target(
+pub(super) async fn launch_runtime_backed_home_target(
     data_dir: &FsPath,
     target: &str,
     context: &HomeLaunchTokenContext,
 ) -> Option<GatewayRuntimeLaunchOutcome> {
+    if let Err(err) = ensure_home_target_package(data_dir, target, false).await {
+        return Some(GatewayRuntimeLaunchOutcome {
+            status: "failed".to_string(),
+            capsule_id: None,
+            detail: Some(err),
+        });
+    }
+
     let capsule_dir = resolve_capsule_dir(data_dir, target)?;
     let manifest = crate::api::capsule_inventory::load_capsule_manifest(&capsule_dir, target)?;
     if !manifest.role.is_shell_launchable() || manifest.capsule_type == CapsuleType::Data {
         return None;
     }
+
+    let runtime_capsule_dir =
+        match materialize_source_wasm_capsule_for_runtime(data_dir, &capsule_dir, &manifest) {
+            Ok(path) => path,
+            Err(err) => {
+                return Some(GatewayRuntimeLaunchOutcome {
+                    status: "failed".to_string(),
+                    capsule_id: None,
+                    detail: Some(err.to_string()),
+                });
+            }
+        };
 
     if let Err(err) = crate::runtime_control::ensure_runtime_for_home(data_dir).await {
         return Some(GatewayRuntimeLaunchOutcome {
@@ -222,7 +255,8 @@ async fn launch_runtime_backed_home_target(
     }
 
     Some(
-        match launch_runtime_capsule(data_dir, &capsule_dir, &manifest.name, context).await {
+        match launch_runtime_capsule(data_dir, &runtime_capsule_dir, &manifest.name, context).await
+        {
             Ok(outcome) => outcome,
             Err(err) => GatewayRuntimeLaunchOutcome {
                 status: "failed".to_string(),
@@ -231,6 +265,35 @@ async fn launch_runtime_backed_home_target(
             },
         },
     )
+}
+
+fn materialize_source_wasm_capsule_for_runtime(
+    data_dir: &FsPath,
+    capsule_dir: &FsPath,
+    manifest: &elastos_common::CapsuleManifest,
+) -> anyhow::Result<PathBuf> {
+    let entrypoint = capsule_dir.join(&manifest.entrypoint);
+    if entrypoint.is_file() || manifest.capsule_type != CapsuleType::Wasm {
+        return Ok(capsule_dir.to_path_buf());
+    }
+
+    let built_entrypoint = capsule_dir
+        .join("target")
+        .join("wasm32-wasip1")
+        .join("release")
+        .join(&manifest.entrypoint);
+    if !built_entrypoint.is_file() {
+        return Ok(capsule_dir.to_path_buf());
+    }
+
+    let bundle_dir = data_dir.join("dev-capsules").join(&manifest.name);
+    std::fs::create_dir_all(&bundle_dir)?;
+    std::fs::copy(
+        capsule_dir.join("capsule.json"),
+        bundle_dir.join("capsule.json"),
+    )?;
+    std::fs::copy(&built_entrypoint, bundle_dir.join(&manifest.entrypoint))?;
+    Ok(bundle_dir)
 }
 
 async fn launch_runtime_capsule(
@@ -268,6 +331,22 @@ async fn launch_runtime_capsule(
         capsule_id: Some(payload.id),
         detail: None,
     })
+}
+
+async fn ensure_home_target_package(
+    data_dir: &FsPath,
+    target: &str,
+    required: bool,
+) -> Result<(), String> {
+    let installed_dir = data_dir.join("capsules").join(target);
+    if !required && !installed_dir.exists() {
+        return Ok(());
+    }
+
+    crate::setup::ensure_capsule_component_for_home_launch(data_dir, target)
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("Home target package materialization failed: {err}"))
 }
 
 pub(super) async fn system_runtime_log(data_dir: &FsPath) -> SystemRuntimeLogSummary {
@@ -575,6 +654,7 @@ fn app_shell_title(name: &str) -> String {
         SYSTEM_CAPSULE_ID => "System".to_string(),
         BROWSER_CAPSULE_ID => "Browser".to_string(),
         WALLET_CAPSULE_ID => "Wallet".to_string(),
+        "archive-manager" => "Archive".to_string(),
         "gba-emulator" => "GBA Emulator".to_string(),
         "elacity-player" => "Owned Video".to_string(),
         "ddrm-viewer" => "Owned Asset".to_string(),
@@ -603,6 +683,7 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
         WALLET_CAPSULE_ID => {
             "View accounts, balances, approvals, and approval methods.".to_string()
         }
+        "archive-manager" => "Open archives selected from Library.".to_string(),
         _ if is_wallet_connector_capsule_id(name) => format!(
             "Add {} as an approval method.",
             wallet_connector_label(name)
@@ -622,6 +703,9 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
 }
 
 pub(crate) fn viewer_object_shell_title(name: &str, description: Option<&str>) -> String {
+    if name == "archive-manager" {
+        return "Archive".to_string();
+    }
     let Some(description) = description.map(str::trim).filter(|value| !value.is_empty()) else {
         return title_case_capsule_name(name);
     };

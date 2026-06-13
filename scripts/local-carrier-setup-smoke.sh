@@ -98,8 +98,22 @@ echo "[local-carrier-setup] building current binary and first-party Home core as
 (cd "${REPO_ROOT}/capsules/webspace-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/object-provider" && cargo build --release)
 (cd "${REPO_ROOT}/capsules/home-cli" && cargo build --target wasm32-wasip1 --release)
-(cd "${REPO_ROOT}/capsules/home" && cargo build --target wasm32-wasip1 --release)
-(cd "${REPO_ROOT}/capsules/system" && cargo build --target wasm32-wasip1 --release)
+for capsule in \
+    home \
+    system \
+    browser \
+    documents \
+    gba-emulator \
+    inbox \
+    library \
+    marketplace \
+    wallet \
+    wallet-metamask \
+    wallet-unisat \
+    wallet-walletconnect
+do
+    (cd "${REPO_ROOT}/capsules/${capsule}" && cargo build --target wasm32-wasip1 --release)
+done
 
 mkdir -p "${ARTIFACTS_DIR}"
 mkdir -p "${DATA_DIR}/bin"
@@ -124,10 +138,16 @@ OBJECT_PROVIDER_BIN="${REPO_ROOT}/capsules/object-provider/target/release/object
 HOME_CLI_DIR="${REPO_ROOT}/capsules/home-cli" \
 HOME_CAPSULE_DIR="${REPO_ROOT}/capsules/home" \
 SYSTEM_CAPSULE_DIR="${REPO_ROOT}/capsules/system" \
+BROWSER_CAPSULE_DIR="${REPO_ROOT}/capsules/browser" \
 DOCUMENTS_CAPSULE_DIR="${REPO_ROOT}/capsules/documents" \
+GBA_EMULATOR_CAPSULE_DIR="${REPO_ROOT}/capsules/gba-emulator" \
 LIBRARY_CAPSULE_DIR="${REPO_ROOT}/capsules/library" \
 MARKETPLACE_CAPSULE_DIR="${REPO_ROOT}/capsules/marketplace" \
 INBOX_CAPSULE_DIR="${REPO_ROOT}/capsules/inbox" \
+WALLET_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet" \
+WALLET_METAMASK_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-metamask" \
+WALLET_UNISAT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-unisat" \
+WALLET_WALLETCONNECT_CAPSULE_DIR="${REPO_ROOT}/capsules/wallet-walletconnect" \
 python3 - <<'PY'
 import hashlib
 import json
@@ -193,6 +213,16 @@ home_cli_manifest["size"] = len(home_cli_data)
 browser_capsules = {
     "home": pathlib.Path(os.environ["HOME_CAPSULE_DIR"]),
     "system": pathlib.Path(os.environ["SYSTEM_CAPSULE_DIR"]),
+    "browser": pathlib.Path(os.environ["BROWSER_CAPSULE_DIR"]),
+    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
+    "gba-emulator": pathlib.Path(os.environ["GBA_EMULATOR_CAPSULE_DIR"]),
+    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
+    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
+    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
+    "wallet": pathlib.Path(os.environ["WALLET_CAPSULE_DIR"]),
+    "wallet-metamask": pathlib.Path(os.environ["WALLET_METAMASK_CAPSULE_DIR"]),
+    "wallet-unisat": pathlib.Path(os.environ["WALLET_UNISAT_CAPSULE_DIR"]),
+    "wallet-walletconnect": pathlib.Path(os.environ["WALLET_WALLETCONNECT_CAPSULE_DIR"]),
 }
 for name, capsule_dir in browser_capsules.items():
     info = platform_info(name)
@@ -207,28 +237,6 @@ for name, capsule_dir in browser_capsules.items():
             arcname=f"{name}/{name}.wasm",
         )
         tar.add(capsule_dir / "browser", arcname=f"{name}/browser")
-    data = archive.read_bytes()
-    info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
-    info["size"] = len(data)
-
-data_capsules = {
-    "documents": pathlib.Path(os.environ["DOCUMENTS_CAPSULE_DIR"]),
-    "library": pathlib.Path(os.environ["LIBRARY_CAPSULE_DIR"]),
-    "marketplace": pathlib.Path(os.environ["MARKETPLACE_CAPSULE_DIR"]),
-    "inbox": pathlib.Path(os.environ["INBOX_CAPSULE_DIR"]),
-}
-for name, capsule_dir in data_capsules.items():
-    info = platform_info(name)
-    release_path = info.get("release_path")
-    if not release_path:
-        raise SystemExit(f"{name} missing release_path for {platform}")
-    archive = artifacts_dir / release_path
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(capsule_dir / "capsule.json", arcname=f"{name}/capsule.json")
-        for asset in sorted(capsule_dir.rglob("*")):
-            if not asset.is_file() or asset.name == "capsule.json":
-                continue
-            tar.add(asset, arcname=f"{name}/{asset.relative_to(capsule_dir)}")
     data = archive.read_bytes()
     info["checksum"] = "sha256:" + hashlib.sha256(data).hexdigest()
     info["size"] = len(data)
@@ -401,15 +409,31 @@ for installed in \
     "${DATA_DIR}/capsules/home/browser/index.html" \
     "${DATA_DIR}/capsules/system/system.wasm" \
     "${DATA_DIR}/capsules/system/browser/index.html" \
-    "${DATA_DIR}/capsules/documents/index.html" \
-    "${DATA_DIR}/capsules/library/index.html" \
-    "${DATA_DIR}/capsules/library/library.css" \
-    "${DATA_DIR}/capsules/library/src/app.js" \
-    "${DATA_DIR}/capsules/library/icons/folder.svg" \
-    "${DATA_DIR}/capsules/marketplace/index.html" \
-    "${DATA_DIR}/capsules/marketplace/marketplace.css" \
-    "${DATA_DIR}/capsules/marketplace/marketplace.js" \
-    "${DATA_DIR}/capsules/inbox/index.html"
+    "${DATA_DIR}/capsules/browser/browser.wasm" \
+    "${DATA_DIR}/capsules/browser/browser/index.html" \
+    "${DATA_DIR}/capsules/documents/documents.wasm" \
+    "${DATA_DIR}/capsules/documents/browser/index.html" \
+    "${DATA_DIR}/capsules/gba-emulator/gba-emulator.wasm" \
+    "${DATA_DIR}/capsules/gba-emulator/browser/index.html" \
+    "${DATA_DIR}/capsules/inbox/inbox.wasm" \
+    "${DATA_DIR}/capsules/inbox/browser/index.html" \
+    "${DATA_DIR}/capsules/library/library.wasm" \
+    "${DATA_DIR}/capsules/library/browser/index.html" \
+    "${DATA_DIR}/capsules/library/browser/library.css" \
+    "${DATA_DIR}/capsules/library/browser/src/app.js" \
+    "${DATA_DIR}/capsules/library/browser/icons/folder.svg" \
+    "${DATA_DIR}/capsules/marketplace/marketplace.wasm" \
+    "${DATA_DIR}/capsules/marketplace/browser/index.html" \
+    "${DATA_DIR}/capsules/marketplace/browser/marketplace.css" \
+    "${DATA_DIR}/capsules/marketplace/browser/marketplace.js" \
+    "${DATA_DIR}/capsules/wallet/wallet.wasm" \
+    "${DATA_DIR}/capsules/wallet/browser/index.html" \
+    "${DATA_DIR}/capsules/wallet-metamask/wallet-metamask.wasm" \
+    "${DATA_DIR}/capsules/wallet-metamask/browser/index.html" \
+    "${DATA_DIR}/capsules/wallet-unisat/wallet-unisat.wasm" \
+    "${DATA_DIR}/capsules/wallet-unisat/browser/index.html" \
+    "${DATA_DIR}/capsules/wallet-walletconnect/wallet-walletconnect.wasm" \
+    "${DATA_DIR}/capsules/wallet-walletconnect/browser/index.html"
 do
     if [[ ! -f "${installed}" ]]; then
         echo "expected installed file missing: ${installed}" >&2

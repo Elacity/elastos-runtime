@@ -402,6 +402,7 @@ mod tests {
             provides: None,
             authority: None,
             capabilities: Vec::new(),
+            interfaces: Vec::new(),
             resources: ResourceLimits::default(),
             permissions: Permissions::default(),
             microvm: None,

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "description": "Play GBA games",
   "role": "viewer",
-  "type": "data",
+  "type": "wasm",
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "gba-emulator.wasm",
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
   },

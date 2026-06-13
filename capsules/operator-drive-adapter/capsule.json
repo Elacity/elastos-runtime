@@ -1,0 +1,32 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "operator-drive-adapter",
+  "version": "0.1.0",
+  "description": "Operator WebSpace resolver adapter for Runtime-mediated metadata, byte read, and mutable write-back tests",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "operator-drive-adapter://*",
+  "authority": {
+    "reason": "Attaches an operator-managed resolver namespace to localhost://WebSpaces without exposing resolver credentials, host paths, or raw backend APIs to app capsules.",
+    "capabilities": [
+      {
+        "resource": "operator-drive-adapter://*",
+        "actions": ["read", "write"],
+        "operations": ["status", "metadata_index", "read_bytes", "write_bytes"]
+      }
+    ],
+    "audit_events": [
+      "operator_drive_adapter.status",
+      "operator_drive_adapter.metadata_index",
+      "operator_drive_adapter.read_bytes",
+      "operator_drive_adapter.write_bytes"
+    ]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

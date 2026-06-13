@@ -414,6 +414,7 @@ mod tests {
             requires: Vec::new(),
             provides: None,
             capabilities: Vec::new(),
+            interfaces: Vec::new(),
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_shares: 100,
@@ -473,6 +474,7 @@ mod tests {
             requires: Vec::new(),
             provides: None,
             capabilities: Vec::new(),
+            interfaces: Vec::new(),
             resources: ResourceLimits::default(),
             permissions: Default::default(),
             microvm: Some(MicroVmConfig {

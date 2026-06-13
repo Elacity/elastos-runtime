@@ -2,11 +2,11 @@
   "schema": "elastos.capsule/v1",
   "name": "library",
   "version": "0.1.0",
-  "description": "File manager for local files, folders, and published objects through the Runtime object provider",
+  "description": "Library for local files, folders, and published objects through the Runtime object provider",
   "role": "app",
-  "type": "data",
+  "type": "wasm",
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "library.wasm",
   "requires": [
     { "name": "object-provider", "kind": "capsule" }
   ],

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "description": "Create, edit, and publish markdown documents",
   "role": "viewer",
-  "type": "data",
+  "type": "wasm",
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "documents.wasm",
   "resources": {
     "memory_mb": 24,
     "gpu": false

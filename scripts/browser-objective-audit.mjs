@@ -305,9 +305,9 @@ function promptToArtifactChecklist({ criteria, hostedBakeoff, nativePreflight, m
       "Prevent diagnostic frames, proof surfaces, or URL-only hosted sessions from masquerading as the product browser.",
       criterionOk(criteria, "native_media_not_faked") && criterionOk(criteria, "native_media_preflight_gate"),
       [
-        "capsules/browser/browser.js",
-        "capsules/browser/browser-input-surface.js",
-        "capsules/browser/browser-remote-display.js",
+        "capsules/browser/browser/browser.js",
+        "capsules/browser/browser/browser-input-surface.js",
+        "capsules/browser/browser/browser-remote-display.js",
         "scripts/browser-display-mode-smoke.mjs",
         "scripts/browser-entropy-check.mjs",
         "docs/BROWSER_CAPSULE.md",
@@ -353,9 +353,9 @@ function main() {
   const runbook = readRepo("scripts/browser-provider-runbook.mjs");
   const entropy = readRepo("scripts/browser-entropy-check.mjs");
   const browserUi = [
-    readRepo("capsules/browser/browser.js"),
-    readRepo("capsules/browser/browser-input-surface.js"),
-    readRepo("capsules/browser/browser-remote-display.js"),
+    readRepo("capsules/browser/browser/browser.js"),
+    readRepo("capsules/browser/browser/browser-input-surface.js"),
+    readRepo("capsules/browser/browser/browser-remote-display.js"),
   ].join("\n");
   const displayModeSmoke = readRepo("scripts/browser-display-mode-smoke.mjs");
 
@@ -495,9 +495,9 @@ function main() {
         displayModeSmoke.includes("remote display must unlock audio from a direct pointer gesture") &&
         displayModeSmoke.includes("remote display must reset audible volume"),
       [
-        "capsules/browser/browser.js",
-        "capsules/browser/browser-input-surface.js",
-        "capsules/browser/browser-remote-display.js",
+        "capsules/browser/browser/browser.js",
+        "capsules/browser/browser/browser-input-surface.js",
+        "capsules/browser/browser/browser-remote-display.js",
         "scripts/browser-display-mode-smoke.mjs",
       ],
       "Wire Browser UI WebRTC audio receive, muted autoplay startup, volume reset, explicit user-gesture unlock, and status feedback before relying on product media proof.",

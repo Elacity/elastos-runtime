@@ -857,11 +857,11 @@ pub(crate) enum WebspaceCommand {
     },
     /// Persistently mount an external namespace under localhost://WebSpaces/<moniker>
     Mount {
-        /// Local WebSpace moniker, for example Google
+        /// Local WebSpace moniker, for example Cloud
         moniker: String,
-        /// External target URI, for example google://drive or https://example.com
+        /// External target URI, for example cloud://drive or https://example.com
         target_uri: String,
-        /// Optional namespace URI override, for example google://
+        /// Optional namespace URI override, for example cloud://
         #[arg(long)]
         namespace_uri: Option<String>,
         /// Resolver/provider identifier required for live access
@@ -903,7 +903,7 @@ pub(crate) enum WebspaceCommand {
     },
     /// Refresh resolver metadata for a WebSpace handle, optionally replacing its resolver index
     Refresh {
-        /// Moniker or handle path to refresh, for example: Google
+        /// Moniker or handle path to refresh, for example: Cloud
         target: String,
         /// Optional JSON file containing a replacement resolver index
         #[arg(long)]
@@ -938,7 +938,7 @@ pub(crate) enum WebspaceCommand {
     },
     /// Show metadata-cache status for a WebSpace handle
     CacheStatus {
-        /// Moniker or handle path, for example: Google/Drive/file.pdf
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
         target: String,
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -946,7 +946,7 @@ pub(crate) enum WebspaceCommand {
     },
     /// Refresh provider-owned metadata cache state for a WebSpace handle
     Cache {
-        /// Moniker or handle path, for example: Google/Drive/file.pdf
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
         target: String,
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -954,7 +954,7 @@ pub(crate) enum WebspaceCommand {
     },
     /// Show sync/dirty status for a WebSpace handle
     SyncStatus {
-        /// Moniker or handle path, for example: Google/Drive/file.pdf
+        /// Moniker or handle path, for example: Cloud/Drive/file.pdf
         target: String,
         /// Emit machine-readable JSON
         #[arg(long)]

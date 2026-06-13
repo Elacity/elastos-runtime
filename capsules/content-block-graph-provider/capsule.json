@@ -1,0 +1,31 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "content-block-graph-provider",
+  "version": "0.1.0",
+  "description": "Runtime-only block graph export/import contract for content repair",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://block-graph/*",
+  "authority": {
+    "reason": "Exports and imports bounded content block graphs for provider-to-provider repair without exposing raw Kubo/IPFS, filesystem, or peer authority to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://block-graph/*",
+        "actions": ["read", "write"],
+        "operations": ["export_graph", "import_graph", "status"]
+      }
+    ],
+    "audit_events": [
+      "content.block_graph.export_requested",
+      "content.block_graph.import_requested",
+      "content.block_graph.failed_closed"
+    ]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

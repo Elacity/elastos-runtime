@@ -5,8 +5,8 @@
   "description": "Connect UniSat as an optional Bitcoin approval method",
   "author": "elastos",
   "role": "app",
-  "type": "data",
-  "entrypoint": "index.html",
+  "type": "wasm",
+  "entrypoint": "wallet-unisat.wasm",
   "resources": {
     "memory_mb": 16,
     "gpu": false
