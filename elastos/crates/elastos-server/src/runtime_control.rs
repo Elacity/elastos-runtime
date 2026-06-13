@@ -348,6 +348,11 @@ pub async fn read_runtime_coords(path: &Path) -> Option<RuntimeCoords> {
         }
     };
 
+    // Fast-path liveness check via /proc is Linux-only; macOS (and other non-Linux
+    // hosts) have no /proc, so this would always report the runtime dead and the
+    // gateway would cold-start a fresh managed runtime on every open. Skip it off
+    // Linux and rely on the authoritative /api/health probe below.
+    #[cfg(target_os = "linux")]
     if !PathBuf::from(format!("/proc/{}", coords.pid)).exists() {
         let _ = std::fs::remove_file(path);
         return None;

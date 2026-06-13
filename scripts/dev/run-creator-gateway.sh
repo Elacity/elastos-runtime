@@ -89,6 +89,21 @@ build_capsule decrypt-provider --features rail-stream,rail-mint
 # Without it the gateway boots but Library object operations fail closed.
 build_capsule object-provider
 
+# v0.4.0 browser app capsules need compiled wasm entrypoints (gitignored like home.wasm).
+# Opening Library/Marketplace/etc. from Home spawns a managed runtime that loads <name>.wasm.
+echo "building v0.4.0 app capsule wasm (wasm32-wasip1) ..."
+for c in library documents inbox system marketplace archive-manager; do
+  cj="${CAPSULES}/${c}/capsule.json"
+  [[ -f "$cj" ]] || continue
+  entry=$(grep -oE '"entrypoint"[^,]*' "$cj" | sed -E 's/.*"entrypoint"[^"]*"([^"]+)".*/\1/')
+  [[ -n "$entry" ]] || continue
+  echo "  ${c} -> ${entry}"
+  cargo build --quiet --manifest-path "${CAPSULES}/${c}/Cargo.toml" --target wasm32-wasip1 --release \
+    || { echo "FAIL: could not build ${c} wasm" >&2; exit 1; }
+  out=$(find "${CAPSULES}/${c}/target/wasm32-wasip1/release" -maxdepth 1 -name '*.wasm' 2>/dev/null | head -1)
+  [[ -n "$out" ]] && cp "$out" "${CAPSULES}/${c}/${entry}"
+done
+
 echo "building media-authority helper ..."
 cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/ddrm-media-authority/Cargo.toml" \
   || echo "WARN: media-authority helper build failed (owned-video playback seam) — mint still works"
@@ -131,6 +146,24 @@ export ELASTOS_DECRYPT_PROVIDER_BIN="$(cap_bin decrypt-provider)"
 export ELASTOS_DDRM_DECRYPT_BIN="$(cap_bin decrypt-provider)"
 # v0.4.0 Library object plane.
 export ELASTOS_OBJECT_PROVIDER_BIN="$(cap_bin object-provider)"
+# Opening an app from Home spawns a managed child runtime (`elastos serve`) that
+# fail-closed VERIFIES every installed provider. On macOS the platform key resolves
+# to "unknown-arm64", which has no manifest entry, so verification rejects providers
+# that have no Rust source crate here (localhost/did/site/tunnel/webspace). These are
+# genuine Mach-O arm64 binaries from the install; point the per-name override at them
+# so the managed runtime trusts them WITHOUT manifest verification (explicit dev trust).
+# The child runtime inherits this env (runtime_control spawns serve without env_clear).
+INSTALLED_BIN="${DATA_DIR}/bin"
+for p in localhost did site tunnel webspace; do
+  bin_path="${INSTALLED_BIN}/${p}-provider"
+  if [[ -x "$bin_path" ]]; then
+    export "ELASTOS_$(echo "${p}_provider" | tr '[:lower:]-' '[:upper:]_')_BIN=$bin_path"
+  fi
+done
+# The managed home runtime also hosts the desktop 'shell' capsule, which it verifies
+# via verify_component_binary (same unknown-arm64 manifest miss). Point ELASTOS_SHELL_BIN
+# at the installed Mach-O arm64 shell so the dev-override bypass trusts it.
+[[ -x "${INSTALLED_BIN}/shell" ]] && export ELASTOS_SHELL_BIN="${INSTALLED_BIN}/shell"
 MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/debug/ddrm-media-authority"
 [[ -x "$MEDIA_AUTH_BIN" ]] && export ELASTOS_DDRM_MEDIA_AUTHORITY_BIN="$MEDIA_AUTH_BIN"
 # The Create portal reads the quorum here (also the default <data_dir>/dkms/quorum.json).
