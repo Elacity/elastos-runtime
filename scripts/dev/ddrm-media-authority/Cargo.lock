@@ -193,6 +193,7 @@ name = "ddrm-media-authority"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ddrm-envelope",
  "ddrm-media",
  "serde_json",
 ]

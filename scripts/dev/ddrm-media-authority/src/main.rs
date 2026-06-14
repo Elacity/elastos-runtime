@@ -31,6 +31,9 @@ use serde_json::{json, Value};
 
 use ddrm_media::{prepare, prepare_blob, PreparedSession, SessionParams};
 
+mod quorum;
+use quorum::{run_quorum, QuorumArgs};
+
 /// Guess a content type from a file extension for the NON-MEDIA object path.
 fn mime_for_path(path: &str) -> &'static str {
     let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -119,6 +122,12 @@ fn run() -> Result<(), String> {
     let mut object_cid = "elastos-owned-media".to_string();
     let mut ttl_secs: u64 = 3600;
     let mut rights_binding: Option<String> = None;
+    // `--quorum` (dKMS consumer-open) inputs.
+    let mut quorum_mode = false;
+    let mut key_bin: Option<String> = None;
+    let mut capsule_path: Option<String> = None;
+    let mut descriptor_path: Option<String> = None;
+    let mut caller_seed_b64: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -139,6 +148,12 @@ fn run() -> Result<(), String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--ttl-secs needs a number")?
             }
+            // dKMS consumer-open: recover the asset's REAL CEK from the 2-of-3 quorum.
+            "--quorum" => quorum_mode = true,
+            "--key-bin" => key_bin = args.next(),
+            "--capsule" => capsule_path = args.next(),
+            "--descriptor" => descriptor_path = args.next(),
+            "--caller-seed" => caller_seed_b64 = args.next(),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -147,6 +162,26 @@ fn run() -> Result<(), String> {
     let decrypt_bin = decrypt_bin.ok_or("--decrypt-bin is required")?;
     if !Path::new(&decrypt_bin).is_file() {
         return Err(format!("decrypt-provider binary not found: {decrypt_bin}"));
+    }
+
+    // dKMS consumer-open path: recover the minted asset's CEK from the 2-of-3 quorum and serve
+    // the byte-identical cleartext (the production analogue of the local-test-KMS object path).
+    if quorum_mode {
+        let key_bin = key_bin.ok_or("--key-bin is required for --quorum")?;
+        if !Path::new(&key_bin).is_file() {
+            return Err(format!("key-provider binary not found: {key_bin}"));
+        }
+        return run_quorum(QuorumArgs {
+            principal,
+            decrypt_bin,
+            key_bin,
+            capsule_path: capsule_path.ok_or("--capsule is required for --quorum")?,
+            descriptor_path: descriptor_path.ok_or("--descriptor is required for --quorum")?,
+            caller_seed_b64: caller_seed_b64.ok_or("--caller-seed is required for --quorum")?,
+            object_cid,
+            mime: object_mime.unwrap_or_else(|| "application/octet-stream".to_string()),
+            ttl_secs,
+        });
     }
 
     // NON-MEDIA object mode: seal an arbitrary owned asset (image/pdf/text/3D) and

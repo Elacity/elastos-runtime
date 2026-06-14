@@ -1106,9 +1106,100 @@ fn run_asset(
     Ok(())
 }
 
+/// MINT-CAPSULE: seal a real asset to the quorum and write the `.ddrm` capsule EXACTLY as the
+/// gateway's `persist_minted_asset_to_library` does — `protections[0]` escrow (scheme,
+/// node_set_id_b64, producer_verifying_key_b64, shares[3]) + `kid` + the persisted
+/// `ciphertext_b64`. This is the artifact `ddrm-media-authority --quorum` opens, so the helper
+/// can be verified against a capsule with the production shape (not a bespoke fixture).
+fn run_mint_capsule(
+    encrypt_bin: &str,
+    input_path: &str,
+    descriptor_path: &str,
+    out_capsule_path: &str,
+) -> Result<(), String> {
+    let plaintext =
+        std::fs::read(input_path).map_err(|e| format!("read input asset {input_path}: {e}"))?;
+    if plaintext.is_empty() {
+        return Err(format!("input asset {input_path} is empty"));
+    }
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path).map_err(|e| format!("read descriptor: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor: {e}"))?;
+    let nodes_v = desc
+        .get("threshold")
+        .and_then(|t| t.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or("descriptor has no threshold.nodes array")?;
+    let node_json: Vec<Value> = nodes_v
+        .iter()
+        .map(|n| {
+            json!({
+                "verifying_key_b64": n.get("verifying_key_b64"),
+                "recipient_pub_b64": n.get("recipient_pub_b64"),
+            })
+        })
+        .collect();
+
+    let mut encrypt = Capsule::spawn("encrypt-provider", encrypt_bin)?;
+    let enc_init = ok_data(&encrypt.call(&json!({ "op": "init" }))?, "encrypt init")?;
+    let producer_vk_b64 = enc_init["producer_verifying_key_b64"]
+        .as_str()
+        .ok_or("encrypt-provider published no producer vk")?
+        .to_string();
+    let sealed = ok_data(
+        &encrypt.call(&json!({
+            "op": "seal_inline_threshold",
+            "plaintext_b64": B64.encode(&plaintext),
+            "nodes": node_json,
+        }))?,
+        "encrypt seal_inline_threshold",
+    )?;
+    encrypt.shutdown();
+
+    let kid_hex = sealed["kid_hex"].as_str().ok_or("no kid_hex")?;
+    let scheme = sealed["scheme"].as_str().ok_or("no scheme")?;
+    let segment_b64 = sealed["segment_b64"].as_str().ok_or("no segment")?;
+    let node_set_id_b64 = sealed["node_set_id_b64"].as_str().ok_or("no node_set_id")?;
+    let shares = sealed["shares"].as_array().ok_or("no shares")?;
+
+    // The exact `.ddrm` capsule shape `persist_minted_asset_to_library` writes (+ ciphertext_b64).
+    let capsule = json!({
+        "schema": "elastos.ddrm.capsule/v1",
+        "title": "verify-asset",
+        "mime": "application/octet-stream",
+        "is_media": false,
+        "kid": kid_hex,
+        "content_id": kid_hex,
+        "ciphertext_b64": segment_b64,
+        "protections": [{
+            "algorithm": "aes-128",
+            "scheme": scheme,
+            "node_set_id_b64": node_set_id_b64,
+            "producer_verifying_key_b64": producer_vk_b64,
+            "shares": shares,
+        }],
+    });
+    std::fs::write(out_capsule_path, serde_json::to_vec_pretty(&capsule).unwrap())
+        .map_err(|e| format!("write capsule: {e}"))?;
+    println!(
+        "mint-capsule: sealed {}B asset -> {out_capsule_path} (kid={kid_hex})",
+        plaintext.len()
+    );
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = if let Some(pos) = args.iter().position(|a| a == "--asset") {
+    let result = if let Some(pos) = args.iter().position(|a| a == "--mint-capsule") {
+        let pre = &args[..pos];
+        let post = &args[pos + 1..];
+        if pre.is_empty() || post.len() < 3 {
+            Err("usage: ddrm-producer-smoke <encrypt-bin> [..] --mint-capsule <input-file> <descriptor.json> <out.ddrm>".to_string())
+        } else {
+            run_mint_capsule(&pre[0], &post[0], &post[1], &post[2])
+        }
+    } else if let Some(pos) = args.iter().position(|a| a == "--asset") {
         let pre = &args[..pos];
         let post = &args[pos + 1..];
         if pre.len() < 3 || post.len() < 3 {

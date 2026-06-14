@@ -24,6 +24,10 @@ path = "src/main.rs"
 ddrm-media = { path = "../../../capsules/ddrm-media" }
 serde_json = "1.0"
 base64 = "0.22"
+# The SAME shared transcript encoder the rail binds (key authority seals to it; the decrypt
+# boundary rebuilds it). The `--quorum` open mode computes the canonical decrypt-transcript
+# AAD with it — no private re-implementation, so it cannot drift from the capsules.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
 
 [profile.dev]
 opt-level = 1
