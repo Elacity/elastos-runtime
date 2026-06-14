@@ -53,7 +53,7 @@ build() {
 }
 build "$CAP/encrypt-provider" --features escrow
 build "$CAP/key-provider" --features key-authority-ref
-build "$CAP/decrypt-provider" --features rail-material,rail-mint
+build "$CAP/decrypt-provider" --features rail-stream,rail-mint
 build "$CAP/dkms-authority"
 build "$CAP/dkms-keygen"
 build "$REPO/scripts/dev/dkms-live-recover"
@@ -116,7 +116,7 @@ echo
 rc=$?
 echo
 if [ $rc -eq 0 ]; then
-  echo "asset-open-verify: PASS — a real asset, sealed to a 2-of-3 quorum and PERSISTED to disk, was reloaded from disk alone, recovered 2-of-3, and decrypted"
+  echo "asset-open-verify: PASS — a real asset, sealed to a 2-of-3 quorum and PERSISTED to disk, was reloaded from disk alone, recovered 2-of-3, decrypted, and RENDERED byte-identical (full consumer-open path)"
 else
   echo "asset-open-verify: FAIL ($rc)"; cat "$WORK"/node*.log
 fi

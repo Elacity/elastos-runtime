@@ -234,6 +234,155 @@ fn step(n: u32, msg: &str) {
     println!("  [{n}] {msg}");
 }
 
+// --- RENDER proof helpers (Day 139): the consumer-open path that returns CLEARTEXT ----
+// The decrypt boundary's `stream_segment` op returns the decrypted segment for the scoped
+// `stream` output kind. The seal CEK is bound to the decrypt transcript, so the RENDER open
+// must rebuild the SAME AAD the counts open used — but with action/output_kind = "stream"
+// (a viewer read), and the key authority re-seals to THAT transcript. These mirror the
+// `view`/`rendered` builders above with the stream-flavoured action/viewer/output kind.
+const ACTION_STREAM: &str = "stream";
+const VIEWER_STREAM: &str = "media";
+const OUTPUT_STREAM: &str = "stream";
+
+fn decrypt_request_stream() -> Value {
+    json!({
+        "schema": "elastos.decrypt.session.request/v1",
+        "request_id": "decrypt:producer-smoke",
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "object_cid": OBJECT_CID,
+        "action": ACTION_STREAM,
+        "viewer_interface": VIEWER_STREAM,
+        "release_receipt": {
+            "schema": RR_SCHEMA,
+            "request_id": RR_REQUEST_ID,
+            "object_cid": OBJECT_CID,
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "action": ACTION_STREAM,
+            "provider": RR_PROVIDER,
+            "status": RR_STATUS,
+            "issued_at": RR_ISSUED_AT,
+            "expires_at": EXPIRES_AT,
+        },
+        "output_kind": OUTPUT_STREAM,
+        "reason": "render content sealed in this run",
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+fn fallback_rights_receipt_stream() -> Value {
+    json!({
+        "schema": "elastos.rights.decision.receipt/v1",
+        "request_id": "rights:producer-smoke",
+        "content_id": OBJECT_CID,
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "right": ACTION_STREAM,
+        "provider": "rights-provider",
+        "allowed": true,
+        "issued_at": RR_ISSUED_AT,
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+fn key_release_request_live_stream(kid_hex: &str, wrapped_cek_b64: &str, scheme: &str) -> Value {
+    json!({
+        "schema": "elastos.key_release.request/v1",
+        "request_id": RR_REQUEST_ID,
+        "principal_id": PRINCIPAL,
+        "session_id": SESSION,
+        "object_cid": OBJECT_CID,
+        "action": ACTION_STREAM,
+        "rights_receipt": fallback_rights_receipt_stream(),
+        "key_envelope": {
+            "scheme": scheme,
+            "kid": kid_hex,
+            "wrapped_cek": wrapped_cek_b64,
+            "policy_hash": "sha256:producer-live",
+            "algorithms": {
+                "cipher": "aes-256-gcm",
+                "signature": ["ed25519", "ml-dsa-65"],
+                "kem": ["x25519", "ml-kem-768"],
+                "share_scheme": "shamir-t-of-n",
+            },
+        },
+        "reason": "render content sealed in this run",
+        "expires_at": EXPIRES_AT,
+    })
+}
+
+/// Rebuild the decrypt-transcript AAD for the STREAM (render) open — identical to
+/// [`transcript_aad`] but bound to the stream action/viewer/output kind.
+fn transcript_aad_stream(
+    session_pub: &[u8],
+    content_hash: &[u8],
+    nonce: &[u8],
+    node_set_id: Option<&[u8]>,
+) -> Vec<u8> {
+    let receipt_hash = release_receipt_hash(
+        RR_SCHEMA,
+        RR_REQUEST_ID,
+        OBJECT_CID,
+        PRINCIPAL,
+        SESSION,
+        ACTION_STREAM,
+        RR_PROVIDER,
+        RR_STATUS,
+        RR_ISSUED_AT,
+        EXPIRES_AT,
+    );
+    DecryptTranscriptV1 {
+        suite_id: SUITE_PQ_HYBRID,
+        provider_id: "decrypt-provider",
+        principal_id: PRINCIPAL,
+        session_id: SESSION,
+        object_cid: OBJECT_CID,
+        content_hash,
+        action: ACTION_STREAM,
+        viewer_interface: VIEWER_STREAM,
+        output_kind: OUTPUT_STREAM,
+        expires_at: EXPIRES_AT,
+        release_receipt_hash: receipt_hash,
+        decrypt_session_pub: session_pub,
+        nonce,
+        node_set_id,
+    }
+    .to_aad()
+}
+
+/// Extract the `mdat` box payload from a single-sample fMP4 segment. The producer's
+/// `mux_single_sample_segment` lays out `moof{…} + mdat{ciphertext}`; with full-sample
+/// AES-CTR (clear_leader == 0) the DECRYPTED mdat payload is byte-identical to the
+/// original asset bytes. Walks top-level boxes ([u32 size][4 type][payload]); handles
+/// 64-bit largesize (1) and to-EOF (0) defensively.
+fn extract_mdat(seg: &[u8]) -> Result<Vec<u8>, String> {
+    let mut off = 0usize;
+    while off + 8 <= seg.len() {
+        let size = u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]]) as usize;
+        let typ = &seg[off + 4..off + 8];
+        let (payload_start, box_end) = if size == 1 {
+            if off + 16 > seg.len() {
+                return Err("truncated 64-bit box header".into());
+            }
+            let large = u64::from_be_bytes(seg[off + 8..off + 16].try_into().unwrap()) as usize;
+            (off + 16, off.checked_add(large).ok_or("box size overflow")?)
+        } else if size == 0 {
+            (off + 8, seg.len())
+        } else {
+            (off + 8, off.checked_add(size).ok_or("box size overflow")?)
+        };
+        if box_end > seg.len() || box_end < payload_start {
+            return Err("box exceeds segment bounds".into());
+        }
+        if typ == b"mdat" {
+            return Ok(seg[payload_start..box_end].to_vec());
+        }
+        off = box_end;
+    }
+    Err("no mdat box found in the decrypted segment".into())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let encrypt_bin = args.first().ok_or("missing <encrypt-provider-bin>")?;
     let key_bin = args.get(1).ok_or("missing <key-provider-bin>")?;
@@ -870,7 +1019,6 @@ fn run_asset(
         &key.call(&json!({ "op": "release", "request": request, "session": session_ctx }))?,
         "key release (dkms 2-of-3)",
     )?;
-    key.shutdown();
     let material = release["material"].clone();
     if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
         return Err(format!("key-provider returned no sealed material: {release}"));
@@ -894,13 +1042,67 @@ fn run_asset(
     if serde_json::to_string(&open).unwrap_or_default().contains(&plaintext_b64) {
         return Err("plaintext leaked in the decrypt-provider response".to_string());
     }
+    step(5, "decrypt-provider: reconstructed the CEK in-VM from the persisted 2-of-3 escrow and DECRYPTED the asset segment (no plaintext on the wire)");
+
+    // === RENDER — the consumer-open path that hands a viewer the CLEARTEXT bytes. ===
+    // A SECOND release bound to the STREAM transcript (action/output_kind = "stream"), so the
+    // decrypt boundary's `stream_segment` op — which recomputes the AAD from the stream request
+    // — opens the SAME re-sealed CEK and returns the decrypted segment. We then strip the fMP4
+    // wrapper (extract the mdat payload) and prove it is BYTE-IDENTICAL to the original asset.
+    let nonce_stream = b"elastos-asset-render-nonce".to_vec();
+    let aad_stream = transcript_aad_stream(&session_pub, &content_hash, &nonce_stream, Some(&node_set_id));
+    let request_stream = key_release_request_live_stream(&kid_hex, &share1, &scheme);
+    let session_ctx_stream = json!({
+        "decrypt_session_pub_b64": session_pub_b64,
+        "producer_vk_b64": producer_vk_b64,
+        "producer_vk2_b64": producer_vk_b64,
+        "producer_vk3_b64": producer_vk_b64,
+        "aad_b64": B64.encode(&aad_stream),
+        "ciphertext_b64": segment_b64,
+        "content_hash_b64": B64.encode(&content_hash),
+        "nonce_b64": B64.encode(&nonce_stream),
+        "wrapped_cek_share2_b64": share2,
+        "wrapped_cek_share3_b64": share3,
+        "now_unix": NOW_UNIX,
+    });
+    let release_stream = ok_data(
+        &key.call(&json!({ "op": "release", "request": request_stream, "session": session_ctx_stream }))?,
+        "key release (dkms 2-of-3, stream)",
+    )?;
+    key.shutdown();
+    let material_stream = release_stream["material"].clone();
+
+    let rendered = decrypt.call(&json!({
+        "op": "stream_segment",
+        "request": decrypt_request_stream(),
+        "material": material_stream,
+        "index": 0,
+        "now_unix": NOW_UNIX,
+    }))?;
+    let rendered_data = ok_data(&rendered, "decrypt stream_segment (quorum render)")?;
+    let segment_out_b64 = rendered_data["segment_b64"]
+        .as_str()
+        .ok_or_else(|| format!("stream_segment returned no segment_b64: {rendered}"))?;
+    let segment_out = B64.decode(segment_out_b64).map_err(|e| e.to_string())?;
+    let recovered = extract_mdat(&segment_out)?;
+    if recovered != plaintext {
+        return Err(format!(
+            "RENDER MISMATCH: recovered {} bytes != original {} bytes — the quorum-decrypted asset is not byte-identical",
+            recovered.len(),
+            plaintext.len()
+        ));
+    }
     decrypt.shutdown();
     let _ = std::fs::remove_dir_all(&escrow_dir);
-    step(5, "decrypt-provider: reconstructed the CEK in-VM from the persisted 2-of-3 escrow and DECRYPTED the asset segment (no plaintext on the wire)");
+    step(6, &format!(
+        "decrypt-provider(stream): rendered the asset via the 2-of-3 quorum and recovered {} bytes BYTE-IDENTICAL to the original (CEK never left the VM)",
+        recovered.len()
+    ));
 
     println!();
     println!("RESULT: a REAL {}-byte asset was sealed to the live 2-of-3 quorum, its escrow PERSISTED to disk,", plaintext.len());
-    println!("        reloaded FROM DISK ALONE, recovered 2-of-3, and decrypted — proving minted assets are RECOVERABLE.");
+    println!("        reloaded FROM DISK ALONE, recovered 2-of-3, decrypted, and RENDERED byte-identical — the full");
+    println!("        consumer-open path (no Lit, no plaintext/CEK/share on any wire). Minted assets are RECOVERABLE + RENDERABLE.");
     Ok(())
 }
 
