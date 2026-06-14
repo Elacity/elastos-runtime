@@ -31,7 +31,7 @@
 
 use std::path::Path as FsPath;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -57,6 +57,50 @@ const QUORUM_DESCRIPTOR_ENV: &str = "ELASTOS_DKMS_QUORUM_DESCRIPTOR";
 /// handed to the pure assembler, identical to `mint_authority`. Overridable for other deployments.
 const DEFAULT_MINT_SELECTOR: &str = "0x47cbeeb4";
 
+/// The real Base ChannelFactory (`pc2-node config/default.json` `contracts.v3.channel_factory`).
+/// Overridable via `ELASTOS_DDRM_CHANNEL_FACTORY`. The app NEVER names this itself.
+const DEFAULT_CHANNEL_FACTORY: &str = "0xE1365ed47353De2F8A6a69E271e36650A9EE368F";
+/// The real Base CentralStorage (`contracts.v3.central_storage`), source of the
+/// `channelCreationFee()`. Overridable via `ELASTOS_DDRM_CENTRAL_STORAGE`.
+const DEFAULT_CENTRAL_STORAGE: &str = "0x0C1EeA2A3361B80AC0e42179335dB536A951760b";
+/// `createChannel(uint8,uint8,string,string,bytes)` selector — pinned (not computed),
+/// handed to the pure assembler. Overridable via `ELASTOS_DDRM_CREATE_CHANNEL_SELECTOR`.
+const DEFAULT_CREATE_CHANNEL_SELECTOR: &str = "0xc384baa2";
+/// `channelCreationFee() returns (uint256 fee, address token)` selector — read on-chain
+/// (eth_call) to set the payable `value`, exactly as PC2's creator does.
+const CHANNEL_CREATION_FEE_SELECTOR: &str = "0x4218a471";
+/// The empty channel config `bytes data`: `abi.encode((address,uint256)[] royalties,
+/// (uint8,address,uint256,uint256,bool)[] plans, (address,uint256)[] tokenAccess)` with all
+/// three arrays empty — a channel with no royalty splits, no subscription plans, no token
+/// gates. The minimal valid config; richer config is a follow-on (PC2's plan/royalty UI).
+const EMPTY_CHANNEL_CONFIG_DATA: &str = "0x0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+/// PC2 channel-type/scope codes (`elacity-creator/app.js`): STANDARD channel, PRIVATE scope
+/// (subscription-gated) is the creator default.
+const CHANNEL_TYPE_STANDARD: u8 = 1;
+const CHANNEL_SCOPE_PRIVATE: u8 = 2;
+const CHANNEL_SCOPE_PUBLIC: u8 = 1;
+
+fn channel_factory() -> String {
+    std::env::var("ELASTOS_DDRM_CHANNEL_FACTORY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CHANNEL_FACTORY.to_string())
+}
+
+fn central_storage() -> String {
+    std::env::var("ELASTOS_DDRM_CENTRAL_STORAGE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CENTRAL_STORAGE.to_string())
+}
+
+fn create_channel_selector() -> String {
+    std::env::var("ELASTOS_DDRM_CREATE_CHANNEL_SELECTOR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CREATE_CHANNEL_SELECTOR.to_string())
+}
+
 /// The mint chain. Defaults to Base mainnet; overridable via `ELASTOS_DDRM_CHAIN_ID`.
 /// The producer signs in the OWNER's wallet, so the linked external account must live here.
 fn mint_chain_id() -> u64 {
@@ -69,6 +113,20 @@ fn mint_chain_id() -> u64 {
 
 fn mint_chain_namespace() -> String {
     format!("eip155:{}", mint_chain_id())
+}
+
+/// Whether a linked account's chain namespace can sign for the mint chain. Mirrors the
+/// wallet-provider's own `chain_namespaces_compatible` (`capsules/wallet-provider/src/
+/// validation.rs`): an EVM address is the SAME key on every `eip155:*` chain, so any
+/// linked EVM account (e.g. linked while MetaMask was on mainnet `eip155:1`) is valid for
+/// the Base mint — the metamask connector switches the provider to the tx's chain at sign
+/// time. Non-EVM namespaces must match exactly. Keeping this in lockstep with the wallet
+/// provider is the One Canonical Path (#10): the Create portal must not be stricter than
+/// the layer that actually signs.
+fn chain_namespace_can_sign_mint(account_namespace: &str) -> bool {
+    let mint = mint_chain_namespace();
+    account_namespace == mint
+        || (account_namespace.starts_with("eip155:") && mint.starts_with("eip155:"))
 }
 
 /// chain-provider network slug for the mint chain (used only to name the broadcast resource
@@ -113,7 +171,9 @@ struct QuorumNode {
 
 /// Listing terms the frame submits alongside the file. The frame holds no authority; these
 /// are plain hints the runtime validates and binds into the (public) envelope + mint.
+/// camelCase on the wire (the frame is JS) — `isMedia`, `creatorAddress`, `fileName`.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MintMeta {
     #[serde(default)]
     title: String,
@@ -231,10 +291,508 @@ pub async fn creator_prepare_mint(
                     "refused: prepared mint carried raw key material",
                 );
             }
+            // Persist into the creator's Library (best-effort) so the asset lists at the
+            // correct location and opens on double-click — PC2 parity for a creator's own mint.
+            persist_minted_asset_to_library(
+                &state.data_dir,
+                &ctx.principal_id,
+                &meta,
+                &file_bytes,
+                &result,
+            );
             Json(result).into_response()
         }
         Err(staged) => staged_error(StatusCode::BAD_GATEWAY, &staged.stage, &staged.message),
     }
+}
+
+// ── GET /api/apps/creator/wallet ───────────────────────────────────────────────
+/// Surface the principal's linked wallet account(s) on the mint chain so the frame can show
+/// the connected address and use it for channel discovery + as the mint/deploy signer. The
+/// frame holds NO wallet authority (#3); it only learns which already-linked address to bind.
+/// Returns addresses ONLY — no keys, no account secrets.
+pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    let ctx =
+        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
+            }
+        };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    let namespace = mint_chain_namespace();
+    let accounts = match provider_data(
+        registry,
+        "wallet",
+        &json!({ "op": "accounts", "principal_id": ctx.principal_id }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(message) => return error_json(StatusCode::BAD_GATEWAY, &message),
+    };
+    let mut addresses: Vec<String> = accounts
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter(|a| {
+                    a.get("chain_namespace")
+                        .and_then(Value::as_str)
+                        .is_some_and(chain_namespace_can_sign_mint)
+                })
+                .filter_map(|a| a.get("address").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The same EVM address may be linked under several eip155 chains — show it once.
+    addresses.sort();
+    addresses.dedup();
+    Json(json!({
+        "schema": "elastos.creator.wallet/v1",
+        "network": mint_network(),
+        "chain_namespace": namespace,
+        "addresses": addresses,
+    }))
+    .into_response()
+}
+
+// ── GET /api/apps/creator/channels?creator=0x… ─────────────────────────────────
+/// The query for channel discovery: the creator's EVM wallet address (the signer-to-be).
+#[derive(Debug, Deserialize)]
+pub struct ChannelsQuery {
+    #[serde(default)]
+    creator: String,
+}
+
+/// Discover the channels the creator already owns on the mint chain, so the Create portal
+/// can offer them for selection (PC2 `loadChannels`). READ-ONLY: the chain provider scans
+/// `ChannelCreated` logs filtered to the creator's address — no keys, no signing, no ambient
+/// authority. Fail-closed: a wallet address is REQUIRED (no silent "all channels" scan).
+pub async fn creator_list_channels(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Query(query): Query<ChannelsQuery>,
+) -> Response {
+    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
+    {
+        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token");
+    }
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    let creator = query.creator.trim();
+    if creator.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "a creator wallet address (0x…) is required — connect your wallet first",
+        );
+    }
+    let req = json!({
+        "op": "list_channels",
+        "network": mint_network(),
+        "factory": channel_factory(),
+        "creator": creator,
+    });
+    match provider_data(registry, "chain", &req).await {
+        Ok(data) => Json(json!({
+            "schema": "elastos.creator.channels/v1",
+            "network": mint_network(),
+            "factory": data.get("factory").cloned().unwrap_or_else(|| json!(channel_factory())),
+            "creator": data.get("creator").cloned().unwrap_or_else(|| json!(creator)),
+            "channels": data.get("channels").cloned().unwrap_or_else(|| json!([])),
+            // Resumable cursor state: the UI re-polls while `indexing` is true so deep
+            // (older) channels surface across calls without re-scanning history each time.
+            "indexing": data.get("indexing").cloned().unwrap_or(json!(false)),
+            "scanned_floor": data.get("scanned_floor").cloned().unwrap_or(Value::Null),
+            "deploy_block": data.get("deploy_block").cloned().unwrap_or(Value::Null),
+            "latest_block": data.get("latest_block").cloned().unwrap_or(Value::Null),
+        }))
+        .into_response(),
+        Err(message) => error_json(StatusCode::BAD_GATEWAY, &message),
+    }
+}
+
+// ── POST /api/apps/creator/create-channel ──────────────────────────────────────
+/// The create-channel request: a name, optional public/private scope, and the creator's
+/// wallet (the signer). Subscription plans / royalties / token gates are a follow-on; this
+/// creates a minimal STANDARD channel (empty config).
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+    /// `"public"` or `"private"` (default). Maps to PC2's CHANNEL_SCOPE.
+    #[serde(default)]
+    scope: String,
+    /// The creator's EVM wallet address — REQUIRED (the wallet that signs the deploy).
+    #[serde(default)]
+    creator_address: String,
+}
+
+/// Prepare an UNSIGNED `createChannel` for the owner's wallet (PC2 parity). The runtime
+/// publishes minimal channel metadata, reads the `channelCreationFee` on-chain, assembles
+/// the pure calldata, binds the owner's linked wallet, and enqueues the MetaMask approval.
+/// The runtime signs NOTHING and deploys NOTHING — the channel is the owner's act.
+pub async fn creator_create_channel(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Result<Json<CreateChannelRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let ctx =
+        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
+            }
+        };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
+    };
+    match run_create_channel(registry, &ctx.principal_id, &req).await {
+        Ok(result) => Json(result).into_response(),
+        Err(message) => error_json(StatusCode::BAD_GATEWAY, &message),
+    }
+}
+
+/// The create-channel spine: publish channel metadata -> read the on-chain creation fee ->
+/// assemble pure `createChannel` calldata -> resolve the owner's wallet -> enqueue approval.
+async fn run_create_channel(
+    registry: &ProviderRegistry,
+    principal_id: &str,
+    req: &CreateChannelRequest,
+) -> Result<Value, String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err("a channel name is required".to_string());
+    }
+    let signer = req.creator_address.trim();
+    if signer.is_empty() {
+        return Err("creating a channel requires your wallet address (the signer)".to_string());
+    }
+    let scope = match req.scope.trim().to_ascii_lowercase().as_str() {
+        "public" => CHANNEL_SCOPE_PUBLIC,
+        "" | "private" => CHANNEL_SCOPE_PRIVATE,
+        other => return Err(format!("unknown channel scope '{other}' (use public|private)")),
+    };
+
+    // 1) Publish minimal channel metadata to IPFS -> tokenURI (PC2 writes `ipfs://<cid>`).
+    let channel_meta = json!({
+        "version": "1.0",
+        "name": name,
+        "description": req.description.trim(),
+    });
+    let metadata_json = serde_json::to_string(&channel_meta)
+        .map_err(|e| format!("serialize channel metadata: {e}"))?;
+    let publish_dir = json!({
+        "op": "publish",
+        "kind": "directory",
+        "files": [ { "path": "0.json", "data": b64.encode(metadata_json.as_bytes()) } ],
+        "pin": true,
+    });
+    let metadata = provider_data(registry, "content", &publish_dir).await?;
+    let meta_cid = metadata
+        .get("cid")
+        .and_then(Value::as_str)
+        .ok_or("channel metadata publish returned no CID")?;
+    let token_uri = format!("ipfs://{meta_cid}");
+
+    // 2) Read the channelCreationFee on-chain (eth_call) — the payable `value`. token == 0x0
+    //    means a native fee paid as msg.value; a non-zero token is an ERC-20 fee we can't
+    //    cover via value (fail closed rather than send a tx that reverts).
+    let value_wei = read_channel_creation_fee(registry).await?;
+
+    // 3) Assemble the pure createChannel calldata.
+    let assemble_req = json!({
+        "op": "assemble_create_channel",
+        "channel": {
+            "selector": create_channel_selector(),
+            "factory": channel_factory(),
+            "channel_type": CHANNEL_TYPE_STANDARD,
+            "scope": scope,
+            "name": name,
+            "token_uri": token_uri,
+            "data_hex": EMPTY_CHANNEL_CONFIG_DATA,
+            "value_wei": value_wei,
+        }
+    });
+    let assembled = provider_data(registry, "chain", &assemble_req).await?;
+    let to = assembled
+        .get("to")
+        .and_then(Value::as_str)
+        .ok_or("chain assemble_create_channel returned no `to`")?
+        .to_string();
+    let data = assembled
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or("chain assemble_create_channel returned no calldata")?
+        .to_string();
+    let value = assembled
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("0x0")
+        .to_string();
+
+    // 4) Bind the owner's linked wallet + enqueue the MetaMask approval (owner deploys).
+    let namespace = mint_chain_namespace();
+    let account_id = resolve_owner_account(registry, principal_id, signer, &namespace).await?;
+    // Let MetaMask estimate gas / gas price / nonce (PC2's createChannel sends only
+    // to/data/value/chainId). createChannel also deploys a contract, so a fixed gas cap is
+    // both fragile and unnecessary on the external-signer path.
+    let intent = json!({
+        "schema": "elastos.chain.unsigned_transaction_intent/v1",
+        "transaction_type": "eip155_legacy",
+        "from": signer,
+        "to": to,
+        "value": value,
+        "data": data,
+        "chain_id": mint_chain_id(),
+        "requires_wallet_approval": true,
+        "wallet_intent": "transaction_intent",
+    });
+    let sign_req = json!({
+        "op": "request_signature",
+        "principal_id": principal_id,
+        "account_id": account_id,
+        "chain_namespace": namespace,
+        "intent": "transaction_intent",
+        "capsule_id": CREATOR_APP,
+        "resource": format!("elastos://chain/{}/broadcast_transaction", mint_network()),
+        "reason": format!("Create dDRM channel \"{name}\" on {}", mint_network()),
+        "payload": intent,
+    });
+    let approval = provider_data(registry, "wallet", &sign_req).await?;
+    let request_id = approval
+        .get("approval_request")
+        .and_then(|r| r.get("request_id"))
+        .and_then(Value::as_str)
+        .ok_or("wallet returned no approval request id")?
+        .to_string();
+
+    Ok(json!({
+        "schema": "elastos.creator.prepared-channel/v1",
+        "name": name,
+        "scope": scope,
+        "token_uri": token_uri,
+        "metadata_cid": meta_cid,
+        "tx": { "to": to, "data": data, "value": value, "chain_id": mint_chain_id() },
+        "channel_approval": { "request_id": request_id, "connector": "wallet-metamask" },
+        "next": "approve_in_wallet",
+    }))
+}
+
+// ── POST /api/apps/creator/prepare-trade-approval ───────────────────────────────
+/// The trade-approval request body: the channel + the OWNER's signer address.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeApprovalRequest {
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    creator_address: String,
+}
+
+/// After the mint CONFIRMS on-chain, make the asset tradable by approving the channel's
+/// authority gateway as an operator on the just-minted asset's operative contract — PC2's 2nd
+/// mint tx (`setApprovalForAll(gateway, true)`, app.js:5104/5119). The runtime discovers the
+/// operative + gateway FROM THE CHAIN (the operative is read from the `AssetCreated` log, which
+/// only exists once the mint succeeded — so this is inherently confirmation-gated, #11),
+/// assembles the pure approval calldata, and enqueues a wallet approval. The runtime never
+/// signs; the OWNER completes the approval in the Wallet app.
+pub async fn creator_prepare_trade_approval(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let ctx =
+        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
+            Ok(ctx) => ctx,
+            Err(_) => {
+                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
+            }
+        };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
+    };
+    match run_prepare_trade_approval(registry, &ctx.principal_id, &req).await {
+        Ok(result) => Json(result).into_response(),
+        Err(message) => error_json(StatusCode::BAD_GATEWAY, &message),
+    }
+}
+
+/// The trade-approval spine: re-confirm the channel is the owner's (#11) -> ask the chain
+/// provider to discover the just-minted operative + gateway and assemble the pure
+/// `setApprovalForAll(gateway, true)` calldata -> if the gateway isn't already approved,
+/// enqueue a wallet approval for the OWNER to sign. Mirrors PC2's confirmation-gated 2nd tx:
+/// the operative comes from the mint's `AssetCreated` log, so a "mint_not_confirmed" error
+/// just means the mint hasn't landed yet — the caller retries.
+async fn run_prepare_trade_approval(
+    registry: &ProviderRegistry,
+    principal_id: &str,
+    req: &TradeApprovalRequest,
+) -> Result<Value, String> {
+    let channel = req.channel.trim();
+    if channel.is_empty() {
+        return Err("a channel is required to enable trading".to_string());
+    }
+    let signer = req.creator_address.trim();
+    if signer.is_empty() {
+        return Err("enabling trading requires your wallet address (the signer)".to_string());
+    }
+    // Same fail-closed ownership gate as the mint: you may only approve on your own channel.
+    confirm_channel_owned(registry, signer, channel).await?;
+
+    let assembled = provider_data(
+        registry,
+        "chain",
+        &json!({
+            "op": "assemble_trade_approval",
+            "network": mint_network(),
+            "channel": channel,
+            "creator": signer,
+        }),
+    )
+    .await?;
+
+    // Idempotent: the gateway is already an approved operator — nothing to sign.
+    if assembled
+        .get("already_approved")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(json!({
+            "schema": "elastos.creator.trade-approval/v1",
+            "already_approved": true,
+            "operative": assembled.get("operative").cloned().unwrap_or(Value::Null),
+            "gateway": assembled.get("gateway").cloned().unwrap_or(Value::Null),
+            "next": "tradable",
+        }));
+    }
+
+    let to = assembled
+        .get("to")
+        .and_then(Value::as_str)
+        .ok_or("chain assemble_trade_approval returned no `to`")?
+        .to_string();
+    let data = assembled
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or("chain assemble_trade_approval returned no calldata")?
+        .to_string();
+    let value = assembled
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("0x0")
+        .to_string();
+    let operative = assembled
+        .get("operative")
+        .and_then(Value::as_str)
+        .unwrap_or(&to)
+        .to_string();
+
+    let namespace = mint_chain_namespace();
+    let account_id = resolve_owner_account(registry, principal_id, signer, &namespace).await?;
+    // Let MetaMask estimate gas / gas price / nonce (same external-signer path as the mint).
+    let intent = json!({
+        "schema": "elastos.chain.unsigned_transaction_intent/v1",
+        "transaction_type": "eip155_legacy",
+        "from": signer,
+        "to": to,
+        "value": value,
+        "data": data,
+        "chain_id": mint_chain_id(),
+        "requires_wallet_approval": true,
+        "wallet_intent": "transaction_intent",
+    });
+    let sign_req = json!({
+        "op": "request_signature",
+        "principal_id": principal_id,
+        "account_id": account_id,
+        "chain_namespace": namespace,
+        "intent": "transaction_intent",
+        "capsule_id": CREATOR_APP,
+        "resource": format!("elastos://chain/{}/broadcast_transaction", mint_network()),
+        "reason": format!("Approve gateway to enable trading on {}", mint_network()),
+        "payload": intent,
+    });
+    let approval = provider_data(registry, "wallet", &sign_req).await?;
+    let request_id = approval
+        .get("approval_request")
+        .and_then(|r| r.get("request_id"))
+        .and_then(Value::as_str)
+        .ok_or("wallet returned no approval request id")?
+        .to_string();
+
+    Ok(json!({
+        "schema": "elastos.creator.trade-approval/v1",
+        "already_approved": false,
+        "operative": operative,
+        "gateway": assembled.get("gateway").cloned().unwrap_or(Value::Null),
+        "tx": { "to": to, "data": data, "value": value, "chain_id": mint_chain_id() },
+        "approval": { "request_id": request_id, "connector": "wallet-metamask" },
+        "next": "approve_in_wallet",
+    }))
+}
+
+/// Read `channelCreationFee() -> (uint256 fee, address token)` from CentralStorage and return
+/// the payable `value` (hex). A native fee (token == zero) is paid as `msg.value`; a non-zero
+/// ERC-20 token fee is refused (we won't assemble a tx that reverts for lack of allowance).
+async fn read_channel_creation_fee(registry: &ProviderRegistry) -> Result<String, String> {
+    if let Ok(forced) = std::env::var("ELASTOS_DDRM_CHANNEL_FEE_WEI") {
+        let forced = forced.trim();
+        if !forced.is_empty() {
+            return Ok(forced.to_string());
+        }
+    }
+    let call = json!({
+        "op": "contract_call",
+        "network": mint_network(),
+        "to": central_storage(),
+        "data": CHANNEL_CREATION_FEE_SELECTOR,
+    });
+    let res = provider_data(registry, "chain", &call).await?;
+    let raw = res
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or("channelCreationFee call returned no result")?;
+    parse_channel_fee_result(raw)
+}
+
+/// Decode `channelCreationFee() -> (uint256 fee, address token)` into the payable `value`
+/// (hex). A native fee (token == zero) is paid as `msg.value`; a non-zero ERC-20 token fee
+/// is refused (fail closed — we won't assemble a tx that reverts for lack of allowance).
+fn parse_channel_fee_result(raw: &str) -> Result<String, String> {
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    // (uint256 fee, address token): two 32-byte words.
+    if hex.len() < 128 {
+        return Err("channelCreationFee returned a short result".to_string());
+    }
+    let fee_word = &hex[0..64];
+    let token_word = &hex[64..128];
+    if token_word.chars().any(|c| c != '0') {
+        return Err(
+            "channel creation requires an ERC-20 fee — token-fee channels are not yet supported"
+                .to_string(),
+        );
+    }
+    let fee = fee_word.trim_start_matches('0');
+    Ok(if fee.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{fee}")
+    })
 }
 
 /// A failure annotated with the spine stage it happened at (so the UI lights the right dot).
@@ -283,6 +841,11 @@ async fn run_prepare_mint(
     let content_id = seal_str(&seal, "content_id_hex").map_err(|e| stage_err("encrypt", e))?;
     let segment_b64 = seal_str(&seal, "segment_b64").map_err(|e| stage_err("encrypt", e))?;
     let node_set_id_b64 = seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
+    // The producer vk that signed each escrow seal. It MUST live in the envelope: the encrypt
+    // producer key is minted fresh per process, so a later open (after the provider restarts)
+    // can only authenticate the escrow against the persisted vk. Missing it => unrecoverable.
+    let producer_vk_b64 =
+        seal_str(&seal, "producer_verifying_key_b64").map_err(|e| stage_err("encrypt", e))?;
     let shares = seal
         .get("shares")
         .cloned()
@@ -313,6 +876,7 @@ async fn run_prepare_mint(
         asset_cid: &asset_cid,
         node_set_id_b64: &node_set_id_b64,
         shares: &shares,
+        producer_vk_b64: &producer_vk_b64,
         meta,
         creator_principal: principal_id,
     });
@@ -324,7 +888,7 @@ async fn run_prepare_mint(
     let publish_dir = json!({
         "op": "publish",
         "kind": "directory",
-        "files": [ { "name": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
+        "files": [ { "path": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
         "pin": true,
     });
     let metadata = provider_data(registry, "content", &publish_dir)
@@ -381,9 +945,24 @@ async fn finalize_mint(
     if channel.is_empty() {
         return Err(stage_err(
             "publish",
-            "a channel address (0x…) is required — enter your dev channel",
+            "a channel is required — select one of your channels (or create one) first",
         ));
     }
+    // Fail-closed ownership gate (#11): you may only mint into a channel YOU created. The
+    // authoritative on-chain proof is the factory's `ChannelCreated` event, whose indexed
+    // `creator` topic must equal the signer — exactly what `list_channels` filters on. So a
+    // channel is "yours" iff it appears in your on-chain-discovered set. This blocks minting
+    // into another creator's channel even if its address is entered manually.
+    let signer_for_channel = meta.creator_address.trim();
+    if signer_for_channel.is_empty() {
+        return Err(stage_err(
+            "publish",
+            "minting requires your wallet address (the signer) — connect your wallet",
+        ));
+    }
+    confirm_channel_owned(registry, signer_for_channel, channel)
+        .await
+        .map_err(|e| stage_err("publish", &e))?;
     let mut publish_req = json!({
         "op": "prepare_publish",
         "request": {
@@ -419,15 +998,35 @@ async fn finalize_mint(
     let prepared = provider_data(registry, "publish", &publish_req)
         .await
         .map_err(|e| stage_err("sign", e))?;
-    let mut unsigned_mint = prepared
+    let unsigned_mint = prepared
         .get("unsigned_mint")
         .cloned()
         .ok_or_else(|| stage_err("sign", "publish provider returned no unsigned mint"))?;
 
-    if let Some(obj) = unsigned_mint.as_object_mut() {
-        obj.entry("selector").or_insert_with(|| json!(mint_selector()));
+    // The publish provider's `unsigned_mint` is a RICHER descriptor (schema, chain_id,
+    // function, op_type, fee_source, signed) than the chain capability's strict ABI input.
+    // chain-provider::assemble_mint fails closed on unknown fields (#11), so project the
+    // descriptor onto exactly the fields it accepts and add the configured selector — the
+    // orchestrator owns this translation, keeping both provider contracts strict (#5, #10).
+    let um = unsigned_mint
+        .as_object()
+        .ok_or_else(|| stage_err("sign", "publish provider returned a non-object unsigned mint"))?;
+    let mut mint = serde_json::Map::new();
+    mint.insert("selector".into(), json!(mint_selector()));
+    for key in [
+        "to",
+        "token_uri",
+        "op_type_code",
+        "content_id",
+        "value_wei",
+        "op_raw",
+        "sell",
+    ] {
+        if let Some(value) = um.get(key) {
+            mint.insert(key.to_string(), value.clone());
+        }
     }
-    let assemble_req = json!({ "op": "assemble_mint", "mint": unsigned_mint });
+    let assemble_req = json!({ "op": "assemble_mint", "mint": Value::Object(mint) });
     let assembled = provider_data(registry, "chain", &assemble_req)
         .await
         .map_err(|e| stage_err("sign", e))?;
@@ -459,6 +1058,10 @@ async fn finalize_mint(
         .await
         .map_err(|e| stage_err("sign", e))?;
 
+    // No nonce / gas_price / gas_limit: the mint deploys an operative contract (~1.5M gas),
+    // so a fixed cap risks out-of-gas, and a fixed price inflates the fee on Base. Like PC2's
+    // EOA mint we hand the wallet only to/data/value/chainId and let MetaMask estimate gas,
+    // gas price, and nonce — the canonical external-signer path.
     let intent = json!({
         "schema": "elastos.chain.unsigned_transaction_intent/v1",
         "transaction_type": "eip155_legacy",
@@ -467,9 +1070,6 @@ async fn finalize_mint(
         "value": value,
         "data": data,
         "chain_id": mint_chain_id(),
-        "nonce": "0x0",
-        "gas_price": "0x3b9aca00",
-        "gas_limit": "0x7a120",
         "requires_wallet_approval": true,
         "wallet_intent": "transaction_intent",
     });
@@ -607,6 +1207,10 @@ async fn run_prepare_mint_media(
     let kid_hex = seal_str(&seal, "kid_hex").map_err(|e| stage_err("encrypt", e))?;
     let content_id = seal_str(&seal, "content_id_hex").map_err(|e| stage_err("encrypt", e))?;
     let node_set_id_b64 = seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
+    // See the object path: the per-process producer vk MUST be persisted or the asset is
+    // unrecoverable after the encrypt provider restarts.
+    let producer_vk_b64 =
+        seal_str(&seal, "producer_verifying_key_b64").map_err(|e| stage_err("encrypt", e))?;
     let shares = seal
         .get("shares")
         .cloned()
@@ -624,15 +1228,15 @@ async fn run_prepare_mint_media(
     //    MPD paths) + the manifest. Inits are NOT encrypted (CENC encrypts media fragments only).
     let mut files: Vec<Value> = Vec::with_capacity(init_files.len() + enc_segments.len() + 1);
     for (path, data) in &init_files {
-        files.push(json!({ "name": path, "data": data }));
+        files.push(json!({ "path": path, "data": data }));
     }
     for (i, enc) in enc_segments.iter().enumerate() {
         let data = enc
             .as_str()
             .ok_or_else(|| stage_err("encrypt", "encrypted segment not a string"))?;
-        files.push(json!({ "name": seg_paths[i], "data": data }));
+        files.push(json!({ "path": seg_paths[i], "data": data }));
     }
-    files.push(json!({ "name": "manifest.mpd", "data": b64.encode(manifest.as_bytes()) }));
+    files.push(json!({ "path": "manifest.mpd", "data": b64.encode(manifest.as_bytes()) }));
 
     // 4) publish the whole DASH directory -> one dir CID (the asset CID).
     let publish_dir = json!({ "op": "publish", "kind": "directory", "files": files, "pin": true });
@@ -652,6 +1256,7 @@ async fn run_prepare_mint_media(
         manifest_path: "manifest.mpd",
         node_set_id_b64: &node_set_id_b64,
         shares: &shares,
+        producer_vk_b64: &producer_vk_b64,
         tracks,
         meta,
         creator_principal: principal_id,
@@ -662,7 +1267,7 @@ async fn run_prepare_mint_media(
     let publish_meta = json!({
         "op": "publish",
         "kind": "directory",
-        "files": [ { "name": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
+        "files": [ { "path": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
         "pin": true,
     });
     let metadata = provider_data(registry, "content", &publish_meta)
@@ -696,6 +1301,9 @@ struct MediaEnvelope<'a> {
     manifest_path: &'a str,
     node_set_id_b64: &'a str,
     shares: &'a Value,
+    /// The producer verifying key that signed each escrow seal (PUBLIC). Persisted so a later
+    /// consumer open can authenticate the quorum escrow recovery against it.
+    producer_vk_b64: &'a str,
     tracks: &'a [Value],
     meta: &'a MintMeta,
     creator_principal: &'a str,
@@ -735,6 +1343,7 @@ fn build_media_envelope(b: MediaEnvelope) -> Value {
                 "scheme": THRESHOLD_SCHEME,
                 "chain": "base",
                 "node_set_id_b64": b.node_set_id_b64,
+                "producer_verifying_key_b64": b.producer_vk_b64,
                 "shares": b.shares.clone(),
             }],
         },
@@ -747,9 +1356,63 @@ fn build_media_envelope(b: MediaEnvelope) -> Value {
     })
 }
 
-/// Find the OWNER's linked EVM account on the mint chain that matches the signer address.
-/// The mint is signed by the OWNER's wallet (not the runtime), so the account must be linked
-/// on the mint chain. Returns the `account_id` to bind the approval to.
+/// Confirm on-chain that `channel` was created by `signer` — the fail-closed ownership gate
+/// for minting. Ownership proof is the factory's `ChannelCreated` event (indexed `creator`),
+/// which `list_channels` scans, so "owned" == "present in the creator's discovered set". A
+/// not-found result distinguishes "still indexing" (retryable) from "not yours" (hard refusal),
+/// so the operator gets an actionable message instead of a silent failure.
+async fn confirm_channel_owned(
+    registry: &ProviderRegistry,
+    signer: &str,
+    channel: &str,
+) -> Result<(), String> {
+    let listed = provider_data(
+        registry,
+        "chain",
+        &json!({
+            "op": "list_channels",
+            "network": mint_network(),
+            "factory": channel_factory(),
+            "creator": signer,
+        }),
+    )
+    .await?;
+    let owned = listed
+        .get("channels")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter().any(|c| {
+                c.get("address")
+                    .and_then(Value::as_str)
+                    .map(|addr| addr.eq_ignore_ascii_case(channel))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if owned {
+        return Ok(());
+    }
+    let indexing = listed
+        .get("indexing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if indexing {
+        Err(format!(
+            "couldn't confirm channel {channel} belongs to your wallet yet — channel discovery is still indexing; wait a few seconds and mint again"
+        ))
+    } else {
+        Err(format!(
+            "channel {channel} was not created by the connected wallet — you can only mint into your own channel"
+        ))
+    }
+}
+
+/// Find the OWNER's linked EVM account that can sign the mint, matched by signer address.
+/// The mint is signed by the OWNER's wallet (not the runtime). An EVM address is the same
+/// key on every `eip155:*` chain, so an account linked on ANY EVM chain (e.g. `eip155:1`)
+/// can sign the Base mint — the wallet provider accepts it (`chain_namespaces_compatible`)
+/// and the metamask connector switches to Base at sign time. We prefer an exact mint-chain
+/// match, then fall back to any compatible EVM account. Returns the `account_id` to bind.
 async fn resolve_owner_account(
     registry: &ProviderRegistry,
     principal_id: &str,
@@ -766,12 +1429,22 @@ async fn resolve_owner_account(
         .get("accounts")
         .and_then(Value::as_array)
         .ok_or("wallet returned no accounts")?;
-    let matched = list.iter().find(|a| {
-        a.get("chain_namespace").and_then(Value::as_str) == Some(namespace)
-            && a.get("address")
+    let address_matches = |a: &&Value| {
+        a.get("address")
+            .and_then(Value::as_str)
+            .map(|addr| addr.eq_ignore_ascii_case(signer))
+            .unwrap_or(false)
+    };
+    let exact = list.iter().find(|a| {
+        a.get("chain_namespace").and_then(Value::as_str) == Some(namespace) && address_matches(a)
+    });
+    let matched = exact.or_else(|| {
+        list.iter().find(|a| {
+            a.get("chain_namespace")
                 .and_then(Value::as_str)
-                .map(|addr| addr.eq_ignore_ascii_case(signer))
-                .unwrap_or(false)
+                .is_some_and(chain_namespace_can_sign_mint)
+                && address_matches(a)
+        })
     });
     match matched {
         Some(a) => a
@@ -780,7 +1453,7 @@ async fn resolve_owner_account(
             .map(str::to_string)
             .ok_or_else(|| "matched wallet account has no account_id".to_string()),
         None => Err(format!(
-            "no wallet account {signer} linked on {namespace} — connect your wallet on this network (Base) first"
+            "wallet {signer} is not linked to this principal — link it in the Wallet app first"
         )),
     }
 }
@@ -790,6 +1463,9 @@ struct BuildEnvelope<'a> {
     asset_cid: &'a str,
     node_set_id_b64: &'a str,
     shares: &'a Value,
+    /// The producer verifying key that signed each escrow seal (PUBLIC). Persisted so a
+    /// later consumer open can authenticate the quorum escrow recovery against it.
+    producer_vk_b64: &'a str,
     meta: &'a MintMeta,
     creator_principal: &'a str,
 }
@@ -815,6 +1491,10 @@ fn build_metadata_envelope(b: BuildEnvelope) -> Value {
                 "chain": "base",
                 // The node-set pin the open must match (detects a node swap).
                 "node_set_id_b64": b.node_set_id_b64,
+                // The producer vk that signed each escrow seal — the recovery boundary
+                // authenticates the quorum escrow under it. Persisted here because the
+                // encrypt producer key is per-process; without it the asset is unrecoverable.
+                "producer_verifying_key_b64": b.producer_vk_b64,
                 // Per-node SEALED indexed shares — public escrow ciphertext the quorum
                 // (and only the quorum, under rights) can unwrap. The dKMS analogue of
                 // PC2's public `litCiphertext`.
@@ -911,6 +1591,80 @@ fn to_wei(price: &str, currency: &str) -> Result<String, String> {
     }
     let trimmed = digits.trim_start_matches('0');
     Ok(if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() })
+}
+
+/// Persist a freshly-prepared mint into the creator's Library so it lists at the correct
+/// location and opens on double-click — the runtime analogue of PC2 indexing a creator's own
+/// mint into their catalog. Two objects are written under the principal's `Documents`:
+///   1. the asset itself — the openable owned object the protected viewer renders, and
+///   2. a PC2-style `.ddrm` capsule carrying the dKMS escrow (`protections[0]`) + the on-chain
+///      identities (contentId/KID, asset+metadata CIDs), i.e. exactly the fields the proven
+///      quorum-open phase reloads from disk to recover the CEK 2-of-3.
+///
+/// Best-effort: a persistence failure is logged but NEVER fails the mint (the tx is already
+/// prepared). Persisting at prepare-time (before the on-chain confirm) is a deliberate
+/// simplification so the asset is visible immediately; a chain-indexed variant can supersede it.
+fn persist_minted_asset_to_library(
+    data_dir: &FsPath,
+    principal_id: &str,
+    meta: &MintMeta,
+    file_bytes: &[u8],
+    prepared: &Value,
+) {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let base = {
+        let name = if !meta.file_name.trim().is_empty() {
+            meta.file_name.trim()
+        } else {
+            meta.title.trim()
+        };
+        sanitize_filename(name)
+    };
+    let mime = Some(meta.mime.trim()).filter(|m| !m.is_empty());
+
+    // 1) the openable asset object (encrypted at rest by the principal-root layer).
+    let asset_uri = format!("{root}/Documents/{base}");
+    if let Err(err) = crate::library::handle_library_upload_bytes(
+        data_dir, principal_id, &asset_uri, mime, None, file_bytes,
+    ) {
+        tracing::warn!("mint persist: could not write owned asset {asset_uri}: {err}");
+        return;
+    }
+
+    // 2) the PC2-style `.ddrm` capsule carrying the dKMS escrow + on-chain identities.
+    let capsule = json!({
+        "schema": "elastos.ddrm.capsule/v1",
+        "title": meta.title.trim(),
+        "description": meta.description.trim(),
+        "mime": meta.mime.trim(),
+        "is_media": meta.is_media,
+        "channel": meta.channel.trim(),
+        "creator_address": meta.creator_address.trim(),
+        "content_id": prepared.get("content_id").cloned().unwrap_or(Value::Null),
+        "kid": prepared.get("kid").cloned().unwrap_or(Value::Null),
+        "asset_cid": prepared.get("asset_cid").cloned().unwrap_or(Value::Null),
+        "metadata_cid": prepared.get("metadata_cid").cloned().unwrap_or(Value::Null),
+        // The dKMS escrow descriptor (scheme, node_set_id_b64, producer_verifying_key_b64,
+        // shares[]) — the exact fields the proven quorum-open phase reloads from disk.
+        "protections": prepared.get("protections").cloned().unwrap_or(Value::Null),
+        "asset_object_uri": asset_uri,
+    });
+    let capsule_uri = format!("{root}/Documents/{base}.ddrm");
+    let capsule_bytes = serde_json::to_vec_pretty(&capsule).unwrap_or_default();
+    if let Err(err) = crate::library::handle_library_upload_bytes(
+        data_dir,
+        principal_id,
+        &capsule_uri,
+        Some("application/x-ddrm"),
+        None,
+        &capsule_bytes,
+    ) {
+        tracing::warn!("mint persist: could not write .ddrm capsule {capsule_uri}: {err}");
+    }
+    tracing::info!(
+        "mint persist: wrote owned asset + .ddrm capsule for \"{}\" under {root}/Documents",
+        meta.title.trim()
+    );
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1133,6 +1887,35 @@ mod tests {
         assert!(assert_no_raw_key_material(&json!({ "a": { "raw_cek": "leak" } })).is_err());
         assert!(assert_no_raw_key_material(&json!({ "x": [ { "seed": "leak" } ] })).is_err());
         assert!(assert_no_raw_key_material(&json!({ "PLAINTEXT_B64": "leak" })).is_err());
+    }
+
+    #[test]
+    fn channel_fee_native_zero_is_value_zero() {
+        let zero = format!("0x{}{}", "0".repeat(64), "0".repeat(64));
+        assert_eq!(parse_channel_fee_result(&zero).unwrap(), "0x0");
+    }
+
+    #[test]
+    fn channel_fee_native_nonzero_carries_into_value() {
+        // fee = 0x2386f26fc10000 (0.01 ETH), token = 0x0 (native).
+        let fee = format!("{:0>64}", "2386f26fc10000");
+        let raw = format!("0x{}{}", fee, "0".repeat(64));
+        assert_eq!(parse_channel_fee_result(&raw).unwrap(), "0x2386f26fc10000");
+    }
+
+    #[test]
+    fn channel_fee_with_erc20_token_fails_closed() {
+        // Non-zero token word -> ERC-20 fee we can't cover via msg.value.
+        let fee = format!("{:0>64}", "64");
+        let token = format!("{:0>64}", "fde4c96c8593536e31f229ea8f37b2ada2699bb2");
+        let raw = format!("0x{fee}{token}");
+        let err = parse_channel_fee_result(&raw).unwrap_err();
+        assert!(err.contains("ERC-20"), "got: {err}");
+    }
+
+    #[test]
+    fn channel_fee_short_result_fails_closed() {
+        assert!(parse_channel_fee_result("0x1234").is_err());
     }
 
     #[test]

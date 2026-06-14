@@ -154,9 +154,36 @@
           </div>
         </div>
         <div class="field">
+          <label for="wallet">Wallet</label>
+          <select id="wallet"><option value="">Connect a wallet on Base…</option></select>
+          <div class="hint" id="wallet-hint">The wallet that signs the mint — must be linked on Base.</div>
+        </div>
+        <div class="field">
           <label for="channel">Channel</label>
-          <input id="channel" type="text" placeholder="dev channel address (0x...)" />
-          <div class="hint">Leave blank to use the runtime's default dev channel.</div>
+          <select id="channel"><option value="">Select a wallet first…</option></select>
+          <div class="hint" id="channel-hint">Your channels are discovered on-chain.</div>
+          <div class="field hidden" id="channel-manual" style="margin-top:10px">
+            <label for="channel-manual-input">Channel contract address</label>
+            <input id="channel-manual-input" type="text" placeholder="0x… (your channel on Base)" autocomplete="off" spellcheck="false" />
+            <div class="hint" id="channel-manual-hint">Paste your channel's contract address. It's verified on-chain (must be created by your wallet) before minting.</div>
+          </div>
+        </div>
+        <div class="field hidden" id="create-channel">
+          <label for="channel-name">New channel name</label>
+          <input id="channel-name" type="text" placeholder="My channel" />
+          <div class="field row" style="margin-top:10px">
+            <div>
+              <label for="channel-scope">Scope</label>
+              <select id="channel-scope">
+                <option value="private">Private (subscription)</option>
+                <option value="public">Public</option>
+              </select>
+            </div>
+            <div style="display:flex;align-items:flex-end">
+              <button id="create-channel-btn" class="primary" type="button">Create channel</button>
+            </div>
+          </div>
+          <div class="hint" id="create-channel-hint">Deploys a new channel from your wallet (you approve in Wallet).</div>
         </div>
       </section>
 
@@ -167,8 +194,13 @@
           <li data-step="publish"><span class="dot"></span> Assemble mint</li>
           <li data-step="sign"><span class="dot"></span> Sign with wallet</li>
           <li data-step="broadcast"><span class="dot"></span> Broadcast</li>
+          <li data-step="approve"><span class="dot"></span> Approve gateway (enable trading)</li>
         </ul>
         <div id="status" class="status"></div>
+        <button id="enable-trading" class="primary" hidden>Step 2 — Enable trading</button>
+        <div id="enable-trading-hint" class="hint" hidden>
+          Once the mint confirms on-chain, approve the gateway so others can trade your asset.
+        </div>
       </section>
     </main>
     <script src="creator.js"></script>

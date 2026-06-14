@@ -268,6 +268,171 @@ pub(super) fn encode_mint_calldata(
     Ok(format!("0x{}", encode_hex(&bytes)))
 }
 
+/// The canonical createChannel signature (selector = `keccak256(..)[..4]` = `0xc384baa2`,
+/// supplied by config — not computed here).
+pub(super) const CREATE_CHANNEL_SIGNATURE: &str = "createChannel(uint8,uint8,string,string,bytes)";
+
+/// Outer `createChannel(uint8,uint8,string,string,bytes)` calldata: `selector ‖ head ‖ tail`.
+/// `channelType`/`scope` are static head words; `name`, `tokenURI`, `data` are dynamic
+/// (offset words). PURE: no chain RPC, no keys.
+pub(super) fn encode_create_channel_calldata(
+    selector: &str,
+    channel_type: u8,
+    scope: u8,
+    name: &str,
+    token_uri: &str,
+    data: &[u8],
+) -> Result<String, String> {
+    let mut bytes = decode_hex(selector, Some(4), "createChannel selector")?;
+    let enc_name = abi_encode_string(name.as_bytes());
+    let enc_uri = abi_encode_string(token_uri.as_bytes());
+    let enc_data = abi_encode_bytes(data);
+
+    let head = 5 * 32;
+    let name_off = head;
+    let uri_off = name_off + enc_name.len();
+    let data_off = uri_off + enc_uri.len();
+
+    bytes.extend_from_slice(&abi_word_u128(channel_type as u128));
+    bytes.extend_from_slice(&abi_word_u128(scope as u128));
+    bytes.extend_from_slice(&abi_word_usize(name_off));
+    bytes.extend_from_slice(&abi_word_usize(uri_off));
+    bytes.extend_from_slice(&abi_word_usize(data_off));
+    bytes.extend_from_slice(&enc_name);
+    bytes.extend_from_slice(&enc_uri);
+    bytes.extend_from_slice(&enc_data);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// The canonical `setApprovalForAll` signature (selector = `keccak256(..)[..4]` = `0xa22cb465`,
+/// supplied by config — not computed here). PC2's 2nd mint tx grants the channel's authority
+/// gateway operator rights on the per-asset operative contract, so the asset is tradable.
+pub(super) const SET_APPROVAL_FOR_ALL_SIGNATURE: &str = "setApprovalForAll(address,bool)";
+
+/// `setApprovalForAll(address operator, bool approved)` calldata: `selector ‖ address ‖ bool`,
+/// both static words. PURE: no chain RPC, no keys (selector supplied, not computed).
+pub(super) fn encode_set_approval_for_all_calldata(
+    selector: &str,
+    operator: &str,
+    approved: bool,
+) -> Result<String, String> {
+    let mut bytes = decode_hex(selector, Some(4), "setApprovalForAll selector")?;
+    bytes.extend_from_slice(&abi_word_address(operator)?);
+    let mut bool_word = vec![0u8; 32];
+    bool_word[31] = u8::from(approved);
+    bytes.extend_from_slice(&bool_word);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// `isApprovedForAll(address account, address operator)` calldata: `selector ‖ address ‖
+/// address`. PURE: no chain RPC, no keys (selector supplied, not computed).
+pub(super) fn encode_is_approved_for_all_calldata(
+    selector: &str,
+    account: &str,
+    operator: &str,
+) -> Result<String, String> {
+    let mut bytes = decode_hex(selector, Some(4), "isApprovedForAll selector")?;
+    bytes.extend_from_slice(&abi_word_address(account)?);
+    bytes.extend_from_slice(&abi_word_address(operator)?);
+    Ok(format!("0x{}", encode_hex(&bytes)))
+}
+
+/// Decode one `AssetCreated(address indexed _to, address indexed _channel, uint256 _tokenId,
+/// string _tokenUri, uint16 _opType, address indexed opContract)` log into `(operative,
+/// token_id_hex, block_number, log_index)`. `opContract` is the 4th indexed topic; `_tokenId`
+/// is the first non-indexed word of `data`. Returns `None` on a malformed/foreign entry.
+pub(super) fn decode_asset_created_log(entry: &Value) -> Option<(String, String, u64, u64)> {
+    let topics = entry.get("topics").and_then(Value::as_array)?;
+    if topics.len() < 4 {
+        return None;
+    }
+    let op_topic = topics.get(3)?.as_str()?;
+    let op_word = decode_hex(op_topic, Some(32), "opContract topic").ok()?;
+    let operative = word_to_address(&op_word).ok()?;
+    let data = entry.get("data").and_then(Value::as_str)?;
+    let data_bytes = decode_hex(data, None, "log data").ok()?;
+    if data_bytes.len() < 32 {
+        return None;
+    }
+    let token_id = format!("0x{}", encode_hex(&data_bytes[0..32]));
+    let block_number = entry
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_hex_u64(value).ok())
+        .unwrap_or(0);
+    let log_index = entry
+        .get("logIndex")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_hex_u64(value).ok())
+        .unwrap_or(0);
+    Some((operative, token_id, block_number, log_index))
+}
+
+/// An EVM address as a 32-byte indexed-log topic (left-zero-padded), `0x`-prefixed.
+pub(super) fn address_topic(address: &str) -> Result<String, String> {
+    let word = abi_word_address(address)?;
+    Ok(format!("0x{}", encode_hex(&word)))
+}
+
+/// Decode an EVM address from a 32-byte ABI word (the low 20 bytes). Fail-closed if the
+/// high 12 bytes are non-zero (not a clean address word).
+pub(super) fn word_to_address(word: &[u8]) -> Result<String, String> {
+    if word.len() != 32 {
+        return Err("address word must be 32 bytes".to_string());
+    }
+    if word[..12].iter().any(|byte| *byte != 0) {
+        return Err("address word has non-zero high bytes".to_string());
+    }
+    Ok(format!("0x{}", encode_hex(&word[12..32])))
+}
+
+/// Decode a `uint8` from a 32-byte ABI word / indexed topic (the low byte; the rest zero).
+pub(super) fn word_to_u8(word: &[u8]) -> Result<u8, String> {
+    if word.len() != 32 {
+        return Err("uint8 word must be 32 bytes".to_string());
+    }
+    if word[..31].iter().any(|byte| *byte != 0) {
+        return Err("uint8 word has non-zero high bytes".to_string());
+    }
+    Ok(word[31])
+}
+
+/// Decode one `ChannelCreated` `eth_getLogs` entry into `{ address, channel_type, scope,
+/// block_number }`. The channel address is the first word of `data` (non-indexed); the
+/// channelType/scope are the 1st/2nd indexed topics. Fail-closed on a malformed entry.
+pub(super) fn decode_channel_log(entry: &Value) -> Result<Value, String> {
+    let data = entry
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or("log entry missing data")?;
+    let data_bytes = decode_hex(data, None, "log data")?;
+    if data_bytes.len() < 32 {
+        return Err("log data too short for a channel address word".to_string());
+    }
+    let channel = word_to_address(&data_bytes[0..32])?;
+    let topics = entry
+        .get("topics")
+        .and_then(Value::as_array)
+        .ok_or("log entry missing topics")?;
+    let topic_u8 = |idx: usize| -> Option<u8> {
+        let topic = topics.get(idx)?.as_str()?;
+        let word = decode_hex(topic, Some(32), "topic").ok()?;
+        word_to_u8(&word).ok()
+    };
+    let channel_type = topic_u8(1);
+    let scope = topic_u8(2);
+    let block_number = entry
+        .get("blockNumber")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_hex_u64(value).ok());
+    Ok(json!({
+        "address": channel,
+        "channel_type": channel_type,
+        "scope": scope,
+        "block_number": block_number,
+    }))
+}
+
 pub(super) fn decode_evm_bool(value: &Value) -> Result<bool, String> {
     let value = value
         .as_str()

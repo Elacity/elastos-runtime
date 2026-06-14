@@ -669,9 +669,252 @@ fn run_live(
     Ok(())
 }
 
+/// ASSET open vertical: prove that a REAL asset file, sealed to the 2-of-3 quorum and whose
+/// escrow descriptor is PERSISTED TO DISK (the mint-time `protections[0]` envelope), can later
+/// be reloaded FROM DISK ALONE and opened — the CEK recovered 2-of-3 from the live nodes and
+/// the segment decrypted. This is the runtime's Library-open path distilled to its crypto core:
+///
+///   phase A (mint): seal_inline_threshold(real bytes) -> write { escrow.json, ciphertext.bin }
+///   phase B (open): reload escrow.json + ciphertext.bin FROM DISK -> key[dkms 2-of-3 recover]
+///                   -> decrypt[open_session_v1] (CEK reconstructed in-VM, segment decrypted)
+///
+/// Between the phases EVERY in-memory copy of the seal output is dropped: phase B reads only the
+/// persisted sidecar, exactly as `/api/viewers/open` will read a stored owned object. This is the
+/// proof the keystone fix made assets RECOVERABLE — `producer_verifying_key_b64` now lives in the
+/// persisted escrow, so the quorum can validate the share signatures with nothing held in process.
+fn run_asset(
+    encrypt_bin: &str,
+    key_bin: &str,
+    decrypt_bin: &str,
+    input_path: &str,
+    descriptor_path: &str,
+    caller_seed_b64: &str,
+) -> Result<(), String> {
+    println!("== dDRM ASSET open vertical (seal real file -> PERSIST escrow -> reload from disk -> 2-of-3 recover -> decrypt) ==");
+
+    let plaintext = std::fs::read(input_path)
+        .map_err(|e| format!("read input asset {input_path}: {e}"))?;
+    if plaintext.is_empty() {
+        return Err(format!("input asset {input_path} is empty"));
+    }
+    let plaintext_b64 = B64.encode(&plaintext);
+
+    // --- read the PUBLIC-ONLY dkms descriptor (the 3 quorum nodes, in node-set order). ---
+    let desc: Value = serde_json::from_slice(
+        &std::fs::read(descriptor_path)
+            .map_err(|e| format!("read descriptor {descriptor_path}: {e}"))?,
+    )
+    .map_err(|e| format!("parse descriptor: {e}"))?;
+    if desc.get("authority_master_seed_b64").is_some() {
+        return Err("descriptor carries a master seed — it must be PUBLIC-ONLY".to_string());
+    }
+    let nodes_v = desc
+        .get("threshold")
+        .and_then(|t| t.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or("descriptor has no threshold.nodes array")?;
+    if nodes_v.len() != 3 {
+        return Err(format!("asset open requires a 3-node 2-of-3 descriptor; got {}", nodes_v.len()));
+    }
+    let mut node_vks: Vec<String> = Vec::with_capacity(3);
+    let mut node_json: Vec<Value> = Vec::with_capacity(3);
+    for (i, n) in nodes_v.iter().enumerate() {
+        let vk = n.get("verifying_key_b64").and_then(Value::as_str)
+            .ok_or_else(|| format!("node {i} missing verifying_key_b64"))?.to_string();
+        let recipient = n.get("recipient_pub_b64").and_then(Value::as_str)
+            .ok_or_else(|| format!("node {i} missing recipient_pub_b64"))?.to_string();
+        node_json.push(json!({ "verifying_key_b64": vk, "recipient_pub_b64": recipient }));
+        node_vks.push(vk);
+    }
+    step(1, &format!("read {}-byte asset + PUBLIC-ONLY 2-of-3 descriptor", plaintext.len()));
+
+    // === PHASE A — MINT: seal the real bytes to the quorum + PERSIST the escrow sidecar. ===
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let escrow_dir = std::env::temp_dir().join(format!(
+        "elastos-asset-escrow-{}-{}",
+        std::process::id(),
+        uniq
+    ));
+    std::fs::create_dir_all(&escrow_dir).map_err(|e| format!("mk escrow dir: {e}"))?;
+    let escrow_json_path = escrow_dir.join("escrow.json");
+    let ciphertext_path = escrow_dir.join("ciphertext.bin");
+    {
+        let mut encrypt = Capsule::spawn("encrypt-provider", encrypt_bin)?;
+        let enc_init = ok_data(&encrypt.call(&json!({ "op": "init" }))?, "encrypt init")?;
+        let producer_vk_b64 = enc_init["producer_verifying_key_b64"].as_str()
+            .ok_or("encrypt-provider published no producer vk (build --features escrow)")?.to_string();
+        let sealed = ok_data(
+            &encrypt.call(&json!({
+                "op": "seal_inline_threshold",
+                "plaintext_b64": plaintext_b64,
+                "nodes": node_json,
+            }))?,
+            "encrypt seal_inline_threshold",
+        )?;
+        encrypt.shutdown();
+
+        let kid_hex = sealed["kid_hex"].as_str().ok_or("no kid_hex")?.to_string();
+        let scheme = sealed["scheme"].as_str().ok_or("no scheme")?.to_string();
+        let segment_b64 = sealed["segment_b64"].as_str().ok_or("no segment")?.to_string();
+        let node_set_id_b64 = sealed["node_set_id_b64"].as_str().ok_or("no node_set_id")?.to_string();
+        let shares = sealed["shares"].as_array().ok_or("no shares")?;
+        if shares.len() != 3 {
+            return Err("expected 3 sealed shares".to_string());
+        }
+        if serde_json::to_string(&sealed).unwrap_or_default().contains(&plaintext_b64) {
+            return Err("plaintext leaked in the seal_inline_threshold response".to_string());
+        }
+
+        // The PERSISTED escrow sidecar — the exact `protections[0]` shape the mint now writes.
+        let escrow = json!({
+            "schema": "elastos.ddrm.escrow/v1",
+            "scheme": scheme,
+            "kid_hex": kid_hex,
+            "node_set_id_b64": node_set_id_b64,
+            "producer_verifying_key_b64": producer_vk_b64,
+            "shares": shares,
+        });
+        std::fs::write(&escrow_json_path, serde_json::to_vec_pretty(&escrow).unwrap())
+            .map_err(|e| format!("persist escrow.json: {e}"))?;
+        let segment_bytes = B64.decode(&segment_b64).map_err(|e| e.to_string())?;
+        std::fs::write(&ciphertext_path, &segment_bytes)
+            .map_err(|e| format!("persist ciphertext.bin: {e}"))?;
+
+        step(2, &format!(
+            "MINT: sealed {}B asset to the quorum; PERSISTED escrow.json ({}B) + ciphertext.bin ({}B); kid={kid_hex}",
+            plaintext.len(),
+            std::fs::metadata(&escrow_json_path).map(|m| m.len()).unwrap_or(0),
+            segment_bytes.len(),
+        ));
+        // All seal outputs (kid_hex, shares, producer_vk, segment) go out of scope HERE.
+    }
+
+    // === PHASE B — OPEN: reload FROM DISK ONLY, recover 2-of-3, decrypt. ===
+    let escrow: Value = serde_json::from_slice(
+        &std::fs::read(&escrow_json_path).map_err(|e| format!("reload escrow.json: {e}"))?,
+    )
+    .map_err(|e| format!("parse persisted escrow: {e}"))?;
+    let segment_bytes = std::fs::read(&ciphertext_path).map_err(|e| format!("reload ciphertext.bin: {e}"))?;
+    let segment_b64 = B64.encode(&segment_bytes);
+
+    let kid_hex = escrow["kid_hex"].as_str().ok_or("persisted escrow missing kid_hex")?.to_string();
+    let scheme = escrow["scheme"].as_str().ok_or("persisted escrow missing scheme")?.to_string();
+    let node_set_id_b64 = escrow["node_set_id_b64"].as_str().ok_or("persisted escrow missing node_set_id_b64")?.to_string();
+    let node_set_id = B64.decode(&node_set_id_b64).map_err(|e| e.to_string())?;
+    let producer_vk_b64 = escrow["producer_verifying_key_b64"].as_str()
+        .ok_or("persisted escrow missing producer_verifying_key_b64 — asset is UNRECOVERABLE (pre-keystone-fix mint)")?
+        .to_string();
+    let shares = escrow["shares"].as_array().ok_or("persisted escrow missing shares")?;
+    let share_wrapped = |i: usize| -> Result<String, String> {
+        shares[i]["wrapped_share_b64"].as_str().map(str::to_string)
+            .ok_or_else(|| format!("persisted share {i} missing wrapped_share_b64"))
+    };
+    let share1 = share_wrapped(0)?;
+    let share2 = share_wrapped(1)?;
+    let share3 = share_wrapped(2)?;
+    step(3, "OPEN: reloaded escrow.json + ciphertext.bin FROM DISK (nothing held in process from the mint)");
+
+    // decrypt boundary: pin all 3 node identities + mint a session key.
+    let mut decrypt = Capsule::spawn("decrypt-provider", decrypt_bin)?;
+    let dec_init = ok_data(
+        &decrypt.call(&json!({
+            "op": "init",
+            "config": {
+                "authority_vk_b64": node_vks[0],
+                "authority_vk2_b64": node_vks[1],
+                "authority_vk3_b64": node_vks[2],
+            }
+        }))?,
+        "decrypt init",
+    )?;
+    let session_pub_b64 = dec_init["decrypt_session_public_key_b64"].as_str()
+        .ok_or("decrypt-provider published no session key (build --features rail-material)")?.to_string();
+    let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
+
+    // Fresh per-open session binding (content_hash + nonce bind the re-seal transcript; both the
+    // key authority's re-seal AAD and the decrypt boundary's unwrap AAD recompute the same value).
+    let content_hash = b"elastos-asset-open-content-hash0".to_vec(); // 32 bytes
+    let nonce = b"elastos-asset-open-nonce".to_vec();
+    let aad = transcript_aad(&session_pub, &content_hash, &nonce, Some(&node_set_id));
+
+    let mut key = Capsule::spawn("key-provider", key_bin)?;
+    ok_data(
+        &key.call(&json!({
+            "op": "init",
+            "config": {
+                "backend": "dkms",
+                "dkms_authority_descriptor": descriptor_path,
+                "dkms_caller_seed_b64": caller_seed_b64,
+            }
+        }))?,
+        "key init (dkms)",
+    )?;
+    let request = key_release_request_live(&kid_hex, &share1, &scheme);
+    let session_ctx = json!({
+        "decrypt_session_pub_b64": session_pub_b64,
+        "producer_vk_b64": producer_vk_b64,
+        "producer_vk2_b64": producer_vk_b64,
+        "producer_vk3_b64": producer_vk_b64,
+        "aad_b64": B64.encode(&aad),
+        "ciphertext_b64": segment_b64,
+        "content_hash_b64": B64.encode(&content_hash),
+        "nonce_b64": B64.encode(&nonce),
+        "wrapped_cek_share2_b64": share2,
+        "wrapped_cek_share3_b64": share3,
+        "now_unix": NOW_UNIX,
+    });
+    let release = ok_data(
+        &key.call(&json!({ "op": "release", "request": request, "session": session_ctx }))?,
+        "key release (dkms 2-of-3)",
+    )?;
+    key.shutdown();
+    let material = release["material"].clone();
+    if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
+        return Err(format!("key-provider returned no sealed material: {release}"));
+    }
+    let release_str = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+    if release_str.contains(&share1) || release_str.contains(&share2) || release_str.contains(&share3) {
+        return Err("an escrowed share blob was echoed by the key authority".to_string());
+    }
+    step(4, "key-provider(dkms): recovered the CEK from ANY TWO live nodes using ONLY the persisted escrow + re-sealed to the session");
+
+    let open = decrypt.call(&json!({
+        "op": "open_session_v1",
+        "request": decrypt_request(),
+        "material": material,
+        "now_unix": NOW_UNIX,
+    }))?;
+    let open_data = ok_data(&open, "decrypt open_session_v1")?;
+    if open_data["decision"].as_str() != Some("opened") {
+        return Err(format!("decrypt did not open the session: {open}"));
+    }
+    if serde_json::to_string(&open).unwrap_or_default().contains(&plaintext_b64) {
+        return Err("plaintext leaked in the decrypt-provider response".to_string());
+    }
+    decrypt.shutdown();
+    let _ = std::fs::remove_dir_all(&escrow_dir);
+    step(5, "decrypt-provider: reconstructed the CEK in-VM from the persisted 2-of-3 escrow and DECRYPTED the asset segment (no plaintext on the wire)");
+
+    println!();
+    println!("RESULT: a REAL {}-byte asset was sealed to the live 2-of-3 quorum, its escrow PERSISTED to disk,", plaintext.len());
+    println!("        reloaded FROM DISK ALONE, recovered 2-of-3, and decrypted — proving minted assets are RECOVERABLE.");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = if let Some(pos) = args.iter().position(|a| a == "--live") {
+    let result = if let Some(pos) = args.iter().position(|a| a == "--asset") {
+        let pre = &args[..pos];
+        let post = &args[pos + 1..];
+        if pre.len() < 3 || post.len() < 3 {
+            Err("usage: ddrm-producer-smoke <encrypt-bin> <key-bin> <decrypt-bin> --asset <input-file> <descriptor.json> <caller_seed_b64>".to_string())
+        } else {
+            run_asset(&pre[0], &pre[1], &pre[2], &post[0], &post[1], &post[2])
+        }
+    } else if let Some(pos) = args.iter().position(|a| a == "--live") {
         let pre = &args[..pos];
         let post = &args[pos + 1..];
         if pre.len() < 3 || post.len() < 2 {

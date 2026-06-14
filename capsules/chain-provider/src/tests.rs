@@ -1280,3 +1280,373 @@ fn mint_rejects_a_bad_channel_address() {
     }));
     assert_eq!(err, "invalid_to");
 }
+
+// --- assemble_create_channel: createChannel(uint8,uint8,string,string,bytes) --------
+//
+// Decode the produced calldata back against the Solidity ABI (no ethers) so the encoder
+// is proven correct, mirroring the mint suite. PC2's real call is
+// `createChannel(STANDARD=1, PRIVATE=2, name, "ipfs://<cid>", configData)`.
+
+const CHANNEL_FACTORY: &str = "0xE1365ed47353De2F8A6a69E271e36650A9EE368F";
+
+fn create_channel_request(value: Option<&str>) -> Request {
+    let mut channel = json!({
+        "selector": MINT_SELECTOR,
+        "factory": CHANNEL_FACTORY,
+        "channel_type": 1,
+        "scope": 2,
+        "name": "My Channel",
+        "token_uri": "ipfs://QmChannelMeta",
+    });
+    if let Some(value) = value {
+        channel["value_wei"] = json!(value);
+    }
+    Request::AssembleCreateChannel {
+        channel: Box::new(serde_json::from_value(channel).unwrap()),
+    }
+}
+
+#[test]
+fn create_channel_calldata_decodes_to_the_pc2_args() {
+    let data = ok_data(ChainProvider::new().handle(create_channel_request(Some("0x2386f26fc10000"))));
+    assert_eq!(data["function"], "createChannel(uint8,uint8,string,string,bytes)");
+    assert_eq!(data["to"], CHANNEL_FACTORY);
+    assert_eq!(data["value"], "0x2386f26fc10000");
+    assert_eq!(data["signed"], false);
+
+    let calldata = mint_hex_to_bytes(data["data"].as_str().unwrap());
+    assert_eq!(&calldata[..4], &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let body = &calldata[4..];
+
+    // head: [channelType=1, scope=2, name_off, uri_off, data_off].
+    assert_eq!(mint_word_u64(body, 0), 1, "channelType STANDARD");
+    assert_eq!(mint_word_u64(body, 32), 2, "scope PRIVATE");
+    let name_off = mint_word_u64(body, 64) as usize;
+    let uri_off = mint_word_u64(body, 96) as usize;
+    let data_off = mint_word_u64(body, 128) as usize;
+    assert_eq!(name_off, 160, "name starts past the 5 head words");
+
+    let name_len = mint_word_u64(body, name_off) as usize;
+    assert_eq!(&body[name_off + 32..name_off + 32 + name_len], b"My Channel");
+
+    let uri_len = mint_word_u64(body, uri_off) as usize;
+    assert_eq!(&body[uri_off + 32..uri_off + 32 + uri_len], b"ipfs://QmChannelMeta");
+
+    // empty `bytes data` -> zero length word.
+    assert_eq!(mint_word_u64(body, data_off), 0, "empty config bytes");
+}
+
+#[test]
+fn create_channel_defaults_value_to_zero() {
+    let data = ok_data(ChainProvider::new().handle(create_channel_request(None)));
+    assert_eq!(data["value"], "0x0");
+}
+
+#[test]
+fn create_channel_rejects_a_bad_factory() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleCreateChannel {
+        channel: Box::new(
+            serde_json::from_value(json!({
+                "selector": MINT_SELECTOR,
+                "factory": "not-an-address",
+                "channel_type": 1,
+                "scope": 2,
+                "name": "X",
+                "token_uri": "ipfs://x",
+            }))
+            .unwrap(),
+        ),
+    }));
+    assert_eq!(err, "invalid_factory");
+}
+
+#[test]
+fn create_channel_rejects_an_empty_name() {
+    let err = error_code(ChainProvider::new().handle(Request::AssembleCreateChannel {
+        channel: Box::new(
+            serde_json::from_value(json!({
+                "selector": MINT_SELECTOR,
+                "factory": CHANNEL_FACTORY,
+                "channel_type": 1,
+                "scope": 2,
+                "name": "   ",
+                "token_uri": "ipfs://x",
+            }))
+            .unwrap(),
+        ),
+    }));
+    assert_eq!(err, "invalid_channel");
+}
+
+// --- decode_channel_log: ChannelCreated log -> { address, channel_type, scope } -----
+
+#[test]
+fn channel_log_decodes_address_type_scope_and_block() {
+    // ChannelCreated(uint8 channelType, uint8 scope, address creator, address channel, ...).
+    // channel address lives in the FIRST data word (non-indexed); type/scope are topics 1/2.
+    let channel = "0x00000000000000000000000000000000000000Aa";
+    let data = format!("0x{}{}", "0".repeat(24), &channel[2..].to_lowercase());
+    let entry = json!({
+        "address": CHANNEL_FACTORY,
+        "topics": [
+            "0x4ae6ef95ddade103ca67593cd4cf68dda177aa1054ad4eeb4963d2c3df44702e",
+            format!("0x{}", "0".repeat(63) + "1"),
+            format!("0x{}", "0".repeat(63) + "2"),
+            format!("0x{}{}", "0".repeat(24), "1234567890123456789012345678901234567890"),
+        ],
+        "data": data,
+        "blockNumber": "0x2a3e42a",
+    });
+    let decoded = decode_channel_log(&entry).expect("should decode");
+    assert_eq!(decoded["address"], json!("0x00000000000000000000000000000000000000aa"));
+    assert_eq!(decoded["channel_type"], json!(1));
+    assert_eq!(decoded["scope"], json!(2));
+    assert_eq!(decoded["block_number"], json!(0x2a3e42a));
+}
+
+#[test]
+fn channel_log_fails_closed_on_short_data() {
+    let entry = json!({ "topics": [], "data": "0x1234" });
+    assert!(decode_channel_log(&entry).is_err());
+}
+
+#[test]
+fn address_topic_roundtrips_through_word_to_address() {
+    let addr = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+    let topic = address_topic(addr).unwrap();
+    let word = mint_hex_to_bytes(&topic);
+    assert_eq!(word_to_address(&word).unwrap(), addr.to_lowercase());
+    // High bytes must be zero for an address word.
+    assert!(word[..12].iter().all(|b| *b == 0));
+}
+
+// ── trade-enabling approval (PC2's 2nd mint tx) ─────────────────────────────────
+
+#[test]
+fn set_approval_for_all_calldata_matches_solidity_abi() {
+    // setApprovalForAll(0x09dBe796…, true): selector ‖ left-padded operator ‖ bool word.
+    let data = encode_set_approval_for_all_calldata(
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D",
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        data,
+        "0xa22cb465\
+         00000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d\
+         0000000000000000000000000000000000000000000000000000000000000001"
+    );
+    // approved = false flips only the final byte.
+    let off = encode_set_approval_for_all_calldata(
+        SET_APPROVAL_FOR_ALL_SELECTOR,
+        "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D",
+        false,
+    )
+    .unwrap();
+    assert!(off.ends_with("0000000000000000000000000000000000000000000000000000000000000000"));
+}
+
+#[test]
+fn is_approved_for_all_calldata_encodes_two_addresses() {
+    let data = encode_is_approved_for_all_calldata(
+        IS_APPROVED_FOR_ALL_SELECTOR,
+        "0x34daf31b99b5a59ceb18e424dbc112fa6e5f3dc3",
+        "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D",
+    )
+    .unwrap();
+    assert_eq!(
+        data,
+        "0xe985e9c5\
+         00000000000000000000000034daf31b99b5a59ceb18e424dbc112fa6e5f3dc3\
+         00000000000000000000000009dbe796f40eceffeaccf243c3d758c4c1d8d87d"
+    );
+}
+
+#[test]
+fn decode_asset_created_log_extracts_operative_and_token_id() {
+    // topics: [topic0, _to, _channel, opContract]; data: tokenId ‖ (string/uint16 tail unused).
+    let entry = json!({
+        "topics": [
+            ASSET_CREATED_TOPIC0,
+            "0x00000000000000000000000034daf31b99b5a59ceb18e424dbc112fa6e5f3dc3",
+            "0x000000000000000000000000807f9eb55a165c2daa74a5baefc6f47324a2825d",
+            "0x000000000000000000000000dc6e56b1e3c9956aaf7ffc0316f360c4ab67d119"
+        ],
+        "data": "0x000000000000000000000000000000000000000000000000000000000000002a",
+        "blockNumber": "0x2d1a4e7",
+        "logIndex": "0x3"
+    });
+    let (operative, token_id, block, log_index) = decode_asset_created_log(&entry).unwrap();
+    assert_eq!(operative, "0xdc6e56b1e3c9956aaf7ffc0316f360c4ab67d119");
+    assert_eq!(
+        token_id,
+        "0x000000000000000000000000000000000000000000000000000000000000002a"
+    );
+    assert_eq!(block, 0x2d1a4e7);
+    assert_eq!(log_index, 3);
+}
+
+#[test]
+fn decode_asset_created_log_rejects_malformed() {
+    // Too few topics (missing indexed opContract).
+    assert!(decode_asset_created_log(&json!({ "topics": [], "data": "0x" })).is_none());
+}
+
+// ── channel index: range-limit detection, dedup ordering, persistence, scan ─────
+
+#[test]
+fn range_limit_error_recognizes_endpoint_caps_but_not_other_errors() {
+    let caps = [
+        "eth_getLogs is limited to 0 - 50 blocks range",
+        "exceed maximum block range: 50000",
+        "ranges over 10000 blocks are not supported on freetier",
+        "eth_getLogs is limited to a 10,000 range",
+    ];
+    for msg in caps {
+        let resp = Response::error("upstream_rpc_error", msg);
+        assert!(
+            ChainProvider::is_range_limit_error(&resp),
+            "should treat as range cap: {msg}"
+        );
+    }
+    // A different RPC error (e.g. execution reverted) must NOT be treated as a range cap —
+    // it would otherwise loop split-and-retry on a genuine failure instead of failing closed.
+    assert!(!ChainProvider::is_range_limit_error(&Response::error(
+        "upstream_rpc_error",
+        "execution reverted"
+    )));
+    // Non-RPC error codes never count.
+    assert!(!ChainProvider::is_range_limit_error(&Response::error(
+        "upstream_unreachable",
+        "block range"
+    )));
+}
+
+#[test]
+fn channel_index_entry_dedups_and_orders_newest_first() {
+    let mut entry = ChannelIndexEntry {
+        deploy_block: 0,
+        floor: 0,
+        head: 0,
+        complete: false,
+        channels: Vec::new(),
+        updated_at: 0,
+    };
+    entry.upsert("0xAAaA00000000000000000000000000000000aAaA", 100, Some(1), Some(0));
+    entry.upsert("0xBBBB00000000000000000000000000000000bBBB", 50, Some(1), Some(1));
+    // Same channel again at a LOWER block (case-insensitive) — keep earliest, don't duplicate.
+    entry.upsert("0xaaaa00000000000000000000000000000000AaAa", 80, None, None);
+    assert_eq!(entry.channels.len(), 2, "duplicate address must not be added twice");
+    // The re-upsert lowered channel A to block 80 (earliest-seen wins), so A (80) sorts
+    // ahead of B (50) newest-first.
+    let ordered = entry.channels_newest_first();
+    assert_eq!(ordered[0].block_number, 80);
+    assert_eq!(ordered[1].block_number, 50);
+    let a = entry
+        .channels
+        .iter()
+        .find(|c| c.address.eq_ignore_ascii_case("0xAAaA00000000000000000000000000000000aAaA"))
+        .unwrap();
+    assert_eq!(a.block_number, 80);
+}
+
+#[test]
+fn channel_index_file_round_trips_through_disk() {
+    let data_dir = TestDataDir::new();
+    let path = channel_index_path(data_dir.path());
+    let mut file = ChannelIndexFile::default();
+    let mut entry = ChannelIndexEntry {
+        deploy_block: 10,
+        floor: 10,
+        head: 200,
+        complete: true,
+        channels: Vec::new(),
+        updated_at: 42,
+    };
+    entry.upsert("0x00000000000000000000000000000000000000aa", 123, Some(1), Some(2));
+    let key = channel_index_key("base-mainnet", "0xFACT", "0xCreAtoR");
+    file.entries.insert(key.clone(), entry);
+    write_channel_index_file(&path, &file).unwrap();
+    let read = read_channel_index_file(&path).unwrap();
+    let got = read.entries.get(&key).expect("entry persisted");
+    assert_eq!(got.head, 200);
+    assert!(got.complete);
+    assert_eq!(got.channels[0].block_number, 123);
+    // Key normalizes factory + creator to lower-case so the same identity maps to one entry.
+    assert_eq!(key, "base-mainnet|0xfact|0xcreator");
+}
+
+fn provider_with_evm_rpc_in(data_dir: &Path, rpc_url: String) -> ChainProvider {
+    let mut provider = ChainProvider::with_data_dir(data_dir.to_path_buf());
+    let init = provider.handle(Request::Init {
+        config: json!({
+            "networks": [{
+                "id": "esc-local",
+                "display_name": "ESC Local",
+                "kind": "evm_json_rpc",
+                "chain_id": 20,
+                "native_symbol": "ELA",
+                "provider": "test",
+                "mainnet": false,
+                "explorer_url": null,
+                "rpc_url": rpc_url
+            }]
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+    provider
+}
+
+#[test]
+fn list_channels_discovers_via_scan_then_serves_from_persisted_cursor() {
+    let creator = "0x1234567890123456789012345678901234567890";
+    let creator_topic = address_topic(creator).unwrap();
+    let channel = "0x00000000000000000000000000000000000000aa";
+    let data = format!("0x{}{}", "0".repeat(24), &channel[2..]);
+    let log = json!({
+        "address": DEFAULT_CHANNEL_FACTORY,
+        "topics": [
+            CHANNEL_CREATED_TOPIC0,
+            format!("0x{}", "0".repeat(63) + "1"),
+            format!("0x{}", "0".repeat(63) + "0"),
+            creator_topic,
+        ],
+        "data": data,
+        "blockNumber": "0x62",
+    });
+    // First call: blockNumber (latest=0x64) -> getLogs (one window, since deploy=0x60).
+    // Second call: only blockNumber — the cursor is complete + cached, so NO rescan.
+    let rpc_url = spawn_rpc_sequence_server(vec![
+        ("eth_blockNumber", json!("0x64")),
+        ("eth_getLogs", json!([log])),
+        ("eth_blockNumber", json!("0x64")),
+    ]);
+    let data_dir = TestDataDir::new();
+    let mut provider = provider_with_evm_rpc_in(data_dir.path(), rpc_url);
+
+    let first = ok_data(provider.handle(Request::ListChannels {
+        network: "esc-local".to_string(),
+        factory: Some(DEFAULT_CHANNEL_FACTORY.to_string()),
+        creator: creator.to_string(),
+        from_block: Some("0x60".to_string()),
+    }));
+    let channels = first["channels"].as_array().unwrap();
+    assert_eq!(channels.len(), 1, "the creator's channel should be discovered");
+    assert_eq!(channels[0]["address"], json!(channel));
+    assert_eq!(first["indexing"], json!(false), "deploy reached → backfill complete");
+
+    // The index file persisted the cursor + channel.
+    let index = read_channel_index_file(&channel_index_path(data_dir.path())).unwrap();
+    assert_eq!(index.entries.len(), 1);
+
+    // Second call serves the channel from the persisted cursor without a getLogs rescan
+    // (the sequence server only has one more response queued: eth_blockNumber).
+    let second = ok_data(provider.handle(Request::ListChannels {
+        network: "esc-local".to_string(),
+        factory: Some(DEFAULT_CHANNEL_FACTORY.to_string()),
+        creator: creator.to_string(),
+        from_block: Some("0x60".to_string()),
+    }));
+    assert_eq!(second["channels"].as_array().unwrap().len(), 1);
+}

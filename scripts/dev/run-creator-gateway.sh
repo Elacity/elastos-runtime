@@ -92,7 +92,7 @@ build_capsule object-provider
 # v0.4.0 browser app capsules need compiled wasm entrypoints (gitignored like home.wasm).
 # Opening Library/Marketplace/etc. from Home spawns a managed runtime that loads <name>.wasm.
 echo "building v0.4.0 app capsule wasm (wasm32-wasip1) ..."
-for c in library documents inbox system marketplace archive-manager; do
+for c in library documents inbox system marketplace archive-manager wallet wallet-metamask wallet-unisat wallet-walletconnect; do
   cj="${CAPSULES}/${c}/capsule.json"
   [[ -f "$cj" ]] || continue
   entry=$(grep -oE '"entrypoint"[^,]*' "$cj" | sed -E 's/.*"entrypoint"[^"]*"([^"]+)".*/\1/')

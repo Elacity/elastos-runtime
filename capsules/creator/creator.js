@@ -47,11 +47,33 @@ const els = {
   desc: document.getElementById("desc"),
   price: document.getElementById("price"),
   currency: document.getElementById("currency"),
+  wallet: document.getElementById("wallet"),
+  walletHint: document.getElementById("wallet-hint"),
   channel: document.getElementById("channel"),
+  channelHint: document.getElementById("channel-hint"),
+  channelManual: document.getElementById("channel-manual"),
+  channelManualInput: document.getElementById("channel-manual-input"),
+  channelManualHint: document.getElementById("channel-manual-hint"),
+  createChannel: document.getElementById("create-channel"),
+  channelName: document.getElementById("channel-name"),
+  channelScope: document.getElementById("channel-scope"),
+  createChannelBtn: document.getElementById("create-channel-btn"),
+  createChannelHint: document.getElementById("create-channel-hint"),
   mint: document.getElementById("mint"),
   steps: document.getElementById("steps"),
   status: document.getElementById("status"),
+  enableTrading: document.getElementById("enable-trading"),
+  enableTradingHint: document.getElementById("enable-trading-hint"),
 };
+
+// The sentinel channel option that reveals the inline create-channel form.
+const CREATE_CHANNEL_VALUE = "__create__";
+// The sentinel that reveals the manual channel-address input (fail-closed fallback for a
+// channel discovery hasn't surfaced yet — still verified on-chain server-side before mint).
+const MANUAL_CHANNEL_VALUE = "__manual__";
+// Re-poll cadence while the on-chain channel index is still backfilling older channels.
+const CHANNEL_POLL_MS = 2500;
+let channelPollTimer = null;
 
 function query(name) {
   try {
@@ -82,7 +104,11 @@ function setStep(name, state) {
 }
 
 function resetSteps() {
-  ["encrypt", "publish", "sign", "broadcast"].forEach((s) => setStep(s, ""));
+  ["encrypt", "publish", "sign", "broadcast", "approve"].forEach((s) => setStep(s, ""));
+  if (els.enableTrading) els.enableTrading.disabled = false;
+  // Button visibility is governed by the wallet+channel selection (refreshTradeEnabled),
+  // so it stays available for the latest minted asset; only re-enable it here.
+  refreshTradeEnabled();
 }
 
 function classifyMedia(mime) {
@@ -116,8 +142,236 @@ function onFile(file) {
   refreshMintEnabled();
 }
 
+function isEvmAddress(v) {
+  return /^0x[0-9a-fA-F]{40}$/.test((v || "").trim());
+}
+
+function selectedChannel() {
+  const v = els.channel.value;
+  if (v === MANUAL_CHANNEL_VALUE) {
+    const manual = (els.channelManualInput.value || "").trim();
+    return isEvmAddress(manual) ? manual : "";
+  }
+  return v && v !== CREATE_CHANNEL_VALUE ? v : "";
+}
+
 function refreshMintEnabled() {
-  els.mint.disabled = !(selectedFile && els.title.value.trim());
+  // Fail-closed: a wallet AND a real channel selection are required — no silent default.
+  els.mint.disabled = !(
+    selectedFile &&
+    els.title.value.trim() &&
+    els.wallet.value &&
+    selectedChannel()
+  );
+  refreshTradeEnabled();
+}
+
+// The trade-enabling 2nd tx targets the newest minted asset in the selected channel, so the
+// "Enable trading" action is available whenever a wallet + a real channel are chosen — both
+// right after a mint AND for an asset minted earlier. It's confirmation-gated server-side.
+function refreshTradeEnabled() {
+  if (!els.enableTrading) return;
+  const ready = Boolean(els.wallet.value && selectedChannel());
+  els.enableTrading.hidden = !ready;
+  if (els.enableTradingHint) els.enableTradingHint.hidden = !ready;
+}
+
+// ── wallet + channel discovery ───────────────────────────────────────────────
+// Learn the principal's linked Base wallet(s) from the host (the frame holds no wallet
+// authority — #3). Populate the picker; the chosen address is the mint/deploy signer.
+async function loadWallets() {
+  try {
+    const resp = await fetch(appUrl("/wallet"), { headers: { ...launchHeaders() } });
+    if (!resp.ok) {
+      els.walletHint.textContent =
+        "No linked Base wallet — link your wallet on Base in the Wallet app, then reopen Create.";
+      return;
+    }
+    const info = await resp.json();
+    const addrs = (info && info.addresses) || [];
+    els.wallet.innerHTML = "";
+    if (addrs.length === 0) {
+      els.wallet.innerHTML = '<option value="">No wallet linked on Base</option>';
+      els.walletHint.textContent =
+        "No linked Base wallet — link your wallet on Base in the Wallet app, then reopen Create.";
+      return;
+    }
+    addrs.forEach((addr) => {
+      const opt = document.createElement("option");
+      opt.value = addr;
+      opt.textContent = addr.slice(0, 8) + "…" + addr.slice(-6);
+      els.wallet.appendChild(opt);
+    });
+    els.wallet.value = addrs[0];
+    els.walletHint.textContent = "Signs the mint on Base.";
+    await loadChannels();
+  } catch (err) {
+    els.walletHint.textContent = "Could not load wallet: " + err.message;
+  }
+}
+
+// Discover the channels the selected wallet already owns (host scans ChannelCreated logs).
+// No silent default: if there are none, the only path forward is "+ Create a new channel".
+// Discover the wallet's channels. The host index is RESUMABLE: deep (older) channels surface
+// across calls, so while `indexing` is true we re-poll and show progress. The current
+// selection is preserved across re-polls so the user can pick as soon as their channel lands.
+async function loadChannels(opts) {
+  const isPoll = opts && opts.poll;
+  if (channelPollTimer && !isPoll) {
+    clearTimeout(channelPollTimer);
+    channelPollTimer = null;
+  }
+  const wallet = els.wallet.value;
+  if (!wallet) {
+    els.channel.innerHTML = '<option value="">Select a wallet first…</option>';
+    els.channelManual.classList.add("hidden");
+    refreshMintEnabled();
+    return;
+  }
+  if (!isPoll) {
+    els.channel.innerHTML = '<option value="">Loading channels…</option>';
+  }
+  const prevSelection = els.channel.value;
+  try {
+    const resp = await fetch(
+      appUrl("/channels?creator=" + encodeURIComponent(wallet)),
+      { headers: { ...launchHeaders() } }
+    );
+    const info = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      els.channel.innerHTML = '<option value="">Channel discovery failed</option>';
+      els.channelHint.textContent = info.error || "Could not discover channels.";
+      addManualOption();
+      addCreateOption();
+      refreshMintEnabled();
+      return;
+    }
+    const channels = (info && info.channels) || [];
+    const indexing = !!(info && info.indexing);
+    els.channel.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = channels.length ? "Select a channel…" : "No channels found yet";
+    els.channel.appendChild(placeholder);
+    channels.forEach((ch) => {
+      const addr = ch.address || "";
+      const opt = document.createElement("option");
+      opt.value = addr;
+      opt.textContent = addr.slice(0, 10) + "…" + addr.slice(-6);
+      els.channel.appendChild(opt);
+    });
+    addManualOption();
+    addCreateOption();
+    // Restore the prior selection if it still exists (don't yank it mid-poll).
+    if (prevSelection) {
+      els.channel.value = prevSelection;
+    }
+
+    if (channels.length > 0) {
+      els.channelHint.textContent = indexing
+        ? channels.length + " channel(s) found — still scanning for older ones…"
+        : channels.length + " channel(s) found on-chain.";
+    } else if (indexing) {
+      els.channelHint.textContent =
+        "Scanning Base for your channels… " + indexingProgress(info) +
+        " (or paste your channel address below).";
+    } else {
+      els.channelHint.textContent =
+        "No channels owned by this wallet. Create one, or paste its address below.";
+    }
+
+    // Keep polling while the backfill is incomplete, so deep channels appear without a reload.
+    if (indexing) {
+      channelPollTimer = setTimeout(() => loadChannels({ poll: true }), CHANNEL_POLL_MS);
+    } else if (channelPollTimer) {
+      clearTimeout(channelPollTimer);
+      channelPollTimer = null;
+    }
+  } catch (err) {
+    els.channel.innerHTML = '<option value="">Channel discovery failed</option>';
+    els.channelHint.textContent = "Could not discover channels: " + err.message;
+    addManualOption();
+    addCreateOption();
+  }
+  refreshMintEnabled();
+}
+
+// Rough % of the factory history scanned so far (latest..deploy down to scanned_floor).
+function indexingProgress(info) {
+  const latest = Number(info.latest_block),
+    deploy = Number(info.deploy_block),
+    floor = Number(info.scanned_floor);
+  if (!latest || !deploy || !floor || latest <= deploy) return "";
+  const pct = Math.min(100, Math.max(0, ((latest - floor) / (latest - deploy)) * 100));
+  return pct.toFixed(0) + "%";
+}
+
+function addManualOption() {
+  const opt = document.createElement("option");
+  opt.value = MANUAL_CHANNEL_VALUE;
+  opt.textContent = "Enter channel address manually…";
+  els.channel.appendChild(opt);
+}
+
+function addCreateOption() {
+  const opt = document.createElement("option");
+  opt.value = CREATE_CHANNEL_VALUE;
+  opt.textContent = "+ Create a new channel…";
+  els.channel.appendChild(opt);
+}
+
+function onChannelChange() {
+  const creating = els.channel.value === CREATE_CHANNEL_VALUE;
+  const manual = els.channel.value === MANUAL_CHANNEL_VALUE;
+  els.createChannel.classList.toggle("hidden", !creating);
+  els.channelManual.classList.toggle("hidden", !manual);
+  refreshMintEnabled();
+}
+
+// Prepare an UNSIGNED createChannel and queue a wallet approval. The owner deploys it; once
+// confirmed on-chain, refreshing channels surfaces it for selection (no auto-mint).
+async function createChannel() {
+  const wallet = els.wallet.value;
+  const name = els.channelName.value.trim();
+  if (!wallet) {
+    els.createChannelHint.textContent = "Select a wallet first.";
+    return;
+  }
+  if (!name) {
+    els.createChannelHint.textContent = "Enter a channel name.";
+    return;
+  }
+  els.createChannelBtn.disabled = true;
+  els.createChannelHint.textContent = "Preparing channel…";
+  try {
+    const resp = await fetch(appUrl("/create-channel"), {
+      method: "POST",
+      headers: { ...launchHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: name,
+        scope: els.channelScope.value,
+        creator_address: wallet,
+      }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    assertNoKeyMaterial(result);
+    if (!resp.ok) {
+      els.createChannelHint.textContent = result.error || "Create failed: " + resp.status;
+      els.createChannelBtn.disabled = false;
+      return;
+    }
+    const approval = result.channel_approval || {};
+    if (approval.request_id) {
+      els.createChannelHint.textContent =
+        "Channel prepared — approve it in the Wallet app, then click Refresh to select it.";
+    } else {
+      els.createChannelHint.textContent =
+        "Prepared but no wallet approval was queued — connect your wallet on Base.";
+    }
+  } catch (err) {
+    els.createChannelHint.textContent = "Create failed: " + err.message;
+  }
+  els.createChannelBtn.disabled = false;
 }
 
 // ── host capability preflight ────────────────────────────────────────────────
@@ -173,10 +427,10 @@ async function mint() {
     description: els.desc.value.trim(),
     price: els.price.value || "0",
     currency: els.currency.value,
-    channel: els.channel.value.trim(),
+    channel: selectedChannel(),
+    creatorAddress: els.wallet.value,
     mime: mime,
     isMedia: classifyMedia(mime),
-    size: selectedFile.size,
     fileName: selectedFile.name,
   };
 
@@ -227,6 +481,11 @@ async function mint() {
           ". Open the Wallet app and approve the mint transaction to sign &amp; broadcast it from your wallet.",
         "ok"
       );
+      // PC2's 2nd mint tx: once the mint confirms on-chain, the owner approves the gateway so
+      // the asset is tradable. The "Enable trading" action (shown whenever a wallet + channel
+      // are selected) is confirmation-gated server-side — it discovers the operative from the
+      // mint's on-chain `AssetCreated` event, so it works once the mint lands.
+      refreshTradeEnabled();
     } else {
       setStep("sign", "active");
       setStatus(
@@ -255,6 +514,66 @@ function fileToBase64(file) {
   });
 }
 
+// PC2's 2nd mint tx (`setApprovalForAll(gateway, true)` on the asset's operative). The host
+// discovers the operative from the mint's on-chain `AssetCreated` event — so this is
+// confirmation-gated: if the mint hasn't landed yet the host returns `mint_not_confirmed`
+// and we ask the owner to confirm the mint first, then retry.
+async function enableTrading() {
+  const channel = selectedChannel();
+  const creatorAddress = els.wallet.value;
+  if (!channel || !creatorAddress) return;
+  els.enableTrading.disabled = true;
+  setStep("approve", "active");
+  setStatus("Checking the mint is confirmed on-chain…", "");
+  try {
+    const resp = await fetch(appUrl("/prepare-trade-approval"), {
+      method: "POST",
+      headers: { ...launchHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const msg = result.error || "Could not prepare the gateway approval: " + resp.status;
+      // Not yet mined — let the owner confirm the mint, then retry.
+      if (/not_confirmed|not confirmed/i.test(msg)) {
+        setStep("approve", "active");
+        setStatus(
+          "Mint isn't confirmed on-chain yet — approve & confirm the mint in the Wallet app, then click “Enable trading” again.",
+          ""
+        );
+      } else {
+        setStep("approve", "err");
+        setStatus(msg, "err");
+      }
+      els.enableTrading.disabled = false;
+      return;
+    }
+    if (result.already_approved) {
+      setStep("approve", "done");
+      setStatus("Gateway already approved — your asset is tradable.", "ok");
+      els.enableTrading.hidden = true;
+      if (els.enableTradingHint) els.enableTradingHint.hidden = true;
+      return;
+    }
+    if (result.approval && result.approval.request_id) {
+      setStatus(
+        "Gateway approval prepared — open the Wallet app and approve the second transaction to make your asset tradable.",
+        "ok"
+      );
+      els.enableTrading.hidden = true;
+      if (els.enableTradingHint) els.enableTradingHint.hidden = true;
+    } else {
+      setStep("approve", "err");
+      setStatus("No wallet approval was queued — connect your wallet on Base and retry.", "err");
+      els.enableTrading.disabled = false;
+    }
+  } catch (err) {
+    setStep("approve", "err");
+    setStatus("Could not enable trading: " + err.message, "err");
+    els.enableTrading.disabled = false;
+  }
+}
+
 // ── wiring ────────────────────────────────────────────────────────────────────
 els.drop.addEventListener("click", () => els.file.click());
 els.drop.addEventListener("keydown", (e) => {
@@ -272,6 +591,19 @@ els.drop.addEventListener("drop", (e) => {
   onFile(e.dataTransfer.files && e.dataTransfer.files[0]);
 });
 els.title.addEventListener("input", refreshMintEnabled);
+els.wallet.addEventListener("change", () => loadChannels());
+els.channel.addEventListener("change", onChannelChange);
+els.channelManualInput.addEventListener("input", () => {
+  const v = els.channelManualInput.value.trim();
+  els.channelManualHint.textContent = v && !isEvmAddress(v)
+    ? "That doesn't look like a 0x… contract address."
+    : "Paste your channel's contract address. It's verified on-chain (must be created by your wallet) before minting.";
+  refreshMintEnabled();
+});
+els.createChannelBtn.addEventListener("click", createChannel);
 els.mint.addEventListener("click", mint);
+if (els.enableTrading) els.enableTrading.addEventListener("click", enableTrading);
 
-preflight();
+preflight().then((ok) => {
+  if (ok) loadWallets();
+});

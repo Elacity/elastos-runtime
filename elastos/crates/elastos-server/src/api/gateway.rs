@@ -669,6 +669,22 @@ pub fn gateway_router(state: GatewayState) -> Router {
             axum::routing::post(super::creator::creator_prepare_mint),
         )
         .route(
+            "/api/apps/creator/wallet",
+            get(super::creator::creator_wallet),
+        )
+        .route(
+            "/api/apps/creator/channels",
+            get(super::creator::creator_list_channels),
+        )
+        .route(
+            "/api/apps/creator/create-channel",
+            axum::routing::post(super::creator::creator_create_channel),
+        )
+        .route(
+            "/api/apps/creator/prepare-trade-approval",
+            axum::routing::post(super::creator::creator_prepare_trade_approval),
+        )
+        .route(
             "/api/viewers/elacity-player/media/open",
             axum::routing::post(super::media_authority::open_demo_media),
         )

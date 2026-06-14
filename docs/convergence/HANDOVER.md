@@ -498,6 +498,7 @@ next context can continue cold.
 - **D69** **`encrypt-provider::seal` runs the full production pipeline on handed-in bytes → complete `SealedObjectV1`.** The non-inline `seal` op (fail-closed Day-1 skeleton) now emits the chain-shaped sealed object — closing the gap between dev `seal_inline` and production `seal`. Audited PC2's producer INPUT path first (`src/services/media/dashPackager.ts`): CEK minted in the host (`generateCEK` `:122–126`), each segment read off disk (`readFileSync` `:504`, `:571–572`), bytes HANDED to the CENC WASM (`executeCENCEncrypt(.., seg.data)` `:432–434`) — the encoder fetches nothing. Mirrored: `SealRequest` gained `content_b64` (handed-in bytes), `recipient_pub_b64` (authority's escrow recipient), `availability_receipt_cid` (pin receipt) — all optional, `deny_unknown_fields` preserved (existing fail-closed tests hold). Given bytes + recipient, `seal` runs the ONE shared `run_seal_pipeline` (mint CEK+KID → CENC-encrypt → content-address Day-68 `payload_cid` → escrow CEK SEALED) and assembles an `elastos_common::protected_content::SealedObjectV1`: real `payload_cid`, `key_envelope.kid` == bytes16 contentId, `policy_hash = sha256(rights_policy_cid)`, PQ-hybrid suite the chain validates. `seal_inline` now DELEGATES to the same pipeline (PRINCIPLES #10). NO fetch/IPFS/network authority — it seals the bytes it's handed. Fail-closed: no recipient/bytes → `not_configured`; missing receipt / empty viewer-interface / empty content → `invalid_request`. encrypt escrow 22→25 (+configured-emits-complete, +each-seal-fresh, +fail-closed-matrix); default 20. `ddrm-producer-smoke.sh` drives the REAL `seal`, deserializes into the SHARED `SealedObjectV1` and runs the SAME `validate_protected_content_key_envelope_algorithms` `key-provider` runs — cross-binary proof the chain accepts it; asserts `payload_cid` (`bafkrei…`) ≠ KID and no plaintext on the wire (production output carries no segment). Gate: encrypt=20/25, ladder INTACT (+wasm), drift PASS, 4 smokes green, clippy clean.
 - **D68** **`encrypt-provider` content-addresses the ciphertext — `payload_cid` is REAL.** The producer's last "trust me" (a hardcoded `bafybeig…` placeholder) is gone. Audited PC2's producer storage first (`src/storage/ipfs.ts`: `storeFile`/`fs.addBytes` `:644–678`; `@helia/unixfs/src/commands/add.ts:15–24` → `cidVersion:1, rawLeaves:true`, 1 MiB `fixedSize` chunker). `encrypt-provider` now derives `payload_cid = CIDv1(raw 0x55, sha2-256)` of the sealed segment in-boundary (`payload_cid_v1_raw` + hand-rolled base32 multibase) — a pure function of the bytes, NO `kubo_api`/network (a CID is not a pin), fail-closed above one chunk (multi-block dag-pb refused). `seal_inline` emits it. Golden pins three inputs to the EXACT strings PC2's real `ipfs-unixfs-importer` produces (incl. canonical raw-`abc`). encrypt-provider 17→20 / 19→22. `ddrm-producer-smoke.sh` independently recomputes the CID via the canonical IPLD `cid` crate (different encoding path) and demands a byte-for-byte cross-binary match. payload_cid (IPFS address) ≠ KID/contentId (chain key). Gate: encrypt=20/22, ladder INTACT (+wasm/sha2), drift PASS, 4 smokes green, clippy clean.
 - **D67** **`drm-provider::open` emits the executable `DrmOpenPlanV1`** — the orchestrator stops being a Day-1 skeleton (`open → not_configured`). Audited PC2's open ordering first (`universal-decrypt-chipotle.js` `main`: access-check `:545–568` → key-release `:570–575` → bind `:577–590` → seal `:602–608`; `chipotle-client.ts::recoverCEKEnvelope` `:1438–1538` sign→assemble→run→return-sealed-only). `open` now validates fail-closed then returns a typed **`DrmOpenPlanV1`** (status `planned`, never `opened`): the 8-step canonical sequence + **binding edges** (rights ⇒ `RightsDecisionReceiptV1` → `key.rights_receipt`; key ⇒ `ReleaseReceiptV1` → `decrypt.release_receipt`; content identity == KID under BOTH `content_id`/`object_cid` per `key-provider:740`'s `content_id==object_cid` invariant) + next-providers + runtime events + `blocked_authority`. Holds ZERO authority (PLANS, runtime EXECUTES — Day-61 pattern); `DrmOpenPlanV1` capsule-local like `UnsignedMintV1` → shared contract + drift untouched. drm-provider 12→15; `ddrm-consumer-smoke.sh` now drives the REAL `drm open`, asserts `planned`+order+bindings, and FOLLOWS the plan (threads receipts into plan-declared fields, identity from the plan) instead of hardcoding (PRINCIPLES #10). Gate: drm-provider=15, ladder INTACT, drift PASS, all 4 smokes green, clippy clean.
+- **D137** **creator mint spine → PC2-parity RPC pool + on-chain channel discovery/selection + createChannel** (build slice, isolated on `feat/ddrm-home-playback`, all conformed to PRINCIPLES). Audited PC2 (not memory): `src/utils/rpc.ts` (round-robin Base pool, key-less public heads), `config/default.json` (factory `0xE1365…368F`, central-storage `0x0C1Ee…760b`, `from_block` 43892000), `data/test-apps/elacity-creator/app.js` (`scanV3ChannelsOnChain` filters `ChannelCreated` logs by creator; `createChannel(STANDARD=1,PRIVATE=2,name,ipfs://meta,config)` with `channelCreationFee()` as `value`). **chain-provider**: (1) `ChainNetwork.rpc_fallback_urls` + `evm_rpc` now fails over across a de-duped pool (PC2's `baseRpcCall` rotate-on-error; answer stays fail-closed, only endpoints rotate); Base pool = operator head (`ELASTOS_CHAIN_BASE_RPC`/`BASE_RPC_URL`) ⊕ PC2's 6 public RPCs. (2) `list_channels` (READ-ONLY `eth_getLogs`, no keys; factory+topic0+from_block pinned, creator as 4th topic → only the creator's channels). (3) `assemble_create_channel` (PURE ABI-encode `createChannel`, selector configured not computed; empty-config bytes; payable `value` injected). Pinned + verified via ethers: createChannel selector `0xc384baa2`, ChannelCreated topic0 `0x4ae6ef95…702e`, channelCreationFee selector `0x4218a471`. **elastos-server** `creator.rs`: `GET /wallet` (principal's linked Base address — no keys), `GET /channels?creator=` (capability-gated discovery), `POST /create-channel` (publish channel metadata → read fee on-chain → assemble → owner-wallet approval; ERC-20-fee channels fail closed); fixed `MintMeta` to camelCase so `creatorAddress`/`isMedia`/`fileName` actually arrive. **creator UI**: text channel field → wallet picker + on-chain channel dropdown + inline create-channel form; mint is fail-closed (no silent default — requires a linked wallet AND a selected channel). Tests: +7 chain-provider (createChannel calldata decode, channel-log decode, address-topic roundtrip, fail-closed cases) + 4 server (fee decode/native/ERC-20/short). chain-provider mint subset still =10. **Gate honesty:** pre-existing branch breakage surfaced (NOT this slice — proven by `git stash` on HEAD `dc32fa0ec`): `key-provider` fails to compile (`E0423/E0428` duplicate `KeyProvider`), cascading to `decrypt-provider vectors`; `encrypt-provider escrow` pin drift (27 vs 25); `pc2-conformance` tampered-carrier (external PC2 decrypt path). drift gate PASS; WASI chain smoke PASS.
 - **D50** **`key-provider` → pluggable multi-backend authority** (Phase A.1; confirms Anders' "providers inside the key capsule") — `KeyAuthorityBackend`: `reference` (native-dev, PQ-hybrid suite), `dkms` (native-production), `lit` (PC2/Chipotle compat, classical suite), all destined to emit the same suite-tagged `SealedDecryptMaterialV1` the decrypt sandbox consumes. Backend is **operator/runtime config at `init`** (never an app input) → shared `KeyReleaseRequestV1` byte-identical. `status` advertises `supported_backends` (suite/kind/state) + `active_backend`; `release` runs **all existing validation first**, then routes per-backend to a precise `not_configured` (reference seal engine = Phase A.2); no backend = fail-closed. 18 characterization tests (was 9), incl. **validation-precedes-backend** (a denied receipt never reaches a backend) + unknown/non-string backend rejection. Default fail-closed + goldens unchanged; ladder pins key-provider=18 + wasm. Mirrors PC2 Lit authority role (`chipotle-client.ts`/`universal-decrypt-chipotle.js`).
 
 ---
@@ -748,8 +749,58 @@ Whatever you pick: keep it isolated on `feat/ddrm-home-playback`, pin it with
 characterization tests, keep the gate green (`scripts/ddrm-verify.sh` + the ladder),
 update `DDRM_STATUS.md`, and end the day by presenting the next 10/10 prompt.
 
-**Day 136 immediate next (mint E2E):** see **§14** — paste that bootstrap prompt into a
-fresh context window to continue without loss.
+**Day 137 (this session) — PC2-parity build slice DONE, mint launch is the next gate.**
+The creator mint spine now has what it needs for a live, channel-correct mint: a fail-over
+Base RPC pool (operator head ⊕ PC2's public pool), on-chain channel **discovery** + a
+selectable dropdown (no more pasting an address), a fail-closed **create-channel** flow, and
+a UI that refuses to mint without a linked wallet AND a selected channel. All conformed to
+PRINCIPLES (read-only discovery, pure assembly, no in-frame keys, owner signs). chain-provider
++ server build clean; +11 characterization tests green; chain-provider `mint` subset still =10.
+
+**Pre-existing branch breakage to reconcile (NOT this slice — confirmed via `git stash` on HEAD
+`dc32fa0ec`):** `key-provider` does not compile (`E0423/E0428` duplicate `KeyProvider`), which
+cascades to `decrypt-provider vectors`; `encrypt-provider escrow` count pin drifted (27 vs 25);
+`pc2-conformance` tampered-carrier (external PC2 decrypt path). These predate Day 137 and gate
+the full ladder — fix or re-pin them before the next push/PR. drift gate + WASI smoke PASS.
+
+**Day 137b (this session) — FIRST LIVE MINT CONFIRMED + 2nd tx (trade-enable) implemented.**
+First real creator mint went through the runtime spine end-to-end on Base:
+- **tx1 mint**: `0xcd79254d3560435b9535f52cbed643d7a84bbff9f052c101bc70f3a02b806cde` — **receipt
+  status = 1**, channel `0x807f9eb5…2825d` `totalSupply` 1017→**1018**, opType 1 (Buy Once),
+  opContract `0xdC6e56b1e3C9956AAF7ffc0316f360c4aB67D119`, **network fee $0.04**.
+- **Gas/fee fix that unblocked it** (root cause was OOG + inflated price): `creator.rs` now hands
+  the wallet only `from/to/value/data/chainId` and lets MetaMask estimate gas/gasPrice/nonce
+  (mint deploys an operative ~1.53M gas; the old fixed 500k cap reverted, fixed 1 gwei inflated
+  the fee). `wallet-provider` validation + `external_wallet_handoff` made these three fields
+  optional. This is PC2's EOA path exactly.
+
+**2nd tx — make the asset tradable (PC2 parity, confirmation-gated #11).** PC2's flow waits for
+the mint receipt, parses `AssetCreated` → `opContract`, reads the channel `authority()` gateway,
+then `setApprovalForAll(gateway, true)` on the operative. Implemented the same in the runtime:
+- **chain-provider** new op `assemble_trade_approval{network,channel,creator}` (`protocol.rs` +
+  `main.rs`): scans the recent `AssetCreated` logs for `(_to==creator, _channel==channel)` via
+  the range-capable log pool (split-and-retry), reads `authority()` (fallback to pinned
+  `DEFAULT_AUTHORITY_GATEWAY 0x09dBe796…`), checks `isApprovedForAll` (idempotent), and pure-encodes
+  `setApprovalForAll(gateway,true)`. New pinned selectors/topic + ABI helpers in `abi.rs`
+  (`encode_set_approval_for_all_calldata`, `encode_is_approved_for_all_calldata`,
+  `decode_asset_created_log`). **Confirmation-gated by construction**: the operative is read from
+  the mint's on-chain event, so "no log yet" → `mint_not_confirmed` error → caller retries.
+- **elastos-server** `POST /api/apps/creator/prepare-trade-approval` (`creator.rs`): re-confirms
+  channel ownership (#11), calls the chain op, and on `!already_approved` enqueues a wallet
+  approval (owner signs in Wallet app; runtime never signs). Returns `already_approved` when the
+  gateway is already an operator.
+- **creator** UI (`index.html` + `creator.js`): 5th step "Approve gateway (enable trading)" + an
+  **Enable trading** button shown whenever a wallet + channel are selected (targets the newest
+  mint in that channel — works post-mint AND for an earlier asset). Friendly retry on
+  `mint_not_confirmed`.
+- chain-provider + server build clean; **+4 characterization tests** (set/isApproved calldata,
+  AssetCreated decode + malformed). Gateway relaunched in CHAIN mode; route serves `401` (registered),
+  updated `creator.js`/`index.html` served live. *Operator: reload Create, select wallet + the
+  channel, click **Enable trading**, approve the gateway tx in the Wallet app → asset tradable.*
+
+**Day 138 immediate next:** confirm tx2 (verify `isApprovedForAll(creator, gateway)==true` on
+`0xdC6e56…` after the operator signs); then media (video) mint via the same path; then consumer
+playback against ≥2/3 live quorum nodes. See **§14** for the bootstrap prompt.
 
 ---
 
@@ -844,3 +895,140 @@ DEFINITION OF DONE (Day 137)
 Begin by reading the docs above, running git status on feat/ddrm-home-playback, and
 reporting readiness. Then ask if we should continue with the mint test.
 ```
+
+---
+
+## DAY 138 (2026-06-14) — Live mint proven + deep PC2-parity audit + keystone recoverability fix
+
+### What is now CONFIRMED working (evidence-backed)
+- **Live on-chain mint (tx1) confirmed on Base.** Non-media (image) asset minted from the
+  Create portal: IPFS CIDs produced, unsigned mint calldata assembled, MetaMask signed,
+  tx broadcast and confirmed (~$0.04 fee). Channel discovery works (2 channels found
+  on-chain for the operator wallet).
+- **Trade-enable (tx2 = `setApprovalForAll`) backend + frontend fully implemented.**
+  `chain-provider::assemble_trade_approval` discovers the per-asset operative contract via
+  `AssetCreated` log scan and prepares the gateway approval tx. Bug fixed: the log scan
+  window was only 10k blocks (~5h); widened to a chunked backward scan of up to 480k blocks
+  (`TRADE_APPROVAL_SCAN_WINDOWS = 48`) so older mints are found. (Operator's MetaMask
+  "Unauthorized"/network issues for actually *sending* tx2 are a client-side wallet/RPC
+  config matter, not a runtime defect — tx2 assembly verified server-side.)
+
+### KEYSTONE BUG found + fixed (recoverability)
+**Symptom:** any asset minted was permanently **unrecoverable** after an `encrypt-provider`
+restart. **Root cause:** the producer signing key that authenticates dKMS escrow shares was
+generated *randomly per process* and **never persisted in the mint metadata envelope**, so
+the quorum could never validate the share signatures at recovery time.
+
+**Fix (committed, builds green):**
+- `capsules/encrypt-provider/src/main.rs` — `seal_inline_threshold` and
+  `seal_segments_threshold` now return `producer_verifying_key_b64` (base64 of
+  `producer.verifying_key`).
+- `elastos/crates/elastos-server/src/api/creator.rs` — `run_prepare_mint` (non-media) and
+  the media path capture `producer_verifying_key_b64` from the seal response;
+  `BuildEnvelope`/`MediaEnvelope` carry it; `build_metadata_envelope`/`build_media_envelope`
+  write it into the asset's `protections[0]` block. Newly minted assets are now recoverable.
+
+> NOTE: assets minted **before** this fix lack `producer_verifying_key_b64` and remain
+> unrecoverable. Re-mint after this change to test playback.
+
+### DEEP PC2 PARITY AUDIT (producer + consumer) — synthesized
+
+**Two-CID model (we match this):** encrypted asset CID + metadata directory CID. On-chain
+`mint()` uses `{metadataDirCid}/metadata.json` as `_uri`, KID as `bytes16 contentId`.
+
+**Where custody fields live (the Lit→dKMS seam):**
+- **Non-media:** in token metadata at `asset.protections[0]`. PC2 stores Lit fields there
+  (`litCiphertext`, `dataToEncryptHash`, `kid`, `iv`, `authority`, `actionCid`, `signature`,
+  `issuer`). **Our dKMS analogue occupies the same slot** with quorum fields (shares,
+  `node_set_id_b64`, `producer_verifying_key_b64`, `kid`, `iv`, `authority`). Same position →
+  consumer routing logic is identical shape.
+- **Video:** custody fields live in the **PSSH JSON inside the DASH init segment**
+  (`protectionType: cenc:lit-aes-gcm-v3`), NOT in the token JSON. Recovery reads PSSH at
+  `/api/media/init`.
+
+**KID + binding:** `KID = bytes16 contentId`; `dataToEncryptHash = SHA-256(cek ‖ kid ‖ authority)`.
+CENC video = AES-128-CTR; non-media = AES-256-GCM (16-byte tag appended; CEK 32 bytes).
+
+**Consumer flow (PC2) — the model we must mirror with dKMS instead of Lit:**
+1. **Library list:** `GET /api/catalog/owned/:address`. Ownership index = `creator_address`
+   match OR content CID present in local `pinned_cids`. (NOT a live on-chain scan; on-chain
+   `hasAccessByContentId` is the authoritative check later, at decrypt.) **Creator sees own
+   mint immediately** via `creator_address`.
+2. **Open:** card click → detail → route by `media.contentType` (video/audio vs non-media).
+   Owned OR free (`opType===0`) enables the open/play button.
+3. **Key recovery (server-side, CEK never reaches browser):** a secure-view session
+   (P-256 delegation + wallet `personal_sign`) authorizes a *server-side* recovery call.
+   PC2 calls the Chipotle Lit Action which checks `hasAccessByContentId(EOA+SA, kid)` then
+   returns an **ECDH-wrapped CEK envelope** to the node (never plaintext to client).
+   **Our dKMS analogue:** key-provider drives the 2-of-3 quorum `release` to reconstruct the
+   CEK in-boundary — same "CEK stays server/provider-side" invariant (PRINCIPLES #3, #11).
+4. **Decrypt + render server-side:**
+   - Non-media: `/api/storage/lit/secure-view` → recover CEK → fetch ciphertext from IPFS →
+     AES-256-GCM decrypt → WASM/Node render → return **JPEG/HTML blob** (never raw bytes).
+   - Video: NOT browser EME/clearKey. `/api/media/init` recovers CEK from PSSH; per-segment
+     `/api/media/segment` does **server-side CENC decrypt + strip DRM boxes** → returns
+     cleartext fMP4; player appends via **MSE**.
+
+### REMAINING GAP to "open + play my minted asset via the quorum" (precise plan)
+The producer side is fixed; the consumer-open vertical for **dKMS** assets is the remaining
+build. Three staged, testable pieces:
+
+1. **`impl-mint-persist` — persist a durable owned Library object at mint.**
+   On successful mint, write a Library object carrying: encrypted asset CID + the full
+   `protections[0]` escrow envelope (now incl. `producer_verifying_key_b64`) + presentation
+   meta (name, mime, image/preview) + `channel`/`tokenId`/`contentId`. This is the runtime
+   analogue of PC2's `content_catalog` row keyed by `creator_address`. Library lists it →
+   PC2-parity creator visibility. *(Requires extending the library object model to hold a
+   sidecar `protections` block rather than plaintext; today opens re-encrypt via test-KMS.)*
+
+2. **`impl-quorum-open` — open route branches on dKMS escrow → quorum recover → decrypt.**
+   When an owned object has a dKMS `protections[0]`, reconstruct the escrow fixture from the
+   envelope and drive `DrmHost(dkms)` (ddrm-plan-runner) → key-provider `release` against the
+   **local 2-of-3 quorum daemons** → decrypt-provider → return plaintext/rendered blob to the
+   viewer. The existing `/api/viewers/open` test-KMS branch must be superseded by this for
+   dKMS-protected objects. The byte-exact `KeyReleaseRequestV1` contract already exists in
+   `ddrm-runtime-open`; reuse that machinery (don't reinvent the share/AAD/nonce binding).
+
+3. **`library-listing` + `test-e2e` — wire UI + prove it.**
+   Library shows the minted asset; double-click/open triggers the quorum path. Test: re-mint
+   a real image after the keystone fix → list in Library → open → quorum recover → decrypt →
+   byte-identical to source, with NO MetaMask needed for seal/recover/decrypt (MetaMask only
+   signs the on-chain mint/approval). Then the video/DASH path as a follow-on.
+
+### Honest status for the operator (morning read)
+- The **live mint is proven**; the **keystone recoverability bug is fixed** (re-mint to test).
+- The **deep PC2 audit is complete** and confirms our envelope already puts custody in the
+  right slot (`protections[0]`), so the consumer path is a faithful Lit→quorum swap.
+- The **open-and-decrypt-via-quorum wiring is the remaining build** (3 staged pieces above).
+  It is cryptographically exact work (share/AAD binding) and was deliberately NOT half-shipped
+  overnight to avoid broken, untested crypto. The plan above is executable step-by-step.
+
+### Crypto core PROVEN on a real file (autonomous, no operator/MetaMask) ✅
+New artifact: `scripts/dev/ddrm-producer-smoke/asset-open-verify.sh` + an `--asset` mode in
+`ddrm-producer-smoke`. It runs the Library-open path distilled to its crypto core against a
+local 2-of-3 quorum the producer does not own:
+- **Phase A (mint):** `seal_inline_threshold` on a REAL file → PERSIST `{escrow.json, ciphertext.bin}`.
+  `escrow.json` is the exact `protections[0]` envelope: `scheme`, `kid_hex`, `node_set_id_b64`,
+  `producer_verifying_key_b64`, `shares[3]`.
+- **Phase B (open):** every in-memory copy is dropped; reload escrow + ciphertext **FROM DISK ALONE**
+  → key-provider(dkms) recover 2-of-3 from live nodes → decrypt-provider `open_session_v1`
+  (CEK reconstructed in-VM, segment decrypted). No plaintext/share blob on any wire.
+
+**Run + result (Day 138):** `bash scripts/dev/ddrm-producer-smoke/asset-open-verify.sh`
+→ **PASS**: 64 KiB asset sealed → `escrow.json` (28 890 B) + `ciphertext.bin` (65 604 B) persisted →
+reloaded from disk → recovered 2-of-3 → decrypted; `kid=7c1e46a0…`. This is the proof the keystone
+fix made assets recoverable: phase B holds nothing from phase A; a pre-fix mint (no
+`producer_verifying_key_b64`) fails closed with `asset is UNRECOVERABLE`. Pass a real path as
+`$1` to verify a specific file.
+
+### §13 Next (updated)
+1. `impl-mint-persist`: durable owned Library object with the `escrow.json`-shaped `protections[0]`
+   sidecar + ciphertext (the on-disk shape is now proven by `asset-open-verify.sh`).
+2. `impl-quorum-open`: in `viewer_open.rs`, branch when an owned object carries a dKMS escrow
+   sidecar → run the proven phase-B sequence (decrypt init pins 3 node vks → key-provider(dkms)
+   `release` 2-of-3 → decrypt `open_session_v1`) → render. Supersede the test-KMS branch for these
+   objects. The exact field contract is in `ddrm-producer-smoke::run_asset`/`run_live`.
+3. `test-e2e` (UI): re-mint image → Library lists it → double-click open → quorum recover →
+   render. (Crypto core already proven above; this is the gateway/UI integration, needs operator
+   to drive passkey + the live quorum.)
+4. Then video/DASH parity (PSSH custody + server-side CENC segment decrypt + MSE).

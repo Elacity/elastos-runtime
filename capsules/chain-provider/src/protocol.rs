@@ -26,6 +26,21 @@ pub(super) struct ChainNetwork {
     #[serde(default)]
     pub(super) explorer_url: Option<String>,
     pub(super) rpc_url: String,
+    /// Additional RPC endpoints tried (in order) when the primary `rpc_url` fails over
+    /// (transport error / HTTP 5xx-4xx / JSON-RPC error). Mirrors PC2's round-robin Base
+    /// RPC pool (`src/utils/rpc.ts`): the primary MUST be a key-less, rate-tolerant
+    /// endpoint; keyed providers belong at the back. A single point of RPC failure
+    /// silently degrades the rights read to "not owned", so the pool is fail-soft on
+    /// transport while the answer itself stays fail-closed.
+    #[serde(default)]
+    pub(super) rpc_fallback_urls: Vec<String>,
+    /// RPC endpoints permitted for `eth_getLogs` (channel discovery / event scans). A SUBSET
+    /// of the pool: many free Base endpoints cap (or refuse) `eth_getLogs` to tiny block
+    /// ranges (e.g. `1rpc.io` → 50 blocks, `blastapi` → 10, `meowrpc` → unsupported), which
+    /// would make the chunked factory scan fail. When non-empty, log queries route ONLY here
+    /// (operator head + range-capable publics); when empty, they fall back to the full pool.
+    #[serde(default)]
+    pub(super) log_query_rpc_urls: Vec<String>,
     #[serde(default)]
     pub(super) rights_methods: Vec<RightsMethod>,
 }
@@ -189,7 +204,63 @@ pub(super) enum Request {
     AssembleMint {
         mint: Box<MintAssembly>,
     },
+    /// Discover the dDRM channels (DigitalAsset collections) a creator owns by scanning the
+    /// channel factory's `ChannelCreated` logs filtered to the creator's address. READ-ONLY
+    /// (`eth_getLogs`); no keys. The factory + event topic + scan-from block default to the
+    /// real Base values (overridable) so the app never names a contract address itself.
+    ListChannels {
+        network: String,
+        #[serde(default)]
+        factory: Option<String>,
+        creator: String,
+        #[serde(default)]
+        from_block: Option<String>,
+    },
+    /// Assemble the `createChannel(uint8,uint8,string,string,bytes)` calldata (PURE: no RPC,
+    /// no keys) — the `{ to, data, value }` an external signer (wallet-provider) signs and
+    /// `broadcast_transaction` sends to deploy a new channel. Mirrors `AssembleMint`.
+    AssembleCreateChannel {
+        channel: Box<CreateChannelAssembly>,
+    },
+    /// Assemble the post-mint trade-enabling approval (PC2's 2nd mint tx). READ-then-PURE:
+    /// discover the just-minted asset's operative contract from its `AssetCreated` log
+    /// (`_to == creator`, `_channel == channel`), read the channel's `authority()` gateway,
+    /// and — unless the gateway is already approved — ABI-encode `setApprovalForAll(gateway,
+    /// true)` on the operative. Never signs/broadcasts; fails closed if no confirmed mint is
+    /// found yet (the caller retries once it is mined).
+    AssembleTradeApproval {
+        network: String,
+        channel: String,
+        creator: String,
+    },
     Shutdown,
+}
+
+/// The structured `createChannel` the chain capability ABI-encodes. The selector + factory
+/// are supplied (configured), exactly like the mint selector — keccak is not computed
+/// in-capsule.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateChannelAssembly {
+    /// The configured 4-byte `createChannel` selector (default `0xc384baa2`).
+    pub selector: String,
+    /// The channel factory contract (createChannel `to`).
+    pub factory: String,
+    /// 0=…, channel type code (PC2 `_channelType`).
+    pub channel_type: u8,
+    /// Channel scope code (PC2 `_scope`).
+    pub scope: u8,
+    /// Human channel name (`_name`).
+    pub name: String,
+    /// Channel metadata token URI (`_tokenURI`).
+    pub token_uri: String,
+    /// Extra `bytes data` arg (default empty bytes).
+    #[serde(default)]
+    pub data_hex: Option<String>,
+    /// The payable `channelCreationFee` (hex quantity) the runtime read from CENTRAL_STORAGE;
+    /// the pure assembler never reads chain state. Defaults to `0x0`.
+    #[serde(default)]
+    pub value_wei: Option<String>,
 }
 
 /// The structured mint the chain capability ABI-encodes (publish-provider's

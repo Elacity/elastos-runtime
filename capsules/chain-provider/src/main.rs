@@ -11,6 +11,7 @@ use std::time::Duration;
 
 mod abi;
 mod backends;
+mod channel_index;
 mod config;
 mod lifecycle;
 mod protocol;
@@ -21,6 +22,7 @@ mod validation;
 mod tests;
 
 use abi::*;
+use channel_index::*;
 use config::*;
 use lifecycle::*;
 use protocol::*;
@@ -34,6 +36,53 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 const NODE_LIFECYCLE_CONTROL_REASON: &str =
     "node lifecycle control requires an operator-approved supervisor";
 
+/// The real Base channel factory (`config/default.json` `contracts.v3.channel_factory`).
+/// Default for channel discovery + createChannel; overridable per request.
+const DEFAULT_CHANNEL_FACTORY: &str = "0xE1365ed47353De2F8A6a69E271e36650A9EE368F";
+/// `keccak256("ChannelCreated(uint8,uint8,address,address,address)")` — the event topic the
+/// factory emits per channel. Pinned (not computed in-capsule), like the call selectors.
+const CHANNEL_CREATED_TOPIC0: &str =
+    "0x4ae6ef95ddade103ca67593cd4cf68dda177aa1054ad4eeb4963d2c3df44702e";
+/// The Base block the channel factory was deployed at (`contracts.v3.from_block`); the
+/// default lower bound for the `ChannelCreated` scan.
+const DEFAULT_CHANNEL_FROM_BLOCK: u64 = 43_892_000;
+/// `keccak256("AssetCreated(address,address,uint256,string,uint16,address)")` — the event a
+/// successful mint emits (topic1=_to, topic2=_channel, topic3 indexed opContract). Pinned
+/// (not computed in-capsule), like the call selectors; used to discover the just-minted
+/// asset's operative contract for the trade-enabling approval.
+const ASSET_CREATED_TOPIC0: &str =
+    "0xc0a995e4052be044599af577ab2f3382d67bd34df95a76226e7c464e9d4dba46";
+/// `authority()` selector — reads the channel's gateway (the operative authority). Pinned.
+const AUTHORITY_SELECTOR: &str = "0xbf7e214f";
+/// `isApprovedForAll(address,address)` selector — reads whether the gateway is already an
+/// approved operator on an operative contract (idempotency check). Pinned.
+const IS_APPROVED_FOR_ALL_SELECTOR: &str = "0xe985e9c5";
+/// `setApprovalForAll(address,bool)` selector — pinned, handed to the pure assembler.
+const SET_APPROVAL_FOR_ALL_SELECTOR: &str = "0xa22cb465";
+/// The real Base AuthorityGateway (`config/default.json` `contracts.v3.authority_gateway`),
+/// the fallback gateway when a channel's `authority()` read misses. The app never names it.
+const DEFAULT_AUTHORITY_GATEWAY: &str = "0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D";
+/// Max block span per `eth_getLogs` window. PINNED to 10k — the proven-safe span across the
+/// whole Base log pool (`pc2-node config/default.json` `max_blocks_per_scan: 10000`). Probed
+/// Jun 2026: `drpc` and `mainnet.base.org` HARD-CAP at 10k (HTTP 400/413 over it) and
+/// `publicnode` is unreliable on wide ranges (rate-limits → empty 200 OR errors), so a larger
+/// span silently dropped channels or failed closed. The scanner is still ADAPTIVE — it halves
+/// on any "range too large" signal (JSON code or HTTP 400/413) — but 10k means it normally
+/// never has to split, matching PC2's behaviour exactly.
+const DEFAULT_MAX_LOG_RANGE: u64 = 10_000;
+/// The scanner never splits a window below this many blocks — a "range" error at/below this
+/// is a real failure (not a range cap), so we fail closed instead of looping forever.
+const MIN_LOG_RANGE: u64 = 2_000;
+/// Backfill budget per `list_channels` call: how many top-level windows we scan downward
+/// before returning, so a single (synchronous) call stays responsive. The cursor is persisted,
+/// so coverage resumes on the next call — newest-first, so recent channels surface first.
+const DEFAULT_BACKFILL_WINDOWS_PER_CALL: u64 = 16;
+/// How many newest-first `max_log_range` windows `assemble_trade_approval` scans for the
+/// creator's `AssetCreated` log before giving up. 48 × 10k ≈ 480k Base blocks (~11 days at
+/// ~2s/block) — generous for a "just minted, now enable trading" flow (which early-stops in
+/// the first window or two) while keeping a single synchronous call bounded.
+const TRADE_APPROVAL_SCAN_WINDOWS: u64 = 48;
+
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
     client: reqwest::blocking::Client,
@@ -41,6 +90,8 @@ struct ChainProvider {
     node_lifecycle_state: NodeLifecycleStateFile,
     node_lifecycle_state_error: Option<String>,
     node_supervisor: NodeSupervisorConfig,
+    channel_index_path: PathBuf,
+    channel_index: ChannelIndexFile,
 }
 
 impl ChainProvider {
@@ -59,6 +110,10 @@ impl ChainProvider {
                 Ok(state) => (state, None),
                 Err(err) => (NodeLifecycleStateFile::default(), Some(err)),
             };
+        let channel_index_path = channel_index_path(&data_dir);
+        // A corrupt index is a recoverable cache, not authority: start empty and let the
+        // next scan repopulate it (fail-open for a cache, never for ownership).
+        let channel_index = read_channel_index_file(&channel_index_path).unwrap_or_default();
         Self {
             networks: default_networks(),
             client,
@@ -66,6 +121,8 @@ impl ChainProvider {
             node_lifecycle_state,
             node_lifecycle_state_error,
             node_supervisor: NodeSupervisorConfig::default(),
+            channel_index_path,
+            channel_index,
         }
     }
 
@@ -153,6 +210,18 @@ impl ChainProvider {
             } => self.broadcast_transaction(&network, &signed_transaction),
             Request::NodeLifecycle { network, action } => self.node_lifecycle(&network, action),
             Request::AssembleMint { mint } => self.assemble_mint(*mint),
+            Request::ListChannels {
+                network,
+                factory,
+                creator,
+                from_block,
+            } => self.list_channels(&network, factory.as_deref(), &creator, from_block.as_deref()),
+            Request::AssembleCreateChannel { channel } => self.assemble_create_channel(*channel),
+            Request::AssembleTradeApproval {
+                network,
+                channel,
+                creator,
+            } => self.assemble_trade_approval(&network, &channel, &creator),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -569,7 +638,7 @@ impl ChainProvider {
             Ok(filter) => filter,
             Err(err) => return Response::error("invalid_filter", &err),
         };
-        match self.evm_rpc(network, "eth_getLogs", json!([filter])) {
+        match self.evm_rpc_logs(network, filter) {
             Ok(logs) => Response::ok(json!({
                 "schema": "elastos.chain.logs/v1",
                 "network": network.id,
@@ -1025,6 +1094,520 @@ impl ChainProvider {
             "signed": false,
             "next_required_providers": ["wallet-provider", "chain-provider"],
         }))
+    }
+
+    /// Max `eth_getLogs` window span (env `ELASTOS_CHANNEL_MAX_LOG_RANGE`, else 10000).
+    fn max_log_range() -> u64 {
+        std::env::var("ELASTOS_CHANNEL_MAX_LOG_RANGE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_LOG_RANGE)
+    }
+
+    /// Backfill windows scanned per call (env `ELASTOS_CHANNEL_BACKFILL_WINDOWS`, else 24).
+    fn backfill_windows_per_call() -> u64 {
+        std::env::var("ELASTOS_CHANNEL_BACKFILL_WINDOWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_BACKFILL_WINDOWS_PER_CALL)
+    }
+
+    /// Latest block height for an EVM network.
+    fn evm_latest_block(&self, network: &ChainNetwork) -> Result<u64, Response> {
+        let value = self.evm_rpc(network, "eth_blockNumber", json!([]))?;
+        let hex = value
+            .as_str()
+            .ok_or_else(|| Response::error("upstream_invalid_block", "blockNumber not a string"))?;
+        parse_hex_u64(hex)
+            .map_err(|err| Response::error("upstream_invalid_block", &err))
+    }
+
+    /// Does an RPC error look like a "block range too large" cap (vs a real failure)? Endpoints
+    /// phrase it differently — "exceed maximum block range", "ranges over 10000 blocks are not
+    /// supported", "eth_getLogs is limited to a 10,000 range", "limited to 0 - 50 blocks". We
+    /// match on the shared shape so the scanner can split-and-retry instead of failing closed.
+    fn is_range_limit_error(response: &Response) -> bool {
+        let Response::Error { code, message } = response else {
+            return false;
+        };
+        let msg = message.to_ascii_lowercase();
+        // Some endpoints reject an over-cap range at the HTTP layer rather than as a JSON-RPC
+        // error: `mainnet.base.org` → HTTP 413, `drpc` free tier → HTTP 400. Treat those as
+        // range signals too so the scanner splits instead of failing the whole discovery.
+        if code == "upstream_http_error" {
+            return msg.contains("413") || msg.contains("400");
+        }
+        if code != "upstream_rpc_error" {
+            return false;
+        }
+        msg.contains("block range")
+            || msg.contains("blocks range")
+            || msg.contains("blocks are not supported")
+            || msg.contains("limited to")
+            || msg.contains("exceed maximum")
+    }
+
+    /// Adaptively scan an inclusive `[from, to]` block window of the factory's `ChannelCreated`
+    /// logs for one creator, folding results into `entry`. READ-ONLY (`eth_getLogs`, range-capable
+    /// pool). On a "range too large" signal (JSON code OR HTTP 400/413) it halves the window and
+    /// scans both halves, so a stricter endpoint still completes. A malformed/foreign log is
+    /// skipped; a non-range RPC/transport failure propagates (caller fails closed).
+    fn scan_channel_window(
+        &self,
+        network: &ChainNetwork,
+        factory: &str,
+        creator_topic: &str,
+        from: u64,
+        to: u64,
+        entry: &mut ChannelIndexEntry,
+    ) -> Result<usize, Response> {
+        // ChannelCreated(uint8 indexed channelType, uint8 indexed scope, address indexed
+        // creator, address channel, address factoryAddr): topic0 + creator (4th topic).
+        let filter = json!({
+            "address": factory,
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "topics": [CHANNEL_CREATED_TOPIC0, Value::Null, Value::Null, creator_topic],
+        });
+        let logs = match self.evm_rpc_logs(network, filter) {
+            Ok(logs) => logs,
+            Err(response) => {
+                // Split-and-retry only when the span is still divisible and the endpoint
+                // complained about range size; otherwise fail closed.
+                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE {
+                    let mid = from + (to - from) / 2;
+                    let lower = self.scan_channel_window(network, factory, creator_topic, from, mid, entry)?;
+                    let upper =
+                        self.scan_channel_window(network, factory, creator_topic, mid + 1, to, entry)?;
+                    return Ok(lower + upper);
+                }
+                return Err(response);
+            }
+        };
+        let entries = logs
+            .as_array()
+            .ok_or_else(|| Response::error("upstream_invalid_logs", "eth_getLogs result was not an array"))?;
+        let mut found = 0usize;
+        for log in entries {
+            let Ok(decoded) = decode_channel_log(log) else {
+                continue;
+            };
+            let Some(address) = decoded.get("address").and_then(Value::as_str) else {
+                continue;
+            };
+            let block_number = decoded
+                .get("block_number")
+                .and_then(Value::as_u64)
+                .unwrap_or(from);
+            let ct = decoded.get("channel_type").and_then(Value::as_u64).map(|v| v as u8);
+            let scope = decoded.get("scope").and_then(Value::as_u64).map(|v| v as u8);
+            entry.upsert(address, block_number, ct, scope);
+            found += 1;
+        }
+        Ok(found)
+    }
+
+    /// Discover a creator's dDRM channels via a PERSISTED, RESUMABLE factory scan. Mirrors
+    /// PC2's `ContentIndexerService` cursor model (forward `head` + backfill `floor`), adapted
+    /// to the runtime's synchronous provider model: each call scans new blocks since `head`
+    /// (cheap) and lowers `floor` toward the deploy block by a bounded budget of windows
+    /// (newest-first, early-surfacing). The index is an untrusted cache (#5) — the chain stays
+    /// canonical (#10) and a selected channel is re-confirmed on-chain before any mint (#11).
+    fn list_channels(
+        &mut self,
+        network_id: &str,
+        factory: Option<&str>,
+        creator: &str,
+        from_block: Option<&str>,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network.clone(),
+            Err(response) => return response,
+        };
+        let factory = factory.unwrap_or(DEFAULT_CHANNEL_FACTORY).to_string();
+        if let Err(err) = validate_evm_address(&factory) {
+            return Response::error("invalid_factory", &err);
+        }
+        if let Err(err) = validate_evm_address(creator) {
+            return Response::error("invalid_creator", &err);
+        }
+        // Per-request override of the backfill lower bound (else the pinned deploy block).
+        let deploy_block = match from_block {
+            Some(value) => match parse_hex_u64(value.trim()) {
+                Ok(value) => value,
+                Err(err) => return Response::error("invalid_from_block", &err),
+            },
+            None => DEFAULT_CHANNEL_FROM_BLOCK,
+        };
+        let creator_topic = match address_topic(creator) {
+            Ok(topic) => topic,
+            Err(err) => return Response::error("invalid_creator", &err),
+        };
+        let latest = match self.evm_latest_block(&network) {
+            Ok(latest) => latest,
+            Err(response) => return response,
+        };
+
+        let key = channel_index_key(&network.id, &factory, creator);
+        let mut entry = self.channel_index.entries.get(&key).cloned().unwrap_or_else(|| {
+            // Fresh cursor: nothing scanned yet, both ends pinned at the chain head so the
+            // first forward pass is a no-op and backfill starts walking down from the tip.
+            ChannelIndexEntry {
+                deploy_block,
+                floor: latest.saturating_add(1),
+                head: latest,
+                complete: false,
+                channels: Vec::new(),
+                updated_at: now_ts(),
+            }
+        });
+        // A per-request deploy override re-opens backfill toward the new (lower) bound.
+        if deploy_block < entry.deploy_block {
+            entry.deploy_block = deploy_block;
+            entry.complete = false;
+        }
+
+        let max_range = Self::max_log_range();
+        let window = max_range.max(1);
+
+        // 1) Forward/incremental: scan new blocks since `head` (cheap; keeps the list fresh).
+        if latest > entry.head {
+            let mut from = entry.head.saturating_add(1);
+            while from <= latest {
+                let to = (from.saturating_add(window - 1)).min(latest);
+                if let Err(response) =
+                    self.scan_channel_window(&network, &factory, &creator_topic, from, to, &mut entry)
+                {
+                    return response;
+                }
+                if to == latest {
+                    break;
+                }
+                from = to.saturating_add(1);
+            }
+            entry.head = latest;
+        }
+
+        // 2) Backfill (resumable, newest-first): lower `floor` toward `deploy_block` by a
+        //    bounded budget so a single synchronous call stays responsive. Early-surface:
+        //    stop this call as soon as we've found channel(s), persisting progress so a later
+        //    call resumes downward — recent channels (the common case) appear in the first call.
+        if !entry.complete && entry.floor > entry.deploy_block {
+            let budget = Self::backfill_windows_per_call();
+            let mut scanned = 0u64;
+            let pre_existing = entry.channels.len();
+            while scanned < budget && entry.floor > entry.deploy_block {
+                let to = entry.floor.saturating_sub(1);
+                let from = to.saturating_sub(window - 1).max(entry.deploy_block);
+                let found = match self
+                    .scan_channel_window(&network, &factory, &creator_topic, from, to, &mut entry)
+                {
+                    Ok(found) => found,
+                    Err(response) => return response,
+                };
+                entry.floor = from;
+                scanned += 1;
+                if from <= entry.deploy_block {
+                    entry.complete = true;
+                    break;
+                }
+                // Early-surface: once this call has discovered new channels, return so the UI
+                // is responsive. The lowered `floor` is persisted; coverage resumes next call.
+                if found > 0 && entry.channels.len() > pre_existing {
+                    break;
+                }
+            }
+        }
+
+        entry.updated_at = now_ts();
+        let ordered = entry.channels_newest_first();
+        let channels: Vec<Value> = ordered
+            .iter()
+            .map(|c| {
+                json!({
+                    "address": c.address,
+                    "channel_type": c.channel_type,
+                    "scope": c.scope,
+                    "block_number": c.block_number,
+                })
+            })
+            .collect();
+        let scanned_floor = entry.floor;
+        let complete = entry.complete;
+        let head = entry.head;
+        let deploy = entry.deploy_block;
+        // Persist the advanced cursor. A write failure only costs a rescan next time, so it
+        // must not fail the (valid) read — surface it as a soft warning instead.
+        self.channel_index.entries.insert(key, entry);
+        let persist_warning = write_channel_index_file(&self.channel_index_path, &self.channel_index)
+            .err();
+
+        Response::ok(json!({
+            "schema": "elastos.chain.channels/v1",
+            "network": network.id,
+            "factory": factory,
+            "creator": normalize_evm_address(creator),
+            "channels": channels,
+            // Cursor state so the UI can show "indexing… N%" and re-poll until complete.
+            "indexing": !complete,
+            "scanned_floor": scanned_floor,
+            "scanned_head": head,
+            "deploy_block": deploy,
+            "latest_block": latest,
+            "index_warning": persist_warning,
+        }))
+    }
+
+    /// Assemble the `createChannel(uint8,uint8,string,string,bytes)` calldata (PURE: no RPC,
+    /// no keys) — the `{ to, data, value }` an external signer sends to deploy a channel.
+    fn assemble_create_channel(&self, channel: CreateChannelAssembly) -> Response {
+        if let Err(err) = validate_evm_address(&channel.factory) {
+            return Response::error("invalid_factory", &err);
+        }
+        if channel.name.trim().is_empty() {
+            return Response::error("invalid_channel", "channel name is required");
+        }
+        if channel.token_uri.trim().is_empty() {
+            return Response::error("invalid_channel", "channel token URI is required");
+        }
+        let data = match channel.data_hex.as_deref() {
+            Some(hex) => match decode_hex(hex, None, "channel data") {
+                Ok(bytes) => bytes,
+                Err(err) => return Response::error("invalid_channel", &err),
+            },
+            None => Vec::new(),
+        };
+        let value = match channel.value_wei.as_deref() {
+            Some(value) => {
+                if let Err(err) = validate_hex_quantity(value, "value") {
+                    return Response::error("invalid_channel", &err);
+                }
+                value.to_string()
+            }
+            None => "0x0".to_string(),
+        };
+        let calldata = match encode_create_channel_calldata(
+            &channel.selector,
+            channel.channel_type,
+            channel.scope,
+            &channel.name,
+            &channel.token_uri,
+            &data,
+        ) {
+            Ok(data) => data,
+            Err(err) => return Response::error("invalid_channel", &err),
+        };
+        Response::ok(json!({
+            "schema": "elastos.chain.create_channel_assembly/v1",
+            "function": CREATE_CHANNEL_SIGNATURE,
+            "to": channel.factory,
+            "data": calldata,
+            "value": value,
+            // Pure assembly: never signed, never broadcast here.
+            "signed": false,
+            "next_required_providers": ["wallet-provider", "chain-provider"],
+        }))
+    }
+
+    /// Assemble the post-mint trade-enabling approval (PC2's 2nd mint tx). Confirmation-gated:
+    /// the operative contract is read from the just-minted asset's `AssetCreated` log (which a
+    /// chain only emits on a SUCCESSFUL mint), so a missing log means "mint not confirmed yet"
+    /// and we fail closed (#11). Idempotent: if the gateway is already an approved operator we
+    /// return `already_approved` rather than queueing a needless second signature.
+    fn assemble_trade_approval(&self, network_id: &str, channel: &str, creator: &str) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network.clone(),
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(channel) {
+            return Response::error("invalid_channel", &err);
+        }
+        if let Err(err) = validate_evm_address(creator) {
+            return Response::error("invalid_creator", &err);
+        }
+        let creator_topic = match address_topic(creator) {
+            Ok(topic) => topic,
+            Err(err) => return Response::error("invalid_creator", &err),
+        };
+        let channel_topic = match address_topic(channel) {
+            Ok(topic) => topic,
+            Err(err) => return Response::error("invalid_channel", &err),
+        };
+        let latest = match self.evm_latest_block(&network) {
+            Ok(latest) => latest,
+            Err(response) => return response,
+        };
+        // The asset's `AssetCreated` log may sit well behind the chain tip (a mint minutes OR
+        // days ago — Base produces ~30k blocks/day, so a single 10k window only covers a few
+        // hours). Scan newest-first in `max_log_range` windows down toward the channel-factory
+        // deploy block, early-stopping at the FIRST window that yields a match (that window's
+        // newest log is the newest mint). A per-call window budget keeps the call bounded; the
+        // common "just minted" case returns in the first window or two.
+        let window = Self::max_log_range().max(1);
+        let floor = DEFAULT_CHANNEL_FROM_BLOCK;
+        let mut to = latest;
+        let mut budget = TRADE_APPROVAL_SCAN_WINDOWS;
+        let found = loop {
+            if budget == 0 || to < floor {
+                break None;
+            }
+            let from = to.saturating_sub(window - 1).max(floor);
+            match self.scan_latest_asset_created(&network, &creator_topic, &channel_topic, from, to)
+            {
+                Ok(Some(hit)) => break Some(hit),
+                Ok(None) => {}
+                Err(response) => return response,
+            }
+            if from <= floor {
+                break None;
+            }
+            to = from.saturating_sub(1);
+            budget -= 1;
+        };
+        let (operative, token_id) = match found {
+            Some((operative, token_id, _, _)) => (operative, token_id),
+            None => {
+                return Response::error(
+                    "mint_not_confirmed",
+                    "no confirmed mint found for this wallet in this channel — if you just minted, wait for it to confirm on-chain and retry",
+                )
+            }
+        };
+
+        // The channel's `authority()` is the gateway that needs operator rights; fall back to
+        // the configured default if the read misses (PC2 does the same — app.js:1674).
+        let gateway = self
+            .read_authority(&network, channel)
+            .unwrap_or_else(|| DEFAULT_AUTHORITY_GATEWAY.to_string());
+
+        // Idempotent: already approved => no second signature needed.
+        match self.read_is_approved_for_all(&network, &operative, creator, &gateway) {
+            Ok(true) => {
+                return Response::ok(json!({
+                    "schema": "elastos.chain.trade_approval_assembly/v1",
+                    "already_approved": true,
+                    "operative": operative,
+                    "gateway": gateway,
+                    "token_id": token_id,
+                }))
+            }
+            Ok(false) => {}
+            Err(response) => return response,
+        }
+
+        let data = match encode_set_approval_for_all_calldata(
+            SET_APPROVAL_FOR_ALL_SELECTOR,
+            &gateway,
+            true,
+        ) {
+            Ok(data) => data,
+            Err(err) => return Response::error("invalid_approval", &err),
+        };
+        Response::ok(json!({
+            "schema": "elastos.chain.trade_approval_assembly/v1",
+            "function": SET_APPROVAL_FOR_ALL_SIGNATURE,
+            "already_approved": false,
+            "to": operative,
+            "data": data,
+            "value": "0x0",
+            "operative": operative,
+            "gateway": gateway,
+            "token_id": token_id,
+            // Pure assembly: never signed, never broadcast here.
+            "signed": false,
+            "next_required_providers": ["wallet-provider", "chain-provider"],
+        }))
+    }
+
+    /// Scan `[from, to]` for `AssetCreated` logs matching `(to == creator, channel)` and return
+    /// the NEWEST `(operative, token_id_hex, block, log_index)`. Topics-only (the emitter
+    /// contract can vary). Split-and-retry on a "range too large" signal — newest half first,
+    /// so the freshly-minted asset surfaces with minimal RPC.
+    fn scan_latest_asset_created(
+        &self,
+        network: &ChainNetwork,
+        creator_topic: &str,
+        channel_topic: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<(String, String, u64, u64)>, Response> {
+        let filter = json!({
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "topics": [ASSET_CREATED_TOPIC0, creator_topic, channel_topic],
+        });
+        let logs = match self.evm_rpc_logs(network, filter) {
+            Ok(logs) => logs,
+            Err(response) => {
+                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE
+                {
+                    let mid = from + (to - from) / 2;
+                    // Newest-first: the upper half holds the freshest blocks.
+                    if let Some(found) =
+                        self.scan_latest_asset_created(network, creator_topic, channel_topic, mid + 1, to)?
+                    {
+                        return Ok(Some(found));
+                    }
+                    return self
+                        .scan_latest_asset_created(network, creator_topic, channel_topic, from, mid);
+                }
+                return Err(response);
+            }
+        };
+        let entries = logs.as_array().ok_or_else(|| {
+            Response::error("upstream_invalid_logs", "eth_getLogs result was not an array")
+        })?;
+        let mut best: Option<(String, String, u64, u64)> = None;
+        for log in entries {
+            let Some((operative, token_id, block_number, log_index)) = decode_asset_created_log(log)
+            else {
+                continue;
+            };
+            let newer = best
+                .as_ref()
+                .map(|(_, _, b, l)| (block_number, log_index) > (*b, *l))
+                .unwrap_or(true);
+            if newer {
+                best = Some((operative, token_id, block_number, log_index));
+            }
+        }
+        Ok(best)
+    }
+
+    /// Read a channel's `authority()` (the gateway). `None` on any read miss so the caller can
+    /// fall back to the configured default gateway (a non-fatal best-effort read).
+    fn read_authority(&self, network: &ChainNetwork, channel: &str) -> Option<String> {
+        let result = self
+            .evm_rpc(
+                network,
+                "eth_call",
+                json!([{ "to": channel, "data": AUTHORITY_SELECTOR }, "latest"]),
+            )
+            .ok()?;
+        let raw = result.as_str()?;
+        let word = decode_hex(raw, Some(32), "authority result").ok()?;
+        word_to_address(&word).ok()
+    }
+
+    /// Read `isApprovedForAll(account, operator)` on an operative contract. Propagates a real
+    /// RPC error (the caller fails closed) rather than guessing approval state.
+    fn read_is_approved_for_all(
+        &self,
+        network: &ChainNetwork,
+        operative: &str,
+        account: &str,
+        operator: &str,
+    ) -> Result<bool, Response> {
+        let data = encode_is_approved_for_all_calldata(IS_APPROVED_FOR_ALL_SELECTOR, account, operator)
+            .map_err(|err| Response::error("invalid_call", &err))?;
+        let result = self.evm_rpc(
+            network,
+            "eth_call",
+            json!([{ "to": operative, "data": data }, "latest"]),
+        )?;
+        decode_evm_bool(&result).map_err(|err| Response::error("upstream_invalid_bool", &err))
     }
 
     fn broadcast_transaction(&self, network_id: &str, signed_transaction: &str) -> Response {

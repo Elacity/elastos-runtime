@@ -176,9 +176,15 @@ pub(crate) fn validate_eip155_transaction_intent_payload(
         return Err("transaction intent from address does not match account".to_string());
     }
     payload_evm_address_bytes(payload, "to")?;
-    payload_quantity_bytes(payload, "nonce")?;
-    payload_quantity_bytes(payload, "gas_price")?;
-    payload_quantity_bytes(payload, "gas_limit")?;
+    // nonce / gas_price / gas_limit are OPTIONAL: an external wallet (MetaMask) estimates
+    // them itself (matching PC2's EOA mint, which sends only to/data/value/chainId). They
+    // stay REQUIRED for the managed local-signing path, which fails closed in
+    // `crypto::evm::transaction` if a managed wallet omits them. Validate only when present.
+    for field in ["nonce", "gas_price", "gas_limit"] {
+        if payload.get(field).is_some() {
+            payload_quantity_bytes(payload, field)?;
+        }
+    }
     payload_quantity_bytes(payload, "value")?;
     payload_hex_bytes(payload, "data")?;
     Ok(())

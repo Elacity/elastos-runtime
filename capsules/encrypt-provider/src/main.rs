@@ -555,6 +555,16 @@ impl EncryptProvider {
             "node_set_id_b64": b64.encode(out.node_set_id),
             // Each node's SEALED indexed share (`x ‖ p(x)` under its recipient) — never a raw share.
             "shares": out.shares,
+            // The producer verifying key that SIGNED each escrow seal. The recovery boundary
+            // authenticates the escrow under this key, so it MUST be captured in the asset's
+            // metadata envelope at mint: the producer signer is minted fresh per process, so a
+            // recovery after this process exits can only verify against the persisted vk. Without
+            // it, a minted asset is permanently unrecoverable. (PUBLIC; the secret never leaves.)
+            "producer_verifying_key_b64": self
+                .producer
+                .as_ref()
+                .map(|p| b64.encode(&p.verifying_key))
+                .unwrap_or_default(),
         }))
     }
 
@@ -709,6 +719,13 @@ impl EncryptProvider {
             "payload_cid": out.payload_cid,
             "node_set_id_b64": b64.encode(out.node_set_id),
             "shares": out.shares,
+            // See `seal_inline_threshold`: the producer vk that signed each escrow MUST be
+            // persisted in the asset envelope or the media asset is unrecoverable after restart.
+            "producer_verifying_key_b64": self
+                .producer
+                .as_ref()
+                .map(|p| b64.encode(&p.verifying_key))
+                .unwrap_or_default(),
         }))
     }
 
