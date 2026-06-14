@@ -85,6 +85,12 @@ build_capsule ipfs-provider
 # local media-authority helper. Not needed to MINT, built so the open path is ready too.
 build_capsule rights-provider --features chain-rights
 build_capsule decrypt-provider --features rail-stream,rail-mint
+# dKMS consumer-open rail: key-provider (dkms backend) recovers the CEK 2-of-3 from the live
+# quorum; dkms-authority is the node daemon; dkms-keygen derives the caller-identity vk the
+# nodes allow-list. Built so a minted dKMS asset opens (double-click -> quorum recover -> render).
+build_capsule key-provider --features key-authority-ref
+build_capsule dkms-authority
+build_capsule dkms-keygen
 # Library object plane (v0.4.0): the provider-backed object model the new Library/Home use.
 # Without it the gateway boots but Library object operations fail closed.
 build_capsule object-provider
@@ -118,13 +124,100 @@ GATEWAY_BIN="${REPO_ROOT}/elastos/target/debug/elastos"
 echo
 
 # ── 3. provision the persistent 2-of-3 quorum (the Create portal seals to it) ──
-QUORUM_JSON="${DATA_DIR}/dkms/quorum.json"
-if [[ -f "$QUORUM_JSON" ]]; then
+QUORUM_DIR="${DATA_DIR}/dkms"
+QUORUM_JSON="${QUORUM_DIR}/quorum.json"
+QUORUM_NODES="${QUORUM_DIR}/quorum-nodes.json"
+if [[ -f "$QUORUM_JSON" && -f "$QUORUM_NODES" ]]; then
   echo "quorum descriptor present: ${QUORUM_JSON} (reusing)"
 else
-  echo "provisioning a fresh 2-of-3 quorum into ${DATA_DIR}/dkms ..."
-  bash "${REPO_ROOT}/scripts/dev/ddrm-provision-quorum.sh" "${DATA_DIR}/dkms" || {
+  echo "provisioning a fresh 2-of-3 quorum into ${QUORUM_DIR} ..."
+  bash "${REPO_ROOT}/scripts/dev/ddrm-provision-quorum.sh" "${QUORUM_DIR}" || {
     echo "FAIL: quorum provisioning failed" >&2; exit 1; }
+fi
+echo
+
+# ── 3b. start the recovery daemons + assemble the OPEN descriptor + caller seed ───────────────
+# Minting only needs the PUBLIC descriptor (sealing is local crypto). OPENING a minted dKMS asset
+# needs the three secret-holding nodes RUNNING (the 2-of-3 recover) + a caller seed the nodes
+# allow-list + an OPEN descriptor that carries each node's live endpoint. We bring the nodes up on
+# their durable stores (same identities the mint sealed to), allow-list a fresh caller seed, and
+# emit a v2 descriptor (top-level node-0 identity + threshold.nodes[] with endpoints) that serves
+# BOTH the mint seal AND the key-provider(dkms) recover.
+NODE_BIN="${CAPSULES}/dkms-authority/target/debug/dkms-authority"
+KEYGEN_BIN="${CAPSULES}/dkms-keygen/target/debug/dkms-keygen"
+KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
+OPEN_DESCRIPTOR="${QUORUM_DIR}/quorum-open.json"
+DKMS_PIDS=()
+QUORUM_OPEN_READY=0
+if [[ -x "$NODE_BIN" && -x "$KEYGEN_BIN" && -x "$KEY_PROVIDER_BIN" && -f "$QUORUM_NODES" ]]; then
+  # A fresh per-boot caller identity the nodes allow-list (its vk is the allow entry; the seed is
+  # the runtime-side secret the key-provider authenticates with — never written to the descriptor).
+  CALLER_SEED_B64="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+  CALLER_VK="$("$KEYGEN_BIN" derive-vk --seed-b64 "$CALLER_SEED_B64" 2>/dev/null | tr -d '\n')"
+  if [[ -z "$CALLER_VK" ]]; then
+    echo "WARN: could not derive a caller vk (dkms-keygen) — quorum OPEN disabled (mint still works)"
+  else
+    # Read the private sidecar (store path + endpoint per node) and start each daemon on its
+    # durable store, listening on its endpoint, allow-listing this caller. (No `mapfile` — macOS
+    # ships bash 3.2; read the lines portably.)
+    NODE_LINES=()
+    while IFS= read -r ln; do [[ -n "$ln" ]] && NODE_LINES+=("$ln"); done < <(python3 - "$QUORUM_NODES" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for n in d.get("nodes", []):
+    print("\t".join([n["verifying_key_b64"], n["recipient_pub_b64"], n["key_store"], n["authority_endpoint"]]))
+PY
+)
+    if [[ "${#NODE_LINES[@]}" -ne 3 ]]; then
+      echo "WARN: quorum sidecar did not yield 3 nodes — quorum OPEN disabled (mint still works)"
+    else
+      VKS=(); RECS=(); ENDPOINTS=()
+      for ln in "${NODE_LINES[@]}"; do
+        IFS=$'\t' read -r vk rec store endpoint <<<"$ln"
+        VKS+=("$vk"); RECS+=("$rec"); ENDPOINTS+=("$endpoint")
+        DKMS_AUTHORITY_LISTEN="$endpoint" \
+        DKMS_AUTHORITY_KEY_STORE="$store" \
+        DKMS_AUTHORITY_ALLOWED_CALLERS="$CALLER_VK" \
+          "$NODE_BIN" >/dev/null 2>>"${QUORUM_DIR}/daemon.log" &
+        DKMS_PIDS+=("$!")
+      done
+      # Wait for each unix socket to appear (the node clears+binds it on startup).
+      for ep in "${ENDPOINTS[@]}"; do
+        for _ in $(seq 1 200); do [[ -S "$ep" ]] && break; sleep 0.05; done
+      done
+      # Assemble the v2 OPEN descriptor (identities the mint sealed to + live endpoints).
+      python3 - "$OPEN_DESCRIPTOR" "${VKS[@]}" "__SEP__" "${RECS[@]}" "__SEP__" "${ENDPOINTS[@]}" <<'PY'
+import json, sys
+args = sys.argv[1:]
+out = args[0]; rest = args[1:]
+groups, cur = [], []
+for a in rest:
+    if a == "__SEP__": groups.append(cur); cur = []
+    else: cur.append(a)
+groups.append(cur)
+vks, recs, eps = groups
+nodes = [{"verifying_key_b64": v, "recipient_pub_b64": r, "authority_endpoint": e}
+         for v, r, e in zip(vks, recs, eps)]
+desc = {
+  "schema": "elastos.dkms.authority/v2",
+  "verifying_key_b64": nodes[0]["verifying_key_b64"],
+  "recipient_pub_b64": nodes[0]["recipient_pub_b64"],
+  "authority_endpoint": nodes[0]["authority_endpoint"],
+  "threshold": {"t": 2, "n": len(nodes), "nodes": nodes},
+}
+json.dump(desc, open(out, "w"), indent=2)
+PY
+      if [[ -f "$OPEN_DESCRIPTOR" ]]; then
+        chmod 600 "$OPEN_DESCRIPTOR" 2>/dev/null || true
+        QUORUM_OPEN_READY=1
+        echo "dKMS recovery quorum LIVE — 3 node daemons up; OPEN descriptor: ${OPEN_DESCRIPTOR}"
+      else
+        echo "WARN: could not assemble the OPEN descriptor — quorum OPEN disabled (mint still works)"
+      fi
+    fi
+  fi
+else
+  echo "WARN: key-provider/dkms-authority/dkms-keygen not built — quorum OPEN disabled (mint still works)"
 fi
 echo
 
@@ -168,6 +261,14 @@ MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/debug/ddrm-
 [[ -x "$MEDIA_AUTH_BIN" ]] && export ELASTOS_DDRM_MEDIA_AUTHORITY_BIN="$MEDIA_AUTH_BIN"
 # The Create portal reads the quorum here (also the default <data_dir>/dkms/quorum.json).
 export ELASTOS_DKMS_QUORUM_DESCRIPTOR="$QUORUM_JSON"
+# dKMS consumer-open (double-click a minted asset): the key-provider the helper drives + the LIVE
+# OPEN descriptor (node endpoints) + the caller seed the running nodes allow-list. Set only when
+# the recovery quorum came up — absent, opening a dKMS asset fails closed with a clear 503.
+if [[ "$QUORUM_OPEN_READY" -eq 1 ]]; then
+  export ELASTOS_DDRM_KEY_PROVIDER_BIN="$KEY_PROVIDER_BIN"
+  export ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR="$OPEN_DESCRIPTOR"
+  export ELASTOS_DDRM_QUORUM_CALLER_SEED_B64="$CALLER_SEED_B64"
+fi
 # Default the rights/mint mode to dev (offline) unless the operator pinned one.
 export ELASTOS_DDRM_RIGHTS="${ELASTOS_DDRM_RIGHTS:-dev}"
 
@@ -178,6 +279,11 @@ for v in ELASTOS_ENCRYPT_PROVIDER_BIN ELASTOS_MEDIA_PROVIDER_BIN ELASTOS_PUBLISH
   printf '  %s=%s\n' "$v" "${!v}"
 done
 echo "  ELASTOS_DDRM_RIGHTS=${ELASTOS_DDRM_RIGHTS}"
+if [[ "$QUORUM_OPEN_READY" -eq 1 ]]; then
+  echo "  ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR=${OPEN_DESCRIPTOR}  (3 node daemons live)"
+else
+  echo "  dKMS consumer-open: DISABLED (mint works; opening a minted asset will 503)"
+fi
 echo
 
 # ── 5. free the port / host lock, then launch ─────────────────────────────────
@@ -193,4 +299,9 @@ echo " (use 'localhost', NOT 127.0.0.1 — WebAuthn rejects bare IPs)"
 echo "=============================================================="
 # The `gateway` command uses the platform default data dir (dirs::data_dir()/elastos); the
 # Create portal finds the quorum via ELASTOS_DKMS_QUORUM_DESCRIPTOR regardless of --data-dir.
-exec "$GATEWAY_BIN" gateway --addr "$ADDR"
+# Run in the FOREGROUND (not exec) so the recovery node daemons we spawned are reaped on exit.
+cleanup_daemons() {
+  for p in "${DKMS_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+}
+trap cleanup_daemons EXIT INT TERM
+"$GATEWAY_BIN" gateway --addr "$ADDR"

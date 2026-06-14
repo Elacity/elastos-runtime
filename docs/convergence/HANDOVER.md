@@ -1077,3 +1077,60 @@ can decrypt" and "the viewer can render a dKMS asset on double-click."
 These require the **live (or local) 2-of-3 quorum nodes** the escrow references to be reachable at
 open time — i.e. verified against the production system (or a local node-set as `asset-open-verify.sh`
 stands up). Deliberately NOT half-shipped untested, per the Day-138 discipline.
+
+---
+
+## DAY 140 — consumer-open SHIPPED: A+B+C+D wired end-to-end + the gateway open path proven byte-identical ✅
+
+Day 139 left the crypto wired and three plumbing items (A/B/C). Day 140 lands all of them **plus**
+the gateway daemon wiring (D), each proven byte-identical against a live local 2-of-3 quorum. A
+minted non-media dKMS asset now double-clicks open in the gateway and renders through the quorum —
+PC2 parity, fail-closed, **no plaintext at rest** and **no CEK/shares ever crossing the gateway**.
+
+**B) `ddrm-media-authority --quorum` (commit `daa1141e1`)** — the production subprocess
+`/api/viewers/open` spawns. New `quorum.rs` runs the EXACT orchestration proven in
+`ddrm-producer-smoke::run_asset`, parameterized by the real principal/object_cid: reads the `.ddrm`
+capsule (`protections[0]` escrow + `ciphertext_b64`), pins the 3 node identities, recovers the CEK
+2-of-3 via `key-provider(dkms)`, reconstructs in-VM + `stream_segment` in `decrypt-provider`, strips
+the fMP4 `mdat`, and serves the byte-identical cleartext over the SAME stdio object protocol the
+local-test-KMS `--object` mode uses. Transcript AAD via the shared `ddrm-envelope` encoder (#10, no
+private re-impl). Added `ddrm-producer-smoke --mint-capsule` (writes a gateway-shaped `.ddrm`
+capsule) + `quorum-helper-verify.sh` (mints to a local quorum, drives the helper, asserts identical).
+**PASS (48KiB).**
+
+**A) mint persists the ciphertext + escrow (commit `855d3a988`).** A NON-MEDIA object is now
+persisted AS its `.ddrm` capsule (escrow + `ciphertext_b64`) — *no plaintext copy at rest*. The
+single-sample ciphertext threads `MintTail.ciphertext_b64 → prepared-mint result → capsule`. Media
+keeps the plaintext object + `.ddrm` sidecar (quorum-open of multi-segment DASH is a follow-on).
+
+**C) `viewer_open.rs` branch (commit `855d3a988`).** Detects a dKMS `.ddrm` capsule (schema +
+2-of-3 threshold escrow + ciphertext + producer key) and routes the open to the quorum path instead
+of the local-test-KMS re-seal. The rights gate still runs (bound to the capsule's on-chain content
+id); the capsule's presentation mime drives rendering. `ObjectAuthorityProc::launch_quorum` spawns
+the helper and serves the recovered bytes through the SAME `ObjectSession`. `resolve_key_bin()`
+locates `key-provider`. Quorum-open is gated on `ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR` (live node
+endpoints) + `ELASTOS_DDRM_QUORUM_CALLER_SEED_B64`; absent ⇒ fail-closed 503.
+
+**D) `run-creator-gateway.sh` brings the recovery quorum LIVE.** Builds `key-provider` +
+`dkms-authority` + `dkms-keygen`; after provisioning it starts the 3 node daemons on their durable
+stores (the SAME identities the mint seals to) over their unix sockets, allow-lists a fresh
+per-boot caller seed, and emits a **v2 OPEN descriptor** (top-level node-0 identity + endpoints +
+`threshold.nodes[]`) that satisfies BOTH the mint seal (`creator::parse_quorum_descriptor`, which
+ignores schema and reads `threshold.nodes[]`) AND `key-provider(dkms)` (`elastos.dkms.authority/v2`
+with per-node `authority_endpoint`). Exports the three open envs; reaps the daemons on exit (no
+`exec`, trap-based cleanup). macOS bash-3.2 safe (no `mapfile`).
+
+**Proof — `quorum-gateway-verify.sh` (PASS, 40KiB):** mirrors the gateway exactly — provision →
+live UNIX-socket daemons from the sidecar → v2 descriptor → MINT a capsule sealing to the PUBLIC v1
+descriptor → OPEN with `--quorum` → **byte-identical**. This is stricter than `quorum-helper-verify`:
+it exercises the unix-socket transport AND proves the v1-mint identities match the v2-open identities
+(the gateway's actual seam). Together with Day-138 `asset-open-verify.sh` and Day-139's 80/80
+`rail-stream` suite, the entire seal→persist→recover→decrypt→render pipeline is proven.
+
+**What's verified vs. what the operator should click-test next:**
+- Verified locally byte-identical: the crypto (Day 139), the helper (`quorum-helper-verify`), and the
+  full gateway open orchestration over unix sockets (`quorum-gateway-verify`). `elastos-server`
+  compiles green; lints clean.
+- Operator click-test (needs a browser + passkey, can't be scripted here): `run-creator-gateway.sh`
+  → mint a non-media asset in the Create portal → it appears in the Library as `<name>.ddrm` →
+  double-click → renders via the live quorum. Media (DASH) quorum-open remains the next follow-on.
