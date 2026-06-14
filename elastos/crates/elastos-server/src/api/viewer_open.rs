@@ -36,9 +36,13 @@ use super::gateway::{
     issue_home_launch_token_with_context, require_home_token_context, GatewayState,
     HomeLaunchTokenContext,
 };
-use super::media_authority::{resolve_decrypt_bin, resolve_helper_bin, MediaAuthorityProc};
+use super::media_authority::{
+    resolve_decrypt_bin, resolve_helper_bin, resolve_key_bin, MediaAuthorityProc,
+};
 use super::object_authority::ObjectAuthorityProc;
-use super::viewer_media::{media_play_route, put_media_session, MediaSession, MEDIA_VIEWER_CAPSULE};
+use super::viewer_media::{
+    media_play_route, put_media_session, MediaSession, MEDIA_VIEWER_CAPSULE,
+};
 use super::viewer_object::{
     object_view_route, put_object_session, ObjectSession, OBJECT_VIEWER_CAPSULE,
 };
@@ -99,7 +103,8 @@ impl PlaintextTemp {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        file.write_all(bytes).map_err(|e| format!("temp write: {e}"))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("temp write: {e}"))?;
         file.flush().map_err(|e| format!("temp flush: {e}"))?;
         Ok(Self { path })
     }
@@ -142,7 +147,10 @@ pub async fn open_owned_in_viewer(
             return (StatusCode::NOT_FOUND, "owned object not found").into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object read panicked")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "owned object read panicked",
+            )
                 .into_response()
         }
     };
@@ -157,11 +165,33 @@ pub async fn open_owned_in_viewer(
             .into_response();
     }
 
-    let object_cid = owned
-        .content_cid
-        .clone()
-        .unwrap_or_else(|| format!("owned:{}", owned.name));
-    let ext = extension_for(&owned.name, &owned.mime);
+    // A minted dKMS asset is persisted AS its `.ddrm` capsule (no plaintext at rest). Detect it
+    // up front: the openable item carries the dKMS escrow + the sealed ciphertext, and the open
+    // is a 2-of-3 quorum RECOVER (production) rather than the local-test-KMS re-seal. The capsule
+    // pins the on-chain content identity (for the rights gate) and the real presentation mime.
+    let capsule = dkms_capsule(&owned.bytes);
+    let render_mime = capsule
+        .as_ref()
+        .and_then(|c| c.get("mime").and_then(serde_json::Value::as_str))
+        .filter(|m| !m.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| owned.mime.clone());
+    let object_cid = capsule
+        .as_ref()
+        .and_then(|c| {
+            c.get("content_id")
+                .or_else(|| c.get("kid"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            owned
+                .content_cid
+                .clone()
+                .unwrap_or_else(|| format!("owned:{}", owned.name))
+        });
+    let ext = extension_for(&owned.name, &render_mime);
 
     // Live-chain gate: the rights-provider capsule decides access (Anders' rule —
     // the DECISION lives in the capsule, not here). The on-chain ownership answer comes
@@ -202,7 +232,10 @@ pub async fn open_owned_in_viewer(
             // outage; a missing/misconfigured provider is a 503.
             if err.contains("wallet not linked") {
                 tracing::info!("owned open denied: {err}");
-                return (StatusCode::FORBIDDEN, "link an EVM wallet to open protected content")
+                return (
+                    StatusCode::FORBIDDEN,
+                    "link an EVM wallet to open protected content",
+                )
                     .into_response();
             }
             tracing::warn!("rights gate unavailable: {err}");
@@ -213,7 +246,11 @@ pub async fn open_owned_in_viewer(
                 .into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "rights gate task panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "rights gate task panicked",
+            )
+                .into_response()
         }
     };
     if !rights.allowed {
@@ -226,15 +263,44 @@ pub async fn open_owned_in_viewer(
     }
     let rights_binding = rights.receipt_hash_hex.clone();
 
+    if let Some(capsule) = capsule {
+        return open_quorum(
+            state,
+            context,
+            capsule,
+            object_cid,
+            render_mime,
+            helper_bin,
+            decrypt_bin,
+            session_id,
+            rights_binding,
+        )
+        .await;
+    }
+
     if is_media_mime(&owned.mime) {
         open_media(
-            state, context, owned, object_cid, ext, helper_bin, decrypt_bin, session_id,
+            state,
+            context,
+            owned,
+            object_cid,
+            ext,
+            helper_bin,
+            decrypt_bin,
+            session_id,
             rights_binding,
         )
         .await
     } else {
         open_object(
-            state, context, owned, object_cid, ext, helper_bin, decrypt_bin, session_id,
+            state,
+            context,
+            owned,
+            object_cid,
+            ext,
+            helper_bin,
+            decrypt_bin,
+            session_id,
             rights_binding,
         )
         .await
@@ -275,7 +341,10 @@ pub async fn buy_owned_access(
             return (StatusCode::NOT_FOUND, "owned object not found").into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object read panicked")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "owned object read panicked",
+            )
                 .into_response()
         }
     };
@@ -315,8 +384,7 @@ pub async fn buy_owned_access(
             .into_response(),
         Ok(Err(err)) => {
             if err.contains("wallet not linked") {
-                return (StatusCode::FORBIDDEN, "link an EVM wallet to buy access")
-                    .into_response();
+                return (StatusCode::FORBIDDEN, "link an EVM wallet to buy access").into_response();
             }
             // A live buy that needs an external signer is a precondition (409), not an
             // outage — surface the assembled tx so the caller can sign it.
@@ -426,7 +494,11 @@ async fn open_media(
             return (StatusCode::BAD_GATEWAY, "could not open owned media").into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "owned media task panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "owned media task panicked",
+            )
+                .into_response()
         }
     };
 
@@ -435,7 +507,8 @@ async fn open_media(
     put_media_session(session_id.clone(), session);
 
     let token =
-        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context) {
+        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context)
+        {
             Ok(token) => token,
             Err(err) => {
                 return (
@@ -446,7 +519,13 @@ async fn open_media(
             }
         };
     let play_url = format!("{}&home_token={}", media_play_route(&session_id), token);
-    open_ok(MEDIA_VIEWER_CAPSULE, &session_id, &title, &play_url, &rights_binding)
+    open_ok(
+        MEDIA_VIEWER_CAPSULE,
+        &session_id,
+        &title,
+        &play_url,
+        &rights_binding,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -486,7 +565,11 @@ async fn open_object(
             return (StatusCode::BAD_GATEWAY, "could not open owned asset").into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object task panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "owned object task panicked",
+            )
+                .into_response()
         }
     };
 
@@ -494,20 +577,195 @@ async fn open_object(
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);
     put_object_session(session_id.clone(), session);
 
-    let token =
-        match issue_home_launch_token_with_context(&state.data_dir, OBJECT_VIEWER_CAPSULE, &context)
-        {
-            Ok(token) => token,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not mint launch token: {err}"),
-                )
-                    .into_response()
-            }
-        };
+    let token = match issue_home_launch_token_with_context(
+        &state.data_dir,
+        OBJECT_VIEWER_CAPSULE,
+        &context,
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not mint launch token: {err}"),
+            )
+                .into_response()
+        }
+    };
     let view_url = format!("{}&home_token={}", object_view_route(&session_id), token);
-    open_ok(OBJECT_VIEWER_CAPSULE, &session_id, &title, &view_url, &rights_binding)
+    open_ok(
+        OBJECT_VIEWER_CAPSULE,
+        &session_id,
+        &title,
+        &view_url,
+        &rights_binding,
+    )
+}
+
+/// Recognize a minted dKMS `.ddrm` capsule that is quorum-openable: the capsule schema, a
+/// 2-of-3 threshold escrow in `protections[0]` (with the producer verifying key needed to verify
+/// the recovered shares), and the persisted sealed `ciphertext_b64`. Anything else (a media
+/// sidecar with no ciphertext, a pre-keystone mint missing the producer key) returns `None` and
+/// falls through to the existing object/media paths.
+fn dkms_capsule(bytes: &[u8]) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if v.get("schema").and_then(|s| s.as_str()) != Some("elastos.ddrm.capsule/v1") {
+        return None;
+    }
+    v.get("ciphertext_b64")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())?;
+    let prot = v
+        .get("protections")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())?;
+    let scheme = prot.get("scheme").and_then(|s| s.as_str())?;
+    if !(scheme.contains("threshold") || scheme.contains("shamir") || scheme.contains("quorum")) {
+        return None;
+    }
+    prot.get("producer_verifying_key_b64")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())?;
+    Some(v)
+}
+
+/// The dKMS consumer-open: recover the minted asset's REAL CEK from the 2-of-3 quorum named by
+/// the `.ddrm` capsule and render the byte-identical cleartext. The gateway spawns the isolated
+/// `ddrm-media-authority --quorum` helper (which drives `key-provider(dkms)` + a separate
+/// `decrypt-provider` boundary); it never links the PQ crypto and never sees the CEK or shares.
+/// The recovered bytes are served through the SAME principal-bound `ObjectSession` as `open_object`.
+#[allow(clippy::too_many_arguments)]
+async fn open_quorum(
+    state: GatewayState,
+    context: HomeLaunchTokenContext,
+    capsule: serde_json::Value,
+    object_cid: String,
+    mime: String,
+    helper_bin: String,
+    decrypt_bin: String,
+    session_id: String,
+    rights_binding: String,
+) -> Response {
+    let principal_id = context.principal_id.clone();
+    let title = capsule
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Protected asset")
+        .to_string();
+
+    let key_bin = resolve_key_bin();
+    if !std::path::Path::new(&key_bin).is_file() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "key-provider not found; build capsules/key-provider or set ELASTOS_DDRM_KEY_PROVIDER_BIN",
+        )
+            .into_response();
+    }
+    // The OPEN descriptor must carry the live node endpoints (the dkms backend connects to them);
+    // it falls back to the mint-time public descriptor when the operator points both at one file.
+    let descriptor = std::env::var("ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR")
+        .or_else(|_| std::env::var("ELASTOS_DKMS_QUORUM_DESCRIPTOR"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let descriptor = match descriptor {
+        Some(d) if std::path::Path::new(&d).is_file() => d,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dKMS quorum open not configured (set ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR to a live node-set descriptor)",
+            )
+                .into_response()
+        }
+    };
+    let caller_seed = match std::env::var("ELASTOS_DDRM_QUORUM_CALLER_SEED_B64")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dKMS quorum open not configured (set ELASTOS_DDRM_QUORUM_CALLER_SEED_B64)",
+            )
+                .into_response()
+        }
+    };
+
+    let capsule_bytes = match serde_json::to_vec(&capsule) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not serialize capsule",
+            )
+                .into_response()
+        }
+    };
+    let object_cid_c = object_cid.clone();
+    let mime_c = mime.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
+        // temp file, unlinked as soon as the helper has read it at launch.
+        let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
+        let capsule_file = temp.path_str();
+        ObjectAuthorityProc::launch_quorum(
+            &helper_bin,
+            &decrypt_bin,
+            &key_bin,
+            &principal_id,
+            &capsule_file,
+            &descriptor,
+            &caller_seed,
+            &object_cid_c,
+            &mime_c,
+        )
+    })
+    .await;
+    let proc = match built {
+        Ok(Ok(proc)) => Arc::new(proc),
+        Ok(Err(err)) => {
+            tracing::warn!("dKMS quorum open failed: {err}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "could not open owned asset from the dKMS quorum",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "quorum open task panicked",
+            )
+                .into_response()
+        }
+    };
+
+    let session =
+        ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);
+    put_object_session(session_id.clone(), session);
+
+    let token = match issue_home_launch_token_with_context(
+        &state.data_dir,
+        OBJECT_VIEWER_CAPSULE,
+        &context,
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not mint launch token: {err}"),
+            )
+                .into_response()
+        }
+    };
+    let view_url = format!("{}&home_token={}", object_view_route(&session_id), token);
+    open_ok(
+        OBJECT_VIEWER_CAPSULE,
+        &session_id,
+        &title,
+        &view_url,
+        &rights_binding,
+    )
 }
 
 fn open_ok(

@@ -33,7 +33,9 @@ use serde_json::{json, Value};
 use super::gateway::{
     issue_home_launch_token_with_context, require_home_token_context, GatewayState,
 };
-use super::viewer_media::{media_play_route, put_media_session, MediaSession, MEDIA_VIEWER_CAPSULE};
+use super::viewer_media::{
+    media_play_route, put_media_session, MediaSession, MEDIA_VIEWER_CAPSULE,
+};
 
 /// Compile-time dev-tree default for the isolated media-authority helper, override
 /// with `ELASTOS_DDRM_MEDIA_AUTHORITY_BIN`.
@@ -57,6 +59,18 @@ pub(crate) fn resolve_helper_bin() -> String {
 /// Resolve the rail decrypt-provider binary (env override or dev-tree default).
 pub(crate) fn resolve_decrypt_bin() -> String {
     std::env::var("ELASTOS_DDRM_DECRYPT_BIN").unwrap_or_else(|_| DEV_DECRYPT_BIN.to_string())
+}
+
+/// Compile-time dev-tree default for the key-provider (dkms backend) the quorum consumer-open
+/// drives, override with `ELASTOS_DDRM_KEY_PROVIDER_BIN`.
+const DEV_KEY_PROVIDER_BIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../capsules/key-provider/target/debug/key-provider"
+);
+
+/// Resolve the key-provider binary (env override or dev-tree default) for `--quorum` opens.
+pub(crate) fn resolve_key_bin() -> String {
+    std::env::var("ELASTOS_DDRM_KEY_PROVIDER_BIN").unwrap_or_else(|_| DEV_KEY_PROVIDER_BIN.to_string())
 }
 
 /// A live media decrypt session backed by a gateway-spawned local key-authority
@@ -158,7 +172,10 @@ impl MediaAuthorityProc {
 
     /// Relay one segment read; returns already-decrypted, `senc`-stripped bytes.
     pub fn segment(&self, index: usize) -> Result<Vec<u8>, String> {
-        let mut io = self.io.lock().map_err(|_| "media-authority mutex poisoned")?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| "media-authority mutex poisoned")?;
         writeln!(io.stdin, "{}", json!({ "op": "segment", "index": index }))
             .map_err(|e| format!("write segment request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
@@ -241,21 +258,30 @@ pub async fn open_demo_media(State(state): State<GatewayState>, headers: HeaderM
         Ok(Ok(proc)) => Arc::new(proc),
         Ok(Err(err)) => {
             tracing::warn!("media open failed: {err}");
-            return (StatusCode::BAD_GATEWAY, format!("could not open owned media: {err}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("could not open owned media: {err}"),
+            )
                 .into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "media open task panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "media open task panicked",
+            )
+                .into_response()
         }
     };
 
     let session_id = random_session_id();
     let segment_count = proc.segment_count;
-    let session = MediaSession::from_authority(MEDIA_VIEWER_CAPSULE, context.principal_id.clone(), proc);
+    let session =
+        MediaSession::from_authority(MEDIA_VIEWER_CAPSULE, context.principal_id.clone(), proc);
     put_media_session(session_id.clone(), session);
 
     let token =
-        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context) {
+        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context)
+        {
             Ok(token) => token,
             Err(err) => {
                 return (

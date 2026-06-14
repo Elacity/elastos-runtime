@@ -212,7 +212,10 @@ pub struct PrepareMintRequest {
 pub async fn creator_status(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
     if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
     {
-        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token");
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid home launch token",
+        );
     }
     match load_quorum_descriptor(&state.data_dir) {
         Ok(nodes) => Json(json!({
@@ -240,15 +243,25 @@ pub async fn creator_prepare_mint(
     headers: HeaderMap,
     body: Result<Json<PrepareMintRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx =
-        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
-            }
-        };
+    let ctx = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[CREATOR_APP],
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            )
+        }
+    };
     let Some(registry) = state.provider_registry.as_ref() else {
-        return staged_error(StatusCode::SERVICE_UNAVAILABLE, "encrypt", "providers unavailable");
+        return staged_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "encrypt",
+            "providers unavailable",
+        );
     };
 
     let Json(req) = match body {
@@ -260,7 +273,13 @@ pub async fn creator_prepare_mint(
     let meta = req.meta;
     let file_bytes = match base64::engine::general_purpose::STANDARD.decode(req.file_b64.trim()) {
         Ok(bytes) => bytes,
-        Err(_) => return staged_error(StatusCode::BAD_REQUEST, "encrypt", "file_b64 is not valid base64"),
+        Err(_) => {
+            return staged_error(
+                StatusCode::BAD_REQUEST,
+                "encrypt",
+                "file_b64 is not valid base64",
+            )
+        }
     };
     if file_bytes.is_empty() {
         return staged_error(StatusCode::BAD_REQUEST, "encrypt", "no file was uploaded");
@@ -312,13 +331,19 @@ pub async fn creator_prepare_mint(
 /// frame holds NO wallet authority (#3); it only learns which already-linked address to bind.
 /// Returns addresses ONLY — no keys, no account secrets.
 pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    let ctx =
-        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
-            }
-        };
+    let ctx = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[CREATOR_APP],
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            )
+        }
+    };
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
@@ -378,7 +403,10 @@ pub async fn creator_list_channels(
 ) -> Response {
     if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
     {
-        return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token");
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid home launch token",
+        );
     }
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
@@ -442,13 +470,19 @@ pub async fn creator_create_channel(
     headers: HeaderMap,
     body: Result<Json<CreateChannelRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx =
-        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
-            }
-        };
+    let ctx = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[CREATOR_APP],
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            )
+        }
+    };
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
@@ -481,7 +515,11 @@ async fn run_create_channel(
     let scope = match req.scope.trim().to_ascii_lowercase().as_str() {
         "public" => CHANNEL_SCOPE_PUBLIC,
         "" | "private" => CHANNEL_SCOPE_PRIVATE,
-        other => return Err(format!("unknown channel scope '{other}' (use public|private)")),
+        other => {
+            return Err(format!(
+                "unknown channel scope '{other}' (use public|private)"
+            ))
+        }
     };
 
     // 1) Publish minimal channel metadata to IPFS -> tokenURI (PC2 writes `ipfs://<cid>`).
@@ -612,13 +650,19 @@ pub async fn creator_prepare_trade_approval(
     headers: HeaderMap,
     body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx =
-        match require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                return error_json(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")
-            }
-        };
+    let ctx = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[CREATOR_APP],
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            )
+        }
+    };
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
@@ -802,7 +846,10 @@ struct StagedError {
 }
 
 fn stage_err(stage: &'static str, message: impl Into<String>) -> StagedError {
-    StagedError { stage, message: message.into() }
+    StagedError {
+        stage,
+        message: message.into(),
+    }
 }
 
 /// The producer spine: escrow -> publish segment -> assemble envelope -> publish metadata
@@ -840,7 +887,8 @@ async fn run_prepare_mint(
     let kid_hex = seal_str(&seal, "kid_hex").map_err(|e| stage_err("encrypt", e))?;
     let content_id = seal_str(&seal, "content_id_hex").map_err(|e| stage_err("encrypt", e))?;
     let segment_b64 = seal_str(&seal, "segment_b64").map_err(|e| stage_err("encrypt", e))?;
-    let node_set_id_b64 = seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
+    let node_set_id_b64 =
+        seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
     // The producer vk that signed each escrow seal. It MUST live in the envelope: the encrypt
     // producer key is minted fresh per process, so a later open (after the provider restarts)
     // can only authenticate the escrow against the persisted vk. Missing it => unrecoverable.
@@ -912,6 +960,7 @@ async fn run_prepare_mint(
             asset_cid: &asset_cid,
             metadata_cid: &metadata_cid,
             protections: &protections,
+            ciphertext_b64: Some(&segment_b64),
         },
     )
     .await
@@ -926,6 +975,11 @@ struct MintTail<'a> {
     asset_cid: &'a str,
     metadata_cid: &'a str,
     protections: &'a Value,
+    /// The base64 single-sample ciphertext segment for a NON-MEDIA object — persisted into the
+    /// `.ddrm` capsule so the quorum consumer-open has the exact bytes to recover (no IPFS fetch
+    /// at open). `None` for media (the DASH directory is the ciphertext; quorum-open of DASH is a
+    /// follow-on).
+    ciphertext_b64: Option<&'a str>,
 }
 
 /// The shared mint tail: `publish prepare_publish` (unsigned mint, contentId == bytes16
@@ -975,8 +1029,7 @@ async fn finalize_mint(
         }
     });
     if is_paid(meta) {
-        let price_wei = to_wei(&meta.price, &meta.currency)
-            .map_err(|e| stage_err("publish", e))?;
+        let price_wei = to_wei(&meta.price, &meta.currency).map_err(|e| stage_err("publish", e))?;
         let creator = meta.creator_address.trim();
         if creator.is_empty() {
             return Err(stage_err(
@@ -1008,9 +1061,12 @@ async fn finalize_mint(
     // chain-provider::assemble_mint fails closed on unknown fields (#11), so project the
     // descriptor onto exactly the fields it accepts and add the configured selector — the
     // orchestrator owns this translation, keeping both provider contracts strict (#5, #10).
-    let um = unsigned_mint
-        .as_object()
-        .ok_or_else(|| stage_err("sign", "publish provider returned a non-object unsigned mint"))?;
+    let um = unsigned_mint.as_object().ok_or_else(|| {
+        stage_err(
+            "sign",
+            "publish provider returned a non-object unsigned mint",
+        )
+    })?;
     let mut mint = serde_json::Map::new();
     mint.insert("selector".into(), json!(mint_selector()));
     for key in [
@@ -1102,6 +1158,9 @@ async fn finalize_mint(
         "asset_cid": tail.asset_cid,
         "metadata_cid": metadata_cid,
         "protections": tail.protections,
+        // The persisted single-sample ciphertext (object only) — fed into the `.ddrm` capsule so
+        // the quorum consumer-open has the exact bytes to recover. Absent for media.
+        "ciphertext_b64": tail.ciphertext_b64,
         "unsigned_mint": unsigned_mint,
         // The exact transaction the OWNER will sign — surfaced for offline inspection.
         "tx": { "to": to, "data": data, "value": value, "chain_id": mint_chain_id() },
@@ -1206,7 +1265,8 @@ async fn run_prepare_mint_media(
     assert_no_raw_key_material(&seal).map_err(|e| stage_err("encrypt", e))?;
     let kid_hex = seal_str(&seal, "kid_hex").map_err(|e| stage_err("encrypt", e))?;
     let content_id = seal_str(&seal, "content_id_hex").map_err(|e| stage_err("encrypt", e))?;
-    let node_set_id_b64 = seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
+    let node_set_id_b64 =
+        seal_str(&seal, "node_set_id_b64").map_err(|e| stage_err("encrypt", e))?;
     // See the object path: the per-process producer vk MUST be persisted or the asset is
     // unrecoverable after the encrypt provider restarts.
     let producer_vk_b64 =
@@ -1290,6 +1350,9 @@ async fn run_prepare_mint_media(
             asset_cid: &dir_cid,
             metadata_cid: &metadata_cid,
             protections: &protections,
+            // Media ciphertext is the DASH directory (multi-segment); quorum-open of DASH is a
+            // follow-on, so no single-segment ciphertext is persisted for media yet.
+            ciphertext_b64: None,
         },
     )
     .await
@@ -1545,7 +1608,7 @@ fn is_paid(meta: &MintMeta) -> bool {
 
 fn price_is_zero(price: &str) -> bool {
     let p = price.trim();
-    p.is_empty() || p.chars().all(|c| c == '0' || c == '.' )
+    p.is_empty() || p.chars().all(|c| c == '0' || c == '.')
 }
 
 fn op_type_for(meta: &MintMeta) -> &'static str {
@@ -1590,7 +1653,11 @@ fn to_wei(price: &str, currency: &str) -> Result<String, String> {
         digits.push('0');
     }
     let trimmed = digits.trim_start_matches('0');
-    Ok(if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() })
+    Ok(if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 /// Persist a freshly-prepared mint into the creator's Library so it lists at the correct
@@ -1620,19 +1687,18 @@ fn persist_minted_asset_to_library(
         };
         sanitize_filename(name)
     };
-    let mime = Some(meta.mime.trim()).filter(|m| !m.is_empty());
+    // The sealed single-sample ciphertext (object only). When present, the consumer-open can
+    // recover the exact bytes from the quorum WITHOUT any plaintext at rest — so the openable
+    // Library item is the `.ddrm` capsule itself, not a decrypted copy.
+    let ciphertext_b64 = prepared
+        .get("ciphertext_b64")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let quorum_openable = !meta.is_media && ciphertext_b64.is_some();
 
-    // 1) the openable asset object (encrypted at rest by the principal-root layer).
-    let asset_uri = format!("{root}/Documents/{base}");
-    if let Err(err) = crate::library::handle_library_upload_bytes(
-        data_dir, principal_id, &asset_uri, mime, None, file_bytes,
-    ) {
-        tracing::warn!("mint persist: could not write owned asset {asset_uri}: {err}");
-        return;
-    }
-
-    // 2) the PC2-style `.ddrm` capsule carrying the dKMS escrow + on-chain identities.
-    let capsule = json!({
+    // The PC2-style `.ddrm` capsule carrying the dKMS escrow + on-chain identities (+ the sealed
+    // ciphertext for the quorum open). This is the artifact `ddrm-media-authority --quorum` reads.
+    let mut capsule = json!({
         "schema": "elastos.ddrm.capsule/v1",
         "title": meta.title.trim(),
         "description": meta.description.trim(),
@@ -1645,26 +1711,63 @@ fn persist_minted_asset_to_library(
         "asset_cid": prepared.get("asset_cid").cloned().unwrap_or(Value::Null),
         "metadata_cid": prepared.get("metadata_cid").cloned().unwrap_or(Value::Null),
         // The dKMS escrow descriptor (scheme, node_set_id_b64, producer_verifying_key_b64,
-        // shares[]) — the exact fields the proven quorum-open phase reloads from disk.
+        // shares[]) — the exact fields the quorum-open reloads.
         "protections": prepared.get("protections").cloned().unwrap_or(Value::Null),
-        "asset_object_uri": asset_uri,
     });
-    let capsule_uri = format!("{root}/Documents/{base}.ddrm");
-    let capsule_bytes = serde_json::to_vec_pretty(&capsule).unwrap_or_default();
-    if let Err(err) = crate::library::handle_library_upload_bytes(
-        data_dir,
-        principal_id,
-        &capsule_uri,
-        Some("application/x-ddrm"),
-        None,
-        &capsule_bytes,
-    ) {
-        tracing::warn!("mint persist: could not write .ddrm capsule {capsule_uri}: {err}");
+    if let Some(ct) = ciphertext_b64 {
+        capsule["ciphertext_b64"] = json!(ct);
     }
-    tracing::info!(
-        "mint persist: wrote owned asset + .ddrm capsule for \"{}\" under {root}/Documents",
-        meta.title.trim()
-    );
+    let capsule_bytes = serde_json::to_vec_pretty(&capsule).unwrap_or_default();
+    let capsule_uri = format!("{root}/Documents/{base}.ddrm");
+
+    if quorum_openable {
+        // PC2 parity, fail-closed: the Library item IS the `.ddrm` capsule — no plaintext copy at
+        // rest. Double-click resolves it, `viewer_open` detects the dKMS escrow, and the quorum
+        // helper recovers + renders the bytes. The capsule carries the presentation `mime` so the
+        // object viewer renders the recovered bytes correctly.
+        if let Err(err) = crate::library::handle_library_upload_bytes(
+            data_dir,
+            principal_id,
+            &capsule_uri,
+            Some("application/x-ddrm"),
+            None,
+            &capsule_bytes,
+        ) {
+            tracing::warn!("mint persist: could not write .ddrm capsule {capsule_uri}: {err}");
+            return;
+        }
+        tracing::info!(
+            "mint persist: wrote dKMS .ddrm capsule (quorum-openable, no plaintext at rest) for \"{}\" at {capsule_uri}",
+            meta.title.trim()
+        );
+    } else {
+        // Media / no-ciphertext: keep the openable object + a `.ddrm` sidecar (the quorum-open of
+        // DASH media is a follow-on; until then these open via the local boundary).
+        let mime = Some(meta.mime.trim()).filter(|m| !m.is_empty());
+        let asset_uri = format!("{root}/Documents/{base}");
+        if let Err(err) = crate::library::handle_library_upload_bytes(
+            data_dir, principal_id, &asset_uri, mime, None, file_bytes,
+        ) {
+            tracing::warn!("mint persist: could not write owned asset {asset_uri}: {err}");
+            return;
+        }
+        capsule["asset_object_uri"] = json!(asset_uri);
+        let capsule_bytes = serde_json::to_vec_pretty(&capsule).unwrap_or_default();
+        if let Err(err) = crate::library::handle_library_upload_bytes(
+            data_dir,
+            principal_id,
+            &capsule_uri,
+            Some("application/x-ddrm"),
+            None,
+            &capsule_bytes,
+        ) {
+            tracing::warn!("mint persist: could not write .ddrm capsule {capsule_uri}: {err}");
+        }
+        tracing::info!(
+            "mint persist: wrote owned asset + .ddrm sidecar for \"{}\" under {root}/Documents",
+            meta.title.trim()
+        );
+    }
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1674,9 +1777,19 @@ fn sanitize_filename(name: &str) -> String {
     }
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if cleaned.is_empty() { "asset.bin".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "asset.bin".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Load the PUBLIC-ONLY quorum descriptor (`threshold.nodes[]`: verifying + recipient keys).
@@ -1697,7 +1810,8 @@ fn load_quorum_descriptor(data_dir: &FsPath) -> Result<Vec<QuorumNode>, String> 
 
 /// Parse + validate a PUBLIC-ONLY quorum descriptor. Pure (testable without disk).
 fn parse_quorum_descriptor(bytes: &[u8]) -> Result<Vec<QuorumNode>, String> {
-    let desc: Value = serde_json::from_slice(bytes).map_err(|e| format!("descriptor is not valid JSON: {e}"))?;
+    let desc: Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("descriptor is not valid JSON: {e}"))?;
     if has_secret_material(&desc) {
         return Err("descriptor carries secret material — it must be PUBLIC-ONLY".into());
     }
@@ -1724,7 +1838,10 @@ fn parse_quorum_descriptor(bytes: &[u8]) -> Result<Vec<QuorumNode>, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("node {i} missing recipient_pub_b64"))?
             .to_string();
-        nodes.push(QuorumNode { verifying_key_b64, recipient_pub_b64 });
+        nodes.push(QuorumNode {
+            verifying_key_b64,
+            recipient_pub_b64,
+        });
     }
     Ok(nodes)
 }
@@ -1821,12 +1938,21 @@ mod tests {
 
     #[test]
     fn op_type_follows_price() {
-        let free = MintMeta { price: "0".into(), ..Default::default() };
+        let free = MintMeta {
+            price: "0".into(),
+            ..Default::default()
+        };
         assert_eq!(op_type_for(&free), "free");
         assert!(!is_paid(&free));
-        let empty = MintMeta { price: "".into(), ..Default::default() };
+        let empty = MintMeta {
+            price: "".into(),
+            ..Default::default()
+        };
         assert_eq!(op_type_for(&empty), "free");
-        let paid = MintMeta { price: "1.5".into(), ..Default::default() };
+        let paid = MintMeta {
+            price: "1.5".into(),
+            ..Default::default()
+        };
         assert_eq!(op_type_for(&paid), "buy_once");
         assert!(is_paid(&paid));
     }
@@ -1870,7 +1996,10 @@ mod tests {
         assert_eq!(prot["shares"].as_array().unwrap().len(), 3);
         // No Lit anywhere.
         let s = serde_json::to_string(&env).unwrap();
-        assert!(!s.to_lowercase().contains("lit"), "envelope must not mention Lit");
+        assert!(
+            !s.to_lowercase().contains("lit"),
+            "envelope must not mention Lit"
+        );
         // The envelope carries no raw key material.
         assert!(assert_no_raw_key_material(&env).is_ok());
     }
@@ -1936,7 +2065,10 @@ mod tests {
             json!({ "kind": "video", "track_id": 1, "codec": "avc1.64000a", "bandwidth": 29100, "width": 160, "height": 90 }),
             json!({ "kind": "audio", "track_id": 2, "codec": "mp4a.40.2", "bandwidth": 104938, "width": null, "height": null }),
         ];
-        let meta = MintMeta { title: "Vid".into(), ..Default::default() };
+        let meta = MintMeta {
+            title: "Vid".into(),
+            ..Default::default()
+        };
         let env = build_media_envelope(MediaEnvelope {
             kid_hex: "0123456789abcdef0123456789abcdef",
             dir_cid: "bafydir",
@@ -1952,7 +2084,10 @@ mod tests {
         assert_eq!(env["asset"]["assetCid"], json!("bafydir"));
         assert_eq!(env["media"]["mediaType"], json!("dash"));
         assert_eq!(env["media"]["manifestPath"], json!("manifest.mpd"));
-        assert_eq!(env["media"]["defaultKID"], json!("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            env["media"]["defaultKID"],
+            json!("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(env["media"]["tracks"].as_array().unwrap().len(), 2);
         // CEK custody is the SAME dKMS escrow block as the object path (Lit's slot).
         let prot = &env["asset"]["protections"][0];
@@ -1961,7 +2096,10 @@ mod tests {
         assert_eq!(prot["shares"].as_array().unwrap().len(), 3);
         // No Lit, and no raw key material.
         let s = serde_json::to_string(&env).unwrap();
-        assert!(!s.to_lowercase().contains("lit"), "envelope must not mention Lit");
+        assert!(
+            !s.to_lowercase().contains("lit"),
+            "envelope must not mention Lit"
+        );
         assert!(assert_no_raw_key_material(&env).is_ok());
     }
 }

@@ -141,9 +141,90 @@ impl ObjectAuthorityProc {
         })
     }
 
+    /// Spawn the helper in `--quorum` mode (the dKMS consumer-open): it recovers the asset's
+    /// REAL CEK from the 2-of-3 quorum named by the `.ddrm` capsule, decrypts, and serves the
+    /// byte-identical cleartext over the SAME descriptor + `object` protocol as `launch`. The
+    /// gateway never links the PQ crypto and never sees the CEK; this is the production analogue
+    /// of the local-test-KMS `launch`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_quorum(
+        helper_bin: &str,
+        decrypt_bin: &str,
+        key_bin: &str,
+        principal_id: &str,
+        capsule_file: &str,
+        descriptor_file: &str,
+        caller_seed_b64: &str,
+        object_cid: &str,
+        mime: &str,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(helper_bin);
+        cmd.args([
+            "--quorum",
+            "--principal",
+            principal_id,
+            "--decrypt-bin",
+            decrypt_bin,
+            "--key-bin",
+            key_bin,
+            "--capsule",
+            capsule_file,
+            "--descriptor",
+            descriptor_file,
+            "--caller-seed",
+            caller_seed_b64,
+            "--object-cid",
+            object_cid,
+            "--mime",
+            mime,
+        ]);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn quorum-authority ({helper_bin}): {e}"))?;
+        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+
+        let mut line = String::new();
+        let n = stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read descriptor: {e}"))?;
+        if n == 0 {
+            return Err("quorum-authority exited before publishing a session".to_string());
+        }
+        let descriptor: Value = serde_json::from_str(line.trim())
+            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        let mime = descriptor
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or(mime)
+            .to_string();
+        let byte_length = descriptor
+            .get("byte_length")
+            .and_then(Value::as_u64)
+            .ok_or("descriptor missing byte_length")? as usize;
+        let expires_at = descriptor
+            .get("expires_at")
+            .and_then(Value::as_u64)
+            .ok_or("descriptor missing expires_at")?;
+
+        Ok(Self {
+            child,
+            io: Mutex::new(ProcIo { stdin, stdout }),
+            mime,
+            byte_length,
+            expires_at,
+        })
+    }
+
     /// Relay the object read; returns the already-decrypted cleartext bytes.
     pub fn object(&self) -> Result<Vec<u8>, String> {
-        let mut io = self.io.lock().map_err(|_| "object-authority mutex poisoned")?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| "object-authority mutex poisoned")?;
         writeln!(io.stdin, "{}", json!({ "op": "object" }))
             .map_err(|e| format!("write object request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
@@ -227,11 +308,18 @@ pub async fn open_owned_object(State(state): State<GatewayState>, headers: Heade
         Ok(Ok(proc)) => Arc::new(proc),
         Ok(Err(err)) => {
             tracing::warn!("object open failed: {err}");
-            return (StatusCode::BAD_GATEWAY, format!("could not open owned asset: {err}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("could not open owned asset: {err}"),
+            )
                 .into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "object open task panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "object open task panicked",
+            )
+                .into_response()
         }
     };
 
@@ -242,18 +330,20 @@ pub async fn open_owned_object(State(state): State<GatewayState>, headers: Heade
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);
     put_object_session(session_id.clone(), session);
 
-    let token =
-        match issue_home_launch_token_with_context(&state.data_dir, OBJECT_VIEWER_CAPSULE, &context)
-        {
-            Ok(token) => token,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not mint launch token: {err}"),
-                )
-                    .into_response()
-            }
-        };
+    let token = match issue_home_launch_token_with_context(
+        &state.data_dir,
+        OBJECT_VIEWER_CAPSULE,
+        &context,
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not mint launch token: {err}"),
+            )
+                .into_response()
+        }
+    };
     let view_url = format!("{}&home_token={}", object_view_route(&session_id), token);
 
     (
