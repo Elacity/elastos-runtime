@@ -1032,3 +1032,48 @@ fix made assets recoverable: phase B holds nothing from phase A; a pre-fix mint 
    render. (Crypto core already proven above; this is the gateway/UI integration, needs operator
    to drive passkey + the live quorum.)
 4. Then video/DASH parity (PSSH custody + server-side CENC segment decrypt + MSE).
+
+---
+
+## DAY 139 — the consumer-open BLOCKER removed: 2-of-3 quorum CLEARTEXT streaming wired + tested ✅
+
+`asset-open-verify.sh` (Day 138) proved the quorum can RECONSTRUCT + decrypt from disk-persisted
+escrow — but only through `open_session_v1`, which is a **containment** op (returns sample/segment
+COUNTS, drops the plaintext). The only op that yields cleartext for a viewer, `stream_segment`,
+**explicitly refused threshold/quorum material**: *"threshold/quorum media streaming is not yet
+wired; single-node stream only."* That refusal was the single thing standing between "the quorum
+can decrypt" and "the viewer can render a dKMS asset on double-click."
+
+**Wired now (commit `4ccf3f52b`), in the trusted decrypt boundary (`capsules/decrypt-provider`):**
+- Factored the 2-of-2 / 2-of-3 reconstruction into ONE canonical helper `open_threshold_plaintexts`
+  (provisioning checks, node-set–bound transcript AAD, expiry, in-VM Shamir/XOR reconstruct). #10
+  One Canonical Path — `open_session_v1` (counts) and the stream read now share it.
+- `stream_segment` routes a split material through that helper and returns ONLY the indexed
+  segment's already-decrypted bytes as the scoped `stream` output. CEK stays in-VM; one segment's
+  plaintext per call; reordered/substituted/expired sets fail closed in the shared reconstruction.
+- New test `stream_segment_quorum_2of3_yields_cleartext_for_any_two_nodes`: every pair of the three
+  nodes streams the cleartext (plaintext at the fMP4 tail) with no CEK leak. **Full `rail-stream`
+  suite green — 80/80.**
+- The gateway launcher already builds `decrypt-provider --features rail-stream,rail-mint`
+  (`run-creator-gateway.sh:87`), so the **runtime ships this capability today** — no build change.
+
+**Net:** every cryptographic primitive for "open my minted dKMS asset and render it via the
+2-of-3 quorum" is now wired and tested. What remains is pure GATEWAY PLUMBING (no new crypto):
+
+- **A) mint stores the CIPHERTEXT.** `persist_minted_asset_to_library` currently writes the
+  PLAINTEXT asset + the `.ddrm` escrow capsule. The quorum-open needs the encrypt-provider's
+  `segment_b64` (ciphertext) on disk. Thread it into the capsule (or a `.ddrm.ct` sidecar). NOTE:
+  this must land TOGETHER with (B)+(C) — storing ciphertext without the quorum helper would break
+  the working local plaintext open.
+- **B) `ddrm-media-authority --quorum` mode.** A long-lived authority (same shape as the existing
+  `--object`/`MediaAuthorityProc`) that loads `{escrow, ciphertext}`, drives key-provider(dkms)
+  `release` 2-of-3 against the node-set in the escrow, then calls decrypt `StreamSegment` (the op
+  wired today) and serves the cleartext segment(s). The exact orchestration is already proven in
+  `ddrm-producer-smoke::run_asset`; lift it into the helper server loop.
+- **C) `viewer_open.rs` branch.** When an owned object has a dKMS `.ddrm` sidecar, spawn the
+  `--quorum` helper instead of `object_authority` (test-KMS). Everything else (rights gate,
+  session, launch token, viewer) is unchanged.
+
+These require the **live (or local) 2-of-3 quorum nodes** the escrow references to be reachable at
+open time — i.e. verified against the production system (or a local node-set as `asset-open-verify.sh`
+stands up). Deliberately NOT half-shipped untested, per the Day-138 discipline.
