@@ -834,12 +834,48 @@ impl DecryptProvider {
             }
             None => return Response::error("invalid_request", "unsupported decrypt suite"),
         }
-        // Threshold/quorum per-segment streaming is not yet wired — refuse rather
-        // than silently treat a split material as single-node.
-        if material.sealed_cek_share2_b64.is_some() || self.authority_vk2.is_some() {
+        // THRESHOLD / QUORUM per-segment streaming (Day 138): a split material is
+        // reconstructed through the SAME canonical path `open_session_v1` uses
+        // (`open_threshold_plaintexts` — node-set–bound AAD, expiry, in-VM Shamir/XOR
+        // reconstruct), then ONLY the indexed segment's already-decrypted bytes are
+        // surfaced as the scoped `stream` output. The CEK materializes only in-VM and a
+        // single segment's plaintext is produced per call; reordered/substituted/expired
+        // sets fail closed in the shared reconstruction before any byte is returned.
+        if let Some(share2_b64) = material.sealed_cek_share2_b64.clone() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let (plaintexts, _meta, _transcript_hash) =
+                match self.open_threshold_plaintexts(&request, &material, &share2_b64, now_unix) {
+                    Ok(v) => v,
+                    Err(resp) => return resp,
+                };
+            let segment_count = plaintexts.len();
+            let segment = match plaintexts.get(index) {
+                Some(s) => s,
+                None => {
+                    return Response::error(
+                        "invalid_request",
+                        "segment index is past the end of the asset",
+                    )
+                }
+            };
+            return Response::ok(json!({
+                "schema": "elastos.decrypt.stream-segment/v1",
+                "session_id": request.session_id,
+                "object_cid": request.object_cid,
+                "viewer_interface": request.viewer_interface,
+                "output_kind": "stream",
+                "segment_index": index,
+                "segment_count": segment_count,
+                "segment_b64": b64.encode(segment),
+            }));
+        }
+        // A threshold/quorum-provisioned boundary must receive a split material for a
+        // stream read — refuse single-CEK material rather than open it single-node.
+        if self.authority_vk2.is_some() {
             return Response::error(
                 "not_configured",
-                "threshold/quorum media streaming is not yet wired; single-node stream only",
+                "threshold/quorum boundary requires a split material (sealed_cek_share2) for a stream read",
             );
         }
 
@@ -933,6 +969,33 @@ impl DecryptProvider {
         share2_b64: &str,
         now_unix: u64,
     ) -> Response {
+        match self.open_threshold_plaintexts(&request, material, share2_b64, now_unix) {
+            Ok((_plaintexts, meta, transcript_hash)) => {
+                let scoped = match scoped_session_response(&request, &meta) {
+                    Response::Ok { data: Some(data) } => data,
+                    other => return other,
+                };
+                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
+            }
+            Err(resp) => resp,
+        }
+    }
+
+    /// Canonical 2-of-2 / 2-of-3 reconstruction (Day 97–116; #10 One Canonical Path).
+    /// Provisioning checks, the node-set–bound transcript AAD, expiry enforcement, and the
+    /// in-VM Shamir/XOR reconstruction live HERE, ONCE. Returns the reconstructed plaintext
+    /// segment(s) + decrypt meta + the transcript hash, or a fail-closed `Response`. The
+    /// CALLER chooses what to surface: the scoped counts/audit envelope
+    /// (`open_session_threshold`) or one segment's already-decrypted bytes as the `stream`
+    /// output (`stream_segment`). The CEK only ever materializes in this sandbox.
+    #[cfg(feature = "rail-material")]
+    fn open_threshold_plaintexts(
+        &self,
+        request: &DecryptSessionRequestV1,
+        material: &SealedDecryptMaterialV1,
+        share2_b64: &str,
+        now_unix: u64,
+    ) -> Result<(Vec<Vec<u8>>, Value, [u8; 32]), Response> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -941,10 +1004,10 @@ impl DecryptProvider {
         let authority_vk2 = match self.authority_vk2.as_ref() {
             Some(vk) => vk,
             None => {
-                return Response::error(
+                return Err(Response::error(
                     "not_configured",
                     "threshold material requires a second key-authority verifying key (authority_vk2)",
-                )
+                ))
             }
         };
         // Day 103–104: derive the NODE-SET IDENTITY from the boundary's OWN pinned vks —
@@ -956,7 +1019,7 @@ impl DecryptProvider {
         let authority_vk = match self.authority_vk.as_ref() {
             Some(vk) => vk,
             None => {
-                return Response::error("not_configured", "trusted key-authority verifying key is not configured")
+                return Err(Response::error("not_configured", "trusted key-authority verifying key is not configured"))
             }
         };
         // Day 113–116: a THIRD pinned identity makes this a 2-of-3 QUORUM boundary — the
@@ -982,22 +1045,22 @@ impl DecryptProvider {
             extra_segments_b64: material.extra_segments_b64.clone(),
             rights_receipt_hash_b64: material.rights_receipt_hash_b64.clone(),
         };
-        let prepared = match self.prepare_bound_open(&request, &bound, Some(&node_set_id)) {
+        let prepared = match self.prepare_bound_open(request, &bound, Some(&node_set_id)) {
             Ok(p) => p,
-            Err(resp) => return resp,
+            Err(resp) => return Err(resp),
         };
         let verifier2 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk2) {
             Some(v) => v,
             None => {
-                return Response::error(
+                return Err(Response::error(
                     "not_configured",
                     "configured second key-authority verifying key is malformed",
-                )
+                ))
             }
         };
         let sealed_share2 = match b64.decode(share2_b64) {
             Ok(b) => b,
-            Err(_) => return Response::error("invalid_request", "sealed_cek_share2_b64 is not valid base64"),
+            Err(_) => return Err(Response::error("invalid_request", "sealed_cek_share2_b64 is not valid base64")),
         };
 
         let transcript_hash = {
@@ -1010,7 +1073,7 @@ impl DecryptProvider {
         let expired =
             now_unix > request.expires_at || now_unix > request.release_receipt.expires_at;
         if expired {
-            return audited_response(&request, &transcript_hash, now_unix, "denied", "expired", None);
+            return Err(audited_response(request, &transcript_hash, now_unix, "denied", "expired", None));
         }
 
         // 2-of-3 QUORUM (Day 113–116): with a third pinned identity, the two arriving
@@ -1025,20 +1088,20 @@ impl DecryptProvider {
             let verifier3 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(vk3) {
                 Some(v) => v,
                 None => {
-                    return Response::error(
+                    return Err(Response::error(
                         "not_configured",
                         "configured third key-authority verifying key is malformed",
-                    )
+                    ))
                 }
             };
             let verifier1 =
                 match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
                     Some(v) => v,
                     None => {
-                        return Response::error(
+                        return Err(Response::error(
                             "not_configured",
                             "configured key-authority verifying key is malformed",
-                        )
+                        ))
                     }
                 };
             if prepared.extra_segments.is_empty() {
@@ -1090,14 +1153,15 @@ impl DecryptProvider {
             )
         };
         match opened {
-            Ok((_plaintexts, meta)) => {
-                let scoped = match scoped_session_response(&request, &meta) {
-                    Response::Ok { data: Some(data) } => data,
-                    other => return other,
-                };
-                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
-            }
-            Err(_) => audited_response(&request, &transcript_hash, now_unix, "denied", "decrypt_failed", None),
+            Ok((plaintexts, meta)) => Ok((plaintexts, meta, transcript_hash)),
+            Err(_) => Err(audited_response(
+                request,
+                &transcript_hash,
+                now_unix,
+                "denied",
+                "decrypt_failed",
+                None,
+            )),
         }
     }
 }
@@ -3148,6 +3212,64 @@ mod tests {
             let s = serde_json::to_string(&resp).unwrap();
             assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
             assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
+        }
+    }
+
+    /// Day 138 — the 2-of-3 QUORUM STREAM read (the consumer-open RENDER path): every
+    /// pair of the three nodes' re-sealed shares reconstructs the CEK in-VM AND the scoped
+    /// `stream` output returns that segment's already-decrypted bytes (plaintext at the fMP4
+    /// tail), proving the quorum rail can now feed a viewer — while the CEK never leaks.
+    #[cfg(feature = "rail-stream")]
+    #[test]
+    fn stream_segment_quorum_2of3_yields_cleartext_for_any_two_nodes() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let cek = [0x5Au8; 16];
+        let coeff = [0x9Du8; 16];
+        let plaintext = b"two-of-three quorum STREAM render payload";
+
+        for (a, b) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            let req = media_decrypt_request();
+            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+                quorum_setup(&req, &cek, &coeff, plaintext, b"nonce-qstream-1", &[0xABu8; 32]);
+            let material = SealedDecryptMaterialV1 {
+                suite: DECRYPT_SUITE_ID.to_string(),
+                sealed_cek_b64: sealed[a].clone(),
+                sealed_cek_share2_b64: Some(sealed[b].clone()),
+                ciphertext_b64,
+                init_segment_b64: None,
+                nonce_b64: b64.encode(b"nonce-qstream-1"),
+                content_hash_b64: b64.encode([0xABu8; 32]),
+                extra_segments_b64: None,
+                rights_receipt_hash_b64: None,
+            };
+            let mut provider = DecryptProvider {
+                session: Some(session),
+                authority_vk: Some(vks[0].clone()),
+                session_pub: Some(pub_bytes),
+                authority_vk2: Some(vks[1].clone()),
+                authority_vk3: Some(vks[2].clone()),
+            };
+            let resp = provider.handle(Request::StreamSegment {
+                request: Box::new(req),
+                material,
+                index: 0,
+                now_unix: 1_850_000_000,
+            });
+            let v = serde_json::to_value(&resp).unwrap();
+            let seg_b64 = v["data"]["segment_b64"].as_str().unwrap_or_else(|| {
+                panic!("quorum pair (node {}, node {}) must stream a segment: {v}", a + 1, b + 1)
+            });
+            let seg = b64.decode(seg_b64).expect("segment_b64 decodes");
+            assert_eq!(
+                &seg[seg.len() - plaintext.len()..],
+                plaintext,
+                "quorum stream pair (node {}, node {}) must return the cleartext segment",
+                a + 1,
+                b + 1
+            );
+            let s = serde_json::to_string(&resp).unwrap();
+            assert!(!s.contains(&b64.encode(cek)), "CEK must not leak on a quorum stream read");
         }
     }
 
