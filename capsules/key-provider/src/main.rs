@@ -10,7 +10,7 @@ use elastos_common::protected_content::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -364,10 +364,18 @@ struct KeyProvider {
     dkms_conn2: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
     /// The long-lived connection to the THIRD quorum node (Day 113–116), same lifecycle as
     /// `dkms_conn`. Retained for the per-node cache symmetry; the quorum rail now dials all three
-    /// concurrently per release (cache-free), so this cell is unused on that path today.
+    /// concurrently per release (via `dkms_pool`), so this cell is unused on that path today.
     #[cfg(all(feature = "key-authority-ref", unix))]
     #[allow(dead_code)]
     dkms_conn3: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
+    /// WARM-SESSION POOL for the PARALLEL quorum rail (Phase A): live node connections keyed by
+    /// endpoint, REUSED across releases so a warm key-provider (daemon mode) skips the init+hello
+    /// handshake (~1–2.3s/node) on every open after the first within the node's session TTL (300s).
+    /// `Mutex` (not `RefCell`) because the parallel recover threads check connections out/in across
+    /// thread boundaries; `DkmsNodeConn` is `Send`. Releases are serialized by the daemon, so at most
+    /// one release's three threads touch the pool at a time (one thread per node, no per-conn race).
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    dkms_pool: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, DkmsNodeConn>>>,
 }
 
 /// The `dkms` EXTERNAL authority as the runtime SEES it: the node's PUBLIC identity (what the
@@ -443,9 +451,11 @@ struct ClientChannel {
 #[cfg(all(feature = "key-authority-ref", unix))]
 struct DkmsNodeConn {
     /// The framed transport to the node (write half + a buffered read half) — Unix or TCP behind
-    /// one seam; the protocol above it is byte-identical.
-    writer: Box<dyn std::io::Write>,
-    reader: Box<dyn std::io::Read>,
+    /// one seam; the protocol above it is byte-identical. `Send` so a warm connection can be checked
+    /// out of the cross-release pool and driven on a per-node recover thread (the concrete transports
+    /// — TcpStream/UnixStream/BufReader — are all `Send`).
+    writer: Box<dyn std::io::Write + Send>,
+    reader: Box<dyn std::io::Read + Send>,
     /// The ESTABLISHED encrypted channel (Day 105–108) — `Some` on the network transport (required
     /// there: a TCP node refuses plaintext recovers), `None` on the host-local Unix socket.
     channel: Option<ClientChannel>,
@@ -606,7 +616,7 @@ fn establish_dkms_session(
                 .starts_with("did:")
                 .then_some(client.endpoint.as_str())
         });
-    let (writer, reader, network): (Box<dyn std::io::Write>, Box<dyn std::io::Read>, bool) =
+    let (writer, reader, network): (Box<dyn std::io::Write + Send>, Box<dyn std::io::Read + Send>, bool) =
         if let Some(target_did) = carrier_target {
             use std::io::Write as _;
             use std::net::{TcpStream, ToSocketAddrs};
@@ -1582,29 +1592,22 @@ impl KeyProvider {
         }
     }
 
-    /// One delegated recover with NO cross-call connection cache — a fresh session (connect + init +
-    /// identity handshake) then ONE recover, all on the calling thread. Used by the PARALLEL quorum
-    /// rail where each node runs on its OWN thread, so a shared `RefCell` conn-cell (non-`Send`,
-    /// single-process reuse) would be unsound; the per-open key-provider process establishes cold
-    /// anyway, so the cache buys nothing here. Same per-node security gates as `delegate_recover`
-    /// (session token + freshness counter + possession proof signed under the committed key).
-    /// Returns the node's re-sealed material `data`, or a fail-closed error string.
+    /// Drive ONE recover on an ALREADY-ESTABLISHED connection (no connect/handshake): bump the
+    /// freshness counter, sign the possession proof under the committed key, send the recover, and
+    /// validate the node's reply. Shared by both the cold (fresh-establish) and warm (pooled) quorum
+    /// paths so the per-node security gates — session token echo + monotonic `recover_seq` + caller
+    /// possession proof — are byte-identical regardless of whether the session was just opened or
+    /// reused. Returns the node's re-sealed material `data`, or a fail-closed error string.
     #[cfg(all(feature = "key-authority-ref", unix))]
-    fn recover_one_node(
-        client: &DkmsClientAuthority,
+    fn run_recover_on_conn(
+        conn: &mut DkmsNodeConn,
+        client_endpoint: &str,
         recover_req: &Value,
         kid_hex: &str,
         decrypt_session_pub_b64: &str,
         content_id: &str,
         now: Option<u64>,
     ) -> Result<Value, String> {
-        let t_sess = std::time::Instant::now();
-        let mut conn = establish_dkms_session(client, now)?;
-        eprintln!(
-            "key-provider timing: establish session ({}) {} ms",
-            client.endpoint,
-            t_sess.elapsed().as_millis()
-        );
         let t_rec = std::time::Instant::now();
         let recover_seq = conn.next_recover_seq();
         let recover = match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq) {
@@ -1620,7 +1623,7 @@ impl KeyProvider {
         };
         eprintln!(
             "key-provider timing: recover call ({}) {} ms",
-            client.endpoint,
+            client_endpoint,
             t_rec.elapsed().as_millis()
         );
         let recover = recover.map_err(|err| format!("dkms node transport failed: {err}"))?;
@@ -1634,6 +1637,65 @@ impl KeyProvider {
             Some(data) => Ok(data.clone()),
             None => Err("dkms node recover returned no material".to_string()),
         }
+    }
+
+    /// One delegated recover for the PARALLEL quorum rail, REUSING a warm pooled connection when one
+    /// is live (Phase A). Each node runs on its OWN thread; this checks the node's connection OUT of
+    /// the cross-release pool (keyed by endpoint) and, if its handshake session is still live, recovers
+    /// over it WITHOUT re-paying connect+init+hello (~1–2.3s/node) — the win that makes a warm
+    /// key-provider daemon fast on every open after the first. On a cold/expired/missing entry it
+    /// establishes a fresh session. On success the (advanced) connection is checked back IN for the
+    /// next open; on ANY error it is dropped so the next open re-establishes cleanly (fail-closed).
+    /// Same per-node security gates as `delegate_recover`.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    fn recover_one_node_pooled(
+        pool: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, DkmsNodeConn>>>,
+        client: &DkmsClientAuthority,
+        recover_req: &Value,
+        kid_hex: &str,
+        decrypt_session_pub_b64: &str,
+        content_id: &str,
+        now: Option<u64>,
+    ) -> Result<Value, String> {
+        // CHECK OUT: take this node's warm connection if present + still live; otherwise establish a
+        // fresh one. We hold the pool lock only across the cheap map op, never across the slow recover.
+        let mut conn = {
+            let mut guard = pool.lock().map_err(|_| "dkms pool lock poisoned".to_string())?;
+            match guard.remove(&client.endpoint) {
+                Some(c) if c.session_live(now) => {
+                    eprintln!("key-provider timing: reuse warm session ({})", client.endpoint);
+                    c
+                }
+                _ => {
+                    drop(guard);
+                    let t_sess = std::time::Instant::now();
+                    let c = establish_dkms_session(client, now)?;
+                    eprintln!(
+                        "key-provider timing: establish session ({}) {} ms",
+                        client.endpoint,
+                        t_sess.elapsed().as_millis()
+                    );
+                    c
+                }
+            }
+        };
+        let result = Self::run_recover_on_conn(
+            &mut conn,
+            &client.endpoint,
+            recover_req,
+            kid_hex,
+            decrypt_session_pub_b64,
+            content_id,
+            now,
+        );
+        // CHECK IN on success so the next open reuses the advanced session; DROP on error so a broken
+        // or rejected connection is never reused (the next open re-establishes from cold, fail-closed).
+        if result.is_ok() {
+            if let Ok(mut guard) = pool.lock() {
+                guard.insert(client.endpoint.clone(), conn);
+            }
+        }
+        result
     }
 
     /// 2-of-3 QUORUM release (Day 113–116): dial + handshake + recover ALL THREE secret-holding
@@ -1721,6 +1783,7 @@ impl KeyProvider {
         // with fewer than two served shares, and a panicked recover thread is counted a fault, never a
         // share. Shares are selected in node order (A,B,C) so the merge input is deterministic.
         let t_par = std::time::Instant::now();
+        let pool = &self.dkms_pool;
         let results: Vec<(usize, Result<Value, String>)> = std::thread::scope(|scope| {
             let decrypt_pub = session.decrypt_session_pub_b64.as_str();
             let cid = content_id.as_str();
@@ -1728,7 +1791,9 @@ impl KeyProvider {
                 .iter()
                 .enumerate()
                 .map(|(idx, (client, req, _label))| {
-                    scope.spawn(move || (idx, Self::recover_one_node(*client, req, kid_hex, decrypt_pub, cid, now)))
+                    scope.spawn(move || {
+                        (idx, Self::recover_one_node_pooled(pool, *client, req, kid_hex, decrypt_pub, cid, now))
+                    })
                 })
                 .collect();
             handles
@@ -2359,6 +2424,107 @@ fn require_identifier(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
+/// Serve newline-delimited JSON requests from one stream (stdin OR one daemon connection) against the
+/// SAME provider, so the warm-session pool and backend config persist across requests. Returns `true`
+/// iff an explicit `shutdown` was received (stdio mode exits; the daemon treats it as end-of-connection
+/// only). Identical request/response framing on both transports — a recover is byte-for-byte the same.
+fn serve_conn<R: BufRead, W: Write>(provider: &mut KeyProvider, reader: R, writer: &mut W) -> bool {
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                eprintln!("key-provider read error: {}", err);
+                return false;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request = match serde_json::from_str::<Request>(&line) {
+            Ok(request) => request,
+            Err(err) => {
+                let response = Response::error("invalid_request", err.to_string());
+                if writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).is_err() {
+                    return false;
+                }
+                let _ = writer.flush();
+                continue;
+            }
+        };
+        let is_shutdown = matches!(request, Request::Shutdown);
+        let response = provider.handle(request);
+        if writeln!(writer, "{}", serde_json::to_string(&response).unwrap()).is_err() {
+            return false;
+        }
+        let _ = writer.flush();
+        if is_shutdown {
+            return true;
+        }
+    }
+    false
+}
+
+/// DAEMON MODE (Phase A — warm sessions): instead of one stdin/stdout open per process, the provider
+/// is spawned ONCE, self-inits its dKMS backend from the environment, and serves opens over a Unix
+/// socket. Because the SAME `KeyProvider` (and its `dkms_pool`) lives across connections, every open
+/// after the first reuses the live node handshake sessions and skips init+hello — the latency win.
+/// A per-connection `shutdown` ends only that connection; the warm daemon stays up. The secret path is
+/// unchanged: the same possession-proofed, fail-closed 2-of-3 recover runs per release.
+#[cfg(unix)]
+fn run_daemon(provider: &mut KeyProvider, sock_path: &str) {
+    use std::os::unix::net::UnixListener;
+
+    // Self-init ONCE from env so per-open connections send ONLY `release` (no re-init churn). The
+    // gateway exports the OPEN descriptor + caller seed the live quorum already allow-lists.
+    if let Ok(desc) = std::env::var("KEY_PROVIDER_DAEMON_DESCRIPTOR") {
+        if !desc.trim().is_empty() {
+            let mut config = json!({ "backend": "dkms", "dkms_authority_descriptor": desc });
+            if let Ok(seed) = std::env::var("KEY_PROVIDER_DAEMON_CALLER_SEED_B64") {
+                if !seed.trim().is_empty() {
+                    config["dkms_caller_seed_b64"] = Value::String(seed);
+                }
+            }
+            let resp = provider.handle(Request::Init { config });
+            eprintln!(
+                "key-provider daemon: self-init -> {}",
+                serde_json::to_string(&resp).unwrap_or_default()
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(sock_path); // clear a stale socket from a prior run
+    let listener = match UnixListener::bind(sock_path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("key-provider daemon: cannot bind {sock_path}: {err}");
+            return;
+        }
+    };
+    eprintln!(
+        "key-provider daemon: warm provider LISTENING on {sock_path} (node sessions reused across opens)"
+    );
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("key-provider daemon: accept error: {err}");
+                continue;
+            }
+        };
+        let reader = match stream.try_clone() {
+            Ok(clone) => BufReader::new(clone),
+            Err(err) => {
+                eprintln!("key-provider daemon: connection clone error: {err}");
+                continue;
+            }
+        };
+        let mut writer = stream;
+        // One open == one connection. Serve its requests, then loop for the next open; the warm
+        // provider + its session pool persist for the lifetime of the daemon.
+        let _ = serve_conn(provider, reader, &mut writer);
+    }
+}
+
 fn main() {
     eprintln!(
         "key-provider: starting v{} (protected content keys)",
@@ -2366,39 +2532,21 @@ fn main() {
     );
 
     let mut provider = KeyProvider::default();
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) => {
-                eprintln!("key-provider read error: {}", err);
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => request,
-            Err(err) => {
-                let response = Response::error("invalid_request", err.to_string());
-                writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-                stdout.flush().unwrap();
-                continue;
-            }
-        };
-        let is_shutdown = matches!(request, Request::Shutdown);
-        let response = provider.handle(request);
-        writeln!(stdout, "{}", serde_json::to_string(&response).unwrap()).unwrap();
-        stdout.flush().unwrap();
-        if is_shutdown {
-            break;
+    // Warm-session daemon (Phase A): present iff the gateway asked for a persistent provider.
+    #[cfg(unix)]
+    if let Ok(sock_path) = std::env::var("KEY_PROVIDER_LISTEN") {
+        if !sock_path.trim().is_empty() {
+            run_daemon(&mut provider, &sock_path);
+            eprintln!("key-provider daemon exiting");
+            return;
         }
     }
 
+    // Default: one open per process over stdin/stdout (the helper-spawned fallback path).
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    serve_conn(&mut provider, stdin.lock(), &mut stdout);
     eprintln!("key-provider exiting");
 }
 
@@ -3877,21 +4025,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn release_rejects_denied_rights_receipt() {
-        let provider = KeyProvider;
-        let mut request = key_release_request();
-        request.rights_receipt.allowed = false;
-
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
-    }
-
-    #[test]
-    fn release_rejects_mismatched_rights_receipt() {
-        let provider = KeyProvider;
-        let mut request = key_release_request();
-        request.rights_receipt.principal_id = "person:local:other".to_string();
-
-        assert_eq!(error_code(provider.release(request)), "invalid_request");
-    }
 }

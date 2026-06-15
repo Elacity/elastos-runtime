@@ -388,6 +388,34 @@ if [[ "$QUORUM_OPEN_READY" -eq 1 ]]; then
   export ELASTOS_DDRM_KEY_PROVIDER_BIN="$KEY_PROVIDER_BIN"
   export ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR="$OPEN_DESCRIPTOR"
   export ELASTOS_DDRM_QUORUM_CALLER_SEED_B64="$CALLER_SEED_B64"
+
+  # ── WARM key-provider daemon (Phase A: reuse node sessions across opens) ──────
+  # Spawn ONE long-lived key-provider that self-inits the dKMS backend and listens on a Unix
+  # socket. The per-open helper dials it (ELASTOS_DDRM_KEY_PROVIDER_SOCKET) and reuses the live
+  # node handshake sessions, so every open after the first skips init+hello (~1–2.3s/node). It
+  # inherits DKMS_CARRIER_CLIENT_ADDR, so it reaches nodes by did:key over the same Carrier path.
+  # CRITICAL: KEY_PROVIDER_LISTEN is passed INLINE (child-only) — never exported — so a
+  # fallback-spawned key-provider still runs in plain stdio mode. If the socket never appears we
+  # simply DON'T advertise it: opens fall back to the per-open spawn (latency only, never access).
+  KP_SOCK="${QUORUM_DIR}/key-provider.sock"
+  rm -f "$KP_SOCK" 2>/dev/null || true
+  KEY_PROVIDER_LISTEN="$KP_SOCK" \
+  KEY_PROVIDER_DAEMON_DESCRIPTOR="$OPEN_DESCRIPTOR" \
+  KEY_PROVIDER_DAEMON_CALLER_SEED_B64="$CALLER_SEED_B64" \
+    "$KEY_PROVIDER_BIN" >"${QUORUM_DIR}/key-provider-daemon.out" 2>&1 &
+  KP_DAEMON_PID=$!
+  DKMS_PIDS+=("$KP_DAEMON_PID")
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    [[ -S "$KP_SOCK" ]] && break
+    kill -0 "$KP_DAEMON_PID" 2>/dev/null || break
+    sleep 0.2
+  done
+  if [[ -S "$KP_SOCK" ]]; then
+    export ELASTOS_DDRM_KEY_PROVIDER_SOCKET="$KP_SOCK"
+    echo "  warm key-provider daemon LIVE (pid ${KP_DAEMON_PID}) on ${KP_SOCK} — node sessions reused across opens"
+  else
+    echo "  WARN: warm key-provider daemon did not come up — opens fall back to per-open spawn (still works, slower)"
+  fi
 fi
 # Default the rights/mint mode to dev (offline) unless the operator pinned one.
 export ELASTOS_DDRM_RIGHTS="${ELASTOS_DDRM_RIGHTS:-dev}"
@@ -453,6 +481,7 @@ echo "=============================================================="
 cleanup_daemons() {
   for p in "${DKMS_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   [[ -n "${CARRIER_PID:-}" ]] && kill "$CARRIER_PID" 2>/dev/null
+  [[ -n "${KP_SOCK:-}" ]] && rm -f "$KP_SOCK" 2>/dev/null
 }
 trap cleanup_daemons EXIT INT TERM
 "$GATEWAY_BIN" gateway --addr "$ADDR"

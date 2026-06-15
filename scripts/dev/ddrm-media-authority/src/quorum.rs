@@ -102,6 +102,74 @@ impl Capsule {
     }
 }
 
+/// Run the dKMS `release` (2-of-3 recover + re-seal to the per-open decrypt session) against the WARM
+/// key-provider daemon over its Unix socket when the gateway wired one up (Phase A — node handshake
+/// sessions reused across opens, no per-open process spawn or init+hello), falling back to spawning a
+/// fresh key-provider for this open when no socket is set OR the daemon is unreachable. The daemon is
+/// pre-init'd, so the socket path sends ONLY the release; the request/response and the fail-closed
+/// 2-of-3 recover are byte-identical on both transports. Returns the release `data` (`{ material, .. }`).
+fn key_release(
+    key_bin: &str,
+    descriptor_path: &str,
+    caller_seed_b64: &str,
+    release_request: &Value,
+    session_ctx: &Value,
+) -> Result<Value, String> {
+    let release_msg = json!({ "op": "release", "request": release_request, "session": session_ctx });
+
+    if let Ok(sock) = std::env::var("ELASTOS_DDRM_KEY_PROVIDER_SOCKET") {
+        if !sock.trim().is_empty() {
+            match key_release_via_daemon(&sock, &release_msg) {
+                Ok(resp) => return ok_data(&resp, "key release (dkms 2-of-3, warm daemon)"),
+                Err(err) => eprintln!(
+                    "ddrm-media-authority: warm key-provider daemon ({sock}) unavailable ({err}); \
+                     falling back to per-open key-provider spawn"
+                ),
+            }
+        }
+    }
+
+    // Fallback / default: a fresh key-provider for this single open (the original cold path).
+    let mut key = Capsule::spawn("key-provider", key_bin)?;
+    ok_data(
+        &key.call(&json!({
+            "op": "init",
+            "config": {
+                "backend": "dkms",
+                "dkms_authority_descriptor": descriptor_path,
+                "dkms_caller_seed_b64": caller_seed_b64,
+            }
+        }))?,
+        "key init (dkms)",
+    )?;
+    let release = ok_data(&key.call(&release_msg)?, "key release (dkms 2-of-3)")?;
+    key.shutdown();
+    Ok(release)
+}
+
+/// One framed request/response against the warm key-provider daemon's Unix socket (same newline-JSON
+/// protocol as the stdio capsule). Any connect/transport error returns `Err` so `key_release` can fall
+/// back to a per-open spawn — the daemon being down degrades latency, never access.
+fn key_release_via_daemon(sock_path: &str, release_msg: &Value) -> Result<Value, String> {
+    use std::os::unix::net::UnixStream;
+    let stream =
+        UnixStream::connect(sock_path).map_err(|e| format!("connect {sock_path}: {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let line = serde_json::to_string(release_msg).map_err(|e| e.to_string())?;
+    writeln!(writer, "{line}").map_err(|e| format!("write to key-provider daemon: {e}"))?;
+    writer.flush().map_err(|e| e.to_string())?;
+    let mut resp = String::new();
+    let n = reader
+        .read_line(&mut resp)
+        .map_err(|e| format!("read from key-provider daemon: {e}"))?;
+    if n == 0 {
+        return Err("key-provider daemon closed its output unexpectedly".to_string());
+    }
+    serde_json::from_str(resp.trim())
+        .map_err(|e| format!("key-provider daemon sent non-JSON: {e}: {resp}"))
+}
+
 fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
     if resp.get("status").and_then(Value::as_str) == Some("ok") {
         Ok(resp.get("data").cloned().unwrap_or(Value::Null))
@@ -374,18 +442,6 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
     .to_aad();
 
     // --- key-provider (dkms): recover 2-of-3 from the live nodes + re-seal to the session. ---
-    let mut key = Capsule::spawn("key-provider", &args.key_bin)?;
-    ok_data(
-        &key.call(&json!({
-            "op": "init",
-            "config": {
-                "backend": "dkms",
-                "dkms_authority_descriptor": args.descriptor_path,
-                "dkms_caller_seed_b64": args.caller_seed_b64,
-            }
-        }))?,
-        "key init (dkms)",
-    )?;
     let session_ctx = json!({
         "decrypt_session_pub_b64": session_pub_b64,
         // All three shares were signed by the SAME in-boundary producer identity at mint.
@@ -400,11 +456,15 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         "wrapped_cek_share3_b64": share3,
         "now_unix": now,
     });
-    let release = ok_data(
-        &key.call(&json!({ "op": "release", "request": key_release_request, "session": session_ctx }))?,
-        "key release (dkms 2-of-3)",
+    // Phase A: drive the recover against the WARM key-provider daemon (node sessions reused across
+    // opens) when the gateway wired one up; otherwise spawn a fresh key-provider for this open.
+    let release = key_release(
+        &args.key_bin,
+        &args.descriptor_path,
+        &args.caller_seed_b64,
+        &key_release_request,
+        &session_ctx,
     )?;
-    key.shutdown();
     let material = release["material"].clone();
     if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
         return Err(format!("key-provider returned no sealed material: {release}"));
