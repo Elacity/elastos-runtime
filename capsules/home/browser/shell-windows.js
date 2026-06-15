@@ -616,10 +616,9 @@ export function openTarget(targetId, options = {}) {
     }
     const loading = openLoadingWindow(
       targetId,
-      ownedUri ? "Opening protected asset…" : canonicalTargetTitle(targetId),
-      ownedUri
-        ? "Verifying your on-chain access and recovering keys from the dKMS quorum…"
-        : "Preparing a secure decrypt session…",
+      "Opening protected asset…",
+      "Verifying your on-chain access and recovering keys from the dKMS quorum…",
+      OWNED_OPEN_STAGES,
     );
     inFlightOwnedOpens.set(openKey, loading.id);
     const launch = ownedUri
@@ -743,7 +742,35 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
 // otherwise kick off a DUPLICATE recover. We track the loading window and re-focus it.
 const inFlightOwnedOpens = new Map();
 
-function loadingBodyHtml(title, detail) {
+// The ordered phases a protected (dKMS quorum) open passes through, shown as a live checklist
+// so the user sees WHERE the open is. These are the genuine, sequential phases the client drives
+// + the gateway runs; the quorum recover (phase 1) is the long, variable pole (cold geo round-trip).
+const OWNED_OPEN_STAGES = [
+  "Preparing secure session",
+  "Verifying access & recovering keys (2-of-3 quorum)",
+  "Decrypting & preparing playback",
+];
+
+function loadingStagesHtml(stages) {
+  return `<ul class="window-loading-stages" aria-hidden="false">${stages
+    .map(
+      (label, i) =>
+        `<li data-stage="${i}" class="${i === 0 ? "is-active" : "is-pending"}">` +
+        `<span class="stage-mark" aria-hidden="true"></span>` +
+        `<span class="stage-label">${escapeHtml(label)}</span></li>`,
+    )
+    .join("")}</ul>`;
+}
+
+function loadingBodyHtml(title, detail, stages) {
+  if (Array.isArray(stages) && stages.length) {
+    return `
+    <div class="window-loading" role="status" aria-live="polite">
+      <div class="window-loading-title">${escapeHtml(title || "Opening…")}</div>
+      ${loadingStagesHtml(stages)}
+    </div>
+  `;
+  }
   return `
     <div class="window-loading" role="status" aria-live="polite">
       <div class="window-loading-spinner" aria-hidden="true"></div>
@@ -753,10 +780,23 @@ function loadingBodyHtml(title, detail) {
   `;
 }
 
+// Advance the staged checklist: every phase before `activeIndex` is done (✓), `activeIndex` is the
+// live one (spinner), the rest stay pending. No-op for windows without stages (legacy spinner).
+function setLoadingStage(entry, activeIndex) {
+  if (!entry || !entry.node) return;
+  const items = entry.node.querySelectorAll(".window-loading-stages li");
+  items.forEach((li, i) => {
+    li.classList.toggle("is-done", i < activeIndex);
+    li.classList.toggle("is-active", i === activeIndex);
+    li.classList.toggle("is-pending", i > activeIndex);
+  });
+}
+
+
 // Open a window with an immediate loading state. The real iframe is swapped in by
 // `navigateLoadingWindow` once the (slow) open resolves; failures are surfaced in-place
 // by `renderLoadingWindowError` instead of leaving a dead spinner.
-function openLoadingWindow(targetId, title, detail) {
+function openLoadingWindow(targetId, title, detail, stages) {
   const offset = browserWindowEntries().length;
   const windowSpec = browserWindowSpec({ target: targetId }, offset);
   const windowId = nextBrowserWindowId(targetId);
@@ -773,7 +813,7 @@ function openLoadingWindow(targetId, title, detail) {
   node.dataset.target = targetId;
   const body = node.querySelector(".window-body");
   body.classList.add("window-body-frame");
-  body.innerHTML = loadingBodyHtml(title, detail);
+  body.innerHTML = loadingBodyHtml(title, detail, stages);
 
   desktop.appendChild(node);
   const entry = {
@@ -903,12 +943,15 @@ function openLaunchedWindow(launched, options = {}) {
 // at the returned play URL (session + scoped launch token baked in). The CEK
 // never reaches the browser — only already-decrypted segment bytes are loaded.
 async function launchOwnedMediaWindow(options = {}, loading = null) {
+  // Single server call does the recover + decrypt, so jump the checklist to the recover phase.
+  setLoadingStage(loading, 1);
   const opened = await fetchJson("/api/viewers/elacity-player/media/open", {
     method: "POST",
   });
   if (typeof opened.play_url !== "string" || opened.play_url === "") {
     throw new Error("media open did not return a play URL");
   }
+  setLoadingStage(loading, 2);
   const launched = {
     target: "elacity-player",
     title: "Owned video",
@@ -935,7 +978,7 @@ function libraryUriFromQuery(query) {
 async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
   let opened;
   try {
-    opened = await openOwnedRequest(uri);
+    opened = await openOwnedRequest(uri, loading);
   } catch (error) {
     // A rights-denied open (no access token yet) is recoverable: buy the access token,
     // then retry the open ONCE. Auth failures (no wallet / locked) are not retried here.
@@ -945,7 +988,7 @@ async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ uri }),
       });
-      opened = await openOwnedRequest(uri);
+      opened = await openOwnedRequest(uri, loading);
     } else {
       throw error;
     }
@@ -953,6 +996,8 @@ async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
   if (typeof opened.play_url !== "string" || opened.play_url === "") {
     throw new Error("owned open did not return a view URL");
   }
+  // Keys recovered + decrypted server-side; the window is about to swap to the player.
+  setLoadingStage(loading, 2);
   const target = typeof opened.viewer === "string" && opened.viewer ? opened.viewer : "ddrm-viewer";
   const launched = {
     target,
@@ -972,7 +1017,8 @@ async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
 //
 // Falls back to the plain open (legacy enrolled-caller path) when the asset is not a quorum capsule
 // (prepare-grant 400) or no injected wallet is available — so non-protected opens are unchanged.
-async function openOwnedRequest(uri) {
+async function openOwnedRequest(uri, loading = null) {
+  setLoadingStage(loading, 0);
   let prepared = null;
   try {
     prepared = await fetchJson("/api/viewers/prepare-grant", {
@@ -1004,6 +1050,9 @@ async function openOwnedRequest(uri) {
     // via the legacy path (enrolled caller), or fails closed if it has no allow-list.
   }
 
+  // Session ready (delegation prepared/signed or reused) — the open call now runs the live on-chain
+  // check + the 2-of-3 quorum recover, the long pole. Advance the checklist to that phase.
+  setLoadingStage(loading, 1);
   return fetchJson("/api/viewers/open", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1066,12 +1115,15 @@ function isRightsDeniedError(error) {
 // at the returned view URL (session + scoped launch token baked in). The CEK never
 // reaches the browser — only the already-decrypted object bytes are loaded.
 async function launchOwnedObjectWindow(options = {}, loading = null) {
+  // Single server call does the recover + decrypt, so jump the checklist to the recover phase.
+  setLoadingStage(loading, 1);
   const opened = await fetchJson("/api/viewers/ddrm-viewer/object/open", {
     method: "POST",
   });
   if (typeof opened.play_url !== "string" || opened.play_url === "") {
     throw new Error("object open did not return a view URL");
   }
+  setLoadingStage(loading, 2);
   const launched = {
     target: "ddrm-viewer",
     title: "Owned asset",
