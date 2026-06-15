@@ -1787,13 +1787,21 @@ impl KeyProvider {
         let results: Vec<(usize, Result<Value, String>)> = std::thread::scope(|scope| {
             let decrypt_pub = session.decrypt_session_pub_b64.as_str();
             let cid = content_id.as_str();
+            // The PQ-hybrid recover (ML-KEM-768 unseal + ML-DSA-65 verify, with sizable in-frame
+            // buffers) is a STACK HOG. A default-stack scoped thread (2 MiB) overflows it; the serial
+            // path got away with it only by running on the 8 MiB main thread. Give each recover thread
+            // an explicit 16 MiB stack so the concurrent rail matches the main-thread headroom.
             let handles: Vec<_> = candidates
                 .iter()
                 .enumerate()
                 .map(|(idx, (client, req, _label))| {
-                    scope.spawn(move || {
-                        (idx, Self::recover_one_node_pooled(pool, *client, req, kid_hex, decrypt_pub, cid, now))
-                    })
+                    std::thread::Builder::new()
+                        .name(format!("dkms-recover-{idx}"))
+                        .stack_size(16 * 1024 * 1024)
+                        .spawn_scoped(scope, move || {
+                            (idx, Self::recover_one_node_pooled(pool, *client, req, kid_hex, decrypt_pub, cid, now))
+                        })
+                        .expect("spawn dkms recover thread")
                 })
                 .collect();
             handles
