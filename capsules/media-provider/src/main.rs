@@ -460,28 +460,39 @@ impl MediaProvider {
         let transcoded = workdir.join(format!("t-{}.mp4", r.id));
         let fragmented = workdir.join(format!("f-{}.mp4", r.id));
 
-        // Step 1 — transcode: scale to the rung height (even width), libx264 at the
-        // rung's crf/preset/profile, audio aac if present.
+        // Step 1 — transcode. PC2 splits video and audio-only sources into two encode
+        // shapes (`encoder.ts`): a video source is scaled + libx264'd (+ aac if it carries
+        // sound); an audio-only source skips the video filter/codec entirely (a `-vf scale`
+        // on a streamless input would abort ffmpeg) and just re-encodes to aac. Both then
+        // fragment identically below.
+        let has_video = probe.width > 0 || probe.height > 0;
         let mut tx = Command::new(&tools.ffmpeg);
-        tx.arg("-y")
-            .arg("-i")
-            .arg(input)
-            .arg("-vf")
-            .arg(format!("scale=-2:{}", r.height))
-            .arg("-c:v")
-            .arg("libx264")
-            .arg("-crf")
-            .arg(r.crf.to_string())
-            .arg("-preset")
-            .arg(&r.preset)
-            .arg("-profile:v")
-            .arg(&r.profile)
-            .arg("-pix_fmt")
-            .arg("yuv420p");
-        if probe.has_audio {
-            tx.arg("-c:a").arg("aac").arg("-b:a").arg(&r.audio_bitrate);
+        tx.arg("-y").arg("-i").arg(input);
+        if has_video {
+            tx.arg("-vf")
+                .arg(format!("scale=-2:{}", r.height))
+                .arg("-c:v")
+                .arg("libx264")
+                .arg("-crf")
+                .arg(r.crf.to_string())
+                .arg("-preset")
+                .arg(&r.preset)
+                .arg("-profile:v")
+                .arg(&r.profile)
+                .arg("-pix_fmt")
+                .arg("yuv420p");
+            if probe.has_audio {
+                tx.arg("-c:a").arg("aac").arg("-b:a").arg(&r.audio_bitrate);
+            } else {
+                tx.arg("-an");
+            }
         } else {
-            tx.arg("-an");
+            // Audio-only rung: drop any (non-existent) video, encode to aac.
+            tx.arg("-vn")
+                .arg("-c:a")
+                .arg("aac")
+                .arg("-b:a")
+                .arg(&r.audio_bitrate);
         }
         tx.arg(&transcoded);
         run_ffmpeg(&mut tx, &format!("transcode {}", r.id))?;
