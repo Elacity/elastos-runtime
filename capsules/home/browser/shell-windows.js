@@ -990,7 +990,11 @@ async function openOwnedRequest(uri) {
   }
 
   const body = { uri };
-  if (prepared && typeof prepared.delegation_canonical === "string" && prepared.grant_handle) {
+  if (prepared && prepared.already_delegated) {
+    // PC2 secure-view session: the wallet already signed a delegation for this asset earlier in the
+    // window — open with just { uri } and the gateway assembles a fresh grant from the cached
+    // delegation (no MetaMask popup). The live on-chain check still gates this open.
+  } else if (prepared && typeof prepared.delegation_canonical === "string" && prepared.grant_handle) {
     const sig = await walletPersonalSign(prepared.delegation_canonical, prepared.owner_address);
     if (sig) {
       body.grant_handle = prepared.grant_handle;

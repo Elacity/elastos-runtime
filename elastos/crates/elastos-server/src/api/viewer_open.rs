@@ -303,6 +303,7 @@ pub async fn open_owned_in_viewer(
         // (or malformed) => fall through to the legacy enrolled-caller path (None).
         let access_grant_b64 = match (req.grant_handle.as_deref(), req.delegation_sig_hex.as_deref()) {
             (Some(handle), Some(sig)) if !handle.trim().is_empty() && !sig.trim().is_empty() => {
+                // Fresh wallet signature (first open of this asset in the window) — assemble + cache.
                 match super::access_grant::assemble(handle, sig)
                     .and_then(|g| super::access_grant::grant_to_b64(&g))
                 {
@@ -320,7 +321,29 @@ pub async fn open_owned_in_viewer(
                     }
                 }
             }
-            _ => None,
+            // No fresh signature: if a live wallet-signed delegation is cached for (subject, kid)
+            // from an earlier open this window, assemble a fresh grant from it — popup-free (PC2
+            // secure-view session parity). The live chain gate above already authorized this open.
+            _ => {
+                let kid_for_grant = normalize_kid_0x(&object_cid);
+                match super::access_grant::assemble_cached(&subject, &kid_for_grant) {
+                    Ok(Some(grant)) => match super::access_grant::grant_to_b64(&grant) {
+                        Ok(b64) => {
+                            tracing::info!("trustless open: reused cached delegation (no wallet popup) for cid {object_cid}");
+                            Some(b64)
+                        }
+                        Err(err) => {
+                            tracing::warn!("trustless open: cached grant serialize failed ({err}); falling back to enrolled path");
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(err) => {
+                        tracing::warn!("trustless open: cached grant assemble failed ({err}); falling back to enrolled path");
+                        None
+                    }
+                }
+            }
         };
         return open_quorum(
             state,
@@ -464,6 +487,25 @@ pub async fn prepare_owned_grant(
     }
 
     let subject = resolve_subject_address(&state, &context.principal_id).await;
+
+    // PC2 secure-view session parity: if the wallet already signed a delegation for (subject, kid)
+    // earlier in the window, tell the browser it is "already delegated" so it skips the MetaMask
+    // popup — the open path will assemble a fresh grant from the cached delegation. The live
+    // on-chain check still runs on every open + every node recover, so revocation is unaffected.
+    if super::access_grant::has_live_session(&subject, &kid_hex) {
+        return (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(json!({
+                "schema": "elastos.viewer.prepare-grant/v1",
+                "already_delegated": true,
+                "kid": kid_hex,
+                "chain_id": chain_id(),
+            })),
+        )
+            .into_response();
+    }
+
     let prepared = match super::access_grant::prepare(chain_id(), &kid_hex, &node_set_id_b64, &subject)
     {
         Ok(p) => p,

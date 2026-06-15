@@ -132,12 +132,16 @@ echo
 #     validates the real transport/crypto end-to-end against the sovereign quorum.
 #     (This Mac must be on the dkms0 mesh to reach those endpoints.)
 REMOTE="${ELASTOS_DKMS_REMOTE:-0}"
-# CARRIER transport (ELASTOS_DKMS_CARRIER=1): reach the LIVE quorum over Carrier (iroh) by did:key
-# instead of the WireGuard mesh (tcp:10.66.66.x:9443). Implies REMOTE (we still seal/recover against
-# the real geo nodes); ONLY the transport changes — no dkms0 VPN, no per-node enrollment. The
-# descriptor's endpoints are `carrier:did:key:...` and a local `dkms-carrier-client` sidecar dials
-# them. (Opt-in for now; the tcp/WireGuard path stays as rollback. Flip the default to carrier once
-# the live nodes run their dkms-carrier-node bridges and validation passes.)
+# Transport to the LIVE quorum, when validating against the real geo nodes (ELASTOS_DKMS_REMOTE=1):
+#   * CARRIER (ELASTOS_DKMS_CARRIER=1) — PRODUCTION: reach each node by its `carrier:did:key:...`
+#     identity over Carrier (iroh); a local `dkms-carrier-client` sidecar dials/relays/hole-punches.
+#     NO WireGuard, NO dkms0 VPN, NO per-node enrollment. This is the path the geo nodes run bridges
+#     for and the one we develop against.
+#   * LEGACY WireGuard mesh (CARRIER unset) — DEPRECATED ROLLBACK ONLY: reach the nodes over
+#     tcp:10.66.66.x:9443 on the dkms0 mesh; requires this Mac on the VPN. Kept as a fallback while
+#     Carrier is proven; slated for removal. Prefer Carrier.
+# (The zero-config default below is LOCAL — a self-contained 2-of-3 quorum on this box, no remote
+# files needed; set ELASTOS_DKMS_CARRIER=1 to validate end-to-end against the live nodes.)
 CARRIER="${ELASTOS_DKMS_CARRIER:-0}"
 CARRIER_CLIENT_BIN="${REPO_ROOT}/scripts/dev/dkms-carrier-client/target/debug/dkms-carrier-client"
 CARRIER_CLIENT_ADDR="${DKMS_CARRIER_CLIENT_ADDR:-127.0.0.1:9444}"
@@ -208,7 +212,8 @@ PY
       exit 1
     fi
   else
-    echo "  NOTE: this Mac must be on the dkms0 mesh (10.66.66.0/24) to reach those tcp: endpoints."
+    echo "  LEGACY WireGuard mesh transport (DEPRECATED — prefer ELASTOS_DKMS_CARRIER=1):"
+    echo "    this Mac must be on the dkms0 mesh (10.66.66.0/24) to reach those tcp: endpoints."
   fi
   echo
 elif [[ -f "$QUORUM_JSON" && -f "$QUORUM_NODES" ]]; then

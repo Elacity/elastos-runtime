@@ -26,9 +26,11 @@ use serde_json::{json, Value};
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
-/// The delegation validity window. Kept well under the node's `MAX_DELEGATION_WINDOW_SECONDS` so a
-/// leaked delegation is short-lived; the open itself only needs a minute.
-const DELEGATION_WINDOW_SECS: u64 = 900;
+/// The delegation validity window. With the gateway's session cache (PC2 parity), the wallet signs
+/// ONCE and re-opens within this window are popup-free, so the window doubles as the "signed-in to
+/// the dDRM system" period. Kept well under the node's `MAX_DELEGATION_WINDOW_SECONDS` (24h) so a
+/// leaked delegation is bounded; the live on-chain check still gates every recover regardless.
+const DELEGATION_WINDOW_SECS: u64 = 3600;
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)

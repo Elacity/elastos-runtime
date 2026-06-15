@@ -60,6 +60,35 @@ fn store() -> &'static PendingStore {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A LIVE wallet-signed delegation cached for reuse across opens (PC2 "secure-view session"
+/// parity, node-compatible variant). After the wallet signs ONCE, we keep the opaque material
+/// (session seed + delegation + the wallet's signature) until the delegation's own `expires_at`,
+/// so re-opening the SAME asset within the window assembles a FRESH grant (new per-request nonce +
+/// timestamp, signed by the cached session key) WITHOUT another MetaMask popup. The live on-chain
+/// `hasAccessByContentId` gate still runs on every open AND every node recover — this only removes
+/// the redundant re-signature, never the revocation check. Keyed by (owner, kid): our delegation
+/// binds a single kid (the node verifies it), so a session is per-asset; "one signature for all
+/// assets" would require dropping kid from the wire schema (a coordinated geo-node redeploy).
+struct GrantSession {
+    session_seed_b64: String,
+    delegation_json: Value,
+    delegation_sig_hex: String,
+    expires_at: u64,
+}
+
+type GrantSessionStore = Mutex<HashMap<String, GrantSession>>;
+
+fn sessions() -> &'static GrantSessionStore {
+    static SESSIONS: OnceLock<GrantSessionStore> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache key for a live delegation: the on-chain owner + the asset's kid, both normalized so the
+/// browser's open path and the prepare path agree on the slot.
+fn session_key(owner_address: &str, kid_hex: &str) -> String {
+    format!("{}|{}", owner_address.trim().to_ascii_lowercase(), kid_hex.trim().to_ascii_lowercase())
+}
+
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -178,6 +207,9 @@ pub fn prepare(
 /// PHASE 2 — consume the handle, hand the sidecar the stashed material + the wallet signature, and
 /// return the assembled grant JSON. The gateway does NOT verify the wallet signature here — that is
 /// the node's job; a bad signature simply fails closed downstream.
+///
+/// On success we ALSO promote the (seed + delegation + signature) into the live session cache keyed
+/// by (owner, kid), so the NEXT open of this asset within the delegation window reuses it (no popup).
 pub fn assemble(handle: &str, delegation_sig_hex: &str) -> Result<Value, String> {
     let sig = delegation_sig_hex.trim();
     if sig.is_empty() {
@@ -190,17 +222,80 @@ pub fn assemble(handle: &str, delegation_sig_hex: &str) -> Result<Value, String>
         map.remove(handle)
             .ok_or("unknown or expired grant handle (re-prepare the open)")?
     };
+    let grant = assemble_with(&pending.session_seed_b64, &pending.delegation_json, sig)?;
+    // Cache the live delegation for popup-free re-opens until its own expiry.
+    cache_session(&pending.session_seed_b64, &pending.delegation_json, sig);
+    Ok(grant)
+}
+
+/// Run the sidecar `--grant-assemble` over the given material and return the grant JSON. Each call
+/// builds a FRESH per-request object (new nonce + timestamp), so reusing the same delegation +
+/// signature across opens yields a new, non-replayable grant every time.
+fn assemble_with(session_seed_b64: &str, delegation_json: &Value, delegation_sig_hex: &str) -> Result<Value, String> {
     let out = run_sidecar(
         "--grant-assemble",
         &json!({
-            "session_seed_b64": pending.session_seed_b64,
-            "delegation_json": pending.delegation_json,
-            "delegation_sig_hex": sig,
+            "session_seed_b64": session_seed_b64,
+            "delegation_json": delegation_json,
+            "delegation_sig_hex": delegation_sig_hex,
         }),
     )?;
     out.get("grant_json")
         .cloned()
         .ok_or_else(|| "sidecar returned no grant_json".to_string())
+}
+
+/// Promote a just-signed delegation into the live session cache keyed by (owner, kid), with the
+/// delegation's own `expires_at` as the TTL. Best-effort: a malformed delegation simply isn't cached.
+fn cache_session(session_seed_b64: &str, delegation_json: &Value, delegation_sig_hex: &str) {
+    let owner = delegation_json.get("owner_address").and_then(Value::as_str).unwrap_or_default();
+    let kid = delegation_json.get("kid_hex").and_then(Value::as_str).unwrap_or_default();
+    let expires_at = delegation_json.get("expires_at").and_then(Value::as_u64).unwrap_or(0);
+    if owner.is_empty() || kid.is_empty() || expires_at == 0 {
+        return;
+    }
+    if let Ok(mut map) = sessions().lock() {
+        let now = now_unix();
+        map.retain(|_, s| s.expires_at > now);
+        map.insert(
+            session_key(owner, kid),
+            GrantSession {
+                session_seed_b64: session_seed_b64.to_string(),
+                delegation_json: delegation_json.clone(),
+                delegation_sig_hex: delegation_sig_hex.to_string(),
+                expires_at,
+            },
+        );
+    }
+}
+
+/// True iff a non-expired wallet-signed delegation is cached for (owner, kid) — i.e. the browser can
+/// skip the MetaMask popup and let the gateway assemble a fresh grant from the cache.
+pub fn has_live_session(owner_address: &str, kid_hex: &str) -> bool {
+    let key = session_key(owner_address, kid_hex);
+    if let Ok(mut map) = sessions().lock() {
+        let now = now_unix();
+        map.retain(|_, s| s.expires_at > now);
+        return map.contains_key(&key);
+    }
+    false
+}
+
+/// Assemble a fresh grant from a cached live delegation for (owner, kid), WITHOUT a new wallet
+/// signature. Returns `Ok(None)` when no live session is cached (caller falls back to prepare+sign).
+pub fn assemble_cached(owner_address: &str, kid_hex: &str) -> Result<Option<Value>, String> {
+    let key = session_key(owner_address, kid_hex);
+    let (seed, delegation, sig) = {
+        let mut map = sessions().lock().map_err(|_| "grant session store poisoned")?;
+        let now = now_unix();
+        map.retain(|_, s| s.expires_at > now);
+        match map.get(&key) {
+            Some(s) => (s.session_seed_b64.clone(), s.delegation_json.clone(), s.delegation_sig_hex.clone()),
+            None => return Ok(None),
+        }
+    };
+    let grant = assemble_with(&seed, &delegation, &sig)?;
+    Ok(Some(grant))
 }
 
 /// Base64 of the grant JSON — the CLI-safe form threaded to the `--quorum` helper.
