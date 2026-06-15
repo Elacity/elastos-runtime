@@ -9,16 +9,31 @@ license = "MIT"
 name = "dkms-authority"
 path = "src/main.rs"
 
+[features]
+default = ["legacy-receipt-authz"]
+# legacy-receipt-authz: accept the pre-trustless path (an UNSIGNED RightsDecisionReceiptV1
+# from an allow-listed caller) WHEN no wallet-signed AccessGrant is supplied. A migration
+# scaffold only — a present grant is ALWAYS evaluated trustlessly (wallet sig + node-side
+# on-chain check); this flag merely keeps existing receipt-only clients working until the
+# runtime is wired to send grants (W4). With the flag OFF a missing grant fails closed.
+legacy-receipt-authz = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Shared PQ-hybrid seal/unwrap + node-identity attestation — single source of truth with key-provider.
-ddrm-envelope = { path = "../ddrm-envelope" }
+# Shared PQ-hybrid seal/unwrap + node-identity attestation + the wallet-signed AccessGrant
+# verifier + the on-chain access ABI — single source of truth with key-provider + the runtime.
+ddrm-envelope = { path = "../ddrm-envelope", features = ["access-grant"] }
 # Shared rights-receipt contract — the node RE-CHECKS authorization in its own boundary (reads the
 # canonical RightsDecisionReceiptV1; defines no new shared type).
 elastos-common = { path = "../../elastos/crates/elastos-common" }
 base64 = "0.22"
+hex = "0.4"
 zeroize = "1"
+# The node's OWN pinned, read-only Base RPC capability — it evaluates hasAccessByContentId
+# itself rather than trusting the caller (No Ambient Authority: operator-configured, read-only,
+# fail-closed). Blocking client; the node already runs a synchronous recover loop.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [profile.release]
 opt-level = "s"

@@ -48,6 +48,11 @@ pub struct QuorumArgs {
     pub object_cid: String,
     pub mime: String,
     pub ttl_secs: u64,
+    /// OPTIONAL wallet-signed access grant (base64 of the AccessGrantV1 JSON). When present the
+    /// dkms nodes authorize TRUSTLESSLY (verify the wallet/session signatures + read
+    /// `hasAccessByContentId` themselves) instead of trusting the unsigned rights receipt. The
+    /// gateway builds it from the user's `personal_sign`; this helper only forwards it.
+    pub access_grant_b64: Option<String>,
 }
 
 fn now_unix() -> u64 {
@@ -309,6 +314,18 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         "reason": "owned dKMS asset render",
         "expires_at": expires_at,
     });
+    // Thread the wallet-signed grant (if the gateway collected one) into the release request, so
+    // key-provider forwards it to each node and the nodes authorize trustlessly. The grant arrives
+    // base64-encoded (CLI-safe); decode it to the AccessGrantV1 JSON the node deserializes.
+    let mut key_release_request = key_release_request;
+    if let Some(grant_b64) = args.access_grant_b64.as_deref().filter(|s| !s.trim().is_empty()) {
+        let grant_bytes = B64
+            .decode(grant_b64.trim())
+            .map_err(|e| format!("--access-grant is not valid base64: {e}"))?;
+        let grant: Value = serde_json::from_slice(&grant_bytes)
+            .map_err(|e| format!("--access-grant is not valid AccessGrantV1 JSON: {e}"))?;
+        key_release_request["access_grant"] = grant;
+    }
 
     // --- decrypt boundary: pin the 3 node identities + mint a session key. ---
     let mut decrypt = Capsule::spawn("decrypt-provider", &args.decrypt_bin)?;

@@ -956,41 +956,221 @@ fn kid_to_content_id_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
-/// The single-chunk ceiling of PC2's producer importer: `@helia/unixfs` `add.ts`
-/// uses `fixedSize({ chunkSize: 1_048_576 })`, so any content at or under 1 MiB is a
-/// single chunk whose root CID IS the lone raw leaf's CID.
+/// PC2's producer importer (`@helia/unixfs` `add.ts`) uses `fixedSize({ chunkSize:
+/// 1_048_576 })`, so content at or under 1 MiB is a single chunk whose root CID IS the
+/// lone raw leaf's CID; content ABOVE this is split into 1 MiB raw leaves under a
+/// balanced **dag-pb** tree (see `payload_cid_v1_raw`).
 const UNIXFS_SINGLE_CHUNK_MAX: usize = 1_048_576;
 
-/// Content-address `bytes` as an IPFS **CIDv1** with the **raw** codec and a
-/// sha2-256 multihash — byte-for-byte what PC2's producer gets from Helia
-/// `unixfs.addBytes` for single-chunk content (`@helia/unixfs` `add.ts`:
-/// `cidVersion: 1, rawLeaves: true`, 1 MiB `fixedSize` chunker; the importer's
-/// `reduceSingleLeafToSelf` collapses a one-chunk file to its raw leaf). Pure
-/// function of the bytes — computable in-boundary with no IPFS node, no network.
+/// `@helia/unixfs` balanced-layout fan-out (`add.ts` pins `maxChildrenPerNode: 1024`).
+/// Up to this many children fit under a SINGLE dag-pb node; above it the importer
+/// batches children into groups of this size, reduces each group to an intermediate
+/// node, and recurses until one root remains — reproduced byte-for-byte below.
+const UNIXFS_MAX_CHILDREN_PER_NODE: usize = 1024;
+
+/// Content-address `bytes` exactly as PC2's producer does with Helia `unixfs.addBytes`
+/// (`@helia/unixfs` `add.ts`: `cidVersion: 1, rawLeaves: true`, 1 MiB `fixedSize`
+/// chunker, balanced layout `maxChildrenPerNode: 1024`). Pure function of the bytes —
+/// computable in-boundary with no IPFS node and no network — so the producer holds a
+/// real content address of the sealed segment for ANY size:
 ///
-/// Fails closed for content larger than one chunk: that would be a balanced
-/// **dag-pb** tree spanning multiple blocks, and we refuse to emit a CID we cannot
-/// reproduce byte-for-byte here rather than guess one.
+///   * ≤ 1 MiB → the lone **raw** CIDv1 leaf (`bafkrei…`); the importer's
+///     `reduceSingleLeafToSelf` collapses a one-chunk file to its raw leaf.
+///   * > 1 MiB → 1 MiB raw leaves under a balanced **dag-pb** root (`bafybei…`),
+///     byte-for-byte what Helia mints (pinned against the real importer by
+///     `scripts/dev/unixfs-oracle`; the identical encoder is exercised by
+///     `scripts/dev/ddrm-runtime-open`).
+///
+/// Returns `Result` for call-site compatibility; the only error is a degenerate
+/// internal misconfiguration (it never fails on input size — any size is supported).
 #[allow(dead_code)]
 fn payload_cid_v1_raw(bytes: &[u8]) -> Result<String, String> {
-    if bytes.len() > UNIXFS_SINGLE_CHUNK_MAX {
-        return Err(format!(
-            "payload of {} bytes exceeds the {UNIXFS_SINGLE_CHUNK_MAX}-byte single-chunk limit; \
-             multi-block dag-pb CIDs are not derived in-boundary",
-            bytes.len()
-        ));
-    }
+    unixfs_root_cid_with(bytes, UNIXFS_SINGLE_CHUNK_MAX, UNIXFS_MAX_CHILDREN_PER_NODE)
+}
+
+/// The raw 36-byte CIDv1 binary of `chunk` (`0x01 0x55 0x12 0x20 ‖ sha2-256`) — the
+/// bytes a dag-pb `PBLink` carries as its `Hash` for a raw leaf.
+#[allow(dead_code)]
+fn raw_cid_binary(chunk: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    // CIDv1 bytes: <version 0x01> <codec raw 0x55> <multihash: sha2-256 0x12, len 0x20, 32-byte digest>.
-    let mut cid_bytes = Vec::with_capacity(4 + digest.len());
-    cid_bytes.push(0x01);
-    cid_bytes.push(0x55);
-    cid_bytes.push(0x12);
-    cid_bytes.push(0x20);
-    cid_bytes.extend_from_slice(&digest);
-    // multibase base32 (lowercase, no pad) — the `b` prefix IPFS CIDv1 strings use.
-    Ok(format!("b{}", base32_lower_nopad(&cid_bytes)))
+    let digest = Sha256::digest(chunk);
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&[0x01, 0x55, 0x12, 0x20]);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Render a raw-leaf CIDv1 (`bafkrei…`) as a multibase-base32 string — the single-chunk
+/// content address (`<version 0x01><codec raw 0x55><sha2-256>`).
+#[allow(dead_code)]
+fn raw_cid_v1_string(chunk: &[u8]) -> String {
+    format!("b{}", base32_lower_nopad(&raw_cid_binary(chunk)))
+}
+
+/// The dag-pb 36-byte CIDv1 binary of `block` (`0x01 0x70 0x12 0x20 ‖ sha2-256`) — the
+/// bytes a PARENT dag-pb `PBLink` carries as its `Hash` for an INTERMEDIATE node.
+#[allow(dead_code)]
+fn dag_pb_cid_binary(block: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(block);
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(&[0x01, 0x70, 0x12, 0x20]);
+    out.extend_from_slice(&digest);
+    out
+}
+
+/// Content-address a dag-pb block as a **CIDv1** (codec 0x70, sha2-256, multibase
+/// base32) — the identity of a UnixFS root (`bafybei…`).
+#[allow(dead_code)]
+fn dag_pb_cid_v1(block: &[u8]) -> String {
+    format!("b{}", base32_lower_nopad(&dag_pb_cid_binary(block)))
+}
+
+/// Append `value` as a protobuf base-128 varint (LEB128).
+#[allow(dead_code)]
+fn put_uvarint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Encode a length-delimited protobuf field: `<tag(field,wire=2)><len><bytes>`.
+#[allow(dead_code)]
+fn put_len_field(buf: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    put_uvarint(buf, (field << 3) | 2);
+    put_uvarint(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+/// Encode a varint protobuf field: `<tag(field,wire=0)><varint>`.
+#[allow(dead_code)]
+fn put_varint_field(buf: &mut Vec<u8>, field: u64, value: u64) {
+    put_uvarint(buf, field << 3);
+    put_uvarint(buf, value);
+}
+
+/// Build the UnixFS `Data` for a chunked File: `Type=File(2)`, `filesize`, repeated
+/// `blocksizes` (field order 1,3,4 — the exact bytes Helia emits; no inline `Data`, no
+/// hashType/fanout).
+#[allow(dead_code)]
+fn unixfs_file_data(filesize: u64, blocksizes: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint_field(&mut out, 1, 2);
+    put_varint_field(&mut out, 3, filesize);
+    for &bs in blocksizes {
+        put_varint_field(&mut out, 4, bs);
+    }
+    out
+}
+
+/// Build one dag-pb `PBLink`: `Hash(1)=<cid bytes>`, `Name(2)=""` (present + empty, as
+/// Helia sets it), `Tsize(3)=<cumulative dag size>` — field order 1,2,3.
+#[allow(dead_code)]
+fn pb_link(child_cid_binary: &[u8], tsize: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_len_field(&mut out, 1, child_cid_binary);
+    put_len_field(&mut out, 2, b"");
+    put_varint_field(&mut out, 3, tsize);
+    out
+}
+
+/// Build the dag-pb `PBNode` for a chunked UnixFS file: every `PBLink` (field 2) FIRST
+/// in child order, then the UnixFS `Data` (field 1) — the canonical @ipld/dag-pb order.
+#[allow(dead_code)]
+fn dag_pb_file_node(links: &[(Vec<u8>, u64)], unixfs_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (cid_binary, tsize) in links {
+        let link = pb_link(cid_binary, *tsize);
+        put_len_field(&mut out, 2, &link);
+    }
+    put_len_field(&mut out, 1, unixfs_data);
+    out
+}
+
+/// One node in the balanced-tree build: its CID (string + 36-byte binary the parent
+/// links), the UnixFS file CONTENT size it covers (the `fileSize` a parent records as
+/// its `blocksize`), and the cumulative dag size (the `Tsize` a parent records: this
+/// node's own block length + every descendant's dag size; for a raw leaf, the leaf
+/// byte length).
+#[allow(dead_code)]
+struct UnixfsNode {
+    cid_str: String,
+    cid_binary: Vec<u8>,
+    content_size: u64,
+    dag_size: u64,
+}
+
+/// Import `bytes` as Helia-compatible UnixFS and return ONLY the root CID string — the
+/// `payload_cid` of the sealed segment. Mirrors `@helia/unixfs` `addBytes` defaults:
+/// fixed-size raw leaves, single-chunk collapse to the raw leaf, and a BALANCED dag-pb
+/// tree above the fan-out. Parameterized by `chunk_size` + `max_children` so tests can
+/// force a multi-level tree with a tiny input (the dag-pb encoding is independent of
+/// both); production passes Helia's real defaults (1 MiB / 1024).
+#[allow(dead_code)]
+fn unixfs_root_cid_with(
+    bytes: &[u8],
+    chunk_size: usize,
+    max_children: usize,
+) -> Result<String, String> {
+    if chunk_size == 0 || max_children < 2 {
+        return Err("unixfs import requires chunk_size > 0 and max_children >= 2".to_string());
+    }
+
+    // Leaves: empty input is one empty raw leaf (Helia's empty-file CID); else 1 MiB raw leaves.
+    let chunks: Vec<&[u8]> =
+        if bytes.is_empty() { vec![bytes] } else { bytes.chunks(chunk_size).collect() };
+    let mut level: Vec<UnixfsNode> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        level.push(UnixfsNode {
+            cid_str: raw_cid_v1_string(chunk),
+            cid_binary: raw_cid_binary(chunk),
+            content_size: chunk.len() as u64,
+            dag_size: chunk.len() as u64,
+        });
+    }
+
+    // A single leaf that IS the whole file collapses to the raw leaf (`reduceSingleLeafToSelf`).
+    if level.len() == 1 {
+        return Ok(level.pop().expect("one leaf").cid_str);
+    }
+
+    // Balanced reduce: group the level into runs of `max_children`, reduce each run to an
+    // intermediate dag-pb file node, recurse until one root node remains.
+    loop {
+        let mut next: Vec<UnixfsNode> = Vec::with_capacity(level.len().div_ceil(max_children));
+        for group in level.chunks(max_children) {
+            let mut links: Vec<(Vec<u8>, u64)> = Vec::with_capacity(group.len());
+            let mut blocksizes: Vec<u64> = Vec::with_capacity(group.len());
+            let mut content_size: u64 = 0;
+            let mut children_dag_size: u64 = 0;
+            for child in group {
+                // PBLink Tsize is the child's CUMULATIVE dag size; the UnixFS blocksize is its
+                // CONTENT size (matching `dag-builder/file.js`: `Tsize: leaf.size`, `addBlockSize`).
+                links.push((child.cid_binary.clone(), child.dag_size));
+                blocksizes.push(child.content_size);
+                content_size += child.content_size;
+                children_dag_size += child.dag_size;
+            }
+            let unixfs_data = unixfs_file_data(content_size, &blocksizes);
+            let block = dag_pb_file_node(&links, &unixfs_data);
+            let cid_str = dag_pb_cid_v1(&block);
+            let cid_binary = dag_pb_cid_binary(&block);
+            let dag_size = block.len() as u64 + children_dag_size;
+            next.push(UnixfsNode { cid_str, cid_binary, content_size, dag_size });
+        }
+        if next.len() == 1 {
+            return Ok(next.pop().expect("one root").cid_str);
+        }
+        level = next;
+    }
 }
 
 /// RFC 4648 base32, lowercase alphabet, no padding — the multibase `b` encoding.
@@ -1350,13 +1530,71 @@ mod tests {
         assert!(a.starts_with("bafkrei"), "raw CIDv1/sha256 strings start with bafkrei");
     }
 
-    /// Fail-closed: content larger than one importer chunk would be a multi-block
-    /// dag-pb tree we do not reproduce in-boundary, so the producer refuses rather
-    /// than emit a CID it cannot prove. The boundary is exactly 1 MiB.
+    /// The single-chunk boundary is exactly 1 MiB: content at or under it addresses to a
+    /// lone RAW leaf (`bafkrei…`); the first byte over it crosses into a balanced dag-pb
+    /// root (`bafybei…`). Both succeed — any size is supported (no fail-closed on size).
     #[test]
-    fn payload_cid_fails_closed_above_one_chunk() {
-        assert!(payload_cid_v1_raw(&vec![0u8; UNIXFS_SINGLE_CHUNK_MAX]).is_ok());
-        assert!(payload_cid_v1_raw(&vec![0u8; UNIXFS_SINGLE_CHUNK_MAX + 1]).is_err());
+    fn payload_cid_crosses_from_raw_leaf_to_dag_pb_at_one_chunk() {
+        let at = payload_cid_v1_raw(&vec![0u8; UNIXFS_SINGLE_CHUNK_MAX]).expect("1 MiB ok");
+        let over = payload_cid_v1_raw(&vec![0u8; UNIXFS_SINGLE_CHUNK_MAX + 1]).expect("1 MiB+1 ok");
+        assert!(at.starts_with("bafkrei"), "single chunk collapses to its raw leaf");
+        assert!(over.starts_with("bafybei"), "above one chunk is a dag-pb tree root");
+    }
+
+    /// GOLDEN (multi-block): content ABOVE one chunk must reproduce, byte-for-byte, the
+    /// dag-pb root CID PC2's producer gets from Helia `unixfs.addBytes` (cidVersion 1,
+    /// rawLeaves, 1 MiB fixedSize, balanced `maxChildrenPerNode: 1024`). Expected strings
+    /// generated by the real kubo importer with the matching flags
+    /// (`ipfs add --cid-version=1 --raw-leaves --chunker=size-1048576`). Deterministic
+    /// byte streams (no committed binaries) so the values are reproducible.
+    #[test]
+    fn payload_cid_matches_ipfs_multiblock_golden() {
+        // 2 MiB of 'a' -> exactly two 1 MiB leaves under one dag-pb root.
+        let two_mib = vec![b'a'; 2 * UNIXFS_SINGLE_CHUNK_MAX];
+        assert_eq!(
+            payload_cid_v1_raw(&two_mib).expect("2 MiB cid"),
+            "bafybeibyhwn67sarrmt4xblquc35mbmss34jv3gjlziuggakuxu7iwmpwu"
+        );
+
+        // 1 MiB + 1 byte of 0x00 -> a 1 MiB leaf + a 1-byte leaf under one dag-pb root.
+        let over = vec![0u8; UNIXFS_SINGLE_CHUNK_MAX + 1];
+        assert_eq!(
+            payload_cid_v1_raw(&over).expect("1 MiB+1 cid"),
+            "bafybeihd4yzq7n5umhjngdum4r6k2to7egxfkf2jz6thvwzf6djus22cmq"
+        );
+
+        // The exact size that surfaced the old single-chunk error (5,915,607 bytes), with a
+        // cross-language-deterministic stream `out[i] = i & 0xff` -> six leaves, one root.
+        let big: Vec<u8> = (0..5_915_607u32).map(|i| (i & 0xff) as u8).collect();
+        assert_eq!(
+            payload_cid_v1_raw(&big).expect("5.9 MiB cid"),
+            "bafybeiffilkaoouj2rwsybiyw7hvaslighb6yvof4czkehkreyswvh2esq"
+        );
+    }
+
+    /// GOLDEN (multi-LEVEL tree): the balanced recursion above the fan-out must match the
+    /// importer too. Pinned against kubo's natural 174-link fan-out at a reduced chunk size
+    /// (`ipfs add --cid-version=1 --raw-leaves --chunker=size-256`): the dag-pb block
+    /// encoding is independent of chunk size + fan-out, so this exercises the SAME code
+    /// path that production (1 MiB / 1024) takes, just with a tiny input. Stream is
+    /// `out[i] = (i*7 + 3) & 0xff`.
+    #[test]
+    fn unixfs_tree_matches_ipfs_fanout_golden() {
+        let stream = |n: usize| -> Vec<u8> { (0..n).map(|i| ((i * 7 + 3) & 0xff) as u8).collect() };
+
+        // 5 chunks @256B -> a single dag-pb parent with 5 links.
+        let single_parent = stream(5 * 256);
+        assert_eq!(
+            unixfs_root_cid_with(&single_parent, 256, 174).expect("single-parent cid"),
+            "bafybeih4uwy7tzj3d527fx22sjgzu7ywhkf2jnlom3iv5ynyqfwxpvfxcu"
+        );
+
+        // 234 chunks @256B -> 174 + 60 leaves -> two intermediate nodes -> one root (2 levels).
+        let multi_level = stream(234 * 256);
+        assert_eq!(
+            unixfs_root_cid_with(&multi_level, 256, 174).expect("multi-level cid"),
+            "bafybeicnpg5ranh5v77m6dfinbrcmlgv5edtc755rigbnaxv7pfdi746ry"
+        );
     }
 
     #[test]

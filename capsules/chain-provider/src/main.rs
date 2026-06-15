@@ -828,22 +828,33 @@ impl ChainProvider {
                 }
             }
         };
+        let build = |has_access: bool| {
+            Response::ok(json!({
+                "network": network.id,
+                "contract": method.contract.as_str(),
+                "content_id": content_id,
+                "subject": subject,
+                "right": right,
+                "has_access": has_access,
+            }))
+        };
         match self.evm_rpc(
             network,
             "eth_call",
             json!([{ "to": method.contract.as_str(), "data": data }, "latest"]),
         ) {
             Ok(result) => match decode_evm_bool(&result) {
-                Ok(has_access) => Response::ok(json!({
-                    "network": network.id,
-                    "contract": method.contract.as_str(),
-                    "content_id": content_id,
-                    "subject": subject,
-                    "right": right,
-                    "has_access": has_access,
-                })),
+                Ok(has_access) => build(has_access),
                 Err(err) => Response::error("upstream_invalid_bool", &err),
             },
+            // PC2 parity (`~/.pc2` `storage.ts`:
+            // `gateway.hasAccessByContentId(holder, kid).catch(() => false)`): a CONTRACT
+            // REVERT is a definitive "no access" for this contentId (the content is not
+            // registered, or the holder has no access record) — NOT an outage. Map it to
+            // `has_access: false` so the rights gate fails CLOSED cleanly (a 403 denial)
+            // instead of surfacing a 503. Genuine transport/RPC failures still propagate, so
+            // an RPC outage can never masquerade as a certain denial.
+            Err(response) if is_contract_revert(&response) => build(false),
             Err(response) => response,
         }
     }
@@ -1730,6 +1741,22 @@ impl ChainProvider {
         )
         .map_err(|err| Response::error("node_lifecycle_state_unavailable", &err))?;
         Ok(entry)
+    }
+}
+
+/// Does this RPC error represent a CONTRACT REVERT (a definitive on-chain "no" for the call)
+/// rather than a transport/endpoint failure? Used by the rights read to mirror PC2's
+/// `.catch(() => false)`: an `eth_call` that reverts means the holder has no access for the
+/// queried contentId (often: the content is not registered on the gateway), which must fail
+/// CLOSED as `has_access: false` — not bubble up as a 503 outage. Standard JSON-RPC revert
+/// signals: code `3` (EIP-1474 "execution reverted") and/or an "execution reverted" message.
+fn is_contract_revert(resp: &Response) -> bool {
+    match resp {
+        Response::Error { code, message } if code == "upstream_rpc_error" => {
+            let m = message.to_ascii_lowercase();
+            m.contains("execution reverted") || m.contains("revert") || message.contains("\"code\":3")
+        }
+        _ => false,
     }
 }
 

@@ -323,8 +323,12 @@ pub fn announce_presence(
         ts,
     };
     let content = serde_json::to_string(&payload)?;
-    // Sign presence announcements — prevents peer impersonation via fake tickets
-    let signature = sign_message(identity_token, sender_id, ts, &content).ok().flatten();
+    // Sign presence announcements — prevents peer impersonation via fake tickets.
+    // Propagate a signing/transport failure instead of swallowing it: a silently
+    // unsigned announcement is dropped by every receiver (see
+    // recv_presence_announcements), so the caller must learn that presence did
+    // not actually propagate rather than assume success.
+    let signature = sign_message(identity_token, sender_id, ts, &content)?;
     send_gossip(
         peer_token,
         &chat_discovery_topic(room),

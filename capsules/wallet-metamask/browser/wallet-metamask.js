@@ -5,6 +5,13 @@ const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readQueryParam("home_token");
 const discoveredWalletProviders = [];
+// Skip the background poll while the user is mid-connect/mid-sign so we never tear down an
+// in-flight approval's button state, and a re-entrancy guard so polls can't overlap.
+let interactionBusy = false;
+let refreshInFlight = false;
+// How often to pick up newly-queued approvals (e.g. a mint tx just enqueued by the Create
+// portal) without the user having to reconnect/reopen the Wallet.
+const APPROVAL_POLL_MS = 5000;
 
 boot();
 
@@ -23,6 +30,22 @@ function boot() {
   refreshWalletState().catch((error) => {
     showStatus(String(error.message || error), "error");
   });
+  startApprovalAutoRefresh();
+}
+
+// Poll for newly-queued approvals so a mint/trade tx enqueued elsewhere appears here on its
+// own. Quiet by design: only when the tab is visible, we have a launch token, and the user
+// isn't mid-interaction; errors are swallowed (the next tick retries).
+function startApprovalAutoRefresh() {
+  window.setInterval(() => {
+    if (!frameHomeToken || interactionBusy || refreshInFlight) {
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    refreshWalletState().catch(() => {});
+  }, APPROVAL_POLL_MS);
 }
 
 function configureMetaMaskDiscovery() {
@@ -75,6 +98,7 @@ async function onConnect() {
     return;
   }
   setButtonBusy(connectButton, true);
+  interactionBusy = true;
   showStatus("Approve in your wallet.", "muted");
   try {
     const { address, chainId } = await connectProvider(provider);
@@ -101,6 +125,7 @@ async function onConnect() {
     showStatus(String(error.message || error), "error");
   } finally {
     setButtonBusy(connectButton, false);
+    interactionBusy = false;
   }
 }
 
@@ -144,26 +169,34 @@ async function refreshWalletState() {
     showStatus("Open from Wallet to review approval requests.", "error");
     return;
   }
-  const [accountSummary, requestSummary] = await Promise.all([
-    fetchJson("/api/apps/wallet-metamask/wallet/accounts", {
-      headers: shellHeaders(),
-    }),
-    fetchJson("/api/apps/wallet-metamask/wallet/approvals", {
-      headers: shellHeaders(),
-    }),
-  ]);
-  const accounts = Array.isArray(accountSummary && accountSummary.accounts)
-    ? accountSummary.accounts
-    : [];
-  const requests = Array.isArray(requestSummary && requestSummary.approval_requests)
-    ? requestSummary.approval_requests
-    : [];
-  renderAccounts(accounts);
-  renderRequests(requests);
-  if (accounts.length > 0) {
-    setState(`${accounts.length} linked`);
-  } else {
-    setState("0 linked");
+  if (refreshInFlight) {
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const [accountSummary, requestSummary] = await Promise.all([
+      fetchJson("/api/apps/wallet-metamask/wallet/accounts", {
+        headers: shellHeaders(),
+      }),
+      fetchJson("/api/apps/wallet-metamask/wallet/approvals", {
+        headers: shellHeaders(),
+      }),
+    ]);
+    const accounts = Array.isArray(accountSummary && accountSummary.accounts)
+      ? accountSummary.accounts
+      : [];
+    const requests = Array.isArray(requestSummary && requestSummary.approval_requests)
+      ? requestSummary.approval_requests
+      : [];
+    renderAccounts(accounts);
+    renderRequests(requests);
+    if (accounts.length > 0) {
+      setState(`${accounts.length} linked`);
+    } else {
+      setState("0 linked");
+    }
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -297,6 +330,7 @@ async function onRequestClick(event) {
     return;
   }
   setButtonBusy(button, true);
+  interactionBusy = true;
   showStatus("Preparing request.", "muted");
   try {
     const handoffSummary = await fetchJson(`/api/apps/wallet-metamask/wallet/approvals/${encodeURIComponent(requestId)}/approve`, {
@@ -356,6 +390,7 @@ async function onRequestClick(event) {
     showStatus(String(error.message || error), "error");
   } finally {
     setButtonBusy(button, false);
+    interactionBusy = false;
   }
 }
 

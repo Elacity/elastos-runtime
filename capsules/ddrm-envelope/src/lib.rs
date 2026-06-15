@@ -41,6 +41,17 @@ pub use x25519_dalek::StaticSecret as XStaticSecret;
 pub type MlKemDk = <MlKem768 as KemCore>::DecapsulationKey;
 pub type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
 
+/// Wallet-signed access-delegation layer (PC2 `SecureViewDelegation` parity).
+///
+/// The trustless authorization object a sovereign runtime hands the quorum: a
+/// wallet-signed delegation of an ephemeral session key over a bounded window,
+/// plus a per-recover request signature. Verified by each node BEFORE it
+/// evaluates the on-chain access condition itself (the on-chain check lives in
+/// the node, not here). Behind `access-grant` so the lean wasm decrypt boundary
+/// does not pull secp256k1/JSON it never needs.
+#[cfg(feature = "access-grant")]
+pub mod access;
+
 /// Domain separation + profile binding for the wrap-key KDF.
 const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
 
@@ -363,6 +374,50 @@ pub fn split_cek_shamir2(cek: &[u8], coeff: &[u8]) -> Result<[Vec<u8>; 3], &'sta
             .collect()
     };
     Ok([eval(1), eval(2), eval(3)])
+}
+
+/// General Shamir t-of-n CEK split — the PRODUCER side, generalizing
+/// [`split_cek_shamir2`] (t=2, n=3) to ANY threshold (e.g. 5-of-12, per the SCALING
+/// doc). `coeffs` are the `t-1` fresh, uniformly-random degree-coefficient vectors
+/// (each the SAME length as `cek`), so the degree-`(t-1)` polynomial is
+/// `p(x) = cek[j] ⊕ Σ_{d=1..t-1} coeffs[d-1][j]·x^d` per byte over GF(256). Returns the
+/// `n` shares `[p(1), …, p(n)]` in x order (share `i` ↔ coordinate `i+1`); ANY `t`
+/// reconstruct via [`lagrange_combine_at_zero`], and any `t-1` are information-
+/// theoretically useless. The CSPRNG stays OUT of this crate (same policy as
+/// [`split_cek_shamir2`]'s `coeff`) so the split is deterministic + golden-vector
+/// replayable. Fails closed on an empty `cek`, `n == 0` (coordinates run `1..=n`, never
+/// 0 — x=0 IS the secret), or a `coeffs` entry whose length ≠ `cek`.
+pub fn split_cek_shamir(cek: &[u8], coeffs: &[&[u8]], n: u8) -> Result<Vec<Vec<u8>>, &'static str> {
+    if cek.is_empty() {
+        return Err("cek must be non-empty");
+    }
+    if n == 0 {
+        return Err("n must be at least 1");
+    }
+    for c in coeffs {
+        if c.len() != cek.len() {
+            return Err("each coeff length must equal cek length");
+        }
+    }
+    let eval = |x: u8| -> Vec<u8> {
+        // powers[d] = x^(d+1), built incrementally so no general pow is needed.
+        let mut powers = Vec::with_capacity(coeffs.len());
+        let mut p = x;
+        for _ in 0..coeffs.len() {
+            powers.push(p);
+            p = gf256_mul(p, x);
+        }
+        (0..cek.len())
+            .map(|j| {
+                let mut acc = cek[j];
+                for (d, c) in coeffs.iter().enumerate() {
+                    acc ^= gf256_mul(c[j], powers[d]);
+                }
+                acc
+            })
+            .collect()
+    };
+    Ok((1..=n).map(eval).collect())
 }
 
 /// Shamir t=2 CEK reconstruction from ANY TWO indexed shares — the DECRYPT-BOUNDARY
@@ -2290,6 +2345,51 @@ mod tests {
             .expect("golden combine");
             assert_eq!(rec.as_slice(), cek.as_slice());
         }
+    }
+
+    /// GENERAL t-of-n (`split_cek_shamir`): a 3-of-5 split where ANY 3 shares reconstruct the
+    /// CEK via the general Lagrange combine, any 2 do NOT, and the 1-coeff/n=3 case is
+    /// byte-identical to the pinned `split_cek_shamir2` (so the generalization cannot drift).
+    #[test]
+    fn cek_shamir_general_t_of_n_reconstructs_and_fails_closed() {
+        let cek: Vec<u8> = (0u8..24).map(|b| b.wrapping_mul(5) ^ 0x11).collect();
+        // t = 3 ⇒ a degree-2 polynomial ⇒ 2 coefficient vectors; n = 5 nodes.
+        let c1: Vec<u8> = (0u8..24).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
+        let c2: Vec<u8> = (0u8..24).map(|b| b.wrapping_mul(13) ^ 0x5A).collect();
+        let shares = crate::split_cek_shamir(&cek, &[&c1, &c2], 5).expect("split 3-of-5");
+        assert_eq!(shares.len(), 5);
+
+        // EVERY size-3 subset of the 5 coordinates reconstructs the exact CEK.
+        let coords = [1u8, 2, 3, 4, 5];
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                for k in (j + 1)..5 {
+                    let pts: Vec<(u8, &[u8])> = vec![
+                        (coords[i], shares[i].as_slice()),
+                        (coords[j], shares[j].as_slice()),
+                        (coords[k], shares[k].as_slice()),
+                    ];
+                    let rec = crate::lagrange_combine_at_zero(&pts).expect("combine triple");
+                    assert_eq!(rec.as_slice(), cek.as_slice(), "subset ({},{},{}) must reconstruct", coords[i], coords[j], coords[k]);
+                }
+            }
+        }
+
+        // BELOW THRESHOLD: 2 points cannot reconstruct a degree-2 secret — the result differs.
+        let two: Vec<(u8, &[u8])> = vec![(1, shares[0].as_slice()), (2, shares[1].as_slice())];
+        let under = crate::lagrange_combine_at_zero(&two).expect("combines but is wrong");
+        assert_ne!(under.as_slice(), cek.as_slice(), "t-1 shares must NOT reconstruct the secret");
+
+        // CONSISTENCY: the general split with one coeff + n=3 equals the pinned 2-of-3 split.
+        let coeff: Vec<u8> = (0u8..24).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
+        let general = crate::split_cek_shamir(&cek, &[&coeff], 3).expect("general 2-of-3");
+        let special = crate::split_cek_shamir2(&cek, &coeff).expect("special 2-of-3");
+        assert_eq!(general, special.to_vec(), "the generalization must match split_cek_shamir2 byte-for-byte");
+
+        // FAIL-CLOSED shapes: empty cek, n=0, coeff length mismatch.
+        assert!(crate::split_cek_shamir(&[], &[&c1], 5).is_err());
+        assert!(crate::split_cek_shamir(&cek, &[&c1, &c2], 0).is_err());
+        assert!(crate::split_cek_shamir(&cek, &[&c1[..23]], 5).is_err());
     }
 
     /// The indexed-share escrow encoding (`x ‖ share`) round-trips and fails closed on a

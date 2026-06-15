@@ -157,6 +157,7 @@ impl ObjectAuthorityProc {
         caller_seed_b64: &str,
         object_cid: &str,
         mime: &str,
+        access_grant_b64: Option<&str>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(helper_bin);
         cmd.args([
@@ -178,6 +179,11 @@ impl ObjectAuthorityProc {
             "--mime",
             mime,
         ]);
+        // TRUSTLESS AUTHORIZATION: forward the wallet-signed grant (base64 JSON) so the nodes
+        // verify the wallet + read the chain themselves. Absent => legacy enrolled-caller path.
+        if let Some(grant) = access_grant_b64.filter(|s| !s.trim().is_empty()) {
+            cmd.args(["--access-grant", grant]);
+        }
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

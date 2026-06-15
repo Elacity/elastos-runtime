@@ -51,6 +51,22 @@ use super::viewer_object::{
 pub struct OpenOwnedRequest {
     /// The Library object URI to open (e.g. `localhost://Users/<principal>/…/clip.mp4`).
     pub uri: String,
+    /// TRUSTLESS open (phase 2): the handle returned by `/api/viewers/prepare-grant` for this
+    /// open. Present only when the browser collected a wallet signature; absent => legacy
+    /// enrolled-caller path (the node still authorizes, via the rights receipt).
+    #[serde(default)]
+    pub grant_handle: Option<String>,
+    /// TRUSTLESS open (phase 2): the wallet's EIP-191 `personal_sign` over the canonical
+    /// delegation `prepare-grant` returned. Paired with `grant_handle`.
+    #[serde(default)]
+    pub delegation_sig_hex: Option<String>,
+}
+
+/// Phase-1 request: which owned object the user wants to open (so the gateway can bind the
+/// delegation to that asset's on-chain identity + this quorum's node-set).
+#[derive(Debug, Deserialize)]
+pub struct PrepareGrantRequest {
+    pub uri: String,
 }
 
 /// True when the asset should play through the media viewer (MSE) rather than the
@@ -131,6 +147,9 @@ pub async fn open_owned_in_viewer(
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };
     let principal_id = context.principal_id.clone();
+    // Phase timing (TRACE-level via INFO so it shows in the dev gateway log): the open has felt
+    // slow, so each phase logs its elapsed ms to pinpoint the cost (read / subject / rights / open).
+    let t_open = std::time::Instant::now();
 
     // Ownership gate: resolve + read the object inside the principal's OWN root.
     let data_dir = state.data_dir.clone();
@@ -204,7 +223,11 @@ pub async fn open_owned_in_viewer(
     // The on-chain subject is the principal's linked EVM wallet (or ELASTOS_DDRM_SUBJECT
     // override). Empty in dev mode is fine (a placeholder is derived); chain mode fails
     // closed without it.
+    tracing::info!("open timing: owned read + capsule parse {} ms", t_open.elapsed().as_millis());
+    let t_subject = std::time::Instant::now();
     let subject = resolve_subject_address(&state, &context.principal_id).await;
+    tracing::info!("open timing: subject resolve {} ms", t_subject.elapsed().as_millis());
+    let t_rights = std::time::Instant::now();
     let rights = {
         let principal_id = context.principal_id.clone();
         let content_id = object_cid.clone();
@@ -253,6 +276,17 @@ pub async fn open_owned_in_viewer(
                 .into_response()
         }
     };
+    // Surface the live decision (source + verdict + the subject the chain was keyed on) so the
+    // on-chain check is visible in the gateway log — `dev-local-attestation` vs
+    // `chain-provider (live RPC: …)` tells the operator exactly which gate ran.
+    tracing::info!(
+        "rights decision: allowed={} source={} cid={} subject={}",
+        rights.allowed,
+        rights.source,
+        object_cid,
+        if subject.trim().is_empty() { "<dev-derived>" } else { subject.as_str() }
+    );
+    tracing::info!("open timing: rights decision (chain RPC) {} ms", t_rights.elapsed().as_millis());
     if !rights.allowed {
         tracing::info!("owned open denied by rights for cid {object_cid}");
         return (
@@ -264,6 +298,30 @@ pub async fn open_owned_in_viewer(
     let rights_binding = rights.receipt_hash_hex.clone();
 
     if let Some(capsule) = capsule {
+        // TRUSTLESS open: if the browser collected a wallet signature (phase 2), assemble the
+        // wallet-signed grant here and forward it so the dKMS nodes authorize themselves. Absent
+        // (or malformed) => fall through to the legacy enrolled-caller path (None).
+        let access_grant_b64 = match (req.grant_handle.as_deref(), req.delegation_sig_hex.as_deref()) {
+            (Some(handle), Some(sig)) if !handle.trim().is_empty() && !sig.trim().is_empty() => {
+                match super::access_grant::assemble(handle, sig)
+                    .and_then(|g| super::access_grant::grant_to_b64(&g))
+                {
+                    Ok(b64) => {
+                        tracing::info!("trustless open: assembled wallet-signed grant for cid {object_cid}");
+                        Some(b64)
+                    }
+                    Err(err) => {
+                        tracing::warn!("trustless open: could not assemble grant ({err}); refusing");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "could not assemble access grant (re-prepare the open)",
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => None,
+        };
         return open_quorum(
             state,
             context,
@@ -274,6 +332,7 @@ pub async fn open_owned_in_viewer(
             decrypt_bin,
             session_id,
             rights_binding,
+            access_grant_b64,
         )
         .await;
     }
@@ -305,6 +364,132 @@ pub async fn open_owned_in_viewer(
         )
         .await
     }
+}
+
+/// The Base chain id the on-chain access lives on (8453 mainnet by default; overridable for tests).
+fn chain_id() -> u64 {
+    std::env::var("ELASTOS_DDRM_CHAIN_ID")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(8453)
+}
+
+/// PC2's `normalizedKid`: the on-chain `bytes16` contentId is the KID, always `0x`-prefixed. The
+/// capsule stores it bare 32-hex; prefix it so the grant binds to the same value the node reads.
+fn normalize_kid_0x(kid: &str) -> String {
+    let t = kid.trim();
+    if t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("0x{t}")
+    } else {
+        t.to_string()
+    }
+}
+
+/// POST /api/viewers/prepare-grant — phase 1 of the trustless open.
+///
+/// Resolve the owned `.ddrm` asset, bind a freshly-minted session key to (chain, the asset's
+/// `bytes16` contentId, THIS quorum's node-set, the user's wallet), and return the canonical
+/// delegation string the browser hands MetaMask for `personal_sign`. No authority is granted here;
+/// the signed grant only becomes meaningful when a node verifies it + reads the chain.
+pub async fn prepare_owned_grant(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(req): Json<PrepareGrantRequest>,
+) -> Response {
+    let context = match require_home_token_context(&state.data_dir, &headers) {
+        Ok(context) => context,
+        Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
+    };
+    let principal_id = context.principal_id.clone();
+
+    // The wallet-signed grant is only meaningful when the dKMS nodes do their OWN node-side
+    // on-chain check (chain mode). In dev / chain-mock the local quorum authorizes the recover
+    // via the enrolled caller seed, so a grant would only make the node fail closed (it requires
+    // DKMS_CHAIN_RPC_POOL). Tell the browser no grant is needed and let it fall back to the plain
+    // open path that already works in those modes.
+    if super::rights_authority::rights_mode() != super::rights_authority::RightsMode::Chain {
+        return (
+            StatusCode::BAD_REQUEST,
+            "wallet grant not required in this rights mode (use plain open)",
+        )
+            .into_response();
+    }
+
+    let data_dir = state.data_dir.clone();
+    let uri = req.uri.clone();
+    let owned = match tokio::task::spawn_blocking(move || {
+        crate::library::read_owned_object_for_viewer(&data_dir, &principal_id, &uri)
+    })
+    .await
+    {
+        Ok(Ok(owned)) => owned,
+        Ok(Err(err)) => {
+            tracing::warn!("prepare-grant: owned object resolve refused: {err}");
+            return (StatusCode::NOT_FOUND, "owned object not found").into_response();
+        }
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object read panicked").into_response()
+        }
+    };
+
+    // Only a quorum-openable `.ddrm` capsule carries the on-chain identity + node-set a grant binds.
+    let capsule = match dkms_capsule(&owned.bytes) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this asset is not a dKMS quorum capsule (no wallet grant needed)",
+            )
+                .into_response()
+        }
+    };
+    let prot = capsule.get("protections").and_then(|p| p.as_array()).and_then(|a| a.first());
+    let node_set_id_b64 = prot
+        .and_then(|p| p.get("node_set_id_b64"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let kid_hex = capsule
+        .get("kid")
+        .or_else(|| capsule.get("content_id"))
+        .and_then(|v| v.as_str())
+        .map(normalize_kid_0x)
+        .unwrap_or_default();
+    if node_set_id_b64.is_empty() || kid_hex.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "asset capsule is missing its node-set id or kid",
+        )
+            .into_response();
+    }
+
+    let subject = resolve_subject_address(&state, &context.principal_id).await;
+    let prepared = match super::access_grant::prepare(chain_id(), &kid_hex, &node_set_id_b64, &subject)
+    {
+        Ok(p) => p,
+        Err(err) => {
+            if err.contains("link an EVM wallet") {
+                return (StatusCode::FORBIDDEN, err).into_response();
+            }
+            tracing::warn!("prepare-grant failed: {err}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not prepare access grant").into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [("cache-control", "no-store")],
+        Json(json!({
+            "schema": "elastos.viewer.prepare-grant/v1",
+            "grant_handle": prepared.handle,
+            // The exact UTF-8 string the browser must EIP-191 personal_sign.
+            "delegation_canonical": prepared.delegation_canonical,
+            "owner_address": prepared.owner_address,
+            "kid": prepared.kid_hex,
+            "chain_id": prepared.chain_id,
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/market/buy — buy an access token for an owned Library object, then report
@@ -644,6 +829,7 @@ async fn open_quorum(
     decrypt_bin: String,
     session_id: String,
     rights_binding: String,
+    access_grant_b64: Option<String>,
 ) -> Response {
     let principal_id = context.principal_id.clone();
     let title = capsule
@@ -703,6 +889,8 @@ async fn open_quorum(
     };
     let object_cid_c = object_cid.clone();
     let mime_c = mime.clone();
+    let grant_c = access_grant_b64.clone();
+    let t_recover = std::time::Instant::now();
     let built = tokio::task::spawn_blocking(move || {
         // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
         // temp file, unlinked as soon as the helper has read it at launch.
@@ -718,6 +906,7 @@ async fn open_quorum(
             &caller_seed,
             &object_cid_c,
             &mime_c,
+            grant_c.as_deref(),
         )
     })
     .await;
@@ -739,6 +928,9 @@ async fn open_quorum(
                 .into_response()
         }
     };
+    // This single span covers helper spawn + key-provider/decrypt-provider spawn + the 2-of-3
+    // quorum recover over Carrier — the dominant cost of the open. Logged so we can see it.
+    tracing::info!("open timing: quorum recover (spawn + 2-of-3 over Carrier) {} ms", t_recover.elapsed().as_millis());
 
     let session =
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);

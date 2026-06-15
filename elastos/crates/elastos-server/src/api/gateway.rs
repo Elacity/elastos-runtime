@@ -653,6 +653,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
             axum::routing::post(super::viewer_open::open_owned_in_viewer),
         )
         .route(
+            "/api/viewers/prepare-grant",
+            axum::routing::post(super::viewer_open::prepare_owned_grant),
+        )
+        .route(
             "/api/market/buy",
             axum::routing::post(super::viewer_open::buy_owned_access),
         )
@@ -666,7 +670,11 @@ pub fn gateway_router(state: GatewayState) -> Router {
         )
         .route(
             "/api/apps/creator/prepare-mint",
-            axum::routing::post(super::creator::creator_prepare_mint),
+            // The mint payload carries the asset bytes (base64) inline, so it far exceeds axum's
+            // 2 MB default body cap. Allow the same ceiling as a Library upload (100 MB) — base64
+            // inflation (~33%) means this comfortably covers an image and a modest video.
+            axum::routing::post(super::creator::creator_prepare_mint)
+                .layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
         )
         .route(
             "/api/apps/creator/wallet",
@@ -683,6 +691,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
         .route(
             "/api/apps/creator/prepare-trade-approval",
             axum::routing::post(super::creator::creator_prepare_trade_approval),
+        )
+        .route(
+            "/api/apps/creator/mint-status",
+            axum::routing::post(super::creator::creator_mint_status),
         )
         .route(
             "/api/viewers/elacity-player/media/open",

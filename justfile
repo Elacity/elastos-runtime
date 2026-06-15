@@ -46,6 +46,12 @@ lint:
 fmt:
     cd elastos && cargo fmt --all
 
+# Dependency CVE audit (RUSTSEC). On-demand gate; the one known advisory
+# (RUSTSEC-2024-0436 — `paste` unmaintained, transitive via iroh) is allow-listed,
+# so this fails only on NEW advisories. Wire into `verify` once the tree is quiet.
+audit:
+    cd elastos && cargo audit --ignore RUSTSEC-2024-0436
+
 # Pre-commit gate: alignment, smoke tests, fmt/lint/test
 verify:
     just alignment-check

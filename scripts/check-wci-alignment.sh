@@ -4,6 +4,35 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# ripgrep is REQUIRED. The forbidden-pattern checks below pass load-bearing
+# `--glob '!...'` exclusions (provider/connector/test/capsule.json exemptions, plus
+# `!target/**`). Those globs are not optional: without them a check matches the very
+# capsules it is meant to exempt (e.g. wallet-provider, wallet-metamask) and reports
+# false failures, and a path-scoped check scans compiled binaries under
+# `capsules/*/target/`. A plain-grep fallback cannot faithfully reproduce ripgrep's
+# gitignore-aware, multi-glob semantics, so we fail loudly here — before any caller
+# redirects stderr to /dev/null — rather than silently produce wrong results.
+if ! command -v rg >/dev/null 2>&1; then
+  echo "[alignment] ERROR: ripgrep (rg) is required for alignment-check." >&2
+  echo "[alignment]   the forbidden-pattern checks rely on rg --glob exclusions that a" >&2
+  echo "[alignment]   grep fallback cannot honor; running without rg yields false results." >&2
+  echo "[alignment]   install: 'brew install ripgrep' (macOS) or 'apt-get install ripgrep' (Debian/Ubuntu)." >&2
+  exit 2
+fi
+
+# Capsules that declare `"role": "provider"` are part of the provider plane and are
+# exempt from the "ordinary app capsule must not touch wallet/chain authority" checks —
+# even when their directory name does not end in `-provider` (e.g. content-market,
+# browser-engine-adapter, operator-drive-adapter). Build role-based exemption globs so
+# the exemption tracks the declared role, not a `-provider` name convention.
+provider_role_globs=()
+for manifest in capsules/*/capsule.json; do
+  if rg -q '"role"[[:space:]]*:[[:space:]]*"provider"' "$manifest" 2>/dev/null; then
+    provider_dir="$(basename "$(dirname "$manifest")")"
+    provider_role_globs+=( --glob "!capsules/${provider_dir}/**" )
+  fi
+done
+
 scope=(
   README.md
   docs
@@ -29,31 +58,7 @@ trap 'rm -f "$tmp"' EXIT
 rg_search() {
   local pattern="$1"
   shift
-  if command -v rg >/dev/null 2>&1; then
-    rg -n "$pattern" "$@"
-    return
-  fi
-  local grep_args=(-R -n -E)
-  local paths=()
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --glob)
-        shift
-        case "${1:-}" in
-          '!archive/**') grep_args+=(--exclude-dir=archive) ;;
-          '!docs/ANTI_DRIFT.md') grep_args+=(--exclude=ANTI_DRIFT.md) ;;
-          '!plans/**') grep_args+=(--exclude-dir=plans) ;;
-          '!scripts/check-wci-alignment.sh') grep_args+=(--exclude=check-wci-alignment.sh) ;;
-          '!target/**') grep_args+=(--exclude-dir=target) ;;
-        esac
-        ;;
-      *)
-        paths+=("$1")
-        ;;
-    esac
-    shift || true
-  done
-  grep "${grep_args[@]}" -- "$pattern" "${paths[@]}"
+  rg -n "$pattern" "$@"
 }
 
 check_forbidden() {
@@ -84,6 +89,47 @@ check_forbidden_in_path() {
   local path="$2"
   local label="$3"
   if rg_search "$pattern" "$path" >"$tmp" 2>/dev/null; then
+    echo "[alignment] forbidden pattern found: $label"
+    cat "$tmp"
+    echo
+    failed=1
+  fi
+}
+
+# Drop rg `-n` hits (path:line:content) whose matched line is comment-only. The scanned
+# capsules are Rust/JS/TS/HTML, so the comment forms are `//`, `/* … */`, block-comment
+# continuations (`* …`), and `<!-- … -->`. `#` (a Rust attribute) and a bare leading `*`
+# (a deref) are deliberately NOT treated as comments. A documentation line that merely
+# NAMES a provider/authority is not a code reference, so it must not trip these checks.
+strip_comment_hits() {
+  awk '{
+    content = $0
+    sub(/^[^:]*:[0-9]+:/, "", content)
+    probe = content
+    sub(/^[[:space:]]+/, "", probe)
+    if (probe ~ /^(\/\/|\/\*|\*\/|\* |<!--)/) next
+    print
+  }'
+}
+
+# "Ordinary app capsule must not touch X authority" check: search `capsules` for
+# forbidden CODE references (comment-only mentions are ignored via strip_comment_hits),
+# always exempting the provider plane (by name and by declared role), capsule manifests,
+# and test/spec/build files. Args: label, rg pattern, then any check-specific --glob args.
+check_app_authority() {
+  local label="$1" pattern="$2"
+  shift 2
+  rg_search "$pattern" capsules \
+    --glob '!**/capsule.json' \
+    --glob '!**/tests/**' \
+    --glob '!**/*test*' \
+    --glob '!**/*spec*' \
+    --glob '!**/target/**' \
+    --glob '!capsules/*-provider/**' \
+    --glob '!elastos/capsules/*-provider/**' \
+    "${provider_role_globs[@]}" \
+    "$@" 2>/dev/null | strip_comment_hits >"$tmp" || true
+  if [[ -s "$tmp" ]]; then
     echo "[alignment] forbidden pattern found: $label"
     cat "$tmp"
     echo
@@ -346,59 +392,26 @@ if rg_search 'passkey|webauthn|PublicKeyCredential|credentials\.(create|get)' ca
   failed=1
 fi
 check_forbidden_in_path 'credentials\.create|passkey/register|webauthn/register' capsules/wallet 'Wallet may request fresh passkey authentication for protected recovery, but must not register passkeys'
-if rg_search 'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window\.ethereum|window\.unisat|ethereum\.request|personal_sign|eth_requestAccounts|eth_sendTransaction|wallet_switchEthereumChain|signMessage' capsules \
+check_app_authority 'app capsules must not touch browser wallet authority directly' \
+  'WalletConnect|walletconnect|MetaMask|metamask|UniSat|unisat|window\.ethereum|window\.unisat|ethereum\.request|personal_sign|eth_requestAccounts|eth_sendTransaction|wallet_switchEthereumChain|signMessage' \
   --glob '!capsules/home/browser/*' \
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/browser/*' \
   --glob '!capsules/wallet-metamask/*' \
   --glob '!capsules/wallet-unisat/*' \
   --glob '!capsules/wallet/*' \
-  --glob '!capsules/wallet-walletconnect/*' \
-  --glob '!capsules/*-provider/**' \
-  --glob '!elastos/capsules/*-provider/**' \
-  --glob '!**/capsule.json' \
-  --glob '!**/tests/**' \
-  --glob '!**/*test*' \
-  --glob '!**/*spec*' \
-  --glob '!**/target/**' >"$tmp" 2>/dev/null; then
-  echo "[alignment] forbidden pattern found: app capsules must not touch browser wallet authority directly"
-  cat "$tmp"
-  echo
-  failed=1
-fi
-if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain provider|rpc_url|RPC_URL|JSON-RPC|jsonrpc|eth_call|eth_chainId|bitcoin-cli|bitcoind|Bitcoin Core RPC' capsules \
-  --glob '!capsules/*-provider/**' \
-  --glob '!elastos/capsules/*-provider/**' \
+  --glob '!capsules/wallet-walletconnect/*'
+check_app_authority 'app capsules must not touch raw chain/node authority directly' \
+  'elastos://chain|/api/provider/chain|chain-provider|blockchain provider|rpc_url|RPC_URL|JSON-RPC|jsonrpc|eth_call|eth_chainId|bitcoin-cli|bitcoind|Bitcoin Core RPC' \
   --glob '!capsules/system/browser/*' \
   --glob '!capsules/wallet-metamask/*' \
   --glob '!capsules/wallet-unisat/*' \
   --glob '!capsules/wallet/*' \
-  --glob '!capsules/wallet-walletconnect/*' \
-  --glob '!**/capsule.json' \
-  --glob '!**/tests/**' \
-  --glob '!**/*test*' \
-  --glob '!**/*spec*' \
-  --glob '!**/target/**' >"$tmp" 2>/dev/null; then
-  echo "[alignment] forbidden pattern found: app capsules must not touch raw chain/node authority directly"
-  cat "$tmp"
-  echo
-  failed=1
-fi
-if rg_search 'elastos://wallet|/api/provider/wallet|wallet-provider' capsules \
+  --glob '!capsules/wallet-walletconnect/*'
+check_app_authority 'app capsules must not reference raw wallet provider authority directly' \
+  'elastos://wallet|/api/provider/wallet|wallet-provider' \
   --glob '!capsules/system/browser/*' \
-  --glob '!capsules/browser/*' \
-  --glob '!capsules/*-provider/**' \
-  --glob '!elastos/capsules/*-provider/**' \
-  --glob '!**/capsule.json' \
-  --glob '!**/tests/**' \
-  --glob '!**/*test*' \
-  --glob '!**/*spec*' \
-  --glob '!**/target/**' >"$tmp" 2>/dev/null; then
-  echo "[alignment] forbidden pattern found: app capsules must not reference raw wallet provider authority directly"
-  cat "$tmp"
-  echo
-  failed=1
-fi
+  --glob '!capsules/browser/*'
 check_forbidden_in_path 'home_session_cookie_header|home_session_cookie_is_valid|SET_COOKIE' elastos/crates/elastos-server/src/api/browser_capsules.rs 'Home static route must not auto-mint a local session cookie'
 check_forbidden_in_path 'default chat profile' docs/GETTING_STARTED.md 'onboarding must teach the default Home profile, not the old chat profile'
 check_forbidden_in_path 'darwin\)' scripts/install.sh 'public installer must stay Linux-only until update/install support macOS coherently'
@@ -549,21 +562,12 @@ for path in manifest_paths:
             "elastos://rights": "raw protected-content rights backend namespace",
             "elastos://key": "raw protected-content key backend namespace",
             "elastos://decrypt": "raw protected-content decrypt/render backend namespace",
-            "chain-provider": "raw chain backend provider",
-            "net-provider": "raw Browser/Net backend provider",
-            "exit-provider": "raw Browser Exit backend provider",
-            "browser-engine-adapter": "raw Browser Engine backend adapter",
-            "browser-engine-supervisor": "raw Browser Engine host supervisor",
-            "browser-stream-bridge": "raw Browser Engine byte transport bridge",
-            "browser-local-exit": "raw Browser local Exit daemon",
-            "wallet-provider": "raw wallet backend provider",
-            "object-provider": "raw object backend provider",
-            "ipfs-provider": "raw IPFS backend provider",
-            "availability-provider": "raw availability backend provider",
-            "drm-provider": "raw protected-content backend provider",
-            "rights-provider": "raw protected-content rights backend provider",
-            "key-provider": "raw protected-content key backend provider",
-            "decrypt-provider": "raw protected-content decrypt/render backend provider",
+            # Bare provider/adapter capsule *names* (chain-provider, object-provider,
+            # wallet-provider, browser-engine-adapter, …) are intentionally NOT topology-leak
+            # signals: an app capsule that merely names a provider — in a log prefix, a
+            # classification list, or its own VIEWER_ID — is not touching that backend. The
+            # real raw-access vectors are kept: the elastos:// namespaces above, the
+            # /api/provider/* routes, and the concrete RPC/SDK/loopback tokens below.
             "/api/provider/chain": "direct chain provider route",
             "/api/provider/net": "direct Browser/Net provider route",
             "/api/provider/exit": "direct Browser Exit provider route",
@@ -571,7 +575,6 @@ for path in manifest_paths:
             "/api/provider/wallet": "direct wallet provider route",
             "ipfs-cluster": "raw IPFS Cluster backend",
             "elacity-sdk": "raw Elacity SDK backend",
-            "elacity": "raw Elacity backend",
             "/api/provider/ipfs": "direct IPFS provider route",
             "WalletConnect": "direct browser wallet adapter authority",
             "walletconnect": "direct browser wallet adapter authority",
@@ -604,9 +607,16 @@ for path in manifest_paths:
                     continue
                 if source.name in {"mgba.js"} or source.suffix not in {".html", ".rs", ".ts", ".tsx", ".js", ".mjs"}:
                     continue
-                text = source.read_text(errors="ignore")
+                # Ignore comment-only lines: a doc comment that merely names a provider
+                # or route is not a code reference. Comment forms for the scanned
+                # Rust/JS/TS/HTML files are //, /* … */, block continuations (* …), and
+                # <!-- … -->; `#` (Rust attribute) and bare `*` (deref) are not comments.
+                code_text = "\n".join(
+                    ln for ln in source.read_text(errors="ignore").splitlines()
+                    if not ln.lstrip().startswith(("//", "/*", "*/", "* ", "<!--"))
+                )
                 for pattern, reason in forbidden_source_patterns.items():
-                    if pattern in text:
+                    if pattern in code_text:
                         print(f"[alignment] ordinary capsule {manifest.get('name', path)} leaks host topology in {source}: {reason}")
                         sys.exit(1)
 
@@ -903,6 +913,33 @@ for name in ("home", "system", "documents", "library", "marketplace", "inbox"):
             print(f"[alignment] {name} capsule missing {platform} archive metadata")
             sys.exit(1)
 PY
+
+# ── Trusted-core freeze (ADR 0001 Phase 0) ───────────────────────────────────
+# These elastos-server files hold app/service logic that ADR 0001 says belongs in
+# capsules (content-market/availability, chat-room, library, documents). Until the
+# extraction lands they are FROZEN: each may only SHRINK. The ceilings are a
+# no-ballooning band — a little above today's size, so ordinary maintenance edits
+# pass but a whole new service concern (hundreds of lines) fails. Policy: ratchet
+# these numbers DOWN as ADR phases land; NEVER raise them. (A per-file freeze can be
+# evaded by adding a new file — that is what the ADR + review catch; this gate stops
+# the known offenders from growing.)
+check_core_freeze() {
+  local rel="$1" ceiling="$2"
+  local path="elastos/crates/elastos-server/src/$rel"
+  [[ -f "$path" ]] || return 0
+  local lines
+  lines=$(wc -l < "$path" | tr -d ' ')
+  if [[ "$lines" -gt "$ceiling" ]]; then
+    echo "[alignment] trusted-core freeze: $rel grew to $lines lines (ceiling $ceiling) — ADR 0001 Phase 0."
+    echo "  This file holds app/service logic that belongs in its capsule, not the trusted core."
+    echo "  Move logic out (shrink it), or — if this commit IS the extraction — lower the ceiling."
+    failed=1
+  fi
+}
+check_core_freeze content.rs 13200
+check_core_freeze room_service.rs 5550
+check_core_freeze documents.rs 1700
+check_core_freeze library.rs 7300   # extra headroom: in-flight dDRM work touches this; tighten after it lands
 
 if [[ "$failed" -ne 0 ]]; then
   echo "[alignment] FAILED"

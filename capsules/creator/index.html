@@ -90,6 +90,17 @@
         cursor: pointer;
       }
       button.primary:disabled { background: #b9c6e8; cursor: not-allowed; }
+      /* Promote "Enable trading" once the mint confirms on-chain so it reads as the next action. */
+      button.primary.is-ready {
+        animation: enable-trading-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes enable-trading-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(64, 120, 240, 0.45); }
+        50% { box-shadow: 0 0 0 7px rgba(64, 120, 240, 0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        button.primary.is-ready { animation: none; box-shadow: 0 0 0 3px rgba(64, 120, 240, 0.35); }
+      }
       .steps { list-style: none; padding: 0; margin: 0; }
       .steps li {
         display: flex;
@@ -139,6 +150,19 @@
           <label for="desc">Description</label>
           <textarea id="desc" placeholder="What is it?"></textarea>
         </div>
+        <div class="field">
+          <label for="thumb-input">Cover thumbnail (optional)</label>
+          <div id="thumb-drop" class="drop" tabindex="0" role="button" aria-label="Choose a cover image" style="padding:16px">
+            <strong id="thumb-drop-title">Add a cover image</strong>
+            <div class="meta" id="thumb-drop-meta">Auto-generated if you skip this &middot; click or drop</div>
+            <input id="thumb-input" type="file" accept="image/*" class="hidden" />
+          </div>
+          <div id="thumb-preview-wrap" class="hidden" style="margin-top:10px;display:flex;align-items:center;gap:10px">
+            <img id="thumb-preview-img" alt="cover preview" style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" />
+            <button id="thumb-remove" type="button" style="border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">Remove</button>
+          </div>
+          <div class="hint" id="thumb-hint">No cover? A degraded preview is generated automatically (blurred for images, a frame for video, a waveform for audio, a template otherwise) — the full asset stays encrypted.</div>
+        </div>
         <div class="field row">
           <div>
             <label for="price">Price</label>
@@ -151,6 +175,27 @@
               <option value="USDC">USDC</option>
               <option value="ETH">ETH</option>
             </select>
+          </div>
+        </div>
+        <div class="field row">
+          <div>
+            <label for="copies">Access tokens (supply)</label>
+            <input id="copies" type="number" min="1" step="1" value="10000" />
+            <div class="hint" id="copies-hint">How many holders can be granted access. Each access token unlocks the content for one owner.</div>
+          </div>
+          <div>
+            <label for="category">Category (optional)</label>
+            <input id="category" type="text" placeholder="e.g. Art, Music, Video" />
+          </div>
+        </div>
+        <div class="field hidden" id="preview-settings">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input id="preview-enabled" type="checkbox" style="width:auto" />
+            <span>Free preview clip (video/audio)</span>
+          </label>
+          <div id="preview-controls" class="hidden" style="margin-top:8px">
+            <input id="preview-duration" type="range" min="5" max="60" step="5" value="15" style="width:100%" />
+            <div class="hint">Plays the first <strong id="preview-duration-display">15s</strong> unencrypted as a public teaser (max 60s). The full asset stays dKMS-encrypted.</div>
           </div>
         </div>
         <div class="field">
@@ -203,6 +248,6 @@
         </div>
       </section>
     </main>
-    <script src="creator.js"></script>
+    <script src="creator.js?v=creator-20260615d"></script>
   </body>
 </html>

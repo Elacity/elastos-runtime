@@ -130,12 +130,15 @@ pub fn buy_access(
                 // authoritative buyer, so ownership is recorded under its address.
                 let chain_id = chain_id_default();
                 let mut intent_seen = Value::Null;
-                let sig =
-                    super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
+                let sig = super::wallet_signer::sign_with_managed_account(
+                    principal_id,
+                    chain_id,
+                    |from| {
                         let intent = mock_transaction_intent(from, content_id, chain_id);
                         intent_seen = intent.clone();
                         Ok(intent)
-                    })?;
+                    },
+                )?;
                 let tx_hash =
                     super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)?;
                 super::owned_ledger::record(content_id, &sig.signer)?;
@@ -168,12 +171,15 @@ pub fn buy_access(
                 // makes `chain` mode genuinely live.
                 let chain_id = chain_id_default();
                 let mut intent_seen = Value::Null;
-                let sig =
-                    super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
+                let sig = super::wallet_signer::sign_with_managed_account(
+                    principal_id,
+                    chain_id,
+                    |from| {
                         let intent = prepare_live_intent(from, content_id)?;
                         intent_seen = intent.clone();
                         Ok(intent)
-                    })?;
+                    },
+                )?;
                 let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)?;
                 // Ownership is read back from `hasAccessByContentId` once the tx confirms,
                 // not from the local ledger; owned_now reflects "broadcast accepted".
@@ -222,14 +228,16 @@ pub fn buy_access(
 /// 32-byte word derived from `content_id` (the ledger's content-hash tokenId); pin the
 /// real value with `ELASTOS_DDRM_BUY_TOKEN_ID`. Pure: no RPC, no keys.
 fn assemble_buy_tx(content_id: &str, subject: &str) -> Value {
-    let to = env_nonempty("ELASTOS_DDRM_BUY_TO").unwrap_or_else(|| BASE_AUTHORITY_GATEWAY.to_string());
+    let to =
+        env_nonempty("ELASTOS_DDRM_BUY_TO").unwrap_or_else(|| BASE_AUTHORITY_GATEWAY.to_string());
     // Default ledger to the AuthorityGateway is wrong; default it to the (overridable)
     // channel. With no channel pinned we fall back to `to` so calldata stays well-formed.
     let ledger = env_nonempty("ELASTOS_DDRM_BUY_LEDGER").unwrap_or_else(|| to.clone());
     let seller = env_nonempty("ELASTOS_DDRM_BUY_SELLER").unwrap_or_else(|| subject.to_string());
     let quantity = env_nonempty("ELASTOS_DDRM_BUY_QUANTITY").unwrap_or_else(|| "1".to_string());
     let price = env_nonempty("ELASTOS_DDRM_BUY_PRICE").unwrap_or_else(|| "0".to_string());
-    let pay_token = env_nonempty("ELASTOS_DDRM_BUY_PAYTOKEN").unwrap_or_else(|| BASE_USDC.to_string());
+    let pay_token =
+        env_nonempty("ELASTOS_DDRM_BUY_PAYTOKEN").unwrap_or_else(|| BASE_USDC.to_string());
     let native = pay_token.is_empty() || pay_token.eq_ignore_ascii_case("native");
 
     // tokenId: a pinned decimal/hex, else derived from content_id.
@@ -242,14 +250,21 @@ fn assemble_buy_tx(content_id: &str, subject: &str) -> Value {
         (
             BUY_ACCESS_NATIVE_SELECTOR.to_string(),
             // Native payment: value carries the price (decimal wei → hex quantity).
-            price.parse::<u128>().map(|n| format!("0x{n:x}")).unwrap_or_else(|_| "0x0".to_string()),
-            BUY_ACCESS_NATIVE_SELECTOR.trim_start_matches("0x").to_string(),
+            price
+                .parse::<u128>()
+                .map(|n| format!("0x{n:x}"))
+                .unwrap_or_else(|_| "0x0".to_string()),
+            BUY_ACCESS_NATIVE_SELECTOR
+                .trim_start_matches("0x")
+                .to_string(),
         )
     } else {
         (
             BUY_ACCESS_ERC20_SELECTOR.to_string(),
             "0x0".to_string(),
-            BUY_ACCESS_ERC20_SELECTOR.trim_start_matches("0x").to_string(),
+            BUY_ACCESS_ERC20_SELECTOR
+                .trim_start_matches("0x")
+                .to_string(),
         )
     };
 
@@ -319,8 +334,16 @@ fn prepare_live_intent(from: &str, content_id: &str) -> Result<Value, String> {
         .filter(|s| !s.is_empty())
         .ok_or("live buy requires ELASTOS_DDRM_BUY_TO (the AuthorityGateway/contract address)")?
         .to_string();
-    let value = tx.get("value").and_then(Value::as_str).unwrap_or("0x0").to_string();
-    let data = tx.get("data").and_then(Value::as_str).unwrap_or("0x").to_string();
+    let value = tx
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("0x0")
+        .to_string();
+    let data = tx
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("0x")
+        .to_string();
     super::chain_tx::prepare_intent_live(from, &to, &value, &data)
 }
 
@@ -374,7 +397,11 @@ fn word_from_uint(dec: &str) -> String {
 fn representative_signed_tx(unsigned_tx: &Value) -> String {
     let mut h = Sha256::new();
     h.update(b"elastos-ddrm/buy-mock-signed/v1");
-    h.update(serde_json::to_string(unsigned_tx).unwrap_or_default().as_bytes());
+    h.update(
+        serde_json::to_string(unsigned_tx)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     format!("0x02{}", hex::encode(h.finalize()))
 }
 
@@ -416,8 +443,7 @@ mod tests {
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));
         std::env::remove_var("ELASTOS_DDRM_RIGHTS"); // dev
 
-        let out = buy_access("did:test:alice", "bafyDEV", SUBJECT, 1_700_000_000)
-            .expect("dev buy");
+        let out = buy_access("did:test:alice", "bafyDEV", SUBJECT, 1_700_000_000).expect("dev buy");
         assert!(out.owned_now);
         assert!(out.tx_hash.starts_with("0x"));
         assert!(super::super::owned_ledger::contains("bafyDEV", SUBJECT));
@@ -432,8 +458,12 @@ mod tests {
         // No pinned overrides -> `to` defaults to the real AuthorityGateway and the
         // calldata uses the real ERC-20 `buyAccess` selector (USDC default).
         for k in [
-            "ELASTOS_DDRM_BUY_TO", "ELASTOS_DDRM_BUY_LEDGER", "ELASTOS_DDRM_BUY_SELLER",
-            "ELASTOS_DDRM_BUY_QUANTITY", "ELASTOS_DDRM_BUY_PRICE", "ELASTOS_DDRM_BUY_PAYTOKEN",
+            "ELASTOS_DDRM_BUY_TO",
+            "ELASTOS_DDRM_BUY_LEDGER",
+            "ELASTOS_DDRM_BUY_SELLER",
+            "ELASTOS_DDRM_BUY_QUANTITY",
+            "ELASTOS_DDRM_BUY_PRICE",
+            "ELASTOS_DDRM_BUY_PAYTOKEN",
             "ELASTOS_DDRM_BUY_TOKEN_ID",
         ] {
             std::env::remove_var(k);
@@ -445,7 +475,8 @@ mod tests {
         // Exactly the fields wallet-provider's `validate_eip155_transaction_intent_payload`
         // requires (schema/type/intent/approval/chain_id/from/to/quantities/data).
         assert_eq!(
-            intent["schema"], "elastos.chain.unsigned_transaction_intent/v1"
+            intent["schema"],
+            "elastos.chain.unsigned_transaction_intent/v1"
         );
         assert_eq!(intent["transaction_type"], "eip155_legacy");
         assert_eq!(intent["wallet_intent"], "transaction_intent");
@@ -517,8 +548,15 @@ mod tests {
         let cid = "bafyLOOP";
         let decide = || {
             super::super::rights_authority::decide_owned_access(
-                "did:test:alice", "s1", cid, SUBJECT, "view", "render", None,
-                1_700_000_000, 900,
+                "did:test:alice",
+                "s1",
+                cid,
+                SUBJECT,
+                "view",
+                "render",
+                None,
+                1_700_000_000,
+                900,
             )
         };
 
@@ -566,10 +604,15 @@ mod tests {
         assert!(out.owned_now);
         // A real, broadcast tx hash (mock-echoed) and a recovered managed signer address.
         assert!(out.tx_hash.starts_with("0x") && out.tx_hash.len() == 66);
-        let signer = out.unsigned_tx["signer"].as_str().expect("signer in audit view");
+        let signer = out.unsigned_tx["signer"]
+            .as_str()
+            .expect("signer in audit view");
         let hex = signer.trim_start_matches("0x");
         assert!(hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(out.unsigned_tx["signed_tx_hash"].as_str().unwrap().starts_with("0x"));
+        assert!(out.unsigned_tx["signed_tx_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
         // Ownership recorded under the signer (the authoritative buyer).
         assert!(super::super::owned_ledger::contains("bafyWALLET", signer));
 

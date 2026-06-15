@@ -26,6 +26,6 @@ name = "dkms-live-recover"
 path = "src/main.rs"
 
 [dependencies]
-ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant"] }
 serde_json = "1.0"
 base64 = "0.22"

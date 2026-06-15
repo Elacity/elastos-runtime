@@ -37,6 +37,7 @@ const FORBIDDEN_KEY_FIELDS = [
 const MEDIA_PREFIXES = ["video/", "audio/"];
 
 let selectedFile = null;
+let customThumbnail = null;
 
 const els = {
   drop: document.getElementById("drop"),
@@ -47,6 +48,18 @@ const els = {
   desc: document.getElementById("desc"),
   price: document.getElementById("price"),
   currency: document.getElementById("currency"),
+  copies: document.getElementById("copies"),
+  category: document.getElementById("category"),
+  thumbDrop: document.getElementById("thumb-drop"),
+  thumbInput: document.getElementById("thumb-input"),
+  thumbPreviewWrap: document.getElementById("thumb-preview-wrap"),
+  thumbPreviewImg: document.getElementById("thumb-preview-img"),
+  thumbRemove: document.getElementById("thumb-remove"),
+  previewSettings: document.getElementById("preview-settings"),
+  previewEnabled: document.getElementById("preview-enabled"),
+  previewControls: document.getElementById("preview-controls"),
+  previewDuration: document.getElementById("preview-duration"),
+  previewDurationDisplay: document.getElementById("preview-duration-display"),
   wallet: document.getElementById("wallet"),
   walletHint: document.getElementById("wallet-hint"),
   channel: document.getElementById("channel"),
@@ -74,6 +87,13 @@ const MANUAL_CHANNEL_VALUE = "__manual__";
 // Re-poll cadence while the on-chain channel index is still backfilling older channels.
 const CHANNEL_POLL_MS = 2500;
 let channelPollTimer = null;
+// Monotonic token to cancel a stale mint-confirmation watcher when a new mint starts.
+let mintWatchToken = 0;
+// True while a freshly-minted asset's first tx (mint) is still pending confirmation: Step 2
+// stays visible-but-disabled until the chain confirms it (PC2 gates the 2nd tx the same way).
+let tradeGated = false;
+const DEFAULT_TRADE_HINT =
+  "Once the mint confirms on-chain, approve the gateway so others can trade your asset.";
 
 function query(name) {
   try {
@@ -104,8 +124,12 @@ function setStep(name, state) {
 }
 
 function resetSteps() {
+  mintWatchToken += 1; // cancel any in-flight mint-confirmation watcher from a prior mint
+  tradeGated = false;
   ["encrypt", "publish", "sign", "broadcast", "approve"].forEach((s) => setStep(s, ""));
+  if (els.enableTrading) els.enableTrading.classList.remove("is-ready");
   if (els.enableTrading) els.enableTrading.disabled = false;
+  if (els.enableTradingHint) els.enableTradingHint.textContent = DEFAULT_TRADE_HINT;
   // Button visibility is governed by the wallet+channel selection (refreshTradeEnabled),
   // so it stays available for the latest minted asset; only re-enable it here.
   refreshTradeEnabled();
@@ -139,6 +163,8 @@ function onFile(file) {
   els.dropMeta.innerHTML =
     humanSize(file.size) + " &middot; " + mime + ' <span class="badge">' + kind + "</span>";
   if (!els.title.value) els.title.value = file.name.replace(/\.[^.]+$/, "");
+  // The free-preview clip only applies to time-based media (video/audio).
+  if (els.previewSettings) els.previewSettings.classList.toggle("hidden", kind !== "media");
   refreshMintEnabled();
 }
 
@@ -174,6 +200,23 @@ function refreshTradeEnabled() {
   const ready = Boolean(els.wallet.value && selectedChannel());
   els.enableTrading.hidden = !ready;
   if (els.enableTradingHint) els.enableTradingHint.hidden = !ready;
+  // While a fresh mint's tx1 is pending, keep Step 2 un-clickable (PC2 parity) even if the
+  // wallet/channel selection re-runs this. The mint-confirmation watcher lifts the gate.
+  if (tradeGated) {
+    els.enableTrading.disabled = true;
+    els.enableTrading.classList.remove("is-ready");
+  }
+}
+
+// After a fresh mint is broadcast: show Step 2 but DISABLE it until the mint confirms on-chain.
+function gateTradeUntilConfirmed() {
+  tradeGated = true;
+  refreshTradeEnabled();
+  if (els.enableTradingHint) {
+    els.enableTradingHint.hidden = !(els.wallet.value && selectedChannel());
+    els.enableTradingHint.textContent =
+      "Waiting for the mint to confirm on-chain… Step 2 unlocks automatically.";
+  }
 }
 
 // ── wallet + channel discovery ───────────────────────────────────────────────
@@ -412,6 +455,201 @@ async function preflight() {
   }
 }
 
+// ── cover thumbnail generation (browser-side; the frame already holds the bytes) ─────────────
+// Mirrors PC2's `elacity-creator` cascade (app.js:4265): a degraded, public teaser derived from
+// the asset. Custom upload wins; otherwise a low-res BLURRED still for images, a frame for video,
+// a synthetic waveform for audio, a canvas teaser for text, and a generative gradient template
+// for anything else. The host pins whatever bytes come back and sets `metadata.image`.
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("thumbnail read error"));
+    reader.onload = () => {
+      const r = reader.result || "";
+      const comma = r.indexOf(",");
+      resolve(comma >= 0 ? r.slice(comma + 1) : r);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function canvasToThumb(canvas, quality) {
+  const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", quality || 0.85));
+  if (!blob) return null;
+  return { b64: await blobToBase64(blob), mime: "image/jpeg" };
+}
+
+async function thumbFromCustom(file) {
+  const img = await createImageBitmap(file);
+  const max = 1280;
+  const scale = Math.min(max / img.width, max / img.height, 1);
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * scale);
+  c.height = Math.round(img.height * scale);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return canvasToThumb(c, 0.85);
+}
+
+async function thumbFromImage(file) {
+  // Low-res + slight blur + darken so it can't substitute for the real content.
+  const img = await createImageBitmap(file);
+  const max = 200;
+  const scale = Math.min(max / img.width, max / img.height, 1);
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * scale);
+  c.height = Math.round(img.height * scale);
+  const ctx = c.getContext("2d");
+  ctx.filter = "blur(1px)";
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  ctx.filter = "none";
+  ctx.fillStyle = "rgba(0,0,0,0.08)";
+  ctx.fillRect(0, 0, c.width, c.height);
+  return canvasToThumb(c, 0.6);
+}
+
+function thumbFromVideo(file) {
+  return new Promise((resolve) => {
+    const v = document.createElement("video");
+    v.preload = "auto";
+    v.muted = true;
+    v.playsInline = true;
+    const url = URL.createObjectURL(file);
+    v.src = url;
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      URL.revokeObjectURL(url);
+      v.src = "";
+      resolve(val);
+    };
+    v.addEventListener("seeked", async () => {
+      const vw = v.videoWidth || 640;
+      const vh = v.videoHeight || 360;
+      const scale = Math.min(640 / vw, 640 / vh, 1);
+      const c = document.createElement("canvas");
+      c.width = Math.round(vw * scale);
+      c.height = Math.round(vh * scale);
+      c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+      finish(await canvasToThumb(c, 0.85));
+    }, { once: true });
+    v.addEventListener("loadeddata", () => {
+      v.currentTime = Math.min(2, (v.duration || 20) * 0.1);
+    }, { once: true });
+    v.addEventListener("error", () => finish(null), { once: true });
+    setTimeout(() => finish(null), 15000);
+    v.load();
+  });
+}
+
+async function thumbFromAudio(file) {
+  // Synthetic waveform placeholder (no decode needed) with the filename.
+  const c = document.createElement("canvas");
+  c.width = 640;
+  c.height = 360;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#1a1a2e";
+  ctx.fillRect(0, 0, 640, 360);
+  const bars = 48;
+  const bw = 640 / bars;
+  for (let i = 0; i < bars; i++) {
+    const h = 40 + Math.random() * 140;
+    ctx.fillStyle = "rgba(99, 102, 241, " + (0.5 + Math.random() * 0.5) + ")";
+    ctx.fillRect(i * bw + bw * 0.2, (360 - h) / 2, bw * 0.6, h);
+  }
+  ctx.fillStyle = "#e2e8f0";
+  ctx.font = "bold 18px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText((file.name || "audio").substring(0, 40), 320, 340);
+  return canvasToThumb(c, 0.85);
+}
+
+async function thumbFromText(file) {
+  // Teaser: first lines with a fade-out gradient so the bottom is unreadable.
+  const text = await file.text();
+  const lines = text.substring(0, 800).split("\n").slice(0, 12);
+  const c = document.createElement("canvas");
+  c.width = 400;
+  c.height = 300;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#f8f9fa";
+  ctx.fillRect(0, 0, 400, 300);
+  ctx.fillStyle = "#1e293b";
+  ctx.font = "13px monospace";
+  ctx.textBaseline = "top";
+  let y = 16;
+  for (const line of lines) {
+    if (y + 16 > 284) break;
+    let s = line;
+    while (ctx.measureText(s + "...").width > 368 && s.length > 0) s = s.slice(0, -1);
+    if (s !== line) s += "...";
+    ctx.fillText(s, 16, y);
+    y += 16;
+  }
+  const g = ctx.createLinearGradient(0, 120, 0, 300);
+  g.addColorStop(0, "rgba(248,249,250,0)");
+  g.addColorStop(0.6, "rgba(248,249,250,0.85)");
+  g.addColorStop(1, "rgba(248,249,250,1)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 120, 400, 180);
+  return canvasToThumb(c, 0.8);
+}
+
+async function thumbGeneric(file, mime) {
+  // Generative gradient template with the file extension + name + mime.
+  const c = document.createElement("canvas");
+  c.width = 640;
+  c.height = 360;
+  const ctx = c.getContext("2d");
+  const grad = ctx.createLinearGradient(0, 0, 640, 360);
+  grad.addColorStop(0, "#1e1b4b");
+  grad.addColorStop(1, "#312e81");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 640, 360);
+  ctx.fillStyle = "rgba(99,102,241,0.15)";
+  ctx.beginPath();
+  ctx.arc(320, 150, 60, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#a5b4fc";
+  ctx.font = "bold 36px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(((file.name.split(".").pop() || "?")).toUpperCase(), 320, 150);
+  ctx.fillStyle = "#e2e8f0";
+  ctx.font = "16px sans-serif";
+  ctx.fillText((file.name || "").substring(0, 44), 320, 240);
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "13px sans-serif";
+  ctx.fillText(mime || "unknown", 320, 268);
+  return canvasToThumb(c, 0.85);
+}
+
+// Produce { b64, mime } for the cover, or null. Never throws — a thumbnail failure must not
+// block the mint (the asset just lists with the type-icon placeholder).
+async function generateThumbnail(file, mime) {
+  try {
+    if (customThumbnail) return await thumbFromCustom(customThumbnail);
+    if (mime.startsWith("image/")) return await thumbFromImage(file);
+    if (mime.startsWith("video/")) {
+      const t = await thumbFromVideo(file);
+      if (t) return t;
+    } else if (mime.startsWith("audio/")) {
+      const t = await thumbFromAudio(file);
+      if (t) return t;
+    } else if (mime === "text/plain" || mime.startsWith("text/")) {
+      const t = await thumbFromText(file);
+      if (t) return t;
+    }
+    return await thumbGeneric(file, mime);
+  } catch (err) {
+    try {
+      return await thumbGeneric(file, mime);
+    } catch (_e) {
+      return null;
+    }
+  }
+}
+
 async function mint() {
   if (!selectedFile) return;
   if (!(await preflight())) return;
@@ -422,6 +660,24 @@ async function mint() {
   setStep("encrypt", "active");
 
   const mime = selectedFile.type || "application/octet-stream";
+  // Access-token supply: how many editions/holders can be granted access. Clamp to >=1;
+  // the host falls back to its default when unset.
+  const copies = Math.max(1, parseInt(els.copies && els.copies.value, 10) || 0) || undefined;
+
+  // Derive the public cover thumbnail (degraded teaser) from bytes we already hold.
+  const thumb = await generateThumbnail(selectedFile, mime);
+
+  // Free-preview length for media (capped at 60s host-side); 0 disables it.
+  let previewDuration = 0;
+  if (
+    classifyMedia(mime) &&
+    els.previewEnabled &&
+    els.previewEnabled.checked &&
+    els.previewDuration
+  ) {
+    previewDuration = Math.min(60, parseInt(els.previewDuration.value, 10) || 0);
+  }
+
   const meta = {
     title: els.title.value.trim(),
     description: els.desc.value.trim(),
@@ -432,6 +688,11 @@ async function mint() {
     mime: mime,
     isMedia: classifyMedia(mime),
     fileName: selectedFile.name,
+    copies: copies,
+    category: (els.category && els.category.value.trim()) || "",
+    thumbnailB64: (thumb && thumb.b64) || "",
+    thumbnailMime: (thumb && thumb.mime) || "",
+    previewDuration: previewDuration,
   };
 
   // The frame ships the bytes + listing terms to the host capability route. The
@@ -481,11 +742,14 @@ async function mint() {
           ". Open the Wallet app and approve the mint transaction to sign &amp; broadcast it from your wallet.",
         "ok"
       );
-      // PC2's 2nd mint tx: once the mint confirms on-chain, the owner approves the gateway so
-      // the asset is tradable. The "Enable trading" action (shown whenever a wallet + channel
-      // are selected) is confirmation-gated server-side — it discovers the operative from the
-      // mint's on-chain `AssetCreated` event, so it works once the mint lands.
-      refreshTradeEnabled();
+      // PC2's 2nd mint tx: the owner approves the gateway only AFTER the mint confirms on-chain.
+      // Show Step 2 but keep it disabled until the chain confirms tx1 — the watcher below lifts
+      // the gate (and promotes the button) the moment the mint's `AssetCreated` event lands.
+      gateTradeUntilConfirmed();
+      // Poll the chain (read-only) so the Broadcast step advances to "done" the moment the mint
+      // lands on-chain, and Step 2 is visibly promoted — instead of a dead spinner that never
+      // updates after you approve the tx in the Wallet app.
+      watchMintConfirmation(meta.channel, meta.creatorAddress);
     } else {
       setStep("sign", "active");
       setStatus(
@@ -556,12 +820,16 @@ async function enableTrading() {
       return;
     }
     if (result.approval && result.approval.request_id) {
+      // Keep the Approve step spinning while the owner signs the 2nd tx, then poll the chain
+      // read-only and tick it green once `isApprovedForAll` flips true.
+      setStep("approve", "active");
       setStatus(
-        "Gateway approval prepared — open the Wallet app and approve the second transaction to make your asset tradable.",
+        "Gateway approval prepared — open the Wallet app and approve the second transaction. This step ticks green automatically once it confirms on-chain.",
         "ok"
       );
       els.enableTrading.hidden = true;
       if (els.enableTradingHint) els.enableTradingHint.hidden = true;
+      watchTradeApproval(channel, creatorAddress);
     } else {
       setStep("approve", "err");
       setStatus("No wallet approval was queued — connect your wallet on Base and retry.", "err");
@@ -571,6 +839,108 @@ async function enableTrading() {
     setStep("approve", "err");
     setStatus("Could not enable trading: " + err.message, "err");
     els.enableTrading.disabled = false;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Promote "Enable trading" so the owner sees it's the next action once the mint lands.
+function promoteEnableTrading() {
+  if (!els.enableTrading) return;
+  tradeGated = false; // mint confirmed — Step 2 is now actionable
+  els.enableTrading.hidden = false;
+  els.enableTrading.disabled = false;
+  els.enableTrading.classList.add("is-ready");
+  if (els.enableTradingHint) {
+    els.enableTradingHint.hidden = false;
+    els.enableTradingHint.textContent = DEFAULT_TRADE_HINT;
+  }
+}
+
+// Read-only poll of the chain (no side effects server-side) so the "Broadcast" step advances
+// to done the moment the mint lands on-chain — the same `AssetCreated` signal Step 2 is gated
+// on — instead of a dead spinner. Cancelled when a new mint starts (token bump in resetSteps).
+async function watchMintConfirmation(channel, creatorAddress) {
+  if (!channel || !creatorAddress) return;
+  const token = ++mintWatchToken;
+  const started = Date.now();
+  const maxMs = 10 * 60 * 1000; // a Base mint can take a while to confirm; keep watching
+  let delay = 4000;
+  while (mintWatchToken === token && Date.now() - started < maxMs) {
+    await sleep(delay);
+    if (mintWatchToken !== token) return; // superseded by a newer mint
+    let confirmed = false;
+    let alreadyApproved = false;
+    try {
+      const resp = await fetch(appUrl("/mint-status"), {
+        method: "POST",
+        headers: { ...launchHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+      });
+      const result = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        confirmed = Boolean(result.confirmed);
+        alreadyApproved = Boolean(result.already_approved);
+      }
+    } catch (_err) {
+      // Transient (RPC hiccup / offline) — keep polling.
+    }
+    if (mintWatchToken !== token) return;
+    if (confirmed) {
+      setStep("broadcast", "done");
+      if (alreadyApproved) {
+        setStep("approve", "done");
+        setStatus("Mint confirmed on-chain ✓ — your asset is already tradable.", "ok");
+        if (els.enableTrading) els.enableTrading.hidden = true;
+        if (els.enableTradingHint) els.enableTradingHint.hidden = true;
+      } else {
+        setStatus(
+          "Mint confirmed on-chain ✓ — click “Step 2 — Enable trading” to make it tradable.",
+          "ok"
+        );
+        promoteEnableTrading();
+      }
+      return;
+    }
+    delay = Math.min(delay + 2000, 12000); // gentle backoff, capped
+  }
+}
+
+// After the owner approves the gateway (2nd tx), poll the chain read-only until
+// `isApprovedForAll` flips true, then tick the Approve step green — instead of leaving the
+// spinner hanging after the wallet confirms. Cancelled if a new mint starts (token bump).
+async function watchTradeApproval(channel, creatorAddress) {
+  if (!channel || !creatorAddress) return;
+  const token = ++mintWatchToken; // the mint is already confirmed here; supersede its watcher
+  const started = Date.now();
+  const maxMs = 10 * 60 * 1000;
+  let delay = 4000;
+  while (mintWatchToken === token && Date.now() - started < maxMs) {
+    await sleep(delay);
+    if (mintWatchToken !== token) return;
+    let approved = false;
+    try {
+      const resp = await fetch(appUrl("/mint-status"), {
+        method: "POST",
+        headers: { ...launchHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+      });
+      const result = await resp.json().catch(() => ({}));
+      if (resp.ok) approved = Boolean(result.already_approved);
+    } catch (_err) {
+      // Transient — keep polling.
+    }
+    if (mintWatchToken !== token) return;
+    if (approved) {
+      setStep("approve", "done");
+      setStatus("Gateway approved ✓ — your asset is now tradable.", "ok");
+      if (els.enableTrading) els.enableTrading.hidden = true;
+      if (els.enableTradingHint) els.enableTradingHint.hidden = true;
+      return;
+    }
+    delay = Math.min(delay + 2000, 12000);
   }
 }
 
@@ -600,6 +970,53 @@ els.channelManualInput.addEventListener("input", () => {
     : "Paste your channel's contract address. It's verified on-chain (must be created by your wallet) before minting.";
   refreshMintEnabled();
 });
+// Custom cover thumbnail (optional). The chosen image overrides the auto-generated teaser.
+function setCustomThumbnail(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  customThumbnail = file;
+  if (els.thumbPreviewImg) els.thumbPreviewImg.src = URL.createObjectURL(file);
+  if (els.thumbPreviewWrap) els.thumbPreviewWrap.classList.remove("hidden");
+  if (els.thumbDrop) els.thumbDrop.classList.add("hidden");
+}
+if (els.thumbDrop) {
+  els.thumbDrop.addEventListener("click", () => els.thumbInput && els.thumbInput.click());
+  els.thumbDrop.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    els.thumbDrop.classList.add("over");
+  });
+  els.thumbDrop.addEventListener("dragleave", () => els.thumbDrop.classList.remove("over"));
+  els.thumbDrop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    els.thumbDrop.classList.remove("over");
+    setCustomThumbnail(e.dataTransfer.files && e.dataTransfer.files[0]);
+  });
+}
+if (els.thumbInput) {
+  els.thumbInput.addEventListener("change", (e) =>
+    setCustomThumbnail(e.target.files && e.target.files[0]),
+  );
+}
+if (els.thumbRemove) {
+  els.thumbRemove.addEventListener("click", () => {
+    customThumbnail = null;
+    if (els.thumbInput) els.thumbInput.value = "";
+    if (els.thumbPreviewWrap) els.thumbPreviewWrap.classList.add("hidden");
+    if (els.thumbDrop) els.thumbDrop.classList.remove("hidden");
+  });
+}
+if (els.previewEnabled) {
+  els.previewEnabled.addEventListener("change", () => {
+    if (els.previewControls)
+      els.previewControls.classList.toggle("hidden", !els.previewEnabled.checked);
+  });
+}
+if (els.previewDuration) {
+  els.previewDuration.addEventListener("input", () => {
+    if (els.previewDurationDisplay)
+      els.previewDurationDisplay.textContent = els.previewDuration.value + "s";
+  });
+}
+
 els.createChannelBtn.addEventListener("click", createChannel);
 els.mint.addEventListener("click", mint);
 if (els.enableTrading) els.enableTrading.addEventListener("click", enableTrading);

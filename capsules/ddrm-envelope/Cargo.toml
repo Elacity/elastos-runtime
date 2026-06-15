@@ -14,6 +14,11 @@ path = "src/lib.rs"
 # ECDSA-P256 signature AND a PQ ML-DSA-65 signature must both verify. OFF by
 # default; the product root is straight ML-DSA-65.
 hybrid = ["p256"]
+# access-grant: the wallet-signed access-delegation layer (PC2 SecureView parity).
+# Adds canonical sorted-key JSON + EIP-191 (secp256k1) delegation recovery + an
+# EIP-1271 smart-account hook + the ML-DSA-65 per-request session signature. OFF by
+# default so the wasm decrypt boundary stays lean; the node + client + tests opt in.
+access-grant = ["serde", "serde_json", "k256", "sha3", "base64", "hex"]
 
 [dependencies]
 # Hybrid KEM (x25519 + ML-KEM-768), AEAD wrap, KDF — the runtime PQ-hybrid profile.
@@ -33,6 +38,15 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 getrandom = "0.2"
 # Classical half of the hybrid verifier (feature `hybrid` only).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
+# Access-grant layer (feature `access-grant` only) — canonical JSON + EIP-191/1271.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# secp256k1 ECDSA with public-key recovery — the user's EVM wallet (EIP-191 personal_sign).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
+# Keccak-256 — Ethereum signed-message hash + address derivation.
+sha3 = { version = "0.10", default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
+hex = { version = "0.4", optional = true }
 
 [profile.release]
 opt-level = "s"

@@ -886,6 +886,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

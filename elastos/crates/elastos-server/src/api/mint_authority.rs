@@ -61,9 +61,21 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
     // Assemble the real mint calldata first (pure step, all modes). This also validates the
     // mint shape (selector, `to`, content_id, op/sell terms) and fails closed if malformed.
     let assembled = assemble_calldata(mint)?;
-    let to = assembled.get("to").and_then(Value::as_str).unwrap_or_default().to_string();
-    let value = assembled.get("value").and_then(Value::as_str).unwrap_or("0x0").to_string();
-    let data = assembled.get("data").and_then(Value::as_str).unwrap_or("0x").to_string();
+    let to = assembled
+        .get("to")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let value = assembled
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("0x0")
+        .to_string();
+    let data = assembled
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("0x")
+        .to_string();
     let content_id = assembled
         .get("content_id")
         .and_then(Value::as_str)
@@ -86,11 +98,12 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
             // on a Mac with no network.
             let chain_id = chain_id_default();
             let mut intent_seen = Value::Null;
-            let sig = super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
-                let intent = mock_transaction_intent(from, &to, &value, &data, chain_id);
-                intent_seen = intent.clone();
-                Ok(intent)
-            })?;
+            let sig =
+                super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
+                    let intent = mock_transaction_intent(from, &to, &value, &data, chain_id);
+                    intent_seen = intent.clone();
+                    Ok(intent)
+                })?;
             let tx_hash =
                 super::chain_tx::broadcast_signed_mock(&intent_seen, &sig.signed_transaction)?;
             Ok(MintOutcome {
@@ -108,11 +121,12 @@ pub fn mint_asset(principal_id: &str, mint: Value, now_unix: u64) -> Result<Mint
             // broadcast the signed bytes through the REAL chain-provider.
             let chain_id = chain_id_default();
             let mut intent_seen = Value::Null;
-            let sig = super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
-                let intent = super::chain_tx::prepare_intent_live(from, &to, &value, &data)?;
-                intent_seen = intent.clone();
-                Ok(intent)
-            })?;
+            let sig =
+                super::wallet_signer::sign_with_managed_account(principal_id, chain_id, |from| {
+                    let intent = super::chain_tx::prepare_intent_live(from, &to, &value, &data)?;
+                    intent_seen = intent.clone();
+                    Ok(intent)
+                })?;
             let tx_hash = super::chain_tx::broadcast_signed_live(&sig.signed_transaction)?;
             Ok(MintOutcome {
                 tx_hash,
@@ -236,7 +250,10 @@ mod tests {
         let intent = mock_transaction_intent(from, to, "0x0", "0x47cbeeb4", 8453);
 
         // Exactly the fields wallet-provider's eip155 intent validator requires.
-        assert_eq!(intent["schema"], "elastos.chain.unsigned_transaction_intent/v1");
+        assert_eq!(
+            intent["schema"],
+            "elastos.chain.unsigned_transaction_intent/v1"
+        );
         assert_eq!(intent["transaction_type"], "eip155_legacy");
         assert_eq!(intent["wallet_intent"], "transaction_intent");
         assert_eq!(intent["requires_wallet_approval"], true);
@@ -275,7 +292,10 @@ mod tests {
 
         assert_eq!(out.mode, "chain-mock+wallet");
         // The assembled calldata leads with the real mint selector.
-        assert!(out.assembled["data"].as_str().unwrap().starts_with("0x47cbeeb4"));
+        assert!(out.assembled["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x47cbeeb4"));
         // A real, broadcast tx hash (mock-echoed) and a recovered managed creator address.
         assert!(out.tx_hash.starts_with("0x") && out.tx_hash.len() == 66);
         let signer = out.signer.expect("managed signer");

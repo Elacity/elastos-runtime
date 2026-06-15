@@ -27,7 +27,9 @@ base64 = "0.22"
 # The SAME shared transcript encoder the rail binds (key authority seals to it; the decrypt
 # boundary rebuilds it). The `--quorum` open mode computes the canonical decrypt-transcript
 # AAD with it — no private re-implementation, so it cannot drift from the capsules.
-ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+# `access-grant` adds the wallet-signed AccessGrantV1 builder (grant-prepare/grant-assemble
+# sidecar modes): the gateway shells out to these so it never links the PQ session signer.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant"] }
 
 [profile.dev]
 opt-level = 1

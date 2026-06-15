@@ -123,18 +123,103 @@ GATEWAY_BIN="${REPO_ROOT}/elastos/target/debug/elastos"
 [[ -x "$GATEWAY_BIN" ]] || { echo "FAIL: gateway binary missing at ${GATEWAY_BIN}" >&2; exit 1; }
 echo
 
-# ── 3. provision the persistent 2-of-3 quorum (the Create portal seals to it) ──
+# ── 3. provision the quorum the Create portal seals to ────────────────────────
+# Two modes:
+#   * LOCAL (default): provision/run a persistent 2-of-3 quorum on this box.
+#   * REMOTE (ELASTOS_DKMS_REMOTE=1): seal + recover against the LIVE 3 geo nodes
+#     (dkms0 mesh, tcp:10.66.66.x:9443) using ~/.elastos-dkms/dkms-authority.v2.json
+#     + ~/.elastos-dkms/secrets/caller.seed. No local daemons are started — this
+#     validates the real transport/crypto end-to-end against the sovereign quorum.
+#     (This Mac must be on the dkms0 mesh to reach those endpoints.)
+REMOTE="${ELASTOS_DKMS_REMOTE:-0}"
+# CARRIER transport (ELASTOS_DKMS_CARRIER=1): reach the LIVE quorum over Carrier (iroh) by did:key
+# instead of the WireGuard mesh (tcp:10.66.66.x:9443). Implies REMOTE (we still seal/recover against
+# the real geo nodes); ONLY the transport changes — no dkms0 VPN, no per-node enrollment. The
+# descriptor's endpoints are `carrier:did:key:...` and a local `dkms-carrier-client` sidecar dials
+# them. (Opt-in for now; the tcp/WireGuard path stays as rollback. Flip the default to carrier once
+# the live nodes run their dkms-carrier-node bridges and validation passes.)
+CARRIER="${ELASTOS_DKMS_CARRIER:-0}"
+CARRIER_CLIENT_BIN="${REPO_ROOT}/scripts/dev/dkms-carrier-client/target/debug/dkms-carrier-client"
+CARRIER_CLIENT_ADDR="${DKMS_CARRIER_CLIENT_ADDR:-127.0.0.1:9444}"
+CARRIER_PID=""
+[[ "$CARRIER" == "1" ]] && REMOTE=1
 QUORUM_DIR="${DATA_DIR}/dkms"
 QUORUM_JSON="${QUORUM_DIR}/quorum.json"
 QUORUM_NODES="${QUORUM_DIR}/quorum-nodes.json"
-if [[ -f "$QUORUM_JSON" && -f "$QUORUM_NODES" ]]; then
+OPEN_DESCRIPTOR="${QUORUM_DIR}/quorum-open.json"
+KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
+DKMS_PIDS=()
+QUORUM_OPEN_READY=0
+
+if [[ "$REMOTE" == "1" ]]; then
+  mkdir -p "$QUORUM_DIR" 2>/dev/null || true
+  if [[ "$CARRIER" == "1" ]]; then
+    REMOTE_DESC="${ELASTOS_DKMS_REMOTE_DESCRIPTOR:-${HOME}/.elastos-dkms/dkms-authority.carrier.json}"
+  else
+    REMOTE_DESC="${ELASTOS_DKMS_REMOTE_DESCRIPTOR:-${HOME}/.elastos-dkms/dkms-authority.v2.json}"
+  fi
+  REMOTE_SEED="${ELASTOS_DKMS_REMOTE_CALLER_SEED:-${HOME}/.elastos-dkms/secrets/caller.seed}"
+  [[ -f "$REMOTE_DESC" ]] || { echo "FAIL: ELASTOS_DKMS_REMOTE=1 but descriptor missing: $REMOTE_DESC" >&2; exit 1; }
+  [[ -f "$REMOTE_SEED" ]] || { echo "FAIL: ELASTOS_DKMS_REMOTE=1 but caller seed missing: $REMOTE_SEED" >&2; exit 1; }
+  QUORUM_JSON="$REMOTE_DESC"       # the Create portal seals CEK shares to the live recipients
+  OPEN_DESCRIPTOR="$REMOTE_DESC"   # the open path recovers 2-of-3 over the live endpoints
+  CALLER_SEED_B64="$(tr -d '\r\n' < "$REMOTE_SEED")"
+  QUORUM_OPEN_READY=1
+  # Remote validation is the live-rail proof; default the rights gate to live on-chain (PC2 parity).
+  export ELASTOS_DDRM_RIGHTS="${ELASTOS_DDRM_RIGHTS:-chain}"
+  echo "dKMS REMOTE quorum — sealing + recovering against the LIVE 3 geo nodes:"
+  python3 - "$REMOTE_DESC" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+th = d.get("threshold", {})
+for i, n in enumerate(th.get("nodes", [])):
+    print(f"    node{i}: {n.get('authority_endpoint')}")
+print(f"    threshold: t={th.get('t')} n={len(th.get('nodes', []))}")
+PY
+  echo "  descriptor: ${REMOTE_DESC}"
+  if [[ "$CARRIER" == "1" ]]; then
+    # Bring up the local Carrier sidecar: key-provider dials each node's did:key through it
+    # (relay/hole-punch, zero VPN). No dkms0 mesh required.
+    echo "building dkms-carrier-client sidecar ..."
+    if ! cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/dkms-carrier-client/Cargo.toml"; then
+      echo "FAIL: could not build dkms-carrier-client" >&2; exit 1
+    fi
+    [[ -x "$CARRIER_CLIENT_BIN" ]] || { echo "FAIL: dkms-carrier-client missing at ${CARRIER_CLIENT_BIN}" >&2; exit 1; }
+    # Pre-warm: hand the sidecar the node did:keys so it dials + keeps the quorum connections hot
+    # from startup — the first open lands on a warm path instead of paying a cold cross-continent
+    # dial per recover (the cause of the ~30s first open).
+    WARM_DIDS="$(python3 - "$REMOTE_DESC" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+eps = [n.get("authority_endpoint", "") for n in d.get("threshold", {}).get("nodes", [])]
+print(" ".join(e for e in eps if e))
+PY
+)"
+    DKMS_CARRIER_CLIENT_LISTEN="$CARRIER_CLIENT_ADDR" DKMS_CARRIER_WARM_DIDS="$WARM_DIDS" "$CARRIER_CLIENT_BIN" \
+      >"${QUORUM_DIR}/carrier-client.out" 2>"${QUORUM_DIR}/carrier-client.err" &
+    CARRIER_PID="$!"
+    for _ in $(seq 1 60); do grep -q '^ready' "${QUORUM_DIR}/carrier-client.out" 2>/dev/null && break; sleep 0.5; done
+    if grep -q '^ready' "${QUORUM_DIR}/carrier-client.out" 2>/dev/null; then
+      export DKMS_CARRIER_CLIENT_ADDR="$CARRIER_CLIENT_ADDR"
+      echo "  Carrier transport LIVE — sidecar on ${CARRIER_CLIENT_ADDR}; key-provider reaches nodes by did:key (NO WireGuard)."
+    else
+      echo "FAIL: dkms-carrier-client did not become ready" >&2
+      tail -5 "${QUORUM_DIR}/carrier-client.err" 2>/dev/null
+      exit 1
+    fi
+  else
+    echo "  NOTE: this Mac must be on the dkms0 mesh (10.66.66.0/24) to reach those tcp: endpoints."
+  fi
+  echo
+elif [[ -f "$QUORUM_JSON" && -f "$QUORUM_NODES" ]]; then
   echo "quorum descriptor present: ${QUORUM_JSON} (reusing)"
+  echo
 else
   echo "provisioning a fresh 2-of-3 quorum into ${QUORUM_DIR} ..."
   bash "${REPO_ROOT}/scripts/dev/ddrm-provision-quorum.sh" "${QUORUM_DIR}" || {
     echo "FAIL: quorum provisioning failed" >&2; exit 1; }
+  echo
 fi
-echo
 
 # ── 3b. start the recovery daemons + assemble the OPEN descriptor + caller seed ───────────────
 # Minting only needs the PUBLIC descriptor (sealing is local crypto). OPENING a minted dKMS asset
@@ -143,6 +228,9 @@ echo
 # their durable stores (same identities the mint sealed to), allow-list a fresh caller seed, and
 # emit a v2 descriptor (top-level node-0 identity + threshold.nodes[] with endpoints) that serves
 # BOTH the mint seal AND the key-provider(dkms) recover.
+# (LOCAL mode only — in REMOTE mode the live geo nodes are already running and the
+#  OPEN descriptor + caller seed were resolved above.)
+if [[ "$REMOTE" != "1" ]]; then
 NODE_BIN="${CAPSULES}/dkms-authority/target/debug/dkms-authority"
 KEYGEN_BIN="${CAPSULES}/dkms-keygen/target/debug/dkms-keygen"
 KEY_PROVIDER_BIN="${CAPSULES}/key-provider/target/debug/key-provider"
@@ -171,14 +259,40 @@ PY
     if [[ "${#NODE_LINES[@]}" -ne 3 ]]; then
       echo "WARN: quorum sidecar did not yield 3 nodes — quorum OPEN disabled (mint still works)"
     else
+      # TRUSTLESS node-side authz (chain mode): give each local daemon its OWN read-only Base
+      # capability so a wallet-signed AccessGrantV1 is authorized by the node itself (verify the
+      # wallet signature + read `hasAccessByContentId` from Base) — a faithful local proxy for the
+      # sovereign quorum, no dkms0 mesh needed. The browser's MetaMask grant flow is only offered
+      # in chain mode (prepare-grant 400s otherwise), so dev/chain-mock keep the enrolled-caller
+      # path and these vars stay unset (NodeChain::from_env -> None).
+      NODE_CHAIN_ENV=()
+      if [[ "${ELASTOS_DDRM_RIGHTS:-dev}" == "chain" ]]; then
+        NODE_CHAIN_ENV=(
+          "DKMS_CHAIN_RPC_POOL=${DKMS_CHAIN_RPC_POOL:-${ELASTOS_CHAIN_BASE_RPC:-https://mainnet.base.org}}"
+          "DKMS_RIGHTS_CONTRACT=${ELASTOS_DDRM_RIGHTS_CONTRACT:-0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D}"
+          "DKMS_RIGHTS_SELECTOR=${ELASTOS_DDRM_RIGHTS_SELECTOR:-0x54d42821}"
+          "DKMS_CHAIN_ID=${ELASTOS_DDRM_CHAIN_ID:-8453}"
+        )
+        echo "  node-side trustless authz ENABLED for local daemons (DKMS_CHAIN_RPC_POOL set; nodes read Base themselves)"
+      fi
       VKS=(); RECS=(); ENDPOINTS=()
       for ln in "${NODE_LINES[@]}"; do
         IFS=$'\t' read -r vk rec store endpoint <<<"$ln"
         VKS+=("$vk"); RECS+=("$rec"); ENDPOINTS+=("$endpoint")
-        DKMS_AUTHORITY_LISTEN="$endpoint" \
-        DKMS_AUTHORITY_KEY_STORE="$store" \
-        DKMS_AUTHORITY_ALLOWED_CALLERS="$CALLER_VK" \
-          "$NODE_BIN" >/dev/null 2>>"${QUORUM_DIR}/daemon.log" &
+        # `${#arr[@]}` is set -u-safe on an empty array (bash 3.2); expanding "${arr[@]}" is
+        # only reached in the non-empty branch, so we never hit `env ""`.
+        if [[ "${#NODE_CHAIN_ENV[@]}" -gt 0 ]]; then
+          env "${NODE_CHAIN_ENV[@]}" \
+          DKMS_AUTHORITY_LISTEN="$endpoint" \
+          DKMS_AUTHORITY_KEY_STORE="$store" \
+          DKMS_AUTHORITY_ALLOWED_CALLERS="$CALLER_VK" \
+            "$NODE_BIN" >/dev/null 2>>"${QUORUM_DIR}/daemon.log" &
+        else
+          DKMS_AUTHORITY_LISTEN="$endpoint" \
+          DKMS_AUTHORITY_KEY_STORE="$store" \
+          DKMS_AUTHORITY_ALLOWED_CALLERS="$CALLER_VK" \
+            "$NODE_BIN" >/dev/null 2>>"${QUORUM_DIR}/daemon.log" &
+        fi
         DKMS_PIDS+=("$!")
       done
       # Wait for each unix socket to appear (the node clears+binds it on startup).
@@ -219,6 +333,7 @@ PY
 else
   echo "WARN: key-provider/dkms-authority/dkms-keygen not built — quorum OPEN disabled (mint still works)"
 fi
+fi  # end LOCAL-quorum bring-up (skipped when ELASTOS_DKMS_REMOTE=1)
 echo
 
 # ── 4. dev overrides: point the gateway at the locally-built capsules ─────────
@@ -272,6 +387,18 @@ fi
 # Default the rights/mint mode to dev (offline) unless the operator pinned one.
 export ELASTOS_DDRM_RIGHTS="${ELASTOS_DDRM_RIGHTS:-dev}"
 
+# Live on-chain rights (PC2 parity): when chain mode is selected, the rights gate drives the
+# REAL chain-provider doing an eth_call of `hasAccessByContentId(address holder, bytes16 kid)`
+# (selector 0x54d42821) against the Base AuthorityGateway (0x09dBe796…, the SAME contract PC2
+# uses). It REQUIRES a Base RPC URL; default to the official public endpoint if the operator
+# did not pin one. Contract/selector/chain-id default to the real Base values in
+# rights_authority.rs and are overridable via ELASTOS_DDRM_RIGHTS_{CONTRACT,SELECTOR}/
+# ELASTOS_DDRM_CHAIN_ID. The subject is the principal's linked EVM wallet (chain mode fails
+# closed with 403 if none is linked) — override for testing with ELASTOS_DDRM_SUBJECT.
+if [[ "$ELASTOS_DDRM_RIGHTS" == "chain" ]]; then
+  export ELASTOS_CHAIN_BASE_RPC="${ELASTOS_CHAIN_BASE_RPC:-https://mainnet.base.org}"
+fi
+
 echo "provider overrides:"
 for v in ELASTOS_ENCRYPT_PROVIDER_BIN ELASTOS_MEDIA_PROVIDER_BIN ELASTOS_PUBLISH_PROVIDER_BIN \
          ELASTOS_CHAIN_PROVIDER_BIN ELASTOS_WALLET_PROVIDER_BIN ELASTOS_IPFS_PROVIDER_BIN \
@@ -279,8 +406,26 @@ for v in ELASTOS_ENCRYPT_PROVIDER_BIN ELASTOS_MEDIA_PROVIDER_BIN ELASTOS_PUBLISH
   printf '  %s=%s\n' "$v" "${!v}"
 done
 echo "  ELASTOS_DDRM_RIGHTS=${ELASTOS_DDRM_RIGHTS}"
+if [[ "$ELASTOS_DDRM_RIGHTS" == "chain" ]]; then
+  echo "  rights gate: LIVE on-chain hasAccessByContentId(address,bytes16) via chain-provider"
+  echo "    contract = ${ELASTOS_DDRM_RIGHTS_CONTRACT:-0x09dBe796f40ECEffEAccf243c3d758C4c1d8D87D}  (Base AuthorityGateway)"
+  echo "    selector = ${ELASTOS_DDRM_RIGHTS_SELECTOR:-0x54d42821}  chain_id = ${ELASTOS_DDRM_CHAIN_ID:-8453}"
+  echo "    rpc      = ${ELASTOS_CHAIN_BASE_RPC}"
+  echo "    subject  = ${ELASTOS_DDRM_SUBJECT:-the principal linked EVM wallet}"
+  echo "    => an asset opens ONLY if that wallet currently holds access on-chain (sell/transfer revokes)"
+elif [[ "$ELASTOS_DDRM_RIGHTS" == "chain-mock" ]]; then
+  echo "  rights gate: chain-mock (real chain-provider vs in-process RPC; ELASTOS_DDRM_CHAIN_ACCESS=denied to fail closed)"
+else
+  echo "  rights gate: dev (local ownership attestation — NOT an on-chain token check)"
+fi
 if [[ "$QUORUM_OPEN_READY" -eq 1 ]]; then
-  echo "  ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR=${OPEN_DESCRIPTOR}  (3 node daemons live)"
+  if [[ "$REMOTE" == "1" && "$CARRIER" == "1" ]]; then
+    echo "  ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR=${OPEN_DESCRIPTOR}  (LIVE 3 geo nodes — Carrier/did:key, no VPN)"
+  elif [[ "$REMOTE" == "1" ]]; then
+    echo "  ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR=${OPEN_DESCRIPTOR}  (LIVE 3 geo nodes — dkms0 mesh)"
+  else
+    echo "  ELASTOS_DDRM_QUORUM_OPEN_DESCRIPTOR=${OPEN_DESCRIPTOR}  (3 node daemons live)"
+  fi
 else
   echo "  dKMS consumer-open: DISABLED (mint works; opening a minted asset will 503)"
 fi
@@ -302,6 +447,7 @@ echo "=============================================================="
 # Run in the FOREGROUND (not exec) so the recovery node daemons we spawned are reaped on exit.
 cleanup_daemons() {
   for p in "${DKMS_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  [[ -n "${CARRIER_PID:-}" ]] && kill "$CARRIER_PID" 2>/dev/null
 }
 trap cleanup_daemons EXIT INT TERM
 "$GATEWAY_BIN" gateway --addr "$ADDR"

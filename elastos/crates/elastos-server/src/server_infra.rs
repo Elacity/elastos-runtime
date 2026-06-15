@@ -548,7 +548,10 @@ async fn setup_server_infrastructure_impl(
 
     if let Some(path) = crate::find_installed_provider_binary("encrypt-provider") {
         if let Err(e) = verify_provider_binary("encrypt-provider", &path) {
-            tracing::warn!("Skipping encrypt-provider due to verification failure: {}", e);
+            tracing::warn!(
+                "Skipping encrypt-provider due to verification failure: {}",
+                e
+            );
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -574,7 +577,10 @@ async fn setup_server_infrastructure_impl(
 
     if let Some(path) = crate::find_installed_provider_binary("publish-provider") {
         if let Err(e) = verify_provider_binary("publish-provider", &path) {
-            tracing::warn!("Skipping publish-provider due to verification failure: {}", e);
+            tracing::warn!(
+                "Skipping publish-provider due to verification failure: {}",
+                e
+            );
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {

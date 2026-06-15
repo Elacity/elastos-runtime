@@ -116,6 +116,21 @@ fn dev_subject_address(principal_id: &str) -> String {
     format!("0x{}", hex::encode(&digest[..20]))
 }
 
+/// PC2's `normalizedKid` rule (`storage.ts`: `kid.startsWith('0x') ? kid : '0x'+kid`):
+/// the on-chain `bytes16 contentId` is the KID, and PC2 always passes it `0x`-prefixed.
+/// Our capsule stores the KID as a bare 32-hex string, so prefix it for the strict
+/// chain-provider encoder. Anything that is NOT a bare 32-hex KID (already-prefixed, or a
+/// non-hex CID) passes through unchanged — so a misconfigured id still reaches the encoder
+/// and fails loudly there rather than being silently mangled.
+fn normalize_kid_0x(content_id: &str) -> String {
+    let trimmed = content_id.trim();
+    if trimmed.len() == 32 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("0x{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Is this content explicitly denied for the dev attestation? `ELASTOS_DDRM_DENY_CIDS`
 /// is a comma-separated list used to exercise the fail-closed path locally.
 fn dev_denies(content_id: &str) -> bool {
@@ -163,11 +178,27 @@ pub fn decide_owned_access(
         match mode {
             RightsMode::Dev => dev_subject_address(principal_id),
             RightsMode::Chain | RightsMode::ChainMock => {
-                return Err("wallet not linked: a chain rights check needs the principal's EVM address".to_string());
+                return Err(
+                    "wallet not linked: a chain rights check needs the principal's EVM address"
+                        .to_string(),
+                );
             }
         }
     } else {
         subject.to_string()
+    };
+
+    // PC2 parity: the live `hasAccessByContentId(address,bytes16)` read keys on the
+    // 0x-prefixed KID (PC2's `normalizedKid = kid.startsWith('0x') ? kid : '0x'+kid`). Our
+    // `.ddrm` capsule stores the KID as a BARE 32-hex string, but the chain-provider's strict
+    // bytes16 encoder requires the `0x` prefix — so normalize it for the live chain path.
+    // The SAME normalized value is bound into the rights-provider request below so the
+    // capsule's `attestation.content_id == request.content_id` check still matches. Only the
+    // real `chain` mode is normalized: `dev`/`chain-mock` use the tolerant string shape and
+    // may carry non-hex CIDs that must NOT be `0x`-prefixed.
+    let chain_content_id = match mode {
+        RightsMode::Chain => normalize_kid_0x(content_id),
+        RightsMode::Dev | RightsMode::ChainMock => content_id.to_string(),
     };
 
     let (attestation, source) = match mode {
@@ -175,15 +206,15 @@ pub fn decide_owned_access(
             json!({
                 "network": "base-mainnet",
                 "contract": "0x0000000000000000000000000000000000000001",
-                "content_id": content_id,
+                "content_id": chain_content_id,
                 "subject": subject,
                 "right": right,
                 "has_access": !dev_denies(content_id),
             }),
             "dev-local-attestation".to_string(),
         ),
-        RightsMode::Chain => chain_attestation(content_id, &subject, right, false)?,
-        RightsMode::ChainMock => chain_attestation(content_id, &subject, right, true)?,
+        RightsMode::Chain => chain_attestation(&chain_content_id, &subject, right, false)?,
+        RightsMode::ChainMock => chain_attestation(&chain_content_id, &subject, right, true)?,
     };
 
     // The rights DECISION is minted by the rights-provider capsule, bound to the request.
@@ -197,7 +228,7 @@ pub fn decide_owned_access(
         "request": {
             "principal_id": principal_id,
             "session_id": session_id,
-            "content_id": content_id,
+            "content_id": chain_content_id,
             "right": right,
             "reason": reason,
             "policy_ref": policy_ref,
@@ -273,14 +304,22 @@ fn chain_attestation(
     } else {
         // Real Base ABI by default; all three pinnable. Only the RPC URL has no sane
         // default (it's deployment-specific), so it stays required.
-        let network = env_nonempty("ELASTOS_DDRM_RIGHTS_NETWORK").unwrap_or_else(|| "base".to_string());
+        let network =
+            env_nonempty("ELASTOS_DDRM_RIGHTS_NETWORK").unwrap_or_else(|| "base".to_string());
         let contract = env_nonempty("ELASTOS_DDRM_RIGHTS_CONTRACT")
             .unwrap_or_else(|| BASE_AUTHORITY_GATEWAY.to_string());
         let selector = env_nonempty("ELASTOS_DDRM_RIGHTS_SELECTOR")
             .unwrap_or_else(|| BASE_HAS_ACCESS_SELECTOR.to_string());
         let rpc_url = env_nonempty("ELASTOS_CHAIN_BASE_RPC")
             .ok_or("ELASTOS_CHAIN_BASE_RPC (Base RPC URL) is required for chain mode")?;
-        (network, contract, selector, LIVE_RIGHTS_ABI.to_string(), rpc_url, None)
+        (
+            network,
+            contract,
+            selector,
+            LIVE_RIGHTS_ABI.to_string(),
+            rpc_url,
+            None,
+        )
     };
     let chain_id: i64 = env_nonempty("ELASTOS_DDRM_CHAIN_ID")
         .and_then(|s| s.parse().ok())
@@ -356,7 +395,10 @@ pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Resul
         let _ = child.wait();
         return Err(format!(
             "chain-provider init failed: {}",
-            init_resp.get("message").and_then(Value::as_str).unwrap_or("unknown")
+            init_resp
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
 
@@ -371,7 +413,10 @@ pub(crate) fn run_chain_capsule(bin: &str, init: &Value, query: &Value) -> Resul
     if query_resp.get("status").and_then(Value::as_str) != Some("ok") {
         return Err(format!(
             "chain-provider op failed: {}",
-            query_resp.get("message").and_then(Value::as_str).unwrap_or("unknown")
+            query_resp
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
     query_resp
@@ -592,23 +637,67 @@ mod tests {
 
         std::env::remove_var("ELASTOS_DDRM_CHAIN_ACCESS");
         let owned = decide_owned_access(
-            "did:test:alice", "s1", "bafyowned", SUBJECT, "view", "render", None,
-            1_700_000_000, 900,
+            "did:test:alice",
+            "s1",
+            "bafyowned",
+            SUBJECT,
+            "view",
+            "render",
+            None,
+            1_700_000_000,
+            900,
         )
         .expect("owned decision");
         assert!(owned.allowed, "owned content must be allowed");
-        assert!(owned.source.contains("mock"), "source should be the in-process mock");
+        assert!(
+            owned.source.contains("mock"),
+            "source should be the in-process mock"
+        );
 
         std::env::set_var("ELASTOS_DDRM_CHAIN_ACCESS", "denied");
         let denied = decide_owned_access(
-            "did:test:alice", "s1", "bafynotowned", SUBJECT, "view", "render", None,
-            1_700_000_000, 900,
+            "did:test:alice",
+            "s1",
+            "bafynotowned",
+            SUBJECT,
+            "view",
+            "render",
+            None,
+            1_700_000_000,
+            900,
         )
         .expect("denied decision");
-        assert!(!denied.allowed, "not-owned content must be denied (fail closed)");
+        assert!(
+            !denied.allowed,
+            "not-owned content must be denied (fail closed)"
+        );
 
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         std::env::remove_var("ELASTOS_DDRM_CHAIN_ACCESS");
+    }
+
+    /// PC2's `normalizedKid` rule: a bare 32-hex KID gets a `0x` prefix (so the strict
+    /// chain-provider bytes16 encoder accepts it); already-prefixed or non-hex ids pass
+    /// through unchanged.
+    #[test]
+    fn normalize_kid_matches_pc2_normalized_kid() {
+        // Bare 32-hex KID -> 0x-prefixed (the capsule stores it bare).
+        assert_eq!(
+            normalize_kid_0x("38691296765e76a331f5d5630bddf9f5"),
+            "0x38691296765e76a331f5d5630bddf9f5"
+        );
+        // Already prefixed -> unchanged.
+        assert_eq!(
+            normalize_kid_0x("0x38691296765e76a331f5d5630bddf9f5"),
+            "0x38691296765e76a331f5d5630bddf9f5"
+        );
+        // A non-hex CID (chain-mock string shape) must NOT be 0x-prefixed.
+        assert_eq!(
+            normalize_kid_0x("bafybeigprotectedcontent"),
+            "bafybeigprotectedcontent"
+        );
+        // Wrong length hex is left alone (so it fails loudly at the encoder, not silently).
+        assert_eq!(normalize_kid_0x("deadbeef"), "deadbeef");
     }
 
     /// Chain mode with no wallet subject and no override must fail closed (not open).
@@ -617,8 +706,15 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
         let result = decide_owned_access(
-            "did:test:nowallet", "s1", "bafyx", "", "view", "render", None,
-            1_700_000_000, 900,
+            "did:test:nowallet",
+            "s1",
+            "bafyx",
+            "",
+            "view",
+            "render",
+            None,
+            1_700_000_000,
+            900,
         );
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         let err = result.expect_err("chain mode with no wallet must error");

@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260607e";
+import { fetchJson } from "./shell-core.js?v=home-20260615b";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");

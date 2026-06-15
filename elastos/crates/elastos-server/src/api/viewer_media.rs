@@ -182,7 +182,10 @@ pub async fn viewer_media_manifest(
     let manifest = media_manifest_value(&session);
     // Defense in depth: never emit a manifest that somehow carries key material.
     if assert_no_key_material(&manifest).is_err() {
-        return media_error(StatusCode::INTERNAL_SERVER_ERROR, "media manifest carried key material");
+        return media_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "media manifest carried key material",
+        );
     }
     (
         StatusCode::OK,
@@ -220,7 +223,12 @@ pub async fn viewer_media_segment(
     };
     let index: usize = match index.parse() {
         Ok(index) => index,
-        Err(_) => return media_error(StatusCode::BAD_REQUEST, "segment index must be a non-negative integer"),
+        Err(_) => {
+            return media_error(
+                StatusCode::BAD_REQUEST,
+                "segment index must be a non-negative integer",
+            )
+        }
     };
     // Range + expiry are enforced BEFORE any decrypt relay — fail closed.
     if let Err(resp) = check_segment_readable(&session, index, crate::auth::now_ts()) {
@@ -229,25 +237,36 @@ pub async fn viewer_media_segment(
     // Gateway-spawned local key-authority (the dDRM viewer seam): relay the read to
     // the helper, which decrypts in-VM through its own boundary and strips `senc`.
     if let Some(authority) = session.authority.clone() {
-        let decrypted =
-            tokio::task::spawn_blocking(move || authority.segment(index)).await;
+        let decrypted = tokio::task::spawn_blocking(move || authority.segment(index)).await;
         return match decrypted {
             Ok(Ok(bytes)) => octet_stream(bytes),
             Ok(Err(err)) => {
                 tracing::warn!(index, "media segment fail-closed: {err}");
-                media_error(StatusCode::BAD_GATEWAY, "the decrypt provider could not serve this segment")
+                media_error(
+                    StatusCode::BAD_GATEWAY,
+                    "the decrypt provider could not serve this segment",
+                )
             }
-            Err(_) => media_error(StatusCode::BAD_GATEWAY, "the decrypt provider could not serve this segment"),
+            Err(_) => media_error(
+                StatusCode::BAD_GATEWAY,
+                "the decrypt provider could not serve this segment",
+            ),
         };
     }
     let Some(registry) = state.provider_registry.as_ref() else {
-        return media_error(StatusCode::SERVICE_UNAVAILABLE, "decrypt provider unavailable");
+        return media_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decrypt provider unavailable",
+        );
     };
     match relay_decrypted_segment(registry, &session, index).await {
         Ok(bytes) => octet_stream(bytes),
         // A substituted/expired/unauthorized read, or an unconfigured decrypt
         // backend, all land here — refuse rather than surface a partial stream.
-        Err(_) => media_error(StatusCode::BAD_GATEWAY, "the decrypt provider could not serve this segment"),
+        Err(_) => media_error(
+            StatusCode::BAD_GATEWAY,
+            "the decrypt provider could not serve this segment",
+        ),
     }
 }
 
@@ -265,9 +284,16 @@ fn media_manifest_value(session: &MediaSession) -> Value {
 
 /// Enforce the per-segment read guard: in-range index AND a live (un-expired) grant.
 /// Returns a fail-closed response on violation; `Ok(())` when the read may proceed.
-fn check_segment_readable(session: &MediaSession, index: usize, now: u64) -> Result<(), Box<Response>> {
+fn check_segment_readable(
+    session: &MediaSession,
+    index: usize,
+    now: u64,
+) -> Result<(), Box<Response>> {
     if now > session.expires_at {
-        return Err(Box::new(media_error(StatusCode::FORBIDDEN, "this media session has expired")));
+        return Err(Box::new(media_error(
+            StatusCode::FORBIDDEN,
+            "this media session has expired",
+        )));
     }
     if index >= session.segment_count {
         return Err(Box::new(media_error(
@@ -331,19 +357,36 @@ fn authorize_media_session(
     let viewer = clean_capsule_ref(viewer)
         .map_err(|_| Box::new(media_error(StatusCode::BAD_REQUEST, "invalid viewer")))?;
     if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
-        return Err(Box::new(media_error(StatusCode::NOT_FOUND, "viewer capsule not found")));
+        return Err(Box::new(media_error(
+            StatusCode::NOT_FOUND,
+            "viewer capsule not found",
+        )));
     }
     let context = require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
-        .map_err(|_| Box::new(media_error(StatusCode::UNAUTHORIZED, "missing or invalid home launch token")))?;
+        .map_err(|_| {
+            Box::new(media_error(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            ))
+        })?;
     let Some(session) = get_media_session(session_id) else {
-        return Err(Box::new(media_error(StatusCode::NOT_FOUND, "media session not found")));
+        return Err(Box::new(media_error(
+            StatusCode::NOT_FOUND,
+            "media session not found",
+        )));
     };
     if session.viewer != viewer {
-        return Err(Box::new(media_error(StatusCode::NOT_FOUND, "media session not found")));
+        return Err(Box::new(media_error(
+            StatusCode::NOT_FOUND,
+            "media session not found",
+        )));
     }
     if session.principal_id != context.principal_id {
         // Never reveal another principal's session exists — same 404 shape.
-        return Err(Box::new(media_error(StatusCode::NOT_FOUND, "media session not found")));
+        return Err(Box::new(media_error(
+            StatusCode::NOT_FOUND,
+            "media session not found",
+        )));
     }
     Ok(session)
 }
@@ -429,7 +472,10 @@ mod tests {
         assert_eq!(manifest["segment_count"], json!(3));
         assert_eq!(manifest["has_init"], json!(true));
         assert_eq!(manifest["is_protected"], json!(true));
-        assert!(assert_no_key_material(&manifest).is_ok(), "manifest must be key-free");
+        assert!(
+            assert_no_key_material(&manifest).is_ok(),
+            "manifest must be key-free"
+        );
     }
 
     #[test]
@@ -439,11 +485,17 @@ mod tests {
         assert!(check_segment_readable(&s, 0, 1_000).is_ok());
         assert!(check_segment_readable(&s, 1, 1_000).is_ok());
         // Out of range: refused.
-        assert!(check_segment_readable(&s, 2, 1_000).is_err(), "index == count is out of range");
+        assert!(
+            check_segment_readable(&s, 2, 1_000).is_err(),
+            "index == count is out of range"
+        );
         assert!(check_segment_readable(&s, 99, 1_000).is_err());
         // Expired grant: refused even for a valid index.
         let expired = session(2, 100);
-        assert!(check_segment_readable(&expired, 0, 1_000).is_err(), "an expired grant is refused");
+        assert!(
+            check_segment_readable(&expired, 0, 1_000).is_err(),
+            "an expired grant is refused"
+        );
     }
 
     #[test]
@@ -488,9 +540,15 @@ mod tests {
             Some("elacity-player")
         );
         // Non-media / unknown interfaces are not routed to the player.
-        assert_eq!(viewer_for_required_interface("elastos.viewer/document@1"), None);
+        assert_eq!(
+            viewer_for_required_interface("elastos.viewer/document@1"),
+            None
+        );
         assert_eq!(viewer_for_required_interface(""), None);
-        assert_eq!(viewer_for_required_interface("elastos.viewer/media@2"), None);
+        assert_eq!(
+            viewer_for_required_interface("elastos.viewer/media@2"),
+            None
+        );
     }
 
     #[test]

@@ -77,7 +77,10 @@ pub fn verify_component_binary_with_data_dir(
     // This is the local-sovereign escape hatch for platforms the installed manifest has
     // no entry for (e.g. macOS arm64 → "unknown-arm64"), where verification would
     // otherwise fail closed against a Linux-only release manifest.
-    let env_name = format!("ELASTOS_{}_BIN", name.to_ascii_uppercase().replace('-', "_"));
+    let env_name = format!(
+        "ELASTOS_{}_BIN",
+        name.to_ascii_uppercase().replace('-', "_")
+    );
     if let Some(override_path) = std::env::var_os(&env_name) {
         if Path::new(&override_path) == path {
             tracing::warn!(

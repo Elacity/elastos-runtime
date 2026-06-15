@@ -48,7 +48,35 @@ const CREATOR_APP: &str = "creator";
 /// The dKMS threshold protection type — the CEK-custody scheme that replaces Lit.
 const THRESHOLD_PROTECTION_TYPE: &str = "cenc:elastos-pq-hybrid-threshold-v0";
 const THRESHOLD_SCHEME: &str = "elastos-pq-hybrid-threshold-v0";
-const ENVELOPE_SCHEMA: &str = "elastos.asset.envelope/v1";
+
+/// The canonical Elacity token-metadata schemas — the EXACT URIs PC2's audited creator
+/// writes (`pc2-node/data/test-apps/elacity-creator/app.js`). The Elacity marketplace
+/// indexer (`pc2-node/src/services/ContentIndexerService.ts`) reads display fields from
+/// THIS shape: top-level `name`/`description`/`image`, `media.uri`/`media.contentType`,
+/// `properties.publisher`, `kid`. Emitting it is what makes a mint show up — with its
+/// title, description and type — on `base.ela.city`. We keep the dKMS escrow exactly
+/// where PC2 wrote the Lit block (`asset.protections[0]`); only the transport differs.
+const ELACITY_ASSET_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/asset/v1.1/schema.json";
+const ELACITY_CONTENT_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/content/v1.0/schema.json";
+const ELACITY_MCO_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/mco/v1.0/schema.json";
+const ELACITY_ACCESS_TOKEN_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/access-token/v1.0/schema.json";
+const ELACITY_ROYALTY_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/royalty/v1.0/schema.json";
+
+/// The Elacity-canonical token-type filenames in the metadata directory: token id `1` is the
+/// Access Token, `2` the Royalty Share (`elacity-creator/app.js` `buildTokenTypeJsons`).
+const ACCESS_TOKEN_FILE: &str =
+    "0000000000000000000000000000000000000000000000000000000000000001.json";
+const ROYALTY_SHARE_FILE: &str =
+    "0000000000000000000000000000000000000000000000000000000000000002.json";
+
+/// Default access-token supply when the creator does not specify one — PC2's
+/// `buildMetadataEnvelope` default (`params.copies || 10000`).
+const DEFAULT_COPIES: u64 = 10_000;
 
 /// Env override for the PUBLIC-ONLY quorum descriptor; defaults to `<data_dir>/dkms/quorum.json`.
 const QUORUM_DESCRIPTOR_ENV: &str = "ELASTOS_DKMS_QUORUM_DESCRIPTOR";
@@ -194,6 +222,38 @@ pub struct MintMeta {
     creator_address: String,
     #[serde(default)]
     file_name: String,
+    /// How many access tokens (editions) to mint — PC2's `copies`/Supply. The number of
+    /// holders who can be granted access. `None`/0 falls back to `DEFAULT_COPIES`.
+    #[serde(default)]
+    copies: Option<u64>,
+    /// Optional marketplace category + tags (PC2 `categories`/`tags`); plain display hints.
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    /// The cover/preview thumbnail bytes (base64), produced client-side by the de-privileged
+    /// frame from bytes it already holds — a degraded teaser (blurred image / video frame /
+    /// audio waveform / generative template). The host pins it via the content capability and
+    /// sets the public `image`. Empty => no thumbnail (marketplace shows the type icon).
+    #[serde(default)]
+    thumbnail_b64: String,
+    /// MIME of `thumbnail_b64` (e.g. `image/jpeg`/`image/png`) — for the pinned file extension.
+    #[serde(default)]
+    thumbnail_mime: String,
+    /// Free-preview length in seconds for media (PC2 `previewDuration`). 0/None => no preview.
+    #[serde(default)]
+    preview_duration: Option<u64>,
+}
+
+impl MintMeta {
+    /// The effective access-token supply: the creator's choice, clamped to ≥1, or the PC2
+    /// default when unspecified.
+    fn effective_copies(&self) -> u64 {
+        match self.copies {
+            Some(n) if n >= 1 => n,
+            _ => DEFAULT_COPIES,
+        }
+    }
 }
 
 /// The prepare-mint request body: the asset bytes (base64) + listing terms. Base64-in-JSON
@@ -638,6 +698,84 @@ pub struct TradeApprovalRequest {
     creator_address: String,
 }
 
+// ── POST /api/apps/creator/mint-status ─────────────────────────────────────────
+/// READ-ONLY poll: has the latest mint in (channel, creator) confirmed on-chain yet?
+/// Reuses the chain provider's `assemble_trade_approval` read (it scans the `AssetCreated`
+/// log + reads `isApprovedForAll`) WITHOUT enqueuing any signature or broadcasting — so the
+/// creator portal can advance its "Broadcast" step and light up "Enable trading" on its own,
+/// instead of leaving a dead spinner. `mint_not_confirmed` is reported as `confirmed:false`
+/// (a normal not-yet-mined state), not an error.
+pub async fn creator_mint_status(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
+    {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid home launch token",
+        );
+    }
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    let Json(req) = match body {
+        Ok(json) => json,
+        Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
+    };
+    let channel = req.channel.trim();
+    let signer = req.creator_address.trim();
+    if channel.is_empty() || signer.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "channel and creatorAddress are required",
+        );
+    }
+    // Read-only ownership gate (same as the mint / trade-approval) before any chain read.
+    if let Err(message) = confirm_channel_owned(registry, signer, channel).await {
+        return error_json(StatusCode::FORBIDDEN, &message);
+    }
+    match provider_data(
+        registry,
+        "chain",
+        &json!({
+            "op": "assemble_trade_approval",
+            "network": mint_network(),
+            "channel": channel,
+            "creator": signer,
+        }),
+    )
+    .await
+    {
+        Ok(assembled) => {
+            let already_approved = assembled
+                .get("already_approved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Json(json!({
+                "schema": "elastos.creator.mint-status/v1",
+                "confirmed": true,
+                "already_approved": already_approved,
+            }))
+            .into_response()
+        }
+        Err(message) => {
+            // The mint simply hasn't landed yet — a normal transient state, not an error.
+            let lowered = message.to_lowercase();
+            if lowered.contains("not_confirmed") || lowered.contains("not confirmed") {
+                return Json(json!({
+                    "schema": "elastos.creator.mint-status/v1",
+                    "confirmed": false,
+                    "already_approved": false,
+                }))
+                .into_response();
+            }
+            error_json(StatusCode::BAD_GATEWAY, &message)
+        }
+    }
+}
+
 /// After the mint CONFIRMS on-chain, make the asset tradable by approving the channel's
 /// authority gateway as an operator on the just-minted asset's operative contract — PC2's 2nd
 /// mint tx (`setApprovalForAll(gateway, true)`, app.js:5104/5119). The runtime discovers the
@@ -918,7 +1056,9 @@ async fn run_prepare_mint(
         .ok_or_else(|| stage_err("publish", "content publish returned no CID"))?
         .to_string();
 
-    // 3) assemble the metadata envelope — the dKMS escrow descriptor takes Lit's place.
+    // 3) pin the client-derived cover thumbnail (degraded teaser) and assemble the Elacity
+    //    token metadata — the dKMS escrow descriptor takes Lit's place.
+    let image = pin_thumbnail(registry, meta).await;
     let envelope = build_metadata_envelope(BuildEnvelope {
         kid_hex: &kid_hex,
         asset_cid: &asset_cid,
@@ -927,16 +1067,18 @@ async fn run_prepare_mint(
         producer_vk_b64: &producer_vk_b64,
         meta,
         creator_principal: principal_id,
+        size: file_bytes.len() as u64,
+        image: &image,
     });
     let protections = envelope["asset"]["protections"].clone();
 
-    // 4) publish metadata.json as a directory, get the metadata CID.
-    let metadata_json = serde_json::to_string(&envelope)
-        .map_err(|e| stage_err("publish", format!("serialize envelope: {e}")))?;
+    // 4) publish the FULL Elacity metadata directory (metadata.json + content.json +
+    //    contract.json + per-token-type files), get the directory CID. The tokenURI is
+    //    `{dirCid}/metadata.json` and the `self://` companions resolve as siblings.
     let publish_dir = json!({
         "op": "publish",
         "kind": "directory",
-        "files": [ { "path": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
+        "files": metadata_directory_files(&envelope, meta, &kid_hex, file_bytes.len() as u64, &image),
         "pin": true,
     });
     let metadata = provider_data(registry, "content", &publish_dir)
@@ -961,6 +1103,7 @@ async fn run_prepare_mint(
             metadata_cid: &metadata_cid,
             protections: &protections,
             ciphertext_b64: Some(&segment_b64),
+            image: &image,
         },
     )
     .await
@@ -980,6 +1123,9 @@ struct MintTail<'a> {
     /// at open). `None` for media (the DASH directory is the ciphertext; quorum-open of DASH is a
     /// follow-on).
     ciphertext_b64: Option<&'a str>,
+    /// The pinned cover thumbnail URI (`ipfs://<cid>`) or empty — persisted into the `.ddrm`
+    /// capsule so the Library/Finder renders the protected-asset cover art.
+    image: &'a str,
 }
 
 /// The shared mint tail: `publish prepare_publish` (unsigned mint, contentId == bytes16
@@ -1040,12 +1186,14 @@ async fn finalize_mint(
         let req = publish_req["request"].as_object_mut().unwrap();
         req.insert("price_wei".into(), json!(price_wei));
         req.insert("creator_address".into(), json!(creator));
-        if !meta.currency.eq_ignore_ascii_case("ELA")
-            && !meta.currency.eq_ignore_ascii_case("ETH")
-            && !meta.currency.trim().is_empty()
-        {
-            // Native currencies omit a token address; named ERC-20s would carry one.
-            // (Resolving symbol -> token address is a follow-on; native works today.)
+        // The number of access tokens (editions) to mint — the creator's chosen supply.
+        // The publish provider encodes it as the ACCESS_TOKEN role's mint amount.
+        req.insert("copies".into(), json!(meta.effective_copies()));
+        // Named ERC-20 currencies (e.g. USDC) carry their token address; native (ELA/ETH)
+        // omits it (the publish provider defaults to the zero address).
+        let (token_address, _) = currency_token(&meta.currency);
+        if token_address != "0x0000000000000000000000000000000000000000" {
+            req.insert("currency_address".into(), json!(token_address));
         }
     }
     let prepared = provider_data(registry, "publish", &publish_req)
@@ -1157,6 +1305,8 @@ async fn finalize_mint(
         "kid": kid_hex,
         "asset_cid": tail.asset_cid,
         "metadata_cid": metadata_cid,
+        // The pinned cover thumbnail URI — persisted into the `.ddrm` capsule for Finder art.
+        "thumbnail": tail.image,
         "protections": tail.protections,
         // The persisted single-sample ciphertext (object only) — fed into the `.ddrm` capsule so
         // the quorum consumer-open has the exact bytes to recover. Absent for media.
@@ -1189,6 +1339,7 @@ async fn run_prepare_mint_media(
         "op": "package_dash",
         "content_b64": b64.encode(file_bytes),
         "filename": meta.file_name,
+        "preview_duration": meta.preview_duration.unwrap_or(0),
     });
     let pkg = provider_data(registry, "media", &pkg_req)
         .await
@@ -1202,6 +1353,30 @@ async fn run_prepare_mint_media(
         .get("tracks")
         .and_then(Value::as_array)
         .ok_or_else(|| stage_err("encrypt", "media package returned no tracks"))?;
+
+    // Free-preview clip + presentation hints from the encoder (PC2 `media.previewURL/duration/
+    // resolution/codec`). The preview is an unencrypted teaser; everything else is display-only.
+    let preview_b64 = pkg
+        .get("preview_b64")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let media_duration = pkg
+        .get("source")
+        .and_then(|s| s.get("duration"))
+        .and_then(Value::as_f64)
+        .or_else(|| pkg.get("total_duration").and_then(Value::as_f64))
+        .unwrap_or(0.0);
+    let media_resolution = pkg
+        .get("resolution")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let media_codec = pkg
+        .get("codec")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
     // Flatten every media segment across tracks IN ORDER (so the single-CEK CENC counter is
     // continuous), recording each segment's directory path + the plaintext per-track inits.
@@ -1309,7 +1484,10 @@ async fn run_prepare_mint_media(
         .ok_or_else(|| stage_err("publish", "content publish returned no CID"))?
         .to_string();
 
-    // 5) media metadata envelope (dir CID + default_KID + dKMS escrow).
+    // 5) pin the cover thumbnail + the free-preview clip (both best-effort, never fatal), then
+    //    assemble the Elacity media metadata (dir CID + default_KID + dKMS escrow).
+    let image = pin_thumbnail(registry, meta).await;
+    let preview_url = pin_preview_clip(registry, &preview_b64).await;
     let envelope = build_media_envelope(MediaEnvelope {
         kid_hex: &kid_hex,
         dir_cid: &dir_cid,
@@ -1320,14 +1498,20 @@ async fn run_prepare_mint_media(
         tracks,
         meta,
         creator_principal: principal_id,
+        size: file_bytes.len() as u64,
+        image: &image,
+        preview_url: &preview_url,
+        duration: media_duration,
+        resolution: &media_resolution,
+        codec: &media_codec,
     });
     let protections = envelope["asset"]["protections"].clone();
-    let metadata_json = serde_json::to_string(&envelope)
-        .map_err(|e| stage_err("publish", format!("serialize envelope: {e}")))?;
+    // Publish the FULL Elacity metadata directory (metadata.json + companions); tokenURI is
+    // `{dirCid}/metadata.json`.
     let publish_meta = json!({
         "op": "publish",
         "kind": "directory",
-        "files": [ { "path": "metadata.json", "data": b64.encode(metadata_json.as_bytes()) } ],
+        "files": metadata_directory_files(&envelope, meta, &kid_hex, file_bytes.len() as u64, &image),
         "pin": true,
     });
     let metadata = provider_data(registry, "content", &publish_meta)
@@ -1353,6 +1537,7 @@ async fn run_prepare_mint_media(
             // Media ciphertext is the DASH directory (multi-segment); quorum-open of DASH is a
             // follow-on, so no single-segment ciphertext is persisted for media yet.
             ciphertext_b64: None,
+            image: &image,
         },
     )
     .await
@@ -1370,12 +1555,26 @@ struct MediaEnvelope<'a> {
     tracks: &'a [Value],
     meta: &'a MintMeta,
     creator_principal: &'a str,
+    /// Plaintext source byte size (PC2 `params.size`).
+    size: u64,
+    /// Pinned cover thumbnail URI (`ipfs://<cid>`) or empty (PC2 `params.image`).
+    image: &'a str,
+    /// Pinned free-preview clip URI (`ipfs://<cid>`) or empty (PC2 `media.previewURL`).
+    preview_url: &'a str,
+    /// Source duration in seconds, and the encoder's resolution/codec hints (PC2 `media.*`).
+    duration: f64,
+    resolution: &'a str,
+    codec: &'a str,
 }
 
-/// Build the public DASH asset envelope. The CEK-custody block (`asset.protections[0]`) is
-/// identical to the object path — the dKMS escrow descriptor. The `media` block carries the
-/// DASH manifest path, the single `defaultKID`, and a per-track summary (PC2's media block).
+/// Build the public DASH token metadata — the SAME Elacity `asset/v1.1` shape as the object
+/// path so media also surfaces (title/description/type) on `base.ela.city`. The `media` block
+/// additionally carries the DASH manifest path, the single `defaultKID`, and a per-track
+/// summary. The CEK-custody block (`asset.protections[0]`) is the dKMS escrow, as for objects.
 fn build_media_envelope(b: MediaEnvelope) -> Value {
+    let mime = if b.meta.mime.trim().is_empty() { "video/mp4" } else { b.meta.mime.trim() };
+    let copies = b.meta.effective_copies();
+    let category = b.meta.category.trim();
     let track_summaries: Vec<Value> = b
         .tracks
         .iter()
@@ -1391,31 +1590,60 @@ fn build_media_envelope(b: MediaEnvelope) -> Value {
         })
         .collect();
     json!({
-        "schema": ENVELOPE_SCHEMA,
-        "kid": b.kid_hex,
-        "asset": {
-            "title": b.meta.title.trim(),
-            "description": b.meta.description.trim(),
-            "kid": b.kid_hex,
-            "mimeType": if b.meta.mime.is_empty() { "video/mp4" } else { b.meta.mime.as_str() },
-            "assetCid": b.dir_cid,
-            "creatorPrincipal": b.creator_principal,
-            "protections": [{
-                "algorithm": "aes-128",
-                "protectionType": THRESHOLD_PROTECTION_TYPE,
-                "scheme": THRESHOLD_SCHEME,
-                "chain": "base",
-                "node_set_id_b64": b.node_set_id_b64,
-                "producer_verifying_key_b64": b.producer_vk_b64,
-                "shares": b.shares.clone(),
-            }],
-        },
+        "schema": ELACITY_ASSET_SCHEMA,
+        "version": "1.1",
+        "name": b.meta.title.trim(),
+        "description": b.meta.description.trim(),
+        "image": b.image,
+        "category": category,
         "media": {
+            "uri": format!("ipfs://{}", b.dir_cid),
+            "contentType": mime,
+            "mimeType": mime,
+            "object": "self://content.json",
+            "protectionType": [THRESHOLD_PROTECTION_TYPE],
+            "size": b.size,
+            // DASH presentation details (the player reads these; the marketplace reads the rest).
             "mediaType": "dash",
             "manifestPath": b.manifest_path,
             "defaultKID": b.kid_hex,
             "tracks": track_summaries,
+            // Free preview clip + presentation hints (PC2 `media.previewURL/duration/...`). The
+            // indexer falls back to `previewURL` for the card thumbnail when `image` is empty.
+            "previewURL": if b.preview_url.is_empty() { Value::Null } else { json!(b.preview_url) },
+            "duration": if b.duration > 0.0 { json!(b.duration) } else { Value::Null },
+            "resolution": if b.resolution.is_empty() { Value::Null } else { json!(b.resolution) },
+            "codec": if b.codec.is_empty() { Value::Null } else { json!(b.codec) },
         },
+        "asset": {
+            "cid": b.dir_cid,
+            "mimeType": mime,
+            "size": b.size,
+            "encrypted": true,
+            "protections": [dkms_protection(b.node_set_id_b64, b.producer_vk_b64, b.shares)],
+            "kid": b.kid_hex,
+        },
+        "properties": {
+            "chainId": mint_chain_id(),
+            "ledger": b.meta.channel.trim(),
+            "publisher": b.meta.creator_address.trim(),
+            "creatorPrincipal": b.creator_principal,
+            "contract": "self://contract.json",
+            "labelType": "Creator",
+            "distribution": distribution_label(b.meta),
+            "tags": b.meta.tags.clone(),
+            "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
+            "kid": b.kid_hex,
+        },
+        "attributes": [
+            { "trait_type": "Content-Type", "value": mime },
+            { "trait_type": "Size", "value": b.size },
+            { "trait_type": "Encrypted", "value": true },
+            { "trait_type": "OpType", "value": op_type_code(b.meta) },
+            { "trait_type": "Supply", "value": copies },
+            { "trait_type": "Algorithm", "value": "aes-128" },
+        ],
+        "kid": b.kid_hex,
     })
 }
 
@@ -1531,41 +1759,321 @@ struct BuildEnvelope<'a> {
     producer_vk_b64: &'a str,
     meta: &'a MintMeta,
     creator_principal: &'a str,
+    /// The plaintext byte size of the asset (PC2 `params.size`) — surfaced in `media.size`,
+    /// `asset.size` and the `Size` attribute for marketplace cards.
+    size: u64,
+    /// The pinned cover thumbnail URI (`ipfs://<cid>`), or empty for none (PC2 `params.image`).
+    image: &'a str,
 }
 
-/// Build the public asset metadata envelope. The CEK-custody block lives in
-/// `asset.protections[0]` — the dKMS escrow descriptor (node-set pin + per-node SEALED
-/// shares), placed EXACTLY where PC2's creator wrote `litCiphertext`/`litBackend`.
-fn build_metadata_envelope(b: BuildEnvelope) -> Value {
+/// Pin the client-supplied cover thumbnail (if any) via the content capability and return its
+/// public `ipfs://<cid>` URI for `metadata.image`. Best-effort: a thumbnail failure NEVER blocks
+/// the mint (the asset simply lists with the type-icon placeholder). The bytes are a degraded
+/// preview the de-privileged frame derived from content it already held — no new authority
+/// crosses the boundary; the host only pins, using the same capability it pins the asset with.
+async fn pin_thumbnail(registry: &ProviderRegistry, meta: &MintMeta) -> String {
+    let data = meta.thumbnail_b64.trim();
+    if data.is_empty() {
+        return String::new();
+    }
+    let ext = match meta.thumbnail_mime.trim() {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    let req = json!({
+        "op": "publish",
+        "kind": "file",
+        "data": data,
+        "filename": format!("thumbnail.{ext}"),
+        "pin": true,
+    });
+    match provider_data(registry, "content", &req).await {
+        Ok(resp) => resp
+            .get("cid")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(|cid| format!("ipfs://{cid}"))
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("mint: thumbnail pin failed (non-fatal): {e}");
+            String::new()
+        }
+    }
+}
+
+/// Pin a media free-preview clip (returned by the media provider as base64) and return its
+/// public `ipfs://<cid>` URI for `media.previewURL`. Best-effort, like the thumbnail.
+async fn pin_preview_clip(registry: &ProviderRegistry, preview_b64: &str) -> String {
+    let data = preview_b64.trim();
+    if data.is_empty() {
+        return String::new();
+    }
+    let req = json!({
+        "op": "publish",
+        "kind": "file",
+        "data": data,
+        "filename": "preview.mp4",
+        "pin": true,
+    });
+    match provider_data(registry, "content", &req).await {
+        Ok(resp) => resp
+            .get("cid")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(|cid| format!("ipfs://{cid}"))
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("mint: preview clip pin failed (non-fatal): {e}");
+            String::new()
+        }
+    }
+}
+
+/// Build the dKMS CEK-custody block — placed EXACTLY where PC2's creator wrote its Lit
+/// block (`asset.protections[0]`). Shared by the object + media envelopes so the producer
+/// and the quorum-open agree on one shape.
+fn dkms_protection(node_set_id_b64: &str, producer_vk_b64: &str, shares: &Value) -> Value {
     json!({
-        "schema": ENVELOPE_SCHEMA,
-        "kid": b.kid_hex,
-        "asset": {
-            "title": b.meta.title.trim(),
-            "description": b.meta.description.trim(),
-            "kid": b.kid_hex,
-            "mimeType": if b.meta.mime.is_empty() { "application/octet-stream" } else { b.meta.mime.as_str() },
-            "assetCid": b.asset_cid,
-            "creatorPrincipal": b.creator_principal,
-            "protections": [{
-                "algorithm": "aes-128",
-                "protectionType": THRESHOLD_PROTECTION_TYPE,
-                "scheme": THRESHOLD_SCHEME,
-                "chain": "base",
-                // The node-set pin the open must match (detects a node swap).
-                "node_set_id_b64": b.node_set_id_b64,
-                // The producer vk that signed each escrow seal — the recovery boundary
-                // authenticates the quorum escrow under it. Persisted here because the
-                // encrypt producer key is per-process; without it the asset is unrecoverable.
-                "producer_verifying_key_b64": b.producer_vk_b64,
-                // Per-node SEALED indexed shares — public escrow ciphertext the quorum
-                // (and only the quorum, under rights) can unwrap. The dKMS analogue of
-                // PC2's public `litCiphertext`.
-                "shares": b.shares.clone(),
-            }],
-        },
-        "media": { "mediaType": "object" },
+        "algorithm": "aes-128",
+        "protectionType": THRESHOLD_PROTECTION_TYPE,
+        "scheme": THRESHOLD_SCHEME,
+        "chain": "base",
+        // The node-set pin the open must match (detects a node swap).
+        "node_set_id_b64": node_set_id_b64,
+        // The producer vk that signed each escrow seal — the recovery boundary authenticates
+        // the quorum escrow under it. Persisted because the encrypt producer key is per-process.
+        "producer_verifying_key_b64": producer_vk_b64,
+        // Per-node SEALED indexed shares — public escrow ciphertext the quorum (and only the
+        // quorum, under rights) can unwrap. The dKMS analogue of PC2's public `litCiphertext`.
+        "shares": shares.clone(),
     })
+}
+
+/// The non-empty effective MIME (`application/octet-stream` when the frame sent none).
+fn effective_mime(meta: &MintMeta) -> &str {
+    if meta.mime.trim().is_empty() {
+        "application/octet-stream"
+    } else {
+        meta.mime.trim()
+    }
+}
+
+/// PC2 `getContentTypeCode` (`elacity-creator/app.js`): a single-letter content class used in
+/// the `Content-Type` attribute of `content.json`.
+fn content_type_code(mime: &str) -> &'static str {
+    if mime.starts_with("audio/") {
+        "F"
+    } else if mime.starts_with("image/") {
+        "D"
+    } else if mime == "application/pdf" || mime.starts_with("text/") {
+        "E"
+    } else {
+        "B"
+    }
+}
+
+/// PC2 op-type code: 0 free, 1 buy-once. (Buy-and-resell, code 2, is a follow-on.)
+fn op_type_code(meta: &MintMeta) -> u64 {
+    if is_paid(meta) {
+        1
+    } else {
+        0
+    }
+}
+
+/// PC2 distribution label for the `properties.distribution` display field.
+fn distribution_label(meta: &MintMeta) -> &'static str {
+    if is_paid(meta) {
+        "Buy Once"
+    } else {
+        "Free"
+    }
+}
+
+/// Build the public token metadata — the EXACT Elacity `asset/v1.1` shape the marketplace
+/// indexer reads for `name`/`description`/`image`/`media.uri`/`properties.publisher`. The
+/// dKMS escrow lives in `asset.protections[0]` (PC2's Lit slot). The companion `content.json`
+/// / `contract.json` referenced via `self://` are published alongside in the same directory.
+fn build_metadata_envelope(b: BuildEnvelope) -> Value {
+    let mime = effective_mime(b.meta);
+    let copies = b.meta.effective_copies();
+    let category = b.meta.category.trim();
+    json!({
+        "schema": ELACITY_ASSET_SCHEMA,
+        "version": "1.1",
+        "name": b.meta.title.trim(),
+        "description": b.meta.description.trim(),
+        // Public cover thumbnail (degraded teaser pinned to IPFS). Empty => the marketplace
+        // indexer falls back to `media.previewURL`, then to the type icon.
+        "image": b.image,
+        "category": category,
+        "media": {
+            "uri": format!("ipfs://{}", b.asset_cid),
+            "contentType": mime,
+            "mimeType": mime,
+            "object": "self://content.json",
+            "protectionType": [THRESHOLD_PROTECTION_TYPE],
+            "size": b.size,
+        },
+        "asset": {
+            "cid": b.asset_cid,
+            "mimeType": mime,
+            "size": b.size,
+            "encrypted": true,
+            // dKMS CEK custody (PC2's Lit slot) + the identities the quorum-open reloads.
+            "protections": [dkms_protection(b.node_set_id_b64, b.producer_vk_b64, b.shares)],
+            "kid": b.kid_hex,
+        },
+        "properties": {
+            "chainId": mint_chain_id(),
+            "ledger": b.meta.channel.trim(),
+            "publisher": b.meta.creator_address.trim(),
+            "creatorPrincipal": b.creator_principal,
+            "contract": "self://contract.json",
+            "labelType": "Creator",
+            "distribution": distribution_label(b.meta),
+            "tags": b.meta.tags.clone(),
+            "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
+            "kid": b.kid_hex,
+        },
+        "attributes": [
+            { "trait_type": "Content-Type", "value": mime },
+            { "trait_type": "Size", "value": b.size },
+            { "trait_type": "Encrypted", "value": true },
+            { "trait_type": "OpType", "value": op_type_code(b.meta) },
+            { "trait_type": "Supply", "value": copies },
+            { "trait_type": "Algorithm", "value": "aes-128" },
+        ],
+        // Top-level kid: the indexer keys on `metadata.kid || metadata.properties.kid`.
+        "kid": b.kid_hex,
+    })
+}
+
+/// Build the companion `content.json` (Elacity `content/v1.0`) referenced by
+/// `media.object = self://content.json`. Carries the dKMS `kid` where PC2 wrote the Lit
+/// `dataToEncryptHash`/`kid`.
+fn build_content_json(meta: &MintMeta, kid_hex: &str, size: u64, image: &str) -> Value {
+    let mime = effective_mime(meta);
+    json!({
+        "schema": ELACITY_CONTENT_SCHEMA,
+        "version": "1.0",
+        "title": meta.title.trim(),
+        "type": mime,
+        "description": "Details about the content, technical informations, etc.",
+        "image": image,
+        "properties": {
+            "size": size,
+            "protectionType": [THRESHOLD_PROTECTION_TYPE],
+            "kid": kid_hex,
+        },
+        "attributes": [
+            { "trait_type": "Content-Type", "value": content_type_code(mime) },
+            { "trait_type": "Size", "value": size },
+            { "trait_type": "Encrypted", "value": true },
+            { "trait_type": "Algorithm", "value": "aes-128" },
+        ],
+    })
+}
+
+/// Build the companion `contract.json` (Elacity MCO `mco/v1.0`) referenced by
+/// `properties.contract = self://contract.json`. Pricing + supply for the listing.
+fn build_contract_json(meta: &MintMeta) -> Value {
+    let mime = effective_mime(meta);
+    let copies = meta.effective_copies();
+    let (token_address, decimals) = currency_token(&meta.currency);
+    json!({
+        "schema": ELACITY_MCO_SCHEMA,
+        "version": "1.0",
+        "title": format!("Contract - {}", meta.title.trim()),
+        "type": "MCO",
+        "description": "Media Contract Ontology (MCO) formatted in JSON",
+        "properties": {
+            "chainId": mint_chain_id(),
+            "channel": meta.channel.trim(),
+            "initialPrice": {
+                "value": if meta.price.trim().is_empty() { "0" } else { meta.price.trim() },
+                "paymentToken": token_address,
+                "paymentDecimals": decimals,
+            },
+        },
+        "attributes": [
+            { "trait_type": "Content-Type", "value": mime },
+            { "trait_type": "OpType", "value": op_type_code(meta) },
+            { "trait_type": "Supply", "value": copies },
+        ],
+    })
+}
+
+/// Build the per-token-type metadata files (Elacity `buildTokenTypeJsons`): the Access Token
+/// (id 1) and Royalty Share (id 2). These resolve as `{tokenId}.json` siblings in the dir.
+fn build_token_type_files(meta: &MintMeta, kid_hex: &str, image: &str) -> Vec<(String, Value)> {
+    let title = meta.title.trim();
+    vec![
+        (
+            ACCESS_TOKEN_FILE.to_string(),
+            json!({
+                "schema": ELACITY_ACCESS_TOKEN_SCHEMA,
+                "version": "1.0",
+                "type": "AccessToken",
+                "name": "Access Token",
+                "description": "Allow owner to access the content",
+                "image": image,
+                "properties": { "kid": kid_hex, "title": title },
+            }),
+        ),
+        (
+            ROYALTY_SHARE_FILE.to_string(),
+            json!({
+                "schema": ELACITY_ROYALTY_SCHEMA,
+                "version": "1.0",
+                "type": "RoyaltyShare",
+                "name": "Royalty Share",
+                "decimals": 1,
+                "description": "10 shares = 1% of revenue",
+                "image": image,
+                "properties": { "kid": kid_hex, "title": title },
+            }),
+        ),
+    ]
+}
+
+/// Resolve a currency symbol to its (token address, decimals) for `contract.json`. Native
+/// (ELA/ETH/unset) carries the zero address + 18 decimals; USDC on Base its real address.
+fn currency_token(currency: &str) -> (&'static str, u32) {
+    match currency.trim().to_ascii_uppercase().as_str() {
+        // Circle USDC on Base mainnet (PC2 `USDC_BASE`).
+        "USDC" => ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6),
+        _ => ("0x0000000000000000000000000000000000000000", 18),
+    }
+}
+
+/// Assemble the full Elacity metadata DIRECTORY (the tokenURI target): `metadata.json` plus
+/// the `self://` companions and the per-token-type files — base64 file entries the content
+/// provider pins as one directory. `metadata.json` is first so the tokenURI
+/// `{dirCid}/metadata.json` resolves.
+fn metadata_directory_files(
+    envelope: &Value,
+    meta: &MintMeta,
+    kid_hex: &str,
+    size: u64,
+    image: &str,
+) -> Vec<Value> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut files: Vec<(String, Value)> = vec![
+        ("metadata.json".to_string(), envelope.clone()),
+        ("content.json".to_string(), build_content_json(meta, kid_hex, size, image)),
+        ("contract.json".to_string(), build_contract_json(meta)),
+    ];
+    files.extend(build_token_type_files(meta, kid_hex, image));
+    files
+        .into_iter()
+        .filter_map(|(path, value)| {
+            serde_json::to_vec(&value).ok().map(|bytes| {
+                json!({ "path": path, "data": b64.encode(bytes) })
+            })
+        })
+        .collect()
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1679,11 +2187,15 @@ fn persist_minted_asset_to_library(
     prepared: &Value,
 ) {
     let root = crate::auth::principal_localhost_root(principal_id);
+    // The Library/Finder name is the creator-supplied TITLE (PC2 names the catalog item by the
+    // asset name, not the uploaded file). Fall back to the original filename only when no title
+    // was given. The `.ddrm` capsule carries the real MIME, so the extensionless title still
+    // opens/renders correctly.
     let base = {
-        let name = if !meta.file_name.trim().is_empty() {
-            meta.file_name.trim()
-        } else {
+        let name = if !meta.title.trim().is_empty() {
             meta.title.trim()
+        } else {
+            meta.file_name.trim()
         };
         sanitize_filename(name)
     };
@@ -1710,6 +2222,9 @@ fn persist_minted_asset_to_library(
         "kid": prepared.get("kid").cloned().unwrap_or(Value::Null),
         "asset_cid": prepared.get("asset_cid").cloned().unwrap_or(Value::Null),
         "metadata_cid": prepared.get("metadata_cid").cloned().unwrap_or(Value::Null),
+        // Cover thumbnail URI (PC2 `descriptor.thumbnail`) — the Library/Finder renders this as
+        // the protected-asset cover art (framed + badged). Empty when no thumbnail was produced.
+        "thumbnail": prepared.get("thumbnail").cloned().unwrap_or(Value::Null),
         // The dKMS escrow descriptor (scheme, node_set_id_b64, producer_verifying_key_b64,
         // shares[]) — the exact fields the quorum-open reloads.
         "protections": prepared.get("protections").cloned().unwrap_or(Value::Null),
@@ -1978,7 +2493,13 @@ mod tests {
         ]);
         let meta = MintMeta {
             title: "T".into(),
+            description: "A test asset".into(),
             mime: "text/plain".into(),
+            creator_address: "0xCreatorWallet".into(),
+            channel: "0xChannel".into(),
+            price: "5".into(),
+            currency: "USDC".into(),
+            copies: Some(250),
             ..Default::default()
         };
         let env = build_metadata_envelope(BuildEnvelope {
@@ -1986,9 +2507,13 @@ mod tests {
             asset_cid: "bafytest",
             node_set_id_b64: "nsid",
             shares: &shares,
+            producer_vk_b64: "dGVzdC12ag==",
             meta: &meta,
             creator_principal: "principal:test",
+            size: 4096,
+            image: "ipfs://bafythumb",
         });
+        assert_eq!(env["image"], json!("ipfs://bafythumb"));
         let prot = &env["asset"]["protections"][0];
         assert_eq!(prot["protectionType"], json!(THRESHOLD_PROTECTION_TYPE));
         assert_eq!(prot["scheme"], json!(THRESHOLD_SCHEME));
@@ -1997,11 +2522,69 @@ mod tests {
         // No Lit anywhere.
         let s = serde_json::to_string(&env).unwrap();
         assert!(
-            !s.to_lowercase().contains("lit"),
+            !s.to_lowercase().contains("\"lit"),
             "envelope must not mention Lit"
         );
         // The envelope carries no raw key material.
         assert!(assert_no_raw_key_material(&env).is_ok());
+
+        // PC2/Elacity `asset/v1.1` parity: the marketplace indexer reads THESE exact fields.
+        assert_eq!(env["schema"], json!(ELACITY_ASSET_SCHEMA));
+        assert_eq!(env["name"], json!("T"));
+        assert_eq!(env["description"], json!("A test asset"));
+        assert_eq!(env["media"]["uri"], json!("ipfs://bafytest"));
+        assert_eq!(env["media"]["contentType"], json!("text/plain"));
+        assert_eq!(env["media"]["object"], json!("self://content.json"));
+        assert_eq!(env["asset"]["cid"], json!("bafytest"));
+        assert_eq!(env["asset"]["size"], json!(4096));
+        assert_eq!(env["properties"]["publisher"], json!("0xCreatorWallet"));
+        assert_eq!(env["properties"]["contract"], json!("self://contract.json"));
+        assert_eq!(env["kid"], json!("0123456789abcdef0123456789abcdef"));
+        assert_eq!(env["properties"]["kid"], json!("0123456789abcdef0123456789abcdef"));
+        // Supply attribute carries the creator's chosen edition count.
+        let supply = env["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["trait_type"] == json!("Supply"))
+            .unwrap();
+        assert_eq!(supply["value"], json!(250));
+    }
+
+    #[test]
+    fn metadata_directory_carries_the_elacity_companions() {
+        let shares = json!([{ "x": 1, "verifying_key_b64": "vk", "wrapped_share_b64": "w" }]);
+        let meta = MintMeta {
+            title: "Doc".into(),
+            mime: "application/pdf".into(),
+            creator_address: "0xWallet".into(),
+            ..Default::default()
+        };
+        let env = build_metadata_envelope(BuildEnvelope {
+            kid_hex: "0123456789abcdef0123456789abcdef",
+            asset_cid: "bafydoc",
+            node_set_id_b64: "nsid",
+            shares: &shares,
+            producer_vk_b64: "dms=",
+            meta: &meta,
+            creator_principal: "principal:test",
+            size: 10,
+            image: "",
+        });
+        let files = metadata_directory_files(&env, &meta, "0123456789abcdef0123456789abcdef", 10, "");
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| f["path"].as_str().unwrap().to_string())
+            .collect();
+        // metadata.json MUST be first so the tokenURI `{dir}/metadata.json` resolves, and the
+        // `self://` companions + token-type files travel in the same directory (PC2 parity).
+        assert_eq!(paths[0], "metadata.json");
+        assert!(paths.contains(&"content.json".to_string()));
+        assert!(paths.contains(&"contract.json".to_string()));
+        assert!(paths.contains(&ACCESS_TOKEN_FILE.to_string()));
+        assert!(paths.contains(&ROYALTY_SHARE_FILE.to_string()));
+        // Default supply when the creator doesn't choose one (PC2 `copies || 10000`).
+        assert_eq!(meta.effective_copies(), DEFAULT_COPIES);
     }
 
     #[test]
@@ -2067,6 +2650,8 @@ mod tests {
         ];
         let meta = MintMeta {
             title: "Vid".into(),
+            mime: "video/mp4".into(),
+            creator_address: "0xCreator".into(),
             ..Default::default()
         };
         let env = build_media_envelope(MediaEnvelope {
@@ -2075,13 +2660,29 @@ mod tests {
             manifest_path: "manifest.mpd",
             node_set_id_b64: "nsid",
             shares: &shares,
+            producer_vk_b64: "dGVzdC12ag==",
             tracks: &tracks,
             meta: &meta,
             creator_principal: "principal:test",
+            size: 1024,
+            image: "ipfs://bafyposter",
+            preview_url: "ipfs://bafypreview",
+            duration: 12.5,
+            resolution: "1280x720",
+            codec: "avc1.64000a",
         });
 
+        // Elacity `asset/v1.1` parity: marketplace display fields are present for media too.
+        assert_eq!(env["schema"], json!(ELACITY_ASSET_SCHEMA));
+        assert_eq!(env["name"], json!("Vid"));
+        assert_eq!(env["image"], json!("ipfs://bafyposter"));
+        assert_eq!(env["media"]["uri"], json!("ipfs://bafydir"));
+        assert_eq!(env["media"]["previewURL"], json!("ipfs://bafypreview"));
+        assert_eq!(env["media"]["duration"], json!(12.5));
+        assert_eq!(env["media"]["resolution"], json!("1280x720"));
+        assert_eq!(env["properties"]["publisher"], json!("0xCreator"));
         // The asset CID is the DASH directory; the media block is DASH with a single default_KID.
-        assert_eq!(env["asset"]["assetCid"], json!("bafydir"));
+        assert_eq!(env["asset"]["cid"], json!("bafydir"));
         assert_eq!(env["media"]["mediaType"], json!("dash"));
         assert_eq!(env["media"]["manifestPath"], json!("manifest.mpd"));
         assert_eq!(
@@ -2097,7 +2698,7 @@ mod tests {
         // No Lit, and no raw key material.
         let s = serde_json::to_string(&env).unwrap();
         assert!(
-            !s.to_lowercase().contains("lit"),
+            !s.to_lowercase().contains("\"lit"),
             "envelope must not mention Lit"
         );
         assert!(assert_no_raw_key_material(&env).is_ok());

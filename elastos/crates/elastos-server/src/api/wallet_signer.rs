@@ -47,7 +47,8 @@ pub struct ManagedSignature {
 }
 
 pub(crate) fn resolve_wallet_bin() -> String {
-    env_nonempty("ELASTOS_WALLET_PROVIDER_BIN").unwrap_or_else(|| DEV_WALLET_PROVIDER_BIN.to_string())
+    env_nonempty("ELASTOS_WALLET_PROVIDER_BIN")
+        .unwrap_or_else(|| DEV_WALLET_PROVIDER_BIN.to_string())
 }
 
 /// Where the wallet capsule keeps its encrypted managed-key store. Stable per user so the
@@ -185,7 +186,9 @@ impl WalletSession {
             reader,
         };
         let init = json!({ "op": "init", "config": { "base_path": base_path } });
-        session.exchange(&init).map_err(|e| format!("wallet init: {e}"))?;
+        session
+            .exchange(&init)
+            .map_err(|e| format!("wallet init: {e}"))?;
         Ok(session)
     }
 
@@ -210,7 +213,9 @@ impl WalletSession {
             Some("ok") => Ok(resp.get("data").cloned().unwrap_or(Value::Null)),
             Some("error") => Err(format!(
                 "wallet-provider op failed: {}",
-                resp.get("message").and_then(Value::as_str).unwrap_or("unknown")
+                resp.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
             )),
             _ => Err("wallet-provider returned malformed response".to_string()),
         }

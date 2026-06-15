@@ -778,9 +778,7 @@ fn home_browser_state(
     let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(err) => {
-            tracing::warn!(
-                "resetting corrupt Home browser-state (cosmetic, no authority): {err}"
-            );
+            tracing::warn!("resetting corrupt Home browser-state (cosmetic, no authority): {err}");
             return Ok(default_home_browser_state(context));
         }
     };

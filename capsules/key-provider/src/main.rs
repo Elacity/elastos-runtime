@@ -363,8 +363,10 @@ struct KeyProvider {
     #[cfg(all(feature = "key-authority-ref", unix))]
     dkms_conn2: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
     /// The long-lived connection to the THIRD quorum node (Day 113–116), same lifecycle as
-    /// `dkms_conn`. `None` until the first quorum release establishes it.
+    /// `dkms_conn`. Retained for the per-node cache symmetry; the quorum rail now dials all three
+    /// concurrently per release (cache-free), so this cell is unused on that path today.
     #[cfg(all(feature = "key-authority-ref", unix))]
+    #[allow(dead_code)]
     dkms_conn3: std::cell::RefCell<Option<Box<DkmsNodeConn>>>,
 }
 
@@ -400,6 +402,20 @@ struct DkmsClientAuthority {
 const DKMS_TCP_CONNECT_TIMEOUT_MS: u64 = 5_000;
 #[cfg(all(feature = "key-authority-ref", unix))]
 const DKMS_TCP_READ_TIMEOUT_MS: u64 = 5_000;
+
+/// CARRIER transport (a `did:`/`carrier:` endpoint): the client connects to the LOCAL
+/// `dkms-carrier-client` sidecar over loopback, then the sidecar dials the node over
+/// Carrier (iroh) and relays bytes. The loopback connect itself is instant, but the
+/// FIRST read returns only AFTER the sidecar completes the remote dial (relay/hole-punch
+/// + a cross-continent RTT), so the read bound is generous — still fail-closed, never a
+/// hung release. The encrypted channel is MANDATORY on this path (network=true).
+#[cfg(all(feature = "key-authority-ref", unix))]
+const DKMS_CARRIER_CONNECT_TIMEOUT_MS: u64 = 5_000;
+#[cfg(all(feature = "key-authority-ref", unix))]
+const DKMS_CARRIER_READ_TIMEOUT_MS: u64 = 20_000;
+/// Where the local Carrier sidecar listens. Overridable for tests/multi-runtime hosts.
+#[cfg(all(feature = "key-authority-ref", unix))]
+const DKMS_CARRIER_CLIENT_DEFAULT_ADDR: &str = "127.0.0.1:9444";
 
 /// The CLIENT side of an established encrypted channel (Day 105–108): after a network `hello`, every
 /// frame in BOTH directions is a sealed envelope — requests sealed to the node's ATTESTED channel
@@ -568,14 +584,66 @@ fn establish_dkms_session(
     use base64::Engine as _;
     use std::os::unix::net::UnixStream;
     let b64 = base64::engine::general_purpose::STANDARD;
+    let mut t_phase = std::time::Instant::now();
 
     // CONNECT to the node's granted endpoint. We do NOT spawn or own the node's process — a real
     // remote authority is reached over a transport, not a child pipe. `tcp:HOST:PORT` is a node
     // taken OFF localhost (Day 105–108): connect under an explicit timeout, bound every read, and
     // REQUIRE the encrypted channel before any recover travels. Anything else is a host-local
     // Unix-domain socket path (the default).
+    // A `carrier:`/`did:` endpoint reaches the node over Carrier (iroh) instead of WireGuard:
+    // the descriptor carries the node's `did:key`, and we dial it through the LOCAL
+    // `dkms-carrier-client` sidecar (loopback). This keeps iroh OUT of this audited crypto
+    // binary — we only open a loopback socket and write a one-line did preamble — while
+    // forcing the mandatory encrypted channel (network=true), exactly like the tcp path but
+    // NAT-traversed with zero VPN and zero per-node enrollment.
+    let carrier_target = client
+        .endpoint
+        .strip_prefix("carrier:")
+        .or_else(|| {
+            client
+                .endpoint
+                .starts_with("did:")
+                .then_some(client.endpoint.as_str())
+        });
     let (writer, reader, network): (Box<dyn std::io::Write>, Box<dyn std::io::Read>, bool) =
-        if let Some(addr) = client.endpoint.strip_prefix("tcp:") {
+        if let Some(target_did) = carrier_target {
+            use std::io::Write as _;
+            use std::net::{TcpStream, ToSocketAddrs};
+            let sidecar = std::env::var("DKMS_CARRIER_CLIENT_ADDR")
+                .unwrap_or_else(|_| DKMS_CARRIER_CLIENT_DEFAULT_ADDR.to_string());
+            let resolved = sidecar
+                .to_socket_addrs()
+                .map_err(|e| format!("dkms carrier sidecar addr {sidecar} does not resolve: {e}"))?
+                .next()
+                .ok_or_else(|| format!("dkms carrier sidecar addr {sidecar} resolves to nothing"))?;
+            let mut stream = TcpStream::connect_timeout(
+                &resolved,
+                std::time::Duration::from_millis(DKMS_CARRIER_CONNECT_TIMEOUT_MS),
+            )
+            .map_err(|e| {
+                format!("dkms carrier sidecar ({sidecar}) is unreachable — is dkms-carrier-client running? {e}")
+            })?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(
+                    DKMS_CARRIER_READ_TIMEOUT_MS,
+                )))
+                .map_err(|e| format!("dkms carrier read timeout could not be set: {e}"))?;
+            // PREAMBLE: tell the sidecar which node did to dial. The sidecar consumes exactly
+            // this one line; everything after is the existing framed PQ-channel protocol.
+            let mut preamble = target_did.to_string();
+            preamble.push('\n');
+            stream
+                .write_all(preamble.as_bytes())
+                .map_err(|e| format!("dkms carrier preamble write failed: {e}"))?;
+            stream
+                .flush()
+                .map_err(|e| format!("dkms carrier preamble flush failed: {e}"))?;
+            let reader = std::io::BufReader::new(
+                stream.try_clone().map_err(|e| format!("dkms carrier clone failed: {e}"))?,
+            );
+            (Box::new(stream), Box::new(reader), true)
+        } else if let Some(addr) = client.endpoint.strip_prefix("tcp:") {
             use std::net::{TcpStream, ToSocketAddrs};
             let resolved = addr
                 .to_socket_addrs()
@@ -635,6 +703,8 @@ fn establish_dkms_session(
         recover_seq: 0,
     };
 
+    eprintln!("key-provider timing:   connect+preamble {} ms", t_phase.elapsed().as_millis());
+    t_phase = std::time::Instant::now();
     // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
     // store path: the secret's location is the node's concern, never the client's.
     let init = conn.call(&json!({ "op": "init", "config": {} }))?;
@@ -649,6 +719,8 @@ fn establish_dkms_session(
     // our ephemeral pubkey so the token is bound to a key only WE hold, and capture the node-signed
     // SESSION TOKEN that will gate every recover over this connection. On the NETWORK transport, ALSO
     // offer our ephemeral channel KEM key — the hello establishes the encrypted channel.
+    eprintln!("key-provider timing:   init call {} ms", t_phase.elapsed().as_millis());
+    t_phase = std::time::Instant::now();
     let channel_keys = if network { Some(ddrm_envelope::mint_session()) } else { None };
     let challenge = ddrm_envelope::random_seed();
     let mut hello_req = json!({
@@ -711,6 +783,7 @@ fn establish_dkms_session(
         .ok_or("dkms node session token is missing an expiry")?;
     conn.session_token = token;
     conn.expires_at = expires_at;
+    eprintln!("key-provider timing:   hello+channel {} ms", t_phase.elapsed().as_millis());
     Ok(conn)
 }
 
@@ -1350,6 +1423,9 @@ impl KeyProvider {
             "principal_id": request.principal_id,
             "session_id": request.session_id,
             "right": request.action,
+            // TRUSTLESS AUTHORIZATION (W4): forward the wallet-signed grant verbatim so the NODE
+            // verifies the wallet + chain itself. Omitted when absent (legacy enrolled-caller path).
+            "access_grant": request.access_grant,
         });
         let now = session.now_unix;
 
@@ -1451,11 +1527,18 @@ impl KeyProvider {
         };
         if need_new {
             *guard = None;
+            let t_sess = std::time::Instant::now();
             match establish_dkms_session(client, now) {
                 Ok(conn) => *guard = Some(Box::new(conn)),
                 Err(err) => return Err(Response::error("not_configured", err)),
             }
+            eprintln!(
+                "key-provider timing: establish session ({}) {} ms",
+                client.endpoint,
+                t_sess.elapsed().as_millis()
+            );
         }
+        let t_rec = std::time::Instant::now();
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
             let recover_seq = conn.next_recover_seq();
@@ -1471,6 +1554,11 @@ impl KeyProvider {
                 Err(err) => Err(err),
             }
         };
+        eprintln!(
+            "key-provider timing: recover call ({}) {} ms",
+            client.endpoint,
+            t_rec.elapsed().as_millis()
+        );
         let recover = match recover {
             Ok(value) => value,
             Err(err) => {
@@ -1494,9 +1582,63 @@ impl KeyProvider {
         }
     }
 
-    /// 2-of-3 QUORUM release (Day 113–116): try ALL THREE secret-holding nodes in order and
-    /// succeed with re-sealed indexed shares from ANY TWO — a dead/unreachable node is a
-    /// tolerated fault, not a failed open. Strictly FAIL-CLOSED below quorum: fewer than two
+    /// One delegated recover with NO cross-call connection cache — a fresh session (connect + init +
+    /// identity handshake) then ONE recover, all on the calling thread. Used by the PARALLEL quorum
+    /// rail where each node runs on its OWN thread, so a shared `RefCell` conn-cell (non-`Send`,
+    /// single-process reuse) would be unsound; the per-open key-provider process establishes cold
+    /// anyway, so the cache buys nothing here. Same per-node security gates as `delegate_recover`
+    /// (session token + freshness counter + possession proof signed under the committed key).
+    /// Returns the node's re-sealed material `data`, or a fail-closed error string.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    fn recover_one_node(
+        client: &DkmsClientAuthority,
+        recover_req: &Value,
+        kid_hex: &str,
+        decrypt_session_pub_b64: &str,
+        content_id: &str,
+        now: Option<u64>,
+    ) -> Result<Value, String> {
+        let t_sess = std::time::Instant::now();
+        let mut conn = establish_dkms_session(client, now)?;
+        eprintln!(
+            "key-provider timing: establish session ({}) {} ms",
+            client.endpoint,
+            t_sess.elapsed().as_millis()
+        );
+        let t_rec = std::time::Instant::now();
+        let recover_seq = conn.next_recover_seq();
+        let recover = match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq) {
+            Ok(caller_sig_b64) => {
+                let mut req = recover_req.clone();
+                req["session_token"] = conn.session_token.clone();
+                req["caller_sig_b64"] = json!(caller_sig_b64);
+                req["recover_seq"] = json!(recover_seq);
+                req["now_unix"] = json!(now);
+                conn.call(&req)
+            }
+            Err(err) => Err(err),
+        };
+        eprintln!(
+            "key-provider timing: recover call ({}) {} ms",
+            client.endpoint,
+            t_rec.elapsed().as_millis()
+        );
+        let recover = recover.map_err(|err| format!("dkms node transport failed: {err}"))?;
+        if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(format!(
+                "dkms node recover failed: {}",
+                recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
+            ));
+        }
+        match recover.get("data") {
+            Some(data) => Ok(data.clone()),
+            None => Err("dkms node recover returned no material".to_string()),
+        }
+    }
+
+    /// 2-of-3 QUORUM release (Day 113–116): dial + handshake + recover ALL THREE secret-holding
+    /// nodes CONCURRENTLY and succeed with re-sealed indexed shares from ANY TWO — a dead/unreachable
+    /// node is a tolerated fault, not a failed open. Strictly FAIL-CLOSED below quorum: fewer than two
     /// served shares refuses the release outright (no single-share material is ever emitted,
     /// and the decrypt boundary independently refuses one anyway). Each node recovers ITS OWN
     /// escrow (share `x‖p(x)` sealed to its recipient at publish) over its OWN connection +
@@ -1564,37 +1706,57 @@ impl KeyProvider {
             .unwrap_or_default()
             .to_string();
 
-        type NodeConnCell = std::cell::RefCell<Option<Box<DkmsNodeConn>>>;
-        let candidates: [(&DkmsClientAuthority, &NodeConnCell, Value, &str); 3] = [
-            (node_a, &self.dkms_conn, recover_req.clone(), "node A"),
-            (node_b, &self.dkms_conn2, req_b, "node B"),
-            (node_c, &self.dkms_conn3, req_c, "node C"),
+        let candidates: [(&DkmsClientAuthority, Value, &str); 3] = [
+            (node_a, recover_req.clone(), "node A"),
+            (node_b, req_b, "node B"),
+            (node_c, req_c, "node C"),
         ];
+
+        // PARALLEL 2-of-3 (Day 117): dial + handshake + recover ALL THREE nodes CONCURRENTLY, each on
+        // its OWN thread, so the release costs the SLOWEST of the two fastest responders (~max), NOT
+        // the SUM of three serial cross-continent round-trips. On a geo-distributed quorum where every
+        // round-trip is seconds, this collapses a ~sum(~4s+~10s) wait toward ~max. Hedging all three
+        // (rather than the first two) also lets a fast third beat a slow first/second — better tail
+        // latency AND resilience. Still strictly FAIL-CLOSED: the quorum math below refuses any release
+        // with fewer than two served shares, and a panicked recover thread is counted a fault, never a
+        // share. Shares are selected in node order (A,B,C) so the merge input is deterministic.
+        let t_par = std::time::Instant::now();
+        let results: Vec<(usize, Result<Value, String>)> = std::thread::scope(|scope| {
+            let decrypt_pub = session.decrypt_session_pub_b64.as_str();
+            let cid = content_id.as_str();
+            let handles: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .map(|(idx, (client, req, _label))| {
+                    scope.spawn(move || (idx, Self::recover_one_node(*client, req, kid_hex, decrypt_pub, cid, now)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))))
+                .collect()
+        });
+        eprintln!(
+            "key-provider timing: parallel quorum recover (3 nodes concurrent) {} ms",
+            t_par.elapsed().as_millis()
+        );
+
+        let mut ordered = results;
+        ordered.sort_by_key(|(idx, _)| *idx);
         let mut materials: Vec<Value> = Vec::new();
         let mut faults: Vec<String> = Vec::new();
-        for (client, conn, req, label) in candidates {
-            if materials.len() == 2 {
-                break; // quorum met — do not touch the remaining node
-            }
-            match self.delegate_recover(
-                client,
-                conn,
-                &req,
-                kid_hex,
-                &session.decrypt_session_pub_b64,
-                &content_id,
-                now,
-            ) {
-                Ok(data) => materials.push(data),
-                Err(resp) => {
-                    // A dead/refusing node is a TOLERATED fault on the quorum rail — record it
-                    // and try the next secret-holder. Quorum math below decides the outcome.
-                    let msg = match &resp {
-                        Response::Error { message, .. } => message.clone(),
-                        _ => "node recover failed".to_string(),
-                    };
-                    faults.push(format!("{label}: {msg}"));
+        for (idx, res) in ordered {
+            let label = candidates.get(idx).map(|c| c.2).unwrap_or("node ?");
+            match res {
+                // Take the first two served shares in node order; extra successes are harmless.
+                Ok(data) => {
+                    if materials.len() < 2 {
+                        materials.push(data);
+                    }
                 }
+                // A dead/refusing node is a TOLERATED fault on the quorum rail — record it; the
+                // quorum math below decides the outcome.
+                Err(msg) => faults.push(format!("{label}: {msg}")),
             }
         }
         if materials.len() < 2 {
@@ -2289,6 +2451,7 @@ mod tests {
             },
             reason: "open protected document".to_string(),
             expires_at: 1_900_000_000,
+            access_grant: None,
         }
     }
 

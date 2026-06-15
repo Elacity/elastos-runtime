@@ -952,6 +952,35 @@ fn has_access_by_content_id_decodes_unowned_as_false() {
 }
 
 #[test]
+fn contract_revert_is_distinguished_from_a_transport_outage() {
+    // PC2 parity (`storage.ts`: `hasAccessByContentId(...).catch(() => false)`): an `eth_call`
+    // that REVERTS is a definitive on-chain "no access" and must map to `has_access: false`
+    // (fail closed cleanly), while a transport/range outage must NOT — it propagates so an
+    // outage can never masquerade as a certain denial.
+    let revert_code3 = Response::error(
+        "upstream_rpc_error",
+        "{\"code\":3,\"data\":\"0xcad88223…\",\"message\":\"execution reverted\"}",
+    );
+    let revert_32000 = Response::error("upstream_rpc_error", "execution reverted: CONTENT_UNKNOWN");
+    assert!(is_contract_revert(&revert_code3), "EIP-1474 code 3 is a revert");
+    assert!(is_contract_revert(&revert_32000), "an 'execution reverted' message is a revert");
+
+    // Genuine outages / non-revert RPC errors are NOT reverts (they must not be denied-with-certainty).
+    assert!(!is_contract_revert(&Response::error(
+        "upstream_rpc_error",
+        "block range is too large"
+    )));
+    assert!(!is_contract_revert(&Response::error(
+        "upstream_unreachable",
+        "connection refused"
+    )));
+    assert!(!is_contract_revert(&Response::error(
+        "upstream_http_error",
+        "upstream returned HTTP 429"
+    )));
+}
+
+#[test]
 fn has_access_by_content_id_fails_closed_on_malformed_bool() {
     // A non-boolean ABI word (here the high bytes are non-zero) must fail closed —
     // never silently coerced to true/false. The decrypt chain depends on this answer.

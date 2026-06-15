@@ -235,6 +235,11 @@ enum Request {
         content_b64: String,
         #[serde(default)]
         filename: Option<String>,
+        /// Optional free-preview length in seconds. When > 0 and the source is longer, an
+        /// UNENCRYPTED, lower-quality first-N-seconds clip is produced (PC2 `previewDuration`,
+        /// `media.ts:1753`). Capped at 60s. The clip never carries the CEK — it's a teaser.
+        #[serde(default)]
+        preview_duration: Option<u64>,
     },
     Shutdown,
 }
@@ -284,7 +289,8 @@ impl MediaProvider {
             Request::PackageDash {
                 content_b64,
                 filename,
-            } => self.package_dash(&content_b64, filename.as_deref()),
+                preview_duration,
+            } => self.package_dash(&content_b64, filename.as_deref(), preview_duration.unwrap_or(0)),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -501,7 +507,12 @@ impl MediaProvider {
     /// references them. Segments are PLAINTEXT — the creator route CENC-encrypts + escrows
     /// them under a single asset CEK before publishing (PRINCIPLE #15). The full multi-rung
     /// adaptive ladder is P4.
-    fn package_dash(&self, content_b64: &str, filename: Option<&str>) -> Response {
+    fn package_dash(
+        &self,
+        content_b64: &str,
+        filename: Option<&str>,
+        preview_duration: u64,
+    ) -> Response {
         let tools = match self.config.resolve() {
             Ok(t) => t,
             Err(e) => return Response::error("not_configured", e),
@@ -515,7 +526,7 @@ impl MediaProvider {
             Ok(d) => d,
             Err(e) => return Response::error("scratch_error", e),
         };
-        let result = self.package_dash_in(&tools, &workdir, &bytes, filename);
+        let result = self.package_dash_in(&tools, &workdir, &bytes, filename, preview_duration);
         let _ = std::fs::remove_dir_all(&workdir);
         match result {
             Ok(data) => Response::ok(data),
@@ -529,6 +540,7 @@ impl MediaProvider {
         workdir: &Path,
         bytes: &[u8],
         filename: Option<&str>,
+        preview_duration: u64,
     ) -> Result<Value, String> {
         let ext = filename
             .and_then(|f| Path::new(f).extension())
@@ -551,6 +563,28 @@ impl MediaProvider {
         if probe.height > 0 && top.height > probe.height {
             top.height = probe.height;
         }
+
+        // Free preview (PC2 `media.ts:1753`): an UNENCRYPTED first-N-seconds teaser at reduced
+        // quality. Produced only when requested AND the source is longer than the window. The
+        // clip carries no CEK — it's a public sample; the full asset stays dKMS-encrypted.
+        let preview = if preview_duration > 0 {
+            let secs = preview_duration.min(PREVIEW_MAX_SECONDS);
+            if probe.duration > secs as f64 {
+                let has_video = probe.width > 0 || probe.height > 0;
+                match make_preview_clip(tools, workdir, &input, secs, has_video) {
+                    Ok(bytes) => Some((bytes, secs)),
+                    Err(e) => {
+                        // Non-fatal: a preview failure must never block the mint.
+                        eprintln!("media-provider: preview clip skipped ({e})");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let frag_bytes = self.fragment_rendition(tools, workdir, &input, &top, &probe)?;
         let streams = mp4::demux_tracks(&frag_bytes)?;
@@ -598,7 +632,7 @@ impl MediaProvider {
             }));
         }
 
-        Ok(json!({
+        let mut out = json!({
             "schema": "elastos.media.dash/v1",
             "rendition_id": top.id,
             "manifest_path": "manifest.mpd",
@@ -610,8 +644,26 @@ impl MediaProvider {
                 "duration": probe.duration,
                 "has_audio": probe.has_audio,
             },
+            // Presentation hints surfaced into the public envelope (PC2 `media.{duration,
+            // resolution,codec}`): the top rendition's resolution + the lead video codec.
+            "resolution": if probe.width > 0 && probe.height > 0 {
+                json!(format!("{}x{}", probe.width, probe.height))
+            } else {
+                Value::Null
+            },
+            "codec": streams
+                .iter()
+                .find(|s| matches!(s.info.kind, mpd::TrackKind::Video))
+                .or_else(|| streams.first())
+                .map(|s| json!(s.info.codec))
+                .unwrap_or(Value::Null),
             "tracks": tracks_out,
-        }))
+        });
+        if let Some((bytes, secs)) = preview {
+            out["preview_b64"] = json!(base64_encode(&bytes));
+            out["preview_duration"] = json!(secs);
+        }
+        Ok(out)
     }
 }
 
@@ -675,6 +727,43 @@ fn probe_source(ffprobe: &str, input: &Path) -> Result<ProbeResult, String> {
         duration,
         has_audio,
     })
+}
+
+/// Max free-preview length (PC2 caps `previewDuration` at 60s, `media.ts:1683`).
+const PREVIEW_MAX_SECONDS: u64 = 60;
+
+/// Produce an UNENCRYPTED, reduced-quality first-`secs`-seconds clip from `input` (PC2's
+/// preview ffmpeg recipe, `media.ts:1763`): H.264 CRF 28 / `scale=min(640,iw)`, AAC 96k,
+/// `+faststart`; audio-only sources drop the video track. Returns the mp4 bytes.
+fn make_preview_clip(
+    tools: &ResolvedTools,
+    workdir: &Path,
+    input: &Path,
+    secs: u64,
+    has_video: bool,
+) -> Result<Vec<u8>, String> {
+    let preview_path = workdir.join("preview.mp4");
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.arg("-i").arg(input).arg("-t").arg(secs.to_string());
+    if has_video {
+        cmd.arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("fast")
+            .arg("-crf")
+            .arg("28")
+            .arg("-vf")
+            .arg("scale=min(640\\,iw):-2")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("96k");
+    } else {
+        cmd.arg("-c:a").arg("aac").arg("-b:a").arg("96k").arg("-vn");
+    }
+    cmd.arg("-movflags").arg("+faststart").arg("-y").arg(&preview_path);
+    run_ffmpeg(&mut cmd, "preview clip")?;
+    std::fs::read(&preview_path).map_err(|e| format!("read preview clip: {e}"))
 }
 
 fn run_ffmpeg(cmd: &mut Command, label: &str) -> Result<(), String> {

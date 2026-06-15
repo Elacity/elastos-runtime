@@ -795,6 +795,12 @@ async fn attach_protected_content_open_chain(
         key_envelope: sealed_object.key_envelope.clone(),
         reason: reason.to_string(),
         expires_at,
+        // TRUSTLESS AUTHORIZATION (W4): the wallet-signed AccessGrant is threaded HERE once the
+        // browser wallet round-trip is wired — the gateway mints the decrypt session key, asks
+        // `wallet-provider` for an EIP-191 `personal_sign` of `ddrm_envelope::access::build_delegation(..)
+        // .canonical()`, then `assemble_grant(..)`. Until that live collection lands the node falls
+        // back to the legacy enrolled-receipt path (W3); the wire + node verifier are already in place.
+        access_grant: None,
     };
     let release_receipt_value = protected_provider_data(
         registry,
@@ -6814,6 +6820,9 @@ fn mime_for_name(name: &str) -> &'static str {
         "video/mp4"
     } else if lower.ends_with(".mp3") {
         "audio/mpeg"
+    } else if lower.ends_with(".ddrm") {
+        // A minted dKMS asset capsule — opened through the protected dDRM viewer (quorum recover).
+        "application/x-ddrm"
     } else {
         "application/octet-stream"
     }
@@ -6844,6 +6853,11 @@ fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
         vec!["documents"]
     } else if lower.ends_with(".gba") || lower.ends_with(".gb") || lower.ends_with(".gbc") {
         vec!["gba-emulator"]
+    } else if lower.ends_with(".ddrm") {
+        // A minted dKMS `.ddrm` capsule opens through the protected dDRM viewer: the shell routes
+        // a `ddrm-viewer` target carrying the owned URI to POST /api/viewers/open, which detects
+        // the capsule and recovers + renders the asset via the 2-of-3 quorum (never the CEK).
+        vec!["ddrm-viewer"]
     } else {
         Vec::new()
     }
@@ -6868,6 +6882,7 @@ fn viewer_label(id: &str) -> &str {
         "video-viewer" => "Video Viewer",
         "gba-emulator" => "GBA Emulator",
         "archive-manager" => "Archive",
+        "ddrm-viewer" => "Protected Viewer",
         _ => id,
     }
 }

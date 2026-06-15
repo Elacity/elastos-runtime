@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 
 use ddrm_media::{prepare, prepare_blob, PreparedSession, SessionParams};
 
+mod grant;
 mod quorum;
 use quorum::{run_quorum, QuorumArgs};
 
@@ -113,6 +114,14 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 fn run() -> Result<(), String> {
+    // Trustless-open sidecar modes (one-shot, stdin JSON -> stdout JSON): the gateway shells out so
+    // it never links the PQ session signer. Handled before the per-open arg parsing.
+    match std::env::args().nth(1).as_deref() {
+        Some("--grant-prepare") => return grant::run_grant_prepare(),
+        Some("--grant-assemble") => return grant::run_grant_assemble(),
+        _ => {}
+    }
+
     let mut principal: Option<String> = None;
     let mut video: Option<String> = None;
     let mut object_file: Option<String> = None;
@@ -128,6 +137,7 @@ fn run() -> Result<(), String> {
     let mut capsule_path: Option<String> = None;
     let mut descriptor_path: Option<String> = None;
     let mut caller_seed_b64: Option<String> = None;
+    let mut access_grant_b64: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -154,6 +164,8 @@ fn run() -> Result<(), String> {
             "--capsule" => capsule_path = args.next(),
             "--descriptor" => descriptor_path = args.next(),
             "--caller-seed" => caller_seed_b64 = args.next(),
+            // OPTIONAL base64 of the wallet-signed AccessGrantV1 JSON (trustless authorization).
+            "--access-grant" => access_grant_b64 = args.next(),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -181,6 +193,7 @@ fn run() -> Result<(), String> {
             object_cid,
             mime: object_mime.unwrap_or_else(|| "application/octet-stream".to_string()),
             ttl_secs,
+            access_grant_b64,
         });
     }
 

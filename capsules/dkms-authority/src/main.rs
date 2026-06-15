@@ -27,6 +27,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
+/// The node's OWN pinned, read-only Base capability + the trustless `authorize_access`
+/// gate (verify the wallet-signed grant here, evaluate `hasAccessByContentId` here).
+mod node_chain;
+
 const PROVIDER_VERSION: &str = "0.1.0-dev";
 
 /// Env var selecting the SOCKET serve transport: when set to a path, the node binds + listens there
@@ -43,13 +47,18 @@ const NODE_KEYSTORE_SCHEMA: &str = "elastos.dkms_node.master_seed/v1";
 /// it (it only knows the node's endpoint + the node's PUBLIC identity).
 const KEY_STORE_ENV: &str = "DKMS_AUTHORITY_KEY_STORE";
 
-/// Env var carrying the node's ALLOW-LIST of KNOWN caller identities (Day 95–96): a comma-separated
-/// list of base64 ML-DSA verifying keys. The OPERATOR/PROVISIONER who launches the daemon sets it;
-/// the connecting CLIENT cannot override it (its `init {}` never clears it). When set + non-empty,
-/// `hello` REFUSES a caller whose ephemeral pubkey is not on the list — the node serves only KNOWN
-/// callers, the runtime-core analogue of PC2's session being OWNER-BOUND to a registered wallet
-/// (`secureViewSession.ts:87`–`:100`). When unset/empty the node accepts any well-formed caller key
-/// (anonymous enrollment — dev/test only; the production rail always provisions the allow-list).
+/// Env var carrying the node's OPTIONAL allow-list of caller identities: a comma-separated list of
+/// base64 ML-DSA verifying keys, set by the OPERATOR/PROVISIONER (the connecting CLIENT cannot
+/// override it). Since W3/D4 this is a SOFT, OPTIONAL gate — NOT the security boundary. The real
+/// authorization is the wallet-signed [`ddrm_envelope::access::AccessGrantV1`] the node verifies +
+/// the on-chain token the node reads itself (see [`authorize`]). Roles of the allow-list now:
+///   * a coarse DoS/handshake gate (refuse unknown callers a session) when an operator wants one;
+///   * the TRUST scope for the LEGACY unsigned-receipt path — that path is honored ONLY for an
+///     enrolled caller, so dropping the allow-list is SAFE: an anonymous caller can authorize only
+///     with a grant and can never forge `allowed:true`.
+/// When unset/empty the node serves ANONYMOUS callers — the millions-of-sovereign-runtimes posture
+/// — relying on the trustless grant gate. (The pinned OPERATOR identity, separate, still governs
+/// lifecycle/rotation/revocation.)
 #[cfg(unix)]
 const ALLOWED_CALLERS_ENV: &str = "DKMS_AUTHORITY_ALLOWED_CALLERS";
 
@@ -189,6 +198,13 @@ enum Request {
         /// rejects a proof once `now > expiry`.
         #[serde(default)]
         attest_expiry: Option<u64>,
+        /// TRUSTLESS AUTHORIZATION (W2): the wallet-signed access grant. When present, the node
+        /// verifies the wallet (EIP-191/1271) + session-key signatures ITSELF and evaluates
+        /// `hasAccessByContentId` per covered address ITSELF — no enrollment, no trusted receipt.
+        /// When absent, the node falls back to the legacy receipt path iff `legacy-receipt-authz`
+        /// is enabled (migration scaffold; off ⇒ a missing grant fails closed).
+        #[serde(default)]
+        access_grant: Option<ddrm_envelope::access::AccessGrantV1>,
     },
     /// SHARE-WISE ROTATION (Day 109–112): re-escrow THIS node's current share to a SUCCESSOR node,
     /// refreshed by an operator-sealed XOR delta — the whole CEK is NEVER reassembled anywhere
@@ -540,6 +556,7 @@ impl DkmsAuthorityNode {
                 now_unix,
                 attest_node_set_id_b64,
                 attest_expiry,
+                access_grant,
             } => self.recover(RecoverArgs {
                 wrapped_cek_b64,
                 scheme,
@@ -562,6 +579,7 @@ impl DkmsAuthorityNode {
                 now_unix,
                 attest_node_set_id_b64,
                 attest_expiry,
+                access_grant,
             }),
             Request::RotateShare {
                 wrapped_cek_b64,
@@ -707,10 +725,11 @@ impl DkmsAuthorityNode {
         if ddrm_envelope::MlDsa65Verifier::from_encoded(&caller_pub).is_none() {
             return Response::error("invalid_request", "caller_pub_b64 is not a valid verifying key");
         }
-        // KNOWN-CALLER GATE (Day 95–96): when an allow-list is provisioned, the node serves ONLY a
-        // caller whose ephemeral identity key it recognizes — an unknown caller is refused at the
-        // handshake, BEFORE any session token is minted (the OWNER-BOUND analogue). When no allow-list
-        // is configured the node accepts any well-formed key (anonymous enrollment, dev/test only).
+        // OPTIONAL DoS GATE (W3/D4): when an allow-list is provisioned, the node serves only a caller
+        // whose ephemeral identity key it recognizes — refused at the handshake, BEFORE a token is
+        // minted. This is now a SOFT gate, not the security boundary (which is the trustless grant
+        // check in `authorize`). When no allow-list is configured the node accepts any well-formed
+        // key (the anonymous, millions-of-runtimes posture — still safe: recover requires a grant).
         if let Some(allowed) = self.allowed_callers.as_ref() {
             if !allowed.iter().any(|vk| vk.as_slice() == caller_pub.as_slice()) {
                 return Response::error(
@@ -883,9 +902,17 @@ impl DkmsAuthorityNode {
         if let Err(err) = verify_session(authority, args) {
             return Response::error("session_invalid", err);
         }
-        // RE-AUTHORIZE in this boundary — refuse to recover for an unauthorized caller before
-        // touching any key material (the node never trusts the client's claim).
-        if let Err(err) = reauthorize(args) {
+        // AUTHORIZE in this boundary — refuse to recover for an unauthorized caller before
+        // touching any key material (the node never trusts the client's claim). Trustless path:
+        // a wallet-signed AccessGrant the node verifies itself + a node-side on-chain
+        // hasAccessByContentId check. Legacy path (feature `legacy-receipt-authz`): the unsigned
+        // RightsDecisionReceiptV1, used ONLY when no grant is supplied (migration scaffold).
+        // The legacy unsigned-receipt path is honored ONLY for an ENROLLED (allow-listed) caller —
+        // an anonymous caller (no allow-list, the millions-of-runtimes posture) can authorize ONLY
+        // with a wallet-signed grant the node verifies + a chain token the node reads. This is what
+        // makes dropping the allow-list as the security boundary SAFE (W3/D4).
+        let legacy_receipt_allowed = self.allowed_callers.is_some();
+        if let Err(err) = authorize(args, legacy_receipt_allowed) {
             return Response::error("access_denied", err);
         }
         let wrapped = match b64().decode(&args.wrapped_cek_b64) {
@@ -1643,6 +1670,7 @@ struct RecoverArgs {
     now_unix: Option<u64>,
     attest_node_set_id_b64: Option<String>,
     attest_expiry: Option<u64>,
+    access_grant: Option<ddrm_envelope::access::AccessGrantV1>,
 }
 
 /// VERIFY the caller's session token + POSSESSION PROOF in the node's OWN boundary. First, the token
@@ -1711,6 +1739,58 @@ fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), S
 /// buggy/compromised client that forwards a denied, foreign, or incoherent receipt is refused. The
 /// runtime-core analogue of PC2's Lit action re-running `hasAccessByContentId` in the TEE
 /// (`universal-decrypt-chipotle.js:560`–`:568`) rather than trusting the caller's claim.
+/// THE AUTHORIZATION GATE. When the caller supplies a wallet-signed [`AccessGrantV1`],
+/// the node authorizes TRUSTLESSLY: it verifies the wallet signature (EIP-191/1271) +
+/// the session-key request signature + the window/nonce/node-set/kid binding ITSELF, then
+/// evaluates `hasAccessByContentId` per covered address against its OWN pinned Base RPC
+/// pool — no enrollment, no trusted gateway. When no grant is supplied it falls back to the
+/// legacy unsigned-receipt path iff `legacy-receipt-authz` is enabled (a migration scaffold;
+/// disabled ⇒ a missing grant fails closed). Every path FAILS CLOSED.
+fn authorize(args: &RecoverArgs, legacy_receipt_allowed: bool) -> Result<(), String> {
+    if let Some(grant) = args.access_grant.as_ref() {
+        let chain = node_chain::NodeChain::from_env().ok_or(
+            "trustless authorization requires a configured node chain capability (DKMS_CHAIN_RPC_POOL)",
+        )?;
+        // The node enforces ITS OWN quorum identity when configured (anti cross-quorum replay);
+        // absent that pin it accepts the grant's declared node-set (the grant is still wallet- +
+        // chain-bound). Operators SHOULD set DKMS_AUTHORITY_NODE_SET_ID_B64 in production.
+        let expected_ns = std::env::var("DKMS_AUTHORITY_NODE_SET_ID_B64")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| grant.delegation.node_set_id_b64.clone());
+        let now = effective_now(args.now_unix);
+        return node_chain::authorize_access(
+            grant,
+            &expected_ns,
+            chain.chain_id(),
+            &args.kid_hex,
+            now,
+            None,
+            &chain,
+        );
+    }
+    // No wallet-signed grant. The legacy receipt is trusted ONLY for an enrolled (allow-listed)
+    // caller; an anonymous caller MUST present a grant (it cannot forge `allowed:true`).
+    if !legacy_receipt_allowed {
+        return Err(
+            "anonymous caller must present a wallet-signed access grant — the node has no allow-list, so the legacy unsigned-receipt path is closed (W3/D4)"
+                .to_string(),
+        );
+    }
+    #[cfg(feature = "legacy-receipt-authz")]
+    {
+        reauthorize(args)
+    }
+    #[cfg(not(feature = "legacy-receipt-authz"))]
+    {
+        Err("no wallet-signed access grant supplied and legacy receipt authorization is disabled".to_string())
+    }
+}
+
+/// LEGACY (pre-trustless) authorization: re-check the unsigned `RightsDecisionReceiptV1` in the
+/// node's own boundary. Retained behind `legacy-receipt-authz` for the migration window; a present
+/// [`AccessGrantV1`] always supersedes this. See [`authorize`].
+#[cfg_attr(not(feature = "legacy-receipt-authz"), allow(dead_code))]
 fn reauthorize(args: &RecoverArgs) -> Result<(), String> {
     use elastos_common::protected_content::{PROTECTED_CONTENT_ACTIONS, RIGHTS_DECISION_RECEIPT_SCHEMA};
     let r = &args.rights_receipt;
@@ -2318,6 +2398,7 @@ mod tests {
         let transcript_aad = b"day87-88-transcript".to_vec();
 
         let (caller, caller_vk) = caller_keypair();
+        node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
         let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let resp = node.recover(RecoverArgs {
@@ -2342,6 +2423,7 @@ mod tests {
             now_unix: Some(NOW),
             attest_node_set_id_b64: None,
             attest_expiry: None,
+            access_grant: None,
         });
         let data = ok_data(resp);
         // The response carries SEALED material only — never a raw CEK.
@@ -2392,6 +2474,7 @@ mod tests {
         let session_pub = b64().decode(&session_pub_b64).unwrap();
 
         let (caller, caller_vk) = caller_keypair();
+        node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
         let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let data = ok_data(node.recover(RecoverArgs {
@@ -2416,6 +2499,7 @@ mod tests {
             now_unix: Some(NOW),
             attest_node_set_id_b64: Some(b64().encode(node_set_id)),
             attest_expiry: Some(expiry),
+            access_grant: None,
         }));
 
         // The node emitted a co-signed attestation; the offline verifier accepts the 1-of-1 quorum.
@@ -2479,6 +2563,7 @@ mod tests {
         // Forged producer vk → recover fails closed (a live session + valid possession proof pass the
         // gate, so the producer check is what we're exercising).
         let (caller, caller_vk) = caller_keypair();
+        node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
         let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let forged = node.recover(RecoverArgs {
@@ -2503,6 +2588,7 @@ mod tests {
             now_unix: Some(NOW),
             attest_node_set_id_b64: None,
             attest_expiry: None,
+            access_grant: None,
         });
         assert_eq!(error_code(&forged), "invalid_request");
 
@@ -2531,6 +2617,7 @@ mod tests {
             now_unix: Some(NOW),
             attest_node_set_id_b64: None,
             attest_expiry: None,
+            access_grant: None,
         });
         assert_eq!(error_code(&pre), "not_configured");
         let _ = std::fs::remove_file(&store);
@@ -2561,6 +2648,7 @@ mod tests {
         let (_session_secret, session_public) = ddrm_envelope::mint_session();
         let session_pub_b64 = b64().encode(ddrm_envelope::session_public_bytes(&session_public));
         let (caller, caller_vk) = caller_keypair();
+        node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
         // Base case uses freshness seq 1; tests that drive multiple recovers re-sign with the
         // returned caller signer at a higher seq.
@@ -2587,8 +2675,44 @@ mod tests {
             now_unix: Some(NOW),
             attest_node_set_id_b64: None,
             attest_expiry: None,
+            access_grant: None,
         };
         (node, args, caller)
+    }
+
+    /// W3/D4 — an ANONYMOUS caller (the node has no allow-list) presenting a valid live session +
+    /// a perfectly-formed `allowed:true` receipt but NO wallet-signed grant is REFUSED. This is the
+    /// safety property that lets the allow-list be dropped as the security boundary: an unenrolled
+    /// runtime cannot forge authorization — it must present a grant the node verifies + a chain
+    /// token the node reads. (The "WITH a valid grant succeeds" half is `node_chain`'s
+    /// `authorize_allows_when_grant_valid_and_chain_true`, which consults no allow-list at all.)
+    #[test]
+    fn anonymous_caller_without_a_grant_is_refused() {
+        let store = unique_store("anon-no-grant");
+        let (mut node, args, _caller) = setup_recover(&store);
+        node.allowed_callers = None; // drop enrollment → caller is anonymous
+        let resp = node.recover(args);
+        assert_eq!(
+            error_code(&resp),
+            "access_denied",
+            "an anonymous caller cannot authorize with an unsigned receipt — a grant is required"
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// W3/D4 — an ENROLLED (allow-listed) caller may still use the legacy unsigned-receipt path
+    /// during the migration window (feature `legacy-receipt-authz`). The allow-list is now a TRUST
+    /// scope for the legacy path, not the system-wide security boundary.
+    #[test]
+    fn enrolled_caller_legacy_receipt_path_still_authorizes() {
+        let store = unique_store("anon-enrolled");
+        let (mut node, args, _caller) = setup_recover(&store); // setup_recover enrolls the caller
+        let resp = node.recover(args);
+        assert!(
+            matches!(resp, Response::Ok { .. }),
+            "an enrolled caller + a valid receipt recovers via the legacy path: {resp:?}"
+        );
+        let _ = std::fs::remove_file(&store);
     }
 
     /// The node's IDENTITY handshake: a `hello` returns the published vk + an attestation that
@@ -2769,11 +2893,15 @@ mod tests {
 
         let store = unique_store("framed");
 
-        // ---- Happy path: a full framed session over one connection. ----
+        // ---- Happy path: a full framed session over one connection. The caller is ENROLLED on the
+        // node's allow-list so the legacy receipt path authorizes (the TRANSPORT, not authZ, is the
+        // subject of this test). ----
+        let (caller, caller_vk) = caller_keypair();
+        let allowed = Some(vec![caller_vk.clone()]);
         let (mut client, server) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || {
             let reader = io::BufReader::new(server.try_clone().unwrap());
-            serve_connection_io(reader, server, &None, &None, &mut Vec::new(), false)
+            serve_connection_io(reader, server, &allowed, &None, &mut Vec::new(), false)
         });
 
         let call = |client: &mut UnixStream, req: Value| -> Value {
@@ -2786,7 +2914,6 @@ mod tests {
         let init = call(&mut client, json!({ "op": "init", "config": { "authority_key_store": store } }));
         assert_eq!(init["status"].as_str().unwrap(), "ok");
 
-        let (caller, caller_vk) = caller_keypair();
         let challenge = b64().encode([0xB2u8; 32]);
         let hello = call(
             &mut client,

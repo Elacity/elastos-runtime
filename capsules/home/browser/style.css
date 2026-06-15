@@ -1177,6 +1177,65 @@ body.dragging-target {
   overflow: hidden;
 }
 
+/* Immediate loading state for a slow owned/protected open (wallet sign + geo quorum
+   recover + decrypt) so a double-click never looks like a dead click. */
+.window-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  width: 100%;
+  height: 100%;
+  padding: 24px;
+  text-align: center;
+  box-sizing: border-box;
+  background-color: var(--panel-strong);
+  color: var(--text-soft, #cbd5e1);
+}
+
+.window-loading-spinner {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 3px solid color-mix(in srgb, currentColor 22%, transparent);
+  border-top-color: currentColor;
+  animation: window-loading-spin 0.85s linear infinite;
+}
+
+.window-loading-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text, #e2e8f0);
+}
+
+.window-loading-detail {
+  font-size: 0.8rem;
+  opacity: 0.75;
+  max-width: 340px;
+  line-height: 1.45;
+}
+
+.window-loading.is-error .window-loading-spinner {
+  display: none;
+}
+
+.window-loading.is-error .window-loading-title {
+  color: var(--danger, #f87171);
+}
+
+@keyframes window-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .window-loading-spinner {
+    animation-duration: 2.4s;
+  }
+}
+
 .window-frame {
   display: block;
   width: 100%;

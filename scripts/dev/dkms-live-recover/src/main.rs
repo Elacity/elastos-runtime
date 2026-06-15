@@ -196,6 +196,189 @@ impl NodeSocket {
     }
 }
 
+/// Build the self-consistent decrypt boundary (producer identity, decrypt session, transcript AAD)
+/// the recover binds to. Shared by the 2-of-3 proof and the single-node grant-gate proof.
+fn make_boundary(caller_seed: [u8; 32]) -> Boundary {
+    let (caller_signer, _caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
+    let (producer_signer, producer_vk) =
+        ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
+    let producer_vk_b64 = B64.encode(&producer_vk);
+    let kid16 = [0xC5u8; 16];
+    let kid_hex: String = kid16.iter().map(|x| format!("{x:02x}")).collect();
+    let (session_secret, session_public) = ddrm_envelope::mint_session();
+    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
+    let session_pub_b64 = B64.encode(&session_pub_bytes);
+    let content_hash = [0xABu8; 32];
+    let nonce = [0xCDu8; 12];
+    let aad = DecryptTranscriptV1 {
+        suite_id: SUITE,
+        provider_id: "decrypt",
+        principal_id: PRINCIPAL,
+        session_id: SESSION,
+        object_cid: CONTENT,
+        content_hash: &content_hash,
+        action: RIGHT,
+        viewer_interface: "reader",
+        output_kind: "page-image",
+        expires_at: EXPIRES_AT,
+        release_receipt_hash: [0u8; 32],
+        decrypt_session_pub: &session_pub_bytes,
+        nonce: &nonce,
+        node_set_id: None,
+    }
+    .to_aad();
+    Boundary {
+        producer_signer,
+        producer_vk_b64,
+        caller_seed,
+        caller_signer,
+        session_secret,
+        session_pub_bytes,
+        session_pub_b64,
+        kid16,
+        kid_hex,
+        aad: aad.clone(),
+        aad_b64: B64.encode(&aad),
+        content_hash_b64: B64.encode(content_hash),
+        nonce_b64: B64.encode(nonce),
+    }
+}
+
+fn read_caller_seed(seed_path: &str) -> Result<[u8; 32], String> {
+    let seed_raw =
+        std::fs::read_to_string(seed_path).map_err(|e| format!("read caller seed {seed_path}: {e}"))?;
+    let seed_bytes = B64
+        .decode(seed_raw.trim())
+        .map_err(|e| format!("caller seed is not base64: {e}"))?;
+    seed_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("caller seed must be 32 bytes, got {}", seed_bytes.len()))
+}
+
+/// SINGLE-NODE TRUSTLESS-GATE PROOF against ONE node running the new `authorize_access` binary
+/// with a live Base RPC pool. Proves, on real infrastructure against the production Base chain:
+///   (a) ANON-NO-GRANT  — a never-enrolled caller with NO grant is REFUSED (W3 anonymous-safe);
+///   (b) FORGED-GRANT   — a grant whose covered set was tampered after signing is REJECTED by the
+///                        node's OWN wallet-signature check, BEFORE any chain read;
+///   (c) DENY-ON-CHAIN  — a VALID wallet-signed grant for an address that does NOT hold the token
+///                        is verified by the node, which then reads `hasAccessByContentId` ITSELF
+///                        against live Base (revert → false) and FAILS CLOSED.
+/// No share is ever released in these cases — they are the fail-closed legs of the trustless gate.
+fn grant_gate(endpoint: &str, seed_path: &str) -> Result<(), String> {
+    println!("==============================================================");
+    println!(" LIVE TRUSTLESS-GATE proof — node-side wallet+chain authorization");
+    println!(" node: {endpoint}");
+    println!("==============================================================");
+
+    let caller_seed = read_caller_seed(seed_path)?;
+    let b = make_boundary(caller_seed);
+
+    // The node verifies the grant against THIS kid (the recover's kid_hex) and chain_id 8453 (Base).
+    let kid_grant = format!("0x{}", b.kid_hex);
+    let node_set = B64.encode(b"elastos-grant-gate-proof");
+
+    let pin = NodePin {
+        label: "node".to_string(),
+        endpoint: endpoint.to_string(),
+        // The single-node gate only needs the node's PUBLISHED identity to escrow + verify; pull it
+        // from the pre-channel init reply so this works against a freshly-initialized test node.
+        vk_b64: String::new(),
+        recipient_pub_b64: String::new(),
+    };
+    let pin = resolve_pin_identity(pin)?;
+
+    // (a) ANON-NO-GRANT: a never-enrolled caller with no wallet grant must be refused.
+    {
+        let (mut node, token) = connect_and_open(&pin, &b)?;
+        let req = recover_value_with_grant(&token, &pin, &[0u8; 32], &b, None)?;
+        let resp = node.call(&req)?;
+        if resp.get("status").and_then(Value::as_str) == Some("ok") {
+            return Err("ANON-NO-GRANT: node served a recover to an un-enrolled caller with NO grant".to_string());
+        }
+        println!(
+            "  (a) ANON-NO-GRANT  -> REFUSED ✓  [{}: {}]",
+            resp.get("error").and_then(Value::as_str).unwrap_or("error"),
+            resp.get("message").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>()
+        );
+    }
+
+    // (b) FORGED-GRANT: tamper the covered set AFTER signing — the wallet sig no longer recovers the
+    //     declared owner, so the node rejects it in its own boundary BEFORE touching the chain.
+    {
+        let (grant, _owner) = ddrm_envelope::access::testkit::signed_grant(
+            &node_set, &kid_grant, 8453, NOW_UNIX, 3600, &[], 7,
+        );
+        let mut grant_v = serde_json::to_value(&grant).map_err(|e| e.to_string())?;
+        grant_v["delegation"]["covered_addresses"]
+            .as_array_mut()
+            .ok_or("grant covered_addresses not an array")?
+            .push(json!("0x000000000000000000000000000000000000dead"));
+        let (mut node, token) = connect_and_open(&pin, &b)?;
+        let req = recover_value_with_grant(&token, &pin, &[0u8; 32], &b, Some(&grant_v))?;
+        let resp = node.call(&req)?;
+        if resp.get("status").and_then(Value::as_str) == Some("ok") {
+            return Err("FORGED-GRANT: node served a recover for a tampered grant".to_string());
+        }
+        println!(
+            "  (b) FORGED-GRANT   -> REJECTED ✓  [{}: {}]",
+            resp.get("error").and_then(Value::as_str).unwrap_or("error"),
+            resp.get("message").and_then(Value::as_str).unwrap_or("").chars().take(80).collect::<String>()
+        );
+    }
+
+    // (c) DENY-ON-CHAIN: a fully VALID wallet-signed grant for a test EOA that holds no access token.
+    //     The node verifies the grant, then reads `hasAccessByContentId` ITSELF against live Base; the
+    //     contract reverts for the unregistered (holder, contentId) → false → the node FAILS CLOSED.
+    {
+        let (grant, owner) = ddrm_envelope::access::testkit::signed_grant(
+            &node_set, &kid_grant, 8453, NOW_UNIX, 3600, &[], 9,
+        );
+        let grant_v = serde_json::to_value(&grant).map_err(|e| e.to_string())?;
+        let (mut node, token) = connect_and_open(&pin, &b)?;
+        let req = recover_value_with_grant(&token, &pin, &[0u8; 32], &b, Some(&grant_v))?;
+        let resp = node.call(&req)?;
+        if resp.get("status").and_then(Value::as_str) == Some("ok") {
+            return Err(format!(
+                "DENY-ON-CHAIN: node released a share for {owner} which holds no token on Base — the live chain gate did not fail closed"
+            ));
+        }
+        let msg = resp.get("message").and_then(Value::as_str).unwrap_or("");
+        // The grant MUST have verified (so we actually reached the chain read), then been denied
+        // on-chain — not rejected as a malformed/invalid grant.
+        if msg.contains("access grant rejected") {
+            return Err(format!("DENY-ON-CHAIN: the valid grant was rejected by verification, not by the chain read: {msg}"));
+        }
+        println!(
+            "  (c) DENY-ON-CHAIN  -> grant VERIFIED, live Base read = no-access, FAIL CLOSED ✓\n        owner {owner}\n        [{}: {}]",
+            resp.get("error").and_then(Value::as_str).unwrap_or("error"),
+            msg.chars().take(100).collect::<String>()
+        );
+    }
+
+    println!("\n==============================================================");
+    println!(" grant-gate: PASS — the node authorizes TRUSTLESSLY (wallet sig + live");
+    println!(" Base read, no enrollment) and FAILS CLOSED on anon/forged/no-token.");
+    println!("==============================================================");
+    Ok(())
+}
+
+/// Fill a pin's published identity (`verifying_key_b64` + `recipient_pub_b64`) from the node's
+/// pre-channel `init` reply, so the grant-gate proof works against a freshly-initialized node.
+fn resolve_pin_identity(mut pin: NodePin) -> Result<NodePin, String> {
+    let mut node = NodeSocket::connect(&pin.endpoint)?;
+    let init = ok_data(&node.call(&json!({ "op": "init", "config": {} }))?, "init (identity)")?;
+    pin.vk_b64 = init["seal_verifying_key_b64"]
+        .as_str()
+        .ok_or("node published no vk")?
+        .to_string();
+    pin.recipient_pub_b64 = init["seal_recipient_pub_b64"]
+        .as_str()
+        .ok_or("node published no recipient")?
+        .to_string();
+    Ok(pin)
+}
+
 fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
     if resp.get("status").and_then(Value::as_str) == Some("ok") {
         Ok(resp.get("data").cloned().unwrap_or(Value::Null))
@@ -270,6 +453,19 @@ struct Boundary {
 /// then sign the possession proof over THIS session's challenge. The same request the happy path
 /// sends and the adversarial gates corrupt.
 fn recover_value(token: &Value, pin: &NodePin, share: &[u8], b: &Boundary) -> Result<Value, String> {
+    recover_value_with_grant(token, pin, share, b, None)
+}
+
+/// As [`recover_value`], but optionally attaches a wallet-signed `access_grant`. When present the
+/// node authorizes TRUSTLESSLY (verify the grant + read `hasAccessByContentId` itself) instead of
+/// trusting the unsigned rights receipt — the path the grant-gate proof exercises against live Base.
+fn recover_value_with_grant(
+    token: &Value,
+    pin: &NodePin,
+    share: &[u8],
+    b: &Boundary,
+    grant: Option<&Value>,
+) -> Result<Value, String> {
     let recipient_bytes = B64.decode(&pin.recipient_pub_b64).map_err(|e| e.to_string())?;
     let recipient_public = ddrm_envelope::session_public_from_bytes(&recipient_bytes)
         .ok_or("node published a malformed recipient")?;
@@ -286,7 +482,7 @@ fn recover_value(token: &Value, pin: &NodePin, share: &[u8], b: &Boundary) -> Re
         &b.session_pub_bytes,
         1,
     ));
-    Ok(json!({
+    let mut req = json!({
         "op": "recover",
         "wrapped_cek_b64": wrapped,
         "scheme": SUITE,
@@ -306,7 +502,11 @@ fn recover_value(token: &Value, pin: &NodePin, share: &[u8], b: &Boundary) -> Re
         "caller_sig_b64": caller_sig_b64,
         "recover_seq": 1u64,
         "now_unix": NOW_UNIX,
-    }))
+    });
+    if let Some(g) = grant {
+        req["access_grant"] = g.clone();
+    }
+    Ok(req)
 }
 
 /// Connect, `init` (load the node's durable master into this fresh connection — idempotent + safe on
@@ -411,6 +611,15 @@ fn run() -> Result<(), String> {
         let endpoint = args.get(2).ok_or("usage: dkms-live-recover describe <tcp:HOST:PORT>")?;
         return describe(endpoint);
     }
+    if args.get(1).map(String::as_str) == Some("grant-gate") {
+        let endpoint = args
+            .get(2)
+            .ok_or("usage: dkms-live-recover grant-gate <tcp:HOST:PORT> <caller.seed>")?;
+        let seed = args
+            .get(3)
+            .ok_or("usage: dkms-live-recover grant-gate <tcp:HOST:PORT> <caller.seed>")?;
+        return grant_gate(endpoint, seed);
+    }
     let desc_path = args.get(1).cloned().unwrap_or_else(|| "dkms-authority.v2.json".to_string());
     let seed_path = args.get(2).cloned().unwrap_or_else(|| "caller.seed".to_string());
 
@@ -429,64 +638,15 @@ fn run() -> Result<(), String> {
 
     // Our ALLOW-LISTED caller identity (the seed the operator provisioned into every node's
     // allow-list). base64 of 32 raw bytes.
-    let seed_raw = std::fs::read_to_string(&seed_path).map_err(|e| format!("read caller seed {seed_path}: {e}"))?;
-    let seed_bytes = B64.decode(seed_raw.trim()).map_err(|e| format!("caller seed is not base64: {e}"))?;
-    let caller_seed: [u8; 32] = seed_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("caller seed must be 32 bytes, got {}", seed_bytes.len()))?;
-    let (caller_signer, _caller_vk) = ddrm_envelope::seal::mldsa_seal_keypair(caller_seed);
-
-    // Producer identity (authenticates the escrow blobs) — ephemeral, the recover carries its vk.
-    let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair(ddrm_envelope::random_seed());
-    let producer_vk_b64 = B64.encode(&producer_vk);
+    let caller_seed = read_caller_seed(&seed_path)?;
 
     // Mint a fresh CEK and Shamir-split it 2-of-3 over GF(256): shares = [p(1), p(2), p(3)].
     let cek = ddrm_envelope::random_seed().to_vec();
     let coeff = ddrm_envelope::random_seed().to_vec();
     let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff)?;
-    let kid16 = [0xC5u8; 16];
-    let kid_hex: String = kid16.iter().map(|x| format!("{x:02x}")).collect();
 
-    // The decrypt-boundary session the nodes re-seal their shares to, and the ONE transcript AAD.
-    let (session_secret, session_public) = ddrm_envelope::mint_session();
-    let session_pub_bytes = ddrm_envelope::session_public_bytes(&session_public);
-    let session_pub_b64 = B64.encode(&session_pub_bytes);
-    let content_hash = [0xABu8; 32];
-    let nonce = [0xCDu8; 12];
-    let aad = DecryptTranscriptV1 {
-        suite_id: SUITE,
-        provider_id: "decrypt",
-        principal_id: PRINCIPAL,
-        session_id: SESSION,
-        object_cid: CONTENT,
-        content_hash: &content_hash,
-        action: RIGHT,
-        viewer_interface: "reader",
-        output_kind: "page-image",
-        expires_at: EXPIRES_AT,
-        release_receipt_hash: [0u8; 32],
-        decrypt_session_pub: &session_pub_bytes,
-        nonce: &nonce,
-        node_set_id: None,
-    }
-    .to_aad();
-
-    let boundary = Boundary {
-        producer_signer,
-        producer_vk_b64,
-        caller_seed,
-        caller_signer,
-        session_secret,
-        session_pub_bytes,
-        session_pub_b64,
-        kid16,
-        kid_hex,
-        aad: aad.clone(),
-        aad_b64: B64.encode(&aad),
-        content_hash_b64: B64.encode(content_hash),
-        nonce_b64: B64.encode(nonce),
-    };
+    // The producer identity, decrypt-boundary session, and the ONE transcript AAD the recover binds.
+    let boundary = make_boundary(caller_seed);
 
     // Recover each node's re-sealed share over the live mesh, then open it in-boundary.
     println!("\n-- recovering re-sealed shares from each live authority over dkms0 --");

@@ -507,7 +507,7 @@ function setWebspaceState(webspace) {
   if (entries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "webspace-row webspace-row-empty";
-    empty.textContent = "No capsules or providers discovered.";
+    empty.textContent = "No Apps or services found yet.";
     webspaceListNode.append(empty);
     return;
   }
@@ -572,7 +572,7 @@ function renderWebspaceDetails(entry) {
     const action = document.createElement("button");
     action.type = "button";
     action.className = "webspace-open";
-    action.textContent = "Open capsule";
+    action.textContent = "Open";
     action.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -609,7 +609,7 @@ function openCapsuleTarget(target) {
 function webspaceName(entry) {
   const id = readText(entry && entry.id);
   if (!id) {
-    return "Unknown capsule";
+    return "Unknown App";
   }
   return id.split("-").map((part) => (
     part ? part.charAt(0).toUpperCase() + part.slice(1) : part

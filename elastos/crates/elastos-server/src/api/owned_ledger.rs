@@ -90,7 +90,8 @@ pub fn record(content_id: &str, subject: &str) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("ledger tmp create: {e}"))?;
-        f.write_all(&body).map_err(|e| format!("ledger write: {e}"))?;
+        f.write_all(&body)
+            .map_err(|e| format!("ledger write: {e}"))?;
         f.flush().map_err(|e| format!("ledger flush: {e}"))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| format!("ledger rename: {e}"))?;
