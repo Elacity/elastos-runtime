@@ -2228,7 +2228,15 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     None => break, // unreachable: a channel implies a completed hello (post-init)
                 };
                 match ddrm_envelope::hybrid_unwrap_bound(channel_secret, &env, &aad, &ch.caller_verifier) {
-                    Ok(opened) => opened.to_vec(),
+                    // Strip the length-hiding pad applied before sealing; a malformed pad is a
+                    // torn/hostile frame -> drop the connection fail-closed.
+                    Ok(opened) => match ddrm_envelope::channel_pad::unpad(&opened) {
+                        Some(plaintext) => plaintext,
+                        None => {
+                            eprintln!("dkms-authority: sealed frame carried malformed padding — dropping connection");
+                            break;
+                        }
+                    },
                     Err(_) => {
                         eprintln!("dkms-authority: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
                         break;
@@ -2337,7 +2345,10 @@ fn respond<W: io::Write>(
             };
             ch.send_seq += 1;
             let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.send_seq);
-            let env = ddrm_envelope::seal::seal_bound(&ch.client_pub, &bytes, &aad, &authority.signer);
+            // Pad the plaintext to a size bucket BEFORE sealing so the on-wire frame length reveals
+            // only the bucket, not the exact response size (pre-audit #5 metadata minimization).
+            let padded = ddrm_envelope::channel_pad::pad(&bytes);
+            let env = ddrm_envelope::seal::seal_bound(&ch.client_pub, &padded, &aad, &authority.signer);
             write_frame(writer, &env.to_bytes())
         }
     }
@@ -3207,7 +3218,9 @@ mod tests {
         // key (signed by the node) — nothing plaintext crosses after establishment.
         let req_bytes = serde_json::to_vec(&json!({ "op": "status" })).unwrap();
         let aad_out = ddrm_envelope::channel_frame_aad(&challenge, 0, 1);
-        let sealed_req = ddrm_envelope::seal::seal_bound(&node_channel, &req_bytes, &aad_out, &caller);
+        // Channel frames are length-bucket padded before sealing (pre-audit #5); the node strips it.
+        let padded_req = ddrm_envelope::channel_pad::pad(&req_bytes);
+        let sealed_req = ddrm_envelope::seal::seal_bound(&node_channel, &padded_req, &aad_out, &caller);
         write_frame(&mut client, &sealed_req.to_bytes()).unwrap();
         let sealed_resp = read_frame(&mut client).unwrap().expect("a sealed response frame");
         assert!(
@@ -3217,7 +3230,8 @@ mod tests {
         let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed_resp).unwrap();
         let aad_in = ddrm_envelope::channel_frame_aad(&challenge, 1, 1);
         let opened = ddrm_envelope::hybrid_unwrap_bound(&client_secret, &env, &aad_in, &verifier).unwrap();
-        let resp: Value = serde_json::from_slice(&opened).unwrap();
+        let unpadded = ddrm_envelope::channel_pad::unpad(&opened).expect("response carries valid padding");
+        let resp: Value = serde_json::from_slice(&unpadded).unwrap();
         assert_eq!(resp["status"].as_str().unwrap(), "ok");
 
         // DOWNGRADE: a plaintext frame after establishment DROPS the connection (no response).

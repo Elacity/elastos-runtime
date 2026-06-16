@@ -47,6 +47,22 @@ use super::viewer_object::{
     object_view_route, put_object_session, ObjectSession, OBJECT_VIEWER_CAPSULE,
 };
 
+/// Privacy-preserving log tag for a sensitive identifier (wallet/subject, content id, principal).
+/// Returns a short, NON-reversible fingerprint (`fp:` + first 8 hex of SHA-256) so an operator can
+/// still correlate a single open across log lines WITHOUT the raw `(wallet, content_id, time)`
+/// access pattern being persisted to the gateway log (pre-audit #5: metadata minimization). The node
+/// itself still observes the raw values in memory while it serves the open — this only keeps them out
+/// of the on-disk/shippable log; see docs/THREAT_MODEL.md for what the operator can and cannot see.
+fn log_fp(value: &str) -> String {
+    use sha2::Digest as _;
+    let v = value.trim();
+    if v.is_empty() {
+        return "<none>".to_string();
+    }
+    let digest = sha2::Sha256::digest(v.as_bytes());
+    format!("fp:{}", hex::encode(&digest[..4]))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OpenOwnedRequest {
     /// The Library object URI to open (e.g. `localhost://Users/<principal>/…/clip.mp4`).
@@ -282,26 +298,24 @@ pub async fn open_owned_in_viewer(
                 .into_response()
         }
     };
-    // Surface the live decision (source + verdict + the subject the chain was keyed on) so the
-    // on-chain check is visible in the gateway log — `dev-local-attestation` vs
-    // `chain-provider (live RPC: …)` tells the operator exactly which gate ran.
+    // Surface the live decision (source + verdict) so the on-chain check is visible in the gateway
+    // log — `dev-local-attestation` vs `chain-provider (live RPC: …)` tells the operator exactly
+    // which gate ran. The subject (wallet) and content id are logged only as NON-reversible
+    // fingerprints (pre-audit #5): the operator can correlate one open across lines, but the raw
+    // `(wallet, content_id)` access pattern is not persisted to the log.
     tracing::info!(
         "rights decision: allowed={} source={} cid={} subject={}",
         rights.allowed,
         rights.source,
-        object_cid,
-        if subject.trim().is_empty() {
-            "<dev-derived>"
-        } else {
-            subject.as_str()
-        }
+        log_fp(&object_cid),
+        log_fp(&subject)
     );
     tracing::info!(
         "open timing: rights decision (chain RPC) {} ms",
         t_rights.elapsed().as_millis()
     );
     if !rights.allowed {
-        tracing::info!("owned open denied by rights for cid {object_cid}");
+        tracing::info!("owned open denied by rights for cid {}", log_fp(&object_cid));
         // GAP-8 custody record for the REFUSAL (best-effort: the access is already denied, so a
         // failed append cannot loosen the decision — it only loses one trail entry, logged loudly).
         if let Err(e) = state.audit_log().content_open(
@@ -381,7 +395,7 @@ pub async fn open_owned_in_viewer(
                 match super::access_grant::assemble_cached(&subject, &kid_for_grant) {
                     Ok(Some(grant)) => match super::access_grant::grant_to_b64(&grant) {
                         Ok(b64) => {
-                            tracing::info!("trustless open: reused cached delegation (no wallet popup) for cid {object_cid}");
+                            tracing::info!("trustless open: reused cached delegation (no wallet popup) for cid {}", log_fp(&object_cid));
                             Some(b64)
                         }
                         Err(err) => {

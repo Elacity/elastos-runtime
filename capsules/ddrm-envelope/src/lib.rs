@@ -1612,6 +1612,63 @@ pub mod frame {
     }
 }
 
+/// Length-hiding PADDING for the dKMS encrypted-channel frames (pre-audit #5: metadata
+/// minimization). Padding is applied to the PLAINTEXT *before* sealing, so the sealed envelope —
+/// and therefore the `[len][payload]` frame an on-path observer sees — lands on a coarse size BUCKET
+/// instead of revealing the exact message size (which would distinguish e.g. a `status` poll from a
+/// `recover`). The recipient strips the padding *after* opening the authenticated envelope, where the
+/// length is integrity-protected. This is a COARSE defense: it collapses the small control/recover
+/// messages that matter most, but it is not full traffic-analysis resistance — the deep fix
+/// (blinded identifiers / oblivious lookup) is roadmap. See docs/THREAT_MODEL.md.
+///
+/// Layout (ISO/IEC 7816-4): `plaintext ‖ 0x80 ‖ 0x00*k`. The `0x80` marker is ALWAYS present, so
+/// `unpad` is unambiguous even when the plaintext itself ends in `0x00`.
+pub mod channel_pad {
+    /// Smallest bucket — every control message rounds up to at least this.
+    const MIN_BUCKET: usize = 256;
+    /// Largest bucketed size. Above this we add the marker only (no size-class expansion): such a
+    /// frame is a rare large content-binding `recover` whose size is already dominated by its
+    /// payload, and capping here keeps a padded frame far below `frame::MAX_FRAME_BYTES` even after
+    /// the seal overhead, so padding can never tip a frame over the transport cap.
+    const TOP_BUCKET: usize = 128 * 1024;
+
+    /// The padded length for a plaintext of `n` bytes (including the mandatory marker byte): powers of
+    /// two from `MIN_BUCKET` up to `TOP_BUCKET`, marker-only beyond.
+    fn bucket(n: usize) -> usize {
+        if n <= MIN_BUCKET {
+            MIN_BUCKET
+        } else if n <= TOP_BUCKET {
+            n.next_power_of_two()
+        } else {
+            n
+        }
+    }
+
+    /// Pad `plaintext` to its size bucket. Always grows by at least the one marker byte.
+    pub fn pad(plaintext: &[u8]) -> Vec<u8> {
+        let target = bucket(plaintext.len() + 1);
+        let mut out = Vec::with_capacity(target);
+        out.extend_from_slice(plaintext);
+        out.push(0x80);
+        out.resize(target, 0x00);
+        out
+    }
+
+    /// Strip ISO 7816-4 padding: drop trailing `0x00`, then the single `0x80` marker. Returns `None`
+    /// for a malformed pad (no marker, or all-zero) — the caller treats that as a torn/hostile frame
+    /// and fails closed.
+    pub fn unpad(padded: &[u8]) -> Option<Vec<u8>> {
+        let mut i = padded.len();
+        while i > 0 && padded[i - 1] == 0x00 {
+            i -= 1;
+        }
+        if i == 0 || padded[i - 1] != 0x80 {
+            return None;
+        }
+        Some(padded[..i - 1].to_vec())
+    }
+}
+
 /// Hybrid (classical + post-quantum) seal-signature verifier — migration-period
 /// profile where a classical ECDSA-P256 signature AND a PQ ML-DSA-65 signature over
 /// the same payload must BOTH verify. Wire layout: `u32 ecdsa_len ‖ ecdsa(DER) ‖
@@ -2315,6 +2372,41 @@ mod tests {
         let mut sink = Vec::new();
         let too_big = vec![0u8; (MAX_FRAME_BYTES + 1) as usize];
         assert!(write_frame(&mut sink, &too_big).is_err());
+    }
+
+    /// Channel-frame padding hides the exact plaintext size behind coarse buckets, always round-trips
+    /// (even when the plaintext ends in 0x00), and fails closed on a malformed pad.
+    #[test]
+    fn channel_pad_buckets_round_trip_and_fail_closed() {
+        use crate::channel_pad::{pad, unpad};
+        // Distinct small sizes collapse onto the SAME bucket length (the metadata-hiding property).
+        let a = pad(b"{\"op\":\"status\"}");
+        let b = pad(b"{\"op\":\"hello\",\"x\":1}");
+        assert_eq!(a.len(), 256, "small control messages land in the 256B bucket");
+        assert_eq!(a.len(), b.len(), "two differently-sized small messages share a bucket");
+
+        // Round-trip across a range of sizes, including a payload that ends in 0x00 (the case the
+        // mandatory 0x80 marker exists to disambiguate) and an exact-power-of-two boundary.
+        for plaintext in [
+            vec![],
+            b"a".to_vec(),
+            vec![0u8; 255],         // +marker crosses into the 512 bucket
+            vec![7u8; 256],
+            {
+                let mut v = b"trailing-zeros".to_vec();
+                v.extend_from_slice(&[0u8; 5]);
+                v
+            },
+            vec![0x42u8; 200_000],  // above TOP_BUCKET -> marker-only, still round-trips
+        ] {
+            let padded = pad(&plaintext);
+            assert!(padded.len() > plaintext.len(), "padding always grows by >= the marker");
+            assert_eq!(unpad(&padded).as_deref(), Some(plaintext.as_slice()));
+        }
+
+        // A pad with no 0x80 marker (all zeros) is malformed -> None (fail closed).
+        assert_eq!(unpad(&[0u8; 16]), None);
+        assert_eq!(unpad(&[]), None);
     }
 
     /// The 2-of-2 XOR share-split round-trips, hides the CEK in each share alone, and

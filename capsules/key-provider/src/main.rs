@@ -495,7 +495,10 @@ impl DkmsNodeConn {
             Some(ch) => {
                 ch.send_seq += 1;
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
-                ddrm_envelope::seal::seal_bound(&ch.node_channel_pub, &payload, &aad, &self.caller_signer)
+                // Pad to a size bucket before sealing so the frame length hides the request size
+                // (pre-audit #5 metadata minimization); the node strips the pad after opening.
+                let padded = ddrm_envelope::channel_pad::pad(&payload);
+                ddrm_envelope::seal::seal_bound(&ch.node_channel_pub, &padded, &aad, &self.caller_signer)
                     .to_bytes()
             }
         };
@@ -515,11 +518,12 @@ impl DkmsNodeConn {
                 })?;
                 ch.recv_seq += 1;
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.recv_seq);
-                ddrm_envelope::hybrid_unwrap_bound(&ch.client_secret, &env, &aad, &ch.node_verifier)
+                let opened = ddrm_envelope::hybrid_unwrap_bound(&ch.client_secret, &env, &aad, &ch.node_verifier)
                     .map_err(|_| {
                         "dkms node response failed to authenticate on the encrypted channel".to_string()
-                    })?
-                    .to_vec()
+                    })?;
+                ddrm_envelope::channel_pad::unpad(&opened)
+                    .ok_or_else(|| "dkms node response carried malformed channel padding".to_string())?
             }
         };
         serde_json::from_slice::<Value>(&plain).map_err(|e| format!("dkms node sent non-JSON: {e}"))
