@@ -31,6 +31,13 @@ where
     F: Fn() -> Fut + Copy + Send + Sync + 'static,
     Fut: Future<Output = anyhow::Result<GatewayControlPlane>> + Send,
 {
+    // Fail-closed build-config guard (DEV_MODE_GUARD_SPEC; PRINCIPLE #11): a RELEASE build
+    // (compiled without `dev-modes`) refuses to start in an insecure dev rights mode rather than
+    // silently upgrading it — so a production misconfiguration is loud. No-op under `dev-modes`.
+    if let Err(msg) = api::rights_authority::enforce_release_build_rights_safety() {
+        return Err(anyhow::anyhow!(msg));
+    }
+
     if public {
         return run_gateway_public(addr, cache_dir, publish, setup_control_plane).await;
     }

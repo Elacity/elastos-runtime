@@ -435,9 +435,13 @@ mod tests {
 
     const SUBJECT: &str = "0x00000000000000000000000000000000000000bb";
 
+    // The dev buy loop (free ownership ledger, no on-chain payment) is a `dev-modes`-only path
+    // now that rights_mode() defaults to Chain (DEV_MODE_GUARD_SPEC): without `dev-modes`, an
+    // unset ELASTOS_DDRM_RIGHTS resolves to Chain, so this dev-ledger flow is unreachable.
     #[test]
+    #[cfg(feature = "dev-modes")]
     fn dev_buy_records_ownership_and_returns_hash() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("buy-dev-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("ELASTOS_DDRM_OWNED_LEDGER", dir.join("owned.json"));

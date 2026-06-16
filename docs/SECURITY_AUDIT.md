@@ -1,4 +1,49 @@
-# Security audit — 2026-06-14
+# Security audit
+
+> **Re-audit — 2026-06-15** (after the dDRM signed-authority work landed). Four read-only
+> adversarial sub-agents: High-fix verification, the new caching/session/delegation surfaces,
+> crypto + memory-safety on changed code, and a regression pass. Headline below; the 2026-06-14
+> original follows. Fix spec: [convergence/DEV_MODE_GUARD_SPEC.md](convergence/DEV_MODE_GUARD_SPEC.md).
+>
+> **Verdict (UPDATED 2026-06-15 — build guard landed): the production path is sound and the High +
+> all six residual findings are now CLOSED.** The new signed `AccessGrantV1` (wallet sig + per-request
+> ML-DSA, domain-separated, kid/node-set/chain/≤24h-bound) is verified by the dKMS node *and*
+> independently confirmed against its own on-chain `hasAccessByContentId`, fail-closed — closing the
+> original forge-`allowed:true` attack on the `dkms` path. Verified strong: the cached delegation,
+> warm session reuse, and trade-approval are all SAFE because **caching never caches the
+> authorization decision** — every open and every node recover re-verify the wallet-signed grant and
+> re-read the chain. Prior fixes (wallet/did zeroization, WebAuthn DoS bounds-check) intact; no new
+> ambient authority, transport-as-truth, key/cleartext leak, or `unsafe`.
+>
+> **Residual findings — all CLOSED by the build guard (DEV_MODE_GUARD_SPEC), 2026-06-15:**
+> - **HIGH — reference key backend forgeable + default in the open driver → CLOSED.** A release build
+>   refuses the `reference` backend at *selection* in `key-provider release` unless `--features
+>   dev-modes` is set; `ddrm-runtime-open` now defaults `backend` to `"dkms"` (`reference` is
+>   dev-modes-only). The production dkms path (wallet-signed grant + on-chain re-check) is unchanged.
+> - **MED — `legacy-receipt-authz` default → CLOSED.** Removed from `dkms-authority` `default`
+>   features; a missing wallet-signed grant fails closed unless `dev-modes` is compiled in.
+> - **MED — Dev/ChainMock rights default → CLOSED.** `rights_mode()` defaults to `Chain`; Dev/ChainMock
+>   are reachable only under `dev-modes`, and a release gateway **refuses to start** if handed one
+>   (`enforce_release_build_rights_safety`, wired at gateway boot).
+> - **MED — node trusts caller `now_unix` → CLOSED.** Security-expiry checks (delegation window +
+>   possession-token expiry) use the node's own clock (`security_now`); the caller value is honored
+>   only in tests / `dev-modes`.
+> - **MED — grant `ReplayGuard` unwired → CLOSED.** A process-held `ReplayGuard` is now wired into the
+>   grant authorization path (per-request-nonce single-use + revoke-by-nonce); each open assembles a
+>   fresh request nonce, so legitimate re-opens are unaffected.
+> - **MED — warm daemon crash-DoS → CLOSED.** The `spawn_scoped` `.expect()` is replaced by a counted
+>   per-node fault, so a spawn failure under resource pressure degrades the quorum (fail-closed below
+>   two shares) instead of aborting the daemon.
+>
+> **How it was closed:** the three insecure dev modes are fenced out of release builds *by
+> construction* via a uniform per-crate `dev-modes` cargo feature (OFF by default) plus a fail-closed
+> startup guard, exactly as specified above. `--features dev-modes` restores all three for local/CI;
+> the run script builds the local harness that way. Tests assert both postures (per-crate) and
+> `capability_conformance` GAP-7 is flipped to CLOSED. No Critical/High remains.
+
+---
+
+# Security audit — 2026-06-14 (original)
 
 Method: `cargo audit` (dependency CVEs) + four read-only adversarial sub-agents — crypto
 correctness, identity/transport binding, secrets hygiene & side channels, and memory-safety /

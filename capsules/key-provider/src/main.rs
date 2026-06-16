@@ -1214,7 +1214,26 @@ impl KeyProvider {
             ),
             // The reference backend ACTUALLY releases (Day 70): recover the producer-escrowed
             // CEK from the rights-bound `key_envelope` and re-seal it to the decrypt session.
-            Some(KeyAuthorityBackend::Reference) => self.release_reference(&request, session),
+            // DEV_MODE_GUARD_SPEC: the reference backend authorizes on an UNSIGNED receipt (no
+            // wallet signature, no node-side on-chain re-check), so it is FENCED OUT of release
+            // builds at SELECTION — even though `key-authority-ref` (which compiles it) is also
+            // what enables the production dkms path. Only a `dev-modes` build may release through it.
+            Some(KeyAuthorityBackend::Reference) => {
+                #[cfg(not(feature = "dev-modes"))]
+                {
+                    let _ = session;
+                    Response::error(
+                        "not_configured",
+                        "the reference key backend is a DEV-ONLY authority fenced out of release builds \
+                         (it authorizes on an unsigned receipt); select the dkms backend, or rebuild with \
+                         `--features dev-modes` for local/CI",
+                    )
+                }
+                #[cfg(feature = "dev-modes")]
+                {
+                    self.release_reference(&request, session)
+                }
+            }
             // The `dkms` backend DELEGATES recovery to the EXTERNAL authority node (Day 87–88):
             // the runtime holds only the node's public identity, so it RPCs the node's endpoint to
             // recover + re-seal — the master/CEK never enter the runtime. Selected-but-unprovisioned
@@ -1235,6 +1254,9 @@ impl KeyProvider {
     /// `seal_recovered_cek_into_material`). The CEK source, KID and scheme come from the
     /// rights-bound `key_envelope` — so the wrapped CEK rides inside the validated request,
     /// not as a side-band param. The CEK stays in `Zeroizing` and leaves only SEALED.
+    /// Reachable from `release` ONLY in a `dev-modes` build (DEV_MODE_GUARD_SPEC); a non-dev build
+    /// fences the reference backend at selection, leaving this method uncalled there.
+    #[cfg_attr(not(feature = "dev-modes"), allow(dead_code))]
     fn release_reference(
         &self,
         request: &KeyReleaseRequestV1,
@@ -1791,7 +1813,14 @@ impl KeyProvider {
             // buffers) is a STACK HOG. A default-stack scoped thread (2 MiB) overflows it; the serial
             // path got away with it only by running on the 8 MiB main thread. Give each recover thread
             // an explicit 16 MiB stack so the concurrent rail matches the main-thread headroom.
-            let handles: Vec<_> = candidates
+            // Spawn each recover thread; a spawn FAILURE (e.g. thread/memory/ulimit pressure —
+            // the 16 MiB×3 reservation enlarges that surface) is COUNTED AS A FAULT for that node,
+            // never an `.expect()` panic. In the single-threaded warm-daemon accept loop a panic
+            // here would abort the whole daemon; the quorum math below still fails closed if fewer
+            // than two shares are served. (DEV_MODE_GUARD_SPEC defense-in-depth.)
+            type SpawnOutcome<'s> =
+                Result<std::thread::ScopedJoinHandle<'s, (usize, Result<Value, String>)>, (usize, String)>;
+            let handles: Vec<SpawnOutcome> = candidates
                 .iter()
                 .enumerate()
                 .map(|(idx, (client, req, _label))| {
@@ -1801,12 +1830,15 @@ impl KeyProvider {
                         .spawn_scoped(scope, move || {
                             (idx, Self::recover_one_node_pooled(pool, *client, req, kid_hex, decrypt_pub, cid, now))
                         })
-                        .expect("spawn dkms recover thread")
+                        .map_err(|e| (idx, format!("failed to spawn recover thread for node {idx}: {e}")))
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))))
+                .map(|outcome| match outcome {
+                    Ok(h) => h.join().unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))),
+                    Err((idx, e)) => (idx, Err(e)),
+                })
                 .collect()
         });
         eprintln!(

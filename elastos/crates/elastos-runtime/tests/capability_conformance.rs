@@ -239,12 +239,13 @@ const KNOWN_GAPS: &[KnownGap] = &[
         finding: "DID signing has no authorization gate: any caller with a non-empty sender_id+ts receives a device-DID signature.",
         location: "capsules/did-provider/src/main.rs:281/293",
     },
-    KnownGap {
-        id: "GAP-7",
-        severity: "high",
-        finding: "CONFIRMED HIGH (security audit, with exploit): rights-decision receipts are unsigned and never verified, yet gate CEK recovery — a caller past the empty-by-default handshake gates forges allowed:true and has the node re-seal the CEK to its own session (a usable key from one node on the single-node rail). Design intent (PROTECTED_CONTENT.md) already specifies signed receipts. Being fixed on the dDRM side. See docs/SECURITY_AUDIT.md.",
-        location: "dkms-authority/src/main.rs:1714; key-provider/src/main.rs:2120; elastos-common/src/protected_content.rs:228",
-    },
+    // GAP-7 (dDRM key-release forgeable on the dev/reference + legacy-receipt + Dev-rights paths)
+    // was CLOSED on 2026-06-15 by the build guard (DEV_MODE_GUARD_SPEC): the three dev modes are
+    // fenced out of release builds by construction, with the production dkms path requiring a
+    // wallet-signed AccessGrantV1 confirmed on-chain. Per the registry convention its row is
+    // deleted; the real assertions live in each crate's own tests (key-provider reference fence,
+    // dkms-authority default-posture, elastos-server rights guard) and are tracked by
+    // `gap7_dev_modes_are_fenced_out_of_release_builds` below.
     KnownGap {
         id: "GAP-8",
         severity: "med",
@@ -303,3 +304,20 @@ fn gap3_core_grant_is_principal_bound() {}
 #[test]
 #[ignore = "GAP-5: prove export_managed_secret requires a capability/session and emits an audit event (note: wallet key material is now zeroized; the authz gate remains upstream)"]
 fn gap5_key_export_is_gated_and_audited() {}
+
+/// GAP-7 (CLOSED): the three insecure dDRM dev modes are fenced out of release builds by
+/// construction (DEV_MODE_GUARD_SPEC). This crate cannot see the other crates' cargo features, so
+/// the enforcing assertions live where the modes do and run on a plain `cargo test`:
+///   - key-provider: `release_reference_fails_closed_without_session_context` + the selection
+///     fence (reference backend refused unless `dev-modes`);
+///   - dkms-authority: `release_build_fences_out_the_legacy_receipt_path` (legacy off by default);
+///   - elastos-server: `release_build_defaults_to_chain_and_refuses_dev_rights_modes`
+///     (rights_mode()==Chain + startup guard fails closed).
+/// This ratchet is intentionally NOT `#[ignore]`d — GAP-7 is closed, so it must stay green.
+#[test]
+fn gap7_dev_modes_are_fenced_out_of_release_builds() {
+    assert!(
+        !KNOWN_GAPS.iter().any(|g| g.id == "GAP-7"),
+        "GAP-7 is closed by the build guard; its registry row must stay deleted"
+    );
+}

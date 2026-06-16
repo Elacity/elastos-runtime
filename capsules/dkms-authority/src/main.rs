@@ -93,15 +93,49 @@ struct SessionToken {
     sig_b64: String,
 }
 
-/// The node's effective wall clock: the caller-supplied `now_unix` when present (keeps issuance +
-/// expiry deterministic for tests + lock-stepped with the client's clock), else the real clock.
+/// The node's effective wall clock for ISSUANCE (minting a session token's expiry): the
+/// caller-supplied `now_unix` when present (keeps issuance deterministic for tests + lock-stepped
+/// with the client's clock), else the real clock.
 fn effective_now(now_unix: Option<u64>) -> u64 {
-    now_unix.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    })
+    now_unix.unwrap_or_else(real_clock_secs)
+}
+
+/// The node's clock for SECURITY-EXPIRY decisions (delegation/session windows, possession-token
+/// expiry). A RELEASE build NEVER trusts the caller's `now_unix` here — otherwise a caller could
+/// pass a `now` inside an already-expired window to keep a revoked delegation / expired token alive
+/// indefinitely, defeating the bounded-window + revocation-via-expiry property the node enforces
+/// trustlessly (DEV_MODE_GUARD_SPEC defense-in-depth; itself backstopped by the live on-chain check
+/// + the strictly-advancing `recover_seq` possession proof). Tests and `dev-modes` builds honor the
+/// caller value for deterministic windows.
+fn security_now(now_unix: Option<u64>) -> u64 {
+    #[cfg(any(test, feature = "dev-modes"))]
+    {
+        if let Some(n) = now_unix {
+            return n;
+        }
+    }
+    #[cfg(not(any(test, feature = "dev-modes")))]
+    {
+        let _ = now_unix;
+    }
+    real_clock_secs()
+}
+
+fn real_clock_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Process-held replay/revocation tracker (PC2's `revokedDelegations` + `seenRequestNonces`):
+/// one per node process, consulted on every grant-authorized recover so a per-request nonce is
+/// single-use and a revoked delegation is refused for its remaining lifetime. Each open assembles a
+/// FRESH per-request nonce (gateway `access_grant.rs`), so legitimate re-opens are never rejected.
+fn replay_guard() -> &'static std::sync::Mutex<ddrm_envelope::access::ReplayGuard> {
+    static GUARD: std::sync::OnceLock<std::sync::Mutex<ddrm_envelope::access::ReplayGuard>> =
+        std::sync::OnceLock::new();
+    GUARD.get_or_init(|| std::sync::Mutex::new(ddrm_envelope::access::ReplayGuard::new()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1700,7 +1734,9 @@ fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), S
     {
         return Err("session token is forged or tampered (signature does not verify)".to_string());
     }
-    if effective_now(args.now_unix) > token.expires_at {
+    // SECURITY-EXPIRY: validate against the node's own clock, not the caller's `now_unix`, so a
+    // captured token can't be kept alive past its window by a backdated caller clock.
+    if security_now(args.now_unix) > token.expires_at {
         return Err("session token has expired — re-establish the handshake session".to_string());
     }
 
@@ -1758,14 +1794,20 @@ fn authorize(args: &RecoverArgs, legacy_receipt_allowed: bool) -> Result<(), Str
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| grant.delegation.node_set_id_b64.clone());
-        let now = effective_now(args.now_unix);
+        // SECURITY-EXPIRY uses the node's own clock (not the caller's) so an expired/revoked
+        // delegation can't be kept alive by a backdated `now_unix`.
+        let now = security_now(args.now_unix);
+        // Wire the process-held ReplayGuard so the per-request nonce is single-use and a
+        // revoked delegation is refused (PC2 parity). Recover from a poisoned lock rather than
+        // panicking — a single bad recover must not wedge the node.
+        let mut guard = replay_guard().lock().unwrap_or_else(|e| e.into_inner());
         return node_chain::authorize_access(
             grant,
             &expected_ns,
             chain.chain_id(),
             &args.kid_hex,
             now,
-            None,
+            Some(&mut guard),
             &chain,
         );
     }
@@ -2347,6 +2389,7 @@ mod tests {
     }
 
     /// A structurally-valid but never-verified token (for cases that fail BEFORE the session gate).
+    #[cfg(feature = "legacy-receipt-authz")]
     fn dummy_token() -> SessionToken {
         SessionToken {
             challenge_b64: b64().encode([0u8; 32]),
@@ -2374,7 +2417,21 @@ mod tests {
 
     /// Escrow a CEK to the node's published recipient exactly as the producer does, then drive a
     /// transcript-bound `recover`; the sealed material the node returns opens to the SAME CEK.
+    /// DEV_MODE_GUARD_SPEC: the secure default build does NOT compile the unsigned legacy-receipt
+    /// path, so a missing wallet-signed grant fails closed regardless of any allow-list — the
+    /// audit's MED→closed assertion for the node. The positive legacy-path tests above are gated
+    /// behind `legacy-receipt-authz` (enabled by `--features dev-modes`) and prove migration parity.
     #[test]
+    #[cfg(not(feature = "legacy-receipt-authz"))]
+    fn release_build_fences_out_the_legacy_receipt_path() {
+        assert!(
+            !cfg!(feature = "legacy-receipt-authz"),
+            "a release build must not compile the legacy unsigned-receipt authorization path"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_round_trips_an_escrowed_cek_and_re_seals_to_the_session() {
         let store = unique_store("roundtrip");
         let mut node = DkmsAuthorityNode::default();
@@ -2446,6 +2503,7 @@ mod tests {
     /// session + node-set, and the standalone offline verifier accepts it as a (1-of-1) quorum proof
     /// while rejecting a wrong-principal check. Proves the node-side half of the portable proof.
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_co_signs_a_release_attestation_the_offline_verifier_accepts() {
         let store = unique_store("attest");
         let mut node = DkmsAuthorityNode::default();
@@ -2543,6 +2601,7 @@ mod tests {
     /// Recover fails closed on a forged producer key (the escrow authenticates the producer), and
     /// before `init` (no master, no recovery).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_fails_closed_on_forged_producer_and_before_init() {
         let store = unique_store("forged");
         let mut node = DkmsAuthorityNode::default();
@@ -2704,6 +2763,7 @@ mod tests {
     /// during the migration window (feature `legacy-receipt-authz`). The allow-list is now a TRUST
     /// scope for the legacy path, not the system-wide security boundary.
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn enrolled_caller_legacy_receipt_path_still_authorizes() {
         let store = unique_store("anon-enrolled");
         let (mut node, args, _caller) = setup_recover(&store); // setup_recover enrolls the caller
@@ -2781,6 +2841,7 @@ mod tests {
     /// or binds different content/principal/session/right than the recover declares — even though
     /// the escrow + transcript are otherwise perfectly valid (a buggy/compromised caller is caught).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_fails_closed_on_unauthorized_or_mismatched_receipt() {
         let store = unique_store("reauth");
         // One node + one valid escrow; each case clones the base args and varies ONLY the receipt.
@@ -2855,6 +2916,7 @@ mod tests {
     /// the token-bound private key cannot drive recovery (the OWNER-BOUND analogue,
     /// `secureViewSession.ts:87`–`:100`).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_fails_closed_without_or_with_wrong_possession_proof() {
         let store = unique_store("possession");
         let (mut node, base, _caller) = setup_recover(&store);
@@ -2887,6 +2949,7 @@ mod tests {
     /// FRESH connection is refused fail-closed (the handler returns an `invalid_frame` error + drops
     /// the connection) without the served node panicking.
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn framed_connection_serves_a_full_session_and_drops_a_torn_frame() {
         use ddrm_envelope::frame::{read_frame, write_frame};
         use std::os::unix::net::UnixStream;
@@ -3644,6 +3707,7 @@ mod tests {
     /// revocation outranks a live session (the immediate-cutoff property, the node-side analogue of
     /// PC2 reading the revoked delegation nonce back per request, `secureViewSession.ts:108`–`:112`).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn revocation_outranks_a_live_session_and_requires_the_operator() {
         let store = unique_store("revoke");
         let (mut node, base, caller) = setup_recover(&store);
@@ -3685,6 +3749,7 @@ mod tests {
     }
 
     /// Pull the challenge string out of a session-token JSON value.
+    #[cfg(feature = "legacy-receipt-authz")]
     fn challenge_str(token: &Value) -> &str {
         token["challenge_b64"].as_str().unwrap()
     }
@@ -3693,6 +3758,7 @@ mod tests {
     /// perfectly valid escrow + receipt — so a long-lived node only recovers within a live handshake
     /// session and a captured/forged token cannot drive recovery.
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_fails_closed_on_an_expired_or_forged_session() {
         let store = unique_store("session");
         let (mut node, base, _caller) = setup_recover(&store);
@@ -3726,6 +3792,7 @@ mod tests {
     /// ONE handshake session authorizes MANY recovers — the node accepts the same live token across
     /// repeated recovers (the persistent-session shape: hello once, recover many).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn one_session_authorizes_many_recovers() {
         let store = unique_store("many");
         let (mut node, base, caller) = setup_recover(&store);
@@ -3753,6 +3820,7 @@ mod tests {
     /// even with an otherwise-valid token + possession proof. The OWNER-bound, anti-replay analogue
     /// of PC2's revocable per-delegation nonce (`secureViewSession.ts:108`–`:112`).
     #[test]
+    #[cfg(feature = "legacy-receipt-authz")]
     fn recover_fails_closed_on_a_replayed_or_stale_recover_seq() {
         let store = unique_store("freshness");
         let (mut node, base, caller) = setup_recover(&store);

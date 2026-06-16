@@ -16,6 +16,13 @@ publish = false
 name = "ddrm-runtime-open"
 path = "src/main.rs"
 
+[features]
+# dev-modes: enables the dev-only `reference` key backend in this NEVER-SHIPPED harness and
+# makes it the default-when-absent. OFF by default so the driver defaults to (and only accepts)
+# the production `dkms` backend (DEV_MODE_GUARD_SPEC). Matches the same-named feature across the
+# dDRM crates; dev/CI build with `--features dev-modes`.
+dev-modes = []
+
 [dependencies]
 # The SAME shared transcript encoder both rail sides bind (Day 54): the orchestrator
 # computes the canonical AAD the key authority seals to and the decrypt boundary

@@ -80,19 +80,57 @@ pub struct RightsDecision {
     pub receipt: Value,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RightsMode {
+    // Dev/ChainMock are constructed by rights_mode() ONLY in a `dev-modes` build
+    // (DEV_MODE_GUARD_SPEC); a release build never produces them, but they remain valid
+    // match targets, so suppress the "never constructed" lint for the non-dev build.
+    #[cfg_attr(not(feature = "dev-modes"), allow(dead_code))]
     Dev,
     Chain,
+    #[cfg_attr(not(feature = "dev-modes"), allow(dead_code))]
     ChainMock,
 }
 
 pub(crate) fn rights_mode() -> RightsMode {
     match std::env::var("ELASTOS_DDRM_RIGHTS").ok().as_deref() {
         Some("chain") => RightsMode::Chain,
+        // `dev` (free unlocks, no chain) and `chain-mock` (in-process RPC) are INSECURE
+        // conveniences. They are reachable ONLY in a `dev-modes` build (DEV_MODE_GUARD_SPEC):
+        // a plain release build defaults to — and cannot leave — the secure `Chain` path, so a
+        // production deploy can never silently hand out content for free. (The startup guard
+        // additionally refuses to boot when a release build is *handed* a dev mode, so the
+        // misconfiguration is loud rather than silently upgraded.)
+        #[cfg(feature = "dev-modes")]
         Some("chain-mock") => RightsMode::ChainMock,
+        #[cfg(feature = "dev-modes")]
         _ => RightsMode::Dev,
+        #[cfg(not(feature = "dev-modes"))]
+        _ => RightsMode::Chain,
     }
+}
+
+/// Fail-closed build-configuration guard (DEV_MODE_GUARD_SPEC; PRINCIPLE #11 — "fail closed,
+/// then explain" — extended to *build config*). A RELEASE build (compiled WITHOUT `dev-modes`)
+/// must REFUSE TO START if it was handed an insecure dev rights mode, rather than silently
+/// overriding it to `Chain` — so an accidental production misconfiguration is loud, not silent.
+/// In a `dev-modes` build this is a no-op (the dev modes are intentionally available).
+pub(crate) fn enforce_release_build_rights_safety() -> Result<(), String> {
+    #[cfg(not(feature = "dev-modes"))]
+    {
+        if let Some(v) = std::env::var("ELASTOS_DDRM_RIGHTS").ok() {
+            let v = v.trim();
+            if v == "dev" || v == "chain-mock" {
+                return Err(format!(
+                    "ELASTOS_DDRM_RIGHTS=\"{v}\" selects an INSECURE dev rights mode (free unlocks / \
+                     no live on-chain check), but this binary is a release build compiled WITHOUT the \
+                     `dev-modes` feature. Refusing to start (fail closed). Set ELASTOS_DDRM_RIGHTS=chain \
+                     for production, or rebuild with `--features dev-modes` for local/CI."
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_rights_bin() -> String {
@@ -719,5 +757,50 @@ mod tests {
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
         let err = result.expect_err("chain mode with no wallet must error");
         assert!(err.contains("wallet not linked"), "unexpected error: {err}");
+    }
+
+    // ── DEV_MODE_GUARD_SPEC: secure-by-construction build posture ──────────────────────
+
+    /// RELEASE posture (no `dev-modes`): `rights_mode()` is `Chain` even when handed a dev
+    /// value, and the startup guard REFUSES to boot in a dev rights mode (fail closed) while
+    /// accepting `chain`. This is the audit's HIGH→closed assertion for the gateway.
+    #[test]
+    #[cfg(not(feature = "dev-modes"))]
+    fn release_build_defaults_to_chain_and_refuses_dev_rights_modes() {
+        let _g = ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
+        assert_eq!(rights_mode(), RightsMode::Chain, "unset must default to Chain");
+
+        for dev in ["dev", "chain-mock"] {
+            std::env::set_var("ELASTOS_DDRM_RIGHTS", dev);
+            // A release build cannot leave the secure path...
+            assert_eq!(rights_mode(), RightsMode::Chain, "{dev} must NOT downgrade rights_mode");
+            // ...and refuses to start rather than silently upgrading the misconfig.
+            let err = enforce_release_build_rights_safety()
+                .expect_err("release build must refuse to start in a dev rights mode");
+            assert!(err.contains("Refusing to start"), "unexpected guard error: {err}");
+        }
+
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
+        assert!(
+            enforce_release_build_rights_safety().is_ok(),
+            "chain mode must boot in a release build"
+        );
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
+    }
+
+    /// DEV posture (`--features dev-modes`): the dev modes are intentionally selectable and the
+    /// guard is a no-op, so local/CI keeps working.
+    #[test]
+    #[cfg(feature = "dev-modes")]
+    fn dev_build_allows_dev_rights_modes() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "dev");
+        assert_eq!(rights_mode(), RightsMode::Dev);
+        assert!(enforce_release_build_rights_safety().is_ok(), "dev-modes build never fails the guard");
+        std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
+        assert_eq!(rights_mode(), RightsMode::ChainMock);
+        std::env::remove_var("ELASTOS_DDRM_RIGHTS");
     }
 }

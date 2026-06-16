@@ -88,8 +88,15 @@ build_capsule decrypt-provider --features rail-stream,rail-mint
 # dKMS consumer-open rail: key-provider (dkms backend) recovers the CEK 2-of-3 from the live
 # quorum; dkms-authority is the node daemon; dkms-keygen derives the caller-identity vk the
 # nodes allow-list. Built so a minted dKMS asset opens (double-click -> quorum recover -> render).
+#
+# DEV_MODE_GUARD_SPEC: this is a LOCAL DEV harness, so the node + gateway are built with the
+# `dev-modes` feature (legacy-receipt fallback + Dev/ChainMock rights for offline testing). A
+# PRODUCTION deploy builds these WITHOUT `dev-modes` (chain rights + wallet-signed grants only).
+# key-provider keeps `--features key-authority-ref` (NOT dev-modes): the production dkms quorum
+# path is compiled while the forgeable `reference` backend stays fenced out at selection, so the
+# local gateway exercises the SAME secure key-release posture the production build ships.
 build_capsule key-provider --features key-authority-ref
-build_capsule dkms-authority
+build_capsule dkms-authority --features dev-modes
 build_capsule dkms-keygen
 # Library object plane (v0.4.0): the provider-backed object model the new Library/Home use.
 # Without it the gateway boots but Library object operations fail closed.
@@ -115,7 +122,11 @@ cargo build --quiet --manifest-path "${REPO_ROOT}/scripts/dev/ddrm-media-authori
   || echo "WARN: media-authority helper build failed (owned-video playback seam) — mint still works"
 
 echo "building the gateway (elastos-server) ..."
-if ! cargo build --quiet --manifest-path "${REPO_ROOT}/elastos/Cargo.toml" -p elastos-server; then
+# DEV_MODE_GUARD_SPEC: built with `dev-modes` so this local harness can run any rights mode
+# (Dev/ChainMock for offline tests) without the fail-closed startup guard refusing to boot. The
+# user's `ELASTOS_DDRM_RIGHTS=chain` happy path works the same; a PRODUCTION gateway builds
+# WITHOUT `dev-modes` (then `chain` is the only selectable rights mode — the guard enforces it).
+if ! cargo build --quiet --manifest-path "${REPO_ROOT}/elastos/Cargo.toml" -p elastos-server --features dev-modes; then
   echo "FAIL: could not build elastos-server" >&2
   exit 1
 fi

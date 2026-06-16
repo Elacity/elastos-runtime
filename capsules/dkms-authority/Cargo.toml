@@ -9,13 +9,21 @@ license = "MIT"
 name = "dkms-authority"
 path = "src/main.rs"
 
+# SECURE BY CONSTRUCTION (DEV_MODE_GUARD_SPEC): the default build fences the insecure
+# migration path OUT. A plain `cargo build --release` does NOT compile legacy-receipt-authz,
+# so a missing wallet-signed grant ALWAYS fails closed. Dev/CI opt back in with `--features
+# dev-modes` (PRINCIPLE #11 — fail closed, then explain — extended to build configuration).
 [features]
-default = ["legacy-receipt-authz"]
+default = []
+# dev-modes: the single, uniform opt-in that re-enables this crate's insecure dev/migration
+# conveniences. OFF by default. Mirrors the same-named feature on key-provider/elastos-server.
+dev-modes = ["legacy-receipt-authz"]
 # legacy-receipt-authz: accept the pre-trustless path (an UNSIGNED RightsDecisionReceiptV1
 # from an allow-listed caller) WHEN no wallet-signed AccessGrant is supplied. A migration
 # scaffold only — a present grant is ALWAYS evaluated trustlessly (wallet sig + node-side
 # on-chain check); this flag merely keeps existing receipt-only clients working until the
 # runtime is wired to send grants (W4). With the flag OFF a missing grant fails closed.
+# NOT in `default` — opt in via `dev-modes` (or directly) for migration/test only.
 legacy-receipt-authz = []
 
 [dependencies]

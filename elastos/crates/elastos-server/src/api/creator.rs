@@ -66,17 +66,45 @@ const ELACITY_ACCESS_TOKEN_SCHEMA: &str =
     "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/access-token/v1.0/schema.json";
 const ELACITY_ROYALTY_SCHEMA: &str =
     "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/royalty/v1.0/schema.json";
+const ELACITY_DISTRIBUTION_RIGHT_SCHEMA: &str =
+    "https://raw.githubusercontent.com/Elacity/wiki/main/metadata/schemas/distribution-right/v1.0/schema.json";
 
 /// The Elacity-canonical token-type filenames in the metadata directory: token id `1` is the
-/// Access Token, `2` the Royalty Share (`elacity-creator/app.js` `buildTokenTypeJsons`).
+/// Access Token, `2` the Royalty Share, `3` the Distribution Right (BUY_AND_RESELL only)
+/// (`elacity-creator/app.js` `buildTokenTypeJsons`).
 const ACCESS_TOKEN_FILE: &str =
     "0000000000000000000000000000000000000000000000000000000000000001.json";
 const ROYALTY_SHARE_FILE: &str =
     "0000000000000000000000000000000000000000000000000000000000000002.json";
+const DISTRIBUTION_RIGHT_FILE: &str =
+    "0000000000000000000000000000000000000000000000000000000000000003.json";
 
 /// Default access-token supply when the creator does not specify one — PC2's
 /// `buildMetadataEnvelope` default (`params.copies || 10000`).
 const DEFAULT_COPIES: u64 = 10_000;
+
+/// Elacity protocol royalty percent (PC2 `ELACITY_ROYALTY_PERCENT`): the platform takes 5%, so
+/// the creator's royalty shares must total 95%. The on-chain protocol applies its cut via
+/// `protocolShares`; the creator rows encode the remaining 95%.
+const ELACITY_ROYALTY_PERCENT: f64 = 5.0;
+
+/// Default BUY_AND_RESELL resale royalty in basis points (PC2 `resellerCut || 900` = 9%). The
+/// human "RRL-Percent" attribute is this / 10.
+const DEFAULT_RESELLER_CUT: u16 = 900;
+
+/// A royalty payee row (PC2 `royalties[]`): `royalty` is a PERCENT (the publish provider encodes
+/// the on-chain amount as `round(10 * royalty)`). `identifier` tags the role — "A" the creator,
+/// "C" the resale distributor for BUY_AND_RESELL's DISTRIBUTION_RIGHT entry.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RoyaltyInput {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    royalty: f64,
+    #[serde(default)]
+    identifier: Option<String>,
+}
 
 /// Env override for the PUBLIC-ONLY quorum descriptor; defaults to `<data_dir>/dkms/quorum.json`.
 const QUORUM_DESCRIPTOR_ENV: &str = "ELASTOS_DKMS_QUORUM_DESCRIPTOR";
@@ -243,6 +271,28 @@ pub struct MintMeta {
     /// Free-preview length in seconds for media (PC2 `previewDuration`). 0/None => no preview.
     #[serde(default)]
     preview_duration: Option<u64>,
+    /// PC2 sale model (`accessMethod`): "free" | "buy_once" | "buy_and_resell". Empty => derived
+    /// from price (a price => buy_once, free => free) for back-compat.
+    #[serde(default)]
+    access_method: String,
+    /// BUY_AND_RESELL resale royalty in basis points (PC2 `resellerCut`, default 900 = 9%).
+    #[serde(default)]
+    reseller_cut: Option<u16>,
+    /// Royalty payees (PC2 `royalties[]`). Empty => the creator gets `100 - ELACITY_ROYALTY_PERCENT`
+    /// with identifier "A". The publish provider encodes these into the on-chain ROYALTY_SHARE roles.
+    #[serde(default)]
+    royalties: Vec<RoyaltyInput>,
+    /// AI/usage licensing object (PC2 `getLicensingData`): perpetual (omitted) or training-rights.
+    /// Carried verbatim into `attributes[Licensing]` so the marketplace shows the license terms.
+    #[serde(default)]
+    licensing: Option<Value>,
+    /// Creator legal attestation (PC2 `legalAttestation`): the signed checkbox set, carried into
+    /// `properties.legal`. `None` => omitted (UI must collect it before a real mint).
+    #[serde(default)]
+    legal_attestation: Option<Value>,
+    /// Adult/18+ content flag (PC2 `isAdult`) — surfaced as the `Adult` attribute.
+    #[serde(default)]
+    is_adult: bool,
 }
 
 impl MintMeta {
@@ -1183,6 +1233,13 @@ async fn finalize_mint(
                 "a paid mint needs the creator payout address (your wallet) — connect a wallet",
             ));
         }
+        // PC2 royalty split: the creator's rows must total 95% (the protocol takes the other 5%).
+        // Default (no rows): the creator gets 95% under identifier "A". For BUY_AND_RESELL the UI
+        // marks the distributor row with identifier "C" so the publish provider emits the
+        // DISTRIBUTION_RIGHT role. Validate BEFORE we encode, mirroring PC2 `validateRoyaltyTotal`.
+        let royalties = effective_royalties(meta, creator);
+        validate_royalty_total(&royalties).map_err(|e| stage_err("publish", &e))?;
+
         let req = publish_req["request"].as_object_mut().unwrap();
         req.insert("price_wei".into(), json!(price_wei));
         req.insert("creator_address".into(), json!(creator));
@@ -1194,6 +1251,12 @@ async fn finalize_mint(
         let (token_address, _) = currency_token(&meta.currency);
         if token_address != "0x0000000000000000000000000000000000000000" {
             req.insert("currency_address".into(), json!(token_address));
+        }
+        req.insert("royalties".into(), json!(royalties));
+        // Resale royalty (basis points) only for BUY_AND_RESELL; the publish provider ignores it
+        // otherwise, but we keep the request honest by only sending it when it applies.
+        if is_resellable(meta) {
+            req.insert("reseller_cut".into(), json!(effective_reseller_cut(meta)));
         }
     }
     let prepared = provider_data(registry, "publish", &publish_req)
@@ -1633,18 +1696,27 @@ fn build_media_envelope(b: MediaEnvelope) -> Value {
             "distribution": distribution_label(b.meta),
             "tags": b.meta.tags.clone(),
             "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
+            "legal": legal_property(b.meta),
             "kid": b.kid_hex,
         },
-        "attributes": [
-            { "trait_type": "Content-Type", "value": mime },
-            { "trait_type": "Size", "value": b.size },
-            { "trait_type": "Encrypted", "value": true },
-            { "trait_type": "OpType", "value": op_type_code(b.meta) },
-            { "trait_type": "Supply", "value": copies },
-            { "trait_type": "Algorithm", "value": "aes-128" },
-        ],
+        "attributes": media_envelope_attributes(b.meta, mime, b.size, copies),
         "kid": b.kid_hex,
     })
+}
+
+/// The media envelope's `attributes[]`: the base DASH/encryption traits plus the shared PC2
+/// sale/rights attributes (resell flags, adult, licensing).
+fn media_envelope_attributes(meta: &MintMeta, mime: &str, size: u64, copies: u64) -> Vec<Value> {
+    let mut attrs = vec![
+        json!({ "trait_type": "Content-Type", "value": mime }),
+        json!({ "trait_type": "Size", "value": size }),
+        json!({ "trait_type": "Encrypted", "value": true }),
+        json!({ "trait_type": "OpType", "value": op_type_code(meta) }),
+        json!({ "trait_type": "Supply", "value": copies }),
+        json!({ "trait_type": "Algorithm", "value": "aes-128" }),
+    ];
+    attrs.extend(sale_rights_attributes(meta));
+    attrs
 }
 
 /// Confirm on-chain that `channel` was created by `signer` — the fail-closed ownership gate
@@ -1873,22 +1945,100 @@ fn content_type_code(mime: &str) -> &'static str {
     }
 }
 
-/// PC2 op-type code: 0 free, 1 buy-once. (Buy-and-resell, code 2, is a follow-on.)
+/// PC2 op-type code: 0 free, 1 buy-once, 2 buy-and-resell.
 fn op_type_code(meta: &MintMeta) -> u64 {
-    if is_paid(meta) {
-        1
-    } else {
-        0
+    match op_type_for(meta) {
+        "buy_and_resell" => 2,
+        "buy_once" => 1,
+        _ => 0,
     }
 }
 
 /// PC2 distribution label for the `properties.distribution` display field.
 fn distribution_label(meta: &MintMeta) -> &'static str {
-    if is_paid(meta) {
-        "Buy Once"
-    } else {
-        "Free"
+    match op_type_for(meta) {
+        "buy_and_resell" => "Buy & Resell",
+        "buy_once" => "Buy Once",
+        _ => "Free",
     }
+}
+
+/// Whether this asset is resellable (PC2 BUY_AND_RESELL): the publish provider then emits the
+/// DISTRIBUTION_RIGHT role + `resellerCut`, and the metadata carries `Resell-Allowed`/`RRL-Percent`.
+fn is_resellable(meta: &MintMeta) -> bool {
+    op_type_for(meta) == "buy_and_resell"
+}
+
+/// The effective resale royalty (bps): the creator's choice or the PC2 default (900 = 9%).
+fn effective_reseller_cut(meta: &MintMeta) -> u16 {
+    meta.reseller_cut.unwrap_or(DEFAULT_RESELLER_CUT)
+}
+
+/// The royalty rows to encode (PC2 `royalties[]`): the creator's non-empty rows, or — when none
+/// are supplied — a single creator row of `100 - ELACITY_ROYALTY_PERCENT` percent (identifier "A").
+/// Each row is `{ address, royalty (percent), identifier? }` exactly as the publish provider reads.
+fn effective_royalties(meta: &MintMeta, creator: &str) -> Vec<Value> {
+    let rows: Vec<&RoyaltyInput> = meta
+        .royalties
+        .iter()
+        .filter(|r| !r.address.trim().is_empty())
+        .collect();
+    if rows.is_empty() {
+        return vec![json!({
+            "address": creator,
+            "royalty": 100.0 - ELACITY_ROYALTY_PERCENT,
+            "identifier": "A",
+        })];
+    }
+    rows.iter()
+        .map(|r| {
+            let mut o = json!({ "address": r.address.trim(), "royalty": r.royalty });
+            if let Some(id) = r.identifier.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                o["identifier"] = json!(id);
+            }
+            o
+        })
+        .collect()
+}
+
+/// The PC2 sale/rights attributes appended to every asset's `attributes[]`: `Resell-Allowed` +
+/// `RRL-Percent` (= resellerCut/10, 0 when not resellable; app.js:1397-1398), `Adult`, and
+/// `Licensing` (the licensing object, or "perpetual"; app.js:1401-1402). Shared by the object +
+/// media envelope builders so both surfaces are identical on `base.ela.city`.
+fn sale_rights_attributes(meta: &MintMeta) -> Vec<Value> {
+    let resellable = is_resellable(meta);
+    let rrl_percent = if resellable {
+        effective_reseller_cut(meta) as f64 / 10.0
+    } else {
+        0.0
+    };
+    vec![
+        json!({ "trait_type": "Resell-Allowed", "value": resellable }),
+        json!({ "trait_type": "RRL-Percent", "value": rrl_percent }),
+        json!({ "trait_type": "Adult", "value": meta.is_adult }),
+        json!({ "trait_type": "Licensing", "value": meta.licensing.clone().unwrap_or_else(|| json!("perpetual")) }),
+    ]
+}
+
+/// The PC2 `properties.legal` value: the creator's signed legal attestation object, or null when
+/// absent (`params.legalAttestation || null`, app.js:1387).
+fn legal_property(meta: &MintMeta) -> Value {
+    meta.legal_attestation.clone().unwrap_or(Value::Null)
+}
+
+/// PC2 `validateRoyaltyTotal`: the creator's royalty shares plus the protocol's `ELACITY_ROYALTY_PERCENT`
+/// must total 100%. Fails closed (the protocol cut is automatic, so the creator rows own 95%).
+fn validate_royalty_total(rows: &[Value]) -> Result<(), String> {
+    let sum: f64 = rows.iter().filter_map(|r| r["royalty"].as_f64()).sum();
+    if (sum + ELACITY_ROYALTY_PERCENT - 100.0).abs() > 0.01 {
+        return Err(format!(
+            "creator royalty shares must total {:.0}% (the protocol takes {:.0}%); got {:.2}%",
+            100.0 - ELACITY_ROYALTY_PERCENT,
+            ELACITY_ROYALTY_PERCENT,
+            sum
+        ));
+    }
+    Ok(())
 }
 
 /// Build the public token metadata — the EXACT Elacity `asset/v1.1` shape the marketplace
@@ -1935,16 +2085,10 @@ fn build_metadata_envelope(b: BuildEnvelope) -> Value {
             "distribution": distribution_label(b.meta),
             "tags": b.meta.tags.clone(),
             "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
+            "legal": legal_property(b.meta),
             "kid": b.kid_hex,
         },
-        "attributes": [
-            { "trait_type": "Content-Type", "value": mime },
-            { "trait_type": "Size", "value": b.size },
-            { "trait_type": "Encrypted", "value": true },
-            { "trait_type": "OpType", "value": op_type_code(b.meta) },
-            { "trait_type": "Supply", "value": copies },
-            { "trait_type": "Algorithm", "value": "aes-128" },
-        ],
+        "attributes": media_envelope_attributes(b.meta, mime, b.size, copies),
         // Top-level kid: the indexer keys on `metadata.kid || metadata.properties.kid`.
         "kid": b.kid_hex,
     })
@@ -1997,19 +2141,33 @@ fn build_contract_json(meta: &MintMeta) -> Value {
                 "paymentDecimals": decimals,
             },
         },
-        "attributes": [
-            { "trait_type": "Content-Type", "value": mime },
-            { "trait_type": "OpType", "value": op_type_code(meta) },
-            { "trait_type": "Supply", "value": copies },
-        ],
+        "attributes": contract_attributes(meta, mime, copies),
     })
+}
+
+/// The `contract.json` attributes: base content/op/supply plus the PC2 resale flags
+/// (`Resell-Allowed`/`RRL-Percent`, app.js:1464-1467) so the contract surface matches the asset.
+fn contract_attributes(meta: &MintMeta, mime: &str, copies: u64) -> Vec<Value> {
+    let resellable = is_resellable(meta);
+    let rrl_percent = if resellable {
+        effective_reseller_cut(meta) as f64 / 10.0
+    } else {
+        0.0
+    };
+    vec![
+        json!({ "trait_type": "Content-Type", "value": mime }),
+        json!({ "trait_type": "OpType", "value": op_type_code(meta) }),
+        json!({ "trait_type": "Supply", "value": copies }),
+        json!({ "trait_type": "Resell-Allowed", "value": resellable }),
+        json!({ "trait_type": "RRL-Percent", "value": rrl_percent }),
+    ]
 }
 
 /// Build the per-token-type metadata files (Elacity `buildTokenTypeJsons`): the Access Token
 /// (id 1) and Royalty Share (id 2). These resolve as `{tokenId}.json` siblings in the dir.
 fn build_token_type_files(meta: &MintMeta, kid_hex: &str, image: &str) -> Vec<(String, Value)> {
     let title = meta.title.trim();
-    vec![
+    let mut files = vec![
         (
             ACCESS_TOKEN_FILE.to_string(),
             json!({
@@ -2035,7 +2193,25 @@ fn build_token_type_files(meta: &MintMeta, kid_hex: &str, image: &str) -> Vec<(S
                 "properties": { "kid": kid_hex, "title": title },
             }),
         ),
-    ]
+    ];
+    // BUY_AND_RESELL also mints a DISTRIBUTION_RIGHT (token id 3) — the tradable right the
+    // distributor holds (PC2 app.js:1505-1518). Emitted ONLY when resellable, so free/buy_once
+    // assets keep the exact two-file directory they had before.
+    if is_resellable(meta) {
+        files.push((
+            DISTRIBUTION_RIGHT_FILE.to_string(),
+            json!({
+                "schema": ELACITY_DISTRIBUTION_RIGHT_SCHEMA,
+                "version": "1.0",
+                "type": "DistributionRight",
+                "name": "Distribution Right",
+                "description": "Allow owner to distribute the content via trade",
+                "image": image,
+                "properties": { "kid": kid_hex, "title": title },
+            }),
+        ));
+    }
+    files
 }
 
 /// Resolve a currency symbol to its (token address, decimals) for `contract.json`. Native
@@ -2110,7 +2286,14 @@ fn seal_str(value: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("escrow response missing {key}"))
 }
 
+/// A paid listing is any non-free op type (buy_once or buy_and_resell).
 fn is_paid(meta: &MintMeta) -> bool {
+    op_type_for(meta) != "free"
+}
+
+/// True when the listing carries a non-zero price (the price-derived signal op_type_for falls
+/// back to when `access_method` is unspecified).
+fn has_price(meta: &MintMeta) -> bool {
     !price_is_zero(&meta.price)
 }
 
@@ -2119,11 +2302,20 @@ fn price_is_zero(price: &str) -> bool {
     p.is_empty() || p.chars().all(|c| c == '0' || c == '.')
 }
 
+/// The PC2 op type, honoring the explicit `accessMethod` (free | buy_once | buy_and_resell) and
+/// falling back to the price-derived choice for back-compat when it is unset.
 fn op_type_for(meta: &MintMeta) -> &'static str {
-    if is_paid(meta) {
-        "buy_once"
-    } else {
-        "free"
+    match meta.access_method.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "free" => "free",
+        "buy_once" | "buyonce" => "buy_once",
+        "buy_and_resell" | "buyandresell" | "resell" => "buy_and_resell",
+        _ => {
+            if has_price(meta) {
+                "buy_once"
+            } else {
+                "free"
+            }
+        }
     }
 }
 

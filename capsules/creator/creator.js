@@ -38,6 +38,8 @@ const MEDIA_PREFIXES = ["video/", "audio/"];
 
 let selectedFile = null;
 let customThumbnail = null;
+// PC2 access method: "free" | "buy_once" | "buy_and_resell". Drives the price/royalty/resell UI.
+let accessMethod = "free";
 
 const els = {
   drop: document.getElementById("drop"),
@@ -47,9 +49,20 @@ const els = {
   title: document.getElementById("title"),
   desc: document.getElementById("desc"),
   price: document.getElementById("price"),
+  priceRow: document.getElementById("price-row"),
   currency: document.getElementById("currency"),
   copies: document.getElementById("copies"),
   category: document.getElementById("category"),
+  methodGrid: document.getElementById("method-grid"),
+  resellField: document.getElementById("resell-field"),
+  resellerCut: document.getElementById("reseller-cut"),
+  royaltyField: document.getElementById("royalty-field"),
+  royaltyRows: document.getElementById("royalty-rows"),
+  royaltyAdd: document.getElementById("royalty-add"),
+  royaltyTotal: document.getElementById("royalty-total"),
+  aiLicensing: document.getElementById("ai-licensing"),
+  adultFlag: document.getElementById("adult-flag"),
+  legalAttest: document.getElementById("legal-attest"),
   thumbDrop: document.getElementById("thumb-drop"),
   thumbInput: document.getElementById("thumb-input"),
   thumbPreviewWrap: document.getElementById("thumb-preview-wrap"),
@@ -165,7 +178,24 @@ function onFile(file) {
   if (!els.title.value) els.title.value = file.name.replace(/\.[^.]+$/, "");
   // The free-preview clip only applies to time-based media (video/audio).
   if (els.previewSettings) els.previewSettings.classList.toggle("hidden", kind !== "media");
+  autoDetectCategory(file, mime);
   refreshMintEnabled();
+}
+
+// Auto-pick the category dropdown from the file when the creator hasn't chosen one
+// (PC2 app.js:992-995 — `.glb/.gltf/.obj/.fbx` => 3d-model, model files => ai-model).
+function autoDetectCategory(file, mime) {
+  if (!els.category || els.category.value) return;
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  let cat = "";
+  if (["glb", "gltf", "obj", "fbx", "stl", "usdz"].includes(ext)) cat = "3d-model";
+  else if (["safetensors", "ckpt", "gguf", "onnx", "pt", "pth", "bin"].includes(ext))
+    cat = "ai-model";
+  else if (mime.startsWith("video/")) cat = "video";
+  else if (mime.startsWith("audio/")) cat = "music";
+  else if (mime.startsWith("image/")) cat = "image";
+  else if (mime === "application/pdf") cat = "document";
+  if (cat) els.category.value = cat;
 }
 
 function isEvmAddress(v) {
@@ -654,6 +684,30 @@ async function mint() {
   if (!selectedFile) return;
   if (!(await preflight())) return;
 
+  // Legal attestation is required (PC2 parity) — the creator must affirm distribution rights.
+  if (els.legalAttest && !els.legalAttest.checked) {
+    setStatus("Please confirm you own or have the rights to distribute this content.", "err");
+    return;
+  }
+  // For paid sales, the royalty rows (if any) must total 95% with the 5% protocol cut.
+  if (isPaidMethod()) {
+    const rows = collectRoyalties();
+    if (rows.length) {
+      const sum = rows.reduce((a, r) => a + r.royalty, 0);
+      if (Math.abs(sum + ELACITY_ROYALTY_PERCENT - 100) > 0.01) {
+        setStatus(
+          "Royalty payees must total " +
+            (100 - ELACITY_ROYALTY_PERCENT) +
+            "% (the protocol takes " +
+            ELACITY_ROYALTY_PERCENT +
+            "%).",
+          "err"
+        );
+        return;
+      }
+    }
+  }
+
   els.mint.disabled = true;
   resetSteps();
   setStatus("Encrypting…", null);
@@ -678,10 +732,40 @@ async function mint() {
     previewDuration = Math.min(60, parseInt(els.previewDuration.value, 10) || 0);
   }
 
+  // PC2 royalty/licensing terms. Resale royalty (RRL) is stored as deci-percent (90% => 900);
+  // the host re-derives RRL-Percent = reseller_cut / 10.
+  const royalties = isPaidMethod() ? collectRoyalties() : [];
+  const resellerCut =
+    accessMethod === "buy_and_resell"
+      ? Math.round((parseFloat(els.resellerCut && els.resellerCut.value) || 0) * 10)
+      : undefined;
+  const aiTraining = els.aiLicensing && els.aiLicensing.checked;
+  const licensing = aiTraining
+    ? {
+        type: "training-rights",
+        terms: { commercial: true, modification: false, redistribution: false, attribution: true, exclusivity: false },
+        aiTraining: {
+          permitted: true,
+          scope: "commercial",
+          modelTypes: ["llm", "vision", "audio", "code", "multimodal", "diffusion", "embedding"],
+          attribution: true,
+          derivativeWorks: false,
+          outputOwnership: "licensee",
+        },
+      }
+    : {
+        type: "perpetual",
+        terms: { commercial: true, modification: false, redistribution: false, attribution: true, exclusivity: false },
+      };
+  const legalAttestation =
+    els.legalAttest && els.legalAttest.checked
+      ? { owns: true, attestedAt: new Date().toISOString(), attestedBy: els.wallet.value }
+      : null;
+
   const meta = {
     title: els.title.value.trim(),
     description: els.desc.value.trim(),
-    price: els.price.value || "0",
+    price: isPaidMethod() ? els.price.value || "0" : "0",
     currency: els.currency.value,
     channel: selectedChannel(),
     creatorAddress: els.wallet.value,
@@ -693,6 +777,12 @@ async function mint() {
     thumbnailB64: (thumb && thumb.b64) || "",
     thumbnailMime: (thumb && thumb.mime) || "",
     previewDuration: previewDuration,
+    accessMethod: accessMethod,
+    resellerCut: resellerCut,
+    royalties: royalties,
+    licensing: licensing,
+    legalAttestation: legalAttestation,
+    isAdult: !!(els.adultFlag && els.adultFlag.checked),
   };
 
   // The frame ships the bytes + listing terms to the host capability route. The
@@ -1016,6 +1106,117 @@ if (els.previewDuration) {
       els.previewDurationDisplay.textContent = els.previewDuration.value + "s";
   });
 }
+
+// ---- Access method + royalty split (PC2 parity) -----------------------------
+
+const ELACITY_ROYALTY_PERCENT = 5; // protocol cut; creator rows own the remaining 95%
+
+function isPaidMethod() {
+  return accessMethod === "buy_once" || accessMethod === "buy_and_resell";
+}
+
+function syncMethodUI() {
+  if (els.methodGrid) {
+    els.methodGrid.querySelectorAll(".method").forEach((card) => {
+      card.classList.toggle("sel", card.dataset.method === accessMethod);
+    });
+  }
+  if (els.priceRow) els.priceRow.classList.toggle("hidden", !isPaidMethod());
+  // Resale royalty only applies to buy_and_resell; royalty split only to paid sales.
+  if (els.resellField)
+    els.resellField.classList.toggle("hidden", accessMethod !== "buy_and_resell");
+  if (els.royaltyField)
+    els.royaltyField.classList.toggle("hidden", !isPaidMethod());
+}
+
+function addRoyaltyRow(address, percent) {
+  if (!els.royaltyRows) return;
+  const row = document.createElement("div");
+  row.className = "royalty-row";
+  const addr = document.createElement("input");
+  addr.type = "text";
+  addr.className = "ry-addr";
+  addr.placeholder = "0x… payee address";
+  addr.value = address || "";
+  const pct = document.createElement("input");
+  pct.type = "number";
+  pct.className = "ry-pct";
+  pct.min = "0";
+  pct.max = "95";
+  pct.step = "0.1";
+  pct.placeholder = "%";
+  pct.value = percent != null ? String(percent) : "";
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "ry-del";
+  del.textContent = "\u00d7";
+  del.title = "Remove payee";
+  del.addEventListener("click", () => {
+    row.remove();
+    refreshRoyaltyTotal();
+  });
+  addr.addEventListener("input", refreshRoyaltyTotal);
+  pct.addEventListener("input", refreshRoyaltyTotal);
+  row.appendChild(addr);
+  row.appendChild(pct);
+  row.appendChild(del);
+  els.royaltyRows.appendChild(row);
+  refreshRoyaltyTotal();
+}
+
+function collectRoyalties() {
+  const rows = [];
+  if (!els.royaltyRows) return rows;
+  els.royaltyRows.querySelectorAll(".royalty-row").forEach((row) => {
+    const address = (row.querySelector(".ry-addr").value || "").trim();
+    const royalty = parseFloat(row.querySelector(".ry-pct").value) || 0;
+    if (address || royalty) rows.push({ address: address, royalty: royalty });
+  });
+  return rows;
+}
+
+function refreshRoyaltyTotal() {
+  if (!els.royaltyTotal) return;
+  const rows = collectRoyalties();
+  if (!rows.length) {
+    els.royaltyTotal.textContent = "";
+    els.royaltyTotal.className = "royalty-total";
+    return;
+  }
+  const sum = rows.reduce((a, r) => a + r.royalty, 0);
+  const target = 100 - ELACITY_ROYALTY_PERCENT;
+  const ok = Math.abs(sum - target) < 0.01;
+  els.royaltyTotal.textContent =
+    "Payees: " +
+    sum.toFixed(1) +
+    "% + protocol " +
+    ELACITY_ROYALTY_PERCENT +
+    "% = " +
+    (sum + ELACITY_ROYALTY_PERCENT).toFixed(1) +
+    "% " +
+    (ok ? "\u2713" : "(must total 100%)");
+  els.royaltyTotal.className = "royalty-total " + (ok ? "ok" : "bad");
+}
+
+if (els.methodGrid) {
+  els.methodGrid.querySelectorAll(".method").forEach((card) => {
+    const pick = () => {
+      accessMethod = card.dataset.method;
+      syncMethodUI();
+    };
+    card.addEventListener("click", pick);
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        pick();
+      }
+    });
+  });
+}
+if (els.royaltyAdd) {
+  els.royaltyAdd.addEventListener("click", () => addRoyaltyRow("", ""));
+}
+syncMethodUI();
 
 els.createChannelBtn.addEventListener("click", createChannel);
 els.mint.addEventListener("click", mint);

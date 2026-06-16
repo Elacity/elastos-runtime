@@ -4986,6 +4986,9 @@ enum OpenMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AuthorityBackend {
     /// In-runtime dev authority: the runtime GENERATES + persists its own master seed (durable key store).
+    /// Dev-only (DEV_MODE_GUARD_SPEC): constructed only under `--features dev-modes` / in tests, but
+    /// retained as a match arm everywhere, so a non-dev build sees it as "never constructed".
+    #[allow(dead_code)]
     Reference,
     /// External authority: a SECRET-HOLDING node owns the master; the runtime holds only its
     /// PUBLIC identity (a public-only descriptor) and DELEGATES recovery to the node — never the
@@ -5006,6 +5009,20 @@ impl AuthorityBackend {
             AuthorityBackend::Dkms => "dkms",
             AuthorityBackend::Lit => "lit",
         }
+    }
+}
+
+/// The key authority backend used when `authority` is absent from the config. Release builds
+/// default to the production `dkms` backend; the dev-only `reference` backend is the default
+/// ONLY under `--features dev-modes` (DEV_MODE_GUARD_SPEC — secure by construction).
+fn default_authority_backend() -> AuthorityBackend {
+    #[cfg(feature = "dev-modes")]
+    {
+        AuthorityBackend::Reference
+    }
+    #[cfg(not(feature = "dev-modes"))]
+    {
+        AuthorityBackend::Dkms
     }
 }
 
@@ -5095,16 +5112,20 @@ impl OpenConfig {
         };
         // `authority` is an OBJECT (room to carry per-backend descriptors later); today its
         // `backend` tag + (for dkms) the node binary + optional `threshold`/`transport` knobs are
-        // read. Absent → reference (back-compat). Fail-closed on an unknown tag or a non-object
-        // `authority`.
+        // read. Absent → the default backend (DEV_MODE_GUARD_SPEC: `dkms` in a release build;
+        // the dev-only `reference` backend ONLY under `--features dev-modes`). Fail-closed on an
+        // unknown tag or a non-object `authority`.
         let (authority, dkms_authority_bin, threshold, nodes, dkms_transport, live_descriptor, dkms_caller_seed_path) = match obj.get("authority") {
-            None => (AuthorityBackend::Reference, None, false, 2u8, DkmsTransport::Unix, None, None),
+            None => (default_authority_backend(), None, false, 2u8, DkmsTransport::Unix, None, None),
             Some(Value::Object(auth)) => {
-                let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or("reference") {
+                let backend = match auth.get("backend").and_then(Value::as_str).unwrap_or(default_authority_backend().tag()) {
+                    #[cfg(feature = "dev-modes")]
                     "reference" => AuthorityBackend::Reference,
+                    #[cfg(not(feature = "dev-modes"))]
+                    "reference" => return Err("config `authority.backend` == \"reference\" is a DEV-ONLY backend fenced out of release builds (DEV_MODE_GUARD_SPEC); use \"dkms\", or rebuild with `--features dev-modes` for local/CI".to_string()),
                     "dkms" => AuthorityBackend::Dkms,
                     "lit" => AuthorityBackend::Lit,
-                    other => return Err(format!("config `authority.backend` must be \"reference\", \"dkms\", or \"lit\", got {other:?}")),
+                    other => return Err(format!("config `authority.backend` must be \"dkms\" or \"lit\" (\"reference\" is dev-modes-only), got {other:?}")),
                 };
                 let node_bin = auth.get("dkms_authority_bin").and_then(Value::as_str).map(str::to_string);
                 // LIVE AUTHORITIES MODE: the nodes already run remotely, so the node BINARY is not
