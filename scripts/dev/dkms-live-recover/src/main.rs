@@ -99,7 +99,7 @@ impl NodeSocket {
             Some(ch) => {
                 ch.send_seq += 1;
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
-                let padded = ddrm_envelope::channel_pad::pad(&payload);
+                let padded = ddrm_envelope::channel_pad::pad_outgoing(&payload);
                 ddrm_envelope::seal::seal_bound(&ch.node_pub, &padded, &aad, &ch.signer).to_bytes()
             }
         };
@@ -119,8 +119,7 @@ impl NodeSocket {
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.recv_seq);
                 let opened = ddrm_envelope::hybrid_unwrap_bound(&ch.secret, &env, &aad, &ch.node_verifier)
                     .map_err(|_| "node response failed to authenticate on the channel".to_string())?;
-                ddrm_envelope::channel_pad::unpad(&opened)
-                    .ok_or_else(|| "node response carried malformed channel padding".to_string())?
+                ddrm_envelope::channel_pad::unpad_incoming(&opened)
             }
         };
         serde_json::from_slice(&plain).map_err(|e| format!("non-JSON frame: {e}"))
@@ -133,7 +132,7 @@ impl NodeSocket {
         let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
         ch.send_seq += 1;
         let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
-        let padded = ddrm_envelope::channel_pad::pad(&payload);
+        let padded = ddrm_envelope::channel_pad::pad_outgoing(&payload);
         Ok(ddrm_envelope::seal::seal_bound(&ch.node_pub, &padded, &aad, &ch.signer).to_bytes())
     }
 

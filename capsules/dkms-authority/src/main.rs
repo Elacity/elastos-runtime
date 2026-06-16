@@ -2228,15 +2228,10 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     None => break, // unreachable: a channel implies a completed hello (post-init)
                 };
                 match ddrm_envelope::hybrid_unwrap_bound(channel_secret, &env, &aad, &ch.caller_verifier) {
-                    // Strip the length-hiding pad applied before sealing; a malformed pad is a
-                    // torn/hostile frame -> drop the connection fail-closed.
-                    Ok(opened) => match ddrm_envelope::channel_pad::unpad(&opened) {
-                        Some(plaintext) => plaintext,
-                        None => {
-                            eprintln!("dkms-authority: sealed frame carried malformed padding — dropping connection");
-                            break;
-                        }
-                    },
+                    // Tolerant unpad: accept a padded (padding-aware client) OR an un-padded
+                    // (legacy client) request, so the node interoperates regardless of rollout
+                    // order. Integrity is the seal above; padding is metadata-hiding only.
+                    Ok(opened) => ddrm_envelope::channel_pad::unpad_incoming(&opened),
                     Err(_) => {
                         eprintln!("dkms-authority: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
                         break;
@@ -2345,9 +2340,11 @@ fn respond<W: io::Write>(
             };
             ch.send_seq += 1;
             let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.send_seq);
-            // Pad the plaintext to a size bucket BEFORE sealing so the on-wire frame length reveals
-            // only the bucket, not the exact response size (pre-audit #5 metadata minimization).
-            let padded = ddrm_envelope::channel_pad::pad(&bytes);
+            // Optionally pad the plaintext to a size bucket BEFORE sealing so the on-wire frame
+            // length reveals only the bucket (pre-audit #5 metadata minimization). OFF by default
+            // and emitted only when ELASTOS_DKMS_CHANNEL_PAD is set across a padding-aware quorum —
+            // a legacy client cannot strip a padded response.
+            let padded = ddrm_envelope::channel_pad::pad_outgoing(&bytes);
             let env = ddrm_envelope::seal::seal_bound(&ch.client_pub, &padded, &aad, &authority.signer);
             write_frame(writer, &env.to_bytes())
         }
@@ -3230,7 +3227,9 @@ mod tests {
         let env = ddrm_envelope::PqSealedEnvelope::from_bytes(&sealed_resp).unwrap();
         let aad_in = ddrm_envelope::channel_frame_aad(&challenge, 1, 1);
         let opened = ddrm_envelope::hybrid_unwrap_bound(&client_secret, &env, &aad_in, &verifier).unwrap();
-        let unpadded = ddrm_envelope::channel_pad::unpad(&opened).expect("response carries valid padding");
+        // Tolerant unpad: the response is un-padded by default (padding is off unless negotiated),
+        // and would be stripped here too if a padding-aware quorum had it enabled.
+        let unpadded = ddrm_envelope::channel_pad::unpad_incoming(&opened);
         let resp: Value = serde_json::from_slice(&unpadded).unwrap();
         assert_eq!(resp["status"].as_str().unwrap(), "ok");
 

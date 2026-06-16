@@ -1644,6 +1644,25 @@ pub mod channel_pad {
         }
     }
 
+    /// Whether to ADD length-hiding padding to OUTGOING channel frames. **OFF by default.**
+    ///
+    /// Padding changes the dKMS channel wire format: an un-upgraded quorum node cannot parse a
+    /// padded plaintext, so a client that pads unilaterally breaks interop with the deployed nodes.
+    /// Padding is therefore a NEGOTIATED feature — enable it with `ELASTOS_DKMS_CHANNEL_PAD=1` on
+    /// BOTH the client and the node only once every node in the set ships a padding-aware build.
+    /// The RECEIVER (`unpad_incoming`) is ALWAYS tolerant of both wire forms, so flipping this on or
+    /// off is rollout-safe in any order. (Padding is metadata minimization, not an integrity
+    /// boundary — the authenticated seal already protects these bytes.)
+    pub fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("ELASTOS_DKMS_CHANNEL_PAD")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        })
+    }
+
     /// Pad `plaintext` to its size bucket. Always grows by at least the one marker byte.
     pub fn pad(plaintext: &[u8]) -> Vec<u8> {
         let target = bucket(plaintext.len() + 1);
@@ -1654,9 +1673,18 @@ pub mod channel_pad {
         out
     }
 
+    /// Wire-side outgoing transform: pad ONLY when channel padding is enabled, else emit the
+    /// plaintext unchanged so the frame matches the un-padded wire format the deployed nodes speak.
+    pub fn pad_outgoing(plaintext: &[u8]) -> Vec<u8> {
+        if enabled() {
+            pad(plaintext)
+        } else {
+            plaintext.to_vec()
+        }
+    }
+
     /// Strip ISO 7816-4 padding: drop trailing `0x00`, then the single `0x80` marker. Returns `None`
-    /// for a malformed pad (no marker, or all-zero) — the caller treats that as a torn/hostile frame
-    /// and fails closed.
+    /// for a malformed pad (no marker, or all-zero). Used directly only by the round-trip tests.
     pub fn unpad(padded: &[u8]) -> Option<Vec<u8>> {
         let mut i = padded.len();
         while i > 0 && padded[i - 1] == 0x00 {
@@ -1666,6 +1694,19 @@ pub mod channel_pad {
             return None;
         }
         Some(padded[..i - 1].to_vec())
+    }
+
+    /// Wire-side incoming transform: if the frame carries a valid ISO 7816-4 pad marker, strip it;
+    /// otherwise return it unchanged (the peer did not pad). This makes a receiver accept BOTH wire
+    /// forms, so a padded and an un-padded peer interoperate regardless of rollout order. It is safe
+    /// because these channel payloads are JSON: valid JSON never ends in a `0x80`-marked, zero-padded
+    /// tail, so "padded" vs "raw" is unambiguous — and the seal already authenticated the bytes, so
+    /// this layer is not an integrity gate.
+    pub fn unpad_incoming(frame: &[u8]) -> Vec<u8> {
+        match unpad(frame) {
+            Some(inner) => inner,
+            None => frame.to_vec(),
+        }
     }
 }
 
@@ -2407,6 +2448,24 @@ mod tests {
         // A pad with no 0x80 marker (all zeros) is malformed -> None (fail closed).
         assert_eq!(unpad(&[0u8; 16]), None);
         assert_eq!(unpad(&[]), None);
+    }
+
+    /// Receive-side tolerance: `unpad_incoming` accepts BOTH wire forms so a padded and an
+    /// un-padded peer interoperate regardless of which side ships padding first. This is the
+    /// property that keeps the channel backward-compatible with the deployed (un-padded) quorum
+    /// nodes — without it, enabling padding on the client breaks every open against an old node.
+    #[test]
+    fn channel_pad_incoming_accepts_padded_and_unpadded_peers() {
+        use crate::channel_pad::{pad, unpad_incoming};
+        // A raw (un-padded) JSON frame from a legacy node round-trips untouched.
+        let raw = br#"{"status":"released","share_b64":"AA=="}"#.to_vec();
+        assert_eq!(unpad_incoming(&raw), raw, "un-padded peer frame passes through unchanged");
+        // A padded frame from a padding-aware node is stripped back to the exact plaintext.
+        assert_eq!(unpad_incoming(&pad(&raw)), raw, "padded peer frame is stripped to plaintext");
+        // Even a binary plaintext that itself ends in 0x80 strips correctly (marker is the last
+        // non-zero byte), so the tolerance is unambiguous beyond JSON too.
+        let ends_in_marker = vec![1u8, 2, 0x80];
+        assert_eq!(unpad_incoming(&pad(&ends_in_marker)), ends_in_marker);
     }
 
     /// The 2-of-2 XOR share-split round-trips, hides the CEK in each share alone, and

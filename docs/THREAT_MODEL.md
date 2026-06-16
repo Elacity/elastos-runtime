@@ -55,7 +55,7 @@ because hiding it would be dishonest and an auditor will find it anyway.
 |-------|------|-------|
 | **dKMS node operator** (each node it serves) | The recover requests it serves: the **content id / kid, the principal (wallet) it is keyed on, the session, the right, and the time**. | This is the core exposure. A node operator learns *who opened what, when* for opens it participates in. The 2-of-3 split protects the *key*, not this *access pattern*. |
 | **The chain / Base RPC provider** | The rights query `hasAccessByContentId(content_id, wallet)` as an `eth_call`. | The configured RPC endpoint sees `(content_id, wallet)` lookups. On-chain ownership/rights are inherently public. See `capsules/dkms-authority/src/node_chain.rs`. |
-| **An on-path network observer** | TLS/connection metadata: peer addresses, connection timing, frame **counts** and **coarse bucketed sizes**. | The channel payloads are sealed (hybrid x25519+ML-KEM-768 AEAD, ML-DSA-65 signed). Frame **lengths** are bucket-padded (see §5), so an observer learns a size *class*, not the exact message size — but timing and frame *count* still leak. |
+| **An on-path network observer** | TLS/connection metadata: peer addresses, connection timing, frame **counts** and **sizes**. | The channel payloads are sealed (hybrid x25519+ML-KEM-768 AEAD, ML-DSA-65 signed). Frame **lengths** *can* be bucket-padded (see §5) to leak only a size *class*, but padding is a negotiated feature that is **off by default** today, so an observer currently sees exact sealed frame sizes; timing and frame *count* leak regardless. |
 | **The local runtime / gateway** | Plaintext, the wallet linkage, the CEK transiently. | This is the **owner's own trusted local boundary** (PRINCIPLES §1, §5). It is trusted on behalf of the signed-in principal; it is not a remote adversary. A *compromised* runtime is out of scope for confidentiality (it is the thing serving the owner). |
 
 ### The `(wallet, content_id, time)` access pattern
@@ -84,17 +84,24 @@ incidental spread (§4, §5); fully blinding it is roadmap (§6).
     Base chain or an external witness). That is a deliberate follow-on; until it lands, do not claim
     more than "tamper-evident against external editing + non-repudiable."
 
-## 5. Channel metadata minimization (coarse, in place)
+## 5. Channel metadata minimization (coarse, negotiated, off by default today)
 
-The dKMS encrypted channel pads each frame's **plaintext to a coarse size bucket before sealing**
+The dKMS encrypted channel *can* pad each frame's **plaintext to a coarse size bucket before sealing**
 (powers of two from 256 B up to a cap; ISO/IEC 7816-4 padding), so the on-wire frame length reveals a
 size *class* rather than the exact message size — collapsing, e.g., a `status` poll and a small
-`recover` into the same bucket. See `ddrm-envelope` `channel_pad`, applied symmetrically at every
+`recover` into the same bucket. See `ddrm-envelope` `channel_pad`, available symmetrically at every
 channel seal/open site (`dkms-authority`, `key-provider`, dev recover tools).
 
-**This is a coarse defense, stated as such:** it does not hide frame **count** or **timing**, and
-large content-binding frames above the cap are not bucket-expanded. It raises the bar against trivial
-size-fingerprinting; it is **not** traffic-analysis resistance.
+**Padding is a NEGOTIATED feature and is OFF by default** (`ELASTOS_DKMS_CHANNEL_PAD`): changing the
+frame layout is a wire-format change, so a client must not emit padded frames to a quorum node that
+predates the padding-aware build (the node cannot parse them). It is enabled only once every node in
+the set ships a padding-aware build; the receiver (`unpad_incoming`) is always tolerant of both wire
+forms, so the rollout is safe in any order. **Until that coordinated rollout, frame sizes are NOT
+padded on the live quorum** — an on-path observer sees exact (sealed) frame sizes.
+
+**Even when enabled this is a coarse defense, stated as such:** it does not hide frame **count** or
+**timing**, and large content-binding frames above the cap are not bucket-expanded. It raises the bar
+against trivial size-fingerprinting; it is **not** traffic-analysis resistance.
 
 ## 6. What we do NOT defend (explicit, for the auditor)
 

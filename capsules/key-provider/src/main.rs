@@ -495,9 +495,11 @@ impl DkmsNodeConn {
             Some(ch) => {
                 ch.send_seq += 1;
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 0, ch.send_seq);
-                // Pad to a size bucket before sealing so the frame length hides the request size
-                // (pre-audit #5 metadata minimization); the node strips the pad after opening.
-                let padded = ddrm_envelope::channel_pad::pad(&payload);
+                // Optionally pad to a size bucket before sealing so the frame length hides the
+                // request size (pre-audit #5 metadata minimization). OFF by default and only
+                // emitted when ELASTOS_DKMS_CHANNEL_PAD is set on a padding-aware quorum — a
+                // deployed node that predates padding cannot parse a padded plaintext.
+                let padded = ddrm_envelope::channel_pad::pad_outgoing(&payload);
                 ddrm_envelope::seal::seal_bound(&ch.node_channel_pub, &padded, &aad, &self.caller_signer)
                     .to_bytes()
             }
@@ -522,8 +524,9 @@ impl DkmsNodeConn {
                     .map_err(|_| {
                         "dkms node response failed to authenticate on the encrypted channel".to_string()
                     })?;
-                ddrm_envelope::channel_pad::unpad(&opened)
-                    .ok_or_else(|| "dkms node response carried malformed channel padding".to_string())?
+                // Tolerant unpad: accept BOTH a padded (padding-aware node) and an un-padded
+                // (deployed/legacy node) response, so the client interoperates either way.
+                ddrm_envelope::channel_pad::unpad_incoming(&opened)
             }
         };
         serde_json::from_slice::<Value>(&plain).map_err(|e| format!("dkms node sent non-JSON: {e}"))
