@@ -553,6 +553,9 @@ impl EncryptProvider {
             "iv8_b64": b64.encode(out.iv8),
             // The node-set pin (hash over all 3 vks + t=2) the open must match — detects a node swap.
             "node_set_id_b64": b64.encode(out.node_set_id),
+            // PRE-AUDIT #1: the published CEK commitment the decrypt boundary verifies the
+            // reconstructed key against (fail-closed integrity backstop). Computed at mint.
+            "cek_commitment_b64": b64.encode(out.cek_commitment),
             // Each node's SEALED indexed share (`x ‖ p(x)` under its recipient) — never a raw share.
             "shares": out.shares,
             // The producer verifying key that SIGNED each escrow seal. The recovery boundary
@@ -612,6 +615,9 @@ impl EncryptProvider {
         }
         let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
         let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &vk_refs);
+        // PRE-AUDIT #1: bind the CEK to its node-set HERE (the only place the whole CEK exists at
+        // mint) so the decrypt boundary can verify the reconstructed key against this commitment.
+        let cek_commitment = ddrm_envelope::cek_commitment(&node_set_id, &minted.cek[..]);
         Ok(ThresholdSealOutput {
             kid_hex: minted.kid_hex.clone(),
             segment,
@@ -619,6 +625,7 @@ impl EncryptProvider {
             ciphertext,
             iv8,
             node_set_id,
+            cek_commitment,
             shares,
         })
         // `minted` (Zeroizing CEK) + `coeff` drop here — both scrubbed before return.
@@ -718,6 +725,8 @@ impl EncryptProvider {
             "segment_count": out.encrypted_segments.len(),
             "payload_cid": out.payload_cid,
             "node_set_id_b64": b64.encode(out.node_set_id),
+            // PRE-AUDIT #1: published CEK commitment — see `seal_inline_threshold`.
+            "cek_commitment_b64": b64.encode(out.cek_commitment),
             "shares": out.shares,
             // See `seal_inline_threshold`: the producer vk that signed each escrow MUST be
             // persisted in the asset envelope or the media asset is unrecoverable after restart.
@@ -784,11 +793,14 @@ impl EncryptProvider {
         }
         let vk_refs: Vec<&[u8]> = vks.iter().map(|v| v.as_slice()).collect();
         let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &vk_refs);
+        // PRE-AUDIT #1: publish the CEK commitment (see `run_seal_pipeline_threshold`).
+        let cek_commitment = ddrm_envelope::cek_commitment(&node_set_id, &minted.cek[..]);
         Ok(SegmentsSealOutput {
             kid_hex: minted.kid_hex.clone(),
             encrypted_segments: encrypted,
             payload_cid,
             node_set_id,
+            cek_commitment,
             shares,
         })
         // `minted` (Zeroizing CEK) + `coeff` drop here — both scrubbed before return.
@@ -817,6 +829,11 @@ struct ThresholdSealOutput {
     ciphertext: Vec<u8>,
     iv8: [u8; 8],
     node_set_id: [u8; 32],
+    /// PRE-AUDIT #1 — the published CEK COMMITMENT (`cek_commitment(node_set_id, cek)`), computed
+    /// here at mint where the CEK legitimately exists. Carried through the escrow so the decrypt
+    /// boundary re-derives it from the reconstructed CEK and fails closed on mismatch — the
+    /// integrity backstop against a Byzantine node returning a wrong-valued (but well-formed) share.
+    cek_commitment: [u8; 32],
     shares: Vec<Value>,
 }
 
@@ -829,6 +846,8 @@ struct SegmentsSealOutput {
     encrypted_segments: Vec<Vec<u8>>,
     payload_cid: String,
     node_set_id: [u8; 32],
+    /// PRE-AUDIT #1 — published CEK commitment (see `ThresholdSealOutput::cek_commitment`).
+    cek_commitment: [u8; 32],
     shares: Vec<Value>,
 }
 
@@ -1915,6 +1934,28 @@ mod tests {
             .expect("2-of-3 combine");
             assert_eq!(cek.len(), 16, "recovered CEK is a 16-byte AES-128 key");
             let cek16: [u8; 16] = cek[..].try_into().unwrap();
+
+            // PRE-AUDIT #1 — the producer PUBLISHES a CEK commitment bound to the node-set, and the
+            // CEK recovered from the quorum SATISFIES it. This is the value the decrypt boundary
+            // re-derives and fails closed on mismatch; prove the producer end of that contract here.
+            let node_set_id = b64
+                .decode(data["node_set_id_b64"].as_str().expect("node_set_id published"))
+                .unwrap();
+            let published_commitment = b64
+                .decode(data["cek_commitment_b64"].as_str().expect("cek_commitment published"))
+                .unwrap();
+            let expected: [u8; 32] = published_commitment[..].try_into().unwrap();
+            assert!(
+                ddrm_envelope::verify_cek_commitment(&node_set_id, &cek[..], &expected),
+                "the recovered CEK must match the producer's published commitment"
+            );
+            // A wrong-valued CEK must NOT satisfy the published commitment (the integrity property).
+            let mut wrong = cek16;
+            wrong[0] ^= 0xFF;
+            assert!(
+                !ddrm_envelope::verify_cek_commitment(&node_set_id, &wrong, &expected),
+                "a wrong CEK must fail the commitment check"
+            );
 
             // PROOF: re-encrypt the ORIGINAL fragments with the RECOVERED CEK under the
             // SAME continuous counter — must byte-match the producer's encrypted segments.

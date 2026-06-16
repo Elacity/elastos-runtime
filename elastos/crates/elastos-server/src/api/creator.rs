@@ -1635,7 +1635,11 @@ struct MediaEnvelope<'a> {
 /// additionally carries the DASH manifest path, the single `defaultKID`, and a per-track
 /// summary. The CEK-custody block (`asset.protections[0]`) is the dKMS escrow, as for objects.
 fn build_media_envelope(b: MediaEnvelope) -> Value {
-    let mime = if b.meta.mime.trim().is_empty() { "video/mp4" } else { b.meta.mime.trim() };
+    let mime = if b.meta.mime.trim().is_empty() {
+        "video/mp4"
+    } else {
+        b.meta.mime.trim()
+    };
     let copies = b.meta.effective_copies();
     let category = b.meta.category.trim();
     let track_summaries: Vec<Value> = b
@@ -1993,7 +1997,12 @@ fn effective_royalties(meta: &MintMeta, creator: &str) -> Vec<Value> {
     rows.iter()
         .map(|r| {
             let mut o = json!({ "address": r.address.trim(), "royalty": r.royalty });
-            if let Some(id) = r.identifier.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(id) = r
+                .identifier
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 o["identifier"] = json!(id);
             }
             o
@@ -2238,16 +2247,19 @@ fn metadata_directory_files(
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut files: Vec<(String, Value)> = vec![
         ("metadata.json".to_string(), envelope.clone()),
-        ("content.json".to_string(), build_content_json(meta, kid_hex, size, image)),
+        (
+            "content.json".to_string(),
+            build_content_json(meta, kid_hex, size, image),
+        ),
         ("contract.json".to_string(), build_contract_json(meta)),
     ];
     files.extend(build_token_type_files(meta, kid_hex, image));
     files
         .into_iter()
         .filter_map(|(path, value)| {
-            serde_json::to_vec(&value).ok().map(|bytes| {
-                json!({ "path": path, "data": b64.encode(bytes) })
-            })
+            serde_json::to_vec(&value)
+                .ok()
+                .map(|bytes| json!({ "path": path, "data": b64.encode(bytes) }))
         })
         .collect()
 }
@@ -2305,7 +2317,13 @@ fn price_is_zero(price: &str) -> bool {
 /// The PC2 op type, honoring the explicit `accessMethod` (free | buy_once | buy_and_resell) and
 /// falling back to the price-derived choice for back-compat when it is unset.
 fn op_type_for(meta: &MintMeta) -> &'static str {
-    match meta.access_method.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+    match meta
+        .access_method
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
         "free" => "free",
         "buy_once" | "buyonce" => "buy_once",
         "buy_and_resell" | "buyandresell" | "resell" => "buy_and_resell",
@@ -2453,7 +2471,12 @@ fn persist_minted_asset_to_library(
         let mime = Some(meta.mime.trim()).filter(|m| !m.is_empty());
         let asset_uri = format!("{root}/Documents/{base}");
         if let Err(err) = crate::library::handle_library_upload_bytes(
-            data_dir, principal_id, &asset_uri, mime, None, file_bytes,
+            data_dir,
+            principal_id,
+            &asset_uri,
+            mime,
+            None,
+            file_bytes,
         ) {
             tracing::warn!("mint persist: could not write owned asset {asset_uri}: {err}");
             return;
@@ -2732,7 +2755,10 @@ mod tests {
         assert_eq!(env["properties"]["publisher"], json!("0xCreatorWallet"));
         assert_eq!(env["properties"]["contract"], json!("self://contract.json"));
         assert_eq!(env["kid"], json!("0123456789abcdef0123456789abcdef"));
-        assert_eq!(env["properties"]["kid"], json!("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            env["properties"]["kid"],
+            json!("0123456789abcdef0123456789abcdef")
+        );
         // Supply attribute carries the creator's chosen edition count.
         let supply = env["attributes"]
             .as_array()
@@ -2763,7 +2789,8 @@ mod tests {
             size: 10,
             image: "",
         });
-        let files = metadata_directory_files(&env, &meta, "0123456789abcdef0123456789abcdef", 10, "");
+        let files =
+            metadata_directory_files(&env, &meta, "0123456789abcdef0123456789abcdef", 10, "");
         let paths: Vec<String> = files
             .iter()
             .map(|f| f["path"].as_str().unwrap().to_string())

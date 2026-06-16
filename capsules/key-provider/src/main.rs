@@ -242,6 +242,15 @@ struct ReleaseSessionContext {
     /// share-3 recover authenticates under it. Absent → falls back to `producer_vk_b64`.
     #[serde(default)]
     producer_vk3_b64: Option<String>,
+    /// PRE-AUDIT #1 — the producer's published CEK COMMITMENT (base64 of
+    /// `ddrm_envelope::cek_commitment(node_set_id, cek)`), carried straight into the sealed
+    /// material (the authority never touches it). The decrypt boundary re-derives it from the
+    /// reconstructed CEK and fails closed on mismatch — the integrity backstop that catches a
+    /// Byzantine node returning a wrong-valued share even on a degraded (2-share) quorum or the
+    /// 2-of-2 threshold rail. Absent → legacy material (integrity then rests on 3-share cheater
+    /// detection, quorum only).
+    #[serde(default)]
+    cek_commitment_b64: Option<String>,
     /// Optional wall-clock for expiry enforcement: if set and the request has expired, the
     /// authority refuses to release (fail-closed), never sealing a CEK past its window.
     #[serde(default)]
@@ -1527,7 +1536,15 @@ impl KeyProvider {
 
         // Merge the two re-sealed shares into ONE threshold material WITHOUT combining them — the CEK is
         // reconstructed only inside the decrypt boundary. The key-provider never holds the whole key.
-        match merge_threshold_material(material_a, &material_b, session.extra_segments_b64.as_deref()) {
+        // 2-of-2 XOR has no third share for cheater detection, so the producer's published CEK
+        // commitment (when present) is the integrity backstop the decrypt boundary checks.
+        match merge_threshold_material(
+            material_a,
+            &material_b,
+            None,
+            session.extra_segments_b64.as_deref(),
+            session.cek_commitment_b64.as_deref(),
+        ) {
             Ok(merged) => Response::ok(merged),
             Err(err) => Response::error("not_configured", err),
         }
@@ -1853,9 +1870,11 @@ impl KeyProvider {
         for (idx, res) in ordered {
             let label = candidates.get(idx).map(|c| c.2).unwrap_or("node ?");
             match res {
-                // Take the first two served shares in node order; extra successes are harmless.
+                // PRE-AUDIT #1: keep ALL served shares (up to 3), not just the first two — the
+                // joins above already waited for every node, so forwarding the third costs no extra
+                // latency and lets the decrypt boundary CROSS-CHECK all three (cheater detection).
                 Ok(data) => {
-                    if materials.len() < 2 {
+                    if materials.len() < 3 {
                         materials.push(data);
                     }
                 }
@@ -1875,9 +1894,19 @@ impl KeyProvider {
                 ),
             );
         }
-        let material_b = materials.pop().expect("two materials checked above");
-        let material_a = materials.pop().expect("two materials checked above");
-        match merge_threshold_material(material_a, &material_b, session.extra_segments_b64.as_deref()) {
+        // Node A is the base material (its re-sealed share rides as `sealed_cek_b64`); node B
+        // contributes share-2; node C (when it also served) contributes share-3 for cheater
+        // detection. Shares are in node order (deterministic merge input).
+        let material_c = if materials.len() >= 3 { Some(materials.remove(2)) } else { None };
+        let material_b = materials.remove(1);
+        let material_a = materials.remove(0);
+        match merge_threshold_material(
+            material_a,
+            &material_b,
+            material_c.as_ref(),
+            session.extra_segments_b64.as_deref(),
+            session.cek_commitment_b64.as_deref(),
+        ) {
             Ok(merged) => Response::ok(merged),
             Err(err) => Response::error("not_configured", err),
         }
@@ -2139,45 +2168,76 @@ fn build_dkms_client(
 fn merge_threshold_material(
     mut data_a: Value,
     data_b: &Value,
+    data_c: Option<&Value>,
     extra_segments_b64: Option<&[String]>,
+    cek_commitment_b64: Option<&str>,
 ) -> Result<Value, String> {
     // Each node returns its full recover `data` — `{ suite, material: { sealed_cek_b64, ... }, ... }`
     // — so the sealed share + content binding live INSIDE the nested `material` object. Node A's `data`
     // is the base (its `material` carries share-1 as `sealed_cek_b64`); node B contributes ONLY its
     // re-sealed share-2, welded into node A's `material.sealed_cek_share2_b64`.
-    let share1 = data_a
-        .get("material")
-        .and_then(|m| m.get("sealed_cek_b64"))
-        .and_then(|v| v.as_str())
-        .ok_or("first dkms node returned material without a sealed share")?
-        .to_string();
-    let share2 = data_b
-        .get("material")
-        .and_then(|m| m.get("sealed_cek_b64"))
-        .and_then(|v| v.as_str())
-        .ok_or("second dkms node returned material without a sealed share")?
-        .to_string();
+    let sealed_share = |data: &Value, which: &str| -> Result<String, String> {
+        data.get("material")
+            .and_then(|m| m.get("sealed_cek_b64"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{which} dkms node returned material without a sealed share"))
+    };
+    let share1 = sealed_share(&data_a, "first")?;
+    let share2 = sealed_share(data_b, "second")?;
     if share1 == share2 {
         return Err(
             "the two dkms nodes returned identical sealed shares — not a real 2-of-2 split".to_string(),
         );
     }
+    // PRE-AUDIT #1: when node C ALSO served, forward its re-sealed share-3 so the decrypt boundary
+    // can cross-check all three (cheater detection). It must bind the SAME content and be distinct
+    // from the other two (a duplicated share is not a real third secret-holder).
+    let share3 = match data_c {
+        Some(c) => {
+            let s = sealed_share(c, "third")?;
+            if s == share1 || s == share2 {
+                return Err(
+                    "a third dkms node returned a share identical to another — not a distinct secret-holder"
+                        .to_string(),
+                );
+            }
+            Some((c, s))
+        }
+        None => None,
+    };
     // Both nodes must bind the SAME content/transcript, or one sealed for a different object — fail
     // closed rather than ship an incoherent pair the decrypt boundary would XOR into garbage.
-    let material_a = data_a.get("material");
-    let material_b = data_b.get("material");
+    let content_of = |data: &Value, k: &str| -> Option<Value> {
+        data.get("material").and_then(|m| m.get(k)).cloned()
+    };
     for k in ["content_hash_b64", "nonce_b64", "ciphertext_b64"] {
-        let a = material_a.and_then(|m| m.get(k));
-        let b = material_b.and_then(|m| m.get(k));
-        if a != b {
+        let a = content_of(&data_a, k);
+        if content_of(data_b, k) != a {
             return Err(format!(
                 "threshold dkms nodes disagree on `{k}` — the two shares are not for the same content"
             ));
+        }
+        if let Some((c, _)) = &share3 {
+            if content_of(c, k) != a {
+                return Err(format!(
+                    "the third dkms node disagrees on `{k}` — its share is not for the same content"
+                ));
+            }
         }
     }
     // Weld node B's re-sealed share into node A's nested material (the shape the decrypt boundary
     // consumes: `material.sealed_cek_share2_b64`). The CEK is reconstructed ONLY in the boundary.
     data_a["material"]["sealed_cek_share2_b64"] = json!(share2);
+    if let Some((_, s3)) = share3 {
+        data_a["material"]["sealed_cek_share3_b64"] = json!(s3);
+    }
+    // PRE-AUDIT #1: carry the producer's published CEK commitment so the decrypt boundary verifies
+    // the reconstructed CEK against it (integrity backstop for the degraded 2-share quorum and the
+    // 2-of-2 threshold rail). The authority never inspects it — it is the producer's published value.
+    if let Some(commit) = cek_commitment_b64.filter(|c| !c.trim().is_empty()) {
+        data_a["material"]["cek_commitment_b64"] = json!(commit);
+    }
     // MULTI-SEGMENT on the threshold/quorum rail: the runtime already welded the ORDERED segment set
     // into `aad_b64` (so every node sealed its share to the SAME segment-bound transcript). Carry the
     // extras into the merged material so the decrypt boundary REBUILDS that exact segment-bound AAD,
@@ -3161,30 +3221,59 @@ mod tests {
                 })
             };
             // Happy: two distinct shares for the same content merge into a two-share material.
-            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None).expect("merge");
+            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, None).expect("merge");
             assert_eq!(merged["material"]["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
             assert_eq!(merged["material"]["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
             assert_eq!(merged["material"]["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
+            // A two-share merge welds NO third share (degraded quorum / 2-of-2 threshold).
+            assert!(merged["material"].get("sealed_cek_share3_b64").is_none(), "no share-3 on a two-node merge");
             // Single-segment merge carries NO extras (byte-identical to the pre-multi-segment material).
             assert!(merged["material"].get("extra_segments_b64").is_none(), "no extras on a single-segment merge");
+
+            // PRE-AUDIT #1 — THREE distinct shares for the same content weld share-3 in for the
+            // decrypt boundary's cheater-detection cross-check.
+            let three = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&base("SHARE3")), None, None)
+                .expect("three-share merge");
+            assert_eq!(three["material"]["sealed_cek_share3_b64"], json!("SHARE3"), "share-3 welded in for cheater detection");
+
+            // PRE-AUDIT #1 — the producer's published CEK commitment is carried into the material.
+            let committed = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, Some("COMMIT64"))
+                .expect("committed merge");
+            assert_eq!(committed["material"]["cek_commitment_b64"], json!("COMMIT64"), "commitment carried through");
+            // A blank commitment is treated as absent (no field stamped).
+            let blank = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, Some("   "))
+                .expect("blank-commitment merge");
+            assert!(blank["material"].get("cek_commitment_b64").is_none(), "blank commitment ⇒ no field");
 
             // MULTI-SEGMENT: the extras are stamped into the merged material so the decrypt boundary
             // rebuilds the segment-bound AAD and reconstructs the split CEK once for the whole asset.
             let extras = ["SEG1".to_string(), "SEG2".to_string()];
-            let multi = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&extras)).expect("merge");
+            let multi = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, Some(&extras), None).expect("merge");
             assert_eq!(multi["material"]["extra_segments_b64"], json!(["SEG1", "SEG2"]), "extras carried into the merged material");
             // An empty extras list is treated as single-segment (no field added).
-            let none_extra = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&[])).expect("merge");
+            let none_extra = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, Some(&[]), None).expect("merge");
             assert!(none_extra["material"].get("extra_segments_b64").is_none(), "empty extras ⇒ single-segment");
 
             // Identical shares → not a real split → fail closed.
-            assert!(merge_threshold_material(base("SAME"), &base("SAME"), None).is_err());
+            assert!(merge_threshold_material(base("SAME"), &base("SAME"), None, None, None).is_err());
+            // A third share DUPLICATING another → not a distinct secret-holder → fail closed.
+            assert!(
+                merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&base("SHARE1")), None, None).is_err(),
+                "a duplicated third share is rejected"
+            );
             // A content/transcript mismatch between nodes → fail closed.
             let mut other = base("SHARE2");
             other["material"]["content_hash_b64"] = json!("DIFFERENT");
-            assert!(merge_threshold_material(base("SHARE1"), &other, None).is_err());
+            assert!(merge_threshold_material(base("SHARE1"), &other, None, None, None).is_err());
+            // A THIRD node disagreeing on content → fail closed.
+            let mut other3 = base("SHARE3");
+            other3["material"]["content_hash_b64"] = json!("DIFFERENT");
+            assert!(
+                merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&other3), None, None).is_err(),
+                "third node content mismatch fails closed"
+            );
             // A node missing its sealed share → fail closed.
-            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2"), None).is_err());
+            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2"), None, None, None).is_err());
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in

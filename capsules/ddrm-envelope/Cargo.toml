@@ -29,6 +29,9 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 sha2 = { version = "0.10", default-features = false }
 zeroize = "1"
+# Constant-time primitives: branchless GF(256) masks + constant-time equality for
+# secret/CEK comparisons (the pre-audit coding standard for any secret compare).
+subtle = { version = "2", default-features = false }
 # ML-DSA-65 (FIPS 204) seal signature. Sign (key authority) + verify (decrypt
 # boundary). Deterministic from-seed keygen keeps committed KATs reproducible.
 ml-dsa = { version = "0.1", default-features = false }

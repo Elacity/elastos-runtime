@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::local_http::LoopbackHttpBaseUrl;
-use crate::provider_resource::build_capability_resource;
+use crate::provider_resource::{build_capability_resource, required_action_for};
 use anyhow::{Context, Result};
 use elastos_common::localhost::{
     is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
@@ -681,12 +681,16 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 match CapabilityToken::from_base64(token_b64) {
                     Ok(token) => {
                         let resource_id = ResourceId::new(&dispatch.resource);
+                        // PRE-AUDIT #3: enforce the action the OPERATION requires, not the token's
+                        // own action. A Read-granted token invoking a write/delete op now fails
+                        // closed here (WrongAction) instead of being waved through.
+                        let required = required_action_for(&dispatch.operation);
                         if bridge_ctx
                             .capability_manager
                             .validate(
                                 &token,
                                 &bridge_ctx.capsule_id,
-                                token.action(),
+                                required,
                                 &resource_id,
                                 None,
                             )
@@ -1709,6 +1713,70 @@ mod tests {
             serde_json::from_value(read_response["response"]["result"]["data"]["content"].clone())
                 .unwrap();
         assert_eq!(content, b"secret-chat-state");
+    }
+
+    #[tokio::test]
+    async fn carrier_invoke_denies_read_token_on_write_operation_preaudit3() {
+        // PRE-AUDIT #3: localhost read/write/delete share ONE resource string, so before this fix a
+        // token granted for `read` could drive a `write` — the bridge only checked the token against
+        // its OWN action. Now the bridge enforces the action the OPERATION requires.
+        let temp = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:active";
+        let protection =
+            crate::auth::store_test_principal_root_protection(temp.path(), principal_id);
+        let mut ctx = bridge_context();
+        ctx.principal_id = Some(principal_id.to_string());
+        ctx.data_dir = Some(temp.path().to_path_buf());
+
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/Chat/state.json",
+            protection.localhost_root
+        );
+        // A token granted ONLY for read on this exact resource.
+        let read_token = bridge_token(&ctx, &object_uri, Action::Read);
+        // Attempt to WRITE with it.
+        let write_with_read = serde_json::json!({
+            "id": 31,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
+                "operation": "write",
+                "token": read_token,
+                "body": { "content": b"escalated-write".to_vec(), "append": false }
+            }
+        })
+        .to_string();
+        let ctx_opt = Some(ctx.clone());
+        let denied = handle_request(&write_with_read, &ctx_opt)
+            .await
+            .expect("bridge should return a response");
+        assert_eq!(denied["id"], 31);
+        assert_eq!(denied["response"]["type"], "error");
+        assert_eq!(
+            denied["response"]["code"], "capability_denied",
+            "a read-granted token must NOT authorize a write op: {denied}"
+        );
+        // And nothing was written.
+        let path = rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        assert!(!path.exists(), "the escalated write must not have touched disk");
+
+        // The matching action (a write-granted token) is still accepted.
+        let write_token = bridge_token(&ctx, &object_uri, Action::Write);
+        let write_ok = serde_json::json!({
+            "id": 32,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
+                "operation": "write",
+                "token": write_token,
+                "body": { "content": b"authorized-write".to_vec(), "append": false }
+            }
+        })
+        .to_string();
+        let ok = handle_request(&write_ok, &ctx_opt)
+            .await
+            .expect("bridge should return a response");
+        assert_eq!(ok["response"]["type"], "carrier_result", "matching action opens: {ok}");
     }
 
     #[tokio::test]

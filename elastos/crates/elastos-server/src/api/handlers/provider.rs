@@ -12,8 +12,8 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::provider_resource::build_capability_resource;
-use elastos_runtime::capability::{CapabilityManager, CapabilityToken, ResourceId};
+use crate::provider_resource::{build_capability_resource, required_action_for};
+use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::Session;
 
@@ -48,7 +48,9 @@ pub async fn provider_proxy(
     let resource = build_capability_resource(&scheme, &op, &request)
         .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
 
-    enforce_capability(&state, &session, &headers, &resource).await?;
+    // PRE-AUDIT #3: the action the OPERATION requires (not the token's own action).
+    let required_action = required_action_for(&op);
+    enforce_capability(&state, &session, &headers, &resource, required_action).await?;
 
     // Forward to provider
     let response = state.registry.send_raw(&scheme, &request).await;
@@ -73,6 +75,7 @@ async fn enforce_capability(
     session: &Session,
     headers: &HeaderMap,
     resource: &str,
+    required_action: Action,
 ) -> Result<(), (StatusCode, String)> {
     // Shell sessions have orchestrator privilege
     if session.is_shell() {
@@ -109,13 +112,14 @@ async fn enforce_capability(
 
     let resource_id = ResourceId::new(resource);
 
-    // Use the token's own action — the shell granted it for this purpose.
-    // The provider capsule enforces fine-grained action checks.
+    // PRE-AUDIT #3: enforce the action the OPERATION requires, not the token's own action. The
+    // bridge no longer trusts capsules to self-check fine-grained actions — a Read-granted token on
+    // a write/delete/admin operation fails closed here (WrongAction).
     cap_mgr
         .validate(
             &token,
             session.id.as_str(),
-            token.action(),
+            required_action,
             &resource_id,
             None,
         )

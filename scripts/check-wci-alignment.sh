@@ -32,6 +32,16 @@ for manifest in capsules/*/capsule.json; do
     provider_role_globs+=( --glob "!capsules/${provider_dir}/**" )
   fi
 done
+# A directory under capsules/ with NO capsule.json is not a deployable app capsule — it is a
+# shared library crate (e.g. ddrm-envelope) or a node/authority binary (e.g. dkms-authority),
+# which legitimately holds crypto primitives and its own on-chain reads. The "app capsule must
+# not touch X authority" checks target app capsules (manifest-bearing by definition), so exempt
+# the manifest-less crates too — the exemption tracks "is an app capsule", not a name.
+for capsule_dir in capsules/*/; do
+  if [[ ! -f "${capsule_dir}capsule.json" ]]; then
+    provider_role_globs+=( --glob "!${capsule_dir%/}/**" )
+  fi
+done
 
 scope=(
   README.md
@@ -121,6 +131,8 @@ check_app_authority() {
   shift 2
   rg_search "$pattern" capsules \
     --glob '!**/capsule.json' \
+    --glob '!**/Cargo.toml' \
+    --glob '!**/Cargo.lock' \
     --glob '!**/tests/**' \
     --glob '!**/*test*' \
     --glob '!**/*spec*' \

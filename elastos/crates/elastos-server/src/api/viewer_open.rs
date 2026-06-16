@@ -223,10 +223,16 @@ pub async fn open_owned_in_viewer(
     // The on-chain subject is the principal's linked EVM wallet (or ELASTOS_DDRM_SUBJECT
     // override). Empty in dev mode is fine (a placeholder is derived); chain mode fails
     // closed without it.
-    tracing::info!("open timing: owned read + capsule parse {} ms", t_open.elapsed().as_millis());
+    tracing::info!(
+        "open timing: owned read + capsule parse {} ms",
+        t_open.elapsed().as_millis()
+    );
     let t_subject = std::time::Instant::now();
     let subject = resolve_subject_address(&state, &context.principal_id).await;
-    tracing::info!("open timing: subject resolve {} ms", t_subject.elapsed().as_millis());
+    tracing::info!(
+        "open timing: subject resolve {} ms",
+        t_subject.elapsed().as_millis()
+    );
     let t_rights = std::time::Instant::now();
     let rights = {
         let principal_id = context.principal_id.clone();
@@ -284,11 +290,30 @@ pub async fn open_owned_in_viewer(
         rights.allowed,
         rights.source,
         object_cid,
-        if subject.trim().is_empty() { "<dev-derived>" } else { subject.as_str() }
+        if subject.trim().is_empty() {
+            "<dev-derived>"
+        } else {
+            subject.as_str()
+        }
     );
-    tracing::info!("open timing: rights decision (chain RPC) {} ms", t_rights.elapsed().as_millis());
+    tracing::info!(
+        "open timing: rights decision (chain RPC) {} ms",
+        t_rights.elapsed().as_millis()
+    );
     if !rights.allowed {
         tracing::info!("owned open denied by rights for cid {object_cid}");
+        // GAP-8 custody record for the REFUSAL (best-effort: the access is already denied, so a
+        // failed append cannot loosen the decision — it only loses one trail entry, logged loudly).
+        if let Err(e) = state.audit_log().content_open(
+            &session_id,
+            &context.principal_id,
+            &object_cid,
+            "open",
+            "denied",
+            &rights.source,
+        ) {
+            tracing::error!("AUDIT content_open(denied) append failed: {e}");
+        }
         return (
             StatusCode::FORBIDDEN,
             "no valid access token for this content (rights provider denied)",
@@ -297,22 +322,49 @@ pub async fn open_owned_in_viewer(
     }
     let rights_binding = rights.receipt_hash_hex.clone();
 
+    // GAP-8: the who-opened-what-when CUSTODY record. We are now AUTHORIZED and committed to opening
+    // (mint session → decrypt). Write it to the tamper-evident log BEFORE the open proceeds, and
+    // FAIL CLOSED if it cannot be durably committed: an open that cannot be recorded in the custody
+    // trail does not happen (custody integrity over availability — fail closed, then explain).
+    if let Err(e) = state.audit_log().content_open(
+        &session_id,
+        &context.principal_id,
+        &object_cid,
+        "open",
+        "opened",
+        &rights.source,
+    ) {
+        tracing::error!("AUDIT content_open(opened) append failed; refusing the open: {e}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit log unavailable; refusing to open without a custody record",
+        )
+            .into_response();
+    }
+
     if let Some(capsule) = capsule {
         // TRUSTLESS open: if the browser collected a wallet signature (phase 2), assemble the
         // wallet-signed grant here and forward it so the dKMS nodes authorize themselves. Absent
         // (or malformed) => fall through to the legacy enrolled-caller path (None).
-        let access_grant_b64 = match (req.grant_handle.as_deref(), req.delegation_sig_hex.as_deref()) {
+        let access_grant_b64 = match (
+            req.grant_handle.as_deref(),
+            req.delegation_sig_hex.as_deref(),
+        ) {
             (Some(handle), Some(sig)) if !handle.trim().is_empty() && !sig.trim().is_empty() => {
                 // Fresh wallet signature (first open of this asset in the window) — assemble + cache.
                 match super::access_grant::assemble(handle, sig)
                     .and_then(|g| super::access_grant::grant_to_b64(&g))
                 {
                     Ok(b64) => {
-                        tracing::info!("trustless open: assembled wallet-signed grant for cid {object_cid}");
+                        tracing::info!(
+                            "trustless open: assembled wallet-signed grant for cid {object_cid}"
+                        );
                         Some(b64)
                     }
                     Err(err) => {
-                        tracing::warn!("trustless open: could not assemble grant ({err}); refusing");
+                        tracing::warn!(
+                            "trustless open: could not assemble grant ({err}); refusing"
+                        );
                         return (
                             StatusCode::BAD_REQUEST,
                             "could not assemble access grant (re-prepare the open)",
@@ -451,7 +503,11 @@ pub async fn prepare_owned_grant(
             return (StatusCode::NOT_FOUND, "owned object not found").into_response();
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "owned object read panicked").into_response()
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "owned object read panicked",
+            )
+                .into_response()
         }
     };
 
@@ -466,7 +522,10 @@ pub async fn prepare_owned_grant(
                 .into_response()
         }
     };
-    let prot = capsule.get("protections").and_then(|p| p.as_array()).and_then(|a| a.first());
+    let prot = capsule
+        .get("protections")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first());
     let node_set_id_b64 = prot
         .and_then(|p| p.get("node_set_id_b64"))
         .and_then(|v| v.as_str())
@@ -506,17 +565,21 @@ pub async fn prepare_owned_grant(
             .into_response();
     }
 
-    let prepared = match super::access_grant::prepare(chain_id(), &kid_hex, &node_set_id_b64, &subject)
-    {
-        Ok(p) => p,
-        Err(err) => {
-            if err.contains("link an EVM wallet") {
-                return (StatusCode::FORBIDDEN, err).into_response();
+    let prepared =
+        match super::access_grant::prepare(chain_id(), &kid_hex, &node_set_id_b64, &subject) {
+            Ok(p) => p,
+            Err(err) => {
+                if err.contains("link an EVM wallet") {
+                    return (StatusCode::FORBIDDEN, err).into_response();
+                }
+                tracing::warn!("prepare-grant failed: {err}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not prepare access grant",
+                )
+                    .into_response();
             }
-            tracing::warn!("prepare-grant failed: {err}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "could not prepare access grant").into_response();
-        }
-    };
+        };
 
     (
         StatusCode::OK,
@@ -972,7 +1035,10 @@ async fn open_quorum(
     };
     // This single span covers helper spawn + key-provider/decrypt-provider spawn + the 2-of-3
     // quorum recover over Carrier — the dominant cost of the open. Logged so we can see it.
-    tracing::info!("open timing: quorum recover (spawn + 2-of-3 over Carrier) {} ms", t_recover.elapsed().as_millis());
+    tracing::info!(
+        "open timing: quorum recover (spawn + 2-of-3 over Carrier) {} ms",
+        t_recover.elapsed().as_millis()
+    );
 
     let session =
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);

@@ -3,9 +3,26 @@
 //! Runtime generates audit events at every security-relevant operation.
 //! These events CANNOT be bypassed by any capsule, including the shell.
 //!
-//! Phase 3: Simple file-based logging
-//! Later: Tamper-evident storage, cryptographic chaining, audit capsule
+//! # Tamper-evidence (GAP-8)
+//!
+//! Each record is written as a [`ChainedRecord`]: a monotonically-increasing `seq`, the
+//! `prev_hash` of the previous record, the event, a `record_hash` over
+//! `domain ‖ seq ‖ prev_hash ‖ event_json`, and an ed25519 `sig` over that hash. Any edit,
+//! reorder, drop, or truncation of the on-disk log breaks the [`AuditLog::verify_chain`] walk.
+//! The `alg` field is a crypto-agility tag (`"ed25519"`) so a post-quantum scheme (ML-DSA) can be
+//! swapped in later with **zero record-format change** — verifiers dispatch on `alg`.
+//!
+//! THREAT MODEL — be honest about what the signature buys: it gives tamper-evidence against
+//! *offline/post-hoc* editing of the log and non-repudiation of records, because an attacker who
+//! rewrites the file cannot re-sign the chain without the signing key. It does **not** defend
+//! against a *live-compromised runtime*, which holds the key and could re-sign a rewritten chain.
+//! Defending that requires EXTERNAL ANCHORING — periodically checkpointing the chain head to an
+//! external witness (e.g. the Base chain). That anchoring is deliberate roadmap, out of scope here;
+//! until it lands, do not claim more than "tamper-evident against external editing + non-repudiable".
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -14,6 +31,85 @@ use std::sync::{Mutex, RwLock};
 
 use super::time::SecureTimestamp;
 use crate::capability::token::{Action, ResourceId, TokenId};
+
+/// Crypto-agility tag for an ed25519-signed audit record. Recorded in [`ChainedRecord::alg`] so a
+/// post-quantum signature (ML-DSA) can replace it later WITHOUT changing the record format — a
+/// verifier simply dispatches on this string. This is the deliberate forward-compat hook.
+pub const AUDIT_SIG_ALG_ED25519: &str = "ed25519";
+
+/// Tag for an UNSIGNED record (memory-only logs, or a file log with no signer provisioned). The
+/// hash-chain still provides tamper-evidence; only non-repudiation is absent.
+pub const AUDIT_SIG_ALG_NONE: &str = "none";
+
+/// Domain separator folded into every `record_hash` so an audit-chain digest can never collide
+/// with a hash computed for any other ElastOS protocol (cross-protocol binding).
+const AUDIT_RECORD_DOMAIN: &[u8] = b"elastos.runtime/audit-chain/v1";
+
+/// Genesis `prev_hash` (hex of 32 zero bytes): the link the very first record points back to.
+fn genesis_prev_hash() -> [u8; 32] {
+    [0u8; 32]
+}
+
+/// Compute the canonical record hash: `SHA-256(domain ‖ seq_be ‖ prev_hash ‖ event_json)`.
+/// `seq` is fixed 8 bytes and `prev_hash` fixed 32, so the concatenation is unambiguous.
+fn compute_record_hash(seq: u64, prev_hash: &[u8; 32], event_json: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(AUDIT_RECORD_DOMAIN);
+    h.update(seq.to_be_bytes());
+    h.update(prev_hash);
+    h.update(event_json);
+    h.finalize().into()
+}
+
+/// One tamper-evident, hash-chained, signed audit record as persisted to disk (one JSON object per
+/// line). The on-disk format; the in-memory ring buffer keeps bare [`AuditEvent`]s for fast reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainedRecord {
+    /// Monotonic sequence number (first record = 1). A gap or repeat is tamper-evidence.
+    pub seq: u64,
+    /// Hex of the previous record's `record_hash` (genesis = 64 zeros). Breaks on reorder/drop.
+    pub prev_hash: String,
+    /// The audited event.
+    pub event: AuditEvent,
+    /// Hex of `SHA-256(domain ‖ seq ‖ prev_hash ‖ event_json)`.
+    pub record_hash: String,
+    /// Crypto-agility tag: which signature scheme `sig` uses (`"ed25519"` or `"none"`).
+    pub alg: String,
+    /// Base64 signature over the raw `record_hash` bytes (`""` when `alg == "none"`).
+    pub sig: String,
+}
+
+/// Errors from [`AuditLog::emit`]. A custody-relevant caller MUST fail its operation closed on any
+/// of these (the record could not be durably committed to the tamper-evident log).
+#[derive(Debug)]
+pub enum AuditError {
+    /// The event could not be serialized.
+    Serialize(String),
+    /// The record could not be written/flushed/synced to durable storage.
+    Io(String),
+    /// The chain-state or writer lock was poisoned.
+    Lock,
+}
+
+impl std::fmt::Display for AuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditError::Serialize(e) => write!(f, "audit event serialization failed: {e}"),
+            AuditError::Io(e) => write!(f, "audit record durable-write failed: {e}"),
+            AuditError::Lock => write!(f, "audit log lock poisoned"),
+        }
+    }
+}
+
+impl std::error::Error for AuditError {}
+
+/// Mutable hash-chain head, guarded by a `Mutex` so `emit(&self, ..)` stays `&self`.
+struct ChainState {
+    /// `seq` of the last DURABLY-committed record (0 = none yet; next record is `last_seq + 1`).
+    last_seq: u64,
+    /// `record_hash` of the last committed record (genesis = zeros). The next record's `prev_hash`.
+    prev_hash: [u8; 32],
+}
 
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +173,23 @@ pub enum AuditEvent {
         cid: String,
         source: FetchSource,
         success: bool,
+    },
+
+    /// Protected content OPENED (or refused) at the dDRM boundary (GAP-8). This is the
+    /// who-opened-what-when custody record — it belongs in the tamper-evident log, not only in
+    /// tracing. The audit log is the DELIBERATE place this identifier triple lives (cf. the metadata
+    /// minimization elsewhere that stops logging it to operator-visible `info!`): a custody trail
+    /// must name the subject, the content, and the decision to be worth anything to an auditor.
+    ContentOpen {
+        timestamp: SecureTimestamp,
+        session_id: String,
+        principal_id: String,
+        content_id: String,
+        action: String,
+        /// `"opened"` or `"denied"`.
+        decision: String,
+        /// The rights-decision provenance (e.g. `chain-provider (live RPC: …)`), for the trail.
+        source: String,
     },
 
     /// Authentication attempt
@@ -255,20 +368,38 @@ pub struct AuditLog {
     echo_stdout: bool,
     /// In-memory buffer of recent events (ring buffer)
     memory_buffer: RwLock<VecDeque<AuditEvent>>,
+    /// Hash-chain head (seq + prev_hash), advanced only on a DURABLY-committed record.
+    chain: Mutex<ChainState>,
+    /// ed25519 signer for the chain. `None` ⇒ records carry `alg = "none"` (chain only, no
+    /// non-repudiation). A persisted, dedicated key (NOT a fresh in-memory one) when file-backed.
+    signer: Option<SigningKey>,
 }
 
 impl AuditLog {
-    /// Create a new audit log without file output (memory only, for testing)
+    /// Create a new audit log without file output (memory only, for testing). No signer: the
+    /// hash-chain still binds in-memory records, but there is nothing durable to non-repudiate.
     pub fn new() -> Self {
         Self {
             writer: None,
             log_path: None,
             echo_stdout: false,
             memory_buffer: RwLock::new(VecDeque::with_capacity(MAX_MEMORY_EVENTS)),
+            chain: Mutex::new(ChainState {
+                last_seq: 0,
+                prev_hash: genesis_prev_hash(),
+            }),
+            signer: None,
         }
     }
 
-    /// Create an audit log that writes to the given path
+    /// Create an audit log that writes to the given path, hash-chained and ed25519-signed.
+    ///
+    /// The signing key is loaded from (or, first time, generated into) a sibling `<log>.signing-key`
+    /// file with `0600` permissions, and the verifying key is published to `<log>.pubkey`. This is a
+    /// DEDICATED, PERSISTED key — not a fresh in-memory one — so the chain stays verifiable across
+    /// restarts and a verifier has a stable key to check. (Host-file protection, not an HSM: see the
+    /// live-compromise caveat in the module docs.) If the log already has records, the chain RESUMES
+    /// from the last one (append-only continuity).
     pub fn with_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
@@ -277,15 +408,24 @@ impl AuditLog {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Resume the chain head from any existing records (append-only continuity across restarts).
+        let chain = resume_chain_state(&path);
 
+        // Open APPEND-ONLY: never truncate or seek; the chain is the integrity, the OS append is the
+        // ordering. (`append(true)` forces every write to EOF even under concurrent writers.)
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let writer = BufWriter::new(file);
+
+        // Load-or-create the dedicated, persisted signing key alongside the log.
+        let signer = load_or_create_signer(&path)?;
 
         Ok(Self {
             writer: Some(Mutex::new(writer)),
             log_path: Some(path),
             echo_stdout: false,
             memory_buffer: RwLock::new(VecDeque::with_capacity(MAX_MEMORY_EVENTS)),
+            chain: Mutex::new(chain),
+            signer: Some(signer),
         })
     }
 
@@ -294,48 +434,201 @@ impl AuditLog {
         self.echo_stdout = echo;
     }
 
-    /// Emit an audit event
+    /// The audit log's verifying key (hex), when file-backed + signed. A verifier checks the
+    /// chain's signatures against this. `None` for a memory-only (unsigned) log.
+    pub fn verifying_key_hex(&self) -> Option<String> {
+        self.signer
+            .as_ref()
+            .map(|s| hex::encode(s.verifying_key().to_bytes()))
+    }
+
+    /// Emit an audit event into the tamper-evident chain.
     ///
     /// This is the ONLY way to create audit records. Capsules cannot call this directly.
-    pub fn emit(&self, event: AuditEvent) {
-        // Store in memory buffer
-        {
-            if let Ok(mut buffer) = self.memory_buffer.write() {
-                if buffer.len() >= MAX_MEMORY_EVENTS {
-                    buffer.pop_front();
-                }
-                buffer.push_back(event.clone());
-            }
-        }
+    ///
+    /// FAIL-LOUD + FAIL-CLOSED: on a serialization or durable-write failure this returns `Err` AND
+    /// logs at `error!`. A custody-relevant caller MUST propagate the `Err` and fail its operation
+    /// closed (the open/grant did not make it into the custody trail). Best-effort callers may
+    /// ignore the result; the loud log still fires. The hash-chain head only advances on a record
+    /// that was durably written + `fsync`ed, so a failed write does not corrupt the chain.
+    pub fn emit(&self, event: AuditEvent) -> Result<(), AuditError> {
+        let event_json =
+            serde_json::to_string(&event).map_err(|e| AuditError::Serialize(e.to_string()))?;
 
-        let json = match serde_json::to_string(&event) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("Audit event serialization failed: {}", e);
-                return;
+        // Take the chain lock for the whole compute→write→advance critical section so `seq`/
+        // `prev_hash` cannot interleave across threads.
+        let mut chain = self.chain.lock().map_err(|_| AuditError::Lock)?;
+        let seq = chain.last_seq + 1;
+        let prev_hash = chain.prev_hash;
+        let record_hash = compute_record_hash(seq, &prev_hash, event_json.as_bytes());
+
+        let (alg, sig) = match &self.signer {
+            Some(key) => {
+                let signature: Signature = key.sign(&record_hash);
+                (
+                    AUDIT_SIG_ALG_ED25519.to_string(),
+                    BASE64.encode(signature.to_bytes()),
+                )
             }
+            None => (AUDIT_SIG_ALG_NONE.to_string(), String::new()),
         };
 
-        // Echo to stdout if enabled
+        let record = ChainedRecord {
+            seq,
+            prev_hash: hex::encode(prev_hash),
+            event: event.clone(),
+            record_hash: hex::encode(record_hash),
+            alg,
+            sig,
+        };
+        let line =
+            serde_json::to_string(&record).map_err(|e| AuditError::Serialize(e.to_string()))?;
+
         if self.echo_stdout {
-            println!("[AUDIT] {}", json);
+            println!("[AUDIT] {}", line);
         }
 
-        // Write to file if configured
+        // Durably commit BEFORE advancing the chain head. A failed write leaves `seq`/`prev_hash`
+        // untouched, so the next emit retries the same seq — no gap, no silent loss.
         if let Some(writer) = &self.writer {
-            if let Ok(mut w) = writer.lock() {
-                if let Err(e) = writeln!(w, "{}", json) {
-                    tracing::error!("Audit event write failed: {}", e);
-                }
-                // Flush to ensure durability
-                let _ = w.flush();
-            }
+            let mut w = writer.lock().map_err(|_| AuditError::Lock)?;
+            writeln!(w, "{}", line).map_err(|e| {
+                tracing::error!("AUDIT durable-write failed (seq {seq}): {e}");
+                AuditError::Io(e.to_string())
+            })?;
+            w.flush().map_err(|e| {
+                tracing::error!("AUDIT flush failed (seq {seq}): {e}");
+                AuditError::Io(e.to_string())
+            })?;
+            // fsync: the record must survive a crash/power loss to be a custody record at all.
+            w.get_ref().sync_all().map_err(|e| {
+                tracing::error!("AUDIT sync_all failed (seq {seq}): {e}");
+                AuditError::Io(e.to_string())
+            })?;
         }
+
+        // Committed: advance the chain head.
+        chain.last_seq = seq;
+        chain.prev_hash = record_hash;
+        drop(chain);
+
+        // Store in the in-memory ring buffer (best-effort; the durable record is the source of truth).
+        if let Ok(mut buffer) = self.memory_buffer.write() {
+            if buffer.len() >= MAX_MEMORY_EVENTS {
+                buffer.pop_front();
+            }
+            buffer.push_back(event);
+        }
+        Ok(())
+    }
+
+    /// Walk the on-disk log and VERIFY the hash-chain + signatures end to end. Returns the number of
+    /// records verified, or an error naming the first break (bad seq, broken link, wrong hash, or a
+    /// signature that does not verify under `verifying_key`). This is the tamper-evidence check.
+    pub fn verify_chain(&self, verifying_key: Option<&VerifyingKey>) -> Result<u64, String> {
+        let path = match &self.log_path {
+            Some(p) => p,
+            None => return Err("no file-backed log to verify".to_string()),
+        };
+        let file = File::open(path).map_err(|e| format!("open audit log: {e}"))?;
+        let reader = BufReader::new(file);
+
+        let mut expected_seq: u64 = 1;
+        let mut expected_prev = genesis_prev_hash();
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("read line: {e}"))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec: ChainedRecord = serde_json::from_str(&line)
+                .map_err(|e| format!("record {expected_seq} does not parse: {e}"))?;
+            if rec.seq != expected_seq {
+                return Err(format!(
+                    "audit chain break: expected seq {expected_seq}, found {}",
+                    rec.seq
+                ));
+            }
+            let prev = hex::decode(&rec.prev_hash)
+                .map_err(|e| format!("seq {}: bad prev_hash hex: {e}", rec.seq))?;
+            if prev.as_slice() != expected_prev.as_slice() {
+                return Err(format!(
+                    "audit chain break at seq {}: prev_hash does not link",
+                    rec.seq
+                ));
+            }
+            let event_json = serde_json::to_string(&rec.event)
+                .map_err(|e| format!("seq {}: re-serialize event: {e}", rec.seq))?;
+            let computed = compute_record_hash(rec.seq, &expected_prev, event_json.as_bytes());
+            let claimed = hex::decode(&rec.record_hash)
+                .map_err(|e| format!("seq {}: bad record_hash hex: {e}", rec.seq))?;
+            if claimed.as_slice() != computed.as_slice() {
+                return Err(format!(
+                    "audit tamper at seq {}: record_hash mismatch (content edited)",
+                    rec.seq
+                ));
+            }
+            // Signature (when the record claims one and a verifying key was supplied).
+            if rec.alg == AUDIT_SIG_ALG_ED25519 {
+                let vk = verifying_key.ok_or_else(|| {
+                    format!(
+                        "seq {}: record is ed25519-signed but no verifying key was supplied",
+                        rec.seq
+                    )
+                })?;
+                let sig_bytes = BASE64
+                    .decode(&rec.sig)
+                    .map_err(|e| format!("seq {}: bad signature base64: {e}", rec.seq))?;
+                let signature = Signature::from_slice(&sig_bytes)
+                    .map_err(|e| format!("seq {}: malformed signature: {e}", rec.seq))?;
+                vk.verify(&computed, &signature).map_err(|_| {
+                    format!("audit tamper at seq {}: signature does not verify", rec.seq)
+                })?;
+            }
+            expected_prev = computed;
+            expected_seq += 1;
+        }
+        Ok(expected_seq - 1)
+    }
+
+    /// Best-effort emit for NON-custody events (capsule lifecycle, capability use, etc.): logs
+    /// loudly at `error!` on failure but never propagates. This is the "fail-loud but don't block"
+    /// half of the split — custody callers ([`content_open`](Self::content_open) and direct
+    /// [`emit`](Self::emit)) instead propagate the `Err` and fail their operation closed.
+    pub fn emit_best_effort(&self, event: AuditEvent) {
+        if let Err(e) = self.emit(event) {
+            tracing::error!("AUDIT append failed (best-effort event dropped): {e}");
+        }
+    }
+
+    /// Emit the GAP-8 CONTENT-OPEN custody record and REQUIRE it to be durably committed.
+    ///
+    /// Returns `Err` if the record could not be hash-chained + signed + `fsync`ed. The dDRM open
+    /// path MUST treat that as fail-closed: if the who-opened-what-when record cannot be written to
+    /// the tamper-evident log, the open does not proceed (custody integrity over availability).
+    #[allow(clippy::too_many_arguments)]
+    pub fn content_open(
+        &self,
+        session_id: &str,
+        principal_id: &str,
+        content_id: &str,
+        action: &str,
+        decision: &str,
+        source: &str,
+    ) -> Result<(), AuditError> {
+        self.emit(AuditEvent::ContentOpen {
+            timestamp: SecureTimestamp::now(),
+            session_id: session_id.to_string(),
+            principal_id: principal_id.to_string(),
+            content_id: content_id.to_string(),
+            action: action.to_string(),
+            decision: decision.to_string(),
+            source: source.to_string(),
+        })
     }
 
     /// Emit a runtime start event
     pub fn runtime_start(&self, version: &str) {
-        self.emit(AuditEvent::RuntimeStart {
+        self.emit_best_effort(AuditEvent::RuntimeStart {
             timestamp: SecureTimestamp::now(),
             version: version.to_string(),
         });
@@ -343,7 +636,7 @@ impl AuditLog {
 
     /// Emit a runtime stop event
     pub fn runtime_stop(&self) {
-        self.emit(AuditEvent::RuntimeStop {
+        self.emit_best_effort(AuditEvent::RuntimeStop {
             timestamp: SecureTimestamp::now(),
         });
     }
@@ -356,7 +649,7 @@ impl AuditLog {
         cid: Option<&str>,
         trust_level: TrustLevel,
     ) {
-        self.emit(AuditEvent::CapsuleLaunch {
+        self.emit_best_effort(AuditEvent::CapsuleLaunch {
             timestamp: SecureTimestamp::now(),
             capsule_id: capsule_id.to_string(),
             capsule_name: capsule_name.to_string(),
@@ -367,7 +660,7 @@ impl AuditLog {
 
     /// Emit a capsule stop event
     pub fn capsule_stop(&self, capsule_id: &str, reason: StopReason) {
-        self.emit(AuditEvent::CapsuleStop {
+        self.emit_best_effort(AuditEvent::CapsuleStop {
             timestamp: SecureTimestamp::now(),
             capsule_id: capsule_id.to_string(),
             reason,
@@ -383,7 +676,7 @@ impl AuditLog {
         action: Action,
         expiry: Option<SecureTimestamp>,
     ) {
-        self.emit(AuditEvent::CapabilityGrant {
+        self.emit_best_effort(AuditEvent::CapabilityGrant {
             timestamp: SecureTimestamp::now(),
             token_id: token_id.to_string(),
             capsule_id: capsule_id.to_string(),
@@ -395,7 +688,7 @@ impl AuditLog {
 
     /// Emit a capability revoke event
     pub fn capability_revoke(&self, token_id: &TokenId, reason: &str) {
-        self.emit(AuditEvent::CapabilityRevoke {
+        self.emit_best_effort(AuditEvent::CapabilityRevoke {
             timestamp: SecureTimestamp::now(),
             token_id: token_id.to_string(),
             reason: reason.to_string(),
@@ -411,7 +704,7 @@ impl AuditLog {
         action: Action,
         success: bool,
     ) {
-        self.emit(AuditEvent::CapabilityUse {
+        self.emit_best_effort(AuditEvent::CapabilityUse {
             timestamp: SecureTimestamp::now(),
             token_id: token_id.to_string(),
             capsule_id: capsule_id.to_string(),
@@ -423,7 +716,7 @@ impl AuditLog {
 
     /// Emit a content fetch event
     pub fn content_fetch(&self, cid: &str, source: FetchSource, success: bool) {
-        self.emit(AuditEvent::ContentFetch {
+        self.emit_best_effort(AuditEvent::ContentFetch {
             timestamp: SecureTimestamp::now(),
             cid: cid.to_string(),
             source,
@@ -433,7 +726,7 @@ impl AuditLog {
 
     /// Emit an epoch advance event
     pub fn epoch_advance(&self, old_epoch: u64, new_epoch: u64, reason: &str) {
-        self.emit(AuditEvent::EpochAdvance {
+        self.emit_best_effort(AuditEvent::EpochAdvance {
             timestamp: SecureTimestamp::now(),
             old_epoch,
             new_epoch,
@@ -450,7 +743,7 @@ impl AuditLog {
         action: &str,
         success: bool,
     ) {
-        self.emit(AuditEvent::StorageAccess {
+        self.emit_best_effort(AuditEvent::StorageAccess {
             timestamp: SecureTimestamp::now(),
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
@@ -462,7 +755,7 @@ impl AuditLog {
 
     /// Emit a security warning
     pub fn security_warning(&self, warning_type: &str, details: &str) {
-        self.emit(AuditEvent::SecurityWarning {
+        self.emit_best_effort(AuditEvent::SecurityWarning {
             timestamp: SecureTimestamp::now(),
             warning_type: warning_type.to_string(),
             details: details.to_string(),
@@ -471,7 +764,7 @@ impl AuditLog {
 
     /// Record an inter-capsule message
     pub fn message_sent(&self, from: &str, to: &str, size_bytes: usize) {
-        self.emit(AuditEvent::MessageSent {
+        self.emit_best_effort(AuditEvent::MessageSent {
             timestamp: SecureTimestamp::now(),
             from: from.to_string(),
             to: to.to_string(),
@@ -487,7 +780,7 @@ impl AuditLog {
         confidence: f32,
         rationale: &str,
     ) {
-        self.emit(AuditEvent::PolicyProposal {
+        self.emit_best_effort(AuditEvent::PolicyProposal {
             timestamp: SecureTimestamp::now(),
             request_id: request_id.to_string(),
             recommended_outcome: recommended_outcome.to_string(),
@@ -508,7 +801,7 @@ impl AuditLog {
         real_rationale: &str,
         shadow_rationale: &str,
     ) {
-        self.emit(AuditEvent::PolicyDivergence {
+        self.emit_best_effort(AuditEvent::PolicyDivergence {
             timestamp: SecureTimestamp::now(),
             request_id: request_id.to_string(),
             real_decision_id: real_decision_id.to_string(),
@@ -532,7 +825,7 @@ impl AuditLog {
         shadow: bool,
         rationale: &str,
     ) {
-        self.emit(AuditEvent::PolicyDecisionMade {
+        self.emit_best_effort(AuditEvent::PolicyDecisionMade {
             timestamp: SecureTimestamp::now(),
             decision_id: decision_id.to_string(),
             request_id: request_id.to_string(),
@@ -595,10 +888,13 @@ impl AuditLog {
         if let Some(path) = &self.log_path {
             if let Ok(file) = File::open(path) {
                 let reader = BufReader::new(file);
+                // Lines are `ChainedRecord`s; extract the inner event. Lines that don't parse as a
+                // chained record (e.g. a legacy pre-chain log) are skipped rather than aborting.
                 let events: Vec<AuditEvent> = reader
                     .lines()
                     .map_while(Result::ok)
-                    .filter_map(|line| serde_json::from_str(&line).ok())
+                    .filter_map(|line| serde_json::from_str::<ChainedRecord>(&line).ok())
+                    .map(|rec| rec.event)
                     .collect();
 
                 // Return last `limit` events
@@ -633,6 +929,7 @@ impl AuditEvent {
             AuditEvent::CapabilityRevoke { .. } => "capability_revoke",
             AuditEvent::CapabilityUse { .. } => "capability_use",
             AuditEvent::ContentFetch { .. } => "content_fetch",
+            AuditEvent::ContentOpen { .. } => "content_open",
             AuditEvent::AuthAttempt { .. } => "auth_attempt",
             AuditEvent::EpochAdvance { .. } => "epoch_advance",
             AuditEvent::ConfigChange { .. } => "config_change",
@@ -677,24 +974,127 @@ impl elastos_namespace::AuditSink for AuditLog {
 
 impl elastos_namespace::NamespaceAuditSink for AuditLog {
     fn namespace_loaded(&self, owner: &str) {
-        self.emit(AuditEvent::Custom {
+        self.emit_best_effort(AuditEvent::Custom {
             event_type: "namespace_loaded".to_string(),
             details: serde_json::json!({ "owner": owner }),
         });
     }
 
     fn namespace_created(&self, owner: &str) {
-        self.emit(AuditEvent::Custom {
+        self.emit_best_effort(AuditEvent::Custom {
             event_type: "namespace_created".to_string(),
             details: serde_json::json!({ "owner": owner }),
         });
     }
 
     fn namespace_saved(&self, owner: &str, cid: &str) {
-        self.emit(AuditEvent::Custom {
+        self.emit_best_effort(AuditEvent::Custom {
             event_type: "namespace_saved".to_string(),
             details: serde_json::json!({ "owner": owner, "cid": cid }),
         });
+    }
+}
+
+/// Resume the hash-chain head from an existing log so appends stay continuous across restarts.
+/// Reads the LAST parseable [`ChainedRecord`] and returns its `seq` + `record_hash` as the next
+/// link. A missing/empty/legacy-format log starts at genesis (seq 0). Tolerant by design: a
+/// best-effort resume must not crash startup — `verify_chain` is the authoritative integrity gate.
+fn resume_chain_state(path: &Path) -> ChainState {
+    let genesis = ChainState {
+        last_seq: 0,
+        prev_hash: genesis_prev_hash(),
+    };
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return genesis,
+    };
+    let mut last: Option<ChainedRecord> = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(rec) = serde_json::from_str::<ChainedRecord>(&line) {
+            last = Some(rec);
+        }
+    }
+    match last {
+        Some(rec) => match hex::decode(&rec.record_hash) {
+            Ok(h) if h.len() == 32 => {
+                let mut prev = [0u8; 32];
+                prev.copy_from_slice(&h);
+                ChainState {
+                    last_seq: rec.seq,
+                    prev_hash: prev,
+                }
+            }
+            _ => genesis,
+        },
+        None => genesis,
+    }
+}
+
+/// Load (or first-time create) the DEDICATED, PERSISTED ed25519 signing key that signs the audit
+/// chain. Stored at `<log>.signing-key` (32-byte seed) with `0600` perms; the verifying key is
+/// published to `<log>.pubkey` (hex) for verifiers. Persisting it keeps the chain verifiable across
+/// restarts and avoids a throwaway in-memory key. NOTE: this is host-file protection, NOT an HSM —
+/// see the module-level live-compromise caveat; hardware/keystore custody is roadmap.
+fn load_or_create_signer(log_path: &Path) -> std::io::Result<SigningKey> {
+    let key_path = sibling(log_path, "signing-key");
+    if let Ok(seed) = std::fs::read(&key_path) {
+        if seed.len() == 32 {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&seed);
+            return Ok(SigningKey::from_bytes(&s));
+        }
+        tracing::error!(
+            "audit signing key at {:?} is malformed ({} bytes) — refusing to overwrite; \
+             remove it to regenerate",
+            key_path,
+            seed.len()
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed audit signing key",
+        ));
+    }
+    // First run: generate, persist with restrictive perms, publish the verifying key.
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    write_private(&key_path, &signing_key.to_bytes())?;
+    let pub_path = sibling(log_path, "pubkey");
+    let _ = std::fs::write(
+        &pub_path,
+        hex::encode(signing_key.verifying_key().to_bytes()),
+    );
+    Ok(signing_key)
+}
+
+/// Build a sibling path `<log>.<suffix>` next to the audit log.
+fn sibling(log_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = log_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".");
+    name.push(suffix);
+    log_path.with_file_name(name)
+}
+
+/// Write a secret file, creating it `0600` on Unix (owner read/write only).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 
@@ -740,6 +1140,187 @@ mod tests {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.contains("runtime_start"));
         assert!(content.contains("capsule_launch"));
+    }
+
+    // --- GAP-8: tamper-evident, hash-chained, signed audit ----------------------------------
+
+    fn read_verifying_key(log: &AuditLog) -> VerifyingKey {
+        let hex = log
+            .verifying_key_hex()
+            .expect("a file-backed log must be signed");
+        let bytes: [u8; 32] = hex::decode(&hex).unwrap().try_into().unwrap();
+        VerifyingKey::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn emit_chains_seq_and_a_clean_log_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+
+        // emit returns Ok and the custody helper records who-opened-what-when.
+        log.emit(AuditEvent::RuntimeStart {
+            timestamp: SecureTimestamp::now(),
+            version: "1.2.3".to_string(),
+        })
+        .expect("emit must succeed");
+        log.content_open(
+            "sess-1",
+            "person:local:alice",
+            "elastos://content/abc",
+            "view",
+            "opened",
+            "chain-provider",
+        )
+        .expect("content_open must commit");
+        log.runtime_stop();
+
+        let vk = read_verifying_key(&log);
+        assert_eq!(
+            log.verify_chain(Some(&vk)).unwrap(),
+            3,
+            "three records chain + verify"
+        );
+
+        // Sequence numbers are contiguous from 1 and each prev_hash links to the prior record_hash.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let recs: Vec<ChainedRecord> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs[0].seq, 1);
+        assert_eq!(recs[1].seq, 2);
+        assert_eq!(recs[2].seq, 3);
+        assert_eq!(
+            recs[0].prev_hash,
+            hex::encode([0u8; 32]),
+            "genesis links to zeros"
+        );
+        assert_eq!(
+            recs[1].prev_hash, recs[0].record_hash,
+            "chain links seq2 → seq1"
+        );
+        assert_eq!(
+            recs[2].prev_hash, recs[1].record_hash,
+            "chain links seq3 → seq2"
+        );
+        assert!(
+            recs.iter().all(|r| r.alg == AUDIT_SIG_ALG_ED25519),
+            "records carry the agility tag"
+        );
+    }
+
+    #[test]
+    fn flipping_a_byte_in_a_record_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.content_open(
+            "s",
+            "person:local:alice",
+            "elastos://c/1",
+            "view",
+            "opened",
+            "src",
+        )
+        .unwrap();
+        log.runtime_stop();
+        let vk = read_verifying_key(&log);
+        assert!(log.verify_chain(Some(&vk)).is_ok(), "baseline verifies");
+
+        // Edit the event content in place (still valid JSON). The record_hash no longer matches.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tampered = content.replacen("person:local:alice", "person:local:mallory", 1);
+        assert_ne!(content, tampered, "the edit must have applied");
+        std::fs::write(&path, tampered).unwrap();
+
+        let err = log.verify_chain(Some(&vk)).unwrap_err();
+        assert!(
+            err.contains("tamper"),
+            "a content edit must be detected: {err}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_record_breaks_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.runtime_start("1.0.0");
+        log.content_open(
+            "s",
+            "person:local:alice",
+            "elastos://c/1",
+            "view",
+            "opened",
+            "src",
+        )
+        .unwrap();
+        log.runtime_stop();
+        let vk = read_verifying_key(&log);
+        assert_eq!(log.verify_chain(Some(&vk)).unwrap(), 3);
+
+        // Drop the middle record: the next record's seq + prev_hash no longer line up.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        lines.remove(1);
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let err = log.verify_chain(Some(&vk)).unwrap_err();
+        assert!(
+            err.contains("chain break"),
+            "a dropped record must be detected: {err}"
+        );
+    }
+
+    #[test]
+    fn a_record_resigned_with_the_wrong_key_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        log.runtime_start("1.0.0");
+        let vk = read_verifying_key(&log);
+
+        // Attacker keeps the event + record_hash intact (so the hash check passes) but re-signs with
+        // a key they control. Only the genuine verifying key can validate the signature → detected.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut rec: ChainedRecord = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let attacker = SigningKey::generate(&mut rand::thread_rng());
+        let hash_bytes = hex::decode(&rec.record_hash).unwrap();
+        rec.sig = BASE64.encode(attacker.sign(&hash_bytes).to_bytes());
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&rec).unwrap())).unwrap();
+
+        let err = log.verify_chain(Some(&vk)).unwrap_err();
+        assert!(
+            err.contains("signature does not verify"),
+            "a forged signature must be detected: {err}"
+        );
+    }
+
+    #[test]
+    fn the_chain_resumes_across_reopen_and_stays_append_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        {
+            let log = AuditLog::with_file(&path).unwrap();
+            log.runtime_start("1.0.0");
+            log.runtime_stop();
+        }
+        // Reopen: the chain head must resume at seq 2, so the next record is seq 3 (no reset to 1).
+        let log = AuditLog::with_file(&path).unwrap();
+        log.runtime_start("1.0.1");
+        let vk = read_verifying_key(&log);
+        assert_eq!(
+            log.verify_chain(Some(&vk)).unwrap(),
+            3,
+            "appends continue the prior chain"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        let last: ChainedRecord = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            last.seq, 3,
+            "reopened log appended at seq 3, never truncated"
+        );
     }
 
     #[test]

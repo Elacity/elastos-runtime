@@ -230,6 +230,7 @@ dependencies = [
  "ml-kem",
  "rand_core",
  "sha2",
+ "subtle",
  "x25519-dalek",
  "zeroize",
 ]

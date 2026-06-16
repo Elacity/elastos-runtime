@@ -173,6 +173,21 @@ struct SealedDecryptMaterialV1 {
     /// trusted node verifying key provisioned at `init` (`authority_vk2_b64`).
     #[serde(default)]
     sealed_cek_share2_b64: Option<String>,
+    /// 2-of-3 QUORUM cheater-detection (pre-audit #1): the THIRD node's re-sealed indexed share,
+    /// when the rail served all three. The boundary unwraps all three and requires every pair to
+    /// agree, so a single Byzantine node returning a wrong-valued share FAILS THE OPEN CLOSED
+    /// rather than combining into a silently-wrong CEK. Absent ⇒ a 2-share (degraded) quorum, for
+    /// which integrity rests on `cek_commitment_b64`.
+    #[serde(default)]
+    sealed_cek_share3_b64: Option<String>,
+    /// Published CEK COMMITMENT (pre-audit #1), base64 of `ddrm_envelope::cek_commitment`. Computed
+    /// by the producer (the only party that legitimately materialises the CEK) at publish and
+    /// carried through the escrow. The boundary re-derives it from the reconstructed CEK and fails
+    /// closed on mismatch — the integrity backstop that catches a wrong-valued share even on the
+    /// 2-share (degraded) quorum and the 2-of-2 threshold rails. Absent ⇒ legacy material; integrity
+    /// then relies on 3-share cheater detection (quorum only).
+    #[serde(default)]
+    cek_commitment_b64: Option<String>,
     ciphertext_b64: String,
     #[serde(default)]
     init_segment_b64: Option<String>,
@@ -1062,6 +1077,36 @@ impl DecryptProvider {
             Ok(b) => b,
             Err(_) => return Err(Response::error("invalid_request", "sealed_cek_share2_b64 is not valid base64")),
         };
+        // PRE-AUDIT #1: the THIRD quorum share (when the rail served all three) enables
+        // cheater detection, and the published CEK commitment is the integrity backstop.
+        let sealed_share3 = match material.sealed_cek_share3_b64.as_deref() {
+            None => None,
+            Some(s) => match b64.decode(s) {
+                Ok(b) => Some(b),
+                Err(_) => {
+                    return Err(Response::error(
+                        "invalid_request",
+                        "sealed_cek_share3_b64 is not valid base64",
+                    ))
+                }
+            },
+        };
+        let cek_commitment: Option<[u8; 32]> = match material.cek_commitment_b64.as_deref() {
+            None => None,
+            Some(s) => match b64.decode(s) {
+                Ok(b) if b.len() == 32 => {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    Some(a)
+                }
+                _ => {
+                    return Err(Response::error(
+                        "invalid_request",
+                        "cek_commitment_b64 must be 32 base64-decoded bytes",
+                    ))
+                }
+            },
+        };
 
         let transcript_hash = {
             use sha2::{Digest, Sha256};
@@ -1104,49 +1149,38 @@ impl DecryptProvider {
                         ))
                     }
                 };
-            if prepared.extra_segments.is_empty() {
-                rail_shim::decrypt_from_carrier_quorum(
-                    prepared.session,
-                    &prepared.carrier.sealed_cek,
-                    &sealed_share2,
-                    &prepared.aad,
-                    &[verifier1, verifier2, verifier3],
-                    &prepared.carrier.ciphertext_segment,
-                    prepared.carrier.init_segment.as_deref(),
-                )
-                .map(|(plaintext, meta)| (vec![plaintext], meta))
-            } else {
-                rail_shim::decrypt_from_carrier_quorum_segments(
-                    prepared.session,
-                    &prepared.carrier.sealed_cek,
-                    &sealed_share2,
-                    &prepared.aad,
-                    &[verifier1, verifier2, verifier3],
-                    &prepared.carrier.ciphertext_segment,
-                    &prepared.extra_segments,
-                    prepared.carrier.init_segment.as_deref(),
-                )
+            // PRE-AUDIT #1: forward ALL served shares (2 or 3) so the checked reconstruction can
+            // cross-check every pair (3-share cheater detection) AND verify the published CEK
+            // commitment. A wrong-valued share — well-formed and correctly indexed — now fails the
+            // open closed instead of combining into a silently-wrong CEK.
+            let mut sealed_shares: Vec<&[u8]> =
+                vec![prepared.carrier.sealed_cek.as_slice(), sealed_share2.as_slice()];
+            if let Some(share3) = sealed_share3.as_deref() {
+                sealed_shares.push(share3);
             }
-        } else if prepared.extra_segments.is_empty() {
-            rail_shim::decrypt_from_carrier_threshold(
+            rail_shim::decrypt_from_carrier_quorum_checked(
                 prepared.session,
-                &prepared.carrier.sealed_cek,
-                &sealed_share2,
+                &sealed_shares,
                 &prepared.aad,
-                &prepared.verifier,
-                &verifier2,
+                &[verifier1, verifier2, verifier3],
+                &node_set_id,
+                cek_commitment.as_ref(),
                 &prepared.carrier.ciphertext_segment,
+                &prepared.extra_segments,
                 prepared.carrier.init_segment.as_deref(),
             )
-            .map(|(plaintext, meta)| (vec![plaintext], meta))
         } else {
-            rail_shim::decrypt_from_carrier_threshold_segments(
+            // 2-of-2 threshold (XOR): no third share to cross-check — the published commitment is
+            // the integrity backstop against a wrong-valued share.
+            rail_shim::decrypt_from_carrier_threshold_checked(
                 prepared.session,
                 &prepared.carrier.sealed_cek,
                 &sealed_share2,
                 &prepared.aad,
                 &prepared.verifier,
                 &verifier2,
+                &node_set_id,
+                cek_commitment.as_ref(),
                 &prepared.carrier.ciphertext_segment,
                 &prepared.extra_segments,
                 prepared.carrier.init_segment.as_deref(),
@@ -2544,6 +2578,8 @@ mod tests {
             suite: suite.to_string(),
             sealed_cek_b64: bound.sealed_cek_b64.clone(),
             sealed_cek_share2_b64: None,
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: None,
             ciphertext_b64: bound.ciphertext_b64.clone(),
             init_segment_b64: bound.init_segment_b64.clone(),
             nonce_b64: bound.nonce_b64.clone(),
@@ -2636,6 +2672,8 @@ mod tests {
             suite: DECRYPT_SUITE_ID.to_string(),
             sealed_cek_b64: b64.encode(&sealed),
             sealed_cek_share2_b64: None,
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: None,
             ciphertext_b64: b64.encode(&seg0),
             init_segment_b64: None,
             nonce_b64: b64.encode(nonce),
@@ -2741,6 +2779,8 @@ mod tests {
             suite: DECRYPT_SUITE_ID.to_string(),
             sealed_cek_b64: b64.encode(&sealed),
             sealed_cek_share2_b64: None,
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: None,
             ciphertext_b64: b64.encode(&seg0),
             init_segment_b64: None,
             nonce_b64: b64.encode(nonce),
@@ -2913,6 +2953,8 @@ mod tests {
             suite: DECRYPT_SUITE_ID.to_string(),
             sealed_cek_b64: b64.encode(&sealed1),
             sealed_cek_share2_b64: Some(b64.encode(&sealed2)),
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: None,
             ciphertext_b64: b64.encode(&segment),
             init_segment_b64: None,
             nonce_b64: b64.encode(nonce),
@@ -3065,6 +3107,8 @@ mod tests {
             suite: DECRYPT_SUITE_ID.to_string(),
             sealed_cek_b64: bound.sealed_cek_b64,
             sealed_cek_share2_b64: None,
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: None,
             ciphertext_b64: bound.ciphertext_b64,
             init_segment_b64: None,
             nonce_b64: bound.nonce_b64,
@@ -3109,7 +3153,7 @@ mod tests {
         plaintext: &[u8],
         nonce: &[u8],
         content_hash: &[u8],
-    ) -> (Vec<String>, crate::rail_shim::SessionSecret, Vec<Vec<u8>>, Vec<u8>, String) {
+    ) -> (Vec<String>, crate::rail_shim::SessionSecret, Vec<Vec<u8>>, Vec<u8>, String, String) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
         use crate::pq_envelope::session_public_bytes;
         use base64::Engine as _;
@@ -3153,12 +3197,16 @@ mod tests {
             })
             .collect();
         let segment = build_encrypted_segment(plaintext, cek, &[0x77u8; 8]);
+        // PRE-AUDIT #1: the producer's published CEK commitment — the boundary verifies the
+        // reconstructed CEK against it, so a wrong-valued share fails the open closed.
+        let commitment_b64 = b64.encode(ddrm_envelope::cek_commitment(&node_set_id, cek));
         (
             sealed,
             crate::rail_shim::SessionSecret::PqHybrid(secret),
             vks,
             pub_bytes,
             b64.encode(&segment),
+            commitment_b64,
         )
     }
 
@@ -3176,12 +3224,14 @@ mod tests {
 
         for (a, b) in [(0usize, 1usize), (0, 2), (1, 2)] {
             let req = decrypt_request();
-            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) =
                 quorum_setup(&req, &cek, &coeff, plaintext, b"nonce-qrm-1", &[0xABu8; 32]);
             let material = SealedDecryptMaterialV1 {
                 suite: DECRYPT_SUITE_ID.to_string(),
                 sealed_cek_b64: sealed[a].clone(),
                 sealed_cek_share2_b64: Some(sealed[b].clone()),
+                sealed_cek_share3_b64: None,
+                cek_commitment_b64: Some(commitment_b64),
                 ciphertext_b64,
                 init_segment_b64: None,
                 nonce_b64: b64.encode(b"nonce-qrm-1"),
@@ -3215,6 +3265,142 @@ mod tests {
         }
     }
 
+    /// PRE-AUDIT FINDING #1 (the malicious-share regression). On the LIVE 2-of-3 quorum open
+    /// path, a single Byzantine node that returns a VALIDLY-SEALED, correctly-INDEXED, but
+    /// WRONG-VALUED share must FAIL THE OPEN CLOSED — never combine into a silently-wrong CEK
+    /// the unauthenticated AES-CTR layer would not catch. With all three shares forwarded the
+    /// boundary cross-checks every pair (cheater detection); the published commitment is the
+    /// backstop; and a degraded (2-share) quorum WITHOUT a commitment is refused outright.
+    #[cfg(feature = "rail-material")]
+    #[test]
+    fn sealed_material_v1_quorum_byzantine_share_fails_closed() {
+        use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
+        use crate::pq_envelope::session_public_bytes;
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let cek = [0x5Au8; 16];
+        let coeff = [0x9Du8; 16];
+        let plaintext = b"three-share cheater-detection payload!!";
+        let nonce = b"nonce-byz-1";
+        let content_hash = [0xABu8; 32];
+        let req = decrypt_request();
+
+        // Build a coherent 2-of-3 quorum, keeping the node signers + session public so we can
+        // forge a WELL-FORMED, correctly-indexed, WRONG-VALUED share sealed by a real node.
+        let (secret, public) = gen_session();
+        let pub_bytes = session_public_bytes(&public);
+        let keys: Vec<_> = [[0xE1u8; 32], [0xE2u8; 32], [0xE3u8; 32]]
+            .into_iter()
+            .map(mldsa_seal_keypair)
+            .collect();
+        let vks: Vec<Vec<u8>> = keys.iter().map(|(_, vk)| vk.clone()).collect();
+        let node_set_id = ddrm_envelope::threshold_node_set_id_n(2, &[&vks[0], &vks[1], &vks[2]]);
+        let aad = DecryptTranscriptV1 {
+            suite_id: DECRYPT_SUITE_ID,
+            provider_id: DECRYPT_PROVIDER_ID,
+            principal_id: &req.principal_id,
+            session_id: &req.session_id,
+            object_cid: &req.object_cid,
+            content_hash: &content_hash,
+            action: &req.action,
+            viewer_interface: &req.viewer_interface,
+            output_kind: &req.output_kind,
+            expires_at: req.expires_at,
+            release_receipt_hash: release_receipt_hash(&req.release_receipt),
+            decrypt_session_pub: &pub_bytes,
+            nonce,
+            node_set_id: Some(&node_set_id),
+        }
+        .to_aad();
+        let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("split");
+        let sealed: Vec<String> = shares
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let payload = ddrm_envelope::indexed_share((i + 1) as u8, s);
+                b64.encode(seal_bound(&public, &payload, &aad, &keys[i].0).to_bytes())
+            })
+            .collect();
+        let commitment_b64 = b64.encode(ddrm_envelope::cek_commitment(&node_set_id, &cek));
+        let segment_b64 = b64.encode(build_encrypted_segment(plaintext, &cek, &[0x77u8; 8]));
+
+        let mut provider = DecryptProvider {
+            session: Some(crate::rail_shim::SessionSecret::PqHybrid(secret)),
+            authority_vk: Some(vks[0].clone()),
+            session_pub: Some(pub_bytes.clone()),
+            authority_vk2: Some(vks[1].clone()),
+            authority_vk3: Some(vks[2].clone()),
+        };
+        let base_material = |share2: String, share3: Option<String>, commit: Option<String>| {
+            SealedDecryptMaterialV1 {
+                suite: DECRYPT_SUITE_ID.to_string(),
+                sealed_cek_b64: sealed[0].clone(),
+                sealed_cek_share2_b64: Some(share2),
+                sealed_cek_share3_b64: share3,
+                cek_commitment_b64: commit,
+                ciphertext_b64: segment_b64.clone(),
+                init_segment_b64: None,
+                nonce_b64: b64.encode(nonce),
+                content_hash_b64: b64.encode(content_hash),
+                extra_segments_b64: None,
+                rights_receipt_hash_b64: None,
+            }
+        };
+
+        // (1) All three HONEST shares open (cheater detection passes; commitment matches).
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(decrypt_request()),
+            material: base_material(sealed[1].clone(), Some(sealed[2].clone()), Some(commitment_b64.clone())),
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("opened"), "three honest shares must open: {v}");
+
+        // (2) A BYZANTINE node C: a validly-sealed, correctly-indexed, WRONG-VALUED share.
+        let mut wrong = shares[2].clone();
+        wrong[0] ^= 0x01; // still well-formed; just the wrong value
+        let malicious = b64.encode(
+            seal_bound(&public, &ddrm_envelope::indexed_share(3, &wrong), &aad, &keys[2].0).to_bytes(),
+        );
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(decrypt_request()),
+            material: base_material(sealed[1].clone(), Some(malicious.clone()), Some(commitment_b64.clone())),
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "a single Byzantine wrong-valued share must fail the open closed: {v}"
+        );
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "no plaintext leaks on the Byzantine path");
+        assert!(!s.contains(&b64.encode(cek)), "no CEK leaks on the Byzantine path");
+
+        // (3) Even with the cheater as ONE of only TWO shares, the commitment catches it.
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(decrypt_request()),
+            material: base_material(malicious.clone(), None, Some(commitment_b64.clone())),
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["data"]["decision"], json!("denied"), "the commitment catches a 2-share Byzantine open: {v}");
+
+        // (4) A degraded (2-share) quorum WITHOUT a commitment is refused outright (fail closed).
+        let resp = provider.handle(Request::OpenSessionV1 {
+            request: Box::new(decrypt_request()),
+            material: base_material(sealed[1].clone(), None, None),
+            now_unix: 1_850_000_000,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "an integrity-uncheckable 2-share quorum (no commitment) is refused: {v}"
+        );
+    }
+
     /// Day 138 — the 2-of-3 QUORUM STREAM read (the consumer-open RENDER path): every
     /// pair of the three nodes' re-sealed shares reconstructs the CEK in-VM AND the scoped
     /// `stream` output returns that segment's already-decrypted bytes (plaintext at the fMP4
@@ -3230,12 +3416,14 @@ mod tests {
 
         for (a, b) in [(0usize, 1usize), (0, 2), (1, 2)] {
             let req = media_decrypt_request();
-            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) =
                 quorum_setup(&req, &cek, &coeff, plaintext, b"nonce-qstream-1", &[0xABu8; 32]);
             let material = SealedDecryptMaterialV1 {
                 suite: DECRYPT_SUITE_ID.to_string(),
                 sealed_cek_b64: sealed[a].clone(),
                 sealed_cek_share2_b64: Some(sealed[b].clone()),
+                sealed_cek_share3_b64: None,
+                cek_commitment_b64: Some(commitment_b64),
                 ciphertext_b64,
                 init_segment_b64: None,
                 nonce_b64: b64.encode(b"nonce-qstream-1"),
@@ -3293,7 +3481,7 @@ mod tests {
         // chosen by `pick` from (the three genuine sealed shares, an optional forged blob).
         let drive = |pick: &dyn Fn(&[String], &str) -> (String, String)| -> Value {
             let req = decrypt_request();
-            let (sealed, session, vks, pub_bytes, ciphertext_b64) =
+            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) =
                 quorum_setup(&req, &cek, &coeff, b"payload", b"nonce-qrm-2", &[0xABu8; 32]);
             // A forged share: a well-formed indexed payload sealed by an UNRELATED key (to a
             // throwaway session — the pinned-identity signature check refuses it first).
@@ -3307,6 +3495,8 @@ mod tests {
                 suite: DECRYPT_SUITE_ID.to_string(),
                 sealed_cek_b64: slot_a,
                 sealed_cek_share2_b64: Some(slot_b),
+                sealed_cek_share3_b64: None,
+                cek_commitment_b64: Some(commitment_b64),
                 ciphertext_b64,
                 init_segment_b64: None,
                 nonce_b64: b64.encode(b"nonce-qrm-2"),
@@ -3407,11 +3597,14 @@ mod tests {
             })
             .collect();
 
+        let commitment_b64 = b64.encode(ddrm_envelope::cek_commitment(&node_set_id, &cek));
         let make_material = |extra: Vec<String>| SealedDecryptMaterialV1 {
             suite: DECRYPT_SUITE_ID.to_string(),
             // Open with nodes {0, 2} — a real quorum that SKIPS node B (the rail survives a dead node).
             sealed_cek_b64: sealed[0].clone(),
             sealed_cek_share2_b64: Some(sealed[2].clone()),
+            sealed_cek_share3_b64: None,
+            cek_commitment_b64: Some(commitment_b64.clone()),
             ciphertext_b64: b64.encode(&seg0),
             init_segment_b64: None,
             nonce_b64: b64.encode(nonce),

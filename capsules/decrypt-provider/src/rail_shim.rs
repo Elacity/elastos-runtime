@@ -211,30 +211,218 @@ fn reconstruct_quorum_two_cek<V: CekSealVerifier>(
     aad: &[u8],
     node_verifiers: &[V],
 ) -> Result<zeroize::Zeroizing<String>, String> {
-    let unwrap_indexed = |sealed: &[u8]| -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
-        let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
-        for (i, verifier) in node_verifiers.iter().enumerate() {
-            let expected_x = (i + 1) as u8;
-            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
-            {
-                let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
-                    .ok_or("sealed quorum share carries no valid x-coordinate")?;
-                if x != expected_x {
-                    return Err(
-                        "quorum share x-coordinate does not match the node identity that sealed it"
-                            .to_string(),
-                    );
-                }
-                return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
-            }
-        }
-        Err("no pinned node identity verifies this sealed quorum share".to_string())
-    };
-    let (x_a, share_a) = unwrap_indexed(sealed_share_a)?;
-    let (x_b, share_b) = unwrap_indexed(sealed_share_b)?;
+    let (x_a, share_a) = unwrap_indexed_share(secret, sealed_share_a, aad, node_verifiers)?;
+    let (x_b, share_b) = unwrap_indexed_share(secret, sealed_share_b, aad, node_verifiers)?;
     let cek = ddrm_envelope::combine_cek_shamir2(x_a, share_a.as_slice(), x_b, share_b.as_slice())
         .map_err(|e| e.to_string())?;
     Ok(cek_to_b64(cek.as_slice()))
+}
+
+/// Unwrap ONE sealed INDEXED quorum share against the pinned node identities: find the
+/// identity whose seal signature verifies, REQUIRE the inside-x to equal that node's
+/// coordinate (x = index+1, so node j cannot impersonate node i even with a valid seal of
+/// its own), and return `(x, share_bytes)` in `Zeroizing`. Fails closed on no verifying
+/// identity, an x/identity mismatch, or a malformed payload. Shared by every quorum path.
+fn unwrap_indexed_share<V: CekSealVerifier>(
+    secret: &SessionKemSecret,
+    sealed: &[u8],
+    aad: &[u8],
+    node_verifiers: &[V],
+) -> Result<(u8, zeroize::Zeroizing<Vec<u8>>), String> {
+    let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
+    for (i, verifier) in node_verifiers.iter().enumerate() {
+        let expected_x = (i + 1) as u8;
+        if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier) {
+            let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
+                .ok_or("sealed quorum share carries no valid x-coordinate")?;
+            if x != expected_x {
+                return Err(
+                    "quorum share x-coordinate does not match the node identity that sealed it"
+                        .to_string(),
+                );
+            }
+            return Ok((x, zeroize::Zeroizing::new(share.to_vec())));
+        }
+    }
+    Err("no pinned node identity verifies this sealed quorum share".to_string())
+}
+
+/// PRE-AUDIT #1 — integrity-checked **2-of-3 QUORUM** reconstruction. Unwraps EVERY supplied
+/// sealed indexed share (2 or 3 — the rail forwards all that the nodes served), then:
+///   - with **3 shares** present, reconstructs with CHEATER DETECTION
+///     ([`ddrm_envelope::combine_cek_shamir2_checked`]): every pair must agree, so a single
+///     Byzantine node returning a validly-sealed, validly-indexed, but **wrong-valued** share is
+///     off the polynomial and the inconsistency FAILS THE OPEN CLOSED — it can no longer combine
+///     into a silently-wrong CEK that the unauthenticated AES-CTR layer would not catch;
+///   - with only **2 shares** (a node down / degraded quorum) there is nothing to cross-check, so
+///     integrity rests on the published commitment below;
+///   - if a published `commitment` is supplied, the reconstructed CEK is verified against it
+///     ([`ddrm_envelope::verify_cek_commitment`]) BEFORE use, catching a wrong CEK even on the
+///     2-share path. A degraded (2-share) quorum WITHOUT a commitment cannot be integrity-checked,
+///     so it is REFUSED — fail closed, then explain (PRINCIPLES #11).
+///
+/// The CEK only ever materialises here, in the sandbox, in `Zeroizing`.
+fn reconstruct_quorum_cek_checked<V: CekSealVerifier>(
+    secret: &SessionKemSecret,
+    sealed_shares: &[&[u8]],
+    aad: &[u8],
+    node_verifiers: &[V],
+    node_set_id: &[u8],
+    commitment: Option<&[u8; 32]>,
+) -> Result<zeroize::Zeroizing<String>, String> {
+    if sealed_shares.len() < 2 {
+        return Err("a quorum open needs at least two sealed shares".to_string());
+    }
+    let mut shares: Vec<(u8, zeroize::Zeroizing<Vec<u8>>)> =
+        Vec::with_capacity(sealed_shares.len());
+    for sealed in sealed_shares {
+        let (x, body) = unwrap_indexed_share(secret, sealed, aad, node_verifiers)?;
+        if shares.iter().any(|(seen, _)| *seen == x) {
+            return Err("the same node share was presented twice — not a real quorum".to_string());
+        }
+        shares.push((x, body));
+    }
+    let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, b)| (*x, b.as_slice())).collect();
+    let cek = if points.len() >= 3 {
+        // Above the threshold: cross-check every pair — a single wrong-valued share is caught.
+        ddrm_envelope::combine_cek_shamir2_checked(&points).map_err(|e| e.to_string())?
+    } else if commitment.is_some() {
+        // Exactly the threshold: no cross-check possible, but the commitment below gates integrity.
+        ddrm_envelope::combine_cek_shamir2(points[0].0, points[0].1, points[1].0, points[1].1)
+            .map_err(|e| e.to_string())?
+    } else {
+        return Err(
+            "degraded quorum: only two shares served and no CEK commitment was published — \
+             refusing an integrity-unchecked open (fail closed)"
+                .to_string(),
+        );
+    };
+    if let Some(expected) = commitment {
+        if !ddrm_envelope::verify_cek_commitment(node_set_id, cek.as_slice(), expected) {
+            return Err(
+                "reconstructed CEK does not match the published commitment — a quorum member \
+                 served a wrong-valued share; the open fails closed"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(cek_to_b64(cek.as_slice()))
+}
+
+/// PRE-AUDIT #1 — integrity-checked **2-of-2 threshold** (XOR) reconstruction. The XOR split has
+/// no third share to cross-check, so integrity is the published commitment: unwrap both sealed
+/// shares, XOR-combine in `Zeroizing`, and verify the reconstructed CEK against the commitment (if
+/// supplied) BEFORE use. A wrong-valued share yields a CEK whose commitment does not match → fail
+/// closed. Absent a commitment this is the historical (unchecked) behaviour — additive + reversible.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_threshold_cek_checked(
+    secret: &SessionKemSecret,
+    sealed_share1: &[u8],
+    sealed_share2: &[u8],
+    aad: &[u8],
+    verifier1: &impl CekSealVerifier,
+    verifier2: &impl CekSealVerifier,
+    node_set_id: &[u8],
+    commitment: Option<&[u8; 32]>,
+) -> Result<zeroize::Zeroizing<String>, String> {
+    let env1 = PqSealedEnvelope::from_bytes(sealed_share1).map_err(|e| format!("{e:?}"))?;
+    let share1 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env1, aad, verifier1)
+        .map_err(|e| format!("{e:?}"))?;
+    let env2 = PqSealedEnvelope::from_bytes(sealed_share2).map_err(|e| format!("{e:?}"))?;
+    let share2 = crate::pq_envelope::hybrid_unwrap_bound(secret, &env2, aad, verifier2)
+        .map_err(|e| format!("{e:?}"))?;
+    let cek = ddrm_envelope::combine_cek_xor(share1.as_slice(), share2.as_slice())
+        .map_err(|e| e.to_string())?;
+    if let Some(expected) = commitment {
+        if !ddrm_envelope::verify_cek_commitment(node_set_id, cek.as_slice(), expected) {
+            return Err(
+                "reconstructed CEK does not match the published commitment — a threshold node \
+                 served a wrong-valued share; the open fails closed"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(cek_to_b64(cek.as_slice()))
+}
+
+/// Integrity-checked **2-of-3 QUORUM** open (single OR multi-segment): reconstruct the CEK ONCE
+/// via [`reconstruct_quorum_cek_checked`] (cheater detection across 3 shares + commitment binding)
+/// and decrypt the whole ordered asset. Returns each segment's plaintext + aggregate metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_from_carrier_quorum_checked<V: CekSealVerifier>(
+    session: &SessionSecret,
+    sealed_shares: &[&[u8]],
+    aad: &[u8],
+    node_verifiers: &[V],
+    node_set_id: &[u8],
+    commitment: Option<&[u8; 32]>,
+    ciphertext_segment: &[u8],
+    extra_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("quorum reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+    let cek_b64 = reconstruct_quorum_cek_checked(
+        secret,
+        sealed_shares,
+        aad,
+        node_verifiers,
+        node_set_id,
+        commitment,
+    )?;
+    if extra_segments.is_empty() {
+        crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+            .map(|(plaintext, meta)| (vec![plaintext], meta))
+    } else {
+        let segments = ordered_segments(ciphertext_segment, extra_segments);
+        crate::decrypt_session_segments(&cek_b64, &segments, init_segment)
+    }
+}
+
+/// Integrity-checked **2-of-2 threshold** open (single OR multi-segment): reconstruct the XOR CEK
+/// ONCE via [`reconstruct_threshold_cek_checked`] (commitment binding) and decrypt the whole
+/// ordered asset. Returns each segment's plaintext + aggregate metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_from_carrier_threshold_checked(
+    session: &SessionSecret,
+    sealed_share1: &[u8],
+    sealed_share2: &[u8],
+    aad: &[u8],
+    verifier1: &impl CekSealVerifier,
+    verifier2: &impl CekSealVerifier,
+    node_set_id: &[u8],
+    commitment: Option<&[u8; 32]>,
+    ciphertext_segment: &[u8],
+    extra_segments: &[Vec<u8>],
+    init_segment: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Value), String> {
+    let secret = match session {
+        SessionSecret::PqHybrid(secret) => secret,
+        SessionSecret::ClassicalP256(_) => {
+            return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
+        }
+    };
+    let cek_b64 = reconstruct_threshold_cek_checked(
+        secret,
+        sealed_share1,
+        sealed_share2,
+        aad,
+        verifier1,
+        verifier2,
+        node_set_id,
+        commitment,
+    )?;
+    if extra_segments.is_empty() {
+        crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
+            .map(|(plaintext, meta)| (vec![plaintext], meta))
+    } else {
+        let segments = ordered_segments(ciphertext_segment, extra_segments);
+        crate::decrypt_session_segments(&cek_b64, &segments, init_segment)
+    }
 }
 
 /// Transcript-bound **2-of-2 threshold** carrier open (Day 97–98): the CEK was

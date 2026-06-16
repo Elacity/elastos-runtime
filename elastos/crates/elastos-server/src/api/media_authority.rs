@@ -70,7 +70,8 @@ const DEV_KEY_PROVIDER_BIN: &str = concat!(
 
 /// Resolve the key-provider binary (env override or dev-tree default) for `--quorum` opens.
 pub(crate) fn resolve_key_bin() -> String {
-    std::env::var("ELASTOS_DDRM_KEY_PROVIDER_BIN").unwrap_or_else(|_| DEV_KEY_PROVIDER_BIN.to_string())
+    std::env::var("ELASTOS_DDRM_KEY_PROVIDER_BIN")
+        .unwrap_or_else(|_| DEV_KEY_PROVIDER_BIN.to_string())
 }
 
 /// A live media decrypt session backed by a gateway-spawned local key-authority

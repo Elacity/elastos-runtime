@@ -313,18 +313,23 @@ pub fn combine_cek_xor(
 // (`share' = share ⊕ delta`) carries over UNCHANGED: a proactive refresh adds a
 // random polynomial q with q(0)=0, delivered to node i as `delta_i = q(x_i)`.
 
-/// GF(2^8) multiply (AES polynomial 0x11B). Constant pattern, no tables.
+/// GF(2^8) multiply (AES polynomial 0x11B). BRANCHLESS + table-free (pre-audit #4): the two
+/// data-dependent branches (`if b&1` add, `if high-bit` reduce) are replaced with arithmetic masks
+/// so the control flow no longer depends on the secret operands — a CEK share's bits cannot be
+/// recovered from a multiply-timing side channel. `0u8.wrapping_sub(bit)` is `0xFF` when `bit==1`
+/// and `0x00` when `bit==0`, the canonical constant-time select (`subtle`'s `Choice` masks the same
+/// way under the hood; the explicit mask keeps this dependency-free and auditable). Iteration count
+/// is already fixed at 8, so the whole routine is constant-time in `a`/`b`.
 fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
     let mut acc = 0u8;
     for _ in 0..8 {
-        if b & 1 != 0 {
-            acc ^= a;
-        }
-        let hi = a & 0x80;
+        // Add `a` into the accumulator iff the current low bit of `b` is set — masked, not branched.
+        let add_mask = 0u8.wrapping_sub(b & 1);
+        acc ^= a & add_mask;
+        // Reduce by 0x1B iff `a`'s high bit is set (captured BEFORE the shift, as in the textbook form).
+        let reduce_mask = 0u8.wrapping_sub((a >> 7) & 1);
         a <<= 1;
-        if hi != 0 {
-            a ^= 0x1B;
-        }
+        a ^= 0x1B & reduce_mask;
         b >>= 1;
     }
     acc
@@ -458,6 +463,52 @@ pub fn combine_cek_shamir2(
             .map(|(&a, &b)| gf256_mul(a, l_a) ^ gf256_mul(b, l_b))
             .collect(),
     ))
+}
+
+/// Reconstruct a 2-of-n CEK from MORE THAN the threshold of indexed shares WITH
+/// CHEATER DETECTION (pre-audit finding #1). Given ≥ 3 distinct, non-zero indexed
+/// shares of the SAME degree-1 secret polynomial, EVERY pair must Lagrange-combine
+/// (`combine_cek_shamir2`) to the SAME CEK — because three or more colinear points
+/// determine one line. A single Byzantine node returning a validly-sealed,
+/// validly-indexed, but **wrong-valued** share is off that line, so the pairs that
+/// include it disagree with the pair that excludes it: the inconsistency is DETECTED
+/// and the open FAILS CLOSED rather than decrypting under a silently-wrong key.
+///
+/// With exactly 2 shares there is nothing to cross-check (any two points define a
+/// line) — callers that hold only the threshold must fall back to the published
+/// [`cek_commitment`] for integrity; this function REFUSES `< 3` shares so a caller
+/// can never *think* it got cheater detection from a bare quorum. All candidate CEKs
+/// are compared in CONSTANT TIME (`subtle`) so a near-miss reveals nothing about the
+/// true key. Result rides in `Zeroizing`; MUST run only inside the decrypt sandbox.
+pub fn combine_cek_shamir2_checked(
+    shares: &[(u8, &[u8])],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    use subtle::ConstantTimeEq;
+    if shares.len() < 3 {
+        return Err("cheater detection needs at least three shares (above the 2-of-n threshold)");
+    }
+    // Reconstruct from every distinct pair; combine_cek_shamir2 enforces non-zero,
+    // distinct coordinates and equal lengths, so a duplicate/zero coordinate or a
+    // length mismatch fails closed here.
+    let mut reference: Option<zeroize::Zeroizing<Vec<u8>>> = None;
+    for i in 0..shares.len() {
+        for j in (i + 1)..shares.len() {
+            let (x_a, share_a) = shares[i];
+            let (x_b, share_b) = shares[j];
+            let candidate = combine_cek_shamir2(x_a, share_a, x_b, share_b)?;
+            match &reference {
+                None => reference = Some(candidate),
+                Some(reference) => {
+                    if reference.len() != candidate.len()
+                        || !bool::from(reference.ct_eq(candidate.as_slice()))
+                    {
+                        return Err("quorum shares are inconsistent — a member returned a wrong-valued share (Byzantine fault); the open fails closed");
+                    }
+                }
+            }
+        }
+    }
+    reference.ok_or("no candidate CEK was reconstructed")
 }
 
 /// Prefix a Shamir share with its x-coordinate for escrow — `x ‖ share` — so the
@@ -681,6 +732,52 @@ pub fn dkg_cek_binding(dkg_id: &[u8], node_set_id: &[u8], cek: &[u8]) -> [u8; 32
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..32]);
     out
+}
+
+/// Domain label for a quorum CEK COMMITMENT (the generalization of [`dkg_cek_binding`]
+/// to ANY threshold-split CEK, DKG-born or producer-split). Separated from every other
+/// hash domain so a commitment can never be confused with a node-set id, a transcript
+/// hash, or a DKG binding.
+pub const CEK_COMMITMENT_DOMAIN: &[u8] = b"elastos.dkms.authority/cek-commitment/v1";
+
+/// A public, hiding+binding COMMITMENT to a threshold-split CEK:
+/// `SHA-256(DOMAIN ‖ lp(node_set_id) ‖ lp(cek))`.
+///
+/// This is the integrity backstop for the live quorum/threshold open (pre-audit finding #1):
+/// the AES-CTR content layer is unauthenticated, so a single Byzantine node returning a
+/// validly-sealed, validly-indexed, but **wrong-valued** share would combine into a SILENTLY
+/// WRONG CEK with no error. The producer — the only party that legitimately materializes the
+/// CEK (transiently, in-boundary, to encrypt) — computes this commitment ONCE at publish and
+/// publishes it alongside the escrow. At open, the decrypt boundary reconstructs the CEK from
+/// its quorum and re-derives this commitment ([`verify_cek_commitment`]): a wrong-valued share
+/// yields a CEK whose commitment does NOT match, so the open FAILS CLOSED instead of decrypting
+/// to garbage (benign for media, catastrophic for the agent-key-custody roadmap).
+///
+/// Bound to `node_set_id` so a commitment published for one quorum cannot be replayed against a
+/// different one; the CEK is unique per content, so the commitment is effectively content-bound.
+/// The CEK is never revealed (pre-image resistance) — only a holder that already reconstructed
+/// the exact CEK can reproduce it. Pure, no RNG; the single source of truth the producer and the
+/// decrypt boundary share.
+pub fn cek_commitment(node_set_id: &[u8], cek: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    let bound = lp_concat(CEK_COMMITMENT_DOMAIN, &[node_set_id, cek]);
+    h.update(&bound);
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
+/// Verify a reconstructed CEK against its published [`cek_commitment`], in CONSTANT TIME.
+///
+/// `true` iff `cek_commitment(node_set_id, cek) == expected`. The comparison is constant-time
+/// (`subtle::ConstantTimeEq`) so the match does not leak — defense for the agent-key-custody
+/// path where the boundary may run co-resident with an adversary. The decrypt boundary calls
+/// this on the reconstructed CEK BEFORE any content decryption and fails closed on `false`.
+pub fn verify_cek_commitment(node_set_id: &[u8], cek: &[u8], expected: &[u8; 32]) -> bool {
+    use subtle::ConstantTimeEq;
+    let got = cek_commitment(node_set_id, cek);
+    got.ct_eq(expected).into()
 }
 
 /// Fail-closed error surface. Messages are coarse so a forged envelope cannot probe
@@ -2322,6 +2419,54 @@ mod tests {
         assert_eq!(rec.as_slice(), cek.as_slice(), "a q(0)=0 refresh preserves the CEK");
         let mixed_gen = crate::combine_cek_shamir2(1, &shares[0], 3, &refreshed[2]).expect("old+new");
         assert_ne!(mixed_gen.as_slice(), cek.as_slice(), "old+refreshed shares must NOT reconstruct");
+    }
+
+    /// PRE-AUDIT FINDING #1 — CEK reconstruction integrity. The 3-share checked combine
+    /// reconstructs the CEK when all three shares are consistent, but FAILS CLOSED the moment
+    /// ANY one of the three carries a well-formed, correctly-indexed, but WRONG value (a single
+    /// Byzantine quorum node). And the published commitment catches a wrong CEK independently.
+    #[test]
+    fn cek_quorum_checked_detects_a_byzantine_share_and_commitment_binds() {
+        let cek: Vec<u8> = (0u8..16).map(|b| b.wrapping_mul(11) ^ 0x5A).collect();
+        let coeff: Vec<u8> = (0u8..16).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
+        let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
+        let pts = |s: &[Vec<u8>]| -> Vec<(u8, Vec<u8>)> {
+            s.iter().enumerate().map(|(i, v)| ((i + 1) as u8, v.clone())).collect()
+        };
+
+        // All three honest shares are consistent ⇒ the checked combine reconstructs the CEK.
+        let honest = pts(&shares);
+        let refs: Vec<(u8, &[u8])> = honest.iter().map(|(x, v)| (*x, v.as_slice())).collect();
+        let rec = crate::combine_cek_shamir2_checked(&refs).expect("3 honest shares reconstruct");
+        assert_eq!(rec.as_slice(), cek.as_slice());
+
+        // A single wrong-valued share (well-formed, correctly indexed) is DETECTED for every
+        // position it could occupy — the open fails closed, never yields a silently-wrong key.
+        for bad in 0..3usize {
+            let mut tampered = shares.clone();
+            tampered[bad][0] ^= 0x01; // flip one byte: still well-formed, wrong value
+            let bad_pts = pts(&tampered);
+            let bad_refs: Vec<(u8, &[u8])> = bad_pts.iter().map(|(x, v)| (*x, v.as_slice())).collect();
+            assert!(
+                crate::combine_cek_shamir2_checked(&bad_refs).is_err(),
+                "a wrong-valued share at position {bad} must fail the checked combine closed"
+            );
+        }
+
+        // Fewer than three shares: the checked combine REFUSES (no false sense of detection).
+        let two: Vec<(u8, &[u8])> = refs[..2].to_vec();
+        assert!(crate::combine_cek_shamir2_checked(&two).is_err());
+
+        // The published commitment binds the CEK to the node-set and rejects a wrong CEK.
+        let node_set_id = crate::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let commitment = crate::cek_commitment(&node_set_id, &cek);
+        assert!(crate::verify_cek_commitment(&node_set_id, &cek, &commitment));
+        let mut wrong = cek.clone();
+        wrong[0] ^= 0x01;
+        assert!(!crate::verify_cek_commitment(&node_set_id, &wrong, &commitment), "commitment rejects a wrong CEK");
+        // A commitment is bound to its node-set: another quorum's commitment does not verify.
+        let other_set = crate::threshold_node_set_id_n(2, &[&[0x11u8; 40][..], &[0x22u8; 40][..], &[0x33u8; 40][..]]);
+        assert!(!crate::verify_cek_commitment(&other_set, &cek, &commitment), "commitment is node-set bound");
     }
 
     /// GOLDEN VECTOR: the Shamir split/combine is pinned byte-for-byte (a refactor or a GF

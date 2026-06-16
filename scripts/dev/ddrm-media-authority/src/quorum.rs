@@ -241,6 +241,14 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         .and_then(Value::as_str)
         .ok_or("escrow missing node_set_id_b64")?
         .to_string();
+    // PRE-AUDIT #1: the producer's published CEK commitment, when the asset was minted with one.
+    // Forwarded verbatim into the session so the decrypt boundary verifies the reconstructed CEK
+    // against it (integrity backstop). Absent ⇒ legacy asset; integrity rests on the boundary's
+    // 3-share cheater detection (the rail serves all three).
+    let cek_commitment_b64 = protections
+        .get("cek_commitment_b64")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let producer_vk_b64 = protections
         .get("producer_verifying_key_b64")
         .and_then(Value::as_str)
@@ -442,7 +450,7 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
     .to_aad();
 
     // --- key-provider (dkms): recover 2-of-3 from the live nodes + re-seal to the session. ---
-    let session_ctx = json!({
+    let mut session_ctx = json!({
         "decrypt_session_pub_b64": session_pub_b64,
         // All three shares were signed by the SAME in-boundary producer identity at mint.
         "producer_vk_b64": producer_vk_b64,
@@ -456,6 +464,11 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         "wrapped_cek_share3_b64": share3,
         "now_unix": now,
     });
+    // PRE-AUDIT #1: forward the published commitment so the key-provider welds it into the merged
+    // material and the decrypt boundary fails closed if the reconstructed CEK does not match.
+    if let Some(commit) = &cek_commitment_b64 {
+        session_ctx["cek_commitment_b64"] = json!(commit);
+    }
     // Phase A: drive the recover against the WARM key-provider daemon (node sessions reused across
     // opens) when the gateway wired one up; otherwise spawn a fresh key-provider for this open.
     let release = key_release(

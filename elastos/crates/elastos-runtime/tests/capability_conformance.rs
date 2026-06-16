@@ -67,7 +67,13 @@ async fn token_denies_a_different_capsule() {
         None,
     );
     let r = m
-        .validate(&token, "capsule-b", Action::Read, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-b",
+            Action::Read,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(
         matches!(r, Err(ValidationError::WrongCapsule { .. })),
@@ -87,7 +93,13 @@ async fn token_denies_a_different_action() {
         None,
     );
     let r = m
-        .validate(&token, "capsule-a", Action::Write, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-a",
+            Action::Write,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(
         matches!(r, Err(ValidationError::WrongAction { .. })),
@@ -133,7 +145,13 @@ async fn token_denies_after_expiry() {
         Some(SecureTimestamp::at(1)), // expired in 1970
     );
     let r = m
-        .validate(&token, "capsule-a", Action::Read, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-a",
+            Action::Read,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(
         matches!(r, Err(ValidationError::TokenExpired)),
@@ -153,11 +171,23 @@ async fn token_denies_after_use_limit() {
         None,
     );
     let ok = m
-        .validate(&token, "capsule-a", Action::Read, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-a",
+            Action::Read,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(ok.is_ok(), "first use should pass; got {ok:?}");
     let r = m
-        .validate(&token, "capsule-a", Action::Read, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-a",
+            Action::Read,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(
         matches!(r, Err(ValidationError::UseLimitExceeded { .. })),
@@ -184,7 +214,13 @@ async fn denial_is_audited() {
     );
     // Trigger a denial.
     let r = m
-        .validate(&token, "capsule-b", Action::Read, &ResourceId::new(RES), None)
+        .validate(
+            &token,
+            "capsule-b",
+            Action::Read,
+            &ResourceId::new(RES),
+            None,
+        )
         .await;
     assert!(matches!(r, Err(ValidationError::WrongCapsule { .. })));
 
@@ -279,11 +315,19 @@ fn gaps_registry_is_intact() {
             g.id,
             g.severity
         );
-        assert!(!g.finding.is_empty() && !g.location.is_empty(), "gap {} underspecified", g.id);
+        assert!(
+            !g.finding.is_empty() && !g.location.is_empty(),
+            "gap {} underspecified",
+            g.id
+        );
         println!("[{}] ({}) {} — {}", g.id, g.severity, g.finding, g.location);
     }
     let highs = KNOWN_GAPS.iter().filter(|g| g.severity == "high").count();
-    println!("\ncapability conformance debt: {} gaps ({} high)", KNOWN_GAPS.len(), highs);
+    println!(
+        "\ncapability conformance debt: {} gaps ({} high)",
+        KNOWN_GAPS.len(),
+        highs
+    );
 }
 
 // ── Ratchet placeholders: each becomes a real assertion when its gap is closed. ──

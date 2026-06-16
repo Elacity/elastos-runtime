@@ -214,6 +214,7 @@ dependencies = [
  "p256",
  "rand_core",
  "sha2",
+ "subtle",
  "x25519-dalek",
  "zeroize",
 ]

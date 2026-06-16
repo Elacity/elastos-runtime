@@ -93,11 +93,24 @@ struct SessionToken {
     sig_b64: String,
 }
 
-/// The node's effective wall clock for ISSUANCE (minting a session token's expiry): the
-/// caller-supplied `now_unix` when present (keeps issuance deterministic for tests + lock-stepped
-/// with the client's clock), else the real clock.
+/// The node's effective wall clock for ISSUANCE (minting a session token's expiry). A RELEASE build
+/// CLAMPS the caller-supplied `now_unix` to the node's real clock (pre-audit #4): a caller may pass an
+/// EARLIER `now` (which only SHRINKS its own session window — harmless), but never a LATER one, since a
+/// future `now` would mint `expires_at = now + TTL` past the intended bound and keep the session alive
+/// beyond its TTL as measured by the node's `security_now`. This mirrors `security_now`'s discipline
+/// (never trust the caller's clock to push time forward). Tests and `dev-modes` honor the caller value
+/// verbatim for deterministic windows.
 fn effective_now(now_unix: Option<u64>) -> u64 {
-    now_unix.unwrap_or_else(real_clock_secs)
+    #[cfg(any(test, feature = "dev-modes"))]
+    {
+        return now_unix.unwrap_or_else(real_clock_secs);
+    }
+    #[cfg(not(any(test, feature = "dev-modes")))]
+    {
+        let node_now = real_clock_secs();
+        // Upper-bound by the node clock; a caller can only ever shorten its window, never extend it.
+        now_unix.map(|n| n.min(node_now)).unwrap_or(node_now)
+    }
 }
 
 /// The node's clock for SECURITY-EXPIRY decisions (delegation/session windows, possession-token
@@ -1787,13 +1800,30 @@ fn authorize(args: &RecoverArgs, legacy_receipt_allowed: bool) -> Result<(), Str
         let chain = node_chain::NodeChain::from_env().ok_or(
             "trustless authorization requires a configured node chain capability (DKMS_CHAIN_RPC_POOL)",
         )?;
-        // The node enforces ITS OWN quorum identity when configured (anti cross-quorum replay);
-        // absent that pin it accepts the grant's declared node-set (the grant is still wallet- +
-        // chain-bound). Operators SHOULD set DKMS_AUTHORITY_NODE_SET_ID_B64 in production.
-        let expected_ns = std::env::var("DKMS_AUTHORITY_NODE_SET_ID_B64")
+        // The node enforces ITS OWN quorum identity (anti cross-quorum replay): a grant minted for a
+        // DIFFERENT node-set must not authorize a recover here. In RELEASE builds the pin is MANDATORY
+        // (pre-audit #4) — absent it, the node would have to trust the grant's caller-declared node-set,
+        // which the attacker controls, so we FAIL CLOSED. Tests/dev-modes fall back to the grant's
+        // declared id for deterministic single-set fixtures (the grant is still wallet- + chain-bound).
+        let pinned_ns = std::env::var("DKMS_AUTHORITY_NODE_SET_ID_B64")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| grant.delegation.node_set_id_b64.clone());
+            .filter(|s| !s.trim().is_empty());
+        let expected_ns = match pinned_ns {
+            Some(ns) => ns,
+            None => {
+                #[cfg(not(any(test, feature = "dev-modes")))]
+                {
+                    return Err(
+                        "DKMS_AUTHORITY_NODE_SET_ID_B64 must be set in release builds: the node refuses to authorize against a caller-declared node-set (cross-quorum replay defense)"
+                            .to_string(),
+                    );
+                }
+                #[cfg(any(test, feature = "dev-modes"))]
+                {
+                    grant.delegation.node_set_id_b64.clone()
+                }
+            }
+        };
         // SECURITY-EXPIRY uses the node's own clock (not the caller's) so an expired/revoked
         // delegation can't be kept alive by a backdated `now_unix`.
         let now = security_now(args.now_unix);

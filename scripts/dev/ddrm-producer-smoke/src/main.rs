@@ -704,6 +704,12 @@ fn run_live(
     let segment_b64 = sealed["segment_b64"].as_str().ok_or("no segment")?.to_string();
     let node_set_id_b64 = sealed["node_set_id_b64"].as_str().ok_or("no node_set_id")?.to_string();
     let node_set_id = B64.decode(&node_set_id_b64).map_err(|e| e.to_string())?;
+    // PRE-AUDIT #1: the producer now PUBLISHES a CEK commitment in the seal — forward it so the
+    // decrypt boundary verifies the reconstructed CEK against it (alongside 3-share cheater detection).
+    let cek_commitment_b64 = sealed["cek_commitment_b64"]
+        .as_str()
+        .ok_or("seal did not publish a cek_commitment_b64 (pre-audit #1)")?
+        .to_string();
     let shares = sealed["shares"].as_array().ok_or("no shares")?;
     if shares.len() != 3 {
         return Err("expected 3 sealed shares".to_string());
@@ -775,6 +781,7 @@ fn run_live(
         "nonce_b64": B64.encode(&nonce),
         "wrapped_cek_share2_b64": share2,
         "wrapped_cek_share3_b64": share3,
+        "cek_commitment_b64": cek_commitment_b64,
         "now_unix": NOW_UNIX,
     });
     let release = ok_data(
@@ -953,6 +960,10 @@ fn run_asset(
     let scheme = escrow["scheme"].as_str().ok_or("persisted escrow missing scheme")?.to_string();
     let node_set_id_b64 = escrow["node_set_id_b64"].as_str().ok_or("persisted escrow missing node_set_id_b64")?.to_string();
     let node_set_id = B64.decode(&node_set_id_b64).map_err(|e| e.to_string())?;
+    // PRE-AUDIT #1: the persisted escrow carries the producer's published CEK commitment; forward it.
+    let cek_commitment_b64 = escrow["cek_commitment_b64"].as_str()
+        .ok_or("persisted escrow missing cek_commitment_b64 (pre-audit #1)")?
+        .to_string();
     let producer_vk_b64 = escrow["producer_verifying_key_b64"].as_str()
         .ok_or("persisted escrow missing producer_verifying_key_b64 — asset is UNRECOVERABLE (pre-keystone-fix mint)")?
         .to_string();
@@ -1013,6 +1024,7 @@ fn run_asset(
         "nonce_b64": B64.encode(&nonce),
         "wrapped_cek_share2_b64": share2,
         "wrapped_cek_share3_b64": share3,
+        "cek_commitment_b64": cek_commitment_b64,
         "now_unix": NOW_UNIX,
     });
     let release = ok_data(
@@ -1063,6 +1075,7 @@ fn run_asset(
         "nonce_b64": B64.encode(&nonce_stream),
         "wrapped_cek_share2_b64": share2,
         "wrapped_cek_share3_b64": share3,
+        "cek_commitment_b64": cek_commitment_b64,
         "now_unix": NOW_UNIX,
     });
     let release_stream = ok_data(

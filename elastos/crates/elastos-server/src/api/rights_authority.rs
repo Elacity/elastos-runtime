@@ -770,16 +770,27 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
 
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");
-        assert_eq!(rights_mode(), RightsMode::Chain, "unset must default to Chain");
+        assert_eq!(
+            rights_mode(),
+            RightsMode::Chain,
+            "unset must default to Chain"
+        );
 
         for dev in ["dev", "chain-mock"] {
             std::env::set_var("ELASTOS_DDRM_RIGHTS", dev);
             // A release build cannot leave the secure path...
-            assert_eq!(rights_mode(), RightsMode::Chain, "{dev} must NOT downgrade rights_mode");
+            assert_eq!(
+                rights_mode(),
+                RightsMode::Chain,
+                "{dev} must NOT downgrade rights_mode"
+            );
             // ...and refuses to start rather than silently upgrading the misconfig.
             let err = enforce_release_build_rights_safety()
                 .expect_err("release build must refuse to start in a dev rights mode");
-            assert!(err.contains("Refusing to start"), "unexpected guard error: {err}");
+            assert!(
+                err.contains("Refusing to start"),
+                "unexpected guard error: {err}"
+            );
         }
 
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain");
@@ -798,7 +809,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "dev");
         assert_eq!(rights_mode(), RightsMode::Dev);
-        assert!(enforce_release_build_rights_safety().is_ok(), "dev-modes build never fails the guard");
+        assert!(
+            enforce_release_build_rights_safety().is_ok(),
+            "dev-modes build never fails the guard"
+        );
         std::env::set_var("ELASTOS_DDRM_RIGHTS", "chain-mock");
         assert_eq!(rights_mode(), RightsMode::ChainMock);
         std::env::remove_var("ELASTOS_DDRM_RIGHTS");

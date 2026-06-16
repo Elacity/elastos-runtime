@@ -482,6 +482,7 @@ fn system_runtime_event_summary(
         | AuditEvent::CapabilityRevoke { timestamp, .. }
         | AuditEvent::CapabilityUse { timestamp, .. }
         | AuditEvent::ContentFetch { timestamp, .. }
+        | AuditEvent::ContentOpen { timestamp, .. }
         | AuditEvent::AuthAttempt { timestamp, .. }
         | AuditEvent::EpochAdvance { timestamp, .. }
         | AuditEvent::ConfigChange { timestamp, .. }
@@ -528,6 +529,11 @@ fn system_runtime_event_summary(
             }
             format!("Content fetch failed — {cid}")
         }
+        AuditEvent::ContentOpen {
+            content_id,
+            decision,
+            ..
+        } => format!("Content {decision} — {content_id}"),
         AuditEvent::AuthAttempt {
             identity,
             success,

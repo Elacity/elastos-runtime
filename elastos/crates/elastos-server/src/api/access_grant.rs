@@ -86,11 +86,18 @@ fn sessions() -> &'static GrantSessionStore {
 /// Cache key for a live delegation: the on-chain owner + the asset's kid, both normalized so the
 /// browser's open path and the prepare path agree on the slot.
 fn session_key(owner_address: &str, kid_hex: &str) -> String {
-    format!("{}|{}", owner_address.trim().to_ascii_lowercase(), kid_hex.trim().to_ascii_lowercase())
+    format!(
+        "{}|{}",
+        owner_address.trim().to_ascii_lowercase(),
+        kid_hex.trim().to_ascii_lowercase()
+    )
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn random_b64(n: usize) -> String {
@@ -121,7 +128,11 @@ fn run_sidecar(mode: &str, input: &Value) -> Result<Value, String> {
     {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         stdin
-            .write_all(serde_json::to_vec(input).map_err(|e| e.to_string())?.as_slice())
+            .write_all(
+                serde_json::to_vec(input)
+                    .map_err(|e| e.to_string())?
+                    .as_slice(),
+            )
             .map_err(|e| format!("write sidecar stdin: {e}"))?;
         // stdin dropped here -> EOF, so the sidecar's read_to_string returns.
     }
@@ -197,11 +208,21 @@ pub fn prepare(
         sweep_expired(&mut map, now);
         map.insert(
             handle.clone(),
-            Pending { session_seed_b64, delegation_json, created_at: now },
+            Pending {
+                session_seed_b64,
+                delegation_json,
+                created_at: now,
+            },
         );
     }
 
-    Ok(PreparedGrant { handle, delegation_canonical, owner_address, kid_hex, chain_id })
+    Ok(PreparedGrant {
+        handle,
+        delegation_canonical,
+        owner_address,
+        kid_hex,
+        chain_id,
+    })
 }
 
 /// PHASE 2 — consume the handle, hand the sidecar the stashed material + the wallet signature, and
@@ -231,7 +252,11 @@ pub fn assemble(handle: &str, delegation_sig_hex: &str) -> Result<Value, String>
 /// Run the sidecar `--grant-assemble` over the given material and return the grant JSON. Each call
 /// builds a FRESH per-request object (new nonce + timestamp), so reusing the same delegation +
 /// signature across opens yields a new, non-replayable grant every time.
-fn assemble_with(session_seed_b64: &str, delegation_json: &Value, delegation_sig_hex: &str) -> Result<Value, String> {
+fn assemble_with(
+    session_seed_b64: &str,
+    delegation_json: &Value,
+    delegation_sig_hex: &str,
+) -> Result<Value, String> {
     let out = run_sidecar(
         "--grant-assemble",
         &json!({
@@ -248,9 +273,18 @@ fn assemble_with(session_seed_b64: &str, delegation_json: &Value, delegation_sig
 /// Promote a just-signed delegation into the live session cache keyed by (owner, kid), with the
 /// delegation's own `expires_at` as the TTL. Best-effort: a malformed delegation simply isn't cached.
 fn cache_session(session_seed_b64: &str, delegation_json: &Value, delegation_sig_hex: &str) {
-    let owner = delegation_json.get("owner_address").and_then(Value::as_str).unwrap_or_default();
-    let kid = delegation_json.get("kid_hex").and_then(Value::as_str).unwrap_or_default();
-    let expires_at = delegation_json.get("expires_at").and_then(Value::as_u64).unwrap_or(0);
+    let owner = delegation_json
+        .get("owner_address")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kid = delegation_json
+        .get("kid_hex")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let expires_at = delegation_json
+        .get("expires_at")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if owner.is_empty() || kid.is_empty() || expires_at == 0 {
         return;
     }
@@ -286,11 +320,17 @@ pub fn has_live_session(owner_address: &str, kid_hex: &str) -> bool {
 pub fn assemble_cached(owner_address: &str, kid_hex: &str) -> Result<Option<Value>, String> {
     let key = session_key(owner_address, kid_hex);
     let (seed, delegation, sig) = {
-        let mut map = sessions().lock().map_err(|_| "grant session store poisoned")?;
+        let mut map = sessions()
+            .lock()
+            .map_err(|_| "grant session store poisoned")?;
         let now = now_unix();
         map.retain(|_, s| s.expires_at > now);
         match map.get(&key) {
-            Some(s) => (s.session_seed_b64.clone(), s.delegation_json.clone(), s.delegation_sig_hex.clone()),
+            Some(s) => (
+                s.session_seed_b64.clone(),
+                s.delegation_json.clone(),
+                s.delegation_sig_hex.clone(),
+            ),
             None => return Ok(None),
         }
     };

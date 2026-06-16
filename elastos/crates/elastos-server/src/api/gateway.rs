@@ -217,9 +217,40 @@ pub struct GatewayState {
     pub cache_dir: PathBuf,
     /// Runtime data directory backing rooted Publisher/Edge/MyWebSite state.
     pub data_dir: PathBuf,
+    /// Tamper-evident audit sink (GAP-8), lazily file-backed under `data_dir/audit/`. Mirrors the
+    /// `identity_manager` lazy pattern: an EXPLICIT field (no hidden global), initialized on first
+    /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. FOLLOW-ON: unify this with the
+    /// runtime/infra audit sink so the gateway and runtime share ONE custody log.
+    pub audit_log: Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>>,
 }
 
 impl GatewayState {
+    /// The tamper-evident audit log, lazily opened (hash-chained + ed25519-signed) under
+    /// `data_dir/audit/gateway-audit.log`. If the file cannot be opened it FALLS BACK to a
+    /// memory-only log and logs loudly — content opens still proceed, but that run is not
+    /// persistently tamper-evident (the open itself is gated elsewhere).
+    pub(crate) fn audit_log(&self) -> Arc<elastos_runtime::primitives::audit::AuditLog> {
+        use elastos_runtime::primitives::audit::AuditLog;
+        if let Some(existing) = self.audit_log.get() {
+            return existing.clone();
+        }
+        let path = self.data_dir.join("audit").join("gateway-audit.log");
+        let log = match AuditLog::with_file(&path) {
+            Ok(log) => Arc::new(log),
+            Err(e) => {
+                tracing::error!(
+                    "audit log file init failed at {:?} ({e}); falling back to memory-only \
+                     (this run's audit is NOT persistently tamper-evident)",
+                    path
+                );
+                Arc::new(AuditLog::new())
+            }
+        };
+        let _ = self.audit_log.set(log.clone());
+        // Another thread may have won the race; return whatever is now canonical.
+        self.audit_log.get().cloned().unwrap_or(log)
+    }
+
     pub(crate) fn identity_manager(
         &self,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<IdentityManager>>> {

@@ -301,14 +301,15 @@ impl PendingRequestStore {
         }
 
         // Audit
-        self.audit_log
-            .emit(crate::primitives::audit::AuditEvent::CapabilityRequested {
+        self.audit_log.emit_best_effort(
+            crate::primitives::audit::AuditEvent::CapabilityRequested {
                 timestamp: SecureTimestamp::now(),
                 request_id: request.id.to_string(),
                 session_id: session_id.to_string(),
                 resource: resource.to_string(),
                 action: action.to_string(),
-            });
+            },
+        );
 
         request
     }
@@ -367,7 +368,7 @@ impl PendingRequestStore {
 
         // Audit
         self.audit_log
-            .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
+            .emit_best_effort(crate::primitives::audit::AuditEvent::CapabilityDenied {
                 timestamp: SecureTimestamp::now(),
                 request_id: request_id.to_string(),
                 session_id: request.session_id.to_string(),
@@ -498,13 +499,14 @@ impl PendingRequestStore {
                 };
 
                 // Audit
-                self.audit_log
-                    .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
+                self.audit_log.emit_best_effort(
+                    crate::primitives::audit::AuditEvent::CapabilityDenied {
                         timestamp: SecureTimestamp::now(),
                         request_id: request_id.to_string(),
                         session_id: request.session_id.to_string(),
                         reason: "Revoked by user".to_string(),
-                    });
+                    },
+                );
             }
         }
     }
@@ -522,13 +524,14 @@ impl PendingRequestStore {
                     reason: "Epoch advanced - all capabilities revoked".to_string(),
                 };
 
-                self.audit_log
-                    .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
+                self.audit_log.emit_best_effort(
+                    crate::primitives::audit::AuditEvent::CapabilityDenied {
                         timestamp: now,
                         request_id: request_id.clone(),
                         session_id: request.session_id.to_string(),
                         reason: "Epoch advanced - all capabilities revoked".to_string(),
-                    });
+                    },
+                );
             }
         }
     }
