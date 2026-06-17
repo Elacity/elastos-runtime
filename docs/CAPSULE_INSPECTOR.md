@@ -166,18 +166,48 @@ the same authority boundary):
 | WASM / microVM capsule, agent | serial Carrier bridge → `carrier_invoke` | `RequestHandler::handle_inspect` | capability token → scope |
 | Browser-hosted UI (this capsule) | node-local control API (`POST /api/provider/inspect/<op>` + `x-elastos-home-token`) | gateway → provider registry | signed home launch token → app → scope |
 
-**Status (Principle #12 honesty):** the capsule/`carrier_invoke` path is
+**Status (Principle #12 honesty).** The capsule/`carrier_invoke` path is
 implemented and tested (`RequestHandler::handle_inspect`). The browser path is
-**not yet wired in the runtime**: the gateway dispatches `/api/provider/<scheme>/<op>`
-via `ProviderRegistry::send_raw`, and `GatewayState` holds only the provider
-registry (no `CapsuleManager`/`AuditLog`). So serving the browser Inspector
-requires exposing inspect as a **registry provider** (`elastos://inspect/*`)
-that holds `CapsuleManager` + `AuditLog` and delegates the decision to
-`crate::inspect`. That provider would also let `RequestHandler::route_to_provider`
-reach the same code, converging on **one canonical path** (Principle #10) — at
-which point the bespoke `handle_inspect` intercept can retire. The UI adapter
-above already targets this `/api/provider/inspect/<op>` contract and degrades
-to sample data until the provider exists.
+**not yet wired, and is not a simple "add a provider" away** — a deeper
+architecture finding blocks the naive convergence:
+
+There is **no single capsule world**. Three separate domains exist, and the
+gateway can reach none of the rich one:
+
+| Domain | Holds | Reached by | Capsule detail |
+| --- | --- | --- | --- |
+| `elastos-runtime::CapsuleManager` | full manifest, capabilities, trust, audit | `RequestHandler::handle_inspect` | rich (the 9 fields) |
+| `elastos-server::Runtime` (`RunningCapsuleInfo`) | id, name, status, type | the supervisor | thin |
+| **Gateway** (browser front door) | **only `Arc<ProviderRegistry>`** | the browser UI | none (provider schemes) |
+
+Evidence: `elastos-server` has zero references to `CapsuleManager`; the gateway
+is started with only the registry (`supervisor.rs` → `start_gateway_server(addr,
+Some(registry), …)`); `GatewayState` holds only `provider_registry`.
+
+Consequences for the plan:
+
+- A registry provider registered **in the supervisor cannot hold a
+  `CapsuleManager`/`AuditLog`** — they don't exist in that process.
+- The `handle_inspect` intercept **must not be retired**: it is the only path
+  that reaches the rich `CapsuleManager` inspect (serving capsules/agents via
+  the IO/carrier bridge).
+- "One canonical path" (#10) is a real cross-process bridging effort, not a
+  provider registration.
+
+Open options (owner decision):
+
+1. **Registry view (feasible now):** a browser-facing inspect that enumerates
+   what the gateway actually has — registered providers/schemes and their
+   status from `ProviderRegistry`. Honest but a *services* view, not the rich
+   capsule view.
+2. **Keep rich inspect as the capsule/agent path** (already built/tested) and
+   defer the browser bridge.
+3. **Bridge gateway → runtime** so the browser can reach the rich
+   `CapsuleManager` inspect (the real convergence; needs the process-topology
+   decision first).
+
+The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
+to sample data until one of these lands.
 
 ## Wire contract: `elastos://inspect/*` (read-only)
 
