@@ -1342,6 +1342,20 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        "inspect" => match op.as_str() {
+            // Read-only Capsule Inspector. Full-view inspect is a System
+            // operator surface (System scope); the provider is read-only and
+            // gated. Write ops (e.g. revoke) are intentionally not exposed
+            // through the browser proxy.
+            "capsules" | "capsule" => &[SYSTEM_CAPSULE_ID],
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
     let context =

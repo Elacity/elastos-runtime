@@ -807,6 +807,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_dispatch_reaches_inspect_provider() {
+        // The leg both product transports converge on: ProviderRegistry::send_raw
+        // by scheme must resolve to the registered inspect provider.
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register(Arc::new(InspectProvider::new(Arc::new(MockSource {
+                entries: vec![probe_entry()],
+            }))))
+            .await;
+        let resp = registry
+            .send_raw("inspect", &json!({ "op": "capsules" }))
+            .await
+            .expect("registry dispatch");
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["capsules"][0]["id"], "cap_probe_1");
+    }
+
+    #[tokio::test]
     async fn registry_source_includes_sub_providers() {
         let registry = Arc::new(ProviderRegistry::new());
         // "did" is a reserved sub-provider scheme.

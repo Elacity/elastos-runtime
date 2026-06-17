@@ -377,6 +377,7 @@ mod documents;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod home_system;
+mod inspect;
 mod library;
 mod marketplace;
 mod recovery;
