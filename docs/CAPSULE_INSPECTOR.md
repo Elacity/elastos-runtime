@@ -54,15 +54,46 @@ A read-only view, one screen per capsule, of nine fields:
 8. **provenance** — signature, signer DID, version, install time, CID
 9. **logs / audit + running processes** — recent audited calls, live instances
 
-## Security invariants (non-negotiable)
+## Security model (non-negotiable)
+
+### Threat
+
+A *system-wide* inspect view aggregates every capsule's manifest, capability
+grants, and audit trail. In the runtime today this god-view is **shell-only**
+(`request_handler.rs` — `ListCapsules`, `GrantCapability`, `RevokeCapability`,
+`Launch`/`Stop` all reject non-shell callers). If the inspect surface returned
+that view to any holder of a flat `inspect` capability, **any installed app
+could enumerate every other capsule's powers and history** — an information-
+disclosure / privilege-escalation hole, and the exact opposite of what this
+feature exists to demonstrate. Visibility must therefore be *scoped*.
+
+### Two tiers
+
+| Capability               | Scope        | Who holds it          | Sees                         |
+| ------------------------ | ------------ | --------------------- | ---------------------------- |
+| `elastos://inspect/all`  | **System**   | shell / System surface | every capsule                |
+| `elastos://inspect/read` | **SelfOnly** | any ordinary capsule  | only its own capsule record  |
+
+Shell callers are always treated as **System** scope, matching existing
+orchestrator privilege. A caller holding neither capability (and not the shell)
+is denied — the gate **fails closed**.
+
+This decision is implemented as a pure, unit-tested unit in the trusted core:
+`elastos-runtime::inspect` (`authorize_view`, `InspectScope`). The runtime-side
+handler MUST call `authorize_view` before returning any per-capsule detail.
+
+### Invariants
 
 - **Read-only.** The inspect surface exposes *no* write/sign/launch effect.
 - **No new trust.** The Inspector capsule holds zero ambient authority and
   itself appears in the Inspector, subject to the same rules it reveals.
-- **Permissioned mirror.** Every inspect call is capability-gated
-  (`elastos://inspect/read`) and audited like any other provider call.
-- **Scope-bound.** A principal can only inspect capsules within its own
-  session / grant scope. Out-of-scope inspection is denied *and* audited.
+- **Permissioned mirror.** Every inspect call is capability-gated and audited
+  like any other provider call.
+- **Scope-bound, fail-closed.** A caller sees only what its scope allows;
+  out-of-scope inspection is denied *and* audited. No capability ⇒ no data.
+- **Least privilege.** The full-view product surface (this Inspector) requests
+  `elastos://inspect/all`, which only the System surface can grant — it is a
+  System-trusted surface, not a freely distributable app.
 
 ## Phasing
 
@@ -82,18 +113,29 @@ deliberately deferred.
 
 This branch contains the Phase-1 starter:
 
-- `capsules/capsule-inspector/` — a WASM **app** capsule (UI) that renders the
-  nine-field view. It requires only `elastos://inspect/read`. Ships with sample
-  data so the UI renders standalone; calls the live provider when present.
-- This doc — the architecture, contract, and phasing.
+- `elastos-runtime::inspect` — the scope/authorization core (`authorize_view`,
+  `InspectScope`) with unit tests. Pure logic, landed and tested ahead of the
+  handler so the security invariant is provable in isolation.
+- `capsules/capsule-inspector/` — a WASM capsule (UI) that renders the
+  nine-field view. As the full-view product surface it requests
+  `elastos://inspect/all` (System-granted). Ships with sample data so the UI
+  renders standalone; calls the live provider when present.
+- This doc — the architecture, security model, contract, and phasing.
 
 The remaining Phase-1 piece is the runtime-side read-only handler that backs
-`elastos://inspect/*` from `CapsuleManager` + `AuditLog`. It is additive and
-read-only; see the contract below.
+`elastos://inspect/*` from `CapsuleManager` + `CapabilityManager` +
+`AuditLog::recent_events`, gated by `inspect::authorize_view` and auditing
+denials. It is additive and read-only; see the contract below. Suggested
+integration point: route `elastos://inspect/*` through the existing
+`ResourceRequest` path in `RequestHandler` (no new protocol variant needed).
 
 ## Wire contract: `elastos://inspect/*` (read-only)
 
-All operations are `read`. Responses are JSON.
+All operations are `read`. Responses are JSON. Every response is **filtered by
+the caller's scope** (see Security model): `System` callers see all capsules;
+`SelfOnly` callers see only their own record. A request for a capsule outside
+the caller's scope returns `{ "error": "out_of_scope" }` and emits an audit
+event — it never silently returns empty.
 
 ### `elastos://inspect/capsules` — list
 

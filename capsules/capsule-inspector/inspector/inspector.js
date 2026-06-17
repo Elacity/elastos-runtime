@@ -28,9 +28,13 @@ async function loadCapsuleList() {
   const live = await inspectInvoke("capsules", {});
   if (live && Array.isArray(live.capsules)) {
     setSourceBadge(true);
+    // Scope is reported by the runtime handler ("system" | "self").
+    setScopeBadge(live.scope || "system");
     return live.capsules;
   }
   setSourceBadge(false);
+  // Sample data illustrates the privileged System view.
+  setScopeBadge("system");
   return SAMPLE_DATA.map((c) => ({
     id: c.id, name: c.name, role: c.role, type: c.type, state: c.state,
   }));
@@ -66,8 +70,15 @@ function setSourceBadge(isLive) {
   badge.className = "badge " + (isLive ? "badge-live" : "badge-sample");
 }
 
+function setScopeBadge(scope) {
+  const badge = document.getElementById("scope-badge");
+  const isSystem = scope === "system";
+  badge.textContent = "scope: " + (isSystem ? "system (all capsules)" : "self only");
+  badge.className = "badge " + (isSystem ? "badge-live" : "badge-sample");
+}
+
 function fmtTime(ts) {
-  if (!ts) return "—";
+  if (typeof ts !== "number" || !isFinite(ts) || ts <= 0) return "—";
   return new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19);
 }
 
