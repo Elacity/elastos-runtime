@@ -1219,9 +1219,11 @@ mod tests {
         (handler, shell_id)
     }
 
-    /// Like `create_test_handler`, but also returns the capability manager so
-    /// inspect conformance tests can mint scoped tokens.
-    async fn create_test_handler_with_caps() -> (RequestHandler, CapsuleId, Arc<CapabilityManager>) {
+    /// Like `create_test_handler`, but also returns the capability and capsule
+    /// managers so inspect conformance tests can mint scoped tokens and launch
+    /// real capsules to introspect.
+    async fn create_test_handler_with_caps(
+    ) -> (RequestHandler, CapsuleId, Arc<CapabilityManager>, Arc<CapsuleManager>) {
         let compute = Arc::new(MockComputeProvider);
         let store = Arc::new(CapabilityStore::new());
         let audit_log = Arc::new(AuditLog::new());
@@ -1245,7 +1247,7 @@ mod tests {
             Arc::new(NullFetcher),
         ));
         let handler = RequestHandler::new(
-            capsule_manager,
+            capsule_manager.clone(),
             capability_manager.clone(),
             message_channel,
             content_resolver,
@@ -1255,7 +1257,112 @@ mod tests {
         );
         let shell_id = CapsuleId::new();
         handler.set_shell(shell_id.clone()).await;
-        (handler, shell_id, capability_manager)
+        (handler, shell_id, capability_manager, capsule_manager)
+    }
+
+    /// A manifest with affordances, a required capability, a storage namespace,
+    /// and a (sensitive) signature — used to prove the inspector renders the
+    /// contract faithfully and never echoes the raw signature.
+    fn probe_manifest() -> elastos_common::CapsuleManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "probe",
+            "role": "app",
+            "type": "wasm",
+            "entrypoint": "probe.wasm",
+            "capabilities": ["elastos://storage/probe"],
+            "interfaces": [{
+                "id": "elastos.probe/v1",
+                "version": "1",
+                "methods": [{
+                    "id": "ping", "risk": "read", "approval": "none", "audit": "summary"
+                }]
+            }],
+            "permissions": { "storage": ["localhost://WebSpaces/probe/"] },
+            "signature": "SECRET_SIGNATURE_MUST_NOT_LEAK"
+        }))
+        .expect("probe manifest deserializes")
+    }
+
+    #[tokio::test]
+    async fn inspect_detail_renders_contract_without_leaking_authority() {
+        let (handler, shell_id, _caps, capsule_manager) = create_test_handler_with_caps().await;
+        let id = capsule_manager
+            .launch_local(std::path::Path::new("."), probe_manifest(), TrustLevel::Trusted)
+            .await
+            .expect("launch probe");
+
+        let resp = handler
+            .handle(
+                &shell_id,
+                inspect_request(
+                    "elastos://inspect/capsule",
+                    None,
+                    Some(serde_json::json!({ "id": id.to_string() })),
+                ),
+            )
+            .await;
+
+        let data = match resp {
+            RuntimeResponse::Ok { data: Some(data) } => data,
+            other => panic!("expected Ok with data, got {:?}", other),
+        };
+
+        // Faithful projection of manifest-declared facts.
+        assert_eq!(data["affordances"][0]["id"], "ping");
+        assert_eq!(data["affordances"][0]["risk"], "read");
+        assert_eq!(data["affordances"][0]["interface"], "elastos.probe/v1");
+        assert_eq!(data["required_capabilities"][0], "elastos://storage/probe");
+        assert_eq!(data["storage_namespaces"][0], "localhost://WebSpaces/probe/");
+        assert_eq!(data["identity"]["signature_present"], true);
+
+        // Principle #16: UI surfaces must not expose bearer tokens or mutation
+        // handles. The raw signature is reduced to a boolean and never echoed,
+        // and no bearer "token" field appears anywhere in the projection.
+        let serialized = serde_json::to_string(&data).unwrap();
+        assert!(
+            !serialized.contains("SECRET_SIGNATURE_MUST_NOT_LEAK"),
+            "raw signature leaked into inspect output"
+        );
+        assert!(
+            !serialized.contains("\"token\""),
+            "bearer token field leaked into inspect output"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_self_returns_callers_own_record() {
+        // Principle #7: any capsule (human-driven or agent) can introspect
+        // itself with a minimal self grant — the same authority model for both.
+        let (handler, _shell, caps, capsule_manager) = create_test_handler_with_caps().await;
+        let id = capsule_manager
+            .launch_local(std::path::Path::new("."), probe_manifest(), TrustLevel::Trusted)
+            .await
+            .expect("launch probe");
+
+        let self_token = caps
+            .grant(
+                id.as_str(),
+                ResourceId::new("elastos://inspect/self"),
+                Action::Read,
+                InternalConstraints::default(),
+                None,
+            )
+            .to_base64()
+            .expect("encode token");
+
+        let resp = handler
+            .handle(&id, inspect_request("elastos://inspect/self", Some(self_token), None))
+            .await;
+
+        match resp {
+            RuntimeResponse::Ok { data: Some(data) } => {
+                assert_eq!(data["id"], id.to_string());
+                assert_eq!(data["name"], "probe");
+            }
+            other => panic!("expected Ok with own record, got {:?}", other),
+        }
     }
 
     fn inspect_request(
@@ -1303,7 +1410,7 @@ mod tests {
     async fn inspect_self_only_token_cannot_reach_system_endpoints() {
         // The privilege-escalation guard at the handler boundary: a self-only
         // grant must not let a capsule enumerate or read other capsules.
-        let (handler, shell_id, caps) = create_test_handler_with_caps().await;
+        let (handler, shell_id, caps, _capsule_manager) = create_test_handler_with_caps().await;
         let caller = CapsuleId::new();
         let self_token = caps
             .grant(

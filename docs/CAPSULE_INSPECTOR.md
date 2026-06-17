@@ -206,6 +206,21 @@ endpoint a `SelfOnly` capsule uses to introspect itself.
 ```
 
 The runtime-side handler maps these fields from existing sources:
-`CapsuleManager::list()` / `get()` (id, manifest, state, cid, trust_level),
-`CapabilityManager` (granted/denied tokens), and `AuditLog::memory_buffer`
-(recent events + counts). No new state is introduced.
+`CapsuleManager::list()` / `get()` (id, manifest, state, cid, trust_level) and
+`AuditLog::recent_events` (recent events + counts). No new state is introduced.
+
+### Why `granted_capabilities` is observed, not enumerated
+
+ElastOS capabilities are **bearer-token object-capabilities**: a grant is an
+unforgeable signed token held by the grantee, validated by signature +
+revocation epoch + revoked-set. The runtime keeps **no central per-capsule
+registry of active grants** (only a revoked-set and use-counts). So the
+authoritative, safe-to-display record of authority is the **audit log** — what
+was actually granted and used. `granted_capabilities` is therefore *observed
+from audit*, by design, not read from a token table.
+
+This is also why Principle #16 (UI Surfaces Must Not Be Authority) is load
+bearing here: the inspector projects an allow-listed set of safe fields and
+**never** echoes a bearer token, a raw signature, or any mutation handle. The
+raw manifest `signature` is reduced to `signature_present: true`. This is
+enforced by test (`inspect_detail_renders_contract_without_leaking_authority`).
