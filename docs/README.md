@@ -29,6 +29,7 @@ Planning and truth surfaces outside `docs/`:
 - [adr/0001-extract-app-and-service-logic-from-trusted-core.md](adr/0001-extract-app-and-service-logic-from-trusted-core.md) — ADR: shrink the trusted core by moving app/service logic into its capsules (Principle 5)
 - [CAPABILITY_AUDIT.md](CAPABILITY_AUDIT.md) — capability-conformance audit: enforcement architecture, what's proven, and the gaps (machine-checked in the `capability_conformance` test harness)
 - [SECURITY_AUDIT.md](SECURITY_AUDIT.md) — adversarial security audit: crypto correctness, identity binding, secrets hygiene, memory safety; findings + what's sound
+- [CONFIDENTIAL_COMPUTE.md](CONFIDENTIAL_COMPUTE.md) — TEE / hardware-enclave (SEV-SNP, TDX, remote attestation) opportunity, runtime-wide wedges, and a phased architecture scaffold (forward design; nothing implemented yet)
 - [CAPSULE_MODEL.md](CAPSULE_MODEL.md) — supplemental capsule/runtime terminology note
 - [CARRIER.md](CARRIER.md) — supplemental Carrier framing note
 - [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
