@@ -364,14 +364,21 @@ The one mutating endpoint. Requires a **`Write`** inspect capability at
 a malformed id. The action is audited (`inspect.revoke`) in addition to the
 capability manager's own revocation audit.
 
-### `elastos://inspect/plan` (params: `{ "id", "interface", "method", "args" }`) — read
+### `elastos://inspect/plan` — read (two reflective modes, never mixed)
 
 Metadata-driven invocation **preview** (read-only dry-run; dispatches no
-effect). Looks up the affordance's typed metadata, validates `args` against its
+effect). It answers, *before* anything runs, "what authority would this ask
+for?" — derived entirely from the capsule's own metadata, so a preview can
+never under-state the gate the runtime later enforces. This is the agent-safe
+wedge made concrete and the reflective half of the CAR invoke kernel
+(`elastos-runtime::invoke`).
+
+**Mode A — affordance** (params: `{ "id", "interface", "method", "args" }`).
+Looks up the `interfaces[].methods` affordance, validates `args` against its
 `input_schema`, and returns the gate the call *would* require:
 
 ```json
-{ "valid": true, "capability_action": "write", "approval": "user", "audit": "event" }
+{ "valid": true, "kind": "affordance", "capability_action": "write", "approval": "user", "audit": "event" }
 ```
 
 or, when the args don't satisfy the contract:
@@ -380,9 +387,29 @@ or, when the args don't satisfy the contract:
 { "valid": false, "error": "missing_required_field", "field": "body" }
 ```
 
-This is the reflective half of the CAR invoke kernel (`elastos-runtime::invoke`).
+**Mode B — provider operation** (params: `{ "id", "operation" }`). Provider
+capsules (DDRM: key release, decrypt render, rights, chain broadcast) express
+their powers via `authority.capabilities[]`, not interface methods. This mode
+reflects that block to return the exact capability tuple — resource + the full
+set of actions a caller's capability must cover — plus the audit events the
+provider emits:
+
+```json
+{ "valid": true, "kind": "operation", "resource": "elastos://key/*",
+  "capability_actions": ["execute"], "audit_events": ["key.release.denied", "key.release.granted"] }
+```
+
+The action set is surfaced **whole**, never collapsed to one, and an action
+keyword the capability layer doesn't recognise is a hard `manifest_error`
+(fail-closed) rather than a silent drop — the preview cannot under-state the
+gate. An operation no capability block declares returns
+`{ "valid": false, "error": "unknown_operation" }`.
+
 Effect *dispatch* (and the location-agnostic Carrier / cross-language transport)
-is intentionally not implemented — that architecture is to be planned.
+is intentionally not implemented — that architecture is to be planned. When the
+DDRM branch lands, dispatch should consult its `required_action_for` op→action
+map as the authoritative classifier so the planner's preview and the carrier
+bridge's enforcement agree by construction.
 
 ### Why `granted_capabilities` is observed, not enumerated
 

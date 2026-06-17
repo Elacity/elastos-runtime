@@ -84,6 +84,15 @@ async function inspectRevoke(tokenId) {
   return await inspectInvoke("revoke", { token_id: tokenId });
 }
 
+// Reflective preview (read-only, dispatches nothing): ask the runtime what
+// capability gate a provider *operation* would require. This is the agent-safe
+// wedge made tangible — "before I let this run, show me exactly what authority
+// it asks for." The answer is derived from the capsule's own `authority`
+// metadata, so it can never under-state the gate the runtime later enforces.
+async function planOperation(id, operation) {
+  return await inspectInvoke("plan", { id, operation });
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -174,19 +183,34 @@ function renderAffordances(affordances) {
 // Provider authority — the declarative powers a provider capsule is authorized
 // for. This is what makes a provider's real capabilities (key release, decrypt
 // render, rights decisions, chain broadcast) visible in the glass box.
-function renderAuthority(authority) {
+function renderAuthority(authority, capsuleId) {
   const wrap = el("div");
   if (authority.reason) {
     wrap.appendChild(el("div", { class: "note", text: authority.reason }));
   }
   for (const cap of authority.capabilities || []) {
-    const ops = (cap.operations || []).join(", ");
     const acts = (cap.actions || []).join(", ");
-    wrap.appendChild(el("div", { class: "row" }, [
-      el("span", { class: "mono grow", text: cap.resource }),
-      el("span", { class: "tag tag-sign", text: acts }),
-      el("span", { class: "tag mono", text: ops }),
-    ]));
+    // One row per operation so each declared power can be previewed on its own.
+    for (const op of cap.operations || []) {
+      const result = el("div", { class: "plan-result" });
+      const previewBtn = el("button", { class: "btn-preview", text: "preview gate" });
+      previewBtn.addEventListener("click", () =>
+        runOperationPreview(capsuleId, op, result, previewBtn));
+      wrap.appendChild(el("div", { class: "row" }, [
+        el("span", { class: "mono grow", text: op }),
+        el("span", { class: "tag mono", text: cap.resource }),
+        el("span", { class: "tag tag-sign", text: acts }),
+        previewBtn,
+      ]));
+      wrap.appendChild(result);
+    }
+    // A capability block with no operations is still worth showing.
+    if (!(cap.operations || []).length) {
+      wrap.appendChild(el("div", { class: "row" }, [
+        el("span", { class: "mono grow", text: cap.resource }),
+        el("span", { class: "tag tag-sign", text: acts }),
+      ]));
+    }
   }
   for (const ev of authority.audit_events || []) {
     wrap.appendChild(el("div", { class: "row" }, [
@@ -194,6 +218,64 @@ function renderAuthority(authority) {
     ]));
   }
   return wrap;
+}
+
+// Offline twin of the server's plan_provider_operation: reflect the sample
+// capsule's authority to derive the same gate when no live runtime is present.
+// Mirrors the server contract exactly so sample and live render identically.
+function localPlanOperation(capsuleId, operation) {
+  const capsule = SAMPLE_DATA.find((c) => c.id === capsuleId);
+  const authority = capsule && capsule.authority;
+  if (!authority) return null;
+  const block = (authority.capabilities || []).find((cap) =>
+    (cap.operations || []).includes(operation));
+  if (!block) return { valid: false, error: "unknown_operation", operation };
+  return {
+    valid: true,
+    kind: "operation",
+    resource: block.resource,
+    capability_actions: block.actions || [],
+    audit_events: authority.audit_events || [],
+  };
+}
+
+// Run a read-only gate preview for one provider operation and render the exact
+// capability tuple it would require, inline beneath the operation row.
+async function runOperationPreview(capsuleId, operation, target, btn) {
+  if (!capsuleId) return;
+  btn.disabled = true;
+  target.innerHTML = "";
+  try {
+    let plan;
+    try {
+      plan = await planOperation(capsuleId, operation);
+    } catch (liveErr) {
+      // No live runtime (sample/offline): derive the same preview from the
+      // capsule's in-memory authority metadata so the demo still works.
+      plan = localPlanOperation(capsuleId, operation);
+      if (!plan) throw liveErr;
+    }
+    if (plan && plan.valid) {
+      const actions = (plan.capability_actions || []).join(" + ");
+      target.appendChild(el("div", { class: "plan-ok" }, [
+        el("span", { class: "note", text: "requires a capability covering" }),
+        el("span", { class: "mono", text: plan.resource }),
+        el("span", { class: "tag tag-sign", text: "action: " + actions }),
+      ]));
+      for (const ev of plan.audit_events || []) {
+        target.appendChild(el("div", { class: "audit-line" }, [
+          el("span", { class: "mono", text: "audits: " + ev }),
+        ]));
+      }
+    } else {
+      const why = (plan && plan.error) || "unknown";
+      target.appendChild(el("div", { class: "plan-deny", text: "no preview: " + why }));
+    }
+  } catch (err) {
+    target.appendChild(el("div", { class: "plan-deny", text: "preview failed: " + err.message }));
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderRequired(caps) {
@@ -286,7 +368,7 @@ function renderDetail(c) {
 
   // Provider powers (for provider capsules that declare authority).
   if (c.authority && (c.authority.capabilities || c.authority.reason)) {
-    detail.appendChild(card("Provider authority (powers)", renderAuthority(c.authority)));
+    detail.appendChild(card("Provider authority (powers)", renderAuthority(c.authority, c.id)));
   }
 
   // 4 + 5 capabilities

@@ -587,39 +587,58 @@ impl InspectProvider {
     }
 
     async fn handle_plan(&self, request: &Value) -> Value {
-        let (id, interface, method) = match (
-            request.get("id").and_then(Value::as_str),
-            request.get("interface").and_then(Value::as_str),
-            request.get("method").and_then(Value::as_str),
-        ) {
-            (Some(id), Some(i), Some(m)) => (id, i, m),
-            _ => {
-                return provider_error(
-                    "invalid_request",
-                    "inspect/plan requires \"id\", \"interface\", and \"method\"",
-                )
-            }
+        let id = match request.get("id").and_then(Value::as_str) {
+            Some(id) => id,
+            None => return provider_error("invalid_request", "inspect/plan requires an \"id\""),
         };
-        let args = request.get("args").cloned().unwrap_or(json!({}));
-
         let entry = match self.source.inspect_get(id).await {
             Some(entry) => entry,
             None => return provider_error("not_found", "no such capsule"),
         };
-        let affordance = match entry
-            .manifest
-            .as_ref()
-            .and_then(|m| find_affordance(m, interface, method))
-        {
+        let manifest = match entry.manifest.as_ref() {
+            Some(m) => m,
+            None => return provider_error("not_found", "capsule has no manifest to plan against"),
+        };
+
+        // Two reflective modes, never mixed:
+        //  - interface/method → preview an affordance call (interfaces[].methods);
+        //  - operation        → preview a provider power (authority.capabilities[]).
+        match (
+            request.get("interface").and_then(Value::as_str),
+            request.get("method").and_then(Value::as_str),
+            request.get("operation").and_then(Value::as_str),
+        ) {
+            (Some(interface), Some(method), None) => {
+                Self::plan_affordance(manifest, interface, method, request)
+            }
+            (None, None, Some(operation)) => Self::plan_operation(manifest, operation),
+            _ => provider_error(
+                "invalid_request",
+                "inspect/plan requires either \"interface\"+\"method\" or \"operation\"",
+            ),
+        }
+    }
+
+    /// Affordance preview: validate args against the input schema and derive the
+    /// capability/approval/audit gate.
+    fn plan_affordance(
+        manifest: &CapsuleManifest,
+        interface: &str,
+        method: &str,
+        request: &Value,
+    ) -> Value {
+        let affordance = match find_affordance(manifest, interface, method) {
             Some(a) => a,
             None => return provider_error("not_found", "no such affordance"),
         };
+        let args = request.get("args").cloned().unwrap_or(json!({}));
 
         match invoke::plan(&affordance, &args) {
             Ok(plan) => json!({
                 "status": "ok",
                 "data": {
                     "valid": true,
+                    "kind": "affordance",
                     // The gate the runtime would enforce for this call.
                     "capability_action": plan.capability_action.to_string(),
                     "approval": serde_json::to_value(&plan.approval).ok(),
@@ -635,6 +654,48 @@ impl InspectProvider {
                 "status": "ok",
                 "data": { "valid": false, "error": "input_type_mismatch", "expected": expected }
             }),
+            // Affordance planning never raises the provider-authority variants.
+            Err(other) => provider_error("invalid_request", &format!("{other:?}")),
+        }
+    }
+
+    /// Provider-power preview: reflect the `authority` metadata to show the exact
+    /// capability tuple (resource + actions) an operation demands. Read-only.
+    fn plan_operation(manifest: &CapsuleManifest, operation: &str) -> Value {
+        let authority = match manifest.authority.as_ref() {
+            Some(a) => a,
+            None => {
+                return provider_error(
+                    "invalid_request",
+                    "capsule declares no provider authority to plan against",
+                )
+            }
+        };
+        match invoke::plan_provider_operation(authority, operation) {
+            Ok(plan) => json!({
+                "status": "ok",
+                "data": {
+                    "valid": true,
+                    "kind": "operation",
+                    "resource": plan.resource,
+                    // Every action a caller's capability must cover (full set).
+                    "capability_actions": plan
+                        .actions
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>(),
+                    "audit_events": plan.audit_events,
+                }
+            }),
+            Err(InvokeError::UnknownOperation(op)) => json!({
+                "status": "ok",
+                "data": { "valid": false, "error": "unknown_operation", "operation": op }
+            }),
+            Err(InvokeError::UnknownDeclaredAction(action)) => provider_error(
+                "manifest_error",
+                &format!("authority declares an unknown action \"{action}\""),
+            ),
+            Err(other) => provider_error("invalid_request", &format!("{other:?}")),
         }
     }
 }
@@ -1095,6 +1156,82 @@ mod tests {
         assert!(!serde_json::to_string(data)
             .unwrap()
             .contains("SECRET_SIGNATURE_MUST_NOT_LEAK"));
+    }
+
+    // A DDRM-style provider capsule whose powers live in `authority`, used to
+    // exercise the operation-preview leg of inspect/plan.
+    fn key_provider_with_release() -> InspectProvider {
+        let manifest = serde_json::from_value::<CapsuleManifest>(json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "key-provider",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "provides": "elastos://key/*",
+            "authority": {
+                "reason": "Runtime key-release boundary for protected content",
+                "capabilities": [
+                    { "resource": "elastos://key/*", "actions": ["read"],
+                      "operations": ["status"] },
+                    { "resource": "elastos://key/*", "actions": ["execute"],
+                      "operations": ["release"] }
+                ],
+                "audit_events": ["key.release.denied", "key.release.granted"]
+            }
+        }))
+        .expect("provider manifest deserializes");
+        let entry = InspectEntry {
+            id: "capsule:key-provider".to_string(),
+            name: "key-provider".to_string(),
+            status: "running".to_string(),
+            capsule_type: "microvm".to_string(),
+            manifest: Some(manifest),
+            cid: None,
+        };
+        InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }))
+    }
+
+    #[tokio::test]
+    async fn plan_previews_provider_operation_gate() {
+        // The agent-safe wedge: preview the exact capability tuple key.release
+        // demands, straight from the manifest authority — dispatching nothing.
+        let resp = key_provider_with_release()
+            .send_raw(&json!({
+                "op": "plan", "id": "capsule:key-provider", "operation": "release"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], true);
+        assert_eq!(resp["data"]["kind"], "operation");
+        assert_eq!(resp["data"]["resource"], "elastos://key/*");
+        assert_eq!(resp["data"]["capability_actions"][0], "execute");
+        assert_eq!(resp["data"]["audit_events"][0], "key.release.denied");
+    }
+
+    #[tokio::test]
+    async fn plan_unknown_operation_reports_invalid() {
+        let resp = key_provider_with_release()
+            .send_raw(&json!({
+                "op": "plan", "id": "capsule:key-provider", "operation": "self_destruct"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], false);
+        assert_eq!(resp["data"]["error"], "unknown_operation");
+    }
+
+    #[tokio::test]
+    async fn plan_rejects_mixed_or_empty_selector() {
+        // Neither interface/method nor operation → invalid_request (fail-closed).
+        let resp = key_provider_with_release()
+            .send_raw(&json!({ "op": "plan", "id": "capsule:key-provider" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "invalid_request");
     }
 
     // Minimal provider used only to register a scheme in the registry.

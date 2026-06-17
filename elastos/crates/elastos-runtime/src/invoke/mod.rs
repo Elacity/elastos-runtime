@@ -19,6 +19,7 @@
 
 use elastos_common::{
     AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk, CapsuleAffordanceDescriptor,
+    ProviderAuthority,
 };
 use serde_json::Value;
 
@@ -31,6 +32,11 @@ pub enum InvokeError {
     InputTypeMismatch { expected: String },
     /// A required input field was missing.
     MissingRequiredField(String),
+    /// The operation is not declared by any of the provider's capability blocks.
+    UnknownOperation(String),
+    /// The manifest declares an action string the capability layer does not know.
+    /// Surfaced (not silently dropped) so the gate is never under-stated.
+    UnknownDeclaredAction(String),
 }
 
 /// The validated plan for an invocation: the capability action it requires,
@@ -116,6 +122,69 @@ pub fn plan(
     })
 }
 
+/// The capability gate a provider *operation* would require, derived from the
+/// capsule's self-describing `authority` metadata — the resource it touches, the
+/// action(s) a caller's capability must cover, and the audit events it emits.
+///
+/// This is the provider-side twin of [`InvocationPlan`]: where `plan` reflects an
+/// `interfaces[].methods` affordance, this reflects an `authority.capabilities[]`
+/// operation (how DDRM providers — key release, decrypt, rights, chain — declare
+/// their powers). It dispatches nothing; it answers "what authority would this
+/// ask for?" straight from the manifest, so the preview can never under-state a
+/// gate the runtime would later enforce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOperationPlan {
+    /// The capability resource URI the operation acts on (e.g. `elastos://key/*`).
+    pub resource: String,
+    /// Every action a caller's capability must cover for this resource. Surfaced
+    /// as the full set (not collapsed to one) so nothing the manifest demands is
+    /// hidden from the reviewer.
+    pub actions: Vec<Action>,
+    /// The audit events this provider declares it emits.
+    pub audit_events: Vec<String>,
+}
+
+/// Parse a manifest-declared action string into a capability [`Action`],
+/// fail-closed: an unrecognised keyword is an error, never a silent no-op.
+fn parse_action(s: &str) -> Result<Action, InvokeError> {
+    match s {
+        "read" => Ok(Action::Read),
+        "write" => Ok(Action::Write),
+        "execute" => Ok(Action::Execute),
+        "message" => Ok(Action::Message),
+        "delete" => Ok(Action::Delete),
+        "admin" => Ok(Action::Admin),
+        other => Err(InvokeError::UnknownDeclaredAction(other.to_string())),
+    }
+}
+
+/// Preview the capability gate a provider `operation` would require, by reflecting
+/// the capsule's `authority` metadata. Finds the capability block that declares
+/// the operation and returns its resource + required actions + the authority's
+/// audit events. Dispatches nothing.
+pub fn plan_provider_operation(
+    authority: &ProviderAuthority,
+    operation: &str,
+) -> Result<ProviderOperationPlan, InvokeError> {
+    let capability = authority
+        .capabilities
+        .iter()
+        .find(|cap| cap.operations.iter().any(|op| op == operation))
+        .ok_or_else(|| InvokeError::UnknownOperation(operation.to_string()))?;
+
+    let actions = capability
+        .actions
+        .iter()
+        .map(|a| parse_action(a))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ProviderOperationPlan {
+        resource: capability.resource.clone(),
+        actions,
+        audit_events: authority.audit_events.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +192,10 @@ mod tests {
 
     fn affordance(value: serde_json::Value) -> CapsuleAffordanceDescriptor {
         serde_json::from_value(value).expect("affordance descriptor")
+    }
+
+    fn authority(value: serde_json::Value) -> ProviderAuthority {
+        serde_json::from_value(value).expect("provider authority")
     }
 
     #[test]
@@ -192,5 +265,70 @@ mod tests {
         }));
         assert!(plan(&a, &json!({ "anything": [1, 2, 3] })).is_ok());
         assert!(plan(&a, &json!("scalar")).is_ok());
+    }
+
+    #[test]
+    fn provider_op_plan_reflects_the_authority_block() {
+        // Mirrors DDRM's key-provider: status is Read, release is Execute, on the
+        // same elastos://key/* resource, with declared audit events.
+        let auth = authority(json!({
+            "reason": "release content keys to authorized renderers",
+            "capabilities": [
+                { "resource": "elastos://key/*", "actions": ["read"], "operations": ["status"] },
+                { "resource": "elastos://key/*", "actions": ["execute"], "operations": ["release"] }
+            ],
+            "audit_events": ["key.release.denied", "key.release.granted"]
+        }));
+
+        let release = plan_provider_operation(&auth, "release").unwrap();
+        assert_eq!(release.resource, "elastos://key/*");
+        assert_eq!(release.actions, vec![Action::Execute]);
+        assert!(release.audit_events.iter().any(|e| e == "key.release.denied"));
+
+        let status = plan_provider_operation(&auth, "status").unwrap();
+        assert_eq!(status.actions, vec![Action::Read]);
+    }
+
+    #[test]
+    fn provider_op_plan_rejects_unknown_operation() {
+        let auth = authority(json!({
+            "reason": "x", "audit_events": ["a"],
+            "capabilities": [
+                { "resource": "elastos://key/*", "actions": ["read"], "operations": ["status"] }
+            ]
+        }));
+        assert_eq!(
+            plan_provider_operation(&auth, "release").unwrap_err(),
+            InvokeError::UnknownOperation("release".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_op_plan_fails_closed_on_unknown_action() {
+        // A manifest action keyword the capability layer does not know must error,
+        // never be silently dropped (which would under-state the gate).
+        let auth = authority(json!({
+            "reason": "x", "audit_events": ["a"],
+            "capabilities": [
+                { "resource": "elastos://key/*", "actions": ["teleport"], "operations": ["release"] }
+            ]
+        }));
+        assert_eq!(
+            plan_provider_operation(&auth, "release").unwrap_err(),
+            InvokeError::UnknownDeclaredAction("teleport".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_op_plan_surfaces_full_action_set() {
+        let auth = authority(json!({
+            "reason": "x", "audit_events": ["a"],
+            "capabilities": [
+                { "resource": "elastos://chain/*", "actions": ["execute", "admin"],
+                  "operations": ["broadcast_transaction"] }
+            ]
+        }));
+        let plan = plan_provider_operation(&auth, "broadcast_transaction").unwrap();
+        assert_eq!(plan.actions, vec![Action::Execute, Action::Admin]);
     }
 }
