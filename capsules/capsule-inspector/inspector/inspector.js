@@ -386,7 +386,12 @@ function renderDetail(c) {
     ])),
   ]));
   detail.appendChild(card("Provenance", kv([
-    ["signed by", prov.signed_by], ["version", prov.version],
+    ["author (declared)", prov.author],
+    ["signed by (verified)", prov.signed_by],
+    ["trust level", prov.trust_level],
+    ["signature", prov.signature_present ? "present" : "none"],
+    ["signature fingerprint", prov.signature_fingerprint],
+    ["version", prov.version],
     ["installed", fmtTime(prov.installed_at)], ["CID", prov.cid],
   ])));
 

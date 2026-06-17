@@ -33,14 +33,20 @@ an isolated worktree, reconciled, built, and tested. Outcome:
 
 ### Mandatory reconciliation recipe (apply in order at the real merge)
 
-1. **(critical, silent)** In `provider_resource.rs`, add to `required_action_for`
-   *before* the `_ => Action::Admin` default:
+1. **(critical, silent — now ENFORCED by a tripwire)** In `provider_resource.rs`,
+   add to `required_action_for` *before* the `_ => Action::Admin` default:
    ```rust
    "capsules" | "capsule" | "plan" | "self" => Action::Read,
    "revoke" => Action::Write,
    ```
    Without this, DDRM's op→action gate fail-closes the carrier inspect leg to
-   `Admin`. Git does **not** flag it.
+   `Admin`. Git does **not** flag it — but our branch now does. The canonical
+   mapping lives in one place, `provider_resource::inspect_op_required_action`,
+   and the test `carrier_inspect_ops_match_canonical_action_contract`
+   (carrier_bridge.rs) drives a real carrier call per inspect op with a token
+   minted at that action. The moment `required_action_for` disagrees, that test
+   goes red at merge instead of breaking silently at runtime. Wire DDRM's inspect
+   arm to delegate to `inspect_op_required_action` so the two cannot drift.
 2. **(compile-break, NOT previously documented)** DDRM added a new field
    `audit_log: Arc<OnceLock<Arc<AuditLog>>>` to the shared `GatewayState`
    (`api/gateway.rs`). Our `api/gateway_tests/inspect.rs` constructs

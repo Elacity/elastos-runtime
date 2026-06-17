@@ -92,6 +92,30 @@ pub fn build_capability_resource(
     }
 }
 
+/// Canonical capability action each Capsule Inspector operation requires.
+///
+/// This is the **single source of truth** for the inspect op→action contract.
+/// Today our carrier gate validates a token against its own action, so this is
+/// authoritative documentation backed by a tripwire test. When the DDRM branch
+/// lands, its `required_action_for(op)` op→action gate MUST agree with this for
+/// every inspect op — otherwise inspect calls fall through to that gate's
+/// `Action::Admin` fail-closed default and break silently (git auto-merges the
+/// two edits without a conflict). The carrier table test
+/// `carrier_inspect_ops_match_canonical_action_contract` enforces the
+/// agreement: it fails loudly the moment an inspect op no longer reaches the
+/// provider with a token minted at the action declared here.
+///
+/// Reads are `Read`; the one mutation (`revoke`) is `Write`. `None` means the op
+/// is not a recognised inspect operation.
+pub fn inspect_op_required_action(op: &str) -> Option<elastos_runtime::capability::token::Action> {
+    use elastos_runtime::capability::token::Action;
+    match op {
+        "capsules" | "capsule" | "self" | "plan" => Some(Action::Read),
+        "revoke" => Some(Action::Write),
+        _ => None,
+    }
+}
+
 fn validate_segment(value: &str, label: &str) -> Result<(), String> {
     if !value.is_empty()
         && value
@@ -284,6 +308,20 @@ mod tests {
             build_capability_resource("inspect", "capsule", &serde_json::json!({})).unwrap(),
             "elastos://inspect/capsule"
         );
+    }
+
+    #[test]
+    fn inspect_op_action_contract_is_pinned() {
+        use elastos_runtime::capability::token::Action;
+        // Reads are Read; revoke is the sole mutation (Write). DDRM's
+        // required_action_for MUST match this for inspect ops at merge.
+        assert_eq!(inspect_op_required_action("capsules"), Some(Action::Read));
+        assert_eq!(inspect_op_required_action("capsule"), Some(Action::Read));
+        assert_eq!(inspect_op_required_action("self"), Some(Action::Read));
+        assert_eq!(inspect_op_required_action("plan"), Some(Action::Read));
+        assert_eq!(inspect_op_required_action("revoke"), Some(Action::Write));
+        // Unknown ops are not silently mapped — fail-closed at the caller.
+        assert_eq!(inspect_op_required_action("nope"), None);
     }
 
     #[test]

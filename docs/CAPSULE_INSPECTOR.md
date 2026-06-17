@@ -266,13 +266,23 @@ async workers aren't stalled. Records are projected to safe fields only
   Inspector lists installed capsules with their full manifests** and running
   status.
 
+**Provenance is derived, never fabricated (#15, #11).** The projection computes
+only what the evidence supports: a fail-closed `trust_level`
+(`signed` → `content-addressed` → `unsigned`), a non-secret 16-hex
+`signature_fingerprint` (SHA-256 over the decoded signature — identifies *which*
+signature without echoing it, #16), the self-declared `author`, and a `did`
+**only** when one genuinely exists (the capsule id or a `did:` author). A
+*verified* signer (`signed_by`) stays `null`: the manifest schema carries no
+signer DID/pubkey, so we refuse to present the author as if verified. Wiring a
+real signature-verification source is the next provenance step.
+
 **Remaining enrichment (honest gap):** `granted_capabilities` is still empty on
 the product path. ElastOS capabilities are bearer tokens with no central
 per-capsule registry, and `RuntimeAuditEventV1` carries no resource/action — so
 deriving the observed grant list needs a capability-event source that records
 resource + action. Everything else is done: projection, scope, no-leak,
 transport wiring, source aggregation, rich manifest detail, sub-provider
-running-status coverage, and live audit (recent + counts).
+running-status coverage, live audit (recent + counts), and derived provenance.
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
 to sample data until the data source is populated on the browser path.

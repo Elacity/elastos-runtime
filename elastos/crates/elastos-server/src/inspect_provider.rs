@@ -30,8 +30,51 @@ use elastos_runtime::inspect::InspectScope;
 use elastos_runtime::invoke::{self, InvokeError};
 use elastos_runtime::provider::{Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::runtime::Runtime;
+
+/// A short, non-secret provenance anchor for a manifest signature: the first 16
+/// hex chars of SHA-256 over the decoded signature bytes (raw base64 if decode
+/// fails). This identifies *which* signature signed the capsule for audit
+/// correlation without ever echoing the signature material itself (#16).
+fn signature_fingerprint(sig_b64: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    if sig_b64.is_empty() {
+        return None;
+    }
+    let bytes = B64.decode(sig_b64).unwrap_or_else(|_| sig_b64.as_bytes().to_vec());
+    Some(hex::encode(Sha256::digest(&bytes))[..16].to_string())
+}
+
+/// Derive a fail-closed trust classification from what is actually verifiable
+/// about a capsule. We never claim more trust than the evidence supports: a
+/// signature yields `signed`; absent that, a content address yields
+/// `content-addressed`; with neither it is `unsigned`. Signer *verification* is
+/// not yet wired (the manifest schema carries no signer DID/pubkey), so this is
+/// presence-based, not a verified-identity claim.
+fn trust_level(signature_present: bool, has_cid: bool) -> &'static str {
+    if signature_present {
+        "signed"
+    } else if has_cid {
+        "content-addressed"
+    } else {
+        "unsigned"
+    }
+}
+
+/// A DID for the capsule only when one genuinely exists — the capsule id or the
+/// declared author when it is a `did:` string. Never fabricated; `Null`
+/// otherwise. A declared author DID is self-asserted, not verified.
+fn capsule_did(entry_id: &str, author: &Value) -> Value {
+    if entry_id.starts_with("did:") {
+        return json!(entry_id);
+    }
+    match author.as_str() {
+        Some(a) if a.starts_with("did:") => json!(a),
+        _ => Value::Null,
+    }
+}
 
 /// One inspectable capsule, as seen by the provider.
 #[derive(Debug, Clone)]
@@ -432,6 +475,18 @@ impl InspectProvider {
             .unwrap_or(false);
         let cid = entry.cid.clone();
 
+        // Provenance, derived honestly from what is actually present — never
+        // fabricated (#15: trust travels with DID/CID/hash/sig).
+        let author = field(&manifest, "author");
+        let did = capsule_did(&entry.id, &author);
+        let trust = trust_level(signature_present, cid.is_some());
+        let sig_fingerprint = manifest
+            .get("signature")
+            .and_then(Value::as_str)
+            .and_then(signature_fingerprint)
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+
         // Provider authority — the declarative powers a provider capsule is
         // authorized for (resource/actions/operations + audit events). DDRM and
         // other provider capsules express their real powers here, not via
@@ -485,10 +540,12 @@ impl InspectProvider {
             "description": field(&manifest, "description"),
             "author": field(&manifest, "author"),
             "identity": {
-                "did": Value::Null,
+                "did": did.clone(),
                 "cid": cid.clone(),
-                "trust_level": Value::Null,
+                "trust_level": trust,
                 "signature_present": signature_present,
+                // No verified signer is available from the manifest schema; we do
+                // not invent one. `signed_by` stays null until verification is wired.
                 "signed_by": Value::Null,
             },
             "manifest": {
@@ -513,11 +570,18 @@ impl InspectProvider {
                 "peers": 0,
             },
             "provenance": {
+                // Self-declared author (unverified) and the trust evidence we can
+                // actually derive. `signed_by` (a verified signer) is not yet
+                // available, so it stays null rather than echoing the author as if
+                // verified.
+                "author": author,
                 "signed_by": Value::Null,
+                "trust_level": trust,
                 "version": field(&manifest, "version"),
                 "installed_at": Value::Null,
                 "cid": cid.clone(),
                 "signature_present": signature_present,
+                "signature_fingerprint": sig_fingerprint,
             },
             "audit": audit,
             "processes": [{ "kind": entry.capsule_type, "status": entry.status }],
@@ -837,6 +901,56 @@ mod tests {
             !serialized.contains("\"token\""),
             "bearer token field leaked into inspect output"
         );
+    }
+
+    #[tokio::test]
+    async fn provenance_is_derived_honestly_not_fabricated() {
+        // The signed probe (id is not a DID, no cid): trust is "signed", a
+        // signature fingerprint is present, and we never invent a signer DID.
+        let resp = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        let data = &resp["data"];
+        assert_eq!(data["identity"]["trust_level"], "signed");
+        assert_eq!(data["identity"]["did"], Value::Null);
+        assert_eq!(data["provenance"]["signed_by"], Value::Null);
+        // A real, non-secret 16-hex fingerprint that is NOT the raw signature.
+        let fp = data["provenance"]["signature_fingerprint"].as_str().unwrap();
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(fp, "SECRET_SIGNATURE_MUST_NOT_LEAK");
+    }
+
+    #[tokio::test]
+    async fn provenance_surfaces_did_when_genuinely_present() {
+        // A capsule whose id IS a DID: surface it (not fabricated — it exists).
+        let mut entry = probe_entry();
+        entry.id = "did:elastos:abc123".to_string();
+        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "did:elastos:abc123" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["data"]["identity"]["did"], "did:elastos:abc123");
+    }
+
+    #[test]
+    fn trust_level_fails_closed() {
+        // Never claims more trust than the evidence supports.
+        assert_eq!(trust_level(true, true), "signed");
+        assert_eq!(trust_level(true, false), "signed");
+        assert_eq!(trust_level(false, true), "content-addressed");
+        assert_eq!(trust_level(false, false), "unsigned");
+    }
+
+    #[test]
+    fn signature_fingerprint_is_stable_and_non_empty() {
+        let a = signature_fingerprint("c2lnbmF0dXJl").unwrap();
+        let b = signature_fingerprint("c2lnbmF0dXJl").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert_eq!(signature_fingerprint(""), None);
     }
 
     #[tokio::test]
