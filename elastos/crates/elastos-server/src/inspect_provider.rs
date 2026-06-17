@@ -432,6 +432,23 @@ impl InspectProvider {
             .unwrap_or(false);
         let cid = entry.cid.clone();
 
+        // Provider authority — the declarative powers a provider capsule is
+        // authorized for (resource/actions/operations + audit events). DDRM and
+        // other provider capsules express their real powers here, not via
+        // interface methods, so surfacing it is what makes the Inspector show
+        // what a provider can actually do (e.g. key release, decrypt render,
+        // rights decisions). Declarative metadata only — no secrets/handles.
+        let authority = manifest
+            .get("authority")
+            .map(|a| {
+                json!({
+                    "reason": a.get("reason").cloned().unwrap_or(Value::Null),
+                    "capabilities": a.get("capabilities").cloned().unwrap_or(Value::Null),
+                    "audit_events": a.get("audit_events").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .unwrap_or(Value::Null);
+
         // Affordances: flatten declared interface methods.
         let mut affordances = Vec::new();
         if let Some(interfaces) = manifest.get("interfaces").and_then(|v| v.as_array()) {
@@ -479,6 +496,8 @@ impl InspectProvider {
                 "entrypoint": field(&manifest, "entrypoint"),
             },
             "affordances": affordances,
+            // Provider powers (declarative authority), for provider capsules.
+            "authority": authority,
             "required_capabilities": field(&manifest, "capabilities"),
             // Bearer-token object-capabilities have no central per-capsule grant
             // registry; observed grants come from the audit plane (not yet wired
@@ -1029,6 +1048,53 @@ mod tests {
             .unwrap();
         assert_eq!(resp["data"]["provenance"]["cid"], "bafyprobecid");
         assert_eq!(resp["data"]["identity"]["cid"], "bafyprobecid");
+    }
+
+    #[tokio::test]
+    async fn detail_surfaces_provider_authority() {
+        // A provider capsule (DDRM-style) expresses its powers via `authority`,
+        // not interface methods — the Inspector must surface them.
+        let manifest = serde_json::from_value::<CapsuleManifest>(json!({
+            "schema": "elastos.capsule/v1",
+            "version": "0.1.0",
+            "name": "key-provider",
+            "role": "provider",
+            "type": "microvm",
+            "entrypoint": "rootfs.ext4",
+            "provides": "elastos://key/*",
+            "authority": {
+                "reason": "Runtime key-release boundary for protected content",
+                "capabilities": [
+                    { "resource": "elastos://key/*", "actions": ["read"],
+                      "operations": ["status", "release"] }
+                ],
+                "audit_events": ["key.status", "key.release.denied"]
+            },
+            "signature": "SECRET_SIGNATURE_MUST_NOT_LEAK"
+        }))
+        .expect("provider manifest deserializes");
+
+        let entry = InspectEntry {
+            id: "capsule:key-provider".to_string(),
+            name: "key-provider".to_string(),
+            status: "running".to_string(),
+            capsule_type: "microvm".to_string(),
+            manifest: Some(manifest),
+            cid: None,
+        };
+        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "capsule:key-provider" }))
+            .await
+            .unwrap();
+        let data = &resp["data"];
+        assert_eq!(data["authority"]["capabilities"][0]["resource"], "elastos://key/*");
+        assert_eq!(data["authority"]["capabilities"][0]["operations"][1], "release");
+        assert_eq!(data["authority"]["audit_events"][1], "key.release.denied");
+        // #16: the raw signature is still never echoed.
+        assert!(!serde_json::to_string(data)
+            .unwrap()
+            .contains("SECRET_SIGNATURE_MUST_NOT_LEAK"));
     }
 
     // Minimal provider used only to register a scheme in the registry.
