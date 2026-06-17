@@ -403,6 +403,11 @@ impl InspectProvider {
                 let iface_id = field(iface, "id");
                 if let Some(methods) = iface.get("methods").and_then(|v| v.as_array()) {
                     for m in methods {
+                        // The typed interface contract (metadata-driven
+                        // reflection): risk/approval/audit class plus the
+                        // input/output schemas that describe how to invoke the
+                        // affordance — the basis for typed, location-agnostic,
+                        // capability-gated calls, not just display.
                         affordances.push(json!({
                             "interface": iface_id,
                             "id": field(m, "id"),
@@ -410,6 +415,8 @@ impl InspectProvider {
                             "approval": field(m, "approval"),
                             "audit": field(m, "audit"),
                             "description": field(m, "description"),
+                            "input_schema": field(m, "input_schema"),
+                            "output_schema": field(m, "output_schema"),
                         }));
                     }
                 }
@@ -560,7 +567,11 @@ mod tests {
             "interfaces": [{
                 "id": "elastos.probe/v1",
                 "version": "1",
-                "methods": [{ "id": "ping", "risk": "read", "approval": "none", "audit": "summary" }]
+                "methods": [{
+                    "id": "ping", "risk": "read", "approval": "none", "audit": "summary",
+                    "input_schema": { "type": "object" },
+                    "output_schema": { "type": "string" }
+                }]
             }],
             "permissions": { "storage": ["localhost://WebSpaces/probe/"] },
             "signature": "SECRET_SIGNATURE_MUST_NOT_LEAK"
@@ -618,6 +629,9 @@ mod tests {
         let data = &resp["data"];
         assert_eq!(data["affordances"][0]["id"], "ping");
         assert_eq!(data["affordances"][0]["risk"], "read");
+        // Typed interface contract is surfaced (metadata-driven reflection).
+        assert_eq!(data["affordances"][0]["input_schema"]["type"], "object");
+        assert_eq!(data["affordances"][0]["output_schema"]["type"], "string");
         assert_eq!(data["required_capabilities"][0], "elastos://storage/probe");
         assert_eq!(data["storage_namespaces"][0], "localhost://WebSpaces/probe/");
         assert_eq!(data["identity"]["signature_present"], true);

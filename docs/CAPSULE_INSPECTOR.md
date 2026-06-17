@@ -40,6 +40,20 @@ Everything the Inspector shows is data the **trusted core already owns**
 (manifests, capability grants, audit log, running instances, provenance). The
 Inspector is therefore a *read-only projection* — not a new architecture.
 
+### Lineage note: granularity, OS perspective, metadata-driven reflection
+
+Self's two limits (per Rong Chen, and why Sun/IBM passed on it) are corrected
+here by design: the unit of reflection is the **capsule**, not the object
+(right granularity); reflection is an **OS-level** capability-gated surface, not
+an in-process toy; and the surface is **metadata-driven** — the manifest's
+typed interface (affordance `risk`/`approval`/`audit` + `input_schema`/
+`output_schema`) is the machine-readable contract. The inspector projects that
+metadata; the same metadata is the basis for typed, **location-agnostic**,
+capability-gated invocation over Carrier — the modern realization of Elastos's
+Component Assembly Runtime (CAR) idea. Today we surface the typed contract;
+metadata-*driven invocation/marshalling* (and cross-language interop) is the
+deeper CAR-scale direction, to be planned, not assumed.
+
 ## What
 
 A read-only view, one screen per capsule, of nine fields:
@@ -302,9 +316,11 @@ endpoint a `SelfOnly` capsule uses to introspect itself.
   "manifest": { "schema": "elastos.capsule/v1", "entrypoint": "chat.wasm" },
   "affordances": [
     { "interface": "elastos.chat/v1", "id": "send", "risk": "write",
-      "approval": "user", "audit": "event", "description": "Send a message" },
+      "approval": "user", "audit": "event", "description": "Send a message",
+      "input_schema": { "type": "object" }, "output_schema": { "type": "object" } },
     { "interface": "elastos.chat/v1", "id": "history", "risk": "read",
-      "approval": "none", "audit": "summary", "description": "Read history" }
+      "approval": "none", "audit": "summary", "description": "Read history",
+      "input_schema": null, "output_schema": null }
   ],
   "required_capabilities": ["elastos://carrier/*", "elastos://storage/chat"],
   "granted_capabilities": [
