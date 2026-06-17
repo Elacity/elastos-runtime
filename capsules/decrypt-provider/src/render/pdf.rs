@@ -18,7 +18,7 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::RenderSettings;
 use image::{ImageBuffer, Rgba, RgbaImage};
 
-use super::watermark::apply_watermark;
+use super::watermark;
 
 /// A parsed PDF held WARM in the decrypt boundary for the lifetime of an open session, so
 /// the document is decrypted + parsed ONCE and every page is a fast rasterise (no re-decrypt,
@@ -82,25 +82,10 @@ impl ParsedPdf {
         let h = pixmap.height() as u32;
         let rgba_bytes = pixmap.data_as_u8_slice();
 
-        let mut img: RgbaImage = ImageBuffer::from_raw(w, h, rgba_bytes.to_vec())
+        let img: RgbaImage = ImageBuffer::from_raw(w, h, rgba_bytes.to_vec())
             .unwrap_or_else(|| RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255])));
 
-        if let Some(wm) = watermark {
-            apply_watermark(&mut img, wm);
-        }
-
-        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-        let mut buf = Vec::new();
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
-        encoder
-            .encode(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| format!("jpeg encode: {e}"))?;
-        Ok(buf)
+        watermark::finalize(img, watermark)
     }
 }
 

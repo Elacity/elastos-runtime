@@ -629,13 +629,31 @@ impl QuorumOpen {
 }
 
 /// Whether a mime is served as flattened, watermarked page images ("pixel-lock") rather than
-/// as its raw bytes. Mirrors the decrypt boundary's `render::is_pixel_lock`. PDFs first.
+/// as its raw bytes. MUST mirror the decrypt boundary's `render::is_pixel_lock` (Principle 12):
+/// PDF (multi-page), CBZ comics (multi-page), text/code (multi-page), SVG (rasterised), raster
+/// images (single page). SVG is rasterised rather than shipped raw (it is scriptable XML).
 fn is_pixel_lock(mime: &str) -> bool {
-    matches!(mime.trim().to_ascii_lowercase().as_str(), "application/pdf")
+    let m = mime.trim().to_ascii_lowercase();
+    m == "application/pdf"
+        || m == "application/vnd.comicbook+zip"
+        || m == "application/x-cbz"
+        || m.starts_with("text/")
+        || matches!(
+            m.as_str(),
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/x-yaml"
+                | "application/yaml"
+                | "application/toml"
+                | "application/x-sh"
+                | "application/x-shellscript"
+        )
+        || m.starts_with("image/")
 }
 
-/// A short, readable forensic stamp from a principal id (the bitmap watermark font covers
-/// hex + `0x:.- `; long DIDs/wallets are elided to first…last so a stamp always fits + shows).
+/// A short, readable forensic stamp from a principal id (the full-ASCII watermark font renders
+/// any principal; long DIDs/wallets are elided to first…last so a stamp always fits + shows).
 fn watermark_for(principal: &str) -> String {
     let p = principal.trim();
     if p.len() <= 22 {

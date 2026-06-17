@@ -132,7 +132,7 @@ envelope-conformance = ["pq-mldsa"]
 # (only a flattened, buyer-watermarked page image egresses). Closes the "raw plaintext reaches
 # the browser" gap and is browser-agnostic (an image always renders). Pulls `hayro` + `image`
 # only when enabled; the default + security-critical builds stay lean. OFF by default.
-pdf-render = ["dep:hayro", "dep:image", "dep:font8x8"]
+pdf-render = ["dep:hayro", "dep:image", "dep:font8x8", "dep:zip", "dep:resvg"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
@@ -174,7 +174,16 @@ getrandom = { version = "0.2", optional = true }
 # rasterised page to JPEG. Mirrors PC2's ddrm-renderer (same crates/versions) so the secure-view
 # behaviour stays aligned. Optional → no footprint on the default decrypt build.
 hayro = { version = "0.5", default-features = false, features = ["embed-fonts"], optional = true }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"], optional = true }
+# Comic-book archive reader (feature `pdf-render`): a CBZ is a ZIP of page images. Pure-Rust
+# deflate (miniz_oxide) so the boundary stays unsafe-free; default features off so no C zlib /
+# encryption backends are pulled. Used only by the pixel-lock comic renderer. Optional.
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+# Pure-Rust SVG rasteriser (feature `pdf-render`): SVG is scriptable XML, so it is flattened to
+# pixels in-boundary like every other document rather than shipped raw. `raster-images` renders
+# embedded bitmaps; `text` rendering is intentionally OFF (no system-font surface; text nodes are
+# best-effort) to keep the boundary lean. Pulls tiny-skia/usvg (all pure Rust). Optional.
+resvg = { version = "0.45", default-features = false, features = ["raster-images"], optional = true }
 # Forensic-watermark glyphs (feature `pdf-render`). `font8x8` is public-domain const bitmap
 # data for the FULL printable-ASCII set (no font-file vendoring, no runtime, builds to
 # wasm32-wasip1), so any principal/DID/wallet stamps legibly. Replaces the prior hand-rolled

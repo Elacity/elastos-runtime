@@ -202,6 +202,8 @@ async function renderPixelLockPager(manifest) {
   stage.append(img);
 
   function syncControls() {
+    // Single-page assets (e.g. a watermarked image) need no pager chrome.
+    bar.hidden = total <= 1;
     label.textContent = `Page ${current + 1} of ${total}`;
     prev.disabled = current <= 0;
     next.disabled = current >= total - 1;

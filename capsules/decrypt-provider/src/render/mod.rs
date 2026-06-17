@@ -11,15 +11,50 @@
 //! watermark), so the secure-view behaviour stays aligned across the two runtimes.
 
 #[cfg(feature = "pdf-render")]
+pub mod cbz;
+#[cfg(feature = "pdf-render")]
+pub mod image_page;
+#[cfg(feature = "pdf-render")]
 pub mod pdf;
+#[cfg(feature = "pdf-render")]
+pub mod svg;
+#[cfg(feature = "pdf-render")]
+pub mod text;
 #[cfg(feature = "pdf-render")]
 pub mod watermark;
 
-/// Whether a mime is served as a flattened page image ("pixel-lock") rather than as
-/// its raw bytes. Pixel-lock content NEVER egresses this boundary in plaintext — only
-/// the rendered image does. PDFs first; the registry grows here as renderers are added.
+/// Whether a (lowercased) mime is text/code we rasterise as paged document text. Source-code
+/// `application/*` mimes are enumerated; everything `text/*` is included.
+fn is_text_like(m: &str) -> bool {
+    m.starts_with("text/")
+        || matches!(
+            m,
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/x-yaml"
+                | "application/yaml"
+                | "application/toml"
+                | "application/x-sh"
+                | "application/x-shellscript"
+        )
+}
+
+/// Whether a mime is served as a flattened, watermarked page image ("pixel-lock") rather than
+/// as its raw bytes. Pixel-lock content NEVER egresses this boundary in plaintext — only the
+/// rendered image does. Covers: PDF (multi-page), CBZ comics (multi-page), text/code
+/// (multi-page), SVG (rasterised, single page), and raster images (single page). SVG is
+/// rasterised rather than shipped raw precisely because it is scriptable XML.
+///
+/// IMPORTANT (Principle 12): the helper keeps a mirror of this predicate in
+/// `scripts/dev/ddrm-media-authority/src/quorum.rs::is_pixel_lock`. Keep the two in sync.
 pub fn is_pixel_lock(mime: &str) -> bool {
-    matches!(mime.trim().to_ascii_lowercase().as_str(), "application/pdf")
+    let m = mime.trim().to_ascii_lowercase();
+    m == "application/pdf"
+        || m == "application/vnd.comicbook+zip"
+        || m == "application/x-cbz"
+        || is_text_like(&m)
+        || m.starts_with("image/")
 }
 
 /// A WARM render session: the decrypted asset parsed ONCE plus an in-memory cache of the
@@ -35,10 +70,50 @@ pub struct RenderSession {
     pub total_pages: u32,
     /// Cap so a hostile/huge document cannot pin unbounded memory via page caching.
     max_cached_pages: usize,
-    parsed: pdf::ParsedPdf,
+    parsed: Renderable,
     /// page index ⇒ encoded JPEG (insertion-ordered so we can evict the oldest).
     cache: std::collections::HashMap<u32, Vec<u8>>,
     order: std::collections::VecDeque<u32>,
+}
+
+/// The parsed, warm form of a pixel-lock asset. Each variant decodes/parses ONCE at `open`
+/// and rasterises a page on demand; the plaintext it holds never leaves the sandbox.
+#[cfg(feature = "pdf-render")]
+enum Renderable {
+    // The PDF and SVG parses hold large inline trees; box them so the enum stays small.
+    Pdf(Box<pdf::ParsedPdf>),
+    Image(image_page::ParsedImage),
+    Cbz(cbz::ParsedCbz),
+    Text(text::ParsedText),
+    Svg(Box<svg::ParsedSvg>),
+}
+
+#[cfg(feature = "pdf-render")]
+impl Renderable {
+    fn total_pages(&self) -> u32 {
+        match self {
+            Renderable::Pdf(p) => p.total_pages,
+            Renderable::Image(p) => p.total_pages(),
+            Renderable::Cbz(p) => p.total_pages(),
+            Renderable::Text(p) => p.total_pages(),
+            Renderable::Svg(p) => p.total_pages(),
+        }
+    }
+
+    fn render_page(
+        &self,
+        page: u32,
+        max_width: Option<u32>,
+        watermark: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            Renderable::Pdf(p) => p.render_page(page, max_width, watermark),
+            Renderable::Image(p) => p.render_page(page, max_width, watermark),
+            Renderable::Cbz(p) => p.render_page(page, max_width, watermark),
+            Renderable::Text(p) => p.render_page(page, max_width, watermark),
+            Renderable::Svg(p) => p.render_page(page, max_width, watermark),
+        }
+    }
 }
 
 #[cfg(feature = "pdf-render")]
@@ -48,13 +123,19 @@ impl RenderSession {
     pub fn open(session_id: String, mime: &str, object: &[u8]) -> Result<Self, String> {
         let mime_norm = mime.trim().to_ascii_lowercase();
         let parsed = match mime_norm.as_str() {
-            "application/pdf" => pdf::parse(object)?,
+            "application/pdf" => Renderable::Pdf(Box::new(pdf::parse(object)?)),
+            "application/vnd.comicbook+zip" | "application/x-cbz" => {
+                Renderable::Cbz(cbz::parse(object)?)
+            }
+            m if is_text_like(m) => Renderable::Text(text::parse(object)?),
+            "image/svg+xml" => Renderable::Svg(Box::new(svg::parse(object)?)),
+            m if m.starts_with("image/") => Renderable::Image(image_page::parse(object)?),
             other => return Err(format!("no pixel-lock renderer for mime: {other}")),
         };
         Ok(Self {
             session_id,
             mime: mime_norm,
-            total_pages: parsed.total_pages,
+            total_pages: parsed.total_pages(),
             max_cached_pages: 24,
             parsed,
             cache: std::collections::HashMap::new(),
@@ -128,21 +209,36 @@ mod tests {
     #[cfg(feature = "pdf-render")]
     #[test]
     fn unknown_renderer_fails_closed() {
-        assert!(is_pixel_lock("application/pdf"));
-        assert!(is_pixel_lock("APPLICATION/PDF"));
-        assert!(!is_pixel_lock("image/png"));
-
+        // A pixel-lock mime with bytes that don't parse must still fail closed (no plaintext).
         assert!(
-            RenderSession::open("s".to_string(), "image/png", b"not used").is_err(),
+            RenderSession::open("s".to_string(), "image/png", b"not an image").is_err(),
+            "a pixel-lock mime with garbage bytes must fail closed"
+        );
+        // A non-pixel-lock mime has no renderer.
+        assert!(
+            RenderSession::open("s".to_string(), "application/zip", b"not used").is_err(),
             "a non-pixel-lock mime must fail closed"
         );
     }
 
     #[test]
-    fn pixel_lock_set_recognises_pdf_only() {
+    fn pixel_lock_set_covers_pdf_image_comics_and_text() {
         assert!(is_pixel_lock("application/pdf"));
         assert!(is_pixel_lock("APPLICATION/PDF"));
-        assert!(!is_pixel_lock("image/png"));
+        assert!(is_pixel_lock("image/png"));
+        assert!(is_pixel_lock("image/jpeg"));
+        assert!(is_pixel_lock("application/vnd.comicbook+zip"));
+        assert!(is_pixel_lock("application/x-cbz"));
+        assert!(is_pixel_lock("text/plain"));
+        assert!(is_pixel_lock("text/markdown"));
+        assert!(is_pixel_lock("application/json"));
+        assert!(is_pixel_lock("application/javascript"));
+        // SVG is pixel-lock too (rasterised, never shipped raw).
+        assert!(is_pixel_lock("image/svg+xml"));
+        // Excluded: non-renderable / streamed types.
+        assert!(!is_pixel_lock("application/zip"));
+        assert!(!is_pixel_lock("video/mp4"));
+        assert!(!is_pixel_lock("audio/mpeg"));
     }
 
     #[test]

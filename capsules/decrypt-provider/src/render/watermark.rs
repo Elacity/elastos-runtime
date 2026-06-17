@@ -10,6 +10,42 @@
 use font8x8::legacy::BASIC_LEGACY;
 use image::{Rgba, RgbaImage};
 
+/// Apply the forensic watermark (when present) and encode to JPEG. The single egress path for
+/// EVERY pixel-lock renderer (pdf / image / comic), so the boundary always emits a flattened,
+/// buyer-stamped JPEG and never the source bytes.
+pub fn finalize(mut img: RgbaImage, watermark: Option<&str>) -> Result<Vec<u8>, String> {
+    if let Some(wm) = watermark {
+        apply_watermark(&mut img, wm);
+    }
+    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 85);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| format!("jpeg encode: {e}"))?;
+    Ok(buf)
+}
+
+/// Downscale `img` so its width is at most `max_width` (preserving aspect ratio); never
+/// upscales. Bounds the egress image (and re-encoding strips the source file + its metadata).
+pub fn fit_width(img: RgbaImage, max_width: Option<u32>) -> RgbaImage {
+    let max_w = match max_width {
+        Some(w) if w > 0 => w,
+        _ => return img,
+    };
+    let (w, h) = img.dimensions();
+    if w <= max_w || w == 0 {
+        return img;
+    }
+    let new_h = ((h as u64 * max_w as u64) / w as u64).max(1) as u32;
+    image::imageops::resize(&img, max_w, new_h, image::imageops::FilterType::Triangle)
+}
+
 /// One glyph cell is 8x8 in the source font.
 const GLYPH: u32 = 8;
 /// Blend strength toward the ink colour (out of 256). ~0.42 — clearly readable on light pages
@@ -98,4 +134,38 @@ fn draw_text(img: &mut RgbaImage, text: &str, x: i64, y: i64, scale: u32) {
 fn blend(src: u8, target: u8, alpha: u16) -> u8 {
     let inv = 256 - alpha;
     ((src as u16 * inv + target as u16 * alpha) / 256) as u8
+}
+
+/// Draw one line of text in a SOLID `ink` colour (for rasterised document BODY text — e.g. the
+/// text/code renderer — as opposed to the translucent tiled watermark). Monospace `font8x8`
+/// glyphs, scaled, clipped to the image. Pixels outside the image are skipped.
+pub fn draw_solid(img: &mut RgbaImage, text: &str, x: i64, y: i64, scale: u32, ink: [u8; 3]) {
+    let (w, h) = img.dimensions();
+    for (i, ch) in text.chars().enumerate() {
+        let code = ch as usize;
+        let bitmap = BASIC_LEGACY[if code < 128 { code } else { '?' as usize }];
+        let cell_x = x + (i as i64) * (GLYPH * scale) as i64;
+        // Cheap horizontal clip: stop once a glyph starts past the right edge.
+        if cell_x >= w as i64 {
+            break;
+        }
+        for (gy, bits) in bitmap.iter().enumerate() {
+            for gx in 0..GLYPH {
+                if bits & (1 << gx) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let px = cell_x + (gx * scale + sx) as i64;
+                        let py = y + (gy as u32 * scale + sy) as i64;
+                        if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
+                            continue;
+                        }
+                        let p = img.get_pixel_mut(px as u32, py as u32);
+                        *p = Rgba([ink[0], ink[1], ink[2], p[3]]);
+                    }
+                }
+            }
+        }
+    }
 }
