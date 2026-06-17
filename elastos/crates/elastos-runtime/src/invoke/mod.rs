@@ -274,7 +274,9 @@ mod tests {
         let err = plan(&a, &json!("not-an-object")).unwrap_err();
         assert_eq!(
             err,
-            InvokeError::InputTypeMismatch { expected: "object".to_string() }
+            InvokeError::InputTypeMismatch {
+                expected: "object".to_string()
+            }
         );
     }
 
@@ -303,7 +305,10 @@ mod tests {
         let release = plan_provider_operation(&auth, "release").unwrap();
         assert_eq!(release.resources, vec!["elastos://key/*".to_string()]);
         assert_eq!(release.actions, vec![Action::Execute]);
-        assert!(release.audit_events.iter().any(|e| e == "key.release.denied"));
+        assert!(release
+            .audit_events
+            .iter()
+            .any(|e| e == "key.release.denied"));
 
         let status = plan_provider_operation(&auth, "status").unwrap();
         assert_eq!(status.actions, vec![Action::Read]);
@@ -327,10 +332,16 @@ mod tests {
         // Both resources are surfaced (union, deduped, order-preserving).
         assert_eq!(
             plan.resources,
-            vec!["elastos://key/*".to_string(), "elastos://decrypt/*".to_string()]
+            vec![
+                "elastos://key/*".to_string(),
+                "elastos://decrypt/*".to_string()
+            ]
         );
         // The full action set across both blocks.
-        assert_eq!(plan.actions, vec![Action::Read, Action::Execute, Action::Admin]);
+        assert_eq!(
+            plan.actions,
+            vec![Action::Read, Action::Execute, Action::Admin]
+        );
     }
 
     #[test]

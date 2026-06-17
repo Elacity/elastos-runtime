@@ -31,7 +31,9 @@ async fn inspect_test_state(dir: &std::path::Path) -> GatewayState {
             Arc::downgrade(&registry),
         ));
     registry
-        .register(Arc::new(crate::inspect_provider::InspectProvider::new(source)))
+        .register(Arc::new(crate::inspect_provider::InspectProvider::new(
+            source,
+        )))
         .await;
 
     GatewayState {
@@ -105,13 +107,19 @@ async fn inspect_write_op_revoke_is_not_browser_reachable() {
                 .uri("/api/provider/inspect/revoke")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from("{\"token_id\":\"00000000000000000000000000000000\"}"))
+                .body(Body::from(
+                    "{\"token_id\":\"00000000000000000000000000000000\"}",
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
     // Not OK, and specifically not found — the op never enters the proxy.
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoke must not be browser-reachable");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "revoke must not be browser-reachable"
+    );
 }
 
 #[tokio::test]
@@ -133,5 +141,9 @@ async fn inspect_capsules_rejects_non_system_app() {
         )
         .await
         .unwrap();
-    assert_ne!(resp.status(), StatusCode::OK, "non-System app must not inspect");
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "non-System app must not inspect"
+    );
 }

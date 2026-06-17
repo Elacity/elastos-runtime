@@ -1402,7 +1402,10 @@ mod tests {
         let cases = [
             ("capsules", serde_json::json!({})),
             ("capsule", serde_json::json!({ "id": "probe" })),
-            ("plan", serde_json::json!({ "id": "probe", "operation": "x" })),
+            (
+                "plan",
+                serde_json::json!({ "id": "probe", "operation": "x" }),
+            ),
         ];
 
         for (op, mut payload) in cases {
@@ -1410,14 +1413,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("no canonical action for inspect op {op}"));
             let token = encode_bridge_capability_token(&capability_manager.grant(
                 "test-capsule",
-                ResourceId::new(&format!("elastos://inspect/{op}")),
+                ResourceId::new(format!("elastos://inspect/{op}")),
                 action,
                 TokenConstraints::default(),
                 None,
             ));
             let obj = payload.as_object_mut().unwrap();
             obj.insert("type".into(), serde_json::json!("carrier_invoke"));
-            obj.insert("uri".into(), serde_json::json!(format!("elastos://inspect/{op}")));
+            obj.insert(
+                "uri".into(),
+                serde_json::json!(format!("elastos://inspect/{op}")),
+            );
             obj.insert("operation".into(), serde_json::json!(op));
             obj.insert("token".into(), serde_json::json!(token));
             let line = serde_json::json!({ "id": 1, "request": payload }).to_string();

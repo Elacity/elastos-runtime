@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use elastos_common::{CapsuleAffordanceDescriptor, CapsuleManifest};
 use elastos_runtime::inspect::InspectScope;
 use elastos_runtime::invoke::{self, InvokeError};
-use elastos_runtime::provider::{Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse};
+use elastos_runtime::provider::{
+    Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -43,10 +45,17 @@ fn signature_fingerprint(sig_b64: &str) -> Option<String> {
     if sig_b64.is_empty() {
         return None;
     }
-    let bytes = B64.decode(sig_b64).unwrap_or_else(|_| sig_b64.as_bytes().to_vec());
+    let bytes = B64
+        .decode(sig_b64)
+        .unwrap_or_else(|_| sig_b64.as_bytes().to_vec());
     // `.take(16)` rather than a `[..16]` slice: can never panic regardless of the
     // digest's hex length (hex chars are single-byte ASCII, so no boundary risk).
-    Some(hex::encode(Sha256::digest(&bytes)).chars().take(16).collect())
+    Some(
+        hex::encode(Sha256::digest(&bytes))
+            .chars()
+            .take(16)
+            .collect(),
+    )
 }
 
 /// Derive a fail-closed trust classification from what is actually verifiable
@@ -186,7 +195,12 @@ impl AuditSource for AuthAuditSource {
                     });
                 }
             }
-            CapsuleAudit { total, denied, attested, recent }
+            CapsuleAudit {
+                total,
+                denied,
+                attested,
+                recent,
+            }
         })
         .await
         .unwrap_or_default()
@@ -222,13 +236,22 @@ fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
 impl InspectSource for RuntimeInspectSource {
     async fn inspect_list(&self) -> Vec<InspectEntry> {
         match self.runtime.upgrade() {
-            Some(rt) => rt.list_capsules().await.into_iter().map(running_to_entry).collect(),
+            Some(rt) => rt
+                .list_capsules()
+                .await
+                .into_iter()
+                .map(running_to_entry)
+                .collect(),
             None => Vec::new(),
         }
     }
 
     async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
-        self.runtime.upgrade()?.get_capsule(id).await.map(running_to_entry)
+        self.runtime
+            .upgrade()?
+            .get_capsule(id)
+            .await
+            .map(running_to_entry)
     }
 }
 
@@ -276,8 +299,8 @@ impl InspectSource for RegistryInspectSource {
     async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
         let scheme = id.strip_prefix("provider:")?;
         let reg = self.registry.upgrade()?;
-        let known =
-            reg.has_provider(scheme).await || reg.sub_provider_schemes().await.iter().any(|s| s == scheme);
+        let known = reg.has_provider(scheme).await
+            || reg.sub_provider_schemes().await.iter().any(|s| s == scheme);
         known.then(|| Self::scheme_entry(scheme.to_string()))
     }
 }
@@ -294,7 +317,10 @@ pub struct CatalogInspectSource {
 
 impl CatalogInspectSource {
     pub fn new(capsules_dir: PathBuf, registry: Weak<ProviderRegistry>) -> Self {
-        Self { capsules_dir, registry }
+        Self {
+            capsules_dir,
+            registry,
+        }
     }
 
     /// The scheme a provider capsule serves, parsed from `provides`
@@ -455,7 +481,10 @@ pub struct InspectProvider {
 
 impl InspectProvider {
     pub fn new(source: Arc<dyn InspectSource>) -> Self {
-        Self { source, audit: None }
+        Self {
+            source,
+            audit: None,
+        }
     }
 
     /// Attach a per-capsule audit source so detail views show live activity.
@@ -617,10 +646,12 @@ impl InspectProvider {
         let recent: Vec<Value> = a
             .recent
             .iter()
-            .map(|r| json!({
-                "ts": r.ts, "event": r.event, "detail": r.detail, "success": r.success,
-                "signed": r.signed, "signer": r.signer,
-            }))
+            .map(|r| {
+                json!({
+                    "ts": r.ts, "event": r.event, "detail": r.detail, "success": r.success,
+                    "signed": r.signed, "signer": r.signer,
+                })
+            })
             .collect();
         json!({
             "counts": { "total": a.total, "denied": a.denied, "attested": a.attested },
@@ -885,7 +916,9 @@ mod tests {
     }
 
     fn provider_with_probe() -> InspectProvider {
-        InspectProvider::new(Arc::new(MockSource { entries: vec![probe_entry()] }))
+        InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
     }
 
     #[tokio::test]
@@ -914,7 +947,10 @@ mod tests {
         assert_eq!(data["affordances"][0]["input_schema"]["type"], "object");
         assert_eq!(data["affordances"][0]["output_schema"]["type"], "string");
         assert_eq!(data["required_capabilities"][0], "elastos://storage/probe");
-        assert_eq!(data["storage_namespaces"][0], "localhost://WebSpaces/probe/");
+        assert_eq!(
+            data["storage_namespaces"][0],
+            "localhost://WebSpaces/probe/"
+        );
         assert_eq!(data["identity"]["signature_present"], true);
 
         // Principle #16: never echo the raw signature or any bearer token.
@@ -942,7 +978,9 @@ mod tests {
         assert_eq!(data["identity"]["did"], Value::Null);
         assert_eq!(data["provenance"]["signed_by"], Value::Null);
         // A real, non-secret 16-hex fingerprint that is NOT the raw signature.
-        let fp = data["provenance"]["signature_fingerprint"].as_str().unwrap();
+        let fp = data["provenance"]["signature_fingerprint"]
+            .as_str()
+            .unwrap();
         assert_eq!(fp.len(), 16);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(fp, "SECRET_SIGNATURE_MUST_NOT_LEAK");
@@ -953,7 +991,9 @@ mod tests {
         // A capsule whose id IS a DID: surface it (not fabricated — it exists).
         let mut entry = probe_entry();
         entry.id = "did:elastos:abc123".to_string();
-        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }));
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![entry],
+        }));
         let resp = provider
             .send_raw(&json!({ "op": "capsule", "id": "did:elastos:abc123" }))
             .await
@@ -1007,14 +1047,18 @@ mod tests {
         let source = RegistryInspectSource::new(Arc::downgrade(&registry));
 
         let entries = source.inspect_list().await;
-        assert!(entries.iter().any(|e| e.name == "wallet" && e.id == "provider:wallet"));
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "wallet" && e.id == "provider:wallet"));
         assert!(source.inspect_get("provider:wallet").await.is_some());
         assert!(source.inspect_get("provider:nope").await.is_none());
     }
 
     #[tokio::test]
     async fn aggregate_source_unions_and_dedups() {
-        let a: Arc<dyn InspectSource> = Arc::new(MockSource { entries: vec![probe_entry()] });
+        let a: Arc<dyn InspectSource> = Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        });
         let b: Arc<dyn InspectSource> = Arc::new(MockSource {
             entries: vec![
                 probe_entry(), // duplicate id — should be deduped
@@ -1069,7 +1113,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["data"]["affordances"][0]["id"], "ping");
-        assert_eq!(resp["data"]["required_capabilities"][0], "elastos://storage/probe");
+        assert_eq!(
+            resp["data"]["required_capabilities"][0],
+            "elastos://storage/probe"
+        );
         let serialized = serde_json::to_string(&resp).unwrap();
         assert!(!serialized.contains("SECRET_SIGNATURE_MUST_NOT_LEAK"));
     }
@@ -1129,8 +1176,10 @@ mod tests {
             }
         }
 
-        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![probe_entry()] }))
-            .with_audit(Arc::new(MockAudit));
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![probe_entry()],
+        }))
+        .with_audit(Arc::new(MockAudit));
         let resp = provider
             .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
             .await
@@ -1140,10 +1189,16 @@ mod tests {
         // Attestation fidelity: who cryptographically signed each event (#15),
         // surfaced as presence + DID, never the signature itself (#16).
         assert_eq!(resp["data"]["audit"]["counts"]["attested"], 1);
-        assert_eq!(resp["data"]["audit"]["recent"][0]["event"], "capability.use");
+        assert_eq!(
+            resp["data"]["audit"]["recent"][0]["event"],
+            "capability.use"
+        );
         assert_eq!(resp["data"]["audit"]["recent"][0]["success"], true);
         assert_eq!(resp["data"]["audit"]["recent"][0]["signed"], true);
-        assert_eq!(resp["data"]["audit"]["recent"][0]["signer"], "did:elastos:gateway");
+        assert_eq!(
+            resp["data"]["audit"]["recent"][0]["signer"],
+            "did:elastos:gateway"
+        );
     }
 
     #[tokio::test]
@@ -1219,7 +1274,9 @@ mod tests {
 
         let entries = source.inspect_list().await;
         assert!(
-            entries.iter().any(|e| e.name == "did" && e.id == "provider:did"),
+            entries
+                .iter()
+                .any(|e| e.name == "did" && e.id == "provider:did"),
             "sub-provider scheme must be listed"
         );
         assert!(source.inspect_get("provider:did").await.is_some());
@@ -1291,14 +1348,22 @@ mod tests {
             manifest: Some(manifest),
             cid: None,
         };
-        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }));
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![entry],
+        }));
         let resp = provider
             .send_raw(&json!({ "op": "capsule", "id": "capsule:key-provider" }))
             .await
             .unwrap();
         let data = &resp["data"];
-        assert_eq!(data["authority"]["capabilities"][0]["resource"], "elastos://key/*");
-        assert_eq!(data["authority"]["capabilities"][0]["operations"][1], "release");
+        assert_eq!(
+            data["authority"]["capabilities"][0]["resource"],
+            "elastos://key/*"
+        );
+        assert_eq!(
+            data["authority"]["capabilities"][0]["operations"][1],
+            "release"
+        );
         assert_eq!(data["authority"]["audit_events"][1], "key.release.denied");
         // #16: the raw signature is still never echoed.
         assert!(!serde_json::to_string(data)
@@ -1337,7 +1402,9 @@ mod tests {
             manifest: Some(manifest),
             cid: None,
         };
-        InspectProvider::new(Arc::new(MockSource { entries: vec![entry] }))
+        InspectProvider::new(Arc::new(MockSource {
+            entries: vec![entry],
+        }))
     }
 
     #[tokio::test]

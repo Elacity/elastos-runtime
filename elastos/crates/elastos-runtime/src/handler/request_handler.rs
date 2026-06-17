@@ -891,7 +891,10 @@ impl RequestHandler {
             // Authoritative capability check: the token must grant the
             // requested URI *and* action. A read grant fails a write endpoint;
             // a self-only grant cannot satisfy a system URI.
-            if let Err(e) = self.validate_token(token_str, from, required_action, uri).await {
+            if let Err(e) = self
+                .validate_token(token_str, from, required_action, uri)
+                .await
+            {
                 return e;
             }
             // Defense in depth: classify the granted pattern into a scope.
@@ -1103,7 +1106,8 @@ impl RequestHandler {
         // the runtime's authoritative record of what this capsule did.
         let events = self._audit_log.recent_events(500);
         let mut recent = Vec::new();
-        let mut grants: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        let mut grants: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
         let (mut total, mut denied) = (0u64, 0u64);
         for ev in &events {
             let v = match serde_json::to_value(ev) {
@@ -1114,9 +1118,20 @@ impl RequestHandler {
                 continue;
             }
             total += 1;
-            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
-            let resource = v.get("resource").and_then(|r| r.as_str()).map(str::to_string);
-            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            let etype = v
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let resource = v
+                .get("resource")
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            let action = v
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
             let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
             if !success {
                 denied += 1;
@@ -1178,7 +1193,7 @@ impl RequestHandler {
             "identity": {
                 "did": Value::Null,
                 "cid": cid,
-                "trust_level": serde_json::to_value(&info.trust_level).ok(),
+                "trust_level": serde_json::to_value(info.trust_level).ok(),
                 "signature_present": signature_present,
                 "signed_by": Value::Null,
             },
@@ -1316,14 +1331,21 @@ mod tests {
     /// Like `create_test_handler`, but also returns the capability and capsule
     /// managers so inspect conformance tests can mint scoped tokens and launch
     /// real capsules to introspect.
-    async fn create_test_handler_with_caps(
-    ) -> (RequestHandler, CapsuleId, Arc<CapabilityManager>, Arc<CapsuleManager>) {
+    async fn create_test_handler_with_caps() -> (
+        RequestHandler,
+        CapsuleId,
+        Arc<CapabilityManager>,
+        Arc<CapsuleManager>,
+    ) {
         let compute = Arc::new(MockComputeProvider);
         let store = Arc::new(CapabilityStore::new());
         let audit_log = Arc::new(AuditLog::new());
         let metrics = Arc::new(MetricsManager::new());
-        let capability_manager =
-            Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics.clone()));
+        let capability_manager = Arc::new(CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics.clone(),
+        ));
         let capsule_manager = Arc::new(CapsuleManager::new(
             compute,
             capability_manager.clone(),
@@ -1383,7 +1405,11 @@ mod tests {
     async fn inspect_detail_renders_contract_without_leaking_authority() {
         let (handler, shell_id, _caps, capsule_manager) = create_test_handler_with_caps().await;
         let id = capsule_manager
-            .launch_local(std::path::Path::new("."), probe_manifest(), TrustLevel::Trusted)
+            .launch_local(
+                std::path::Path::new("."),
+                probe_manifest(),
+                TrustLevel::Trusted,
+            )
             .await
             .expect("launch probe");
 
@@ -1408,7 +1434,10 @@ mod tests {
         assert_eq!(data["affordances"][0]["risk"], "read");
         assert_eq!(data["affordances"][0]["interface"], "elastos.probe/v1");
         assert_eq!(data["required_capabilities"][0], "elastos://storage/probe");
-        assert_eq!(data["storage_namespaces"][0], "localhost://WebSpaces/probe/");
+        assert_eq!(
+            data["storage_namespaces"][0],
+            "localhost://WebSpaces/probe/"
+        );
         assert_eq!(data["identity"]["signature_present"], true);
 
         // Principle #16: UI surfaces must not expose bearer tokens or mutation
@@ -1431,7 +1460,11 @@ mod tests {
         // itself with a minimal self grant — the same authority model for both.
         let (handler, _shell, caps, capsule_manager) = create_test_handler_with_caps().await;
         let id = capsule_manager
-            .launch_local(std::path::Path::new("."), probe_manifest(), TrustLevel::Trusted)
+            .launch_local(
+                std::path::Path::new("."),
+                probe_manifest(),
+                TrustLevel::Trusted,
+            )
             .await
             .expect("launch probe");
 
@@ -1447,7 +1480,10 @@ mod tests {
             .expect("encode token");
 
         let resp = handler
-            .handle(&id, inspect_request("elastos://inspect/self", Some(self_token), None))
+            .handle(
+                &id,
+                inspect_request("elastos://inspect/self", Some(self_token), None),
+            )
             .await;
 
         match resp {
@@ -1536,7 +1572,10 @@ mod tests {
                 ),
             )
             .await;
-        assert!(matches!(resp, RuntimeResponse::Ok { .. }), "shell revoke should succeed");
+        assert!(
+            matches!(resp, RuntimeResponse::Ok { .. }),
+            "shell revoke should succeed"
+        );
 
         // The capability is now revoked and fails validation.
         assert!(caps
@@ -1580,7 +1619,10 @@ mod tests {
                 ),
             )
             .await;
-        assert!(matches!(resp, RuntimeResponse::Ok { .. }), "write-scope revoke should succeed");
+        assert!(
+            matches!(resp, RuntimeResponse::Ok { .. }),
+            "write-scope revoke should succeed"
+        );
         assert!(caps
             .validate(&victim, victim_capsule.as_str(), Action::Read, &res, None)
             .await
@@ -1623,7 +1665,10 @@ mod tests {
     async fn inspect_shell_can_list_with_system_scope() {
         let (handler, shell_id) = create_test_handler().await;
         let resp = handler
-            .handle(&shell_id, inspect_request("elastos://inspect/capsules", None, None))
+            .handle(
+                &shell_id,
+                inspect_request("elastos://inspect/capsules", None, None),
+            )
             .await;
         match resp {
             RuntimeResponse::Ok { data: Some(data) } => {
@@ -1639,7 +1684,10 @@ mod tests {
         let (handler, _shell) = create_test_handler().await;
         let caller = CapsuleId::new();
         let resp = handler
-            .handle(&caller, inspect_request("elastos://inspect/capsules", None, None))
+            .handle(
+                &caller,
+                inspect_request("elastos://inspect/capsules", None, None),
+            )
             .await;
         match resp {
             RuntimeResponse::Error { code, .. } => assert_eq!(code, "missing_token"),
@@ -1699,7 +1747,10 @@ mod tests {
     async fn inspect_unknown_endpoint_is_not_found() {
         let (handler, shell_id) = create_test_handler().await;
         let resp = handler
-            .handle(&shell_id, inspect_request("elastos://inspect/bogus", None, None))
+            .handle(
+                &shell_id,
+                inspect_request("elastos://inspect/bogus", None, None),
+            )
             .await;
         match resp {
             RuntimeResponse::Error { code, .. } => assert_eq!(code, "not_found"),

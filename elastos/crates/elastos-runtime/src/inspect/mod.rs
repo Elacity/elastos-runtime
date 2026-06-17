@@ -146,10 +146,14 @@ mod tests {
 
     #[test]
     fn system_grant_wins_regardless_of_order() {
-        let forward =
-            InspectScope::from_grants(false, [INSPECT_SELF.to_string(), INSPECT_SYSTEM.to_string()]);
-        let reverse =
-            InspectScope::from_grants(false, [INSPECT_SYSTEM.to_string(), INSPECT_SELF.to_string()]);
+        let forward = InspectScope::from_grants(
+            false,
+            [INSPECT_SELF.to_string(), INSPECT_SYSTEM.to_string()],
+        );
+        let reverse = InspectScope::from_grants(
+            false,
+            [INSPECT_SYSTEM.to_string(), INSPECT_SELF.to_string()],
+        );
         assert_eq!(forward, Some(InspectScope::System));
         assert_eq!(reverse, Some(InspectScope::System));
     }
