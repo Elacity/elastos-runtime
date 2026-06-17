@@ -1154,6 +1154,19 @@ impl RequestHandler {
             .map(|s| s.is_string())
             .unwrap_or(false);
 
+        // Provider authority — declarative powers a provider capsule is
+        // authorized for (parity with the product-side inspect provider).
+        let authority = manifest
+            .get("authority")
+            .map(|a| {
+                json!({
+                    "reason": a.get("reason").cloned().unwrap_or(Value::Null),
+                    "capabilities": a.get("capabilities").cloned().unwrap_or(Value::Null),
+                    "audit_events": a.get("audit_events").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .unwrap_or(Value::Null);
+
         json!({
             "id": id,
             "name": field(&manifest, "name"),
@@ -1174,6 +1187,7 @@ impl RequestHandler {
                 "entrypoint": field(&manifest, "entrypoint"),
             },
             "affordances": affordances,
+            "authority": authority,
             "required_capabilities": field(&manifest, "capabilities"),
             "granted_capabilities": granted_capabilities,
             "storage_namespaces": manifest.pointer("/permissions/storage").cloned().unwrap_or(Value::Null),
