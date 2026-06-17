@@ -8,7 +8,7 @@
   "type": "wasm",
   "entrypoint": "capsule-inspector.wasm",
   "capabilities": [
-    "elastos://inspect/all"
+    "elastos://inspect/*"
   ],
   "resources": {
     "memory_mb": 32,

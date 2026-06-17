@@ -10,24 +10,29 @@
 //! pure, testable unit. The runtime-side inspect handler MUST call
 //! [`authorize_view`] before returning any per-capsule detail, and MUST audit
 //! denials. Keeping the decision here (no async, no I/O) lets us prove the
-//! invariant in isolation, ahead of the handler wiring.
+//! invariant in isolation, independent of the handler wiring.
 //!
-//! ## Two tiers
+//! ## Two tiers (encoded as capability grant patterns)
 //!
-//! - [`INSPECT_ALL`] (`elastos://inspect/all`): the privileged, system-wide
-//!   view. Granted only to the shell / System surface.
-//! - [`INSPECT_READ`] (`elastos://inspect/read`): the self-only view. An
-//!   ordinary capsule holding this may inspect *itself* and nothing else.
+//! - [`INSPECT_SYSTEM`] (`elastos://inspect/*`): the privileged, system-wide
+//!   view. This wildcard pattern is what lets a caller reach the system
+//!   endpoints (`elastos://inspect/capsules`, `.../capsule`). Granted only to
+//!   the shell / System surface.
+//! - [`INSPECT_SELF`] (`elastos://inspect/self`): the self-only view. A caller
+//!   holding this may reach only `elastos://inspect/self` and sees only its
+//!   own capsule record.
 //!
-//! Shell callers are always treated as [`InspectScope::System`], matching the
-//! existing orchestrator privilege used for `ListCapsules`, `GrantCapability`,
-//! and friends in the request handler.
+//! Because capability validation matches the requested URI against the token's
+//! resource *pattern*, a self-only token (`elastos://inspect/self`, no
+//! wildcard) cannot satisfy a request to `elastos://inspect/capsules` — so the
+//! tier boundary is enforced by the existing capability layer, and
+//! [`authorize_view`] is the defense-in-depth gate on top.
 
-/// Capability resource that grants the privileged, system-wide inspect view.
-pub const INSPECT_ALL: &str = "elastos://inspect/all";
+/// Capability grant pattern for the privileged, system-wide inspect view.
+pub const INSPECT_SYSTEM: &str = "elastos://inspect/*";
 
-/// Capability resource that grants the self-only inspect view.
-pub const INSPECT_READ: &str = "elastos://inspect/read";
+/// Capability grant pattern for the self-only inspect view.
+pub const INSPECT_SELF: &str = "elastos://inspect/self";
 
 /// The visibility a caller is entitled to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,17 @@ pub enum InspectScope {
     System,
     /// May inspect only its own capsule record.
     SelfOnly,
+}
+
+/// Map a single granted capability resource to the inspect scope it confers.
+///
+/// Returns `None` for any resource that is not an inspect grant.
+pub fn scope_for_grant(resource: &str) -> Option<InspectScope> {
+    match resource {
+        INSPECT_SYSTEM => Some(InspectScope::System),
+        INSPECT_SELF => Some(InspectScope::SelfOnly),
+        _ => None,
+    }
 }
 
 impl InspectScope {
@@ -56,12 +72,11 @@ impl InspectScope {
 
         let mut scope = None;
         for resource in granted {
-            match resource.as_ref() {
-                // The privileged grant always wins; nothing can widen it
-                // further, so we can return immediately.
-                INSPECT_ALL => return Some(InspectScope::System),
-                INSPECT_READ => scope = Some(InspectScope::SelfOnly),
-                _ => {}
+            match scope_for_grant(resource.as_ref()) {
+                // System is the strongest tier; nothing widens it further.
+                Some(InspectScope::System) => return Some(InspectScope::System),
+                Some(InspectScope::SelfOnly) => scope = Some(InspectScope::SelfOnly),
+                None => {}
             }
         }
         scope
@@ -98,20 +113,28 @@ mod tests {
     const BOB: &str = "cap_bob";
 
     #[test]
+    fn scope_for_grant_maps_known_patterns() {
+        assert_eq!(scope_for_grant(INSPECT_SYSTEM), Some(InspectScope::System));
+        assert_eq!(scope_for_grant(INSPECT_SELF), Some(InspectScope::SelfOnly));
+        assert_eq!(scope_for_grant("elastos://inspect/capsules"), None);
+        assert_eq!(scope_for_grant("elastos://storage/foo"), None);
+    }
+
+    #[test]
     fn shell_always_gets_system_scope_even_without_grants() {
         let scope = InspectScope::from_grants(true, Vec::<String>::new());
         assert_eq!(scope, Some(InspectScope::System));
     }
 
     #[test]
-    fn inspect_all_grants_system_scope() {
-        let scope = InspectScope::from_grants(false, [INSPECT_ALL.to_string()]);
+    fn system_grant_yields_system_scope() {
+        let scope = InspectScope::from_grants(false, [INSPECT_SYSTEM.to_string()]);
         assert_eq!(scope, Some(InspectScope::System));
     }
 
     #[test]
-    fn inspect_read_grants_self_only_scope() {
-        let scope = InspectScope::from_grants(false, [INSPECT_READ.to_string()]);
+    fn self_grant_yields_self_only_scope() {
+        let scope = InspectScope::from_grants(false, [INSPECT_SELF.to_string()]);
         assert_eq!(scope, Some(InspectScope::SelfOnly));
     }
 
@@ -122,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn inspect_all_wins_regardless_of_order() {
+    fn system_grant_wins_regardless_of_order() {
         let forward =
-            InspectScope::from_grants(false, [INSPECT_READ.to_string(), INSPECT_ALL.to_string()]);
+            InspectScope::from_grants(false, [INSPECT_SELF.to_string(), INSPECT_SYSTEM.to_string()]);
         let reverse =
-            InspectScope::from_grants(false, [INSPECT_ALL.to_string(), INSPECT_READ.to_string()]);
+            InspectScope::from_grants(false, [INSPECT_SYSTEM.to_string(), INSPECT_SELF.to_string()]);
         assert_eq!(forward, Some(InspectScope::System));
         assert_eq!(reverse, Some(InspectScope::System));
     }
@@ -145,7 +168,7 @@ mod tests {
 
     #[test]
     fn authorize_view_self_only_capsule_sees_only_itself() {
-        let grants = vec![INSPECT_READ.to_string()];
+        let grants = vec![INSPECT_SELF.to_string()];
         // Alice inspecting herself: allowed.
         assert!(authorize_view(false, ALICE, ALICE, &grants));
         // Alice inspecting Bob: denied — this is the privilege-escalation guard.
@@ -154,7 +177,7 @@ mod tests {
 
     #[test]
     fn authorize_view_system_surface_sees_everything() {
-        let grants = vec![INSPECT_ALL.to_string()];
+        let grants = vec![INSPECT_SYSTEM.to_string()];
         assert!(authorize_view(false, "system", BOB, &grants));
         // Shell needs no explicit grant.
         assert!(authorize_view(true, "shell", BOB, &[]));

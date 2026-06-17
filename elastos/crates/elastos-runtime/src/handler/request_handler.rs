@@ -14,7 +14,7 @@ use elastos_namespace::ContentUri;
 
 use crate::capability::token::{Action, ResourceId, TokenConstraints as InternalConstraints};
 use crate::capability::CapabilityManager;
-use crate::capsule::{prepare_fetched_capsule, CapsuleId, CapsuleManager};
+use crate::capsule::{prepare_fetched_capsule, CapsuleId, CapsuleInfo, CapsuleManager};
 use crate::content::ContentResolver;
 use crate::messaging::Message;
 use crate::messaging::MessageChannel;
@@ -626,6 +626,14 @@ impl RequestHandler {
             );
         }
 
+        // Read-only Capsule Inspector surface. Served directly here (not via the
+        // provider registry) because it projects runtime-owned state — capsule
+        // manifests, capability grants, audit — under a scoped, fail-closed
+        // authorization gate. See `crate::inspect` and docs/CAPSULE_INSPECTOR.md.
+        if uri == "elastos://inspect" || uri.starts_with("elastos://inspect/") {
+            return self.handle_inspect(from, uri, params, token).await;
+        }
+
         let resource_action = match action.to_lowercase().as_str() {
             "read" => ResourceAction::Read,
             "write" => ResourceAction::Write,
@@ -830,6 +838,284 @@ impl RequestHandler {
             capsule_count: running.len(),
         }
     }
+
+    // ===== Capsule Inspector (read-only) =====
+
+    /// Dispatch an `elastos://inspect/*` request under a scoped, fail-closed
+    /// authorization gate. Every operation is read-only.
+    async fn handle_inspect(
+        &self,
+        from: &CapsuleId,
+        uri: &str,
+        params: Option<serde_json::Value>,
+        token: Option<String>,
+    ) -> RuntimeResponse {
+        use crate::capability::token::CapabilityToken;
+        use crate::inspect::{self, InspectScope};
+
+        // Determine the caller's inspect scope. Shell is System by existing
+        // orchestrator privilege; every other caller must present a valid
+        // inspect capability token, and the grant pattern fixes the tier.
+        let is_shell = self.is_shell(from).await;
+        let scope = if is_shell {
+            InspectScope::System
+        } else {
+            let token_str = match token.as_deref() {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    return RuntimeResponse::error(
+                        "missing_token",
+                        "Capability token required for inspect access",
+                    )
+                }
+            };
+            // Authoritative capability check: the token must grant the
+            // requested URI (a self-only grant cannot satisfy a system URI).
+            if let Err(e) = self.validate_token(token_str, from, Action::Read, uri).await {
+                return e;
+            }
+            // Defense in depth: classify the granted pattern into a scope.
+            let granted = match CapabilityToken::from_base64(token_str) {
+                Ok(t) => vec![t.resource().as_str().to_string()],
+                Err(_) => {
+                    return RuntimeResponse::error(
+                        "invalid_token",
+                        "Failed to decode capability token",
+                    )
+                }
+            };
+            match inspect::InspectScope::from_grants(false, granted.iter()) {
+                Some(s) => s,
+                None => {
+                    return RuntimeResponse::error(
+                        "permission_denied",
+                        "Capability does not grant an inspect scope",
+                    )
+                }
+            }
+        };
+
+        let endpoint = uri
+            .strip_prefix("elastos://inspect")
+            .unwrap_or("")
+            .trim_start_matches('/');
+
+        match endpoint {
+            "capsules" => self.inspect_list(scope, from).await,
+            "self" => self.inspect_detail(scope, from, from.as_str()).await,
+            "capsule" => {
+                match params
+                    .as_ref()
+                    .and_then(|p| p.get("id"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(id) => self.inspect_detail(scope, from, id).await,
+                    None => RuntimeResponse::error(
+                        "invalid_input",
+                        "inspect/capsule requires an \"id\" parameter",
+                    ),
+                }
+            }
+            _ => RuntimeResponse::error("not_found", "Unknown inspect endpoint"),
+        }
+    }
+
+    /// List capsules visible under the caller's scope.
+    async fn inspect_list(
+        &self,
+        scope: crate::inspect::InspectScope,
+        from: &CapsuleId,
+    ) -> RuntimeResponse {
+        use crate::inspect::InspectScope;
+
+        let mut capsules = Vec::new();
+        for id in self.capsule_manager.list().await {
+            if !scope.can_view(from.as_str(), id.as_str()) {
+                continue;
+            }
+            if let Some(info) = self.capsule_manager.get(&id).await {
+                capsules.push(serde_json::json!({
+                    "id": id.to_string(),
+                    "name": info.manifest.name,
+                    "role": serde_json::to_value(&info.manifest.role).ok(),
+                    "type": serde_json::to_value(&info.manifest.capsule_type).ok(),
+                    "state": format!("{:?}", info.state).to_lowercase(),
+                }));
+            }
+        }
+
+        let scope_label = match scope {
+            InspectScope::System => "system",
+            InspectScope::SelfOnly => "self",
+        };
+        RuntimeResponse::ok_with_data(serde_json::json!({
+            "scope": scope_label,
+            "capsules": capsules,
+        }))
+    }
+
+    /// Return the full inspector view of a single capsule, gated by scope.
+    /// Out-of-scope requests are denied and audited.
+    async fn inspect_detail(
+        &self,
+        scope: crate::inspect::InspectScope,
+        from: &CapsuleId,
+        target: &str,
+    ) -> RuntimeResponse {
+        use crate::primitives::audit::AuditEvent;
+
+        if !scope.can_view(from.as_str(), target) {
+            self._audit_log.emit(AuditEvent::Custom {
+                event_type: "inspect.out_of_scope".to_string(),
+                details: serde_json::json!({ "caller": from.as_str(), "target": target }),
+            });
+            return RuntimeResponse::error("out_of_scope", "Caller may not inspect this capsule");
+        }
+
+        let mut info = None;
+        for id in self.capsule_manager.list().await {
+            if id.as_str() == target {
+                info = self.capsule_manager.get(&id).await;
+                break;
+            }
+        }
+        match info {
+            Some(info) => RuntimeResponse::ok_with_data(self.build_capsule_view(&info)),
+            None => RuntimeResponse::error("not_found", "No such capsule"),
+        }
+    }
+
+    /// Project a capsule's runtime-owned state into the inspector contract
+    /// (see docs/CAPSULE_INSPECTOR.md). Read-only; surfaces only what the
+    /// runtime actually knows and leaves unknown fields null.
+    fn build_capsule_view(&self, info: &CapsuleInfo) -> serde_json::Value {
+        use serde_json::{json, Value};
+
+        fn field(v: &Value, key: &str) -> Value {
+            v.get(key).cloned().unwrap_or(Value::Null)
+        }
+
+        let id = info.id.to_string();
+        let cid = info.cid.clone();
+        let manifest = serde_json::to_value(&info.manifest).unwrap_or_else(|_| json!({}));
+
+        // Affordances: flatten declared interface methods.
+        let mut affordances = Vec::new();
+        if let Some(interfaces) = manifest.get("interfaces").and_then(|v| v.as_array()) {
+            for iface in interfaces {
+                let iface_id = field(iface, "id");
+                if let Some(methods) = iface.get("methods").and_then(|v| v.as_array()) {
+                    for m in methods {
+                        affordances.push(json!({
+                            "interface": iface_id,
+                            "id": field(m, "id"),
+                            "risk": field(m, "risk"),
+                            "approval": field(m, "approval"),
+                            "audit": field(m, "audit"),
+                            "description": field(m, "description"),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Capability grants + recent activity, derived from the audit log —
+        // the runtime's authoritative record of what this capsule did.
+        let events = self._audit_log.recent_events(500);
+        let mut recent = Vec::new();
+        let mut grants: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        let (mut total, mut denied) = (0u64, 0u64);
+        for ev in &events {
+            let v = match serde_json::to_value(ev) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("capsule_id").and_then(|c| c.as_str()) != Some(id.as_str()) {
+                continue;
+            }
+            total += 1;
+            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let resource = v.get("resource").and_then(|r| r.as_str()).map(str::to_string);
+            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
+            if !success {
+                denied += 1;
+            }
+            if let Some(res) = &resource {
+                let key = format!("{} {}", res, action);
+                let entry = grants.entry(key).or_insert(true);
+                if etype == "capability_use" && !success {
+                    *entry = false;
+                }
+            }
+            if recent.len() < 20 {
+                recent.push(json!({
+                    "ts": v.get("timestamp").and_then(|t| t.get("unix_secs")).cloned(),
+                    "event": etype,
+                    "detail": resource
+                        .map(|r| format!("{} {}", r, action))
+                        .unwrap_or_default(),
+                    "success": success,
+                }));
+            }
+        }
+        let granted_capabilities: Vec<Value> = grants
+            .into_iter()
+            .map(|(key, ok)| {
+                let mut parts = key.splitn(2, ' ');
+                let resource = parts.next().unwrap_or("");
+                let action = parts.next().unwrap_or("");
+                json!({ "resource": resource, "action": action, "granted": ok })
+            })
+            .collect();
+
+        let signature_present = manifest
+            .get("signature")
+            .map(|s| s.is_string())
+            .unwrap_or(false);
+
+        json!({
+            "id": id,
+            "name": field(&manifest, "name"),
+            "version": field(&manifest, "version"),
+            "role": field(&manifest, "role"),
+            "type": field(&manifest, "type"),
+            "description": field(&manifest, "description"),
+            "author": field(&manifest, "author"),
+            "identity": {
+                "did": Value::Null,
+                "cid": cid,
+                "trust_level": serde_json::to_value(&info.trust_level).ok(),
+                "signature_present": signature_present,
+                "signed_by": Value::Null,
+            },
+            "manifest": {
+                "schema": field(&manifest, "schema"),
+                "entrypoint": field(&manifest, "entrypoint"),
+            },
+            "affordances": affordances,
+            "required_capabilities": field(&manifest, "capabilities"),
+            "granted_capabilities": granted_capabilities,
+            "storage_namespaces": manifest.pointer("/permissions/storage").cloned().unwrap_or(Value::Null),
+            "carrier": {
+                "enabled": manifest.pointer("/permissions/carrier").cloned().unwrap_or(Value::Null),
+                "endpoints": [],
+                "peers": 0,
+            },
+            "provenance": {
+                "signed_by": Value::Null,
+                "version": field(&manifest, "version"),
+                "installed_at": Value::Null,
+                "cid": info.cid.clone(),
+                "signature_present": signature_present,
+            },
+            "audit": {
+                "counts": { "total": total, "denied": denied },
+                "recent": recent,
+            },
+            "processes": [],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -931,6 +1217,146 @@ mod tests {
         handler.set_shell(shell_id.clone()).await;
 
         (handler, shell_id)
+    }
+
+    /// Like `create_test_handler`, but also returns the capability manager so
+    /// inspect conformance tests can mint scoped tokens.
+    async fn create_test_handler_with_caps() -> (RequestHandler, CapsuleId, Arc<CapabilityManager>) {
+        let compute = Arc::new(MockComputeProvider);
+        let store = Arc::new(CapabilityStore::new());
+        let audit_log = Arc::new(AuditLog::new());
+        let metrics = Arc::new(MetricsManager::new());
+        let capability_manager =
+            Arc::new(CapabilityManager::new(store, audit_log.clone(), metrics.clone()));
+        let capsule_manager = Arc::new(CapsuleManager::new(
+            compute,
+            capability_manager.clone(),
+            metrics.clone(),
+            audit_log.clone(),
+        ));
+        let message_channel = Arc::new(MessageChannel::new(
+            capability_manager.clone(),
+            metrics.clone(),
+            audit_log.clone(),
+        ));
+        let content_resolver = Arc::new(ContentResolver::new(
+            ResolverConfig::default(),
+            audit_log.clone(),
+            Arc::new(NullFetcher),
+        ));
+        let handler = RequestHandler::new(
+            capsule_manager,
+            capability_manager.clone(),
+            message_channel,
+            content_resolver,
+            audit_log,
+            "0.1.0".to_string(),
+            None,
+        );
+        let shell_id = CapsuleId::new();
+        handler.set_shell(shell_id.clone()).await;
+        (handler, shell_id, capability_manager)
+    }
+
+    fn inspect_request(
+        uri: &str,
+        token: Option<String>,
+        params: Option<serde_json::Value>,
+    ) -> RuntimeRequest {
+        RuntimeRequest::ResourceRequest {
+            uri: uri.to_string(),
+            action: "read".to_string(),
+            params,
+            token,
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_shell_can_list_with_system_scope() {
+        let (handler, shell_id) = create_test_handler().await;
+        let resp = handler
+            .handle(&shell_id, inspect_request("elastos://inspect/capsules", None, None))
+            .await;
+        match resp {
+            RuntimeResponse::Ok { data: Some(data) } => {
+                assert_eq!(data["scope"], "system");
+                assert!(data["capsules"].is_array());
+            }
+            other => panic!("expected Ok with data, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_non_shell_without_token_is_denied() {
+        let (handler, _shell) = create_test_handler().await;
+        let caller = CapsuleId::new();
+        let resp = handler
+            .handle(&caller, inspect_request("elastos://inspect/capsules", None, None))
+            .await;
+        match resp {
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "missing_token"),
+            other => panic!("expected missing_token error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_self_only_token_cannot_reach_system_endpoints() {
+        // The privilege-escalation guard at the handler boundary: a self-only
+        // grant must not let a capsule enumerate or read other capsules.
+        let (handler, shell_id, caps) = create_test_handler_with_caps().await;
+        let caller = CapsuleId::new();
+        let self_token = caps
+            .grant(
+                caller.as_str(),
+                ResourceId::new("elastos://inspect/self"),
+                Action::Read,
+                InternalConstraints::default(),
+                None,
+            )
+            .to_base64()
+            .expect("encode token");
+
+        // Read another capsule via the system detail endpoint: denied.
+        let resp = handler
+            .handle(
+                &caller,
+                inspect_request(
+                    "elastos://inspect/capsule",
+                    Some(self_token.clone()),
+                    Some(serde_json::json!({ "id": shell_id.to_string() })),
+                ),
+            )
+            .await;
+        match resp {
+            // Blocked at the capability layer: a self-only pattern cannot match
+            // a system URI. (inspect::can_view is the defense-in-depth gate.)
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "permission_denied"),
+            other => panic!("expected permission_denied, got {:?}", other),
+        }
+
+        // Enumerate all capsules: also denied.
+        let resp = handler
+            .handle(
+                &caller,
+                inspect_request("elastos://inspect/capsules", Some(self_token), None),
+            )
+            .await;
+        assert!(
+            matches!(resp, RuntimeResponse::Error { .. }),
+            "self-only grant must not list all capsules"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_unknown_endpoint_is_not_found() {
+        let (handler, shell_id) = create_test_handler().await;
+        let resp = handler
+            .handle(&shell_id, inspect_request("elastos://inspect/bogus", None, None))
+            .await;
+        match resp {
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "not_found"),
+            other => panic!("expected not_found, got {:?}", other),
+        }
     }
 
     #[tokio::test]

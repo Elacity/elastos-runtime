@@ -1,7 +1,7 @@
 // Capsule Inspector (Phase 1) — read-only object-centered view.
 //
-// Data flow: the UI reads `elastos://inspect/*` (capability
-// `elastos://inspect/read`) through the runtime bridge when present. When the
+// Data flow: the UI reads the `elastos://inspect/*` endpoints (System-scope
+// capability `elastos://inspect/*`) through the runtime bridge when present. When the
 // bridge is absent (e.g. opened standalone in a plain browser for design
 // review), it falls back to SAMPLE_DATA so the surface always renders. No
 // write/sign/launch path exists anywhere in this capsule.
@@ -12,12 +12,14 @@
 // Live data source: elastos://inspect/* via the runtime bridge.
 // Returns null when no bridge is available so the UI can fall back to samples.
 // ---------------------------------------------------------------------------
-async function inspectInvoke(operation, body) {
+// Mirrors the runtime ResourceRequest: a read against an `elastos://inspect/*`
+// URI with params. The host bridge validates the capability token and routes
+// to RequestHandler::handle_inspect. Returns null when no bridge is present.
+async function inspectRead(uri, params) {
   const bridge = window.elastos && window.elastos.inspect;
   if (!bridge || typeof bridge.invoke !== "function") return null;
   try {
-    // bridge.invoke(uri, operation, body) -> parsed JSON
-    return await bridge.invoke("elastos://inspect", operation, body || {});
+    return await bridge.invoke(uri, "read", params || {});
   } catch (err) {
     console.warn("inspect bridge error:", err);
     return null;
@@ -25,7 +27,7 @@ async function inspectInvoke(operation, body) {
 }
 
 async function loadCapsuleList() {
-  const live = await inspectInvoke("capsules", {});
+  const live = await inspectRead("elastos://inspect/capsules", {});
   if (live && Array.isArray(live.capsules)) {
     setSourceBadge(true);
     // Scope is reported by the runtime handler ("system" | "self").
@@ -41,7 +43,7 @@ async function loadCapsuleList() {
 }
 
 async function loadCapsuleDetail(id) {
-  const live = await inspectInvoke("capsule", { id });
+  const live = await inspectRead("elastos://inspect/capsule", { id });
   if (live && live.id) return live;
   return SAMPLE_DATA.find((c) => c.id === id) || null;
 }
@@ -324,15 +326,15 @@ const SAMPLE_DATA = [
     identity: { did: "did:key:z6MkInspectorExample", cid: "bafyinspector...", trust_level: "verified", signature_present: true, signed_by: "gateway-did" },
     manifest: { schema: "elastos.capsule/v1", entrypoint: "capsule-inspector.wasm" },
     affordances: [],
-    required_capabilities: ["elastos://inspect/read"],
+    required_capabilities: ["elastos://inspect/*"],
     granted_capabilities: [
-      { resource: "elastos://inspect/read", action: "read", granted: true, token_id: "tok_i0n1" },
+      { resource: "elastos://inspect/*", action: "read", granted: true, token_id: "tok_i0n1" },
     ],
     storage_namespaces: [],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781990000, cid: "bafyinspector..." },
     audit: { counts: { total_today: 3, user_approved: 0, denied: 0 }, recent: [
-      { ts: 1781990200, event: "capability.use", detail: "inspect/read capsules", success: true },
+      { ts: 1781990200, event: "capability.use", detail: "inspect/* capsules", success: true },
     ] },
     processes: [{ kind: "wasm", instance: "#1", memory_mb: 9, uptime_s: 200 }],
   },

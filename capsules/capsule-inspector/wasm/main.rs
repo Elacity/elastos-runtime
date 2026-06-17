@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Capsule Inspector (Phase 1): a read-only, object-centered view of live
 // capsules. The WASM entrypoint announces the capsule; the inspector UI is
 // served from `inspector/` and reads `elastos://inspect/*` (capability
-// `elastos://inspect/read`). Holds no ambient authority and no write effect.
+// `elastos://inspect/*`). Holds no ambient authority and no write effect.
 fn main() {
     let info = elastos_guest::CapsuleInfo::from_env();
     let launched_at = SystemTime::now()
