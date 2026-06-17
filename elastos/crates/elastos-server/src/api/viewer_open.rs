@@ -86,10 +86,13 @@ pub struct PrepareGrantRequest {
 }
 
 /// True when the asset should play through the media viewer (MSE) rather than the
-/// whole-object viewer. Kept narrow (video) so non-playable types render as objects.
+/// whole-object viewer. Covers video AND audio: both are packaged on the fly into DASH by the
+/// media authority (the audio-only path skips the video filter) and played through the same
+/// single-SourceBuffer MSE player. Audio routed here (not the object viewer, which has no
+/// playback) so an owned track actually plays. Non-playable types still render as objects.
 fn is_media_mime(mime: &str) -> bool {
     let m = mime.trim().to_ascii_lowercase();
-    m.starts_with("video/")
+    m.starts_with("video/") || m.starts_with("audio/")
 }
 
 /// Best-effort file extension for the helper's temp input (so its mime fallback +
