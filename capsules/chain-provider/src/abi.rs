@@ -368,6 +368,47 @@ pub(super) fn decode_asset_created_log(entry: &Value) -> Option<(String, String,
     Some((operative, token_id, block_number, log_index))
 }
 
+/// Decode the leading `bytes16` contentId (KID) from a `mint(string,uint16,bytes,bytes)`
+/// calldata. `opRawData` is argument #2 (a dynamic `bytes`); its payload always begins with
+/// the abi-encoded `bytes16 contentId` (left-aligned in the first word), so the first 16 bytes
+/// of the payload ARE the KID — for both the FREE and PAID layouts. Returns `0x<32 hex>`.
+/// `None` on any selector/offset/length mismatch (the caller treats that as "not this asset").
+pub(super) fn decode_mint_content_id(input: &str) -> Option<String> {
+    let bytes = decode_hex(input, None, "tx input").ok()?;
+    // selector (4) + at least 4 head words (tokenURI off, opType, opRawData off, sellRawData off).
+    if bytes.len() < 4 + 4 * 32 {
+        return None;
+    }
+    let args = &bytes[4..];
+    // The 3rd head word (bytes 64..96) is the offset to opRawData, relative to args start.
+    let op_off = word_to_usize(&args[64..96])?;
+    let len_pos = op_off.checked_add(32)?;
+    let len = word_to_usize(args.get(op_off..len_pos)?)?;
+    let payload = args.get(len_pos..len_pos.checked_add(len)?)?;
+    if payload.len() < 16 {
+        return None;
+    }
+    Some(format!("0x{}", encode_hex(&payload[0..16])))
+}
+
+/// Read a 32-byte ABI word as a `usize` offset/length. Fail-closed if it does not fit in a
+/// `usize` or has non-zero high bytes beyond the low 8 (a malformed/hostile calldata word).
+fn word_to_usize(word: &[u8]) -> Option<usize> {
+    if word.len() != 32 || word[..24].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&word[24..32]);
+    usize::try_from(u64::from_be_bytes(v)).ok()
+}
+
+/// Normalise a `bytes16` content id to lowercase 32-hex (no `0x`). `None` if it is not a clean
+/// 16-byte hex value — so a caller can pin only on a real KID and fail closed otherwise.
+pub(super) fn normalize_content_id_bytes16(content_id: &str) -> Option<String> {
+    let bytes = decode_hex(content_id, Some(16), "bytes16 contentId").ok()?;
+    Some(encode_hex(&bytes))
+}
+
 /// An EVM address as a 32-byte indexed-log topic (left-zero-padded), `0x`-prefixed.
 pub(super) fn address_topic(address: &str) -> Result<String, String> {
     let word = abi_word_address(address)?;

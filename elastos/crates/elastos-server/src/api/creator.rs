@@ -746,6 +746,11 @@ pub struct TradeApprovalRequest {
     channel: String,
     #[serde(default)]
     creator_address: String,
+    /// The just-minted asset's `bytes16` content id (KID). When present the chain provider pins
+    /// the operative to THIS asset (the mint tx that embeds this KID), so a fresh mint is never
+    /// reported tradable off an EARLIER, already-approved asset in the same channel.
+    #[serde(default)]
+    content_id: Option<String>,
 }
 
 // ── POST /api/apps/creator/mint-status ─────────────────────────────────────────
@@ -786,6 +791,12 @@ pub async fn creator_mint_status(
     if let Err(message) = confirm_channel_owned(registry, signer, channel).await {
         return error_json(StatusCode::FORBIDDEN, &message);
     }
+    // Pin to the asset's KID when supplied; an empty value falls back to legacy resolution.
+    let content_id = req
+        .content_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match provider_data(
         registry,
         "chain",
@@ -794,6 +805,7 @@ pub async fn creator_mint_status(
             "network": mint_network(),
             "channel": channel,
             "creator": signer,
+            "content_id": content_id,
         }),
     )
     .await
@@ -886,6 +898,12 @@ async fn run_prepare_trade_approval(
     // Same fail-closed ownership gate as the mint: you may only approve on your own channel.
     confirm_channel_owned(registry, signer, channel).await?;
 
+    // Pin to the asset's KID when supplied; an empty value falls back to legacy resolution.
+    let content_id = req
+        .content_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let assembled = provider_data(
         registry,
         "chain",
@@ -894,6 +912,7 @@ async fn run_prepare_trade_approval(
             "network": mint_network(),
             "channel": channel,
             "creator": signer,
+            "content_id": content_id,
         }),
     )
     .await?;

@@ -215,13 +215,19 @@ impl ChainProvider {
                 factory,
                 creator,
                 from_block,
-            } => self.list_channels(&network, factory.as_deref(), &creator, from_block.as_deref()),
+            } => self.list_channels(
+                &network,
+                factory.as_deref(),
+                &creator,
+                from_block.as_deref(),
+            ),
             Request::AssembleCreateChannel { channel } => self.assemble_create_channel(*channel),
             Request::AssembleTradeApproval {
                 network,
                 channel,
                 creator,
-            } => self.assemble_trade_approval(&network, &channel, &creator),
+                content_id,
+            } => self.assemble_trade_approval(&network, &channel, &creator, content_id.as_deref()),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -1131,8 +1137,7 @@ impl ChainProvider {
         let hex = value
             .as_str()
             .ok_or_else(|| Response::error("upstream_invalid_block", "blockNumber not a string"))?;
-        parse_hex_u64(hex)
-            .map_err(|err| Response::error("upstream_invalid_block", &err))
+        parse_hex_u64(hex).map_err(|err| Response::error("upstream_invalid_block", &err))
     }
 
     /// Does an RPC error look like a "block range too large" cap (vs a real failure)? Endpoints
@@ -1187,19 +1192,36 @@ impl ChainProvider {
             Err(response) => {
                 // Split-and-retry only when the span is still divisible and the endpoint
                 // complained about range size; otherwise fail closed.
-                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE {
+                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE
+                {
                     let mid = from + (to - from) / 2;
-                    let lower = self.scan_channel_window(network, factory, creator_topic, from, mid, entry)?;
-                    let upper =
-                        self.scan_channel_window(network, factory, creator_topic, mid + 1, to, entry)?;
+                    let lower = self.scan_channel_window(
+                        network,
+                        factory,
+                        creator_topic,
+                        from,
+                        mid,
+                        entry,
+                    )?;
+                    let upper = self.scan_channel_window(
+                        network,
+                        factory,
+                        creator_topic,
+                        mid + 1,
+                        to,
+                        entry,
+                    )?;
                     return Ok(lower + upper);
                 }
                 return Err(response);
             }
         };
-        let entries = logs
-            .as_array()
-            .ok_or_else(|| Response::error("upstream_invalid_logs", "eth_getLogs result was not an array"))?;
+        let entries = logs.as_array().ok_or_else(|| {
+            Response::error(
+                "upstream_invalid_logs",
+                "eth_getLogs result was not an array",
+            )
+        })?;
         let mut found = 0usize;
         for log in entries {
             let Ok(decoded) = decode_channel_log(log) else {
@@ -1212,8 +1234,14 @@ impl ChainProvider {
                 .get("block_number")
                 .and_then(Value::as_u64)
                 .unwrap_or(from);
-            let ct = decoded.get("channel_type").and_then(Value::as_u64).map(|v| v as u8);
-            let scope = decoded.get("scope").and_then(Value::as_u64).map(|v| v as u8);
+            let ct = decoded
+                .get("channel_type")
+                .and_then(Value::as_u64)
+                .map(|v| v as u8);
+            let scope = decoded
+                .get("scope")
+                .and_then(Value::as_u64)
+                .map(|v| v as u8);
             entry.upsert(address, block_number, ct, scope);
             found += 1;
         }
@@ -1262,18 +1290,23 @@ impl ChainProvider {
         };
 
         let key = channel_index_key(&network.id, &factory, creator);
-        let mut entry = self.channel_index.entries.get(&key).cloned().unwrap_or_else(|| {
-            // Fresh cursor: nothing scanned yet, both ends pinned at the chain head so the
-            // first forward pass is a no-op and backfill starts walking down from the tip.
-            ChannelIndexEntry {
-                deploy_block,
-                floor: latest.saturating_add(1),
-                head: latest,
-                complete: false,
-                channels: Vec::new(),
-                updated_at: now_ts(),
-            }
-        });
+        let mut entry = self
+            .channel_index
+            .entries
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| {
+                // Fresh cursor: nothing scanned yet, both ends pinned at the chain head so the
+                // first forward pass is a no-op and backfill starts walking down from the tip.
+                ChannelIndexEntry {
+                    deploy_block,
+                    floor: latest.saturating_add(1),
+                    head: latest,
+                    complete: false,
+                    channels: Vec::new(),
+                    updated_at: now_ts(),
+                }
+            });
         // A per-request deploy override re-opens backfill toward the new (lower) bound.
         if deploy_block < entry.deploy_block {
             entry.deploy_block = deploy_block;
@@ -1288,9 +1321,14 @@ impl ChainProvider {
             let mut from = entry.head.saturating_add(1);
             while from <= latest {
                 let to = (from.saturating_add(window - 1)).min(latest);
-                if let Err(response) =
-                    self.scan_channel_window(&network, &factory, &creator_topic, from, to, &mut entry)
-                {
+                if let Err(response) = self.scan_channel_window(
+                    &network,
+                    &factory,
+                    &creator_topic,
+                    from,
+                    to,
+                    &mut entry,
+                ) {
                     return response;
                 }
                 if to == latest {
@@ -1312,9 +1350,14 @@ impl ChainProvider {
             while scanned < budget && entry.floor > entry.deploy_block {
                 let to = entry.floor.saturating_sub(1);
                 let from = to.saturating_sub(window - 1).max(entry.deploy_block);
-                let found = match self
-                    .scan_channel_window(&network, &factory, &creator_topic, from, to, &mut entry)
-                {
+                let found = match self.scan_channel_window(
+                    &network,
+                    &factory,
+                    &creator_topic,
+                    from,
+                    to,
+                    &mut entry,
+                ) {
                     Ok(found) => found,
                     Err(response) => return response,
                 };
@@ -1352,8 +1395,8 @@ impl ChainProvider {
         // Persist the advanced cursor. A write failure only costs a rescan next time, so it
         // must not fail the (valid) read — surface it as a soft warning instead.
         self.channel_index.entries.insert(key, entry);
-        let persist_warning = write_channel_index_file(&self.channel_index_path, &self.channel_index)
-            .err();
+        let persist_warning =
+            write_channel_index_file(&self.channel_index_path, &self.channel_index).err();
 
         Response::ok(json!({
             "schema": "elastos.chain.channels/v1",
@@ -1427,7 +1470,13 @@ impl ChainProvider {
     /// chain only emits on a SUCCESSFUL mint), so a missing log means "mint not confirmed yet"
     /// and we fail closed (#11). Idempotent: if the gateway is already an approved operator we
     /// return `already_approved` rather than queueing a needless second signature.
-    fn assemble_trade_approval(&self, network_id: &str, channel: &str, creator: &str) -> Response {
+    fn assemble_trade_approval(
+        &self,
+        network_id: &str,
+        channel: &str,
+        creator: &str,
+        content_id: Option<&str>,
+    ) -> Response {
         let network = match self.evm_network(network_id) {
             Ok(network) => network.clone(),
             Err(response) => return response,
@@ -1446,6 +1495,18 @@ impl ChainProvider {
             Ok(topic) => topic,
             Err(err) => return Response::error("invalid_channel", &err),
         };
+        // When a content id is supplied, pin to it (fail-closed if it is not a clean bytes16 KID).
+        let want_content_id =
+            match content_id {
+                Some(cid) => match normalize_content_id_bytes16(cid) {
+                    Some(norm) => Some(norm),
+                    None => return Response::error(
+                        "invalid_content_id",
+                        "content_id must be a 16-byte (bytes16) hex KID to pin the trade approval",
+                    ),
+                },
+                None => None,
+            };
         let latest = match self.evm_latest_block(&network) {
             Ok(latest) => latest,
             Err(response) => return response,
@@ -1453,9 +1514,9 @@ impl ChainProvider {
         // The asset's `AssetCreated` log may sit well behind the chain tip (a mint minutes OR
         // days ago — Base produces ~30k blocks/day, so a single 10k window only covers a few
         // hours). Scan newest-first in `max_log_range` windows down toward the channel-factory
-        // deploy block, early-stopping at the FIRST window that yields a match (that window's
-        // newest log is the newest mint). A per-call window budget keeps the call bounded; the
-        // common "just minted" case returns in the first window or two.
+        // deploy block. With a content-id PIN we accept only the asset whose mint tx embeds THAT
+        // KID (so an earlier, already-approved asset in the same channel can never be mistaken
+        // for the just-minted one); without a pin we early-stop at the channel's newest mint.
         let window = Self::max_log_range().max(1);
         let floor = DEFAULT_CHANNEL_FROM_BLOCK;
         let mut to = latest;
@@ -1465,8 +1526,20 @@ impl ChainProvider {
                 break None;
             }
             let from = to.saturating_sub(window - 1).max(floor);
-            match self.scan_latest_asset_created(&network, &creator_topic, &channel_topic, from, to)
-            {
+            let hit = match &want_content_id {
+                Some(cid) => self.scan_asset_created_for_content_id(
+                    &network,
+                    &creator_topic,
+                    &channel_topic,
+                    cid,
+                    from,
+                    to,
+                ),
+                None => self
+                    .scan_latest_asset_created(&network, &creator_topic, &channel_topic, from, to)
+                    .map(|opt| opt.map(|(op, tid, _, _)| (op, tid))),
+            };
+            match hit {
                 Ok(Some(hit)) => break Some(hit),
                 Ok(None) => {}
                 Err(response) => return response,
@@ -1478,12 +1551,14 @@ impl ChainProvider {
             budget -= 1;
         };
         let (operative, token_id) = match found {
-            Some((operative, token_id, _, _)) => (operative, token_id),
+            Some(hit) => hit,
             None => {
-                return Response::error(
-                    "mint_not_confirmed",
-                    "no confirmed mint found for this wallet in this channel — if you just minted, wait for it to confirm on-chain and retry",
-                )
+                let detail = if want_content_id.is_some() {
+                    "this asset's mint is not confirmed on-chain yet — wait for it to mine and retry"
+                } else {
+                    "no confirmed mint found for this wallet in this channel — if you just minted, wait for it to confirm on-chain and retry"
+                };
+                return Response::error("mint_not_confirmed", detail);
             }
         };
 
@@ -1556,23 +1631,36 @@ impl ChainProvider {
                 {
                     let mid = from + (to - from) / 2;
                     // Newest-first: the upper half holds the freshest blocks.
-                    if let Some(found) =
-                        self.scan_latest_asset_created(network, creator_topic, channel_topic, mid + 1, to)?
-                    {
+                    if let Some(found) = self.scan_latest_asset_created(
+                        network,
+                        creator_topic,
+                        channel_topic,
+                        mid + 1,
+                        to,
+                    )? {
                         return Ok(Some(found));
                     }
-                    return self
-                        .scan_latest_asset_created(network, creator_topic, channel_topic, from, mid);
+                    return self.scan_latest_asset_created(
+                        network,
+                        creator_topic,
+                        channel_topic,
+                        from,
+                        mid,
+                    );
                 }
                 return Err(response);
             }
         };
         let entries = logs.as_array().ok_or_else(|| {
-            Response::error("upstream_invalid_logs", "eth_getLogs result was not an array")
+            Response::error(
+                "upstream_invalid_logs",
+                "eth_getLogs result was not an array",
+            )
         })?;
         let mut best: Option<(String, String, u64, u64)> = None;
         for log in entries {
-            let Some((operative, token_id, block_number, log_index)) = decode_asset_created_log(log)
+            let Some((operative, token_id, block_number, log_index)) =
+                decode_asset_created_log(log)
             else {
                 continue;
             };
@@ -1585,6 +1673,112 @@ impl ChainProvider {
             }
         }
         Ok(best)
+    }
+
+    /// Scan `[from, to]` for the `AssetCreated` whose MINT TRANSACTION embeds `want_content_id`
+    /// (a normalised 32-hex `bytes16` KID) in `opRawData` — i.e. the EXACT asset just minted,
+    /// not merely the channel's newest. For each candidate log (newest-first) we fetch the
+    /// emitting transaction and decode its leading `bytes16` content id; the first KID match
+    /// wins. Returns `(operative, token_id_hex)`. `None` when no log in the window matches (the
+    /// mint of THIS asset is not on-chain yet → the caller keeps the trade step gated, #11).
+    fn scan_asset_created_for_content_id(
+        &self,
+        network: &ChainNetwork,
+        creator_topic: &str,
+        channel_topic: &str,
+        want_content_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<(String, String)>, Response> {
+        let entries =
+            self.fetch_asset_created_logs(network, creator_topic, channel_topic, from, to)?;
+        // Decode + sort newest-first so a repeated KID (re-mint) resolves to the latest one.
+        let mut decoded: Vec<(String, String, u64, u64, String)> = Vec::new();
+        for log in &entries {
+            let Some((operative, token_id, block, log_index)) = decode_asset_created_log(log)
+            else {
+                continue;
+            };
+            let Some(tx_hash) = log.get("transactionHash").and_then(Value::as_str) else {
+                continue;
+            };
+            decoded.push((operative, token_id, block, log_index, tx_hash.to_string()));
+        }
+        decoded.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)));
+        for (operative, token_id, _, _, tx_hash) in decoded {
+            let Some(input) = self.tx_input(network, &tx_hash)? else {
+                continue;
+            };
+            let Some(cid) = decode_mint_content_id(&input) else {
+                continue;
+            };
+            if normalize_content_id_bytes16(&cid).as_deref() == Some(want_content_id) {
+                return Ok(Some((operative, token_id)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetch ALL `AssetCreated` log entries in `[from, to]` for `(creator, channel)`, splitting
+    /// the range on a provider "range too large" signal (mirrors `scan_latest_asset_created`).
+    /// The caller orders/filters the raw entries.
+    fn fetch_asset_created_logs(
+        &self,
+        network: &ChainNetwork,
+        creator_topic: &str,
+        channel_topic: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Value>, Response> {
+        let filter = json!({
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "topics": [ASSET_CREATED_TOPIC0, creator_topic, channel_topic],
+        });
+        match self.evm_rpc_logs(network, filter) {
+            Ok(logs) => Ok(logs
+                .as_array()
+                .ok_or_else(|| {
+                    Response::error(
+                        "upstream_invalid_logs",
+                        "eth_getLogs result was not an array",
+                    )
+                })?
+                .clone()),
+            Err(response) => {
+                if Self::is_range_limit_error(&response) && to.saturating_sub(from) >= MIN_LOG_RANGE
+                {
+                    let mid = from + (to - from) / 2;
+                    let mut entries = self.fetch_asset_created_logs(
+                        network,
+                        creator_topic,
+                        channel_topic,
+                        mid + 1,
+                        to,
+                    )?;
+                    entries.extend(self.fetch_asset_created_logs(
+                        network,
+                        creator_topic,
+                        channel_topic,
+                        from,
+                        mid,
+                    )?);
+                    Ok(entries)
+                } else {
+                    Err(response)
+                }
+            }
+        }
+    }
+
+    /// Read a transaction's `input` calldata by hash (`eth_getTransactionByHash`). `None` when
+    /// the transaction is unknown/pending or carries no input — the caller skips that candidate.
+    fn tx_input(&self, network: &ChainNetwork, tx_hash: &str) -> Result<Option<String>, Response> {
+        let result = self.evm_rpc(network, "eth_getTransactionByHash", json!([tx_hash]))?;
+        Ok(result
+            .get("input")
+            .and_then(Value::as_str)
+            .map(str::to_string))
     }
 
     /// Read a channel's `authority()` (the gateway). `None` on any read miss so the caller can
@@ -1611,8 +1805,9 @@ impl ChainProvider {
         account: &str,
         operator: &str,
     ) -> Result<bool, Response> {
-        let data = encode_is_approved_for_all_calldata(IS_APPROVED_FOR_ALL_SELECTOR, account, operator)
-            .map_err(|err| Response::error("invalid_call", &err))?;
+        let data =
+            encode_is_approved_for_all_calldata(IS_APPROVED_FOR_ALL_SELECTOR, account, operator)
+                .map_err(|err| Response::error("invalid_call", &err))?;
         let result = self.evm_rpc(
             network,
             "eth_call",
@@ -1754,7 +1949,9 @@ fn is_contract_revert(resp: &Response) -> bool {
     match resp {
         Response::Error { code, message } if code == "upstream_rpc_error" => {
             let m = message.to_ascii_lowercase();
-            m.contains("execution reverted") || m.contains("revert") || message.contains("\"code\":3")
+            m.contains("execution reverted")
+                || m.contains("revert")
+                || message.contains("\"code\":3")
         }
         _ => false,
     }

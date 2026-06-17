@@ -58,7 +58,13 @@ pub(super) struct IndexedChannel {
 impl ChannelIndexEntry {
     /// Insert a discovered channel, de-duplicated by address (case-insensitive); keeps the
     /// earliest seen block so ordering stays stable across rescans.
-    pub(super) fn upsert(&mut self, address: &str, block_number: u64, ct: Option<u8>, scope: Option<u8>) {
+    pub(super) fn upsert(
+        &mut self,
+        address: &str,
+        block_number: u64,
+        ct: Option<u8>,
+        scope: Option<u8>,
+    ) {
         if let Some(existing) = self
             .channels
             .iter_mut()

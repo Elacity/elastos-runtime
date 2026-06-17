@@ -240,9 +240,8 @@ impl ChainProvider {
                 Err(response) => last_err = Some(response),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            Response::error("upstream_unreachable", "all RPC endpoints failed")
-        }))
+        Err(last_err
+            .unwrap_or_else(|| Response::error("upstream_unreachable", "all RPC endpoints failed")))
     }
 
     /// A single JSON-RPC round trip against one endpoint URL.

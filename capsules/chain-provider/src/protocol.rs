@@ -232,6 +232,13 @@ pub(super) enum Request {
         network: String,
         channel: String,
         creator: String,
+        /// PIN the approval to the JUST-MINTED asset by its `bytes16` content id (KID). When
+        /// present, the operative is resolved from the `AssetCreated` whose mint transaction
+        /// embeds THIS content id in `opRawData` — never the channel's newest mint — so a
+        /// freshly-minted asset is never falsely reported tradable because an EARLIER asset in
+        /// the same channel was already approved. Absent ⇒ legacy newest-in-channel resolution.
+        #[serde(default)]
+        content_id: Option<String>,
     },
     Shutdown,
 }

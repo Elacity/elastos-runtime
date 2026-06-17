@@ -102,6 +102,10 @@ const CHANNEL_POLL_MS = 2500;
 let channelPollTimer = null;
 // Monotonic token to cancel a stale mint-confirmation watcher when a new mint starts.
 let mintWatchToken = 0;
+// The just-minted asset's bytes16 content id (KID). Every confirm/approve check is PINNED to
+// it so a fresh mint is never reported tradable off an EARLIER asset in the same channel
+// (each asset is its own operative contract and needs its own gateway approval).
+let currentMintContentId = "";
 // True while a freshly-minted asset's first tx (mint) is still pending confirmation: Step 2
 // stays visible-but-disabled until the chain confirms it (PC2 gates the 2nd tx the same way).
 let tradeGated = false;
@@ -823,6 +827,8 @@ async function mint() {
     // transaction. The user completes it in the Wallet app (eth_sendTransaction),
     // so the OWNER is msg.sender / the on-chain creator. The runtime never signs.
     const id = result.content_id || result.kid || "";
+    // Pin every subsequent confirm/approve check to THIS asset's KID.
+    currentMintContentId = id;
     const approval = result.mint_approval || {};
     if (approval.request_id) {
       setStep("sign", "done");
@@ -838,8 +844,8 @@ async function mint() {
       gateTradeUntilConfirmed();
       // Poll the chain (read-only) so the Broadcast step advances to "done" the moment the mint
       // lands on-chain, and Step 2 is visibly promoted — instead of a dead spinner that never
-      // updates after you approve the tx in the Wallet app.
-      watchMintConfirmation(meta.channel, meta.creatorAddress);
+      // updates after you approve the tx in the Wallet app. Pinned to THIS asset's KID.
+      watchMintConfirmation(meta.channel, meta.creatorAddress, id);
     } else {
       setStep("sign", "active");
       setStatus(
@@ -883,7 +889,9 @@ async function enableTrading() {
     const resp = await fetch(appUrl("/prepare-trade-approval"), {
       method: "POST",
       headers: { ...launchHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+      // Pin the approval to THIS asset's operative (its own contract) — never the channel's
+      // newest mint — so each asset gets its own gateway approval (PC2's per-asset 2nd tx).
+      body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: currentMintContentId || undefined }),
     });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -919,7 +927,7 @@ async function enableTrading() {
       );
       els.enableTrading.hidden = true;
       if (els.enableTradingHint) els.enableTradingHint.hidden = true;
-      watchTradeApproval(channel, creatorAddress);
+      watchTradeApproval(channel, creatorAddress, currentMintContentId);
     } else {
       setStep("approve", "err");
       setStatus("No wallet approval was queued — connect your wallet on Base and retry.", "err");
@@ -952,7 +960,7 @@ function promoteEnableTrading() {
 // Read-only poll of the chain (no side effects server-side) so the "Broadcast" step advances
 // to done the moment the mint lands on-chain — the same `AssetCreated` signal Step 2 is gated
 // on — instead of a dead spinner. Cancelled when a new mint starts (token bump in resetSteps).
-async function watchMintConfirmation(channel, creatorAddress) {
+async function watchMintConfirmation(channel, creatorAddress, contentId) {
   if (!channel || !creatorAddress) return;
   const token = ++mintWatchToken;
   const started = Date.now();
@@ -967,7 +975,10 @@ async function watchMintConfirmation(channel, creatorAddress) {
       const resp = await fetch(appUrl("/mint-status"), {
         method: "POST",
         headers: { ...launchHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+        // Pin to THIS asset: the host only reports confirmed/already_approved for the mint
+        // whose KID matches, so an earlier approved asset can't end the watch prematurely.
+        // Omitted when unknown (falls back to the legacy newest-in-channel resolution).
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined }),
       });
       const result = await resp.json().catch(() => ({}));
       if (resp.ok) {
@@ -1001,7 +1012,7 @@ async function watchMintConfirmation(channel, creatorAddress) {
 // After the owner approves the gateway (2nd tx), poll the chain read-only until
 // `isApprovedForAll` flips true, then tick the Approve step green — instead of leaving the
 // spinner hanging after the wallet confirms. Cancelled if a new mint starts (token bump).
-async function watchTradeApproval(channel, creatorAddress) {
+async function watchTradeApproval(channel, creatorAddress, contentId) {
   if (!channel || !creatorAddress) return;
   const token = ++mintWatchToken; // the mint is already confirmed here; supersede its watcher
   const started = Date.now();
@@ -1015,7 +1026,8 @@ async function watchTradeApproval(channel, creatorAddress) {
       const resp = await fetch(appUrl("/mint-status"), {
         method: "POST",
         headers: { ...launchHeaders(), "Content-Type": "application/json" },
-        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress }),
+        // Pinned to THIS asset's operative: isApprovedForAll is read on the just-minted contract.
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined }),
       });
       const result = await resp.json().catch(() => ({}));
       if (resp.ok) approved = Boolean(result.already_approved);

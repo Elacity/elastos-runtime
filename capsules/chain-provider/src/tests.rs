@@ -962,8 +962,14 @@ fn contract_revert_is_distinguished_from_a_transport_outage() {
         "{\"code\":3,\"data\":\"0xcad88223…\",\"message\":\"execution reverted\"}",
     );
     let revert_32000 = Response::error("upstream_rpc_error", "execution reverted: CONTENT_UNKNOWN");
-    assert!(is_contract_revert(&revert_code3), "EIP-1474 code 3 is a revert");
-    assert!(is_contract_revert(&revert_32000), "an 'execution reverted' message is a revert");
+    assert!(
+        is_contract_revert(&revert_code3),
+        "EIP-1474 code 3 is a revert"
+    );
+    assert!(
+        is_contract_revert(&revert_32000),
+        "an 'execution reverted' message is a revert"
+    );
 
     // Genuine outages / non-revert RPC errors are NOT reverts (they must not be denied-with-certainty).
     assert!(!is_contract_revert(&Response::error(
@@ -1170,8 +1176,15 @@ fn mint_assemble_free_calldata_decodes_to_the_bytes16_content_id() {
     // opRawData = abi.encode(bytes16): a 32-byte dynamic blob == the bytes16 word.
     assert_eq!(mint_word_u64(body, op_off), 32, "opRawData byte length");
     let op_word = &body[op_off + 32..op_off + 64];
-    assert_eq!(&op_word[..16], &mint_hex_to_bytes(MINT_KID32)[..], "contentId high 16");
-    assert!(op_word[16..].iter().all(|b| *b == 0), "bytes16 zero-padded right");
+    assert_eq!(
+        &op_word[..16],
+        &mint_hex_to_bytes(MINT_KID32)[..],
+        "contentId high 16"
+    );
+    assert!(
+        op_word[16..].iter().all(|b| *b == 0),
+        "bytes16 zero-padded right"
+    );
 
     // sellRawData is empty for a free mint.
     assert_eq!(mint_word_u64(body, sell_off), 0, "sellRawData empty");
@@ -1246,18 +1259,20 @@ fn mint_free_rejects_sale_terms() {
 
 #[test]
 fn mint_paid_requires_sale_terms() {
-    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
-        mint: Box::new(
-            serde_json::from_value(json!({
-                "selector": MINT_SELECTOR,
-                "to": MINT_CHANNEL,
-                "token_uri": "QmMetaFolderCidV0/metadata.json",
-                "op_type_code": 1,
-                "content_id": format!("0x{MINT_KID32}"),
-            }))
-            .unwrap(),
-        ),
-    }));
+    let err = error_code(
+        ChainProvider::new().handle(Request::AssembleMint {
+            mint: Box::new(
+                serde_json::from_value(json!({
+                    "selector": MINT_SELECTOR,
+                    "to": MINT_CHANNEL,
+                    "token_uri": "QmMetaFolderCidV0/metadata.json",
+                    "op_type_code": 1,
+                    "content_id": format!("0x{MINT_KID32}"),
+                }))
+                .unwrap(),
+            ),
+        }),
+    );
     assert_eq!(err, "invalid_mint");
 }
 
@@ -1272,41 +1287,47 @@ fn mint_rejects_a_non_bytes16_content_id() {
     }))
     .unwrap();
     bad.content_id = "0xdeadbeef".to_string();
-    let err = error_code(ChainProvider::new().handle(Request::AssembleMint { mint: Box::new(bad) }));
+    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
+        mint: Box::new(bad),
+    }));
     assert_eq!(err, "invalid_mint");
 }
 
 #[test]
 fn mint_rejects_a_bad_selector() {
-    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
-        mint: Box::new(
-            serde_json::from_value(json!({
-                "selector": "0xzz",
-                "to": MINT_CHANNEL,
-                "token_uri": "QmMetaFolderCidV0/metadata.json",
-                "op_type_code": 0,
-                "content_id": format!("0x{MINT_KID32}"),
-            }))
-            .unwrap(),
-        ),
-    }));
+    let err = error_code(
+        ChainProvider::new().handle(Request::AssembleMint {
+            mint: Box::new(
+                serde_json::from_value(json!({
+                    "selector": "0xzz",
+                    "to": MINT_CHANNEL,
+                    "token_uri": "QmMetaFolderCidV0/metadata.json",
+                    "op_type_code": 0,
+                    "content_id": format!("0x{MINT_KID32}"),
+                }))
+                .unwrap(),
+            ),
+        }),
+    );
     assert_eq!(err, "invalid_mint");
 }
 
 #[test]
 fn mint_rejects_a_bad_channel_address() {
-    let err = error_code(ChainProvider::new().handle(Request::AssembleMint {
-        mint: Box::new(
-            serde_json::from_value(json!({
-                "selector": MINT_SELECTOR,
-                "to": "not-an-address",
-                "token_uri": "QmMetaFolderCidV0/metadata.json",
-                "op_type_code": 0,
-                "content_id": format!("0x{MINT_KID32}"),
-            }))
-            .unwrap(),
-        ),
-    }));
+    let err = error_code(
+        ChainProvider::new().handle(Request::AssembleMint {
+            mint: Box::new(
+                serde_json::from_value(json!({
+                    "selector": MINT_SELECTOR,
+                    "to": "not-an-address",
+                    "token_uri": "QmMetaFolderCidV0/metadata.json",
+                    "op_type_code": 0,
+                    "content_id": format!("0x{MINT_KID32}"),
+                }))
+                .unwrap(),
+            ),
+        }),
+    );
     assert_eq!(err, "invalid_to");
 }
 
@@ -1337,8 +1358,12 @@ fn create_channel_request(value: Option<&str>) -> Request {
 
 #[test]
 fn create_channel_calldata_decodes_to_the_pc2_args() {
-    let data = ok_data(ChainProvider::new().handle(create_channel_request(Some("0x2386f26fc10000"))));
-    assert_eq!(data["function"], "createChannel(uint8,uint8,string,string,bytes)");
+    let data =
+        ok_data(ChainProvider::new().handle(create_channel_request(Some("0x2386f26fc10000"))));
+    assert_eq!(
+        data["function"],
+        "createChannel(uint8,uint8,string,string,bytes)"
+    );
     assert_eq!(data["to"], CHANNEL_FACTORY);
     assert_eq!(data["value"], "0x2386f26fc10000");
     assert_eq!(data["signed"], false);
@@ -1356,10 +1381,16 @@ fn create_channel_calldata_decodes_to_the_pc2_args() {
     assert_eq!(name_off, 160, "name starts past the 5 head words");
 
     let name_len = mint_word_u64(body, name_off) as usize;
-    assert_eq!(&body[name_off + 32..name_off + 32 + name_len], b"My Channel");
+    assert_eq!(
+        &body[name_off + 32..name_off + 32 + name_len],
+        b"My Channel"
+    );
 
     let uri_len = mint_word_u64(body, uri_off) as usize;
-    assert_eq!(&body[uri_off + 32..uri_off + 32 + uri_len], b"ipfs://QmChannelMeta");
+    assert_eq!(
+        &body[uri_off + 32..uri_off + 32 + uri_len],
+        b"ipfs://QmChannelMeta"
+    );
 
     // empty `bytes data` -> zero length word.
     assert_eq!(mint_word_u64(body, data_off), 0, "empty config bytes");
@@ -1373,37 +1404,41 @@ fn create_channel_defaults_value_to_zero() {
 
 #[test]
 fn create_channel_rejects_a_bad_factory() {
-    let err = error_code(ChainProvider::new().handle(Request::AssembleCreateChannel {
-        channel: Box::new(
-            serde_json::from_value(json!({
-                "selector": MINT_SELECTOR,
-                "factory": "not-an-address",
-                "channel_type": 1,
-                "scope": 2,
-                "name": "X",
-                "token_uri": "ipfs://x",
-            }))
-            .unwrap(),
-        ),
-    }));
+    let err = error_code(
+        ChainProvider::new().handle(Request::AssembleCreateChannel {
+            channel: Box::new(
+                serde_json::from_value(json!({
+                    "selector": MINT_SELECTOR,
+                    "factory": "not-an-address",
+                    "channel_type": 1,
+                    "scope": 2,
+                    "name": "X",
+                    "token_uri": "ipfs://x",
+                }))
+                .unwrap(),
+            ),
+        }),
+    );
     assert_eq!(err, "invalid_factory");
 }
 
 #[test]
 fn create_channel_rejects_an_empty_name() {
-    let err = error_code(ChainProvider::new().handle(Request::AssembleCreateChannel {
-        channel: Box::new(
-            serde_json::from_value(json!({
-                "selector": MINT_SELECTOR,
-                "factory": CHANNEL_FACTORY,
-                "channel_type": 1,
-                "scope": 2,
-                "name": "   ",
-                "token_uri": "ipfs://x",
-            }))
-            .unwrap(),
-        ),
-    }));
+    let err = error_code(
+        ChainProvider::new().handle(Request::AssembleCreateChannel {
+            channel: Box::new(
+                serde_json::from_value(json!({
+                    "selector": MINT_SELECTOR,
+                    "factory": CHANNEL_FACTORY,
+                    "channel_type": 1,
+                    "scope": 2,
+                    "name": "   ",
+                    "token_uri": "ipfs://x",
+                }))
+                .unwrap(),
+            ),
+        }),
+    );
     assert_eq!(err, "invalid_channel");
 }
 
@@ -1427,7 +1462,10 @@ fn channel_log_decodes_address_type_scope_and_block() {
         "blockNumber": "0x2a3e42a",
     });
     let decoded = decode_channel_log(&entry).expect("should decode");
-    assert_eq!(decoded["address"], json!("0x00000000000000000000000000000000000000aa"));
+    assert_eq!(
+        decoded["address"],
+        json!("0x00000000000000000000000000000000000000aa")
+    );
     assert_eq!(decoded["channel_type"], json!(1));
     assert_eq!(decoded["scope"], json!(2));
     assert_eq!(decoded["block_number"], json!(0x2a3e42a));
@@ -1522,6 +1560,50 @@ fn decode_asset_created_log_rejects_malformed() {
     assert!(decode_asset_created_log(&json!({ "topics": [], "data": "0x" })).is_none());
 }
 
+#[test]
+fn decode_mint_content_id_roundtrips_free_and_paid_calldata() {
+    let kid = "0x38691296765e76a331f5d5630bddf9f5"; // a 16-byte KID
+    let want = normalize_content_id_bytes16(kid).unwrap();
+
+    // FREE mint: opRawData = abi.encode(bytes16 contentId).
+    let free_op = encode_op_raw_free(kid).unwrap();
+    let free_call = encode_mint_calldata("0xdeadbeef", "ipfs://meta", 0, &free_op, &[]).unwrap();
+    assert_eq!(
+        normalize_content_id_bytes16(&decode_mint_content_id(&free_call).unwrap()).as_deref(),
+        Some(want.as_str()),
+        "free mint calldata must round-trip the KID"
+    );
+
+    // PAID mint: opRawData = abi.encode(bytes16, string, address[], uint256[], uint256[]).
+    let paid_op = encode_op_raw_paid(
+        kid,
+        "ipfs://meta",
+        &["0x34daf31b99b5a59ceb18e424dbc112fa6e5f3dc3".to_string()],
+        &[0],
+        &["1000".to_string()],
+        None,
+    )
+    .unwrap();
+    let sell = encode_sell_raw_data(
+        "1",
+        "1000000000000000",
+        "0x0000000000000000000000000000000000000000",
+    )
+    .unwrap();
+    let paid_call = encode_mint_calldata("0xdeadbeef", "ipfs://meta", 1, &paid_op, &sell).unwrap();
+    assert_eq!(
+        normalize_content_id_bytes16(&decode_mint_content_id(&paid_call).unwrap()).as_deref(),
+        Some(want.as_str()),
+        "paid mint calldata must round-trip the KID"
+    );
+}
+
+#[test]
+fn decode_mint_content_id_fails_closed_on_short_input() {
+    assert!(decode_mint_content_id("0xdeadbeef").is_none());
+    assert!(normalize_content_id_bytes16("not-hex").is_none());
+}
+
 // ── channel index: range-limit detection, dedup ordering, persistence, scan ─────
 
 #[test]
@@ -1562,11 +1644,25 @@ fn channel_index_entry_dedups_and_orders_newest_first() {
         channels: Vec::new(),
         updated_at: 0,
     };
-    entry.upsert("0xAAaA00000000000000000000000000000000aAaA", 100, Some(1), Some(0));
-    entry.upsert("0xBBBB00000000000000000000000000000000bBBB", 50, Some(1), Some(1));
+    entry.upsert(
+        "0xAAaA00000000000000000000000000000000aAaA",
+        100,
+        Some(1),
+        Some(0),
+    );
+    entry.upsert(
+        "0xBBBB00000000000000000000000000000000bBBB",
+        50,
+        Some(1),
+        Some(1),
+    );
     // Same channel again at a LOWER block (case-insensitive) — keep earliest, don't duplicate.
     entry.upsert("0xaaaa00000000000000000000000000000000AaAa", 80, None, None);
-    assert_eq!(entry.channels.len(), 2, "duplicate address must not be added twice");
+    assert_eq!(
+        entry.channels.len(),
+        2,
+        "duplicate address must not be added twice"
+    );
     // The re-upsert lowered channel A to block 80 (earliest-seen wins), so A (80) sorts
     // ahead of B (50) newest-first.
     let ordered = entry.channels_newest_first();
@@ -1575,7 +1671,10 @@ fn channel_index_entry_dedups_and_orders_newest_first() {
     let a = entry
         .channels
         .iter()
-        .find(|c| c.address.eq_ignore_ascii_case("0xAAaA00000000000000000000000000000000aAaA"))
+        .find(|c| {
+            c.address
+                .eq_ignore_ascii_case("0xAAaA00000000000000000000000000000000aAaA")
+        })
         .unwrap();
     assert_eq!(a.block_number, 80);
 }
@@ -1593,7 +1692,12 @@ fn channel_index_file_round_trips_through_disk() {
         channels: Vec::new(),
         updated_at: 42,
     };
-    entry.upsert("0x00000000000000000000000000000000000000aa", 123, Some(1), Some(2));
+    entry.upsert(
+        "0x00000000000000000000000000000000000000aa",
+        123,
+        Some(1),
+        Some(2),
+    );
     let key = channel_index_key("base-mainnet", "0xFACT", "0xCreAtoR");
     file.entries.insert(key.clone(), entry);
     write_channel_index_file(&path, &file).unwrap();
@@ -1661,9 +1765,17 @@ fn list_channels_discovers_via_scan_then_serves_from_persisted_cursor() {
         from_block: Some("0x60".to_string()),
     }));
     let channels = first["channels"].as_array().unwrap();
-    assert_eq!(channels.len(), 1, "the creator's channel should be discovered");
+    assert_eq!(
+        channels.len(),
+        1,
+        "the creator's channel should be discovered"
+    );
     assert_eq!(channels[0]["address"], json!(channel));
-    assert_eq!(first["indexing"], json!(false), "deploy reached → backfill complete");
+    assert_eq!(
+        first["indexing"],
+        json!(false),
+        "deploy reached → backfill complete"
+    );
 
     // The index file persisted the cursor + channel.
     let index = read_channel_index_file(&channel_index_path(data_dir.path())).unwrap();
