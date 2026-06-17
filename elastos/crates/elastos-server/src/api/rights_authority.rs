@@ -118,7 +118,7 @@ pub(crate) fn rights_mode() -> RightsMode {
 pub(crate) fn enforce_release_build_rights_safety() -> Result<(), String> {
     #[cfg(not(feature = "dev-modes"))]
     {
-        if let Some(v) = std::env::var("ELASTOS_DDRM_RIGHTS").ok() {
+        if let Ok(v) = std::env::var("ELASTOS_DDRM_RIGHTS") {
             let v = v.trim();
             if v == "dev" || v == "chain-mock" {
                 return Err(format!(

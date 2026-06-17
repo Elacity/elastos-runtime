@@ -202,8 +202,10 @@ pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCata
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let mut counts = CapsuleCatalogCounts::default();
-    counts.total = capsules.len();
+    let mut counts = CapsuleCatalogCounts {
+        total: capsules.len(),
+        ..Default::default()
+    };
     for capsule in &capsules {
         match capsule.role.as_str() {
             "app" => counts.apps += 1,
@@ -262,12 +264,14 @@ pub(super) fn capsule_interface_registry_summary(
         }
     }
 
-    let mut counts = CapsuleInterfaceRegistryCounts::default();
-    counts.capsules = interfaces
-        .iter()
-        .map(|interface| interface.capsule.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
+    let mut counts = CapsuleInterfaceRegistryCounts {
+        capsules: interfaces
+            .iter()
+            .map(|interface| interface.capsule.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        ..Default::default()
+    };
     counts.interfaces = interfaces.len();
     counts.methods = interfaces
         .iter()

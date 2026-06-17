@@ -357,6 +357,7 @@ fn gap5_key_export_is_gated_and_audited() {}
 ///   - dkms-authority: `release_build_fences_out_the_legacy_receipt_path` (legacy off by default);
 ///   - elastos-server: `release_build_defaults_to_chain_and_refuses_dev_rights_modes`
 ///     (rights_mode()==Chain + startup guard fails closed).
+///
 /// This ratchet is intentionally NOT `#[ignore]`d — GAP-7 is closed, so it must stay green.
 #[test]
 fn gap7_dev_modes_are_fenced_out_of_release_builds() {

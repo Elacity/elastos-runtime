@@ -431,7 +431,7 @@ pub async fn creator_prepare_mint(
             );
             Json(result).into_response()
         }
-        Err(staged) => staged_error(StatusCode::BAD_GATEWAY, &staged.stage, &staged.message),
+        Err(staged) => staged_error(StatusCode::BAD_GATEWAY, staged.stage, &staged.message),
     }
 }
 
