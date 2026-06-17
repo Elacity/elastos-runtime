@@ -227,14 +227,21 @@ function localPlanOperation(capsuleId, operation) {
   const capsule = SAMPLE_DATA.find((c) => c.id === capsuleId);
   const authority = capsule && capsule.authority;
   if (!authority) return null;
-  const block = (authority.capabilities || []).find((cap) =>
+  // Aggregate ALL matching blocks (union), mirroring the server — fail-closed.
+  const blocks = (authority.capabilities || []).filter((cap) =>
     (cap.operations || []).includes(operation));
-  if (!block) return { valid: false, error: "unknown_operation", operation };
+  if (!blocks.length) return { valid: false, error: "unknown_operation", operation };
+  const resources = [];
+  const actions = [];
+  for (const b of blocks) {
+    if (!resources.includes(b.resource)) resources.push(b.resource);
+    for (const a of b.actions || []) if (!actions.includes(a)) actions.push(a);
+  }
   return {
     valid: true,
     kind: "operation",
-    resource: block.resource,
-    capability_actions: block.actions || [],
+    resources,
+    capability_actions: actions,
     audit_events: authority.audit_events || [],
   };
 }
@@ -257,9 +264,11 @@ async function runOperationPreview(capsuleId, operation, target, btn) {
     }
     if (plan && plan.valid) {
       const actions = (plan.capability_actions || []).join(" + ");
+      // Union of every resource the op touches (fail-closed; never just one).
+      const resources = (plan.resources || []).join(", ");
       target.appendChild(el("div", { class: "plan-ok" }, [
         el("span", { class: "note", text: "requires a capability covering" }),
-        el("span", { class: "mono", text: plan.resource }),
+        el("span", { class: "mono", text: resources }),
         el("span", { class: "tag tag-sign", text: "action: " + actions }),
       ]));
       for (const ev of plan.audit_events || []) {

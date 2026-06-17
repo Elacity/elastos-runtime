@@ -763,7 +763,9 @@ impl InspectProvider {
                 "data": {
                     "valid": true,
                     "kind": "operation",
-                    "resource": plan.resource,
+                    // Union of every resource the op touches across all matching
+                    // authority blocks — never just the first (fail-closed).
+                    "resources": plan.resources,
                     // Every action a caller's capability must cover (full set).
                     "capability_actions": plan
                         .actions
@@ -1349,7 +1351,7 @@ mod tests {
         assert_eq!(resp["status"], "ok");
         assert_eq!(resp["data"]["valid"], true);
         assert_eq!(resp["data"]["kind"], "operation");
-        assert_eq!(resp["data"]["resource"], "elastos://key/*");
+        assert_eq!(resp["data"]["resources"][0], "elastos://key/*");
         assert_eq!(resp["data"]["capability_actions"][0], "execute");
         assert_eq!(resp["data"]["audit_events"][0], "key.release.denied");
     }

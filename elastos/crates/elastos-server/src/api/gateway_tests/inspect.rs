@@ -89,6 +89,32 @@ async fn inspect_capsules_requires_token_and_lists_installed_capsule() {
 }
 
 #[tokio::test]
+async fn inspect_write_op_revoke_is_not_browser_reachable() {
+    // Least-privilege at the edge (#16): the write op `revoke` is deliberately
+    // absent from the browser allow-list, so it is unreachable through the
+    // gateway proxy even WITH a System operator token — mutation stays on the
+    // capability-gated carrier/admin path, never the browser.
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+
+    let token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/revoke")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{\"token_id\":\"00000000000000000000000000000000\"}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Not OK, and specifically not found — the op never enters the proxy.
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "revoke must not be browser-reachable");
+}
+
+#[tokio::test]
 async fn inspect_capsules_rejects_non_system_app() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(inspect_test_state(dir.path()).await);

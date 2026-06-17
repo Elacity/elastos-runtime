@@ -408,14 +408,17 @@ set of actions a caller's capability must cover — plus the audit events the
 provider emits:
 
 ```json
-{ "valid": true, "kind": "operation", "resource": "elastos://key/*",
+{ "valid": true, "kind": "operation", "resources": ["elastos://key/*"],
   "capability_actions": ["execute"], "audit_events": ["key.release.denied", "key.release.granted"] }
 ```
 
-The action set is surfaced **whole**, never collapsed to one, and an action
-keyword the capability layer doesn't recognise is a hard `manifest_error`
-(fail-closed) rather than a silent drop — the preview cannot under-state the
-gate. An operation no capability block declares returns
+Both `resources` and `capability_actions` are the **union across every**
+capability block that declares the operation — never just the first match — so a
+manifest that splits one operation across blocks cannot hide a resource or
+action the call also requires. The action set is surfaced **whole**, never
+collapsed to one, and an unrecognised action keyword in *any* matching block is a
+hard `manifest_error` (fail-closed) rather than a silent drop — the preview can
+never under-state the gate. An operation no capability block declares returns
 `{ "valid": false, "error": "unknown_operation" }`.
 
 Effect *dispatch* (and the location-agnostic Carrier / cross-language transport)

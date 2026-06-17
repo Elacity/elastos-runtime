@@ -134,11 +134,15 @@ pub fn plan(
 /// gate the runtime would later enforce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderOperationPlan {
-    /// The capability resource URI the operation acts on (e.g. `elastos://key/*`).
-    pub resource: String,
-    /// Every action a caller's capability must cover for this resource. Surfaced
-    /// as the full set (not collapsed to one) so nothing the manifest demands is
-    /// hidden from the reviewer.
+    /// Every capability resource URI the operation acts on (e.g. `elastos://key/*`).
+    /// Surfaced as the union across *all* capability blocks that declare the
+    /// operation — never just the first — so a manifest that splits an operation
+    /// across blocks cannot hide a resource the call also requires.
+    pub resources: Vec<String>,
+    /// Every action a caller's capability must cover. The union across all
+    /// matching blocks, surfaced whole (not collapsed to one), so nothing the
+    /// manifest demands is hidden from the reviewer. Fail-closed: an unrecognised
+    /// action keyword in *any* matching block is an error, not a silent drop.
     pub actions: Vec<Action>,
     /// The audit events this provider declares it emits.
     pub audit_events: Vec<String>,
@@ -159,27 +163,43 @@ fn parse_action(s: &str) -> Result<Action, InvokeError> {
 }
 
 /// Preview the capability gate a provider `operation` would require, by reflecting
-/// the capsule's `authority` metadata. Finds the capability block that declares
-/// the operation and returns its resource + required actions + the authority's
-/// audit events. Dispatches nothing.
+/// the capsule's `authority` metadata. Aggregates *every* capability block that
+/// declares the operation and returns the union of their resources + required
+/// actions, plus the authority's audit events. Dispatches nothing.
+///
+/// Fail-closed by construction: surfacing the union (not the first match) means
+/// the preview can never under-state the authority a call needs, even if the
+/// manifest splits one operation across several blocks.
 pub fn plan_provider_operation(
     authority: &ProviderAuthority,
     operation: &str,
 ) -> Result<ProviderOperationPlan, InvokeError> {
-    let capability = authority
+    let matching: Vec<&_> = authority
         .capabilities
         .iter()
-        .find(|cap| cap.operations.iter().any(|op| op == operation))
-        .ok_or_else(|| InvokeError::UnknownOperation(operation.to_string()))?;
+        .filter(|cap| cap.operations.iter().any(|op| op == operation))
+        .collect();
 
-    let actions = capability
-        .actions
-        .iter()
-        .map(|a| parse_action(a))
-        .collect::<Result<Vec<_>, _>>()?;
+    if matching.is_empty() {
+        return Err(InvokeError::UnknownOperation(operation.to_string()));
+    }
+
+    let mut resources: Vec<String> = Vec::new();
+    let mut actions: Vec<Action> = Vec::new();
+    for cap in matching {
+        if !resources.contains(&cap.resource) {
+            resources.push(cap.resource.clone());
+        }
+        for a in &cap.actions {
+            let action = parse_action(a)?; // unknown keyword in any block → error
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
 
     Ok(ProviderOperationPlan {
-        resource: capability.resource.clone(),
+        resources,
         actions,
         audit_events: authority.audit_events.clone(),
     })
@@ -281,12 +301,53 @@ mod tests {
         }));
 
         let release = plan_provider_operation(&auth, "release").unwrap();
-        assert_eq!(release.resource, "elastos://key/*");
+        assert_eq!(release.resources, vec!["elastos://key/*".to_string()]);
         assert_eq!(release.actions, vec![Action::Execute]);
         assert!(release.audit_events.iter().any(|e| e == "key.release.denied"));
 
         let status = plan_provider_operation(&auth, "status").unwrap();
         assert_eq!(status.actions, vec![Action::Read]);
+    }
+
+    #[test]
+    fn provider_op_plan_aggregates_split_blocks_fail_closed() {
+        // Hardening: an operation declared across MULTIPLE capability blocks must
+        // surface the UNION of resources and actions — never just the first match
+        // — so a split-privilege manifest cannot trick the preview into
+        // under-stating the authority a call actually requires.
+        let auth = authority(json!({
+            "reason": "x", "audit_events": ["a"],
+            "capabilities": [
+                { "resource": "elastos://key/*", "actions": ["read"], "operations": ["release"] },
+                { "resource": "elastos://decrypt/*", "actions": ["execute", "admin"],
+                  "operations": ["release", "render"] }
+            ]
+        }));
+        let plan = plan_provider_operation(&auth, "release").unwrap();
+        // Both resources are surfaced (union, deduped, order-preserving).
+        assert_eq!(
+            plan.resources,
+            vec!["elastos://key/*".to_string(), "elastos://decrypt/*".to_string()]
+        );
+        // The full action set across both blocks.
+        assert_eq!(plan.actions, vec![Action::Read, Action::Execute, Action::Admin]);
+    }
+
+    #[test]
+    fn provider_op_plan_fails_closed_when_any_matching_block_has_unknown_action() {
+        // If ANY matching block declares an unrecognised action, the whole preview
+        // errors — we never quietly report only the blocks we understood.
+        let auth = authority(json!({
+            "reason": "x", "audit_events": ["a"],
+            "capabilities": [
+                { "resource": "elastos://key/*", "actions": ["read"], "operations": ["release"] },
+                { "resource": "elastos://key/*", "actions": ["teleport"], "operations": ["release"] }
+            ]
+        }));
+        assert_eq!(
+            plan_provider_operation(&auth, "release").unwrap_err(),
+            InvokeError::UnknownDeclaredAction("teleport".to_string())
+        );
     }
 
     #[test]
