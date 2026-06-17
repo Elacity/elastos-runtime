@@ -171,6 +171,31 @@ function renderAffordances(affordances) {
   return wrap;
 }
 
+// Provider authority — the declarative powers a provider capsule is authorized
+// for. This is what makes a provider's real capabilities (key release, decrypt
+// render, rights decisions, chain broadcast) visible in the glass box.
+function renderAuthority(authority) {
+  const wrap = el("div");
+  if (authority.reason) {
+    wrap.appendChild(el("div", { class: "note", text: authority.reason }));
+  }
+  for (const cap of authority.capabilities || []) {
+    const ops = (cap.operations || []).join(", ");
+    const acts = (cap.actions || []).join(", ");
+    wrap.appendChild(el("div", { class: "row" }, [
+      el("span", { class: "mono grow", text: cap.resource }),
+      el("span", { class: "tag tag-sign", text: acts }),
+      el("span", { class: "tag mono", text: ops }),
+    ]));
+  }
+  for (const ev of authority.audit_events || []) {
+    wrap.appendChild(el("div", { class: "row" }, [
+      el("span", { class: "mono", text: "audit: " + ev }),
+    ]));
+  }
+  return wrap;
+}
+
 function renderRequired(caps) {
   const wrap = el("div");
   for (const r of caps || []) {
@@ -259,6 +284,11 @@ function renderDetail(c) {
   // 3 affordances
   detail.appendChild(card("Affordances (slots / messages)", renderAffordances(c.affordances)));
 
+  // Provider powers (for provider capsules that declare authority).
+  if (c.authority && (c.authority.capabilities || c.authority.reason)) {
+    detail.appendChild(card("Provider authority (powers)", renderAuthority(c.authority)));
+  }
+
   // 4 + 5 capabilities
   detail.appendChild(el("div", { class: "grid2" }, [
     card("Required capabilities", renderRequired(c.required_capabilities)),
@@ -344,6 +374,13 @@ const SAMPLE_DATA = [
       { interface: "elastos.wallet/v1", id: "delete", risk: "privileged", approval: "user", audit: "full", description: "Delete account" },
     ],
     required_capabilities: ["elastos://wallet/*"],
+    authority: {
+      reason: "Holds wallet keys; validates proof bindings and signs approved transactions without exposing key material.",
+      capabilities: [
+        { resource: "elastos://wallet/*", actions: ["read", "sign"], operations: ["accounts", "sign", "delete"] },
+      ],
+      audit_events: ["wallet.sign.denied", "wallet.delete"],
+    },
     granted_capabilities: [
       { resource: "elastos://wallet/*", action: "read", granted: true, token_id: "tok_w9z0" },
     ],
