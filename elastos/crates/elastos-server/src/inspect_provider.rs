@@ -21,6 +21,7 @@
 //! reference to the heavy runtime object it reads from, so registering the
 //! provider on the registry never creates a reference cycle.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -137,8 +138,99 @@ impl InspectSource for RegistryInspectSource {
     }
 }
 
+/// Source backed by the installed-capsule catalog on disk:
+/// `<data_dir>/capsules/<name>/capsule.json`. Reads each capsule's full
+/// manifest (rich detail: capabilities, affordances, provenance) and marks it
+/// `running` when the scheme it `provides` is registered in the live registry,
+/// else `installed`. This is the rich, manifest-backed source for the product.
+pub struct CatalogInspectSource {
+    capsules_dir: PathBuf,
+    registry: Weak<ProviderRegistry>,
+}
+
+impl CatalogInspectSource {
+    pub fn new(capsules_dir: PathBuf, registry: Weak<ProviderRegistry>) -> Self {
+        Self { capsules_dir, registry }
+    }
+
+    /// The scheme a provider capsule serves, parsed from `provides`
+    /// (e.g. `elastos://wallet/*` → `wallet`).
+    fn provided_scheme(manifest: &CapsuleManifest) -> Option<String> {
+        manifest
+            .provides
+            .as_ref()?
+            .strip_prefix("elastos://")
+            .and_then(|rest| rest.split('/').next())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    async fn running_schemes(&self) -> std::collections::HashSet<String> {
+        match self.registry.upgrade() {
+            Some(reg) => reg.schemes().await.into_iter().collect(),
+            None => std::collections::HashSet::new(),
+        }
+    }
+
+    async fn read_entry(
+        &self,
+        name: &str,
+        running: &std::collections::HashSet<String>,
+    ) -> Option<InspectEntry> {
+        let path = self.capsules_dir.join(name).join("capsule.json");
+        let data = tokio::fs::read_to_string(&path).await.ok()?;
+        let manifest: CapsuleManifest = serde_json::from_str(&data).ok()?;
+        let is_running = Self::provided_scheme(&manifest)
+            .map(|s| running.contains(&s))
+            .unwrap_or(false);
+        Some(InspectEntry {
+            id: format!("capsule:{name}"),
+            name: manifest.name.clone(),
+            status: if is_running { "running" } else { "installed" }.to_string(),
+            capsule_type: format!("{:?}", manifest.capsule_type).to_lowercase(),
+            manifest: Some(manifest),
+        })
+    }
+}
+
+#[async_trait]
+impl InspectSource for CatalogInspectSource {
+    async fn inspect_list(&self) -> Vec<InspectEntry> {
+        let running = self.running_schemes().await;
+        let mut out = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(&self.capsules_dir).await {
+            while let Ok(Some(dir_entry)) = rd.next_entry().await {
+                let is_dir = dir_entry
+                    .file_type()
+                    .await
+                    .map(|t| t.is_dir())
+                    .unwrap_or(false);
+                if !is_dir {
+                    continue;
+                }
+                if let Some(name) = dir_entry.file_name().to_str() {
+                    if let Some(entry) = self.read_entry(name, &running).await {
+                        out.push(entry);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
+        let name = id.strip_prefix("capsule:")?;
+        // Reject path traversal in the id.
+        if name.contains('/') || name.contains("..") {
+            return None;
+        }
+        let running = self.running_schemes().await;
+        self.read_entry(name, &running).await
+    }
+}
+
 /// Aggregates several sources into one. This is the unification point: the main
-/// product path composes the runtime source and the registry source so the
+/// product path composes the runtime, catalog, and/or registry sources so the
 /// browser Inspector shows every capsule any source knows about. De-duplicates
 /// by id (first source wins).
 pub struct AggregateInspectSource {
@@ -486,6 +578,75 @@ mod tests {
         let entries = agg.inspect_list().await;
         assert_eq!(entries.len(), 2, "duplicate ids must be deduped");
         assert!(agg.inspect_get("provider:wallet").await.is_some());
+    }
+
+    fn write_capsule(capsules_dir: &std::path::Path, dir_name: &str, manifest: &Value) {
+        let dir = capsules_dir.join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("capsule.json"),
+            serde_json::to_vec_pretty(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_reads_installed_manifest_richly_without_leaking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capsules_dir = tmp.path().join("capsules");
+        write_capsule(
+            &capsules_dir,
+            "probe",
+            &serde_json::to_value(probe_manifest()).unwrap(),
+        );
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let source = CatalogInspectSource::new(capsules_dir, Arc::downgrade(&registry));
+
+        let entries = source.inspect_list().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "capsule:probe");
+        assert_eq!(entries[0].status, "installed"); // nothing registered
+
+        // Detail is rich and never leaks the raw signature.
+        let provider = InspectProvider::new(Arc::new(source));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "capsule:probe" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["data"]["affordances"][0]["id"], "ping");
+        assert_eq!(resp["data"]["required_capabilities"][0], "elastos://storage/probe");
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(!serialized.contains("SECRET_SIGNATURE_MUST_NOT_LEAK"));
+    }
+
+    #[tokio::test]
+    async fn catalog_marks_running_when_provided_scheme_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capsules_dir = tmp.path().join("capsules");
+        write_capsule(
+            &capsules_dir,
+            "wallet-provider",
+            &json!({
+                "schema": "elastos.capsule/v1",
+                "version": "0.1.0",
+                "name": "wallet-provider",
+                "role": "app",
+                "type": "wasm",
+                "entrypoint": "wallet.wasm",
+                "provides": "elastos://wallet/*"
+            }),
+        );
+
+        let registry = Arc::new(ProviderRegistry::new());
+        registry.register(Arc::new(MockSchemeProvider)).await; // registers scheme "wallet"
+        let source = CatalogInspectSource::new(capsules_dir, Arc::downgrade(&registry));
+
+        let entry = source.inspect_get("capsule:wallet-provider").await.unwrap();
+        assert_eq!(entry.status, "running");
+
+        // Path-traversal ids are rejected.
+        assert!(source.inspect_get("capsule:../etc").await.is_none());
     }
 
     // Minimal provider used only to register a "wallet" scheme in the registry.

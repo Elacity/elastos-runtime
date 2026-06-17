@@ -303,17 +303,20 @@ pub async fn run_serve(
 
     // Register the read-only Capsule Inspector on the shared provider registry
     // (the same Arc handed to the supervisor/gateway and the carrier bridge).
-    // The source aggregates this runtime's running capsules with the registered
-    // provider schemes, so the browser Inspector shows what the product knows.
+    // The source aggregates this runtime's running capsules with the rich
+    // installed-capsule catalog (<data_dir>/capsules/<name>/capsule.json), so
+    // the browser Inspector shows the full manifest-backed view of what the
+    // product knows.
     {
         use elastos_server::inspect_provider as ip;
         let runtime_src: Arc<dyn ip::InspectSource> =
             Arc::new(ip::RuntimeInspectSource::new(Arc::downgrade(&runtime)));
-        let registry_src: Arc<dyn ip::InspectSource> = Arc::new(ip::RegistryInspectSource::new(
+        let catalog_src: Arc<dyn ip::InspectSource> = Arc::new(ip::CatalogInspectSource::new(
+            data_dir.join("capsules"),
             Arc::downgrade(&infra.provider_registry),
         ));
         let source: Arc<dyn ip::InspectSource> =
-            Arc::new(ip::AggregateInspectSource::new(vec![runtime_src, registry_src]));
+            Arc::new(ip::AggregateInspectSource::new(vec![runtime_src, catalog_src]));
         infra
             .provider_registry
             .register(Arc::new(ip::InspectProvider::new(source)))

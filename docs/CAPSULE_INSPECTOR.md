@@ -216,27 +216,33 @@ caller-identity injection) and `revoke` (needs the gateway capability plane).
 - `RuntimeInspectSource` — the server `Runtime`'s running-capsule registry
   (capsules launched with a retained manifest → rich detail). Populated on the
   single-VM serve path.
+- `CatalogInspectSource` — the installed-capsule catalog on disk
+  (`<data_dir>/capsules/<name>/capsule.json`). Reads each capsule's **full
+  manifest** (rich nine-field detail) and marks it `running` when the scheme it
+  `provides` is registered live, else `installed`. This is the rich,
+  manifest-backed source for the product. (`id = capsule:<name>`, with
+  path-traversal ids rejected.)
 - `RegistryInspectSource` — the registered provider schemes from
-  `ProviderRegistry` (the running provider capsules/services). Always populated
-  on the main product path. Thin (`id = provider:<scheme>`, no manifest yet).
+  `ProviderRegistry` (thin, `id = provider:<scheme>`). Available as a source
+  for built-in schemes that have no on-disk capsule; not in the default
+  aggregate.
 - `AggregateInspectSource` — unions sources and de-dups by id.
 
 **Wired on both serve paths:**
 
 - Single-VM serve (`elastos serve <microvm>`): `RuntimeInspectSource` → rich,
   populated end-to-end.
-- Main product path: `Aggregate[RuntimeInspectSource, RegistryInspectSource]`
+- Main product path: `Aggregate[RuntimeInspectSource, CatalogInspectSource]`
   on the shared registry the supervisor/gateway use — so the **browser
-  Inspector now lists the running provider services**.
+  Inspector lists installed capsules with their full manifests** and running
+  status.
 
-**Remaining enrichment (honest gap):** provider-scheme entries are thin
-(`manifest = None`) because the registry does not carry per-provider manifests,
-and `ProviderRegistry::schemes()` lists main providers only (sub-providers and
-their manifests are not yet enumerated). Restoring the full nine-field detail
-for provider capsules means adding a catalog-backed source that reads each
-installed capsule's `capsule.json`. The projection, scope, no-leak, transport
-wiring, and source aggregation are done; richer provider metadata is the next
-refinement.
+**Remaining enrichment (honest gap):** `ProviderRegistry::schemes()` lists main
+providers only (sub-providers are not enumerated), so running-status detection
+in the catalog source is by `provides`-scheme match and may miss sub-provider
+schemes; and live audit/grant aggregation into the projection is still pending.
+Projection, scope, no-leak, transport wiring, source aggregation, and the rich
+manifest view are done.
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
 to sample data until the data source is populated on the browser path.
