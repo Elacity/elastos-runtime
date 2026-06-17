@@ -175,10 +175,15 @@ There are two transports to the **one** authority decision
 (`crate::inspect::InspectScope`), satisfying Principle #7 (every path enforces
 the same authority boundary):
 
-| Caller | Transport (adapter) | Front door | Identity / scope |
-| --- | --- | --- | --- |
-| WASM / microVM capsule, agent | serial Carrier bridge → `carrier_invoke` | `RequestHandler::handle_inspect` | capability token → scope |
-| Browser-hosted UI (this capsule) | node-local control API (`POST /api/provider/inspect/<op>` + `x-elastos-home-token`) | gateway → provider registry | signed home launch token → app → scope |
+| Caller | Transport (adapter) | Front door | Identity / scope | Verified |
+| --- | --- | --- | --- | --- |
+| WASM / microVM capsule, agent | Carrier bridge → `carrier_invoke` | `carrier_bridge` → capability check → provider registry | capability token → resource | ✅ e2e test (`carrier_invoke_reaches_inspect_provider_with_capability`) |
+| Browser-hosted UI | node-local control API (`POST /api/provider/inspect/<op>` + `x-elastos-home-token`) | gateway allow-list → provider registry | signed home launch token → app → System | ✅ e2e test (gateway router, signed token) |
+
+Both transports converge on `ProviderRegistry::send_raw("inspect", …)` → the
+inspect provider, and both are now verified end-to-end by test. Read ops
+(`capsules`, `capsule`, `plan`) are exposed on both; the write op (`revoke`,
+runtime path) is not exposed through the browser proxy.
 
 **Status (Principle #12 honesty).** The capsule/`carrier_invoke` path is
 implemented and tested (`RequestHandler::handle_inspect`). The browser path is

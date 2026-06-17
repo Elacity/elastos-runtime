@@ -1252,6 +1252,96 @@ mod tests {
         assert!(!is_runtime_control_request("request_capability"));
     }
 
+    // End-to-end over the Carrier bridge: a capsule's capability-gated
+    // carrier_invoke("elastos://inspect/capsules") must validate the inspect
+    // capability and reach the inspect provider; without a token it is rejected.
+    #[tokio::test]
+    async fn carrier_invoke_reaches_inspect_provider_with_capability() {
+        use crate::inspect_provider::{CatalogInspectSource, InspectProvider, InspectSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let capsule_dir = tmp.path().join("capsules").join("probe");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "probe",
+                "role": "app", "type": "wasm", "entrypoint": "probe.wasm"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics,
+        ));
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let source: Arc<dyn InspectSource> = Arc::new(CatalogInspectSource::new(
+            tmp.path().join("capsules"),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register(Arc::new(InspectProvider::new(source)))
+            .await;
+
+        // System inspect capability granted to the calling capsule.
+        let token = encode_bridge_capability_token(&capability_manager.grant(
+            "test-capsule",
+            ResourceId::new("elastos://inspect/*"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        ));
+
+        let ctx = Some(BridgeContext {
+            provider_registry: registry,
+            capability_manager: capability_manager.clone(),
+            pending_store: Arc::new(
+                elastos_runtime::capability::pending::PendingRequestStore::new(audit_log),
+            ),
+            capsule_id: "test-capsule".to_string(),
+            principal_id: None,
+            data_dir: None,
+        });
+
+        // With a valid capability: reaches the provider.
+        let line = serde_json::json!({
+            "id": 1,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://inspect/capsules",
+                "operation": "capsules",
+                "token": token,
+            }
+        })
+        .to_string();
+        let resp = handle_request(&line, &ctx).await.unwrap();
+        assert_eq!(resp["response"]["type"], "carrier_result");
+        assert_eq!(resp["response"]["result"]["status"], "ok");
+        assert!(
+            resp["response"]["result"].to_string().contains("probe"),
+            "carrier inspect did not reach the provider: {resp}"
+        );
+
+        // Without a token: rejected before dispatch.
+        let line_no_token = serde_json::json!({
+            "id": 2,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://inspect/capsules",
+                "operation": "capsules",
+            }
+        })
+        .to_string();
+        let denied = handle_request(&line_no_token, &ctx).await.unwrap();
+        assert_eq!(denied["response"]["code"], "missing_token");
+    }
+
     #[test]
     fn carrier_invoke_dispatch_uses_uri_resource_contract() {
         let dispatch = carrier_invoke_dispatch(
