@@ -252,10 +252,13 @@ caller-identity injection) and `revoke` (needs the gateway capability plane).
 **Live audit.** The provider takes an optional `AuditSource`. `AuthAuditSource`
 reads the signed runtime audit log (`RuntimeAuditEventV1` in the auth state),
 correlates events by `capsule_id` (the capsule name), and fills the detail
-view's `audit` section — recent events (newest-first, capped) plus `total` and
-`denied` counts. Wired on both serve paths. Reads run on a blocking task so the
-async workers aren't stalled. Records are projected to safe fields only
-(timestamp, event type, reason, success) — no signatures or handles (#16).
+view's `audit` section — recent events (newest-first, capped) plus `total`,
+`denied`, and `attested` counts. Wired on both serve paths. Reads run on a
+blocking task so the async workers aren't stalled. Records are projected to safe
+fields only (timestamp, event type, reason, success) plus **attestation** — the
+*presence* of a signature (`signed`) and the attesting `signer` DID, which is
+the verified-signer evidence the audit plane actually carries (#15). The
+signature material itself is never echoed (#16).
 
 **Wired on both serve paths:**
 

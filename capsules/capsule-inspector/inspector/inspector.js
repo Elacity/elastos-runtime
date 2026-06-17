@@ -303,15 +303,23 @@ function renderGranted(grants) {
 function renderAudit(audit) {
   const wrap = el("div");
   const counts = (audit && audit.counts) || {};
+  // total/denied/attested are the live runtime counts; total_today/user_approved
+  // are sample-only fields, tolerated when present.
+  const total = counts.total ?? counts.total_today ?? 0;
   wrap.appendChild(el("div", { class: "note", text:
-    `today: ${counts.total_today ?? 0} calls · ${counts.user_approved ?? 0} user-approved · ${counts.denied ?? 0} denied` }));
+    `${total} events · ${counts.denied ?? 0} denied · ${counts.attested ?? 0} cryptographically attested` }));
   for (const e of (audit && audit.recent) || []) {
-    wrap.appendChild(el("div", { class: "audit-line" }, [
+    const row = [
       el("span", { class: "ts", text: fmtTime(e.ts) }),
       el("span", { class: "mono", text: e.event }),
       el("span", { class: "mono", text: e.detail }),
       el("span", { class: e.success ? "pill-ok" : "pill-deny", text: e.success ? "ok" : "blocked" }),
-    ]));
+    ];
+    // Attestation: presence + signer DID (never the signature, #16).
+    if (e.signed) {
+      row.push(el("span", { class: "pill-ok mono", title: e.signer || "", text: "⛓ attested" }));
+    }
+    wrap.appendChild(el("div", { class: "audit-line audit-line-attest" }, row));
   }
   return wrap;
 }
@@ -474,9 +482,9 @@ const SAMPLE_DATA = [
     storage_namespaces: ["localhost://WebSpaces/wallet/"],
     carrier: { enabled: false, endpoints: [], peers: 0 },
     provenance: { signed_by: "gateway-did", version: "0.1.0", installed_at: 1781731200, cid: "bafywallet..." },
-    audit: { counts: { total_today: 7, user_approved: 3, denied: 0 }, recent: [
-      { ts: 1781989000, event: "capability.use", detail: "wallet/* read accounts", success: true },
-      { ts: 1781988500, event: "affordance.sign", detail: "sign tx (user approved)", success: true },
+    audit: { counts: { total: 7, total_today: 7, user_approved: 3, denied: 0, attested: 2 }, recent: [
+      { ts: 1781989000, event: "capability.use", detail: "wallet/* read accounts", success: true, signed: true, signer: "did:elastos:gateway" },
+      { ts: 1781988500, event: "affordance.sign", detail: "sign tx (user approved)", success: true, signed: true, signer: "did:elastos:gateway" },
     ] },
     processes: [{ kind: "microvm", instance: "vm#2", memory_mb: 64, uptime_s: 25200 }],
   },

@@ -105,6 +105,13 @@ pub struct AuditRecord {
     pub event: String,
     pub detail: String,
     pub success: bool,
+    /// Whether this event is cryptographically attested (a signature is present).
+    /// We surface the *fact* of attestation, never the signature itself (#16).
+    pub signed: bool,
+    /// The DID that attested the event, when present. A DID is public identity,
+    /// safe to surface, and is the verified-signer evidence the audit plane
+    /// actually carries (#15).
+    pub signer: Option<String>,
 }
 
 /// A capsule's recent audit activity.
@@ -112,6 +119,8 @@ pub struct AuditRecord {
 pub struct CapsuleAudit {
     pub total: u64,
     pub denied: u64,
+    /// How many of the recent events are cryptographically attested.
+    pub attested: u64,
     pub recent: Vec<AuditRecord>,
 }
 
@@ -148,6 +157,7 @@ impl AuditSource for AuthAuditSource {
             };
             let mut total = 0u64;
             let mut denied = 0u64;
+            let mut attested = 0u64;
             let mut recent = Vec::new();
             // Newest-first.
             for event in state.audit.iter().rev() {
@@ -159,16 +169,22 @@ impl AuditSource for AuthAuditSource {
                 if !success {
                     denied += 1;
                 }
+                let signed = event.signature.is_some();
+                if signed {
+                    attested += 1;
+                }
                 if recent.len() < recent_limit {
                     recent.push(AuditRecord {
                         ts: event.occurred_at,
                         event: event.event_type.clone(),
                         detail: event.reason.clone(),
                         success,
+                        signed,
+                        signer: event.signer_did.clone(),
                     });
                 }
             }
-            CapsuleAudit { total, denied, recent }
+            CapsuleAudit { total, denied, attested, recent }
         })
         .await
         .unwrap_or_default()
@@ -593,15 +609,21 @@ impl InspectProvider {
     /// Empty when no audit source is attached.
     async fn audit_value(&self, entry: &InspectEntry) -> Value {
         let Some(audit) = &self.audit else {
-            return json!({ "counts": { "total": 0, "denied": 0 }, "recent": [] });
+            return json!({ "counts": { "total": 0, "denied": 0, "attested": 0 }, "recent": [] });
         };
         let a = audit.for_capsule(&entry.name, 20).await;
         let recent: Vec<Value> = a
             .recent
             .iter()
-            .map(|r| json!({ "ts": r.ts, "event": r.event, "detail": r.detail, "success": r.success }))
+            .map(|r| json!({
+                "ts": r.ts, "event": r.event, "detail": r.detail, "success": r.success,
+                "signed": r.signed, "signer": r.signer,
+            }))
             .collect();
-        json!({ "counts": { "total": a.total, "denied": a.denied }, "recent": recent })
+        json!({
+            "counts": { "total": a.total, "denied": a.denied, "attested": a.attested },
+            "recent": recent,
+        })
     }
 
     async fn handle_op(&self, request: &Value) -> Value {
@@ -1087,11 +1109,14 @@ mod tests {
                     CapsuleAudit {
                         total: 3,
                         denied: 1,
+                        attested: 1,
                         recent: vec![AuditRecord {
                             ts: 100,
                             event: "capability.use".to_string(),
                             detail: "did read".to_string(),
                             success: true,
+                            signed: true,
+                            signer: Some("did:elastos:gateway".to_string()),
                         }],
                     }
                 } else {
@@ -1108,8 +1133,13 @@ mod tests {
             .unwrap();
         assert_eq!(resp["data"]["audit"]["counts"]["total"], 3);
         assert_eq!(resp["data"]["audit"]["counts"]["denied"], 1);
+        // Attestation fidelity: who cryptographically signed each event (#15),
+        // surfaced as presence + DID, never the signature itself (#16).
+        assert_eq!(resp["data"]["audit"]["counts"]["attested"], 1);
         assert_eq!(resp["data"]["audit"]["recent"][0]["event"], "capability.use");
         assert_eq!(resp["data"]["audit"]["recent"][0]["success"], true);
+        assert_eq!(resp["data"]["audit"]["recent"][0]["signed"], true);
+        assert_eq!(resp["data"]["audit"]["recent"][0]["signer"], "did:elastos:gateway");
     }
 
     #[tokio::test]
