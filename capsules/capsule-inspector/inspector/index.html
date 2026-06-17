@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Capsule Inspector</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <h1>Capsule Inspector</h1>
+      </div>
+      <div class="meta">
+        <span id="source-badge" class="badge badge-sample">sample data</span>
+        <span class="hint">read-only · permissioned mirror · audited</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- Left: live object world (the capsule list) -->
+      <nav class="sidebar" aria-label="Capsules">
+        <div class="sidebar-head">Live capsules</div>
+        <ul id="capsule-list" class="capsule-list"></ul>
+      </nav>
+
+      <!-- Right: the nine-field "glass box" detail -->
+      <section id="detail" class="detail" aria-live="polite"></section>
+    </main>
+
+    <script src="inspector.js"></script>
+  </body>
+</html>

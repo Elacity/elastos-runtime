@@ -1,0 +1,19 @@
+[package]
+name = "capsule-inspector"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Capsule Inspector capsule"
+license = "MIT"
+
+[[bin]]
+name = "capsule-inspector"
+path = "wasm/main.rs"
+
+[dependencies]
+elastos-guest = { path = "../../elastos/crates/elastos-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

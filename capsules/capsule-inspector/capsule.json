@@ -1,0 +1,17 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "capsule-inspector",
+  "version": "0.1.0",
+  "description": "Object-centered, read-only inspector for live capsules: identity, affordances, capabilities, provenance, and audit in one view",
+  "author": "elastos",
+  "role": "app",
+  "type": "wasm",
+  "entrypoint": "capsule-inspector.wasm",
+  "capabilities": [
+    "elastos://inspect/read"
+  ],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}
