@@ -756,6 +756,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
             get(super::viewer_object::viewer_object_bytes),
         )
         .route(
+            "/api/viewers/:viewer/object/:session/page",
+            get(super::viewer_object::viewer_object_page),
+        )
+        .route(
             "/apps/:app",
             get(super::browser_capsules::serve_browser_app_root),
         )

@@ -687,13 +687,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                         let required = required_action_for(&dispatch.operation);
                         if bridge_ctx
                             .capability_manager
-                            .validate(
-                                &token,
-                                &bridge_ctx.capsule_id,
-                                required,
-                                &resource_id,
-                                None,
-                            )
+                            .validate(&token, &bridge_ctx.capsule_id, required, &resource_id, None)
                             .await
                             .is_err()
                         {
@@ -1758,7 +1752,10 @@ mod tests {
         );
         // And nothing was written.
         let path = rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
-        assert!(!path.exists(), "the escalated write must not have touched disk");
+        assert!(
+            !path.exists(),
+            "the escalated write must not have touched disk"
+        );
 
         // The matching action (a write-granted token) is still accepted.
         let write_token = bridge_token(&ctx, &object_uri, Action::Write);
@@ -1776,7 +1773,10 @@ mod tests {
         let ok = handle_request(&write_ok, &ctx_opt)
             .await
             .expect("bridge should return a response");
-        assert_eq!(ok["response"]["type"], "carrier_result", "matching action opens: {ok}");
+        assert_eq!(
+            ok["response"]["type"], "carrier_result",
+            "matching action opens: {ok}"
+        );
     }
 
     #[tokio::test]

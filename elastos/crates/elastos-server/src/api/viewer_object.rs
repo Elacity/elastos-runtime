@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path as FsPath;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -72,6 +72,13 @@ pub struct ObjectSession {
     pub byte_length: usize,
     /// Whether the asset is protected (always true on this path; surfaced for the UI).
     pub is_protected: bool,
+    /// Pixel-lock: the asset is viewed as flattened, watermarked page images served by the
+    /// page route; the raw `/bytes` egress is refused (the plaintext never leaves the boundary).
+    pub pixel_locked: bool,
+    /// For pixel-lock assets, the document's page count.
+    pub total_pages: u32,
+    /// For pixel-lock assets, the content type of each rendered page (e.g. `image/jpeg`).
+    pub page_content_type: String,
     /// Unix expiry; reads after this fail closed.
     pub expires_at: u64,
     /// The gateway-spawned LOCAL KEY-AUTHORITY subprocess (which owns a SEPARATE rail
@@ -94,6 +101,9 @@ impl ObjectSession {
             mime: authority.mime.clone(),
             byte_length: authority.byte_length,
             is_protected: true,
+            pixel_locked: authority.pixel_locked,
+            total_pages: authority.total_pages,
+            page_content_type: authority.page_content_type.clone(),
             expires_at: authority.expires_at,
             authority,
         }
@@ -166,6 +176,14 @@ pub async fn viewer_object_bytes(
         Ok(session) => session,
         Err(resp) => return *resp,
     };
+    // Pixel-lock assets (e.g. PDF) never egress their raw plaintext — only watermarked page
+    // images, via the page route. Refuse the raw bytes path fail-closed (one canonical path).
+    if session.pixel_locked {
+        return object_error(
+            StatusCode::FORBIDDEN,
+            "this asset is pixel-locked; fetch rendered pages via /page?n=",
+        );
+    }
     if crate::auth::now_ts() > session.expires_at {
         return object_error(StatusCode::FORBIDDEN, "this object session has expired");
     }
@@ -201,6 +219,52 @@ pub async fn viewer_object_bytes(
     }
 }
 
+/// GET /api/viewers/:viewer/object/:session/page?n=N — one rendered, watermarked page image
+/// for a pixel-lock asset. The raw object never reaches the browser; only this image does.
+/// `X-Asset-Pages` carries the page count so the viewer can page through. Fails closed for
+/// non-pixel-lock sessions, expiry, and any render/relay error.
+pub async fn viewer_object_page(
+    State(state): State<GatewayState>,
+    Path((viewer, session_id)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authorize_object_session(&state.data_dir, &headers, &viewer, &session_id) {
+        Ok(session) => session,
+        Err(resp) => return *resp,
+    };
+    if !session.pixel_locked {
+        return object_error(
+            StatusCode::BAD_REQUEST,
+            "this asset is not pixel-locked; fetch it via /bytes",
+        );
+    }
+    if crate::auth::now_ts() > session.expires_at {
+        return object_error(StatusCode::FORBIDDEN, "this object session has expired");
+    }
+    let n: u32 = params.get("n").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if session.total_pages > 0 && n >= session.total_pages {
+        return object_error(StatusCode::NOT_FOUND, "page out of range");
+    }
+    let authority = session.authority.clone();
+    let page_mime = session.page_content_type.clone();
+    let rendered = tokio::task::spawn_blocking(move || authority.object_page(n)).await;
+    match rendered {
+        Ok(Ok((bytes, total_pages))) => image_page(bytes, &page_mime, total_pages, n),
+        Ok(Err(err)) => {
+            tracing::warn!("object page render fail-closed: {err}");
+            object_error(
+                StatusCode::BAD_GATEWAY,
+                "the decrypt provider could not render this page",
+            )
+        }
+        Err(_) => object_error(
+            StatusCode::BAD_GATEWAY,
+            "the decrypt provider could not render this page",
+        ),
+    }
+}
+
 /// Compose the browser-facing view manifest — metadata ONLY, never key material.
 fn object_manifest_value(session: &ObjectSession) -> Value {
     json!({
@@ -208,6 +272,9 @@ fn object_manifest_value(session: &ObjectSession) -> Value {
         "mime": session.mime,
         "byte_length": session.byte_length,
         "is_protected": session.is_protected,
+        "pixel_locked": session.pixel_locked,
+        "total_pages": session.total_pages,
+        "page_content_type": session.page_content_type,
         "expires_at": session.expires_at,
     })
 }
@@ -284,6 +351,28 @@ fn octet_stream(bytes: Vec<u8>, mime: &str) -> Response {
         [
             ("content-type", "application/octet-stream"),
             ("cache-control", "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// A rendered page image response: the watermarked bytes, the page's content type, no-store,
+/// and `X-Asset-Pages`/`X-Asset-Page` so the viewer can build its pager. The bytes are an
+/// opaque flattened image — never the source document.
+fn image_page(bytes: Vec<u8>, content_type: &str, total_pages: u32, page_index: u32) -> Response {
+    let content_type = if content_type.is_empty() {
+        "image/jpeg".to_string()
+    } else {
+        content_type.to_string()
+    };
+    (
+        StatusCode::OK,
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-store".to_string()),
+            ("x-asset-pages", total_pages.to_string()),
+            ("x-asset-page", page_index.to_string()),
         ],
         bytes,
     )

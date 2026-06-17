@@ -15,7 +15,12 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
     let buf = init;
 
     // Walk moov → trak → mdia → minf → stbl → stsd to find the sample entry
-    let stsd = match find_box_path(buf, 0, buf.len(), &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]) {
+    let stsd = match find_box_path(
+        buf,
+        0,
+        buf.len(),
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+    ) {
         Some(info) => info,
         None => return buf.to_vec(),
     };
@@ -73,8 +78,12 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
                     Some(h) => h,
                     None => break,
                 };
-                if inner_h.size < 8 { break; }
-                if &inner_h.box_type == b"frma" && inner + inner_h.header_size as usize + 4 <= sinf_end {
+                if inner_h.size < 8 {
+                    break;
+                }
+                if &inner_h.box_type == b"frma"
+                    && inner + inner_h.header_size as usize + 4 <= sinf_end
+                {
                     let frma_data_start = inner + inner_h.header_size as usize;
                     original_format.copy_from_slice(&buf[frma_data_start..frma_data_start + 4]);
                 }
@@ -91,7 +100,10 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
     };
 
     // Collect removal ranges: sinf + top-level pssh boxes + pssh inside moov
-    let mut removals: Vec<Removal> = vec![Removal { start: sinf_off, size: sinf_size }];
+    let mut removals: Vec<Removal> = vec![Removal {
+        start: sinf_off,
+        size: sinf_size,
+    }];
 
     // Scan top-level boxes for pssh
     let mut top_pos = 0;
@@ -100,9 +112,14 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
             Some(h) => h,
             None => break,
         };
-        if h.size < 8 || top_pos + h.size as usize > buf.len() { break; }
+        if h.size < 8 || top_pos + h.size as usize > buf.len() {
+            break;
+        }
         if &h.box_type == b"pssh" {
-            removals.push(Removal { start: top_pos, size: h.size as usize });
+            removals.push(Removal {
+                start: top_pos,
+                size: h.size as usize,
+            });
         }
         top_pos += h.size as usize;
     }
@@ -116,9 +133,14 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
                 Some(h) => h,
                 None => break,
             };
-            if h.size < 8 || pos + h.size as usize > moov_end { break; }
+            if h.size < 8 || pos + h.size as usize > moov_end {
+                break;
+            }
             if &h.box_type == b"pssh" {
-                removals.push(Removal { start: pos, size: h.size as usize });
+                removals.push(Removal {
+                    start: pos,
+                    size: h.size as usize,
+                });
             }
             pos += h.size as usize;
         }
@@ -136,7 +158,8 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
     }
 
     // Adjust ancestor box sizes
-    let ancestors = collect_ancestor_positions(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]);
+    let ancestors =
+        collect_ancestor_positions(buf, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]);
     let mut ancestor_list: Vec<(usize, u64)> = ancestors;
 
     // Include sample entry box
@@ -152,7 +175,8 @@ pub fn strip_encryption_signaling(init: &[u8]) -> Vec<u8> {
 
     for &(orig_pos, orig_size) in &ancestor_list {
         let anc_end = orig_pos + orig_size as usize;
-        let removed_within: usize = removals.iter()
+        let removed_within: usize = removals
+            .iter()
             .filter(|r| r.start >= orig_pos && r.start + r.size <= anc_end)
             .map(|r| r.size)
             .sum();
@@ -204,9 +228,14 @@ pub fn strip_segment_encryption_boxes(segment: &[u8]) -> Vec<u8> {
             Some(h) => h,
             None => break,
         };
-        if h.size < 8 || scan_pos + h.size as usize > traf_end { break; }
+        if h.size < 8 || scan_pos + h.size as usize > traf_end {
+            break;
+        }
         if enc_box_types.iter().any(|t| **t == h.box_type) {
-            removals.push(Removal { start: scan_pos, size: h.size as usize });
+            removals.push(Removal {
+                start: scan_pos,
+                size: h.size as usize,
+            });
         }
         scan_pos += h.size as usize;
     }
@@ -242,8 +271,10 @@ pub fn strip_segment_encryption_boxes(segment: &[u8]) -> Vec<u8> {
                 let do_pos = trun_start + 16;
                 if do_pos + 4 <= output.len() {
                     let old_offset = i32::from_be_bytes([
-                        output[do_pos], output[do_pos + 1],
-                        output[do_pos + 2], output[do_pos + 3],
+                        output[do_pos],
+                        output[do_pos + 1],
+                        output[do_pos + 2],
+                        output[do_pos + 3],
                     ]);
                     let new_offset = old_offset - total_removed as i32;
                     output[do_pos..do_pos + 4].copy_from_slice(&new_offset.to_be_bytes());
@@ -279,7 +310,8 @@ fn build_without_removals(buf: &[u8], removals: &[Removal]) -> Vec<u8> {
 }
 
 fn map_to_output(orig_pos: usize, removals: &[Removal]) -> usize {
-    let shift: usize = removals.iter()
+    let shift: usize = removals
+        .iter()
         .filter(|r| r.start < orig_pos)
         .map(|r| r.size)
         .sum();
@@ -290,8 +322,12 @@ fn find_box_start(buf: &[u8], start: usize, end: usize, box_type: &[u8; 4]) -> O
     let mut pos = start;
     while pos + 8 <= end {
         let h = read_box_header(buf, pos)?;
-        if h.size < 8 || pos + h.size as usize > end { return None; }
-        if &h.box_type == box_type { return Some(pos); }
+        if h.size < 8 || pos + h.size as usize > end {
+            return None;
+        }
+        if &h.box_type == box_type {
+            return Some(pos);
+        }
         pos += h.size as usize;
     }
     None
@@ -304,18 +340,26 @@ struct BoxInfo {
 }
 
 fn find_box_path(buf: &[u8], start: usize, end: usize, path: &[&[u8; 4]]) -> Option<BoxInfo> {
-    if path.is_empty() { return None; }
+    if path.is_empty() {
+        return None;
+    }
 
     let mut pos = start;
     while pos + 8 <= end {
         let h = read_box_header(buf, pos)?;
-        if h.size < 8 || pos + h.size as usize > end { return None; }
+        if h.size < 8 || pos + h.size as usize > end {
+            return None;
+        }
         let content_start = pos + h.header_size as usize;
         let box_end = pos + h.size as usize;
 
         if h.box_type == *path[0] {
             if path.len() == 1 {
-                return Some(BoxInfo { box_start: pos, content_start, box_end });
+                return Some(BoxInfo {
+                    box_start: pos,
+                    content_start,
+                    box_end,
+                });
             }
             return find_box_path(buf, content_start, box_end, &path[1..]);
         }
@@ -337,7 +381,9 @@ fn collect_ancestor_positions(buf: &[u8], path: &[&[u8; 4]]) -> Vec<(usize, u64)
                 Some(h) => h,
                 None => break,
             };
-            if h.size < 8 || pos + h.size as usize > end { break; }
+            if h.size < 8 || pos + h.size as usize > end {
+                break;
+            }
             if h.box_type == **target {
                 ancestors.push((pos, h.size));
                 start = pos + h.header_size as usize;
@@ -347,7 +393,9 @@ fn collect_ancestor_positions(buf: &[u8], path: &[&[u8; 4]]) -> Vec<(usize, u64)
             }
             pos += h.size as usize;
         }
-        if !found { break; }
+        if !found {
+            break;
+        }
     }
 
     ancestors
@@ -361,8 +409,15 @@ fn find_bytes(buf: &[u8], needle: &[u8; 4]) -> Option<usize> {
 /// Standard boxes: 4 bytes at `offset`.
 /// Extended boxes (where the original 32-bit size was 1): 8 bytes at `offset+8`.
 fn write_box_size(buf: &mut [u8], offset: usize, new_size: u64) {
-    if offset + 4 > buf.len() { return; }
-    let existing_size32 = u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]);
+    if offset + 4 > buf.len() {
+        return;
+    }
+    let existing_size32 = u32::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ]);
 
     if existing_size32 == 1 {
         // Extended size — write 64-bit value at offset+8

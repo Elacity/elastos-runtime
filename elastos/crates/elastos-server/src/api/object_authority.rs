@@ -60,6 +60,14 @@ pub struct ObjectAuthorityProc {
     pub byte_length: usize,
     /// Unix expiry; reads after this fail closed.
     pub expires_at: u64,
+    /// Pixel-lock: the asset is served as flattened, watermarked page images (the raw bytes
+    /// never leave the decrypt boundary). When true, the object read is refused and the page
+    /// route is the only way to view it.
+    pub pixel_locked: bool,
+    /// For pixel-lock assets, the document's page count (from the descriptor).
+    pub total_pages: u32,
+    /// For pixel-lock assets, the content type of each rendered page (e.g. `image/jpeg`).
+    pub page_content_type: String,
 }
 
 struct ProcIo {
@@ -138,6 +146,9 @@ impl ObjectAuthorityProc {
             mime,
             byte_length,
             expires_at,
+            pixel_locked: false,
+            total_pages: 0,
+            page_content_type: String::new(),
         })
     }
 
@@ -215,6 +226,21 @@ impl ObjectAuthorityProc {
             .get("expires_at")
             .and_then(Value::as_u64)
             .ok_or("descriptor missing expires_at")?;
+        // Pixel-lock metadata: present (true) when the helper renders this asset to page images
+        // in-boundary (e.g. PDFs). Absent ⇒ a raw object read, as before.
+        let pixel_locked = descriptor
+            .get("pixel_locked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let total_pages = descriptor
+            .get("total_pages")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let page_content_type = descriptor
+            .get("page_content_type")
+            .and_then(Value::as_str)
+            .unwrap_or("image/jpeg")
+            .to_string();
 
         Ok(Self {
             child,
@@ -222,7 +248,51 @@ impl ObjectAuthorityProc {
             mime,
             byte_length,
             expires_at,
+            pixel_locked,
+            total_pages,
+            page_content_type,
         })
+    }
+
+    /// Relay a pixel-lock page read; returns that page's rendered (watermarked) image bytes and
+    /// the document's page count. The raw object never crosses this boundary — only the image.
+    pub fn object_page(&self, n: u32) -> Result<(Vec<u8>, u32), String> {
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| "object-authority mutex poisoned")?;
+        writeln!(io.stdin, "{}", json!({ "op": "page", "n": n }))
+            .map_err(|e| format!("write page request: {e}"))?;
+        io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        let mut line = String::new();
+        let read = io
+            .stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read page response: {e}"))?;
+        if read == 0 {
+            return Err("object-authority closed its stdout".to_string());
+        }
+        let resp: Value =
+            serde_json::from_str(line.trim()).map_err(|e| format!("parse response: {e}"))?;
+        if resp.get("status").and_then(Value::as_str) != Some("ok") {
+            let message = resp
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("object-authority error");
+            return Err(message.to_string());
+        }
+        let b64 = resp
+            .get("page_b64")
+            .and_then(Value::as_str)
+            .ok_or("response missing page_b64")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("decode page_b64: {e}"))?;
+        let total_pages = resp
+            .get("total_pages")
+            .and_then(Value::as_u64)
+            .unwrap_or(self.total_pages as u64) as u32;
+        Ok((bytes, total_pages))
     }
 
     /// Relay the object read; returns the already-decrypted cleartext bytes.

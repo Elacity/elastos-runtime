@@ -35,6 +35,11 @@ mod vector_format;
 // `rail-live` (via OpenSessionLive below).
 #[cfg(feature = "rail-shim")]
 mod rail_shim;
+// Pixel-lock secure renderer (feature `pdf-render`): rasterises a decrypted PDF page to
+// a watermarked JPEG inside this boundary so the plaintext never egresses. PC2
+// ddrm-renderer parity. Wired into the `Render` op under the fail-closed contract.
+#[cfg(feature = "pdf-render")]
+mod render;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
@@ -101,8 +106,44 @@ enum Request {
         material: SealedDecryptMaterialV1,
         index: usize,
         now_unix: u64,
+        /// Pixel-lock render directive (feature `pdf-render`). When present, the decrypted
+        /// object is NOT returned as raw bytes — it is rasterised to a single watermarked page
+        /// image INSIDE this boundary and only that image egresses (the plaintext object never
+        /// leaves the sandbox). Absent ⇒ the legacy raw-segment response, byte-identical.
+        #[serde(default)]
+        render: Option<RenderDirective>,
+    },
+    // Pixel-lock NEXT-PAGE read (feature `pdf-render`): render one more page of an asset
+    // ALREADY decrypted + parsed in THIS session by a prior `StreamSegment { render }`. It
+    // carries NO sealed material and NO ciphertext — only the warm session id + the page —
+    // so paging never re-ships the object or re-contacts the quorum. Fails closed if the
+    // warm session is absent or its id does not match (the helper must establish it first).
+    #[cfg(feature = "pdf-render")]
+    RenderPage {
+        session_id: String,
+        page: u32,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        watermark: Option<String>,
     },
     Shutdown,
+}
+
+/// A pixel-lock render request rider on `StreamSegment` (capsule-local, so the shared
+/// `DecryptSessionRequestV1` contract stays byte-identical). Carries the object's real
+/// mime (to pick the renderer + confirm it is pixel-lock), the page to render, a width
+/// cap, and the forensic watermark text (the buyer/owner identity stamped onto the page).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderDirective {
+    mime: String,
+    #[serde(default)]
+    page: Option<u32>,
+    #[serde(default)]
+    max_width: Option<u32>,
+    #[serde(default)]
+    watermark: Option<String>,
 }
 
 /// The VM-sealed decrypt material delivered on the live rail (Option A). Carries
@@ -324,6 +365,19 @@ struct DecryptProvider {
     session_pub: Option<Vec<u8>>,
 }
 
+// WARM pixel-lock render state (feature `pdf-render`). The decrypt-provider process is spawned
+// per OPEN and kept alive for the view session by the helper, so a single warm slot holds the
+// object decrypted + parsed ONCE plus a page-image cache: the quorum is hit once, the object is
+// decrypted + parsed once, and each page is a fast in-VM rasterise (re-visits are an instant
+// cache hit). Thread-local (not a struct field) because the boundary is single-threaded stdio
+// and this avoids threading render state through every construction site. It lives and dies with
+// the process, so the parsed plaintext is gone the moment the open ends.
+#[cfg(feature = "pdf-render")]
+thread_local! {
+    static RENDER_CACHE: std::cell::RefCell<Option<render::RenderSession>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl DecryptProvider {
     fn handle(&mut self, request: Request) -> Response {
         match request {
@@ -340,17 +394,32 @@ impl DecryptProvider {
                 self.open_session_bound(*request, &material)
             }
             #[cfg(feature = "rail-audit")]
-            Request::OpenSessionAudited { request, material, now_unix } => {
-                self.open_session_audited(*request, &material, now_unix)
-            }
+            Request::OpenSessionAudited {
+                request,
+                material,
+                now_unix,
+            } => self.open_session_audited(*request, &material, now_unix),
             #[cfg(feature = "rail-material")]
-            Request::OpenSessionV1 { request, material, now_unix } => {
-                self.open_session_v1(*request, material, now_unix)
-            }
+            Request::OpenSessionV1 {
+                request,
+                material,
+                now_unix,
+            } => self.open_session_v1(*request, material, now_unix),
             #[cfg(feature = "rail-stream")]
-            Request::StreamSegment { request, material, index, now_unix } => {
-                self.stream_segment(*request, material, index, now_unix)
-            }
+            Request::StreamSegment {
+                request,
+                material,
+                index,
+                now_unix,
+                render,
+            } => self.stream_segment(*request, material, index, now_unix, render),
+            #[cfg(feature = "pdf-render")]
+            Request::RenderPage {
+                session_id,
+                page,
+                max_width,
+                watermark,
+            } => self.render_cached_page(&session_id, page, max_width, watermark.as_deref()),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -383,7 +452,12 @@ impl DecryptProvider {
         if let Some(vk_b64) = config.get("authority_vk_b64").and_then(Value::as_str) {
             match b64.decode(vk_b64) {
                 Ok(vk) => self.authority_vk = Some(vk),
-                Err(_) => return Response::error("invalid_request", "authority_vk_b64 is not valid base64"),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        "authority_vk_b64 is not valid base64",
+                    )
+                }
             }
         }
 
@@ -392,7 +466,12 @@ impl DecryptProvider {
         if let Some(vk_b64) = config.get("authority_vk2_b64").and_then(Value::as_str) {
             match b64.decode(vk_b64) {
                 Ok(vk) => self.authority_vk2 = Some(vk),
-                Err(_) => return Response::error("invalid_request", "authority_vk2_b64 is not valid base64"),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        "authority_vk2_b64 is not valid base64",
+                    )
+                }
             }
         }
 
@@ -409,7 +488,12 @@ impl DecryptProvider {
             }
             match b64.decode(vk_b64) {
                 Ok(vk) => self.authority_vk3 = Some(vk),
-                Err(_) => return Response::error("invalid_request", "authority_vk3_b64 is not valid base64"),
+                Err(_) => {
+                    return Response::error(
+                        "invalid_request",
+                        "authority_vk3_b64 is not valid base64",
+                    )
+                }
             }
         }
 
@@ -477,7 +561,11 @@ impl DecryptProvider {
     /// `Response`. Fails closed (coarse `decrypt_failed`) on any unprovisioned state,
     /// profile/secret mismatch, malformed carrier, wrong session, or bad signature.
     #[cfg(feature = "rail-live")]
-    fn open_session_live(&self, request: DecryptSessionRequestV1, material: &RailMaterial) -> Response {
+    fn open_session_live(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: &RailMaterial,
+    ) -> Response {
         use base64::Engine as _;
 
         if let Err(err) = validate_decrypt_session_request(&request) {
@@ -509,25 +597,42 @@ impl DecryptProvider {
         let profile = match material.profile.as_str() {
             "pq_hybrid" => rail_shim::SealProfile::PqHybrid,
             "classical_p256" => rail_shim::SealProfile::ClassicalP256,
-            other => return Response::error("invalid_request", format!("unsupported seal profile: {other}")),
+            other => {
+                return Response::error(
+                    "invalid_request",
+                    format!("unsupported seal profile: {other}"),
+                )
+            }
         };
         let sealed_cek = match b64.decode(&material.sealed_cek_b64) {
             Ok(bytes) => bytes,
-            Err(_) => return Response::error("invalid_request", "sealed_cek_b64 is not valid base64"),
+            Err(_) => {
+                return Response::error("invalid_request", "sealed_cek_b64 is not valid base64")
+            }
         };
         let ciphertext_segment = match b64.decode(&material.ciphertext_b64) {
             Ok(bytes) => bytes,
-            Err(_) => return Response::error("invalid_request", "ciphertext_b64 is not valid base64"),
+            Err(_) => {
+                return Response::error("invalid_request", "ciphertext_b64 is not valid base64")
+            }
         };
         let init_segment = match material.init_segment_b64.as_deref().map(|s| b64.decode(s)) {
             None => None,
             Some(Ok(bytes)) => Some(bytes),
-            Some(Err(_)) => return Response::error("invalid_request", "init_segment_b64 is not valid base64"),
+            Some(Err(_)) => {
+                return Response::error("invalid_request", "init_segment_b64 is not valid base64")
+            }
         };
 
-        let verifier = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk) {
+        let verifier = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk)
+        {
             Some(v) => v,
-            None => return Response::error("not_configured", "configured key-authority verifying key is malformed"),
+            None => {
+                return Response::error(
+                    "not_configured",
+                    "configured key-authority verifying key is malformed",
+                )
+            }
         };
 
         let carrier = rail_shim::SealedDecryptBundle {
@@ -556,7 +661,11 @@ impl DecryptProvider {
     /// cannot be replayed against any other — it fails closed at the GCM tag /
     /// signature before any plaintext exists.
     #[cfg(feature = "rail-bind")]
-    fn open_session_bound(&self, request: DecryptSessionRequestV1, material: &BoundRailMaterial) -> Response {
+    fn open_session_bound(
+        &self,
+        request: DecryptSessionRequestV1,
+        material: &BoundRailMaterial,
+    ) -> Response {
         let prepared = match self.prepare_bound_open(&request, material, None) {
             Ok(p) => p,
             Err(resp) => return resp,
@@ -595,19 +704,29 @@ impl DecryptProvider {
         }
 
         let session = self.session.as_ref().ok_or_else(|| {
-            Response::error("not_configured", "decrypt session key is not provisioned in this boundary")
+            Response::error(
+                "not_configured",
+                "decrypt session key is not provisioned in this boundary",
+            )
         })?;
         let session_pub = self.session_pub.as_ref().ok_or_else(|| {
-            Response::error("not_configured", "decrypt session public key is not published")
+            Response::error(
+                "not_configured",
+                "decrypt session public key is not published",
+            )
         })?;
         let authority_vk = self.authority_vk.as_ref().ok_or_else(|| {
-            Response::error("not_configured", "trusted key-authority verifying key is not configured")
+            Response::error(
+                "not_configured",
+                "trusted key-authority verifying key is not configured",
+            )
         })?;
 
         let b64 = base64::engine::general_purpose::STANDARD;
         let decode = |s: &str, field: &str| -> Result<Vec<u8>, Response> {
-            b64.decode(s)
-                .map_err(|_| Response::error("invalid_request", format!("{field} is not valid base64")))
+            b64.decode(s).map_err(|_| {
+                Response::error("invalid_request", format!("{field} is not valid base64"))
+            })
         };
         let sealed_cek = decode(&material.sealed_cek_b64, "sealed_cek_b64")?;
         let ciphertext_segment = decode(&material.ciphertext_b64, "ciphertext_b64")?;
@@ -648,7 +767,12 @@ impl DecryptProvider {
         };
 
         let verifier = crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk)
-            .ok_or_else(|| Response::error("not_configured", "configured key-authority verifying key is malformed"))?;
+            .ok_or_else(|| {
+                Response::error(
+                    "not_configured",
+                    "configured key-authority verifying key is malformed",
+                )
+            })?;
 
         let aad = DecryptTranscriptV1 {
             suite_id: DECRYPT_SUITE_ID,
@@ -708,8 +832,8 @@ impl DecryptProvider {
         };
 
         // Short-expiry enforcement — before any crypto.
-        let expired = now_unix > request.expires_at
-            || now_unix > request.release_receipt.expires_at;
+        let expired =
+            now_unix > request.expires_at || now_unix > request.release_receipt.expires_at;
         if expired {
             return audited_response(
                 &request,
@@ -748,9 +872,23 @@ impl DecryptProvider {
                     Response::Ok { data: Some(data) } => data,
                     other => return other,
                 };
-                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
+                audited_response(
+                    &request,
+                    &transcript_hash,
+                    now_unix,
+                    "opened",
+                    "ok",
+                    Some(scoped),
+                )
             }
-            Err(_) => audited_response(&request, &transcript_hash, now_unix, "denied", "decrypt_failed", None),
+            Err(_) => audited_response(
+                &request,
+                &transcript_hash,
+                now_unix,
+                "denied",
+                "decrypt_failed",
+                None,
+            ),
         }
     }
 
@@ -831,6 +969,7 @@ impl DecryptProvider {
         material: SealedDecryptMaterialV1,
         index: usize,
         now_unix: u64,
+        render: Option<RenderDirective>,
     ) -> Response {
         // The stream read is media-only: it serves the scoped `stream` output kind.
         if request.output_kind != "stream" {
@@ -857,8 +996,6 @@ impl DecryptProvider {
         // single segment's plaintext is produced per call; reordered/substituted/expired
         // sets fail closed in the shared reconstruction before any byte is returned.
         if let Some(share2_b64) = material.sealed_cek_share2_b64.clone() {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD;
             let (plaintexts, _meta, _transcript_hash) =
                 match self.open_threshold_plaintexts(&request, &material, &share2_b64, now_unix) {
                     Ok(v) => v,
@@ -874,16 +1011,7 @@ impl DecryptProvider {
                     )
                 }
             };
-            return Response::ok(json!({
-                "schema": "elastos.decrypt.stream-segment/v1",
-                "session_id": request.session_id,
-                "object_cid": request.object_cid,
-                "viewer_interface": request.viewer_interface,
-                "output_kind": "stream",
-                "segment_index": index,
-                "segment_count": segment_count,
-                "segment_b64": b64.encode(segment),
-            }));
+            return self.respond_segment(&request, &render, segment, segment_count, index);
         }
         // A threshold/quorum-provisioned boundary must receive a split material for a
         // stream read — refuse single-CEK material rather than open it single-node.
@@ -935,7 +1063,12 @@ impl DecryptProvider {
         };
         let (plaintexts, _meta) = match decrypt_result {
             Ok(v) => v,
-            Err(_) => return Response::error("invalid_request", "the decrypt session could not be opened"),
+            Err(_) => {
+                return Response::error(
+                    "invalid_request",
+                    "the decrypt session could not be opened",
+                )
+            }
         };
 
         let segment_count = plaintexts.len();
@@ -948,11 +1081,42 @@ impl DecryptProvider {
                 )
             }
         };
+        self.respond_segment(&request, &render, segment, segment_count, index)
+    }
+
+    /// Shape the `stream_segment` response from the decrypted segment. Default: the raw
+    /// `stream` payload (ONLY this segment's bytes — no CEK/IV/other segment), byte-identical
+    /// to the legacy contract. With a pixel-lock render directive: the object is extracted and
+    /// rasterised to a watermarked page image IN-BOUNDARY and ONLY that image egresses — the
+    /// plaintext object never leaves this sandbox. Either way the recovered CEK stays in-VM.
+    fn respond_segment(
+        &self,
+        request: &DecryptSessionRequestV1,
+        render: &Option<RenderDirective>,
+        segment: &[u8],
+        segment_count: usize,
+        index: usize,
+    ) -> Response {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
-        // The scoped `stream` payload: ONLY this segment's decrypted bytes — no CEK,
-        // no IV, no other segment. The runtime decodes `segment_b64` and relays the
-        // raw bytes to the viewer's MSE SourceBuffer at /media/{session}/segment/{i}.
+
+        if let Some(directive) = render {
+            #[cfg(feature = "pdf-render")]
+            {
+                return self.render_segment_page(request, directive, segment, index);
+            }
+            #[cfg(not(feature = "pdf-render"))]
+            {
+                let _ = directive;
+                return Response::error(
+                    "not_configured",
+                    "this decrypt boundary was not built with the pixel-lock renderer (feature `pdf-render`)",
+                );
+            }
+        }
+
+        // The runtime decodes `segment_b64` and relays the raw bytes to the viewer's MSE
+        // SourceBuffer at /media/{session}/segment/{i}.
         Response::ok(json!({
             "schema": "elastos.decrypt.stream-segment/v1",
             "session_id": request.session_id,
@@ -963,6 +1127,120 @@ impl DecryptProvider {
             "segment_count": segment_count,
             "segment_b64": b64.encode(segment),
         }))
+    }
+
+    /// Extract the protected object from the decrypted segment and rasterise the requested
+    /// page to a watermarked JPEG, INSIDE this boundary. Returns the image plus the document's
+    /// page count so the viewer can page through without ever receiving the source file. Fails
+    /// closed (no bytes) on a non-pixel-lock mime, an unparseable object, or a render error —
+    /// and never surfaces the plaintext in the response.
+    #[cfg(feature = "pdf-render")]
+    fn render_segment_page(
+        &self,
+        request: &DecryptSessionRequestV1,
+        directive: &RenderDirective,
+        segment: &[u8],
+        index: usize,
+    ) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        if !render::is_pixel_lock(&directive.mime) {
+            return Response::error(
+                "invalid_request",
+                "render requested for a mime that is not pixel-lock",
+            );
+        }
+        let object = match render::extract_object_mdat(segment) {
+            Ok(object) => object,
+            // Coarse failure: never echo the segment/plaintext on the error path.
+            Err(_) => {
+                return Response::error("decrypt_failed", "could not extract the protected object")
+            }
+        };
+
+        let page = directive.page.unwrap_or(0);
+        let mime_norm = directive.mime.trim().to_ascii_lowercase();
+
+        // WARM the session: decrypt + parse happened above; parse the document ONCE here and
+        // hold it for the rest of the open so every later page is a fast rasterise (#1+#4).
+        // Keyed by session id so a stale/foreign warm session is replaced, never reused.
+        RENDER_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            let need_open = match cache.as_ref() {
+                Some(s) => s.session_id != request.session_id || s.mime != mime_norm,
+                None => true,
+            };
+            if need_open {
+                match render::RenderSession::open(
+                    request.session_id.clone(),
+                    &directive.mime,
+                    &object,
+                ) {
+                    Ok(session) => *cache = Some(session),
+                    Err(e) => return Response::error("invalid_request", e),
+                }
+            }
+            // The object plaintext (`object`) is dropped after this call; only the parsed handle
+            // (which owns its own copy) stays warm. Render the requested page from the warm doc.
+            let session = cache.as_mut().expect("warm session just established");
+            match session.page(page, directive.max_width, directive.watermark.as_deref()) {
+                Ok(image) => Response::ok(json!({
+                    "schema": "elastos.decrypt.render-page/v1",
+                    "session_id": request.session_id,
+                    "object_cid": request.object_cid,
+                    "viewer_interface": request.viewer_interface,
+                    "output_kind": "stream",
+                    "segment_index": index,
+                    "page_index": page,
+                    "total_pages": session.total_pages,
+                    "content_type": "image/jpeg",
+                    "rendered_b64": b64.encode(image),
+                })),
+                // Fail closed: a render miss returns the reason only, never the plaintext.
+                Err(e) => Response::error("invalid_request", e),
+            }
+        })
+    }
+
+    /// Render a further page from the WARM session established by a prior `StreamSegment`
+    /// render — no material, no ciphertext, no quorum round-trip. Fails closed if no warm
+    /// session matches `session_id` (the helper must open the document first).
+    #[cfg(feature = "pdf-render")]
+    fn render_cached_page(
+        &self,
+        session_id: &str,
+        page: u32,
+        max_width: Option<u32>,
+        watermark: Option<&str>,
+    ) -> Response {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        RENDER_CACHE.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            let session = match cache.as_mut() {
+                Some(s) if s.session_id == session_id => s,
+                _ => {
+                    return Response::error(
+                        "invalid_request",
+                        "no warm pixel-lock session for this id (open the document first)",
+                    )
+                }
+            };
+            match session.page(page, max_width, watermark) {
+                Ok(image) => Response::ok(json!({
+                    "schema": "elastos.decrypt.render-page/v1",
+                    "session_id": session_id,
+                    "output_kind": "stream",
+                    "page_index": page,
+                    "total_pages": session.total_pages,
+                    "content_type": "image/jpeg",
+                    "rendered_b64": b64.encode(image),
+                })),
+                Err(e) => Response::error("invalid_request", e),
+            }
+        })
     }
 
     /// 2-of-2 threshold open (Day 97–98): the CEK was XOR-split across two dKMS nodes
@@ -990,7 +1268,14 @@ impl DecryptProvider {
                     Response::Ok { data: Some(data) } => data,
                     other => return other,
                 };
-                audited_response(&request, &transcript_hash, now_unix, "opened", "ok", Some(scoped))
+                audited_response(
+                    &request,
+                    &transcript_hash,
+                    now_unix,
+                    "opened",
+                    "ok",
+                    Some(scoped),
+                )
             }
             Err(resp) => resp,
         }
@@ -1018,12 +1303,10 @@ impl DecryptProvider {
         // open — fail closed if a threshold material arrives at a single-node boundary.
         let authority_vk2 = match self.authority_vk2.as_ref() {
             Some(vk) => vk,
-            None => {
-                return Err(Response::error(
-                    "not_configured",
-                    "threshold material requires a second key-authority verifying key (authority_vk2)",
-                ))
-            }
+            None => return Err(Response::error(
+                "not_configured",
+                "threshold material requires a second key-authority verifying key (authority_vk2)",
+            )),
         };
         // Day 103–104: derive the NODE-SET IDENTITY from the boundary's OWN pinned vks —
         // never from the request/material — and weld it into the transcript AAD below. The
@@ -1034,14 +1317,19 @@ impl DecryptProvider {
         let authority_vk = match self.authority_vk.as_ref() {
             Some(vk) => vk,
             None => {
-                return Err(Response::error("not_configured", "trusted key-authority verifying key is not configured"))
+                return Err(Response::error(
+                    "not_configured",
+                    "trusted key-authority verifying key is not configured",
+                ))
             }
         };
         // Day 113–116: a THIRD pinned identity makes this a 2-of-3 QUORUM boundary — the
         // node-set identity then covers ALL THREE secret-holders (any-2 serve, but the SET
         // the producer escrowed to is the trio), byte-identical to the 2-node id otherwise.
         let node_set_id = match self.authority_vk3.as_ref() {
-            Some(vk3) => ddrm_envelope::threshold_node_set_id_n(2, &[authority_vk, authority_vk2, vk3]),
+            Some(vk3) => {
+                ddrm_envelope::threshold_node_set_id_n(2, &[authority_vk, authority_vk2, vk3])
+            }
             None => ddrm_envelope::threshold_node_set_id(2, authority_vk, authority_vk2),
         };
 
@@ -1064,18 +1352,24 @@ impl DecryptProvider {
             Ok(p) => p,
             Err(resp) => return Err(resp),
         };
-        let verifier2 = match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk2) {
-            Some(v) => v,
-            None => {
-                return Err(Response::error(
-                    "not_configured",
-                    "configured second key-authority verifying key is malformed",
-                ))
-            }
-        };
+        let verifier2 =
+            match crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(authority_vk2) {
+                Some(v) => v,
+                None => {
+                    return Err(Response::error(
+                        "not_configured",
+                        "configured second key-authority verifying key is malformed",
+                    ))
+                }
+            };
         let sealed_share2 = match b64.decode(share2_b64) {
             Ok(b) => b,
-            Err(_) => return Err(Response::error("invalid_request", "sealed_cek_share2_b64 is not valid base64")),
+            Err(_) => {
+                return Err(Response::error(
+                    "invalid_request",
+                    "sealed_cek_share2_b64 is not valid base64",
+                ))
+            }
         };
         // PRE-AUDIT #1: the THIRD quorum share (when the rail served all three) enables
         // cheater detection, and the published CEK commitment is the integrity backstop.
@@ -1118,7 +1412,14 @@ impl DecryptProvider {
         let expired =
             now_unix > request.expires_at || now_unix > request.release_receipt.expires_at;
         if expired {
-            return Err(audited_response(request, &transcript_hash, now_unix, "denied", "expired", None));
+            return Err(audited_response(
+                request,
+                &transcript_hash,
+                now_unix,
+                "denied",
+                "expired",
+                None,
+            ));
         }
 
         // 2-of-3 QUORUM (Day 113–116): with a third pinned identity, the two arriving
@@ -1153,8 +1454,10 @@ impl DecryptProvider {
             // cross-check every pair (3-share cheater detection) AND verify the published CEK
             // commitment. A wrong-valued share — well-formed and correctly indexed — now fails the
             // open closed instead of combining into a silently-wrong CEK.
-            let mut sealed_shares: Vec<&[u8]> =
-                vec![prepared.carrier.sealed_cek.as_slice(), sealed_share2.as_slice()];
+            let mut sealed_shares: Vec<&[u8]> = vec![
+                prepared.carrier.sealed_cek.as_slice(),
+                sealed_share2.as_slice(),
+            ];
             if let Some(share3) = sealed_share3.as_deref() {
                 sealed_shares.push(share3);
             }
@@ -1303,7 +1606,10 @@ fn decrypt_session_segments(
     for (i, segment) in ciphertext_segments.iter().enumerate() {
         let (plaintext, meta) = decrypt_session_segment(cek_b64, segment, init_segment)
             .map_err(|err| format!("segment {i} failed closed: {err}"))?;
-        total_samples += meta.get("sample_count").and_then(Value::as_u64).unwrap_or(0);
+        total_samples += meta
+            .get("sample_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         plaintexts.push(plaintext);
     }
     let meta = json!({
@@ -1705,7 +2011,10 @@ mod tests {
         // (rail stand-in) CEK nor the recovered plaintext.
         let response = scoped_session_response(&decrypt_request(), &meta);
         let serialized = serde_json::to_string(&response).unwrap();
-        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must not cross the boundary"
+        );
         assert!(
             !serialized.contains(std::str::from_utf8(&expected).unwrap()),
             "plaintext must not cross the boundary"
@@ -1745,7 +2054,10 @@ mod tests {
 
         let response = scoped_session_response(&decrypt_request(), &meta);
         let serialized = serde_json::to_string(&response).unwrap();
-        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must not cross the boundary"
+        );
         assert!(
             !serialized.contains(std::str::from_utf8(&expected).unwrap()),
             "plaintext must not cross the boundary"
@@ -1784,7 +2096,10 @@ mod tests {
 
         let response = scoped_session_response(&decrypt_request(), &meta);
         let serialized = serde_json::to_string(&response).unwrap();
-        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must not cross the boundary"
+        );
         assert!(
             !serialized.contains(std::str::from_utf8(&expected).unwrap()),
             "plaintext must not cross the boundary"
@@ -1809,15 +2124,24 @@ mod tests {
             .unwrap();
 
         let cek_b64 = v.cek_b64.clone();
-        let segments: Vec<Vec<u8>> =
-            v.segments_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
-        let expected: Vec<Vec<u8>> =
-            v.expected_plaintexts_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
+        let segments: Vec<Vec<u8>> = v
+            .segments_b64
+            .iter()
+            .map(|s| b64.decode(s).unwrap())
+            .collect();
+        let expected: Vec<Vec<u8>> = v
+            .expected_plaintexts_b64
+            .iter()
+            .map(|s| b64.decode(s).unwrap())
+            .collect();
         assert!(segments.len() >= 2, "the golden is a multi-segment asset");
         // The segments are genuinely distinct fragments (each is independently content-addressed
         // by the content plane and fetched by its own CIDv1 before reaching this boundary).
         for i in 1..segments.len() {
-            assert_ne!(segments[i], segments[0], "segments are distinct media fragments");
+            assert_ne!(
+                segments[i], segments[0],
+                "segments are distinct media fragments"
+            );
         }
 
         // Decrypt the whole asset segment-by-segment under the ONE presentation CEK.
@@ -1842,7 +2166,10 @@ mod tests {
         // CEK nor ANY segment's recovered plaintext.
         let response = scoped_session_response(&decrypt_request(), &meta);
         let serialized = serde_json::to_string(&response).unwrap();
-        assert!(!serialized.contains(&cek_b64), "CEK must not cross the boundary");
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must not cross the boundary"
+        );
         for exp in &expected {
             assert!(
                 !serialized.contains(std::str::from_utf8(exp).unwrap()),
@@ -1866,8 +2193,11 @@ mod tests {
             )))
             .unwrap();
         let cek_b64 = v.cek_b64.clone();
-        let mut segments: Vec<Vec<u8>> =
-            v.segments_b64.iter().map(|s| b64.decode(s).unwrap()).collect();
+        let mut segments: Vec<Vec<u8>> = v
+            .segments_b64
+            .iter()
+            .map(|s| b64.decode(s).unwrap())
+            .collect();
 
         // Truncate the LAST segment so its box structure is unparseable: the loop must refuse the
         // whole asset (and name the segment), not return the segments it managed to decrypt first.
@@ -2006,9 +2336,13 @@ mod tests {
 
         let (_segment_bytes, meta) = decrypt_session_segment(&cek_b64, &segment, None).unwrap();
         let serialized =
-            serde_json::to_string(&scoped_session_response(&media_decrypt_request(), &meta)).unwrap();
+            serde_json::to_string(&scoped_session_response(&media_decrypt_request(), &meta))
+                .unwrap();
 
-        assert!(!serialized.contains(&cek_b64), "CEK must not reach the media player");
+        assert!(
+            !serialized.contains(&cek_b64),
+            "CEK must not reach the media player"
+        );
         assert!(
             !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
             "decrypted media must not reach the player as plaintext in the scoped response"
@@ -2133,7 +2467,8 @@ mod tests {
         let session_sk = SecretKey::random(&mut OsRng);
         let wrong_sk = SecretKey::random(&mut OsRng);
         let sealed = seal_cek_envelope(&session_sk.public_key(), &cek, 0x03);
-        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
+        let segment =
+            build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
 
         // A wrong session key cannot unwrap the envelope -> the whole step fails
         // closed before any segment decryption is attempted.
@@ -2148,7 +2483,16 @@ mod tests {
     // proves containment (neither CEK nor plaintext crosses to the caller).
 
     #[cfg(feature = "rail-live")]
-    fn pq_rail_material(seed: [u8; 32], cek: &[u8; 16], plaintext: &[u8]) -> (RailMaterial, Vec<u8>, crate::rail_shim::SessionSecret, Vec<u8>) {
+    fn pq_rail_material(
+        seed: [u8; 32],
+        cek: &[u8; 16],
+        plaintext: &[u8],
+    ) -> (
+        RailMaterial,
+        Vec<u8>,
+        crate::rail_shim::SessionSecret,
+        Vec<u8>,
+    ) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal};
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -2162,7 +2506,12 @@ mod tests {
             ciphertext_b64: b64.encode(&segment),
             init_segment_b64: None,
         };
-        (material, sealed, crate::rail_shim::SessionSecret::PqHybrid(secret), authority_vk)
+        (
+            material,
+            sealed,
+            crate::rail_shim::SessionSecret::PqHybrid(secret),
+            authority_vk,
+        )
     }
 
     #[cfg(feature = "rail-live")]
@@ -2172,7 +2521,8 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD;
         let cek = [0x5Au8; 16];
         let plaintext = b"rail-live: protected payload through the provider";
-        let (material, _sealed, session, authority_vk) = pq_rail_material([0x33u8; 32], &cek, plaintext);
+        let (material, _sealed, session, authority_vk) =
+            pq_rail_material([0x33u8; 32], &cek, plaintext);
 
         // Provision the boundary (VM-minted session + trusted authority vk), then
         // drive the REAL dispatch through `handle`.
@@ -2187,14 +2537,23 @@ mod tests {
         });
 
         let serialized = serde_json::to_string(&resp).unwrap();
-        assert!(serialized.contains("\"status\":\"ok\""), "live rail must open the session: {serialized}");
-        assert!(serialized.contains("session:test"), "scoped response carries the session id");
+        assert!(
+            serialized.contains("\"status\":\"ok\""),
+            "live rail must open the session: {serialized}"
+        );
+        assert!(
+            serialized.contains("session:test"),
+            "scoped response carries the session id"
+        );
         // Containment through the full provider path: neither plaintext nor CEK leak.
         assert!(
             !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
             "decrypted plaintext must never cross the provider boundary to the caller"
         );
-        assert!(!serialized.contains(&b64.encode(cek)), "raw CEK must never cross the boundary");
+        assert!(
+            !serialized.contains(&b64.encode(cek)),
+            "raw CEK must never cross the boundary"
+        );
     }
 
     #[cfg(feature = "rail-live")]
@@ -2214,7 +2573,11 @@ mod tests {
             ..Default::default()
         };
         let resp = provider.open_session_live(decrypt_request(), &material);
-        assert_eq!(error_code(resp), "decrypt_failed", "a tampered carrier must fail closed");
+        assert_eq!(
+            error_code(resp),
+            "decrypt_failed",
+            "a tampered carrier must fail closed"
+        );
     }
 
     #[cfg(feature = "rail-live")]
@@ -2250,7 +2613,12 @@ mod tests {
         plaintext: &[u8],
         nonce: &[u8],
         content_hash: &[u8],
-    ) -> (BoundRailMaterial, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>) {
+    ) -> (
+        BoundRailMaterial,
+        crate::rail_shim::SessionSecret,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
         use crate::pq_envelope::session_public_bytes;
         use base64::Engine as _;
@@ -2290,7 +2658,12 @@ mod tests {
             extra_segments_b64: None,
             rights_receipt_hash_b64: None,
         };
-        (material, crate::rail_shim::SessionSecret::PqHybrid(secret), authority_vk, pub_bytes)
+        (
+            material,
+            crate::rail_shim::SessionSecret::PqHybrid(secret),
+            authority_vk,
+            pub_bytes,
+        )
     }
 
     #[cfg(feature = "rail-bind")]
@@ -2301,8 +2674,14 @@ mod tests {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
         let plaintext = b"transcript-bound payload through the provider";
-        let (material, session, authority_vk, pub_bytes) =
-            bound_setup([0x55u8; 32], &req, &cek, plaintext, b"nonce-0001", &[0xABu8; 32]);
+        let (material, session, authority_vk, pub_bytes) = bound_setup(
+            [0x55u8; 32],
+            &req,
+            &cek,
+            plaintext,
+            b"nonce-0001",
+            &[0xABu8; 32],
+        );
 
         let mut provider = DecryptProvider {
             session: Some(session),
@@ -2317,8 +2696,14 @@ mod tests {
         });
 
         let serialized = serde_json::to_string(&resp).unwrap();
-        assert!(serialized.contains("\"status\":\"ok\""), "matching transcript must open: {serialized}");
-        assert!(!serialized.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            serialized.contains("\"status\":\"ok\""),
+            "matching transcript must open: {serialized}"
+        );
+        assert!(
+            !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!serialized.contains(&b64.encode(cek)), "CEK must not leak");
     }
 
@@ -2327,8 +2712,14 @@ mod tests {
     fn open_session_bound_fails_closed_on_replay_against_different_session() {
         let seal_req = decrypt_request();
         let cek = [0x5Au8; 16];
-        let (material, session, authority_vk, pub_bytes) =
-            bound_setup([0x66u8; 32], &seal_req, &cek, b"payload", b"nonce-0002", &[0xABu8; 32]);
+        let (material, session, authority_vk, pub_bytes) = bound_setup(
+            [0x66u8; 32],
+            &seal_req,
+            &cek,
+            b"payload",
+            b"nonce-0002",
+            &[0xABu8; 32],
+        );
 
         // Submit the SAME sealed material under a different session id — exactly the
         // replay the transcript binding must defeat. The boundary rebuilds the AAD
@@ -2347,7 +2738,11 @@ mod tests {
             request: Box::new(replay_req),
             material,
         });
-        assert_eq!(error_code(resp), "decrypt_failed", "a CEK bound to one session must not open another");
+        assert_eq!(
+            error_code(resp),
+            "decrypt_failed",
+            "a CEK bound to one session must not open another"
+        );
     }
 
     #[cfg(feature = "rail-bind")]
@@ -2359,8 +2754,14 @@ mod tests {
         let cek = [0x5Au8; 16];
 
         // (a) replayed/altered nonce -> rebuilt transcript differs -> fail closed.
-        let (mut material, session, authority_vk, pub_bytes) =
-            bound_setup([0x77u8; 32], &req, &cek, b"payload", b"nonce-0003", &[0xABu8; 32]);
+        let (mut material, session, authority_vk, pub_bytes) = bound_setup(
+            [0x77u8; 32],
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-0003",
+            &[0xABu8; 32],
+        );
         material.nonce_b64 = b64.encode(b"nonce-XXXX");
         let mut provider = DecryptProvider {
             session: Some(session),
@@ -2373,11 +2774,21 @@ mod tests {
             request: Box::new(decrypt_request()),
             material,
         });
-        assert_eq!(error_code(resp), "decrypt_failed", "a swapped replay nonce must fail closed");
+        assert_eq!(
+            error_code(resp),
+            "decrypt_failed",
+            "a swapped replay nonce must fail closed"
+        );
 
         // (b) tampered sealed carrier -> fail closed.
-        let (mut material2, session2, authority_vk2, pub_bytes2) =
-            bound_setup([0x88u8; 32], &req, &cek, b"payload", b"nonce-0004", &[0xABu8; 32]);
+        let (mut material2, session2, authority_vk2, pub_bytes2) = bound_setup(
+            [0x88u8; 32],
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-0004",
+            &[0xABu8; 32],
+        );
         let mut sealed = b64.decode(&material2.sealed_cek_b64).unwrap();
         sealed[0] ^= 0xFF;
         material2.sealed_cek_b64 = b64.encode(&sealed);
@@ -2392,7 +2803,11 @@ mod tests {
             request: Box::new(decrypt_request()),
             material: material2,
         });
-        assert_eq!(error_code(resp2), "decrypt_failed", "a tampered carrier must fail closed");
+        assert_eq!(
+            error_code(resp2),
+            "decrypt_failed",
+            "a tampered carrier must fail closed"
+        );
     }
 
     // --- in-sandbox session-key mint + publish (feature `rail-mint`) -------------
@@ -2418,9 +2833,17 @@ mod tests {
             config: json!({ "authority_vk_b64": b64.encode(&authority_vk) }),
         });
         let init_json = serde_json::to_value(&init).unwrap();
-        assert_eq!(init_json["data"]["configured"], json!(true), "trusted vk pins configured");
+        assert_eq!(
+            init_json["data"]["configured"],
+            json!(true),
+            "trusted vk pins configured"
+        );
         let pub_bytes = b64
-            .decode(init_json["data"]["decrypt_session_public_key_b64"].as_str().unwrap())
+            .decode(
+                init_json["data"]["decrypt_session_public_key_b64"]
+                    .as_str()
+                    .unwrap(),
+            )
             .unwrap();
         // The minted secret must never appear in the published init response.
         assert!(!serde_json::to_string(&init).unwrap().contains("secret"));
@@ -2467,8 +2890,14 @@ mod tests {
             material,
         });
         let serialized = serde_json::to_string(&resp).unwrap();
-        assert!(serialized.contains("\"status\":\"ok\""), "minted+published flow must open: {serialized}");
-        assert!(!serialized.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            serialized.contains("\"status\":\"ok\""),
+            "minted+published flow must open: {serialized}"
+        );
+        assert!(
+            !serialized.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!serialized.contains(&b64.encode(cek)), "CEK must not leak");
     }
 
@@ -2506,8 +2935,14 @@ mod tests {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
         let plaintext = b"audited fresh-grant payload";
-        let (material, session, authority_vk, pub_bytes) =
-            bound_setup([0xA1u8; 32], &req, &cek, plaintext, b"nonce-aud-1", &[0xABu8; 32]);
+        let (material, session, authority_vk, pub_bytes) = bound_setup(
+            [0xA1u8; 32],
+            &req,
+            &cek,
+            plaintext,
+            b"nonce-aud-1",
+            &[0xABu8; 32],
+        );
         let mut provider = DecryptProvider {
             session: Some(session),
             authority_vk: Some(authority_vk),
@@ -2526,9 +2961,15 @@ mod tests {
         assert_eq!(v["data"]["audit"]["decision"], json!("opened"));
         assert_eq!(v["data"]["audit"]["timestamp"], json!(now));
         assert!(v["data"]["audit"]["transcript_hash_b64"].is_string());
-        assert!(v["data"]["session"].is_object(), "opened carries a scoped session");
+        assert!(
+            v["data"]["session"].is_object(),
+            "opened carries a scoped session"
+        );
         let s = serde_json::to_string(&resp).unwrap();
-        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            !s.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
     }
 
@@ -2540,8 +2981,14 @@ mod tests {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
         let plaintext = b"audited expired-grant payload";
-        let (material, session, authority_vk, pub_bytes) =
-            bound_setup([0xA2u8; 32], &req, &cek, plaintext, b"nonce-aud-2", &[0xABu8; 32]);
+        let (material, session, authority_vk, pub_bytes) = bound_setup(
+            [0xA2u8; 32],
+            &req,
+            &cek,
+            plaintext,
+            b"nonce-aud-2",
+            &[0xABu8; 32],
+        );
         let mut provider = DecryptProvider {
             session: Some(session),
             authority_vk: Some(authority_vk),
@@ -2558,10 +3005,16 @@ mod tests {
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["data"]["decision"], json!("denied"));
         assert_eq!(v["data"]["audit"]["reason"], json!("expired"));
-        assert!(v["data"]["session"].is_null(), "a denied open carries no session");
+        assert!(
+            v["data"]["session"].is_null(),
+            "a denied open carries no session"
+        );
         // The audit record is CEK/plaintext-free even on deny.
         let s = serde_json::to_string(&resp).unwrap();
-        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            !s.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
     }
 
@@ -2597,8 +3050,14 @@ mod tests {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
         let plaintext = b"consolidated envelope payload";
-        let (bound, session, authority_vk, pub_bytes) =
-            bound_setup([0xB1u8; 32], &req, &cek, plaintext, b"nonce-v1-1", &[0xABu8; 32]);
+        let (bound, session, authority_vk, pub_bytes) = bound_setup(
+            [0xB1u8; 32],
+            &req,
+            &cek,
+            plaintext,
+            b"nonce-v1-1",
+            &[0xABu8; 32],
+        );
         let material = material_v1(DECRYPT_SUITE_ID, &bound);
 
         let mut provider = DecryptProvider {
@@ -2614,9 +3073,16 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("opened"), "PQ suite opens: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "PQ suite opens: {v}"
+        );
         let s = serde_json::to_string(&resp).unwrap();
-        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            !s.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
     }
 
@@ -2697,15 +3163,26 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("opened"), "multi-segment opens: {v}");
-        assert_eq!(v["data"]["session"]["segment_count"], json!(2), "both fragments reported");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "multi-segment opens: {v}"
+        );
+        assert_eq!(
+            v["data"]["session"]["segment_count"],
+            json!(2),
+            "both fragments reported"
+        );
         assert!(
             v["data"]["session"]["sample_count"].as_u64().unwrap() >= 2,
             "sample_count summed across segments: {v}"
         );
         let s = serde_json::to_string(&resp).unwrap();
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
-        assert!(!s.contains("multi-seg-fragment"), "no fragment plaintext crosses the boundary");
+        assert!(
+            !s.contains("multi-seg-fragment"),
+            "no fragment plaintext crosses the boundary"
+        );
 
         // Substituted fragment: same valid sealed CEK, but the extra segment's bytes are swapped.
         // The boundary recomputes the segment digests over the tampered set → AAD mismatch → the
@@ -2805,14 +3282,32 @@ mod tests {
                 material: make_material(vec![b64.encode(&seg1)]),
                 index,
                 now_unix: 1_850_000_000,
+                render: None,
             });
             let v = serde_json::to_value(&resp).unwrap();
-            assert_eq!(v["data"]["segment_index"], json!(index), "segment index echoed: {v}");
-            assert_eq!(v["data"]["segment_count"], json!(2), "both fragments counted: {v}");
-            let bytes = b64.decode(v["data"]["segment_b64"].as_str().unwrap()).unwrap();
-            assert_eq!(&bytes[bytes.len() - pt.len()..], pt, "segment {index} decrypts to its plaintext");
+            assert_eq!(
+                v["data"]["segment_index"],
+                json!(index),
+                "segment index echoed: {v}"
+            );
+            assert_eq!(
+                v["data"]["segment_count"],
+                json!(2),
+                "both fragments counted: {v}"
+            );
+            let bytes = b64
+                .decode(v["data"]["segment_b64"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                &bytes[bytes.len() - pt.len()..],
+                pt,
+                "segment {index} decrypts to its plaintext"
+            );
             let s = serde_json::to_string(&resp).unwrap();
-            assert!(!s.contains(&b64.encode(cek)), "CEK must not appear in a stream response");
+            assert!(
+                !s.contains(&b64.encode(cek)),
+                "CEK must not appear in a stream response"
+            );
             assert!(
                 !s.contains(std::str::from_utf8(other).unwrap()),
                 "no OTHER segment's plaintext crosses on a per-segment read"
@@ -2825,8 +3320,13 @@ mod tests {
             make_material(vec![b64.encode(&seg1)]),
             2,
             1_850_000_000,
+            None,
         );
-        assert_eq!(error_code(resp_oob), "invalid_request", "an out-of-range index is refused");
+        assert_eq!(
+            error_code(resp_oob),
+            "invalid_request",
+            "an out-of-range index is refused"
+        );
 
         // Substituted fragment: valid sealed CEK, but the extra segment's bytes are swapped.
         // The recomputed segment-digest AAD no longer matches the seal → unwrap fails closed.
@@ -2838,8 +3338,13 @@ mod tests {
             make_material(vec![b64.encode(&bad_seg1)]),
             0,
             1_850_000_000,
+            None,
         );
-        assert_eq!(error_code(resp_bad), "invalid_request", "a substituted fragment is refused");
+        assert_eq!(
+            error_code(resp_bad),
+            "invalid_request",
+            "a substituted fragment is refused"
+        );
 
         // A non-`stream` request is refused before any crypto.
         let resp_kind = provider.stream_segment(
@@ -2847,8 +3352,13 @@ mod tests {
             make_material(vec![b64.encode(&seg1)]),
             0,
             1_850_000_000,
+            None,
         );
-        assert_eq!(error_code(resp_kind), "invalid_request", "stream serves the stream output kind only");
+        assert_eq!(
+            error_code(resp_kind),
+            "invalid_request",
+            "stream serves the stream output kind only"
+        );
     }
 
     #[cfg(feature = "rail-material")]
@@ -2856,8 +3366,14 @@ mod tests {
     fn sealed_material_v1_unknown_suite_fails_closed() {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
-        let (bound, session, authority_vk, pub_bytes) =
-            bound_setup([0xB2u8; 32], &req, &cek, b"payload", b"nonce-v1-2", &[0xABu8; 32]);
+        let (bound, session, authority_vk, pub_bytes) = bound_setup(
+            [0xB2u8; 32],
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-v1-2",
+            &[0xABu8; 32],
+        );
         let material = material_v1("totally-unknown-suite-v9", &bound);
         let provider = DecryptProvider {
             session: Some(session),
@@ -2867,7 +3383,11 @@ mod tests {
             authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
-        assert_eq!(error_code(resp), "invalid_request", "an unknown suite must fail closed before any crypto");
+        assert_eq!(
+            error_code(resp),
+            "invalid_request",
+            "an unknown suite must fail closed before any crypto"
+        );
     }
 
     #[cfg(feature = "rail-material")]
@@ -2875,8 +3395,14 @@ mod tests {
     fn sealed_material_v1_classical_compat_suite_rejected_on_product_path() {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
-        let (bound, session, authority_vk, pub_bytes) =
-            bound_setup([0xB3u8; 32], &req, &cek, b"payload", b"nonce-v1-3", &[0xABu8; 32]);
+        let (bound, session, authority_vk, pub_bytes) = bound_setup(
+            [0xB3u8; 32],
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-v1-3",
+            &[0xABu8; 32],
+        );
         let material = material_v1(DECRYPT_SUITE_CLASSICAL_COMPAT, &bound);
         let provider = DecryptProvider {
             session: Some(session),
@@ -2886,7 +3412,11 @@ mod tests {
             authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
-        assert_eq!(error_code(resp), "invalid_request", "compat suite is migration-only on the bound product path");
+        assert_eq!(
+            error_code(resp),
+            "invalid_request",
+            "compat suite is migration-only on the bound product path"
+        );
     }
 
     // --- 2-of-2 threshold reconstruction (feature `rail-material`, Day 97–98) -----
@@ -2910,7 +3440,13 @@ mod tests {
         nonce: &[u8],
         content_hash: &[u8],
         bind_node_set: bool,
-    ) -> (SealedDecryptMaterialV1, crate::rail_shim::SessionSecret, Vec<u8>, Vec<u8>, Vec<u8>) {
+    ) -> (
+        SealedDecryptMaterialV1,
+        crate::rail_shim::SessionSecret,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
         use crate::pq_envelope::session_public_bytes;
         use base64::Engine as _;
@@ -2939,7 +3475,11 @@ mod tests {
             release_receipt_hash: release_receipt_hash(&seal_req.release_receipt),
             decrypt_session_pub: &pub_bytes,
             nonce,
-            node_set_id: if bind_node_set { Some(&node_set_id) } else { None },
+            node_set_id: if bind_node_set {
+                Some(&node_set_id)
+            } else {
+                None
+            },
         }
         .to_aad();
 
@@ -2962,7 +3502,13 @@ mod tests {
             extra_segments_b64: None,
             rights_receipt_hash_b64: None,
         };
-        (material, crate::rail_shim::SessionSecret::PqHybrid(secret), vk_a, vk_b, pub_bytes)
+        (
+            material,
+            crate::rail_shim::SessionSecret::PqHybrid(secret),
+            vk_a,
+            vk_b,
+            pub_bytes,
+        )
     }
 
     #[cfg(feature = "rail-material")]
@@ -2975,7 +3521,15 @@ mod tests {
         let mask = [0x3Cu8; 16];
         let plaintext = b"two-of-two threshold reconstructed payload!!";
         let (material, session, vk_a, vk_b, pub_bytes) = threshold_setup(
-            [0xC1u8; 32], [0xC2u8; 32], &mask, &req, &cek, plaintext, b"nonce-thr-1", &[0xABu8; 32], true,
+            [0xC1u8; 32],
+            [0xC2u8; 32],
+            &mask,
+            &req,
+            &cek,
+            plaintext,
+            b"nonce-thr-1",
+            &[0xABu8; 32],
+            true,
         );
         let mut provider = DecryptProvider {
             session: Some(session),
@@ -2990,12 +3544,22 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("opened"), "2-of-2 must open: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "2-of-2 must open: {v}"
+        );
         // Neither the CEK nor either raw share crosses the boundary.
         let s = serde_json::to_string(&resp).unwrap();
-        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+        assert!(
+            !s.contains(std::str::from_utf8(plaintext).unwrap()),
+            "plaintext must not leak"
+        );
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
-        assert!(!s.contains(&b64.encode(mask)), "share-1 (the mask) must not leak");
+        assert!(
+            !s.contains(&b64.encode(mask)),
+            "share-1 (the mask) must not leak"
+        );
     }
 
     /// An attacker who controls only one node cannot mint the SECOND node's seal: a
@@ -3009,7 +3573,15 @@ mod tests {
         let cek = [0x5Au8; 16];
         let mask = [0x3Cu8; 16];
         let (material, session, vk_a, _vk_b_real, pub_bytes) = threshold_setup(
-            [0xD1u8; 32], [0xD2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-2", &[0xABu8; 32], true,
+            [0xD1u8; 32],
+            [0xD2u8; 32],
+            &mask,
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-thr-2",
+            &[0xABu8; 32],
+            true,
         );
         // Provision a DIFFERENT node-B key than the one that actually sealed share-2,
         // i.e. the second share was not produced by the trusted node.
@@ -3028,7 +3600,11 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("denied"), "an unauthorized second share must be denied: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "an unauthorized second share must be denied: {v}"
+        );
         assert_eq!(v["data"]["audit"]["reason"], json!("decrypt_failed"));
     }
 
@@ -3042,7 +3618,15 @@ mod tests {
         let cek = [0x5Au8; 16];
         let mask = [0x3Cu8; 16];
         let (material, session, vk_a, _vk_b, pub_bytes) = threshold_setup(
-            [0xF1u8; 32], [0xF2u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-3", &[0xABu8; 32], true,
+            [0xF1u8; 32],
+            [0xF2u8; 32],
+            &mask,
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-thr-3",
+            &[0xABu8; 32],
+            true,
         );
         let provider = DecryptProvider {
             session: Some(session),
@@ -3052,7 +3636,11 @@ mod tests {
             authority_vk3: None,
         };
         let resp = provider.open_session_v1(req, material, 1_850_000_000);
-        assert_eq!(error_code(resp), "not_configured", "threshold material requires a second node vk");
+        assert_eq!(
+            error_code(resp),
+            "not_configured",
+            "threshold material requires a second node vk"
+        );
     }
 
     /// Day 103–104: the transcript AAD BINDS the node-set. Shares sealed by the GENUINE
@@ -3068,7 +3656,15 @@ mod tests {
         let mask = [0x3Cu8; 16];
         // Genuine nodes, genuine shares — but the seal's AAD omits the node-set id.
         let (material, session, vk_a, vk_b, pub_bytes) = threshold_setup(
-            [0xA7u8; 32], [0xA8u8; 32], &mask, &req, &cek, b"payload", b"nonce-thr-4", &[0xABu8; 32], false,
+            [0xA7u8; 32],
+            [0xA8u8; 32],
+            &mask,
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-thr-4",
+            &[0xABu8; 32],
+            false,
         );
         let mut provider = DecryptProvider {
             session: Some(session),
@@ -3101,8 +3697,14 @@ mod tests {
         let req = decrypt_request();
         let cek = [0x5Au8; 16];
         // A perfectly VALID single-node-sealed material (node A's seal, no second share).
-        let (bound, session, vk_a, pub_bytes) =
-            bound_setup([0xB9u8; 32], &req, &cek, b"payload", b"nonce-thr-5", &[0xABu8; 32]);
+        let (bound, session, vk_a, pub_bytes) = bound_setup(
+            [0xB9u8; 32],
+            &req,
+            &cek,
+            b"payload",
+            b"nonce-thr-5",
+            &[0xABu8; 32],
+        );
         let material = SealedDecryptMaterialV1 {
             suite: DECRYPT_SUITE_ID.to_string(),
             sealed_cek_b64: bound.sealed_cek_b64,
@@ -3153,7 +3755,14 @@ mod tests {
         plaintext: &[u8],
         nonce: &[u8],
         content_hash: &[u8],
-    ) -> (Vec<String>, crate::rail_shim::SessionSecret, Vec<Vec<u8>>, Vec<u8>, String, String) {
+    ) -> (
+        Vec<String>,
+        crate::rail_shim::SessionSecret,
+        Vec<Vec<u8>>,
+        Vec<u8>,
+        String,
+        String,
+    ) {
         use crate::pq_envelope::seal_support::{gen_session, mldsa_seal_keypair, seal_bound};
         use crate::pq_envelope::session_public_bytes;
         use base64::Engine as _;
@@ -3260,7 +3869,10 @@ mod tests {
                 b + 1
             );
             let s = serde_json::to_string(&resp).unwrap();
-            assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "plaintext must not leak");
+            assert!(
+                !s.contains(std::str::from_utf8(plaintext).unwrap()),
+                "plaintext must not leak"
+            );
             assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
         }
     }
@@ -3351,21 +3963,39 @@ mod tests {
         // (1) All three HONEST shares open (cheater detection passes; commitment matches).
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(decrypt_request()),
-            material: base_material(sealed[1].clone(), Some(sealed[2].clone()), Some(commitment_b64.clone())),
+            material: base_material(
+                sealed[1].clone(),
+                Some(sealed[2].clone()),
+                Some(commitment_b64.clone()),
+            ),
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("opened"), "three honest shares must open: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "three honest shares must open: {v}"
+        );
 
         // (2) A BYZANTINE node C: a validly-sealed, correctly-indexed, WRONG-VALUED share.
         let mut wrong = shares[2].clone();
         wrong[0] ^= 0x01; // still well-formed; just the wrong value
         let malicious = b64.encode(
-            seal_bound(&public, &ddrm_envelope::indexed_share(3, &wrong), &aad, &keys[2].0).to_bytes(),
+            seal_bound(
+                &public,
+                &ddrm_envelope::indexed_share(3, &wrong),
+                &aad,
+                &keys[2].0,
+            )
+            .to_bytes(),
         );
         let resp = provider.handle(Request::OpenSessionV1 {
             request: Box::new(decrypt_request()),
-            material: base_material(sealed[1].clone(), Some(malicious.clone()), Some(commitment_b64.clone())),
+            material: base_material(
+                sealed[1].clone(),
+                Some(malicious.clone()),
+                Some(commitment_b64.clone()),
+            ),
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
@@ -3375,8 +4005,14 @@ mod tests {
             "a single Byzantine wrong-valued share must fail the open closed: {v}"
         );
         let s = serde_json::to_string(&resp).unwrap();
-        assert!(!s.contains(std::str::from_utf8(plaintext).unwrap()), "no plaintext leaks on the Byzantine path");
-        assert!(!s.contains(&b64.encode(cek)), "no CEK leaks on the Byzantine path");
+        assert!(
+            !s.contains(std::str::from_utf8(plaintext).unwrap()),
+            "no plaintext leaks on the Byzantine path"
+        );
+        assert!(
+            !s.contains(&b64.encode(cek)),
+            "no CEK leaks on the Byzantine path"
+        );
 
         // (3) Even with the cheater as ONE of only TWO shares, the commitment catches it.
         let resp = provider.handle(Request::OpenSessionV1 {
@@ -3385,7 +4021,11 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("denied"), "the commitment catches a 2-share Byzantine open: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "the commitment catches a 2-share Byzantine open: {v}"
+        );
 
         // (4) A degraded (2-share) quorum WITHOUT a commitment is refused outright (fail closed).
         let resp = provider.handle(Request::OpenSessionV1 {
@@ -3416,8 +4056,14 @@ mod tests {
 
         for (a, b) in [(0usize, 1usize), (0, 2), (1, 2)] {
             let req = media_decrypt_request();
-            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) =
-                quorum_setup(&req, &cek, &coeff, plaintext, b"nonce-qstream-1", &[0xABu8; 32]);
+            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) = quorum_setup(
+                &req,
+                &cek,
+                &coeff,
+                plaintext,
+                b"nonce-qstream-1",
+                &[0xABu8; 32],
+            );
             let material = SealedDecryptMaterialV1 {
                 suite: DECRYPT_SUITE_ID.to_string(),
                 sealed_cek_b64: sealed[a].clone(),
@@ -3443,10 +4089,15 @@ mod tests {
                 material,
                 index: 0,
                 now_unix: 1_850_000_000,
+                render: None,
             });
             let v = serde_json::to_value(&resp).unwrap();
             let seg_b64 = v["data"]["segment_b64"].as_str().unwrap_or_else(|| {
-                panic!("quorum pair (node {}, node {}) must stream a segment: {v}", a + 1, b + 1)
+                panic!(
+                    "quorum pair (node {}, node {}) must stream a segment: {v}",
+                    a + 1,
+                    b + 1
+                )
             });
             let seg = b64.decode(seg_b64).expect("segment_b64 decodes");
             assert_eq!(
@@ -3457,7 +4108,10 @@ mod tests {
                 b + 1
             );
             let s = serde_json::to_string(&resp).unwrap();
-            assert!(!s.contains(&b64.encode(cek)), "CEK must not leak on a quorum stream read");
+            assert!(
+                !s.contains(&b64.encode(cek)),
+                "CEK must not leak on a quorum stream read"
+            );
         }
     }
 
@@ -3481,15 +4135,22 @@ mod tests {
         // chosen by `pick` from (the three genuine sealed shares, an optional forged blob).
         let drive = |pick: &dyn Fn(&[String], &str) -> (String, String)| -> Value {
             let req = decrypt_request();
-            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) =
-                quorum_setup(&req, &cek, &coeff, b"payload", b"nonce-qrm-2", &[0xABu8; 32]);
+            let (sealed, session, vks, pub_bytes, ciphertext_b64, commitment_b64) = quorum_setup(
+                &req,
+                &cek,
+                &coeff,
+                b"payload",
+                b"nonce-qrm-2",
+                &[0xABu8; 32],
+            );
             // A forged share: a well-formed indexed payload sealed by an UNRELATED key (to a
             // throwaway session — the pinned-identity signature check refuses it first).
             let (forger, _forger_vk) = mldsa_seal_keypair([0xEEu8; 32]);
             let shares = ddrm_envelope::split_cek_shamir2(&cek, &coeff).expect("split");
             let payload = ddrm_envelope::indexed_share(2, &shares[1]);
             let (_throwaway_secret, throwaway_public) = gen_session();
-            let forged = b64.encode(seal_bound(&throwaway_public, &payload, b"", &forger).to_bytes());
+            let forged =
+                b64.encode(seal_bound(&throwaway_public, &payload, b"", &forger).to_bytes());
             let (slot_a, slot_b) = pick(&sealed, &forged);
             let material = SealedDecryptMaterialV1 {
                 suite: DECRYPT_SUITE_ID.to_string(),
@@ -3521,15 +4182,27 @@ mod tests {
 
         // (a) DUPLICATE node: node 1's sealed share twice — the combine refuses x_a == x_b.
         let v = drive(&|sealed, _forged| (sealed[0].clone(), sealed[0].clone()));
-        assert_eq!(v["data"]["decision"], json!("denied"), "one node's share twice is NOT a quorum: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "one node's share twice is NOT a quorum: {v}"
+        );
 
         // (b) FORGED share: no pinned identity verifies the unrelated signer.
         let v = drive(&|sealed, forged| (sealed[0].clone(), forged.to_string()));
-        assert_eq!(v["data"]["decision"], json!("denied"), "a forged quorum share must be denied: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("denied"),
+            "a forged quorum share must be denied: {v}"
+        );
 
         // (c) ORDER-FREE: (node2, node1) opens exactly like (node1, node2).
         let v = drive(&|sealed, _forged| (sealed[1].clone(), sealed[0].clone()));
-        assert_eq!(v["data"]["decision"], json!("opened"), "the quorum is order-free: {v}");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "the quorum is order-free: {v}"
+        );
     }
 
     /// MULTI-SEGMENT on the 2-of-3 QUORUM rail: a 2-fragment asset under ONE Shamir-split CEK opens
@@ -3628,15 +4301,26 @@ mod tests {
             now_unix: 1_850_000_000,
         });
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["data"]["decision"], json!("opened"), "quorum multi-segment opens: {v}");
-        assert_eq!(v["data"]["session"]["segment_count"], json!(2), "both fragments reported");
+        assert_eq!(
+            v["data"]["decision"],
+            json!("opened"),
+            "quorum multi-segment opens: {v}"
+        );
+        assert_eq!(
+            v["data"]["session"]["segment_count"],
+            json!(2),
+            "both fragments reported"
+        );
         assert!(
             v["data"]["session"]["sample_count"].as_u64().unwrap() >= 2,
             "sample_count summed across segments: {v}"
         );
         let s = serde_json::to_string(&resp).unwrap();
         assert!(!s.contains(&b64.encode(cek)), "CEK must not leak");
-        assert!(!s.contains("quorum-multi-seg"), "no fragment plaintext crosses the boundary");
+        assert!(
+            !s.contains("quorum-multi-seg"),
+            "no fragment plaintext crosses the boundary"
+        );
 
         // Substituted fragment: same valid sealed shares, but the extra segment's bytes are swapped.
         // The boundary recomputes the segment digests over the tampered set → AAD mismatch → the

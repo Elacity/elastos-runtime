@@ -33,7 +33,10 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 const DELEGATION_WINDOW_SECS: u64 = 3600;
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn read_stdin_json() -> Result<Value, String> {
@@ -144,7 +147,9 @@ pub fn run_grant_assemble() -> Result<(), String> {
     let session_seed_b64 = require_str(&inp, "session_seed_b64")?;
     let delegation_sig_hex = require_str(&inp, "delegation_sig_hex")?;
     let delegation: AccessDelegationV1 = serde_json::from_value(
-        inp.get("delegation_json").cloned().ok_or("missing `delegation_json`")?,
+        inp.get("delegation_json")
+            .cloned()
+            .ok_or("missing `delegation_json`")?,
     )
     .map_err(|e| format!("delegation_json is not an AccessDelegationV1: {e}"))?;
 

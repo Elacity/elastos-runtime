@@ -4,8 +4,8 @@
 //! the senc box. Handles both full-sample and subsample encryption.
 //! CEK is zeroed in memory after use.
 
-use aes::cipher::{KeyIvInit, StreamCipher};
 use super::mp4box::{SencSample, SubsampleEntry, TrunEntry};
+use aes::cipher::{KeyIvInit, StreamCipher};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -145,12 +145,18 @@ mod tests {
 
         // Encrypt only the encrypted portions
         let mut cipher = Aes128Ctr::new(&key.into(), &iv.into());
-        cipher.apply_keystream(&mut data[5..16]);   // first encrypted range
-        cipher.apply_keystream(&mut data[19..32]);   // second encrypted range
+        cipher.apply_keystream(&mut data[5..16]); // first encrypted range
+        cipher.apply_keystream(&mut data[19..32]); // second encrypted range
 
         let subsamples = vec![
-            SubsampleEntry { clear_bytes: 5, encrypted_bytes: 11 },
-            SubsampleEntry { clear_bytes: 3, encrypted_bytes: 13 },
+            SubsampleEntry {
+                clear_bytes: 5,
+                encrypted_bytes: 11,
+            },
+            SubsampleEntry {
+                clear_bytes: 3,
+                encrypted_bytes: 13,
+            },
         ];
 
         decrypt_subsamples(&mut data, &key, &iv, &subsamples).unwrap();

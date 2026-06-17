@@ -126,6 +126,36 @@ The provider plane should expose typed questions instead:
 - `elastos://decrypt/session/open`
 - `elastos://decrypt/render`
 
+## Pixel-Lock Secure Rendering (documents)
+
+Some content types must never reach the browser as their source file — a PDF handed to
+the browser is a raw, re-extractable, unwatermarked copy (and browsers like Brave block
+`blob:`/`data:` PDFs in iframes anyway). For these, the runtime uses a **pixel-lock**
+tier (PC2 `ddrm-renderer` parity): the asset is rasterised to flattened, buyer-watermarked
+page **images** *inside the decrypt boundary*, and only those images egress.
+
+- Renderer placement: the `decrypt-provider` capsule (feature `pdf-render`), NOT the
+  trusted core. It uses `hayro` (pure-Rust, `#![forbid(unsafe_code)]` PDF rasteriser) +
+  `image`. The trusted core gains no PDF code — it only routes bytes (Principle 5/13).
+- Containment: the `StreamSegment` op takes an optional `render` directive; when present
+  for a pixel-lock mime, the boundary extracts the object from the decrypted fragment and
+  returns a watermarked JPEG (`rendered_b64` + `total_pages`) — never the raw bytes. The
+  recovered CEK stays in-VM and the plaintext document never leaves the sandbox.
+- Fail-closed: a non-pixel-lock mime, an unparseable object, or a render error returns an
+  error with no bytes (Principle 11). There is **one canonical path** per mime — the raw
+  `/bytes` egress is refused for pixel-lock sessions (Principle 10).
+- Browser contract (served by `elastos-server`, routing only):
+  - `GET /api/viewers/ddrm-viewer/object/{session}` → manifest adds
+    `pixel_locked: true`, `total_pages`, `page_content_type`.
+  - `GET /api/viewers/ddrm-viewer/object/{session}/page?n=N` → one rendered page image
+    (`image/jpeg`) + `X-Asset-Pages`/`X-Asset-Page` headers.
+  - `GET …/object/{session}/bytes` → `403` for pixel-lock sessions.
+- Watermark: the buyer/owner principal is stamped onto every page (forensic provenance),
+  elided to first…last for long DIDs/wallets.
+
+Pixel-lock currently covers `application/pdf`; the renderer registry
+(`decrypt-provider/src/render`) is the extension point for images/text/code/EPUB next.
+
 ## Remaining Sequence
 
 1. Wire real `elastos://drm/open` orchestration behind the declared sequence:

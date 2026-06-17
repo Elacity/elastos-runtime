@@ -15,6 +15,10 @@
 //           (metadata only — no key)
 //   GET /api/viewers/ddrm-viewer/object/{session}/bytes
 //        -> decrypted object bytes (octet-stream, no-store); expired/unauthorized => 4xx
+//        -> 403 for pixel-lock assets (their raw bytes never leave the decrypt boundary)
+//   GET /api/viewers/ddrm-viewer/object/{session}/page?n=N
+//        -> one watermarked page IMAGE for a pixel-lock asset (e.g. PDF rendered in-boundary);
+//           X-Asset-Pages carries the page count. The raw document never reaches the browser.
 //
 // Auth: the Home launch token rides in the `x-elastos-home-token` header, exactly
 // like the other viewer capsules.
@@ -164,15 +168,125 @@ function renderImage(bytes, mime) {
   renderRoot.replaceChildren(img);
 }
 
-function renderPdf(bytes, mime) {
-  const blob = new Blob([bytes], { type: mime || "application/pdf" });
-  objectUrl = URL.createObjectURL(blob);
-  // The browser's built-in PDF viewer renders the blob in-frame; no CDN, no plugin.
-  const frame = document.createElement("iframe");
-  frame.className = "object-pdf";
-  frame.title = "Owned document";
-  frame.src = objectUrl;
-  renderRoot.replaceChildren(frame);
+// PIXEL-LOCK: the asset (e.g. PDF) is rendered to flattened, watermarked page images
+// IN the decrypt boundary; the raw file never reaches the browser. We page through those
+// images via the scoped page route — so there is no blob/data PDF for a browser to block,
+// and the buyer watermark is baked into every page. This is the canonical PDF path.
+async function renderPixelLockPager(manifest) {
+  let total = Number.isInteger(manifest.total_pages) && manifest.total_pages > 0
+    ? manifest.total_pages
+    : 1;
+  let current = 0;
+
+  const img = document.createElement("img");
+  img.className = "object-image object-page";
+  img.alt = "Owned document page";
+  img.decoding = "async";
+
+  const bar = document.createElement("div");
+  bar.className = "pager-bar";
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.className = "pager-btn";
+  prev.textContent = "‹ Prev";
+  const label = document.createElement("span");
+  label.className = "pager-label";
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "pager-btn";
+  next.textContent = "Next ›";
+  bar.append(prev, label, next);
+
+  const stage = document.createElement("div");
+  stage.className = "pager-stage";
+  stage.append(img);
+
+  function syncControls() {
+    label.textContent = `Page ${current + 1} of ${total}`;
+    prev.disabled = current <= 0;
+    next.disabled = current >= total - 1;
+  }
+
+  // Client-side page cache (n -> object URL). The decrypt boundary already caches the
+  // RENDERED page (warm parse + page-image LRU), so prefetching the NEXT page primes both
+  // the boundary cache AND the browser blob, making forward navigation feel instant.
+  // Bounded so a long document can't accumulate unbounded blob URLs.
+  const MAX_CACHED_PAGES = 8;
+  const cache = new Map(); // n -> { url }
+  const inflight = new Map(); // n -> Promise<string url>
+
+  function evictIfNeeded() {
+    while (cache.size > MAX_CACHED_PAGES) {
+      // Evict the page furthest from the current view (keep a window around `current`).
+      let victim = null;
+      let bestDist = -1;
+      for (const n of cache.keys()) {
+        const d = Math.abs(n - current);
+        if (d > bestDist) { bestDist = d; victim = n; }
+      }
+      if (victim === null) break;
+      const entry = cache.get(victim);
+      cache.delete(victim);
+      if (entry && entry.url) {
+        try { URL.revokeObjectURL(entry.url); } catch (_e) { /* best effort */ }
+      }
+    }
+  }
+
+  // Fetch page `n` to a blob URL, caching it. Returns the cached URL if present. Shares
+  // in-flight requests so a click + a prefetch for the same page don't double-fetch.
+  function fetchPage(n) {
+    const hit = cache.get(n);
+    if (hit) return Promise.resolve(hit.url);
+    const pending = inflight.get(n);
+    if (pending) return pending;
+    const p = (async () => {
+      const resp = await fetch(objectUrlFor("/page?n=" + encodeURIComponent(n)), {
+        headers: { ...launchHeaders() },
+      });
+      if (!resp.ok) {
+        throw new Error("page fetch failed: " + resp.status);
+      }
+      const pages = parseInt(resp.headers.get("x-asset-pages") || "", 10);
+      if (Number.isInteger(pages) && pages > 0) {
+        total = pages;
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      cache.set(n, { url });
+      evictIfNeeded();
+      return url;
+    })();
+    inflight.set(n, p);
+    p.catch(() => {}).finally(() => inflight.delete(n));
+    return p;
+  }
+
+  // Background prefetch — never surfaces an error (best effort) and never blocks the UI.
+  function prefetch(n) {
+    if (n < 0 || n >= total) return;
+    fetchPage(n).catch(() => {});
+  }
+
+  async function loadPage(n) {
+    const url = await fetchPage(n);
+    img.src = url;
+    current = n;
+    syncControls();
+    // Warm the neighbours so the next click is instant (forward first — the common path).
+    prefetch(n + 1);
+    prefetch(n - 1);
+  }
+
+  prev.addEventListener("click", () => {
+    if (current > 0) loadPage(current - 1).catch((e) => failClosed("Could not load page: " + e.message));
+  });
+  next.addEventListener("click", () => {
+    if (current < total - 1) loadPage(current + 1).catch((e) => failClosed("Could not load page: " + e.message));
+  });
+
+  renderRoot.replaceChildren(bar, stage);
+  await loadPage(0);
 }
 
 function renderText(bytes) {
@@ -226,6 +340,19 @@ async function start() {
   const kind = kindFor(manifest.mime);
   kindBadge.textContent = kind;
   kindBadge.hidden = false;
+
+  // PIXEL-LOCK assets (e.g. PDF) are served as watermarked page images — never raw bytes.
+  // Take the page route and return; the /bytes egress is refused server-side for these.
+  if (manifest.pixel_locked) {
+    try {
+      await renderPixelLockPager(manifest);
+      setOverlay(null);
+      setStatus("");
+    } catch (error) {
+      failClosed("Could not render the protected document: " + error.message);
+    }
+    return;
+  }
 
   let bytes;
   try {

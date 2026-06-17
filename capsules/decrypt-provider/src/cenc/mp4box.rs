@@ -78,16 +78,32 @@ pub fn read_box_header(data: &[u8], offset: usize) -> Option<BoxHeader> {
     if offset + 8 > data.len() {
         return None;
     }
-    let size32 = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
-    let box_type = [data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]];
+    let size32 = u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]);
+    let box_type = [
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ];
 
     let (size, header_size) = if size32 == 1 {
         if offset + 16 > data.len() {
             return None;
         }
         let size64 = u64::from_be_bytes([
-            data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
-            data[offset + 12], data[offset + 13], data[offset + 14], data[offset + 15],
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+            data[offset + 12],
+            data[offset + 13],
+            data[offset + 14],
+            data[offset + 15],
         ]);
         (size64, 16u64)
     } else if size32 == 0 {
@@ -96,7 +112,11 @@ pub fn read_box_header(data: &[u8], offset: usize) -> Option<BoxHeader> {
         (size32 as u64, 8u64)
     };
 
-    Some(BoxHeader { box_type, size, header_size })
+    Some(BoxHeader {
+        box_type,
+        size,
+        header_size,
+    })
 }
 
 fn box_type_str(t: &[u8; 4]) -> &str {
@@ -116,7 +136,11 @@ pub fn parse_segment(data: &[u8], iv_size: u8) -> Result<ParsedSegment, String> 
             .ok_or_else(|| format!("truncated box at offset {offset}"))?;
         let box_end = offset + header.size as usize;
         if box_end > data.len() {
-            return Err(format!("{} box size {} exceeds data at offset {offset}", box_type_str(&header.box_type), header.size));
+            return Err(format!(
+                "{} box size {} exceeds data at offset {offset}",
+                box_type_str(&header.box_type),
+                header.size
+            ));
         }
         let content_start = offset + header.header_size as usize;
 
@@ -140,8 +164,8 @@ pub fn parse_segment(data: &[u8], iv_size: u8) -> Result<ParsedSegment, String> 
 fn parse_moof(data: &[u8], iv_size: u8) -> Result<Option<TrackFragment>, String> {
     let mut offset = 0usize;
     while offset < data.len() {
-        let header = read_box_header(data, offset)
-            .ok_or_else(|| "truncated box in moof".to_string())?;
+        let header =
+            read_box_header(data, offset).ok_or_else(|| "truncated box in moof".to_string())?;
         let box_end = offset + header.size as usize;
         let content_start = offset + header.header_size as usize;
 
@@ -155,12 +179,15 @@ fn parse_moof(data: &[u8], iv_size: u8) -> Result<Option<TrackFragment>, String>
 }
 
 fn parse_traf(data: &[u8], iv_size: u8) -> Result<TrackFragment, String> {
-    let mut frag = TrackFragment { trun: None, senc: None };
+    let mut frag = TrackFragment {
+        trun: None,
+        senc: None,
+    };
     let mut offset = 0usize;
 
     while offset < data.len() {
-        let header = read_box_header(data, offset)
-            .ok_or_else(|| "truncated box in traf".to_string())?;
+        let header =
+            read_box_header(data, offset).ok_or_else(|| "truncated box in traf".to_string())?;
         let box_end = offset + header.size as usize;
         let content_start = offset + header.header_size as usize;
         let content = &data[content_start..box_end];
@@ -189,14 +216,18 @@ fn parse_trun(data: &[u8]) -> Result<TrunBox, String> {
     let mut buf4 = [0u8; 4];
 
     let data_offset = if flags & 0x000001 != 0 {
-        cursor.read_exact(&mut buf4).map_err(|e| format!("trun data_offset: {e}"))?;
+        cursor
+            .read_exact(&mut buf4)
+            .map_err(|e| format!("trun data_offset: {e}"))?;
         Some(i32::from_be_bytes(buf4))
     } else {
         None
     };
 
     let first_sample_flags = if flags & 0x000004 != 0 {
-        cursor.read_exact(&mut buf4).map_err(|e| format!("trun first_sample_flags: {e}"))?;
+        cursor
+            .read_exact(&mut buf4)
+            .map_err(|e| format!("trun first_sample_flags: {e}"))?;
         Some(u32::from_be_bytes(buf4))
     } else {
         None
@@ -210,25 +241,33 @@ fn parse_trun(data: &[u8]) -> Result<TrunBox, String> {
     let mut entries = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let sample_duration = if has_duration {
-            cursor.read_exact(&mut buf4).map_err(|e| format!("trun duration: {e}"))?;
+            cursor
+                .read_exact(&mut buf4)
+                .map_err(|e| format!("trun duration: {e}"))?;
             Some(u32::from_be_bytes(buf4))
         } else {
             None
         };
         let sample_size = if has_size {
-            cursor.read_exact(&mut buf4).map_err(|e| format!("trun size: {e}"))?;
+            cursor
+                .read_exact(&mut buf4)
+                .map_err(|e| format!("trun size: {e}"))?;
             Some(u32::from_be_bytes(buf4))
         } else {
             None
         };
         let sample_flags = if has_flags {
-            cursor.read_exact(&mut buf4).map_err(|e| format!("trun flags: {e}"))?;
+            cursor
+                .read_exact(&mut buf4)
+                .map_err(|e| format!("trun flags: {e}"))?;
             Some(u32::from_be_bytes(buf4))
         } else {
             None
         };
         let composition_time_offset = if has_cto {
-            cursor.read_exact(&mut buf4).map_err(|e| format!("trun cto: {e}"))?;
+            cursor
+                .read_exact(&mut buf4)
+                .map_err(|e| format!("trun cto: {e}"))?;
             if version == 0 {
                 Some(u32::from_be_bytes(buf4) as i32)
             } else {
@@ -238,10 +277,21 @@ fn parse_trun(data: &[u8]) -> Result<TrunBox, String> {
             None
         };
 
-        entries.push(TrunEntry { sample_duration, sample_size, sample_flags, composition_time_offset });
+        entries.push(TrunEntry {
+            sample_duration,
+            sample_size,
+            sample_flags,
+            composition_time_offset,
+        });
     }
 
-    Ok(TrunBox { version, flags, data_offset, first_sample_flags, entries })
+    Ok(TrunBox {
+        version,
+        flags,
+        data_offset,
+        first_sample_flags,
+        entries,
+    })
 }
 
 pub fn parse_senc(data: &[u8], default_iv_size: u8) -> Result<SencBox, String> {
@@ -259,18 +309,26 @@ pub fn parse_senc(data: &[u8], default_iv_size: u8) -> Result<SencBox, String> {
 
     for _ in 0..sample_count {
         let mut iv = vec![0u8; iv_size];
-        cursor.read_exact(&mut iv).map_err(|e| format!("senc iv: {e}"))?;
+        cursor
+            .read_exact(&mut iv)
+            .map_err(|e| format!("senc iv: {e}"))?;
 
         let subsamples = if has_subsamples {
             let mut buf2 = [0u8; 2];
-            cursor.read_exact(&mut buf2).map_err(|e| format!("senc subsample count: {e}"))?;
+            cursor
+                .read_exact(&mut buf2)
+                .map_err(|e| format!("senc subsample count: {e}"))?;
             let count = u16::from_be_bytes(buf2) as usize;
             let mut subs = Vec::with_capacity(count);
             for _ in 0..count {
                 let mut clear = [0u8; 2];
                 let mut enc = [0u8; 4];
-                cursor.read_exact(&mut clear).map_err(|e| format!("senc clear_bytes: {e}"))?;
-                cursor.read_exact(&mut enc).map_err(|e| format!("senc encrypted_bytes: {e}"))?;
+                cursor
+                    .read_exact(&mut clear)
+                    .map_err(|e| format!("senc clear_bytes: {e}"))?;
+                cursor
+                    .read_exact(&mut enc)
+                    .map_err(|e| format!("senc encrypted_bytes: {e}"))?;
                 subs.push(SubsampleEntry {
                     clear_bytes: u16::from_be_bytes(clear),
                     encrypted_bytes: u32::from_be_bytes(enc),
@@ -284,39 +342,51 @@ pub fn parse_senc(data: &[u8], default_iv_size: u8) -> Result<SencBox, String> {
         samples.push(SencSample { iv, subsamples });
     }
 
-    Ok(SencBox { version, flags, samples })
+    Ok(SencBox {
+        version,
+        flags,
+        samples,
+    })
 }
 
 /// Parse an init segment to extract tenc (Track Encryption Box) default params.
 /// Path: moov -> trak -> mdia -> minf -> stbl -> stsd -> encv/enca -> sinf -> schi -> tenc
 pub fn parse_init_for_tenc(data: &[u8]) -> Option<TencBox> {
-    find_box_recursive(data, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"])
-        .and_then(|stsd_data| {
-            if stsd_data.len() < 8 {
-                return None;
-            }
-            // stsd content: version+flags(4) + entry_count(4) + entries...
-            let entry_count = u32::from_be_bytes([stsd_data[4], stsd_data[5], stsd_data[6], stsd_data[7]]);
-            if entry_count == 0 {
-                return None;
-            }
-            // First sample entry starts at offset 8 within stsd content
-            let entry_data = &stsd_data[8..];
-            let header = read_box_header(entry_data, 0)?;
-            let entry_type = &header.box_type;
+    find_box_recursive(
+        data,
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+    )
+    .and_then(|stsd_data| {
+        if stsd_data.len() < 8 {
+            return None;
+        }
+        // stsd content: version+flags(4) + entry_count(4) + entries...
+        let entry_count =
+            u32::from_be_bytes([stsd_data[4], stsd_data[5], stsd_data[6], stsd_data[7]]);
+        if entry_count == 0 {
+            return None;
+        }
+        // First sample entry starts at offset 8 within stsd content
+        let entry_data = &stsd_data[8..];
+        let header = read_box_header(entry_data, 0)?;
+        let entry_type = &header.box_type;
 
-            // Determine format-specific header size to skip before child boxes.
-            // Common SampleEntry: 6 reserved + 2 data_ref_index = 8 bytes
-            // VisualSampleEntry (encv): + 70 bytes = 78 total
-            // AudioSampleEntry  (enca): + 20 bytes = 28 total
-            let skip = if entry_type == b"encv" { 78usize } else { 28usize };
-            let child_start = header.header_size as usize + skip;
-            if child_start >= header.size as usize {
-                return None;
-            }
-            let children = &entry_data[child_start..header.size as usize];
-            find_sinf_tenc(children)
-        })
+        // Determine format-specific header size to skip before child boxes.
+        // Common SampleEntry: 6 reserved + 2 data_ref_index = 8 bytes
+        // VisualSampleEntry (encv): + 70 bytes = 78 total
+        // AudioSampleEntry  (enca): + 20 bytes = 28 total
+        let skip = if entry_type == b"encv" {
+            78usize
+        } else {
+            28usize
+        };
+        let child_start = header.header_size as usize + skip;
+        if child_start >= header.size as usize {
+            return None;
+        }
+        let children = &entry_data[child_start..header.size as usize];
+        find_sinf_tenc(children)
+    })
 }
 
 fn find_sinf_tenc(sample_entry: &[u8]) -> Option<TencBox> {
@@ -389,7 +459,8 @@ fn parse_tenc(data: &[u8]) -> Option<TencBox> {
     let mut default_kid = [0u8; 16];
     default_kid.copy_from_slice(&data[8..24]);
 
-    let default_constant_iv = if version >= 1 && default_per_sample_iv_size == 0 && data.len() > 24 {
+    let default_constant_iv = if version >= 1 && default_per_sample_iv_size == 0 && data.len() > 24
+    {
         let iv_len = data[24] as usize;
         if data.len() >= 25 + iv_len {
             Some(data[25..25 + iv_len].to_vec())

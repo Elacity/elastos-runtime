@@ -69,7 +69,10 @@ fn sample_object_svg() -> String {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn main() {
@@ -300,7 +303,10 @@ fn serve_object(session: &PreparedSession, out: &mut impl Write) -> Result<(), S
         let req: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(e) => {
-                reply(out, &json!({"status": "error", "message": format!("bad request json: {e}")}))?;
+                reply(
+                    out,
+                    &json!({"status": "error", "message": format!("bad request json: {e}")}),
+                )?;
                 continue;
             }
         };
@@ -336,7 +342,10 @@ fn serve(session: &PreparedSession, out: &mut impl Write) -> Result<(), String> 
         let req: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(e) => {
-                reply(out, &json!({"status": "error", "message": format!("bad request json: {e}")}))?;
+                reply(
+                    out,
+                    &json!({"status": "error", "message": format!("bad request json: {e}")}),
+                )?;
                 continue;
             }
         };
@@ -378,19 +387,32 @@ fn produce_fragmented_mp4(input: Option<&str>, out: &PathBuf) -> Result<(), Stri
             cmd.args(["-i", path]);
         }
         None => {
-            cmd.args(["-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=15"]);
+            cmd.args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=6:size=320x240:rate=15",
+            ]);
         }
     }
     cmd.args([
-        "-c:v", "libx264",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        "-pix_fmt", "yuv420p",
-        "-g", "15",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-level",
+        "3.0",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "15",
         "-an",
-        "-t", "6",
-        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-        "-frag_duration", "1000000",
+        "-t",
+        "6",
+        "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof",
+        "-frag_duration",
+        "1000000",
     ]);
     cmd.arg(out);
     cmd.stdout(std::process::Stdio::null());

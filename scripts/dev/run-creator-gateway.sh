@@ -84,7 +84,7 @@ build_capsule ipfs-provider
 # Playback rail (for opening a minted asset later): rights gate + decrypt boundary + the
 # local media-authority helper. Not needed to MINT, built so the open path is ready too.
 build_capsule rights-provider --features chain-rights
-build_capsule decrypt-provider --features rail-stream,rail-mint
+build_capsule decrypt-provider --features rail-stream,rail-mint,pdf-render
 # dKMS consumer-open rail: key-provider (dkms backend) recovers the CEK 2-of-3 from the live
 # quorum; dkms-authority is the node daemon; dkms-keygen derives the caller-identity vk the
 # nodes allow-list. Built so a minted dKMS asset opens (double-click -> quorum recover -> render).

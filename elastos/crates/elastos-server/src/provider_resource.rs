@@ -24,35 +24,111 @@ use serde_json::Value;
 pub fn required_action_for(op: &str) -> Action {
     match op {
         // ---- Read: observation, never mutation ------------------------------------------------
-        "status" | "read" | "list" | "stat" | "exists" | "resolve" | "networks" | "block_number"
-        | "sync_health" | "balance" | "contract_call" | "estimate_gas" | "transaction_count"
-        | "gas_price" | "fee_history" | "code" | "logs" | "transaction" | "receipt" | "proof"
-        | "fetch" | "has_access_by_content_id" | "is_subscription_active" | "can_stream"
-        | "can_download" | "accounts" | "default_account" | "approval_requests" | "get_did"
-        | "get_nickname" | "get_persona_did" | "get_ticket" | "get_node_id" | "list_peers"
-        | "list_topics" | "list_topic_peers" | "gossip_recv" | "page_status" | "frame"
-        | "screenshot" | "summary" | "roots" | "ping" | "list_backends" | "list_channels" => {
-            Action::Read
-        }
+        "status"
+        | "read"
+        | "list"
+        | "stat"
+        | "exists"
+        | "resolve"
+        | "networks"
+        | "block_number"
+        | "sync_health"
+        | "balance"
+        | "contract_call"
+        | "estimate_gas"
+        | "transaction_count"
+        | "gas_price"
+        | "fee_history"
+        | "code"
+        | "logs"
+        | "transaction"
+        | "receipt"
+        | "proof"
+        | "fetch"
+        | "has_access_by_content_id"
+        | "is_subscription_active"
+        | "can_stream"
+        | "can_download"
+        | "accounts"
+        | "default_account"
+        | "approval_requests"
+        | "get_did"
+        | "get_nickname"
+        | "get_persona_did"
+        | "get_ticket"
+        | "get_node_id"
+        | "list_peers"
+        | "list_topics"
+        | "list_topic_peers"
+        | "gossip_recv"
+        | "page_status"
+        | "frame"
+        | "screenshot"
+        | "summary"
+        | "roots"
+        | "ping"
+        | "list_backends"
+        | "list_channels" => Action::Read,
         // ---- Write: creates/changes state but does not destroy --------------------------------
-        "write" | "mkdir" | "set_nickname" | "remember_peer" | "link_account"
-        | "create_managed_account" | "set_default_account" | "rename_account" | "revoke_account"
-        | "publish" | "ensure" | "repair" | "create" | "save" | "rename" | "move" | "copy" => {
-            Action::Write
-        }
+        "write"
+        | "mkdir"
+        | "set_nickname"
+        | "remember_peer"
+        | "link_account"
+        | "create_managed_account"
+        | "set_default_account"
+        | "rename_account"
+        | "revoke_account"
+        | "publish"
+        | "ensure"
+        | "repair"
+        | "create"
+        | "save"
+        | "rename"
+        | "move"
+        | "copy" => Action::Write,
         // ---- Delete: destroys state -----------------------------------------------------------
         "delete" | "delete_permanently" | "trash" | "unpublish" => Action::Delete,
         // ---- Message: peer messaging ----------------------------------------------------------
         "gossip_send" => Action::Message,
         // ---- Execute: invoke an authorized capability (sign/decrypt/connect/tx-assembly) ------
-        "gossip_join" | "gossip_leave" | "gossip_join_peers" | "connect" | "verify"
-        | "verify_did_recovery" | "verify_proof" | "verify_bip322_proof" | "verify_contract_proof"
-        | "sign_chat_message" | "request_signature" | "challenge" | "bitcoin_challenge"
-        | "release" | "release_ref" | "release_from_escrow_ref" | "open_session" | "render"
-        | "stream_segment" | "prepare_transaction" | "assemble_mint" | "assemble_create_channel"
-        | "assemble_trade_approval" | "broadcast_transaction" | "decide_access_from_chain"
-        | "chat_completions" | "stream" | "http" | "open_stream" | "close_stream" | "http_fetch"
-        | "launch" | "attach_stream" | "close_page" | "input" | "webrtc_signal" | "open"
+        "gossip_join"
+        | "gossip_leave"
+        | "gossip_join_peers"
+        | "connect"
+        | "verify"
+        | "verify_did_recovery"
+        | "verify_proof"
+        | "verify_bip322_proof"
+        | "verify_contract_proof"
+        | "sign_chat_message"
+        | "request_signature"
+        | "challenge"
+        | "bitcoin_challenge"
+        | "release"
+        | "release_ref"
+        | "release_from_escrow_ref"
+        | "open_session"
+        | "render"
+        | "stream_segment"
+        | "prepare_transaction"
+        | "assemble_mint"
+        | "assemble_create_channel"
+        | "assemble_trade_approval"
+        | "broadcast_transaction"
+        | "decide_access_from_chain"
+        | "chat_completions"
+        | "stream"
+        | "http"
+        | "open_stream"
+        | "close_stream"
+        | "http_fetch"
+        | "launch"
+        | "attach_stream"
+        | "close_page"
+        | "input"
+        | "webrtc_signal"
+        | "open"
         | "quote" => Action::Execute,
         // ---- Admin: lifecycle + secret/approval custody (highest privilege) -------------------
         // `init`/`shutdown`, node lifecycle, secret import/export, approval workflow, and EVERY
@@ -316,30 +392,70 @@ mod tests {
     #[test]
     fn required_action_classifies_operations_and_fails_closed() {
         // Read: observation.
-        for op in ["status", "read", "list", "stat", "exists", "fetch", "balance", "gossip_recv"] {
+        for op in [
+            "status",
+            "read",
+            "list",
+            "stat",
+            "exists",
+            "fetch",
+            "balance",
+            "gossip_recv",
+        ] {
             assert_eq!(required_action_for(op), Action::Read, "{op} should be Read");
         }
         // Write: mutate-not-destroy.
         for op in ["write", "mkdir", "set_nickname", "publish", "link_account"] {
-            assert_eq!(required_action_for(op), Action::Write, "{op} should be Write");
+            assert_eq!(
+                required_action_for(op),
+                Action::Write,
+                "{op} should be Write"
+            );
         }
         // Delete: destruction (the read/write/delete collapse is the core PRE-AUDIT #3 risk).
         for op in ["delete", "delete_permanently", "trash", "unpublish"] {
-            assert_eq!(required_action_for(op), Action::Delete, "{op} should be Delete");
+            assert_eq!(
+                required_action_for(op),
+                Action::Delete,
+                "{op} should be Delete"
+            );
         }
         // Message.
         assert_eq!(required_action_for("gossip_send"), Action::Message);
         // Execute: invoke an authorized capability.
-        for op in ["release", "open_session", "render", "request_signature", "broadcast_transaction"] {
-            assert_eq!(required_action_for(op), Action::Execute, "{op} should be Execute");
+        for op in [
+            "release",
+            "open_session",
+            "render",
+            "request_signature",
+            "broadcast_transaction",
+        ] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Execute,
+                "{op} should be Execute"
+            );
         }
         // Admin: lifecycle + secret/approval custody.
-        for op in ["init", "shutdown", "node_lifecycle", "export_managed_secret", "sign_approved"] {
-            assert_eq!(required_action_for(op), Action::Admin, "{op} should be Admin");
+        for op in [
+            "init",
+            "shutdown",
+            "node_lifecycle",
+            "export_managed_secret",
+            "sign_approved",
+        ] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Admin,
+                "{op} should be Admin"
+            );
         }
         // FAIL CLOSED: an unmapped/unknown operation requires Admin, so a Read/Write token cannot
         // drive it — a forgotten mapping denies rather than under-enforces.
-        assert_eq!(required_action_for("totally_new_unmapped_op"), Action::Admin);
+        assert_eq!(
+            required_action_for("totally_new_unmapped_op"),
+            Action::Admin
+        );
         assert_eq!(required_action_for(""), Action::Admin);
     }
 

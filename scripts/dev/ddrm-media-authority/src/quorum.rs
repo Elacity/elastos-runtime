@@ -56,7 +56,10 @@ pub struct QuorumArgs {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// A live capsule process driven over its stdin/stdout JSON line protocol.
@@ -77,7 +80,12 @@ impl Capsule {
             .map_err(|e| format!("spawn {name} ({bin}): {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
-        Ok(Self { name: name.to_string(), child, stdin, stdout })
+        Ok(Self {
+            name: name.to_string(),
+            child,
+            stdin,
+            stdout,
+        })
     }
 
     fn call(&mut self, req: &Value) -> Result<Value, String> {
@@ -115,7 +123,8 @@ fn key_release(
     release_request: &Value,
     session_ctx: &Value,
 ) -> Result<Value, String> {
-    let release_msg = json!({ "op": "release", "request": release_request, "session": session_ctx });
+    let release_msg =
+        json!({ "op": "release", "request": release_request, "session": session_ctx });
 
     if let Ok(sock) = std::env::var("ELASTOS_DDRM_KEY_PROVIDER_SOCKET") {
         if !sock.trim().is_empty() {
@@ -152,8 +161,7 @@ fn key_release(
 /// back to a per-open spawn — the daemon being down degrades latency, never access.
 fn key_release_via_daemon(sock_path: &str, release_msg: &Value) -> Result<Value, String> {
     use std::os::unix::net::UnixStream;
-    let stream =
-        UnixStream::connect(sock_path).map_err(|e| format!("connect {sock_path}: {e}"))?;
+    let stream = UnixStream::connect(sock_path).map_err(|e| format!("connect {sock_path}: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
     let line = serde_json::to_string(release_msg).map_err(|e| e.to_string())?;
@@ -185,7 +193,8 @@ fn ok_data(resp: &Value, ctx: &str) -> Result<Value, String> {
 fn extract_mdat(seg: &[u8]) -> Result<Vec<u8>, String> {
     let mut off = 0usize;
     while off + 8 <= seg.len() {
-        let size = u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]]) as usize;
+        let size =
+            u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]]) as usize;
         let typ = &seg[off + 4..off + 8];
         let (payload_start, box_end) = if size == 1 {
             if off + 16 > seg.len() {
@@ -219,10 +228,11 @@ fn random_id() -> String {
 }
 
 /// Recover + decrypt + render the asset to its byte-identical cleartext via the 2-of-3 quorum.
-fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
+fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
     // --- read the `.ddrm` capsule: escrow + persisted ciphertext. ---
     let capsule: Value = serde_json::from_slice(
-        &std::fs::read(&args.capsule_path).map_err(|e| format!("read capsule {}: {e}", args.capsule_path))?,
+        &std::fs::read(&args.capsule_path)
+            .map_err(|e| format!("read capsule {}: {e}", args.capsule_path))?,
     )
     .map_err(|e| format!("parse capsule: {e}"))?;
 
@@ -279,7 +289,9 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         .and_then(Value::as_str)
         .ok_or("capsule missing ciphertext_b64 — re-mint to persist the sealed segment")?
         .to_string();
-    let node_set_id = B64.decode(&node_set_id_b64).map_err(|e| format!("node_set_id_b64: {e}"))?;
+    let node_set_id = B64
+        .decode(&node_set_id_b64)
+        .map_err(|e| format!("node_set_id_b64: {e}"))?;
 
     // --- read the PUBLIC-ONLY quorum descriptor for the 3 node verifying keys. ---
     let desc: Value = serde_json::from_slice(
@@ -293,7 +305,10 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         .and_then(Value::as_array)
         .ok_or("descriptor has no threshold.nodes array")?;
     if nodes_v.len() != 3 {
-        return Err(format!("open requires a 3-node 2-of-3 descriptor; got {}", nodes_v.len()));
+        return Err(format!(
+            "open requires a 3-node 2-of-3 descriptor; got {}",
+            nodes_v.len()
+        ));
     }
     let node_vk = |i: usize| -> Result<String, String> {
         nodes_v[i]["verifying_key_b64"]
@@ -394,7 +409,11 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
     // key-provider forwards it to each node and the nodes authorize trustlessly. The grant arrives
     // base64-encoded (CLI-safe); decode it to the AccessGrantV1 JSON the node deserializes.
     let mut key_release_request = key_release_request;
-    if let Some(grant_b64) = args.access_grant_b64.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(grant_b64) = args
+        .access_grant_b64
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         let grant_bytes = B64
             .decode(grant_b64.trim())
             .map_err(|e| format!("--access-grant is not valid base64: {e}"))?;
@@ -414,7 +433,9 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
     )?;
     let session_pub_b64 = dec_init["decrypt_session_public_key_b64"]
         .as_str()
-        .ok_or("decrypt-provider published no session key (build --features rail-stream,rail-mint)")?
+        .ok_or(
+            "decrypt-provider published no session key (build --features rail-stream,rail-mint)",
+        )?
         .to_string();
     let session_pub = B64.decode(&session_pub_b64).map_err(|e| e.to_string())?;
 
@@ -479,31 +500,168 @@ fn open_quorum_object(args: &QuorumArgs) -> Result<Vec<u8>, String> {
         &session_ctx,
     )?;
     let material = release["material"].clone();
-    if material["sealed_cek_b64"].as_str().unwrap_or_default().is_empty() {
-        return Err(format!("key-provider returned no sealed material: {release}"));
+    if material["sealed_cek_b64"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(format!(
+            "key-provider returned no sealed material: {release}"
+        ));
     }
 
-    // --- decrypt: reconstruct the CEK in-VM from the 2-of-3 shares + stream the segment. ---
-    let rendered = decrypt.call(&json!({
-        "op": "stream_segment",
-        "request": decrypt_request,
-        "material": material,
-        "index": 0,
-        "now_unix": now,
-    }))?;
-    let rendered_data = ok_data(&rendered, "decrypt stream_segment (quorum render)")?;
-    let segment_out_b64 = rendered_data["segment_b64"]
-        .as_str()
-        .ok_or_else(|| format!("stream_segment returned no segment_b64: {rendered}"))?;
-    decrypt.shutdown();
-    let segment_out = B64.decode(segment_out_b64).map_err(|e| e.to_string())?;
-    extract_mdat(&segment_out)
+    // The CEK is recovered + re-sealed; the live decrypt boundary holds it in-VM. We DO NOT
+    // decrypt here — the boundary is kept warm so the object can be decrypted once (raw mimes)
+    // or rendered page-by-page (pixel-lock mimes) WITHOUT re-hitting the quorum. The recovered
+    // CEK never leaves the VM; for pixel-lock content not even the plaintext leaves the VM.
+    Ok(QuorumOpen {
+        decrypt,
+        decrypt_request,
+        material,
+        now,
+    })
+}
+
+/// A warm quorum open: the CEK is recovered + sealed into the live decrypt boundary. Drives
+/// the boundary for either a one-shot raw object read (media/other) or repeated in-boundary
+/// page renders (pixel-lock), reusing the same sealed material — no extra quorum round-trips.
+struct QuorumOpen {
+    decrypt: Capsule,
+    decrypt_request: Value,
+    material: Value,
+    now: u64,
+}
+
+/// A rendered page returned from the decrypt boundary: the watermarked image plus the
+/// document's page count (so the viewer can page through without the source file).
+struct RenderedPage {
+    image: Vec<u8>,
+    content_type: String,
+    total_pages: u32,
+}
+
+impl QuorumOpen {
+    /// Decrypt the whole object once (the legacy raw path: media + non-pixel-lock objects).
+    /// Reconstructs the CEK in-VM, returns the byte-identical cleartext (mdat payload).
+    fn decrypt_object(&mut self) -> Result<Vec<u8>, String> {
+        let (request, material, now) = (
+            self.decrypt_request.clone(),
+            self.material.clone(),
+            self.now,
+        );
+        let rendered = self.decrypt.call(&json!({
+            "op": "stream_segment",
+            "request": request,
+            "material": material,
+            "index": 0,
+            "now_unix": now,
+        }))?;
+        let data = ok_data(&rendered, "decrypt stream_segment (quorum render)")?;
+        let segment_b64 = data["segment_b64"]
+            .as_str()
+            .ok_or_else(|| format!("stream_segment returned no segment_b64: {rendered}"))?;
+        let segment = B64.decode(segment_b64).map_err(|e| e.to_string())?;
+        extract_mdat(&segment)
+    }
+
+    /// FIRST page render: ships the sealed material ONCE so the boundary reconstructs the CEK,
+    /// decrypts + extracts the object, and PARSES it into a warm in-VM session keyed by this
+    /// open's `session_id`. Only the watermarked page image comes back (the raw file never
+    /// leaves the boundary). Every later page is served by `render_warm_page` with NO material.
+    fn render_first_page(&mut self, mime: &str, watermark: &str) -> Result<RenderedPage, String> {
+        let (request, material, now) = (
+            self.decrypt_request.clone(),
+            self.material.clone(),
+            self.now,
+        );
+        let resp = self.decrypt.call(&json!({
+            "op": "stream_segment",
+            "request": request,
+            "material": material,
+            "index": 0,
+            "now_unix": now,
+            "render": { "mime": mime, "page": 0, "watermark": watermark },
+        }))?;
+        Self::parse_rendered_page(resp)
+    }
+
+    /// Render a FURTHER page from the warm in-VM session — NO sealed material, NO ciphertext,
+    /// NO quorum round-trip. The boundary rasterises from the already-parsed document (or serves
+    /// a cached page image). Fails closed in the boundary if the warm session is gone.
+    fn render_warm_page(&mut self, page: u32, watermark: &str) -> Result<RenderedPage, String> {
+        let session_id = self
+            .decrypt_request
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or("decrypt request missing session_id for a warm page render")?
+            .to_string();
+        let resp = self.decrypt.call(&json!({
+            "op": "render_page",
+            "session_id": session_id,
+            "page": page,
+            "watermark": watermark,
+        }))?;
+        Self::parse_rendered_page(resp)
+    }
+
+    /// Decode a `render-page/v1` response into a `RenderedPage`. Fails closed on a missing image.
+    fn parse_rendered_page(resp: Value) -> Result<RenderedPage, String> {
+        let data = ok_data(&resp, "decrypt render page")?;
+        let image_b64 = data["rendered_b64"]
+            .as_str()
+            .ok_or_else(|| format!("render returned no rendered_b64: {resp}"))?;
+        let image = B64.decode(image_b64).map_err(|e| e.to_string())?;
+        let content_type = data["content_type"]
+            .as_str()
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let total_pages = data["total_pages"].as_u64().unwrap_or(1) as u32;
+        Ok(RenderedPage {
+            image,
+            content_type,
+            total_pages,
+        })
+    }
+
+    fn shutdown(self) {
+        self.decrypt.shutdown();
+    }
+}
+
+/// Whether a mime is served as flattened, watermarked page images ("pixel-lock") rather than
+/// as its raw bytes. Mirrors the decrypt boundary's `render::is_pixel_lock`. PDFs first.
+fn is_pixel_lock(mime: &str) -> bool {
+    matches!(mime.trim().to_ascii_lowercase().as_str(), "application/pdf")
+}
+
+/// A short, readable forensic stamp from a principal id (the bitmap watermark font covers
+/// hex + `0x:.- `; long DIDs/wallets are elided to first…last so a stamp always fits + shows).
+fn watermark_for(principal: &str) -> String {
+    let p = principal.trim();
+    if p.len() <= 22 {
+        p.to_string()
+    } else {
+        format!("{}..{}", &p[..10], &p[p.len() - 8..])
+    }
 }
 
 /// `--quorum` entrypoint: recover the asset once, print the object descriptor, then serve the
 /// decrypted bytes over the same stdio protocol the gateway's object viewer already drives.
 pub fn run_quorum(args: QuorumArgs) -> Result<(), String> {
-    let object = open_quorum_object(&args)?;
+    let mut open = recover_quorum(&args)?;
+
+    // PIXEL-LOCK (e.g. PDF): the raw file NEVER leaves the decrypt boundary. We render page 0
+    // in-VM to learn the page count + serve the first image, then answer `{"op":"page","n":I}`
+    // by rendering that page on demand (reusing the warm boundary). The gateway/browser only
+    // ever receive watermarked JPEGs — closing the "raw plaintext reaches the client" gap and
+    // sidestepping browser PDF-viewer quirks.
+    if is_pixel_lock(&args.mime) {
+        return serve_pixel_lock(&mut open, &args);
+    }
+
+    // RAW path (media + non-pixel-lock objects): unchanged — decrypt once, serve the bytes.
+    let object = open.decrypt_object()?;
+    open.shutdown();
 
     let descriptor = json!({
         "schema": "elastos.media-authority.session/v1",
@@ -527,7 +685,10 @@ pub fn run_quorum(args: QuorumArgs) -> Result<(), String> {
         let req: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                reply(&mut out, &json!({"status": "error", "message": format!("bad request json: {e}")}))?;
+                reply(
+                    &mut out,
+                    &json!({"status": "error", "message": format!("bad request json: {e}")}),
+                )?;
                 continue;
             }
         };
@@ -537,6 +698,87 @@ pub fn run_quorum(args: QuorumArgs) -> Result<(), String> {
                 &mut out,
                 &json!({ "status": "ok", "object_b64": B64.encode(&object) }),
             )?,
+            other => reply(
+                &mut out,
+                &json!({"status": "error", "message": format!("unknown op: {other:?}")}),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Serve a pixel-lock asset as on-demand, watermarked page images. The descriptor advertises
+/// `pixel_locked: true` + `total_pages`; the gateway's page route drives `{"op":"page","n":I}`.
+/// The decrypt boundary stays warm so each page renders in-VM without another quorum recovery.
+fn serve_pixel_lock(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), String> {
+    let watermark = watermark_for(&args.principal);
+
+    // Render page 0 up front: ships material ONCE, warms the in-VM parsed-document session, and
+    // yields the page count for the descriptor. Every later page reuses that warm session.
+    let first = open.render_first_page(&args.mime, &watermark)?;
+
+    let descriptor = json!({
+        "schema": "elastos.media-authority.session/v1",
+        "kind": "object",
+        "mime": args.mime,
+        "pixel_locked": true,
+        "page_content_type": first.content_type,
+        "total_pages": first.total_pages,
+        // No single coherent byte_length for a paged render; report the first page's size.
+        "byte_length": first.image.len(),
+        "expires_at": now_unix() + args.ttl_secs.max(60),
+    });
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{descriptor}").map_err(|e| format!("write descriptor: {e}"))?;
+    out.flush().map_err(|e| format!("flush descriptor: {e}"))?;
+
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| format!("read stdin: {e}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                reply(
+                    &mut out,
+                    &json!({"status": "error", "message": format!("bad request json: {e}")}),
+                )?;
+                continue;
+            }
+        };
+        match req.get("op").and_then(Value::as_str) {
+            Some("shutdown") => return Ok(()),
+            Some("page") => {
+                let n = req.get("n").and_then(Value::as_u64).unwrap_or(0) as u32;
+                // Reuse the page-0 render rather than re-rendering it.
+                let page = if n == 0 {
+                    Ok(RenderedPage {
+                        image: first.image.clone(),
+                        content_type: first.content_type.clone(),
+                        total_pages: first.total_pages,
+                    })
+                } else {
+                    // Warm path: no material, no quorum — rasterise from the parsed doc in-VM.
+                    open.render_warm_page(n, &watermark)
+                };
+                match page {
+                    Ok(p) => reply(
+                        &mut out,
+                        &json!({
+                            "status": "ok",
+                            "page_index": n,
+                            "total_pages": p.total_pages,
+                            "content_type": p.content_type,
+                            "page_b64": B64.encode(&p.image),
+                        }),
+                    )?,
+                    Err(e) => reply(&mut out, &json!({"status": "error", "message": e}))?,
+                }
+            }
             other => reply(
                 &mut out,
                 &json!({"status": "error", "message": format!("unknown op: {other:?}")}),

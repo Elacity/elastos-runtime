@@ -322,7 +322,8 @@ impl ReferenceAuthority {
             .map_err(|e| format!("malformed escrow envelope: {e:?}"))?;
         let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(producer_vk)
             .ok_or_else(|| "malformed producer verifying key".to_string())?;
-        let aad = ddrm_envelope::transcript::escrow_aad(scheme, kid_bytes16, &self.recipient_public);
+        let aad =
+            ddrm_envelope::transcript::escrow_aad(scheme, kid_bytes16, &self.recipient_public);
         ddrm_envelope::hybrid_unwrap_bound(&self.recipient_secret, &env, &aad, &verifier)
             .map_err(|e| format!("escrow recover failed: {e:?}"))
     }
@@ -500,8 +501,13 @@ impl DkmsNodeConn {
                 // emitted when ELASTOS_DKMS_CHANNEL_PAD is set on a padding-aware quorum — a
                 // deployed node that predates padding cannot parse a padded plaintext.
                 let padded = ddrm_envelope::channel_pad::pad_outgoing(&payload);
-                ddrm_envelope::seal::seal_bound(&ch.node_channel_pub, &padded, &aad, &self.caller_signer)
-                    .to_bytes()
+                ddrm_envelope::seal::seal_bound(
+                    &ch.node_channel_pub,
+                    &padded,
+                    &aad,
+                    &self.caller_signer,
+                )
+                .to_bytes()
             }
         };
         ddrm_envelope::frame::write_frame(&mut self.writer, &wire)
@@ -520,10 +526,15 @@ impl DkmsNodeConn {
                 })?;
                 ch.recv_seq += 1;
                 let aad = ddrm_envelope::channel_frame_aad(&ch.channel_id, 1, ch.recv_seq);
-                let opened = ddrm_envelope::hybrid_unwrap_bound(&ch.client_secret, &env, &aad, &ch.node_verifier)
-                    .map_err(|_| {
-                        "dkms node response failed to authenticate on the encrypted channel".to_string()
-                    })?;
+                let opened = ddrm_envelope::hybrid_unwrap_bound(
+                    &ch.client_secret,
+                    &env,
+                    &aad,
+                    &ch.node_verifier,
+                )
+                .map_err(|_| {
+                    "dkms node response failed to authenticate on the encrypted channel".to_string()
+                })?;
                 // Tolerant unpad: accept BOTH a padded (padding-aware node) and an un-padded
                 // (deployed/legacy node) response, so the client interoperates either way.
                 ddrm_envelope::channel_pad::unpad_incoming(&opened)
@@ -556,7 +567,9 @@ impl DkmsNodeConn {
             .and_then(|v| v.as_str())
             .ok_or("dkms session token is missing its challenge")?;
         let challenge = b64.decode(challenge_b64).map_err(|e| e.to_string())?;
-        let session_pub = b64.decode(decrypt_session_pub_b64).map_err(|e| e.to_string())?;
+        let session_pub = b64
+            .decode(decrypt_session_pub_b64)
+            .map_err(|e| e.to_string())?;
         let sig = ddrm_envelope::sign_recover_proof(
             &self.caller_signer,
             &challenge,
@@ -623,83 +636,94 @@ fn establish_dkms_session(
     // binary — we only open a loopback socket and write a one-line did preamble — while
     // forcing the mandatory encrypted channel (network=true), exactly like the tcp path but
     // NAT-traversed with zero VPN and zero per-node enrollment.
-    let carrier_target = client
-        .endpoint
-        .strip_prefix("carrier:")
-        .or_else(|| {
-            client
-                .endpoint
-                .starts_with("did:")
-                .then_some(client.endpoint.as_str())
-        });
-    let (writer, reader, network): (Box<dyn std::io::Write + Send>, Box<dyn std::io::Read + Send>, bool) =
-        if let Some(target_did) = carrier_target {
-            use std::io::Write as _;
-            use std::net::{TcpStream, ToSocketAddrs};
-            let sidecar = std::env::var("DKMS_CARRIER_CLIENT_ADDR")
-                .unwrap_or_else(|_| DKMS_CARRIER_CLIENT_DEFAULT_ADDR.to_string());
-            let resolved = sidecar
-                .to_socket_addrs()
-                .map_err(|e| format!("dkms carrier sidecar addr {sidecar} does not resolve: {e}"))?
-                .next()
-                .ok_or_else(|| format!("dkms carrier sidecar addr {sidecar} resolves to nothing"))?;
-            let mut stream = TcpStream::connect_timeout(
+    let carrier_target = client.endpoint.strip_prefix("carrier:").or_else(|| {
+        client
+            .endpoint
+            .starts_with("did:")
+            .then_some(client.endpoint.as_str())
+    });
+    let (writer, reader, network): (
+        Box<dyn std::io::Write + Send>,
+        Box<dyn std::io::Read + Send>,
+        bool,
+    ) = if let Some(target_did) = carrier_target {
+        use std::io::Write as _;
+        use std::net::{TcpStream, ToSocketAddrs};
+        let sidecar = std::env::var("DKMS_CARRIER_CLIENT_ADDR")
+            .unwrap_or_else(|_| DKMS_CARRIER_CLIENT_DEFAULT_ADDR.to_string());
+        let resolved = sidecar
+            .to_socket_addrs()
+            .map_err(|e| format!("dkms carrier sidecar addr {sidecar} does not resolve: {e}"))?
+            .next()
+            .ok_or_else(|| format!("dkms carrier sidecar addr {sidecar} resolves to nothing"))?;
+        let mut stream = TcpStream::connect_timeout(
                 &resolved,
                 std::time::Duration::from_millis(DKMS_CARRIER_CONNECT_TIMEOUT_MS),
             )
             .map_err(|e| {
                 format!("dkms carrier sidecar ({sidecar}) is unreachable — is dkms-carrier-client running? {e}")
             })?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(
+                DKMS_CARRIER_READ_TIMEOUT_MS,
+            )))
+            .map_err(|e| format!("dkms carrier read timeout could not be set: {e}"))?;
+        // PREAMBLE: tell the sidecar which node did to dial. The sidecar consumes exactly
+        // this one line; everything after is the existing framed PQ-channel protocol.
+        let mut preamble = target_did.to_string();
+        preamble.push('\n');
+        stream
+            .write_all(preamble.as_bytes())
+            .map_err(|e| format!("dkms carrier preamble write failed: {e}"))?;
+        stream
+            .flush()
+            .map_err(|e| format!("dkms carrier preamble flush failed: {e}"))?;
+        let reader = std::io::BufReader::new(
             stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(
-                    DKMS_CARRIER_READ_TIMEOUT_MS,
-                )))
-                .map_err(|e| format!("dkms carrier read timeout could not be set: {e}"))?;
-            // PREAMBLE: tell the sidecar which node did to dial. The sidecar consumes exactly
-            // this one line; everything after is the existing framed PQ-channel protocol.
-            let mut preamble = target_did.to_string();
-            preamble.push('\n');
+                .try_clone()
+                .map_err(|e| format!("dkms carrier clone failed: {e}"))?,
+        );
+        (Box::new(stream), Box::new(reader), true)
+    } else if let Some(addr) = client.endpoint.strip_prefix("tcp:") {
+        use std::net::{TcpStream, ToSocketAddrs};
+        let resolved = addr
+            .to_socket_addrs()
+            .map_err(|e| format!("dkms authority endpoint tcp:{addr} does not resolve: {e}"))?
+            .next()
+            .ok_or_else(|| format!("dkms authority endpoint tcp:{addr} resolves to nothing"))?;
+        let stream = TcpStream::connect_timeout(
+            &resolved,
+            std::time::Duration::from_millis(DKMS_TCP_CONNECT_TIMEOUT_MS),
+        )
+        .map_err(|e| format!("dkms authority node (tcp:{addr}) is unreachable: {e}"))?;
+        // NETWORK-FAULT SEMANTICS: a node that stalls mid-recover (or a dropped connection that
+        // never delivers a frame) fails the read within a bounded window — fail-closed with no
+        // partial material, never a hung release.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(
+                DKMS_TCP_READ_TIMEOUT_MS,
+            )))
+            .map_err(|e| format!("dkms tcp read timeout could not be set: {e}"))?;
+        let reader = std::io::BufReader::new(
             stream
-                .write_all(preamble.as_bytes())
-                .map_err(|e| format!("dkms carrier preamble write failed: {e}"))?;
-            stream
-                .flush()
-                .map_err(|e| format!("dkms carrier preamble flush failed: {e}"))?;
-            let reader = std::io::BufReader::new(
-                stream.try_clone().map_err(|e| format!("dkms carrier clone failed: {e}"))?,
-            );
-            (Box::new(stream), Box::new(reader), true)
-        } else if let Some(addr) = client.endpoint.strip_prefix("tcp:") {
-            use std::net::{TcpStream, ToSocketAddrs};
-            let resolved = addr
-                .to_socket_addrs()
-                .map_err(|e| format!("dkms authority endpoint tcp:{addr} does not resolve: {e}"))?
-                .next()
-                .ok_or_else(|| format!("dkms authority endpoint tcp:{addr} resolves to nothing"))?;
-            let stream = TcpStream::connect_timeout(
-                &resolved,
-                std::time::Duration::from_millis(DKMS_TCP_CONNECT_TIMEOUT_MS),
+                .try_clone()
+                .map_err(|e| format!("dkms tcp clone failed: {e}"))?,
+        );
+        (Box::new(stream), Box::new(reader), true)
+    } else {
+        let stream = UnixStream::connect(&client.endpoint).map_err(|e| {
+            format!(
+                "dkms authority node ({}) is unreachable: {e}",
+                client.endpoint
             )
-            .map_err(|e| format!("dkms authority node (tcp:{addr}) is unreachable: {e}"))?;
-            // NETWORK-FAULT SEMANTICS: a node that stalls mid-recover (or a dropped connection that
-            // never delivers a frame) fails the read within a bounded window — fail-closed with no
-            // partial material, never a hung release.
+        })?;
+        let reader = std::io::BufReader::new(
             stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(DKMS_TCP_READ_TIMEOUT_MS)))
-                .map_err(|e| format!("dkms tcp read timeout could not be set: {e}"))?;
-            let reader = std::io::BufReader::new(
-                stream.try_clone().map_err(|e| format!("dkms tcp clone failed: {e}"))?,
-            );
-            (Box::new(stream), Box::new(reader), true)
-        } else {
-            let stream = UnixStream::connect(&client.endpoint).map_err(|e| {
-                format!("dkms authority node ({}) is unreachable: {e}", client.endpoint)
-            })?;
-            let reader = std::io::BufReader::new(
-                stream.try_clone().map_err(|e| format!("dkms socket clone failed: {e}"))?,
-            );
-            (Box::new(stream), Box::new(reader), false)
-        };
+                .try_clone()
+                .map_err(|e| format!("dkms socket clone failed: {e}"))?,
+        );
+        (Box::new(stream), Box::new(reader), false)
+    };
     // The caller identity whose public half binds the session token + signs every recover. When the
     // runtime was provisioned with its OWN stable caller seed (Day 95–96), derive a KNOWN identity
     // from it so the node's allow-list recognizes us; otherwise mint an EPHEMERAL keypair (anonymous,
@@ -710,7 +734,10 @@ fn establish_dkms_session(
                 .decode(seed_b64)
                 .map_err(|e| format!("dkms caller seed is not base64: {e}"))?;
             if bytes.len() != 32 {
-                return Err(format!("dkms caller seed must be 32 bytes, got {}", bytes.len()));
+                return Err(format!(
+                    "dkms caller seed must be 32 bytes, got {}",
+                    bytes.len()
+                ));
             }
             let mut seed = [0u8; 32];
             seed.copy_from_slice(&bytes);
@@ -729,7 +756,10 @@ fn establish_dkms_session(
         recover_seq: 0,
     };
 
-    eprintln!("key-provider timing:   connect+preamble {} ms", t_phase.elapsed().as_millis());
+    eprintln!(
+        "key-provider timing:   connect+preamble {} ms",
+        t_phase.elapsed().as_millis()
+    );
     t_phase = std::time::Instant::now();
     // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
     // store path: the secret's location is the node's concern, never the client's.
@@ -737,7 +767,9 @@ fn establish_dkms_session(
     if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Err(format!(
             "dkms node init failed: {}",
-            init.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error")
+            init.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
         ));
     }
 
@@ -745,9 +777,16 @@ fn establish_dkms_session(
     // our ephemeral pubkey so the token is bound to a key only WE hold, and capture the node-signed
     // SESSION TOKEN that will gate every recover over this connection. On the NETWORK transport, ALSO
     // offer our ephemeral channel KEM key — the hello establishes the encrypted channel.
-    eprintln!("key-provider timing:   init call {} ms", t_phase.elapsed().as_millis());
+    eprintln!(
+        "key-provider timing:   init call {} ms",
+        t_phase.elapsed().as_millis()
+    );
     t_phase = std::time::Instant::now();
-    let channel_keys = if network { Some(ddrm_envelope::mint_session()) } else { None };
+    let channel_keys = if network {
+        Some(ddrm_envelope::mint_session())
+    } else {
+        None
+    };
     let challenge = ddrm_envelope::random_seed();
     let mut hello_req = json!({
         "op": "hello",
@@ -763,13 +802,29 @@ fn establish_dkms_session(
     if hello.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Err(format!(
             "dkms node hello failed: {}",
-            hello.get("message").and_then(|v| v.as_str()).unwrap_or("handshake rejected")
+            hello
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("handshake rejected")
         ));
     }
-    let data = hello.get("data").ok_or("dkms node hello returned no attestation")?;
-    let node_vk_b64 = data.get("verifying_key_b64").and_then(|v| v.as_str()).unwrap_or("");
-    let attestation_b64 = data.get("attestation_b64").and_then(|v| v.as_str()).unwrap_or("");
-    verify_hello_attestation(&client.verifying_key_b64, node_vk_b64, &challenge, attestation_b64)?;
+    let data = hello
+        .get("data")
+        .ok_or("dkms node hello returned no attestation")?;
+    let node_vk_b64 = data
+        .get("verifying_key_b64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let attestation_b64 = data
+        .get("attestation_b64")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    verify_hello_attestation(
+        &client.verifying_key_b64,
+        node_vk_b64,
+        &challenge,
+        attestation_b64,
+    )?;
 
     // ESTABLISH the encrypted channel (network only): the node's channel KEM key must arrive
     // ATTESTED under the descriptor-PINNED identity — an attacker terminating the TCP connection
@@ -777,11 +832,8 @@ fn establish_dkms_session(
     // here, fail-closed, before anything is delegated. A missing channel block on a network
     // transport is equally fatal (no channel, no recover).
     if let Some((client_secret, _client_pub)) = channel_keys {
-        let node_channel_pub_bytes = resolve_node_channel_key(
-            &client.verifying_key_b64,
-            &challenge,
-            data.get("channel"),
-        )?;
+        let node_channel_pub_bytes =
+            resolve_node_channel_key(&client.verifying_key_b64, &challenge, data.get("channel"))?;
         let node_channel_pub = ddrm_envelope::session_public_from_bytes(&node_channel_pub_bytes)
             .ok_or("dkms node published a malformed channel KEM key")?;
         let pinned = b64
@@ -809,7 +861,10 @@ fn establish_dkms_session(
         .ok_or("dkms node session token is missing an expiry")?;
     conn.session_token = token;
     conn.expires_at = expires_at;
-    eprintln!("key-provider timing:   hello+channel {} ms", t_phase.elapsed().as_millis());
+    eprintln!(
+        "key-provider timing:   hello+channel {} ms",
+        t_phase.elapsed().as_millis()
+    );
     Ok(conn)
 }
 
@@ -830,10 +885,20 @@ fn resolve_node_channel_key(
         "dkms node hello established no encrypted channel — a network transport requires one (no channel, no recover)",
     )?;
     let node_channel_pub = b64
-        .decode(channel.get("node_channel_pub_b64").and_then(|v| v.as_str()).unwrap_or(""))
+        .decode(
+            channel
+                .get("node_channel_pub_b64")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
         .map_err(|_| "dkms node channel key is not valid base64".to_string())?;
     let sig = b64
-        .decode(channel.get("channel_sig_b64").and_then(|v| v.as_str()).unwrap_or(""))
+        .decode(
+            channel
+                .get("channel_sig_b64")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )
         .map_err(|_| "dkms node channel attestation is not valid base64".to_string())?;
     let pinned = b64
         .decode(pinned_vk_b64)
@@ -972,12 +1037,13 @@ impl KeyProvider {
         #[cfg(feature = "key-authority-ref")]
         if let Some(authority) = self.reference.as_ref() {
             use base64::Engine as _;
-            data["seal_verifying_key_b64"] = json!(base64::engine::general_purpose::STANDARD
-                .encode(&authority.verifying_key));
+            data["seal_verifying_key_b64"] =
+                json!(base64::engine::general_purpose::STANDARD.encode(&authority.verifying_key));
             // The authority also publishes its KEM RECIPIENT key so the producer
             // (encrypt-provider) can escrow a freshly-minted CEK to it (Phase C).
-            data["seal_recipient_pub_b64"] = json!(base64::engine::general_purpose::STANDARD
-                .encode(&authority.recipient_public));
+            data["seal_recipient_pub_b64"] = json!(
+                base64::engine::general_purpose::STANDARD.encode(&authority.recipient_public)
+            );
         }
         // The `dkms` CLIENT republishes the EXTERNAL node's PUBLIC identity straight from the
         // descriptor pins (no key material is held here) — same rail contract: the decrypt boundary
@@ -1215,7 +1281,11 @@ impl KeyProvider {
         }))
     }
 
-    fn release(&self, request: KeyReleaseRequestV1, session: Option<ReleaseSessionContext>) -> Response {
+    fn release(
+        &self,
+        request: KeyReleaseRequestV1,
+        session: Option<ReleaseSessionContext>,
+    ) -> Response {
         // Validation (schema, rights-receipt binding, scheme, PQ-hybrid algorithms)
         // always runs *before* any backend is consulted: a malformed or
         // unauthorized request must never reach a key-delivery backend.
@@ -1295,13 +1365,11 @@ impl KeyProvider {
             };
             let session = match session {
                 Some(session) => session,
-                None => {
-                    return Response::error(
-                        "not_configured",
-                        "reference key authority release requires runtime-injected session context \
+                None => return Response::error(
+                    "not_configured",
+                    "reference key authority release requires runtime-injected session context \
                          (decrypt session key + producer vk + transcript)",
-                    )
-                }
+                ),
             };
             // Refuse to release on an already-expired request (fail-closed), when the
             // runtime supplies a clock. The CEK must never be sealed past its window.
@@ -1328,7 +1396,10 @@ impl KeyProvider {
             let producer_vk = match b64.decode(&session.producer_vk_b64) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    return Response::error("invalid_request", "producer_vk_b64 is not valid base64")
+                    return Response::error(
+                        "invalid_request",
+                        "producer_vk_b64 is not valid base64",
+                    )
                 }
             };
             let public = match b64
@@ -1462,10 +1533,18 @@ impl KeyProvider {
             "producer_vk_b64": session.producer_vk_b64,
             "decrypt_session_pub_b64": session.decrypt_session_pub_b64,
             "aad_b64": session.aad_b64,
-            "ciphertext_b64": session.ciphertext_b64,
+            // CONTENT BYTES STAY CLIENT-SIDE: the node binds content via `content_hash_b64` +
+            // `aad_b64` and only ECHOED the ciphertext back — it never inspects it. Shipping the
+            // whole ciphertext (e.g. an inline document sealed into the `.ddrm`) can exceed
+            // `frame::MAX_FRAME_BYTES` and fail every recover closed. Send an EMPTY ciphertext (the
+            // node's wire shape requires the field) and omit the init segment; the real content is
+            // welded back into the material AFTER recovery — exactly as `extra_segments_b64` already
+            // are, which never leave the runtime. Smaller frames, less seen by the node
+            // (metadata-minimization), and large/inline assets of any size now open.
+            "ciphertext_b64": "",
             "content_hash_b64": session.content_hash_b64,
             "nonce_b64": session.nonce_b64,
-            "init_segment_b64": session.init_segment_b64,
+            "init_segment_b64": Value::Null,
             "rights_receipt": request.rights_receipt,
             "content_id": request.object_cid,
             "principal_id": request.principal_id,
@@ -1501,10 +1580,19 @@ impl KeyProvider {
             Err(resp) => return resp,
         };
 
-        // SINGLE-NODE RAIL: no second node provisioned → return node A's material verbatim (unchanged).
+        // SINGLE-NODE RAIL: no second node provisioned → return node A's material, with the
+        // client-side content welded back in (the recover shipped an empty ciphertext).
         let node_b = match self.dkms2.as_ref() {
             Some(node) => node,
-            None => return Response::ok(material_a),
+            None => {
+                let mut material_a = material_a;
+                attach_local_content(
+                    &mut material_a,
+                    &session.ciphertext_b64,
+                    session.init_segment_b64.as_deref(),
+                );
+                return Response::ok(material_a);
+            }
         };
 
         // 2-of-2 THRESHOLD (Day 97–98): a second secret-holding node is provisioned, so the CEK was
@@ -1552,7 +1640,14 @@ impl KeyProvider {
             session.extra_segments_b64.as_deref(),
             session.cek_commitment_b64.as_deref(),
         ) {
-            Ok(merged) => Response::ok(merged),
+            Ok(mut merged) => {
+                attach_local_content(
+                    &mut merged,
+                    &session.ciphertext_b64,
+                    session.init_segment_b64.as_deref(),
+                );
+                Response::ok(merged)
+            }
             Err(err) => Response::error("not_configured", err),
         }
     }
@@ -1598,7 +1693,8 @@ impl KeyProvider {
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
             let recover_seq = conn.next_recover_seq();
-            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq) {
+            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq)
+            {
                 Ok(caller_sig_b64) => {
                     let mut req = recover_req.clone();
                     req["session_token"] = conn.session_token.clone();
@@ -1620,7 +1716,10 @@ impl KeyProvider {
             Err(err) => {
                 // A broken connection is discarded so the next release re-establishes; fail closed now.
                 *guard = None;
-                return Err(Response::error("not_configured", format!("dkms node transport failed: {err}")));
+                return Err(Response::error(
+                    "not_configured",
+                    format!("dkms node transport failed: {err}"),
+                ));
             }
         };
         if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
@@ -1628,13 +1727,19 @@ impl KeyProvider {
                 "not_configured",
                 format!(
                     "dkms node recover failed: {}",
-                    recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
+                    recover
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("recover rejected")
                 ),
             ));
         }
         match recover.get("data") {
             Some(data) => Ok(data.clone()),
-            None => Err(Response::error("not_configured", "dkms node recover returned no material")),
+            None => Err(Response::error(
+                "not_configured",
+                "dkms node recover returned no material",
+            )),
         }
     }
 
@@ -1656,17 +1761,19 @@ impl KeyProvider {
     ) -> Result<Value, String> {
         let t_rec = std::time::Instant::now();
         let recover_seq = conn.next_recover_seq();
-        let recover = match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq) {
-            Ok(caller_sig_b64) => {
-                let mut req = recover_req.clone();
-                req["session_token"] = conn.session_token.clone();
-                req["caller_sig_b64"] = json!(caller_sig_b64);
-                req["recover_seq"] = json!(recover_seq);
-                req["now_unix"] = json!(now);
-                conn.call(&req)
-            }
-            Err(err) => Err(err),
-        };
+        let recover =
+            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq)
+            {
+                Ok(caller_sig_b64) => {
+                    let mut req = recover_req.clone();
+                    req["session_token"] = conn.session_token.clone();
+                    req["caller_sig_b64"] = json!(caller_sig_b64);
+                    req["recover_seq"] = json!(recover_seq);
+                    req["now_unix"] = json!(now);
+                    conn.call(&req)
+                }
+                Err(err) => Err(err),
+            };
         eprintln!(
             "key-provider timing: recover call ({}) {} ms",
             client_endpoint,
@@ -1676,7 +1783,10 @@ impl KeyProvider {
         if recover.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Err(format!(
                 "dkms node recover failed: {}",
-                recover.get("message").and_then(|v| v.as_str()).unwrap_or("recover rejected")
+                recover
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("recover rejected")
             ));
         }
         match recover.get("data") {
@@ -1706,10 +1816,15 @@ impl KeyProvider {
         // CHECK OUT: take this node's warm connection if present + still live; otherwise establish a
         // fresh one. We hold the pool lock only across the cheap map op, never across the slow recover.
         let mut conn = {
-            let mut guard = pool.lock().map_err(|_| "dkms pool lock poisoned".to_string())?;
+            let mut guard = pool
+                .lock()
+                .map_err(|_| "dkms pool lock poisoned".to_string())?;
             match guard.remove(&client.endpoint) {
                 Some(c) if c.session_live(now) => {
-                    eprintln!("key-provider timing: reuse warm session ({})", client.endpoint);
+                    eprintln!(
+                        "key-provider timing: reuse warm session ({})",
+                        client.endpoint
+                    );
                     c
                 }
                 _ => {
@@ -1763,17 +1878,18 @@ impl KeyProvider {
     ) -> Response {
         let node_b = match self.dkms2.as_ref() {
             Some(node) => node,
-            None => {
-                return Response::error(
-                    "not_configured",
-                    "a third quorum node is provisioned without a second — the node-set is incoherent",
-                )
-            }
+            None => return Response::error(
+                "not_configured",
+                "a third quorum node is provisioned without a second — the node-set is incoherent",
+            ),
         };
         let node_c = match self.dkms3.as_ref() {
             Some(node) => node,
             None => {
-                return Response::error("not_configured", "quorum release requires a third provisioned node")
+                return Response::error(
+                    "not_configured",
+                    "quorum release requires a third provisioned node",
+                )
             }
         };
         // ALL THREE escrows must be supplied — a missing escrow silently shrinks the candidate
@@ -1842,8 +1958,10 @@ impl KeyProvider {
             // never an `.expect()` panic. In the single-threaded warm-daemon accept loop a panic
             // here would abort the whole daemon; the quorum math below still fails closed if fewer
             // than two shares are served. (DEV_MODE_GUARD_SPEC defense-in-depth.)
-            type SpawnOutcome<'s> =
-                Result<std::thread::ScopedJoinHandle<'s, (usize, Result<Value, String>)>, (usize, String)>;
+            type SpawnOutcome<'s> = Result<
+                std::thread::ScopedJoinHandle<'s, (usize, Result<Value, String>)>,
+                (usize, String),
+            >;
             let handles: Vec<SpawnOutcome> = candidates
                 .iter()
                 .enumerate()
@@ -1852,15 +1970,33 @@ impl KeyProvider {
                         .name(format!("dkms-recover-{idx}"))
                         .stack_size(16 * 1024 * 1024)
                         .spawn_scoped(scope, move || {
-                            (idx, Self::recover_one_node_pooled(pool, *client, req, kid_hex, decrypt_pub, cid, now))
+                            (
+                                idx,
+                                Self::recover_one_node_pooled(
+                                    pool,
+                                    *client,
+                                    req,
+                                    kid_hex,
+                                    decrypt_pub,
+                                    cid,
+                                    now,
+                                ),
+                            )
                         })
-                        .map_err(|e| (idx, format!("failed to spawn recover thread for node {idx}: {e}")))
+                        .map_err(|e| {
+                            (
+                                idx,
+                                format!("failed to spawn recover thread for node {idx}: {e}"),
+                            )
+                        })
                 })
                 .collect();
             handles
                 .into_iter()
                 .map(|outcome| match outcome {
-                    Ok(h) => h.join().unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))),
+                    Ok(h) => h
+                        .join()
+                        .unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))),
                     Err((idx, e)) => (idx, Err(e)),
                 })
                 .collect()
@@ -1904,7 +2040,11 @@ impl KeyProvider {
         // Node A is the base material (its re-sealed share rides as `sealed_cek_b64`); node B
         // contributes share-2; node C (when it also served) contributes share-3 for cheater
         // detection. Shares are in node order (deterministic merge input).
-        let material_c = if materials.len() >= 3 { Some(materials.remove(2)) } else { None };
+        let material_c = if materials.len() >= 3 {
+            Some(materials.remove(2))
+        } else {
+            None
+        };
         let material_b = materials.remove(1);
         let material_a = materials.remove(0);
         match merge_threshold_material(
@@ -1914,7 +2054,14 @@ impl KeyProvider {
             session.extra_segments_b64.as_deref(),
             session.cek_commitment_b64.as_deref(),
         ) {
-            Ok(merged) => Response::ok(merged),
+            Ok(mut merged) => {
+                attach_local_content(
+                    &mut merged,
+                    &session.ciphertext_b64,
+                    session.init_segment_b64.as_deref(),
+                );
+                Response::ok(merged)
+            }
             Err(err) => Response::error("not_configured", err),
         }
     }
@@ -2077,11 +2224,15 @@ fn build_dkms_client(
     ),
     String,
 > {
-    let path = match config.get("dkms_authority_descriptor").and_then(|v| v.as_str()) {
+    let path = match config
+        .get("dkms_authority_descriptor")
+        .and_then(|v| v.as_str())
+    {
         Some(path) => path,
         None => return Ok((None, None, None)),
     };
-    let bytes = std::fs::read(path).map_err(|e| format!("dkms authority descriptor {path}: {e}"))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("dkms authority descriptor {path}: {e}"))?;
     let desc: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("dkms authority descriptor {path} is corrupt: {e}"))?;
     if desc.get("schema").and_then(|v| v.as_str()) != Some(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA) {
@@ -2131,7 +2282,11 @@ fn build_dkms_client(
                 }
                 let node_b = parse_public_authority(path, &nodes[1], caller_seed_b64.clone())?;
                 let node_c = if node_count == 3 {
-                    Some(parse_public_authority(path, &nodes[2], caller_seed_b64.clone())?)
+                    Some(parse_public_authority(
+                        path,
+                        &nodes[2],
+                        caller_seed_b64.clone(),
+                    )?)
                 } else {
                     None
                 };
@@ -2164,6 +2319,33 @@ fn build_dkms_client(
     Ok((Some(node_a), node_b, node_c))
 }
 
+/// Weld the real content bytes back into a node-returned material CLIENT-SIDE. The recover request
+/// ships an EMPTY `ciphertext_b64` (and no init segment) so a large/inline asset can never exceed
+/// `frame::MAX_FRAME_BYTES`; the node binds content via `content_hash_b64` + `aad_b64` and never
+/// needs the bytes (it only echoed them). The decrypt boundary consumes the full content here —
+/// the same pattern as `extra_segments_b64`, which already never leaves the runtime. A substituted
+/// ciphertext still fails closed: the CEK is sealed BOUND to `aad_b64` (the content transcript), so
+/// the AEAD unwrap rejects mismatched content. No content integrity is lost by carrying it locally.
+#[cfg(all(feature = "key-authority-ref", unix))]
+fn attach_local_content(
+    material: &mut Value,
+    ciphertext_b64: &str,
+    init_segment_b64: Option<&str>,
+) {
+    let Some(inner) = material.get_mut("material") else {
+        return;
+    };
+    inner["ciphertext_b64"] = json!(ciphertext_b64);
+    match init_segment_b64 {
+        Some(init) => inner["init_segment_b64"] = json!(init),
+        None => {
+            if let Some(obj) = inner.as_object_mut() {
+                obj.remove("init_segment_b64");
+            }
+        }
+    }
+}
+
 /// Merge two node-recovered materials into ONE 2-of-2 threshold `SealedDecryptMaterialV1` WITHOUT
 /// combining the shares — the CEK is reconstructed ONLY inside the decrypt boundary, never here. Node
 /// A's material is the base (suite, ciphertext, nonce, content hash, init, and its re-sealed share-1 as
@@ -2194,7 +2376,8 @@ fn merge_threshold_material(
     let share2 = sealed_share(data_b, "second")?;
     if share1 == share2 {
         return Err(
-            "the two dkms nodes returned identical sealed shares — not a real 2-of-2 split".to_string(),
+            "the two dkms nodes returned identical sealed shares — not a real 2-of-2 split"
+                .to_string(),
         );
     }
     // PRE-AUDIT #1: when node C ALSO served, forward its re-sealed share-3 so the decrypt boundary
@@ -2278,10 +2461,24 @@ fn parse_public_authority(
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| format!("dkms authority descriptor {path} is missing {key} ({what})"))
     };
-    let verifying_key_b64 = field("verifying_key_b64", "an external authority must publish its identity")?;
-    let recipient_pub_b64 = field("recipient_pub_b64", "an external authority must publish its escrow recipient")?;
-    let endpoint = field("authority_endpoint", "the runtime must know where to delegate recovery")?;
-    Ok(DkmsClientAuthority { verifying_key_b64, recipient_pub_b64, endpoint, caller_seed_b64 })
+    let verifying_key_b64 = field(
+        "verifying_key_b64",
+        "an external authority must publish its identity",
+    )?;
+    let recipient_pub_b64 = field(
+        "recipient_pub_b64",
+        "an external authority must publish its escrow recipient",
+    )?;
+    let endpoint = field(
+        "authority_endpoint",
+        "the runtime must know where to delegate recovery",
+    )?;
+    Ok(DkmsClientAuthority {
+        verifying_key_b64,
+        recipient_pub_b64,
+        endpoint,
+        caller_seed_b64,
+    })
 }
 
 /// Verify a dKMS node's IDENTITY handshake response against the descriptor-PINNED verifying key.
@@ -2300,7 +2497,8 @@ fn verify_hello_attestation(
     let b64 = base64::engine::general_purpose::STANDARD;
     if node_vk_b64 != pinned_vk_b64 {
         return Err(
-            "dkms node identity mismatch: node vk does not match the pinned descriptor vk".to_string(),
+            "dkms node identity mismatch: node vk does not match the pinned descriptor vk"
+                .to_string(),
         );
     }
     let attestation = b64
@@ -2327,7 +2525,8 @@ fn reference_authority_from_master(master: &[u8; 32]) -> ReferenceAuthority {
     let seal_seed = ddrm_envelope::derive_seed(master, b"key-authority/seal/v1");
     let (signer, verifying_key) = ddrm_envelope::seal::mldsa_seal_keypair(seal_seed);
     let recipient_seed = ddrm_envelope::derive_seed(master, b"key-authority/recipient/v1");
-    let (recipient_secret, recipient_public) = ddrm_envelope::mint_session_from_seed(recipient_seed);
+    let (recipient_secret, recipient_public) =
+        ddrm_envelope::mint_session_from_seed(recipient_seed);
     ReferenceAuthority {
         signer,
         verifying_key,
@@ -2350,12 +2549,16 @@ fn load_or_create_authority_seed(path: &str) -> Result<[u8; 32], String> {
             let record: Value = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("authority key store {path} is corrupt: {e}"))?;
             if record.get("schema").and_then(|v| v.as_str()) != Some(AUTHORITY_KEYSTORE_SCHEMA) {
-                return Err(format!("authority key store {path} has an unexpected schema"));
+                return Err(format!(
+                    "authority key store {path} has an unexpected schema"
+                ));
             }
             let seed_b64 = record
                 .get("authority_seed_b64")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("authority key store {path} is missing authority_seed_b64"))?;
+                .ok_or_else(|| {
+                    format!("authority key store {path} is missing authority_seed_b64")
+                })?;
             let seed_bytes = b64
                 .decode(seed_b64)
                 .map_err(|e| format!("authority key store {path} seed is not base64: {e}"))?;
@@ -2774,7 +2977,10 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.scheme = "frost-only".to_string();
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2783,7 +2989,10 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.algorithms.cipher = "aes-128-gcm".to_string();
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2792,7 +3001,10 @@ mod tests {
         let mut request = key_release_request();
         request.key_envelope.algorithms.kem = vec!["x25519".to_string()];
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2801,7 +3013,10 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.allowed = false;
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2810,7 +3025,10 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.principal_id = "person:local:attacker".to_string();
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2819,7 +3037,10 @@ mod tests {
         let mut request = key_release_request();
         request.rights_receipt.content_id = "bafybeigsomethingelse".to_string();
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2829,7 +3050,10 @@ mod tests {
         request.action = "download".to_string();
         // receipt still authorizes only "view"
 
-        assert_eq!(error_code(provider.release(request, None)), "invalid_request");
+        assert_eq!(
+            error_code(provider.release(request, None)),
+            "invalid_request"
+        );
     }
 
     // --- pluggable key authority backends (Phase A.1) -----------------------
@@ -2909,7 +3133,8 @@ mod tests {
         // The reference backend now ACTUALLY releases (Day 70), but only with the
         // runtime-injected session context; the canonical request alone fails closed
         // (and an uninitialized authority, as here, fails closed too).
-        let response = configured(KeyAuthorityBackend::Reference).release(key_release_request(), None);
+        let response =
+            configured(KeyAuthorityBackend::Reference).release(key_release_request(), None);
         assert_eq!(error_code_ref(&response), "not_configured");
         assert!(error_message(response).contains("reference"));
     }
@@ -2974,7 +3199,10 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             std::env::temp_dir()
-                .join(format!("ddrm-authority-{tag}-{}-{nanos}.json", std::process::id()))
+                .join(format!(
+                    "ddrm-authority-{tag}-{}-{nanos}.json",
+                    std::process::id()
+                ))
                 .to_string_lossy()
                 .into_owned()
         }
@@ -3003,16 +3231,21 @@ mod tests {
             );
 
             // A CEK escrowed to the FIRST launch's published recipient recovers on the SECOND.
-            let recip_bytes = b64().decode(d1["seal_recipient_pub_b64"].as_str().unwrap()).unwrap();
-            let recipient_public =
-                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+            let recip_bytes = b64()
+                .decode(d1["seal_recipient_pub_b64"].as_str().unwrap())
+                .unwrap();
+            let recipient_public = ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
             let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([5u8; 32]);
             let cek: Vec<u8> = (0u8..16).collect();
             let kid = [0x42u8; 16];
-            let aad =
-                ddrm_envelope::transcript::escrow_aad(ddrm_envelope::SUITE_PQ_HYBRID, &kid, &recip_bytes);
+            let aad = ddrm_envelope::transcript::escrow_aad(
+                ddrm_envelope::SUITE_PQ_HYBRID,
+                &kid,
+                &recip_bytes,
+            );
             let wrapped =
-                ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &aad, &producer_signer).to_bytes();
+                ddrm_envelope::seal::seal_bound(&recipient_public, &cek, &aad, &producer_signer)
+                    .to_bytes();
             let recovered = second
                 .reference
                 .as_ref()
@@ -3041,7 +3274,8 @@ mod tests {
             let path = unique_store_path("corrupt");
             std::fs::write(&path, b"{ not valid json").unwrap();
             let mut provider = KeyProvider::default();
-            let resp = provider.init(json!({ "backend": "reference", "authority_key_store": path }));
+            let resp =
+                provider.init(json!({ "backend": "reference", "authority_key_store": path }));
             assert_eq!(error_code_ref(&resp), "not_configured");
             let _ = std::fs::remove_file(&path);
         }
@@ -3106,13 +3340,17 @@ mod tests {
             let node_c = dkms_node_entry(&[0x7cu8; 32], "/path/to/node-c");
             let mut three = node_a.clone();
             three["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
-            three["threshold"] = json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c] });
+            three["threshold"] =
+                json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c] });
             let three_path = unique_store_path("dkms-3ofn");
             std::fs::write(&three_path, serde_json::to_vec(&three).unwrap()).unwrap();
             let mut q = KeyProvider::default();
             assert_eq!(
-                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &three_path }))),
-                "not_configured", "3-of-N is not implemented and must fail closed"
+                error_code_ref(
+                    &q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &three_path }))
+                ),
+                "not_configured",
+                "3-of-N is not implemented and must fail closed"
             );
             assert!(q.dkms2.is_none());
 
@@ -3124,8 +3362,11 @@ mod tests {
             std::fs::write(&dup_path, serde_json::to_vec(&dup).unwrap()).unwrap();
             let mut r = KeyProvider::default();
             assert_eq!(
-                error_code_ref(&r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))),
-                "not_configured", "identical threshold nodes must fail closed"
+                error_code_ref(
+                    &r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))
+                ),
+                "not_configured",
+                "identical threshold nodes must fail closed"
             );
 
             // A single-node descriptor (threshold.t == 1) still resolves only node A.
@@ -3139,7 +3380,10 @@ mod tests {
                 s.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &single_path })),
                 Response::Ok { .. }
             ));
-            assert!(s.dkms.is_some() && s.dkms2.is_none(), "a single-node (t=1) descriptor resolves one node");
+            assert!(
+                s.dkms.is_some() && s.dkms2.is_none(),
+                "a single-node (t=1) descriptor resolves one node"
+            );
 
             for p in [&path, &three_path, &dup_path, &single_path] {
                 let _ = std::fs::remove_file(p);
@@ -3159,7 +3403,8 @@ mod tests {
             // The real 2-of-3: top-level = node A, threshold.nodes = [A, B, C].
             let mut desc = node_a.clone();
             desc["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
-            desc["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
+            desc["threshold"] =
+                json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
             let path = unique_store_path("dkms-quorum-2of3");
             std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
             let mut p = KeyProvider::default();
@@ -3167,23 +3412,32 @@ mod tests {
                 p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &path })),
                 Response::Ok { .. }
             ));
-            assert!(p.dkms.is_some() && p.dkms2.is_some() && p.dkms3.is_some(), "all three quorum nodes resolve");
+            assert!(
+                p.dkms.is_some() && p.dkms2.is_some() && p.dkms3.is_some(),
+                "all three quorum nodes resolve"
+            );
             let vks = [
                 p.dkms.as_ref().unwrap().verifying_key_b64.clone(),
                 p.dkms2.as_ref().unwrap().verifying_key_b64.clone(),
                 p.dkms3.as_ref().unwrap().verifying_key_b64.clone(),
             ];
-            assert!(vks[0] != vks[1] && vks[0] != vks[2] && vks[1] != vks[2], "three DISTINCT secret-holders");
+            assert!(
+                vks[0] != vks[1] && vks[0] != vks[2] && vks[1] != vks[2],
+                "three DISTINCT secret-holders"
+            );
 
             // A duplicated identity in the trio (node C == node B) collapses the quorum → fail closed.
             let mut dup = node_a.clone();
             dup["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
-            dup["threshold"] = json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_b.clone()] });
+            dup["threshold"] =
+                json!({ "t": 2, "nodes": [node_a.clone(), node_b.clone(), node_b.clone()] });
             let dup_path = unique_store_path("dkms-quorum-dup");
             std::fs::write(&dup_path, serde_json::to_vec(&dup).unwrap()).unwrap();
             let mut q = KeyProvider::default();
             assert_eq!(
-                error_code_ref(&q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))),
+                error_code_ref(
+                    &q.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &dup_path }))
+                ),
                 "not_configured",
                 "a duplicated quorum identity must fail closed"
             );
@@ -3192,12 +3446,15 @@ mod tests {
             // t = 3 over three nodes (a 3-of-3) is still unimplemented → fail closed (no downgrade).
             let mut t3 = node_a.clone();
             t3["schema"] = json!(DKMS_AUTHORITY_DESCRIPTOR_SCHEMA);
-            t3["threshold"] = json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
+            t3["threshold"] =
+                json!({ "t": 3, "nodes": [node_a.clone(), node_b.clone(), node_c.clone()] });
             let t3_path = unique_store_path("dkms-quorum-t3");
             std::fs::write(&t3_path, serde_json::to_vec(&t3).unwrap()).unwrap();
             let mut r = KeyProvider::default();
             assert_eq!(
-                error_code_ref(&r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &t3_path }))),
+                error_code_ref(
+                    &r.init(json!({ "backend": "dkms", "dkms_authority_descriptor": &t3_path }))
+                ),
                 "not_configured",
                 "t=3 must fail closed rather than silently downgrade"
             );
@@ -3228,44 +3485,113 @@ mod tests {
                 })
             };
             // Happy: two distinct shares for the same content merge into a two-share material.
-            let merged = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, None).expect("merge");
-            assert_eq!(merged["material"]["sealed_cek_b64"], json!("SHARE1"), "share-1 stays the primary");
-            assert_eq!(merged["material"]["sealed_cek_share2_b64"], json!("SHARE2"), "share-2 welded in");
-            assert_eq!(merged["material"]["ciphertext_b64"], json!("CIPHER"), "content carried through unchanged");
+            let merged =
+                merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, None)
+                    .expect("merge");
+            assert_eq!(
+                merged["material"]["sealed_cek_b64"],
+                json!("SHARE1"),
+                "share-1 stays the primary"
+            );
+            assert_eq!(
+                merged["material"]["sealed_cek_share2_b64"],
+                json!("SHARE2"),
+                "share-2 welded in"
+            );
+            assert_eq!(
+                merged["material"]["ciphertext_b64"],
+                json!("CIPHER"),
+                "content carried through unchanged"
+            );
             // A two-share merge welds NO third share (degraded quorum / 2-of-2 threshold).
-            assert!(merged["material"].get("sealed_cek_share3_b64").is_none(), "no share-3 on a two-node merge");
+            assert!(
+                merged["material"].get("sealed_cek_share3_b64").is_none(),
+                "no share-3 on a two-node merge"
+            );
             // Single-segment merge carries NO extras (byte-identical to the pre-multi-segment material).
-            assert!(merged["material"].get("extra_segments_b64").is_none(), "no extras on a single-segment merge");
+            assert!(
+                merged["material"].get("extra_segments_b64").is_none(),
+                "no extras on a single-segment merge"
+            );
 
             // PRE-AUDIT #1 — THREE distinct shares for the same content weld share-3 in for the
             // decrypt boundary's cheater-detection cross-check.
-            let three = merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&base("SHARE3")), None, None)
-                .expect("three-share merge");
-            assert_eq!(three["material"]["sealed_cek_share3_b64"], json!("SHARE3"), "share-3 welded in for cheater detection");
+            let three = merge_threshold_material(
+                base("SHARE1"),
+                &base("SHARE2"),
+                Some(&base("SHARE3")),
+                None,
+                None,
+            )
+            .expect("three-share merge");
+            assert_eq!(
+                three["material"]["sealed_cek_share3_b64"],
+                json!("SHARE3"),
+                "share-3 welded in for cheater detection"
+            );
 
             // PRE-AUDIT #1 — the producer's published CEK commitment is carried into the material.
-            let committed = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, Some("COMMIT64"))
-                .expect("committed merge");
-            assert_eq!(committed["material"]["cek_commitment_b64"], json!("COMMIT64"), "commitment carried through");
+            let committed = merge_threshold_material(
+                base("SHARE1"),
+                &base("SHARE2"),
+                None,
+                None,
+                Some("COMMIT64"),
+            )
+            .expect("committed merge");
+            assert_eq!(
+                committed["material"]["cek_commitment_b64"],
+                json!("COMMIT64"),
+                "commitment carried through"
+            );
             // A blank commitment is treated as absent (no field stamped).
-            let blank = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, Some("   "))
-                .expect("blank-commitment merge");
-            assert!(blank["material"].get("cek_commitment_b64").is_none(), "blank commitment ⇒ no field");
+            let blank =
+                merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, None, Some("   "))
+                    .expect("blank-commitment merge");
+            assert!(
+                blank["material"].get("cek_commitment_b64").is_none(),
+                "blank commitment ⇒ no field"
+            );
 
             // MULTI-SEGMENT: the extras are stamped into the merged material so the decrypt boundary
             // rebuilds the segment-bound AAD and reconstructs the split CEK once for the whole asset.
             let extras = ["SEG1".to_string(), "SEG2".to_string()];
-            let multi = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, Some(&extras), None).expect("merge");
-            assert_eq!(multi["material"]["extra_segments_b64"], json!(["SEG1", "SEG2"]), "extras carried into the merged material");
+            let multi = merge_threshold_material(
+                base("SHARE1"),
+                &base("SHARE2"),
+                None,
+                Some(&extras),
+                None,
+            )
+            .expect("merge");
+            assert_eq!(
+                multi["material"]["extra_segments_b64"],
+                json!(["SEG1", "SEG2"]),
+                "extras carried into the merged material"
+            );
             // An empty extras list is treated as single-segment (no field added).
-            let none_extra = merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, Some(&[]), None).expect("merge");
-            assert!(none_extra["material"].get("extra_segments_b64").is_none(), "empty extras ⇒ single-segment");
+            let none_extra =
+                merge_threshold_material(base("SHARE1"), &base("SHARE2"), None, Some(&[]), None)
+                    .expect("merge");
+            assert!(
+                none_extra["material"].get("extra_segments_b64").is_none(),
+                "empty extras ⇒ single-segment"
+            );
 
             // Identical shares → not a real split → fail closed.
-            assert!(merge_threshold_material(base("SAME"), &base("SAME"), None, None, None).is_err());
+            assert!(
+                merge_threshold_material(base("SAME"), &base("SAME"), None, None, None).is_err()
+            );
             // A third share DUPLICATING another → not a distinct secret-holder → fail closed.
             assert!(
-                merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&base("SHARE1")), None, None).is_err(),
+                merge_threshold_material(
+                    base("SHARE1"),
+                    &base("SHARE2"),
+                    Some(&base("SHARE1")),
+                    None,
+                    None
+                )
+                .is_err(),
                 "a duplicated third share is rejected"
             );
             // A content/transcript mismatch between nodes → fail closed.
@@ -3276,11 +3602,94 @@ mod tests {
             let mut other3 = base("SHARE3");
             other3["material"]["content_hash_b64"] = json!("DIFFERENT");
             assert!(
-                merge_threshold_material(base("SHARE1"), &base("SHARE2"), Some(&other3), None, None).is_err(),
+                merge_threshold_material(
+                    base("SHARE1"),
+                    &base("SHARE2"),
+                    Some(&other3),
+                    None,
+                    None
+                )
+                .is_err(),
                 "third node content mismatch fails closed"
             );
             // A node missing its sealed share → fail closed.
-            assert!(merge_threshold_material(json!({"material":{"ciphertext_b64":"C"}}), &base("S2"), None, None, None).is_err());
+            assert!(merge_threshold_material(
+                json!({"material":{"ciphertext_b64":"C"}}),
+                &base("S2"),
+                None,
+                None,
+                None
+            )
+            .is_err());
+        }
+
+        /// Large / inline-asset fix: the recover request must NOT carry the content bytes, so an
+        /// asset whose base64 ciphertext exceeds `frame::MAX_FRAME_BYTES` (e.g. a PDF sealed inline
+        /// into the `.ddrm`) still fits a recover frame and opens. The content is welded back into
+        /// the node-returned material CLIENT-SIDE after recovery. Before the fix, an inline asset
+        /// blew past the 1 MiB frame cap and every node "served 0 of 3" → fail closed → 502.
+        #[cfg(unix)]
+        #[test]
+        fn recover_omits_oversized_content_yet_welds_it_back_client_side() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            // An inline asset whose base64 ciphertext is well over the 1 MiB transport frame cap.
+            let big = b64.encode(vec![
+                7u8;
+                (ddrm_envelope::frame::MAX_FRAME_BYTES as usize) + 4096
+            ]);
+            assert!(
+                big.len() as u32 > ddrm_envelope::frame::MAX_FRAME_BYTES,
+                "fixture must exceed the frame cap"
+            );
+
+            // The recover request the runtime sends carries only the small content BINDING (hash),
+            // never the bytes — so it fits the transport frame regardless of asset size.
+            let recover_req = json!({
+                "op": "recover",
+                "wrapped_cek_b64": "AA==",
+                "ciphertext_b64": "",
+                "content_hash_b64": b64.encode(b"hash"),
+                "nonce_b64": b64.encode(b"nonce"),
+                "init_segment_b64": Value::Null,
+            });
+            let wire = serde_json::to_vec(&recover_req).expect("serialize recover request");
+            let mut frame = Vec::new();
+            ddrm_envelope::frame::write_frame(&mut frame, &wire)
+                .expect("a content-free recover request must fit MAX_FRAME_BYTES");
+
+            // CONTROL: the pre-fix request (ciphertext inline) would have blown the cap — the bug.
+            let old_req = json!({ "op": "recover", "ciphertext_b64": big.clone() });
+            let old_wire = serde_json::to_vec(&old_req).unwrap();
+            let mut old_frame = Vec::new();
+            assert!(
+                ddrm_envelope::frame::write_frame(&mut old_frame, &old_wire).is_err(),
+                "the pre-fix request (ciphertext inline) exceeds MAX_FRAME_BYTES — the bug this fix removes"
+            );
+
+            // After recovery, the real content is welded back into the node-returned material.
+            let mut material = json!({
+                "suite": "elastos-pq-hybrid-threshold-v0",
+                "material": { "sealed_cek_b64": "AA==", "ciphertext_b64": "", "content_hash_b64": "HASH" },
+            });
+            attach_local_content(&mut material, &big, None);
+            assert_eq!(
+                material["material"]["ciphertext_b64"],
+                json!(big),
+                "full content welded back in"
+            );
+            assert!(
+                material["material"].get("init_segment_b64").is_none(),
+                "no init segment when absent"
+            );
+
+            // With an init segment present, it is welded in too.
+            attach_local_content(&mut material, "C", Some("INIT"));
+            assert_eq!(
+                material["material"]["init_segment_b64"],
+                json!("INIT"),
+                "init segment welded when present"
+            );
         }
 
         /// The `dkms` backend RESOLVES the EXTERNAL node's PUBLIC identity + endpoint from a handed-in
@@ -3304,15 +3713,24 @@ mod tests {
 
             // The client holds the PUBLIC identity + endpoint, and NO recovery secret: `reference`
             // (which owns a recipient_secret + signer) is never populated for `dkms`.
-            assert!(second.dkms.is_some(), "dkms resolved a public client from the descriptor");
+            assert!(
+                second.dkms.is_some(),
+                "dkms resolved a public client from the descriptor"
+            );
             assert!(
                 second.reference.is_none(),
                 "the dkms client must hold NO recovery secret (no ReferenceAuthority)"
             );
             // The republished identity matches the descriptor pins exactly (no derivation here).
             let client = second.dkms.as_ref().unwrap();
-            assert_eq!(d2["seal_verifying_key_b64"].as_str().unwrap(), client.verifying_key_b64);
-            assert_eq!(d2["seal_recipient_pub_b64"].as_str().unwrap(), client.recipient_pub_b64);
+            assert_eq!(
+                d2["seal_verifying_key_b64"].as_str().unwrap(),
+                client.verifying_key_b64
+            );
+            assert_eq!(
+                d2["seal_recipient_pub_b64"].as_str().unwrap(),
+                client.recipient_pub_b64
+            );
             assert_eq!(client.endpoint, "/path/to/dkms-authority");
             let _ = std::fs::remove_file(&path);
         }
@@ -3351,7 +3769,10 @@ mod tests {
         fn dkms_fails_closed_on_a_missing_or_bad_descriptor() {
             // No descriptor -> selected but unconfigured -> release fails closed with "no dKMS node".
             let mut bare = KeyProvider::default();
-            assert!(matches!(bare.init(json!({ "backend": "dkms" })), Response::Ok { .. }));
+            assert!(matches!(
+                bare.init(json!({ "backend": "dkms" })),
+                Response::Ok { .. }
+            ));
             assert!(bare.dkms.is_none());
             assert_eq!(
                 error_code_ref(&bare.release(key_release_request(), None)),
@@ -3363,7 +3784,9 @@ mod tests {
             std::fs::write(&corrupt, b"{ not json").unwrap();
             let mut p = KeyProvider::default();
             assert_eq!(
-                error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": corrupt }))),
+                error_code_ref(
+                    &p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": corrupt }))
+                ),
                 "not_configured"
             );
             let _ = std::fs::remove_file(&corrupt);
@@ -3391,7 +3814,9 @@ mod tests {
                 std::fs::write(&path, serde_json::to_vec(&desc).unwrap()).unwrap();
                 let mut p = KeyProvider::default();
                 assert_eq!(
-                    error_code_ref(&p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": path }))),
+                    error_code_ref(
+                        &p.init(json!({ "backend": "dkms", "dkms_authority_descriptor": path }))
+                    ),
                     "not_configured"
                 );
                 let _ = std::fs::remove_file(&path);
@@ -3428,7 +3853,9 @@ mod tests {
             assert!(verify_hello_attestation(&pinned, &pinned, &replay, &genuine).is_err());
 
             // A malformed/empty attestation → rejected (no panic).
-            assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "!!!not-base64").is_err());
+            assert!(
+                verify_hello_attestation(&pinned, &pinned, &challenge, "!!!not-base64").is_err()
+            );
             assert!(verify_hello_attestation(&pinned, &pinned, &challenge, "").is_err());
         }
 
@@ -3444,7 +3871,8 @@ mod tests {
             let challenge = [0x24u8; 32];
             let (_secret, channel_pub) = ddrm_envelope::mint_session();
             let channel_pub_bytes = ddrm_envelope::session_public_bytes(&channel_pub);
-            let sig = ddrm_envelope::attest_channel_key(&node_signer, &challenge, &channel_pub_bytes);
+            let sig =
+                ddrm_envelope::attest_channel_key(&node_signer, &challenge, &channel_pub_bytes);
             let block = |key: &[u8], sig: &[u8]| {
                 json!({
                     "node_channel_pub_b64": b64().encode(key),
@@ -3455,7 +3883,8 @@ mod tests {
             // The genuine attested key resolves to its raw bytes.
             let genuine = block(&channel_pub_bytes, &sig);
             assert_eq!(
-                resolve_node_channel_key(&pinned, &challenge, Some(&genuine)).expect("genuine channel"),
+                resolve_node_channel_key(&pinned, &challenge, Some(&genuine))
+                    .expect("genuine channel"),
                 channel_pub_bytes
             );
             // NO channel block on a network hello → fail closed (no channel, no recover).
@@ -3551,8 +3980,7 @@ mod tests {
 
             // (2) a producer mints a CEK + KID and escrows it to that recipient under
             // the shared escrow AAD, signed by the producer's ML-DSA key.
-            let (producer_signer, producer_vk) =
-                ddrm_envelope::seal::mldsa_seal_keypair([7u8; 32]);
+            let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([7u8; 32]);
             let cek: Vec<u8> = (0u8..16).collect();
             let kid = [0xABu8; 16];
             let aad = ddrm_envelope::transcript::escrow_aad(
@@ -3567,14 +3995,13 @@ mod tests {
             // (3) the authority recovers the EXACT CEK.
             let authority = provider.reference.as_ref().unwrap();
             let recovered = authority
-                .recover_escrowed_cek(
-                    &wrapped,
-                    ddrm_envelope::SUITE_PQ_HYBRID,
-                    &kid,
-                    &producer_vk,
-                )
+                .recover_escrowed_cek(&wrapped, ddrm_envelope::SUITE_PQ_HYBRID, &kid, &producer_vk)
                 .expect("authority recovers the escrowed CEK");
-            assert_eq!(&recovered[..], &cek[..], "recovered CEK matches the escrowed CEK");
+            assert_eq!(
+                &recovered[..],
+                &cek[..],
+                "recovered CEK matches the escrowed CEK"
+            );
 
             // (4) wrong KID fails closed (AAD mismatch at the GCM tag).
             let mut bad_kid = kid;
@@ -3616,12 +4043,10 @@ mod tests {
             let data = ok_data(provider.init(json!({ "backend": "reference" })));
             let recip_b64 = data["seal_recipient_pub_b64"].as_str().unwrap();
             let recip_bytes = b64.decode(recip_b64).unwrap();
-            let recipient_public =
-                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+            let recipient_public = ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
 
             // Producer mints a CEK + KID and escrows it to the authority's recipient.
-            let (producer_signer, producer_vk) =
-                ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
+            let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
             let cek: Vec<u8> = (10u8..26).collect();
             let kid = [0x5Cu8; 16];
             let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
@@ -3669,11 +4094,17 @@ mod tests {
                 .decode(out["seal_verifying_key_b64"].as_str().unwrap())
                 .unwrap();
             let verifier = ddrm_envelope::MlDsa65Verifier::from_encoded(&vk).unwrap();
-            let recovered =
-                ddrm_envelope::hybrid_unwrap_bound(&session_secret, &envelope, transcript, &verifier)
-                    .unwrap();
+            let recovered = ddrm_envelope::hybrid_unwrap_bound(
+                &session_secret,
+                &envelope,
+                transcript,
+                &verifier,
+            )
+            .unwrap();
             assert_eq!(recovered.as_slice(), cek.as_slice());
-            assert!(!serde_json::to_string(&out).unwrap().contains(&b64.encode(&cek)));
+            assert!(!serde_json::to_string(&out)
+                .unwrap()
+                .contains(&b64.encode(&cek)));
 
             // A tampered escrow blob fails closed (no material).
             let mut bad = wrapped.clone();
@@ -3744,11 +4175,9 @@ mod tests {
             let recip_bytes = b64
                 .decode(data["seal_recipient_pub_b64"].as_str().unwrap())
                 .unwrap();
-            let recipient_public =
-                ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
+            let recipient_public = ddrm_envelope::session_public_from_bytes(&recip_bytes).unwrap();
 
-            let (producer_signer, producer_vk) =
-                ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
+            let (producer_signer, producer_vk) = ddrm_envelope::seal::mldsa_seal_keypair([3u8; 32]);
             let cek: Vec<u8> = (10u8..26).collect();
             let kid = [0x5Cu8; 16];
             let kid_hex: String = kid.iter().map(|b| format!("{b:02x}")).collect();
@@ -3763,8 +4192,7 @@ mod tests {
             .to_bytes();
 
             let (session_secret, session_public) = ddrm_envelope::mint_session();
-            let session_pub_b64 =
-                b64.encode(ddrm_envelope::session_public_bytes(&session_public));
+            let session_pub_b64 = b64.encode(ddrm_envelope::session_public_bytes(&session_public));
 
             // The escrow blob rides INSIDE the rights-bound key_envelope (not side-band).
             let mut request = key_release_request();
@@ -3836,7 +4264,9 @@ mod tests {
             );
             assert_eq!(out["suite"], json!(ddrm_envelope::SUITE_PQ_HYBRID));
             assert!(
-                !serde_json::to_string(&out).unwrap().contains(&b64.encode(&s.cek)),
+                !serde_json::to_string(&out)
+                    .unwrap()
+                    .contains(&b64.encode(&s.cek)),
                 "no raw CEK may appear in the release response"
             );
         }
@@ -3865,7 +4295,10 @@ mod tests {
             });
             let ctx: ReleaseSessionContext =
                 serde_json::from_value(v).expect("rotated session context parses");
-            assert_eq!(ctx.producer_vk2_b64.as_deref(), Some("Uk9UQVRFRC1OT0RFLVZL"));
+            assert_eq!(
+                ctx.producer_vk2_b64.as_deref(),
+                Some("Uk9UQVRFRC1OT0RFLVZL")
+            );
         }
 
         /// 2-of-3 QUORUM (Day 113–116): the session context carries an OPTIONAL third share
@@ -3876,7 +4309,10 @@ mod tests {
         fn session_context_carries_an_optional_third_share_escrow() {
             let s = escrow_scenario();
             let base = session_ctx(&s, &s.producer_vk, None).expect("session context");
-            assert!(base.wrapped_cek_share3_b64.is_none(), "absent on the non-quorum rails");
+            assert!(
+                base.wrapped_cek_share3_b64.is_none(),
+                "absent on the non-quorum rails"
+            );
             let b64 = b64();
             let v = json!({
                 "decrypt_session_pub_b64": s.session_pub_b64,
@@ -3896,7 +4332,10 @@ mod tests {
             // QUORUM ROTATION (Day 117–120): the per-share-3 producer identity is carried so a
             // rotated share-3 (re-escrowed + signed by node C) authenticates under the right key.
             assert_eq!(ctx.producer_vk3_b64.as_deref(), Some("Uk9UQVRFRC1OPURFLUM"));
-            assert!(base.producer_vk3_b64.is_none(), "absent on the non-rotated rails");
+            assert!(
+                base.producer_vk3_b64.is_none(),
+                "absent on the non-rotated rails"
+            );
         }
 
         /// A denied rights receipt is rejected BEFORE the escrow is ever touched
@@ -3906,7 +4345,10 @@ mod tests {
             let mut s = escrow_scenario();
             s.request.rights_receipt.allowed = false;
             let session = session_ctx(&s, &s.producer_vk, None);
-            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+            assert_eq!(
+                error_code(s.provider.release(s.request, session)),
+                "invalid_request"
+            );
         }
 
         /// An already-expired request is refused when the runtime supplies a clock — the
@@ -3916,7 +4358,10 @@ mod tests {
             let s = escrow_scenario();
             let expires_at = s.request.expires_at;
             let session = session_ctx(&s, &s.producer_vk, Some(expires_at)); // now == expiry -> expired
-            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+            assert_eq!(
+                error_code(s.provider.release(s.request, session)),
+                "invalid_request"
+            );
         }
 
         /// A KID-swap (the request's key_envelope.kid no longer matches the escrow's bound
@@ -3926,7 +4371,10 @@ mod tests {
             let mut s = escrow_scenario();
             s.request.key_envelope.kid = "ab".repeat(16); // a different, valid 32-hex KID
             let session = session_ctx(&s, &s.producer_vk, None);
-            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+            assert_eq!(
+                error_code(s.provider.release(s.request, session)),
+                "invalid_request"
+            );
         }
 
         /// A forged producer (the session vk doesn't match the escrow's signer) fails
@@ -3936,7 +4384,10 @@ mod tests {
             let s = escrow_scenario();
             let (_other, other_vk) = ddrm_envelope::seal::mldsa_seal_keypair([8u8; 32]);
             let session = session_ctx(&s, &other_vk, None);
-            assert_eq!(error_code(s.provider.release(s.request, session)), "invalid_request");
+            assert_eq!(
+                error_code(s.provider.release(s.request, session)),
+                "invalid_request"
+            );
         }
 
         /// Without the runtime-injected session context, the canonical `release` fails
@@ -3944,7 +4395,10 @@ mod tests {
         #[test]
         fn canonical_release_requires_session_context() {
             let s = escrow_scenario();
-            assert_eq!(error_code(s.provider.release(s.request, None)), "not_configured");
+            assert_eq!(
+                error_code(s.provider.release(s.request, None)),
+                "not_configured"
+            );
         }
 
         #[test]
@@ -4160,5 +4614,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -315,7 +315,10 @@ pub async fn open_owned_in_viewer(
         t_rights.elapsed().as_millis()
     );
     if !rights.allowed {
-        tracing::info!("owned open denied by rights for cid {}", log_fp(&object_cid));
+        tracing::info!(
+            "owned open denied by rights for cid {}",
+            log_fp(&object_cid)
+        );
         // GAP-8 custody record for the REFUSAL (best-effort: the access is already denied, so a
         // failed append cannot loosen the decision — it only loses one trail entry, logged loudly).
         if let Err(e) = state.audit_log().content_open(

@@ -106,7 +106,12 @@ pub fn decrypt_from_carrier_bound(
             if !aad.is_empty() {
                 return Err("transcript binding requires the PQ-hybrid profile".to_string());
             }
-            crate::decrypt_sealed_segment(sk, &carrier.sealed_cek, &carrier.ciphertext_segment, init)
+            crate::decrypt_sealed_segment(
+                sk,
+                &carrier.sealed_cek,
+                &carrier.ciphertext_segment,
+                init,
+            )
         }
         (SealProfile::PqHybrid, SessionSecret::PqHybrid(secret)) => {
             let envelope =
@@ -456,8 +461,14 @@ pub fn decrypt_from_carrier_threshold(
             return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
         }
     };
-    let cek_b64 =
-        reconstruct_threshold_cek(secret, sealed_share1, sealed_share2, aad, verifier1, verifier2)?;
+    let cek_b64 = reconstruct_threshold_cek(
+        secret,
+        sealed_share1,
+        sealed_share2,
+        aad,
+        verifier1,
+        verifier2,
+    )?;
     crate::decrypt_session_segment(&cek_b64, ciphertext_segment, init_segment)
 }
 
@@ -486,8 +497,14 @@ pub fn decrypt_from_carrier_threshold_segments(
             return Err("threshold reconstruction requires the PQ-hybrid session".to_string())
         }
     };
-    let cek_b64 =
-        reconstruct_threshold_cek(secret, sealed_share1, sealed_share2, aad, verifier1, verifier2)?;
+    let cek_b64 = reconstruct_threshold_cek(
+        secret,
+        sealed_share1,
+        sealed_share2,
+        aad,
+        verifier1,
+        verifier2,
+    )?;
     let segments = ordered_segments(ciphertext_segment, extra_segments);
     crate::decrypt_session_segments(&cek_b64, &segments, init_segment)
 }
@@ -606,7 +623,8 @@ pub fn decrypt_from_carrier_quorum_k<V: CekSealVerifier>(
         let env = PqSealedEnvelope::from_bytes(sealed).map_err(|e| format!("{e:?}"))?;
         for (i, verifier) in node_verifiers.iter().enumerate() {
             let expected_x = (i + 1) as u8;
-            if let Ok(payload) = crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
+            if let Ok(payload) =
+                crate::pq_envelope::hybrid_unwrap_bound(secret, &env, aad, verifier)
             {
                 let (x, share) = ddrm_envelope::parse_indexed_share(&payload)
                     .ok_or("sealed quorum share carries no valid x-coordinate")?;
@@ -633,7 +651,10 @@ pub fn decrypt_from_carrier_quorum_k<V: CekSealVerifier>(
         shares.push((x, body));
     }
 
-    let points: Vec<(u8, &[u8])> = shares.iter().map(|(x, body)| (*x, body.as_slice())).collect();
+    let points: Vec<(u8, &[u8])> = shares
+        .iter()
+        .map(|(x, body)| (*x, body.as_slice()))
+        .collect();
     let cek = ddrm_envelope::lagrange_combine_at_zero(&points).map_err(|e| e.to_string())?;
     let cek_b64 = zeroize::Zeroizing::new(base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
@@ -699,8 +720,12 @@ mod tests {
     fn classical_carrier(v: &Value) -> SealedDecryptBundle {
         SealedDecryptBundle {
             profile: SealProfile::ClassicalP256,
-            sealed_cek: b64().decode(v["sealed_envelope_b64"].as_str().unwrap()).unwrap(),
-            ciphertext_segment: b64().decode(v["encrypted_segment_b64"].as_str().unwrap()).unwrap(),
+            sealed_cek: b64()
+                .decode(v["sealed_envelope_b64"].as_str().unwrap())
+                .unwrap(),
+            ciphertext_segment: b64()
+                .decode(v["encrypted_segment_b64"].as_str().unwrap())
+                .unwrap(),
             init_segment: None,
         }
     }
@@ -709,7 +734,9 @@ mod tests {
     fn classical_carrier_decrypts_to_plaintext() {
         let v = classical_vector();
         let sk = p256::SecretKey::from_slice(
-            &b64().decode(v["session_secret_key_b64"].as_str().unwrap()).unwrap(),
+            &b64()
+                .decode(v["session_secret_key_b64"].as_str().unwrap())
+                .unwrap(),
         )
         .unwrap();
         let carrier = classical_carrier(&v);
@@ -718,7 +745,9 @@ mod tests {
             decrypt_from_carrier(&SessionSecret::ClassicalP256(sk), &carrier, &StubVerifier)
                 .expect("carrier should decrypt");
 
-        let expected = b64().decode(v["expected_plaintext_b64"].as_str().unwrap()).unwrap();
+        let expected = b64()
+            .decode(v["expected_plaintext_b64"].as_str().unwrap())
+            .unwrap();
         let off = carrier.ciphertext_segment.len() - expected.len();
         assert_eq!(&output[off..], expected.as_slice());
         assert_eq!(meta["is_protected"], serde_json::json!(true));
@@ -730,8 +759,12 @@ mod tests {
         let wrong = p256::SecretKey::random(&mut rand_core::OsRng);
         let carrier = classical_carrier(&v);
         assert!(
-            decrypt_from_carrier(&SessionSecret::ClassicalP256(wrong), &carrier, &StubVerifier)
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::ClassicalP256(wrong),
+                &carrier,
+                &StubVerifier
+            )
+            .is_err(),
             "a wrong VM session key must fail closed"
         );
     }
@@ -740,14 +773,17 @@ mod tests {
     fn classical_carrier_malformed_fails_closed() {
         let v = classical_vector();
         let sk = p256::SecretKey::from_slice(
-            &b64().decode(v["session_secret_key_b64"].as_str().unwrap()).unwrap(),
+            &b64()
+                .decode(v["session_secret_key_b64"].as_str().unwrap())
+                .unwrap(),
         )
         .unwrap();
         let mut carrier = classical_carrier(&v);
         carrier.sealed_cek.truncate(5); // malformed envelope
 
         assert!(
-            decrypt_from_carrier(&SessionSecret::ClassicalP256(sk), &carrier, &StubVerifier).is_err(),
+            decrypt_from_carrier(&SessionSecret::ClassicalP256(sk), &carrier, &StubVerifier)
+                .is_err(),
             "a malformed carrier must fail closed"
         );
     }
@@ -758,14 +794,19 @@ mod tests {
         let carrier = classical_carrier(&v); // ClassicalP256 profile
         let (secret, _public) = gen_session(); // Pq session secret
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier).is_err(),
+            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier)
+                .is_err(),
             "profile/secret mismatch must fail closed"
         );
     }
 
     // --- PQ-hybrid profile (the shipped target) ---
 
-    fn pq_carrier(public: &crate::pq_envelope::SessionKemPublic, cek: &[u8; 16], segment: Vec<u8>) -> SealedDecryptBundle {
+    fn pq_carrier(
+        public: &crate::pq_envelope::SessionKemPublic,
+        cek: &[u8; 16],
+        segment: Vec<u8>,
+    ) -> SealedDecryptBundle {
         // The key authority seals the CEK; the carrier transports its wire form.
         let env = seal(public, cek, &StubSigner);
         SealedDecryptBundle {
@@ -799,11 +840,13 @@ mod tests {
         let (_secret_a, public_a) = gen_session();
         let (secret_b, _public_b) = gen_session();
         let cek = [0x11u8; 16];
-        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
+        let segment =
+            build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
         let carrier = pq_carrier(&public_a, &cek, segment);
 
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(secret_b), &carrier, &StubVerifier).is_err(),
+            decrypt_from_carrier(&SessionSecret::PqHybrid(secret_b), &carrier, &StubVerifier)
+                .is_err(),
             "a wrong PQ session secret must fail closed"
         );
     }
@@ -812,14 +855,16 @@ mod tests {
     fn pq_carrier_tampered_signature_fails_closed() {
         let (secret, public) = gen_session();
         let cek = [0x11u8; 16];
-        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
+        let segment =
+            build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
         let mut carrier = pq_carrier(&public, &cek, segment);
         // Flip the last byte (the signature tail) of the wire envelope.
         let n = carrier.sealed_cek.len();
         carrier.sealed_cek[n - 1] ^= 0xFF;
 
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier).is_err(),
+            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier)
+                .is_err(),
             "a tampered carrier signature must fail closed"
         );
     }
@@ -828,12 +873,14 @@ mod tests {
     fn pq_carrier_malformed_fails_closed() {
         let (secret, public) = gen_session();
         let cek = [0x11u8; 16];
-        let segment = build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
+        let segment =
+            build_encrypted_segment(b"the quick brown fox jumps over!!", &cek, &[0x22u8; 8]);
         let mut carrier = pq_carrier(&public, &cek, segment);
         carrier.sealed_cek.truncate(10); // malformed PQ envelope
 
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier).is_err(),
+            decrypt_from_carrier(&SessionSecret::PqHybrid(secret), &carrier, &StubVerifier)
+                .is_err(),
             "a malformed PQ carrier must fail closed"
         );
     }
@@ -867,11 +914,17 @@ mod tests {
             profile: SealProfile::ClassicalP256,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
-            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+            init_segment: v
+                .init_segment_b64
+                .as_ref()
+                .map(|s| b64().decode(s).unwrap()),
         };
-        let (output, meta) =
-            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_session(&v)), &carrier, &StubVerifier)
-                .expect("carrier golden should decrypt through the shim");
+        let (output, meta) = decrypt_from_carrier(
+            &SessionSecret::ClassicalP256(classical_session(&v)),
+            &carrier,
+            &StubVerifier,
+        )
+        .expect("carrier golden should decrypt through the shim");
 
         let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
         let off = carrier.ciphertext_segment.len() - expected.len();
@@ -894,8 +947,12 @@ mod tests {
             init_segment: None,
         };
         assert!(
-            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_session(&v)), &carrier, &StubVerifier)
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::ClassicalP256(classical_session(&v)),
+                &carrier,
+                &StubVerifier
+            )
+            .is_err(),
             "a tampered carrier golden must fail closed"
         );
     }
@@ -912,8 +969,14 @@ mod tests {
     }
 
     #[cfg(not(feature = "gen-vectors"))]
-    fn pq_session(v: &crate::vector_format::RailCarrierVector) -> crate::pq_envelope::SessionKemSecret {
-        let x: [u8; 32] = b64().decode(&v.session_secret_key_b64).unwrap().try_into().unwrap();
+    fn pq_session(
+        v: &crate::vector_format::RailCarrierVector,
+    ) -> crate::pq_envelope::SessionKemSecret {
+        let x: [u8; 32] = b64()
+            .decode(&v.session_secret_key_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let dk = b64()
             .decode(v.mlkem_dk_b64.as_ref().expect("PQ carrier needs mlkem_dk"))
             .unwrap();
@@ -932,11 +995,17 @@ mod tests {
             profile: SealProfile::PqHybrid,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
-            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+            init_segment: v
+                .init_segment_b64
+                .as_ref()
+                .map(|s| b64().decode(s).unwrap()),
         };
-        let (output, meta) =
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &StubVerifier)
-                .expect("PQ carrier golden should decrypt through the shim");
+        let (output, meta) = decrypt_from_carrier(
+            &SessionSecret::PqHybrid(pq_session(&v)),
+            &carrier,
+            &StubVerifier,
+        )
+        .expect("PQ carrier golden should decrypt through the shim");
 
         let expected = b64().decode(&v.expected_plaintext_b64).unwrap();
         let off = carrier.ciphertext_segment.len() - expected.len();
@@ -959,8 +1028,12 @@ mod tests {
             init_segment: None,
         };
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &StubVerifier)
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::PqHybrid(pq_session(&v)),
+                &carrier,
+                &StubVerifier
+            )
+            .is_err(),
             "a tampered PQ carrier golden must fail closed"
         );
     }
@@ -983,9 +1056,15 @@ mod tests {
     }
 
     #[cfg(all(feature = "pq-mldsa", not(feature = "gen-vectors")))]
-    fn mldsa_verifier(v: &crate::vector_format::RailCarrierVector) -> crate::pq_envelope::mldsa::MlDsa65Verifier {
+    fn mldsa_verifier(
+        v: &crate::vector_format::RailCarrierVector,
+    ) -> crate::pq_envelope::mldsa::MlDsa65Verifier {
         let vk = b64()
-            .decode(v.mldsa_vk_b64.as_ref().expect("real-signed PQ carrier needs mldsa_vk"))
+            .decode(
+                v.mldsa_vk_b64
+                    .as_ref()
+                    .expect("real-signed PQ carrier needs mldsa_vk"),
+            )
             .unwrap();
         crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(&vk).expect("ML-DSA-65 vk decodes")
     }
@@ -996,7 +1075,10 @@ mod tests {
             profile: SealProfile::PqHybrid,
             sealed_cek: b64().decode(&v.sealed_cek_b64).unwrap(),
             ciphertext_segment: b64().decode(&v.ciphertext_segment_b64).unwrap(),
-            init_segment: v.init_segment_b64.as_ref().map(|s| b64().decode(s).unwrap()),
+            init_segment: v
+                .init_segment_b64
+                .as_ref()
+                .map(|s| b64().decode(s).unwrap()),
         }
     }
 
@@ -1030,8 +1112,12 @@ mod tests {
         let n = carrier.sealed_cek.len();
         carrier.sealed_cek[n - 1] ^= 0xFF; // corrupt the signature tail
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::PqHybrid(pq_session(&v)),
+                &carrier,
+                &mldsa_verifier(&v)
+            )
+            .is_err(),
             "a tampered ML-DSA-65 carrier signature must fail closed"
         );
     }
@@ -1046,11 +1132,15 @@ mod tests {
 
         // A genuine but unrelated verifying key (deterministic from a different seed).
         let other_seed: ml_dsa::B32 = [0xABu8; 32].into();
-        let other_vk = SigningKey::<MlDsa65>::from_seed(&other_seed).verifying_key().encode().to_vec();
+        let other_vk = SigningKey::<MlDsa65>::from_seed(&other_seed)
+            .verifying_key()
+            .encode()
+            .to_vec();
         let wrong = crate::pq_envelope::mldsa::MlDsa65Verifier::from_encoded(&other_vk).unwrap();
 
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &wrong).is_err(),
+            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &wrong)
+                .is_err(),
             "a carrier signed by key A must not verify under key B"
         );
     }
@@ -1064,8 +1154,12 @@ mod tests {
         let mid = carrier.sealed_cek.len() / 2; // lands in the signed envelope body
         carrier.sealed_cek[mid] ^= 0xFF;
         assert!(
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::PqHybrid(pq_session(&v)),
+                &carrier,
+                &mldsa_verifier(&v)
+            )
+            .is_err(),
             "a tampered carrier body must fail closed"
         );
     }
@@ -1091,8 +1185,12 @@ mod tests {
         };
         let classical_secret = p256::SecretKey::random(&mut rand_core::OsRng);
         assert!(
-            decrypt_from_carrier(&SessionSecret::ClassicalP256(classical_secret), &carrier, &StubVerifier)
-                .is_err(),
+            decrypt_from_carrier(
+                &SessionSecret::ClassicalP256(classical_secret),
+                &carrier,
+                &StubVerifier
+            )
+            .is_err(),
             "a PQ carrier with a classical secret must fail closed"
         );
     }
@@ -1115,8 +1213,12 @@ mod tests {
                 init_segment: None,
             };
             assert!(
-                decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
-                    .is_err(),
+                decrypt_from_carrier(
+                    &SessionSecret::PqHybrid(pq_session(&v)),
+                    &carrier,
+                    &mldsa_verifier(&v)
+                )
+                .is_err(),
                 "carrier byte {i} flip must fail closed"
             );
         }
@@ -1134,11 +1236,17 @@ mod tests {
 
         // Happy path: scoped metadata must not contain the plaintext.
         let carrier = pq_mldsa_carrier(&v);
-        let (_out, meta) =
-            decrypt_from_carrier(&SessionSecret::PqHybrid(pq_session(&v)), &carrier, &mldsa_verifier(&v))
-                .expect("golden should decrypt");
+        let (_out, meta) = decrypt_from_carrier(
+            &SessionSecret::PqHybrid(pq_session(&v)),
+            &carrier,
+            &mldsa_verifier(&v),
+        )
+        .expect("golden should decrypt");
         let meta_str = serde_json::to_string(&meta).unwrap();
-        assert!(!meta_str.contains(&pt_str), "metadata must not contain the plaintext");
+        assert!(
+            !meta_str.contains(&pt_str),
+            "metadata must not contain the plaintext"
+        );
 
         // Tampered path: the error string must not contain the plaintext either.
         let mut tampered = pq_mldsa_carrier(&v);
@@ -1150,7 +1258,10 @@ mod tests {
             &mldsa_verifier(&v),
         )
         .unwrap_err();
-        assert!(!err.contains(&pt_str), "error string must not contain the plaintext");
+        assert!(
+            !err.contains(&pt_str),
+            "error string must not contain the plaintext"
+        );
     }
 
     /// Day 121–125: the boundary OPENS a RECONFIGURED **3-of-5** quorum — the
@@ -1194,7 +1305,11 @@ mod tests {
         let session = SessionSecret::PqHybrid(secret);
 
         // ANY THREE shares open the reconfigured quorum and decrypt.
-        let pick = [sealed[0].as_slice(), sealed[2].as_slice(), sealed[4].as_slice()];
+        let pick = [
+            sealed[0].as_slice(),
+            sealed[2].as_slice(),
+            sealed[4].as_slice(),
+        ];
         let (out, meta) =
             decrypt_from_carrier_quorum_k(&session, 3, &pick, aad, &verifiers, &segment, None)
                 .expect("any 3-of-5 shares open the reconfigured quorum");
@@ -1205,21 +1320,29 @@ mod tests {
         // BELOW quorum: two shares fail closed.
         let two = [sealed[0].as_slice(), sealed[1].as_slice()];
         assert!(
-            decrypt_from_carrier_quorum_k(&session, 3, &two, aad, &verifiers, &segment, None).is_err(),
+            decrypt_from_carrier_quorum_k(&session, 3, &two, aad, &verifiers, &segment, None)
+                .is_err(),
             "two shares are below the 3-of-5 quorum"
         );
 
         // A replayed single share can never reach quorum.
-        let dup = [sealed[0].as_slice(), sealed[0].as_slice(), sealed[0].as_slice()];
+        let dup = [
+            sealed[0].as_slice(),
+            sealed[0].as_slice(),
+            sealed[0].as_slice(),
+        ];
         assert!(
-            decrypt_from_carrier_quorum_k(&session, 3, &dup, aad, &verifiers, &segment, None).is_err(),
+            decrypt_from_carrier_quorum_k(&session, 3, &dup, aad, &verifiers, &segment, None)
+                .is_err(),
             "the same share presented three times is not a real quorum"
         );
 
         // A share whose sealed x disagrees with its signing identity is refused: node x=1
         // signs an x=2 payload — the boundary binds the coordinate to the identity.
-        let mis_payload =
-            ddrm_envelope::indexed_share(2, &ddrm_envelope::reshare_eval(&cek, &higher, 2).unwrap());
+        let mis_payload = ddrm_envelope::indexed_share(
+            2,
+            &ddrm_envelope::reshare_eval(&cek, &higher, 2).unwrap(),
+        );
         let mis_env = seal_bound(&public, &mis_payload, aad, &signers[0]);
         let mis = [mis_env.to_bytes(), sealed[2].clone(), sealed[3].clone()];
         let mis_refs: Vec<&[u8]> = mis.iter().map(|s| s.as_slice()).collect();
@@ -1286,12 +1409,19 @@ mod tests {
             decrypt_from_carrier_quorum_k(&session, 2, &pick, aad, &verifiers, &segment, None)
                 .expect("any 2-of-3 DKG-born shares open the quorum");
         let off = segment.len() - plaintext.len();
-        assert_eq!(&out[off..], plaintext, "the DKG-born quorum decrypts the content");
+        assert_eq!(
+            &out[off..],
+            plaintext,
+            "the DKG-born quorum decrypts the content"
+        );
         assert_eq!(meta["is_protected"], serde_json::json!(true));
 
         // The DKG CEK BINDING verifies for the reconstructed CEK (and rejects a wrong one).
         let dkg_id = [0x33u8; 16];
-        let node_set = ddrm_envelope::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let node_set = ddrm_envelope::threshold_node_set_id_n(
+            2,
+            &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]],
+        );
         let binding = ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &cek);
         assert_eq!(
             binding,
@@ -1300,12 +1430,17 @@ mod tests {
         );
         let mut wrong = cek;
         wrong[0] ^= 0x01;
-        assert_ne!(binding, ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &wrong), "binding rejects a wrong CEK");
+        assert_ne!(
+            binding,
+            ddrm_envelope::dkg_cek_binding(&dkg_id, &node_set, &wrong),
+            "binding rejects a wrong CEK"
+        );
 
         // BELOW quorum: one DKG-born share fails closed.
         let one = [sealed[1].as_slice()];
         assert!(
-            decrypt_from_carrier_quorum_k(&session, 2, &one, aad, &verifiers, &segment, None).is_err(),
+            decrypt_from_carrier_quorum_k(&session, 2, &one, aad, &verifiers, &segment, None)
+                .is_err(),
             "one DKG-born share is below the 2-of-3 quorum"
         );
     }
@@ -1371,7 +1506,14 @@ mod tests {
         let now = 1u64;
         let att = |i: usize| {
             ddrm_envelope::sign_release_attestation(
-                &node_signers[i], content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry,
+                &node_signers[i],
+                content_id,
+                principal_id,
+                right,
+                &node_set_id,
+                &session_pub,
+                &kid,
+                expiry,
             )
         };
         let a0 = att(0);
@@ -1379,7 +1521,17 @@ mod tests {
         let proof: Vec<(usize, &[u8])> = vec![(0, &a0), (2, &a2)];
         assert_eq!(
             ddrm_envelope::verify_quorum_release_proof(
-                t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof,
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof,
             ),
             Ok(2),
             "the aggregated proof verifies offline and names the serving node-set"
@@ -1387,14 +1539,34 @@ mod tests {
         // Under-quorum: a single attestation is rejected.
         assert!(matches!(
             ddrm_envelope::verify_quorum_release_proof(
-                t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, a0.as_slice())],
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &[(0, a0.as_slice())],
             ),
             Err(ddrm_envelope::QuorumProofError::BelowQuorum { .. })
         ));
         // Wrong-principal: the proof does not authorize a different principal.
         assert!(matches!(
             ddrm_envelope::verify_quorum_release_proof(
-                t, &members, &node_set_id, content_id, b"principal:eve", right, &session_pub, &kid, expiry, now, &proof,
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                b"principal:eve",
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof,
             ),
             Err(ddrm_envelope::QuorumProofError::BadSignature { .. })
         ));
@@ -1436,18 +1608,40 @@ mod tests {
         let qsession = SessionSecret::PqHybrid(qsecret);
 
         let (plaintexts, meta) = decrypt_from_carrier_quorum_segments(
-            &qsession, &qsealed[0], &qsealed[2], aad, &qverifiers, &seg0, &extras, None,
+            &qsession,
+            &qsealed[0],
+            &qsealed[2],
+            aad,
+            &qverifiers,
+            &seg0,
+            &extras,
+            None,
         )
         .expect("any 2-of-3 shares open the multi-segment asset");
-        assert_eq!(meta["segment_count"], serde_json::json!(2), "both fragments reported");
+        assert_eq!(
+            meta["segment_count"],
+            serde_json::json!(2),
+            "both fragments reported"
+        );
         assert_eq!(plaintexts.len(), 2, "each segment yields its plaintext");
         assert_eq!(&plaintexts[0][off0..], plaintext0, "segment 0 decrypts");
-        assert_eq!(&plaintexts[1][off1..], plaintext1, "segment 1 decrypts under the same CEK");
+        assert_eq!(
+            &plaintexts[1][off1..],
+            plaintext1,
+            "segment 1 decrypts under the same CEK"
+        );
 
         // Below quorum: one node's share twice fails the WHOLE open closed.
         assert!(
             decrypt_from_carrier_quorum_segments(
-                &qsession, &qsealed[0], &qsealed[0], aad, &qverifiers, &seg0, &extras, None,
+                &qsession,
+                &qsealed[0],
+                &qsealed[0],
+                aad,
+                &qverifiers,
+                &seg0,
+                &extras,
+                None,
             )
             .is_err(),
             "the same node share twice is not a quorum — fail closed"
@@ -1471,7 +1665,11 @@ mod tests {
         .expect("2-of-2 opens the multi-segment asset");
         assert_eq!(tmeta["segment_count"], serde_json::json!(2));
         assert_eq!(&tplain[0][off0..], plaintext0, "segment 0 decrypts");
-        assert_eq!(&tplain[1][off1..], plaintext1, "segment 1 decrypts under the same CEK");
+        assert_eq!(
+            &tplain[1][off1..],
+            plaintext1,
+            "segment 1 decrypts under the same CEK"
+        );
 
         // A second share NOT sealed by node B fails the whole threshold open closed.
         let (rogue_signer, _rogue_vk) = mldsa_seal_keypair([0x99u8; 32]);

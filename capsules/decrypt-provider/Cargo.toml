@@ -126,6 +126,13 @@ gen-vectors = ["vectors"]
 # unwrap re-exports the shared crate, so this also confirms the dedup stays coherent.
 # Adds one test under `pq-mldsa`. OFF by default.
 envelope-conformance = ["pq-mldsa"]
+# pdf-render: the "pixel-lock" secure renderer (PC2 ddrm-renderer parity). Rasterises a
+# protected PDF page to a watermarked JPEG INSIDE this decrypt boundary via the pure-Rust,
+# `#![forbid(unsafe_code)]` `hayro` rasteriser — so the plaintext PDF never leaves the sandbox
+# (only a flattened, buyer-watermarked page image egresses). Closes the "raw plaintext reaches
+# the browser" gap and is browser-agnostic (an image always renders). Pulls `hayro` + `image`
+# only when enabled; the default + security-critical builds stay lean. OFF by default.
+pdf-render = ["dep:hayro", "dep:image", "dep:font8x8"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
@@ -162,6 +169,17 @@ ml-dsa = { version = "0.1", default-features = false, optional = true }
 # verify-only rungs pull no RNG; on wasm32-wasip1 getrandom uses WASI `random_get`.
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 getrandom = { version = "0.2", optional = true }
+# Pixel-lock PDF renderer (feature `pdf-render`). `hayro` is a pure-Rust,
+# `#![forbid(unsafe_code)]` PDF rasteriser that compiles to wasm32-wasip1; `image` encodes the
+# rasterised page to JPEG. Mirrors PC2's ddrm-renderer (same crates/versions) so the secure-view
+# behaviour stays aligned. Optional → no footprint on the default decrypt build.
+hayro = { version = "0.5", default-features = false, features = ["embed-fonts"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+# Forensic-watermark glyphs (feature `pdf-render`). `font8x8` is public-domain const bitmap
+# data for the FULL printable-ASCII set (no font-file vendoring, no runtime, builds to
+# wasm32-wasip1), so any principal/DID/wallet stamps legibly. Replaces the prior hand-rolled
+# hex-only font that garbled non-hex characters. Optional → no footprint on the default build.
+font8x8 = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }

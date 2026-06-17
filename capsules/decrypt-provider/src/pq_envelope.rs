@@ -120,8 +120,8 @@ pub fn decrypt_pq_sealed_segment_bound(
     use base64::Engine as _;
     use zeroize::Zeroizing;
 
-    let cek =
-        hybrid_unwrap_bound(session, sealed_envelope, aad, verifier).map_err(|err| format!("{err:?}"))?;
+    let cek = hybrid_unwrap_bound(session, sealed_envelope, aad, verifier)
+        .map_err(|err| format!("{err:?}"))?;
     // Bridge the recovered CEK into the cenc engine's command surface, held in
     // `Zeroizing` so it is scrubbed across the internal hand-off (same discipline
     // as the classical `decrypt_sealed_segment`).
@@ -147,8 +147,8 @@ pub fn decrypt_pq_sealed_segments_bound(
     use base64::Engine as _;
     use zeroize::Zeroizing;
 
-    let cek =
-        hybrid_unwrap_bound(session, sealed_envelope, aad, verifier).map_err(|err| format!("{err:?}"))?;
+    let cek = hybrid_unwrap_bound(session, sealed_envelope, aad, verifier)
+        .map_err(|err| format!("{err:?}"))?;
     let cek_b64 = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(cek.as_slice()));
     crate::decrypt_session_segments(&cek_b64, ciphertext_segments, init_segment)
 }
@@ -221,7 +221,11 @@ mod tests {
 
         let recovered = hybrid_unwrap(&secret, &env, &StubVerifier).expect("unwrap");
         // `recovered` is `Zeroizing<Vec<u8>>` (compile-time containment).
-        assert_eq!(recovered.as_slice(), &cek, "hybrid KEM + AEAD recovers the CEK");
+        assert_eq!(
+            recovered.as_slice(),
+            &cek,
+            "hybrid KEM + AEAD recovers the CEK"
+        );
     }
 
     #[test]
@@ -308,8 +312,13 @@ mod tests {
         let cek = [0x42u8; 16];
         let env = seal(&public, &cek, &signer);
 
-        let recovered = hybrid_unwrap(&secret, &env, &verifier).expect("unwrap with real ML-DSA-65");
-        assert_eq!(recovered.as_slice(), &cek, "real ML-DSA-65 verify gates a correct unwrap");
+        let recovered =
+            hybrid_unwrap(&secret, &env, &verifier).expect("unwrap with real ML-DSA-65");
+        assert_eq!(
+            recovered.as_slice(),
+            &cek,
+            "real ML-DSA-65 verify gates a correct unwrap"
+        );
 
         let mut tampered = env;
         tampered.signature[0] ^= 0xFF;
@@ -353,7 +362,10 @@ mod tests {
 
         let mut bad = msg.to_vec();
         bad[0] ^= 0xFF;
-        assert!(!verifier.verify(&bad, &sig), "a tampered body must fail closed");
+        assert!(
+            !verifier.verify(&bad, &sig),
+            "a tampered body must fail closed"
+        );
     }
 
     /// Malformed encodings fail closed without panicking: a wrong-size signature
@@ -363,7 +375,10 @@ mod tests {
     fn mldsa_malformed_inputs_fail_closed() {
         let (_signer, vk_bytes) = mldsa_keypair([3u8; 32]);
         let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk_bytes).expect("verifier");
-        assert!(!verifier.verify(b"msg", &[0u8; 8]), "wrong-size signature must fail closed");
+        assert!(
+            !verifier.verify(b"msg", &[0u8; 8]),
+            "wrong-size signature must fail closed"
+        );
         assert!(
             mldsa::MlDsa65Verifier::from_encoded(&[0u8; 8]).is_none(),
             "wrong-size verifying-key encoding must yield no verifier"
@@ -402,7 +417,10 @@ mod tests {
     /// Deterministic hybrid keypair from two seeds. Returns the signer + the
     /// published verifying keys (ECDSA SEC1 compressed point, ML-DSA-65 encoding).
     #[cfg(feature = "pq-mldsa-hybrid")]
-    fn hybrid_keypair(ecdsa_seed: [u8; 32], mldsa_seed: [u8; 32]) -> (HybridSigner, Vec<u8>, Vec<u8>) {
+    fn hybrid_keypair(
+        ecdsa_seed: [u8; 32],
+        mldsa_seed: [u8; 32],
+    ) -> (HybridSigner, Vec<u8>, Vec<u8>) {
         use p256::elliptic_curve::sec1::ToEncodedPoint;
         let ecdsa = p256::ecdsa::SigningKey::from_slice(&ecdsa_seed).expect("valid p256 scalar");
         let ecdsa_sec1 = ecdsa
@@ -420,14 +438,19 @@ mod tests {
     #[test]
     fn hybrid_real_signatures_drive_hybrid_unwrap() {
         let (signer, ecdsa_vk, mldsa_vk) = hybrid_keypair([0x11u8; 32], [0x22u8; 32]);
-        let verifier = hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
+        let verifier =
+            hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
 
         let (secret, public) = gen_session();
         let cek = [0x42u8; 16];
         let env = seal(&public, &cek, &signer);
 
         let recovered = hybrid_unwrap(&secret, &env, &verifier).expect("unwrap with hybrid verify");
-        assert_eq!(recovered.as_slice(), &cek, "hybrid (ECDSA+ML-DSA) verify gates the unwrap");
+        assert_eq!(
+            recovered.as_slice(),
+            &cek,
+            "hybrid (ECDSA+ML-DSA) verify gates the unwrap"
+        );
 
         let mut tampered = env;
         tampered.signature[0] ^= 0xFF;
@@ -475,24 +498,37 @@ mod tests {
     #[test]
     fn hybrid_malformed_inputs_fail_closed() {
         let (signer, ecdsa_vk, mldsa_vk) = hybrid_keypair([0x11u8; 32], [0x22u8; 32]);
-        let verifier = hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
+        let verifier =
+            hybrid::HybridVerifier::from_encoded(&ecdsa_vk, &mldsa_vk).expect("verifier");
 
         let (_secret, public) = gen_session();
         let env = seal(&public, &[0x42u8; 16], &signer);
         let good = &env.signature;
         let msg = env.signed_payload();
-        assert!(verifier.verify(&msg, good), "the genuine hybrid signature verifies");
+        assert!(
+            verifier.verify(&msg, good),
+            "the genuine hybrid signature verifies"
+        );
 
         // Every proper prefix must fail closed (no panic, no partial-accept).
         for n in 0..good.len() {
-            assert!(!verifier.verify(&msg, &good[..n]), "prefix len {n} must fail closed");
+            assert!(
+                !verifier.verify(&msg, &good[..n]),
+                "prefix len {n} must fail closed"
+            );
         }
         // Trailing byte appended -> exact-framing check rejects it.
         let mut trailing = good.clone();
         trailing.push(0x00);
-        assert!(!verifier.verify(&msg, &trailing), "trailing bytes must fail closed");
+        assert!(
+            !verifier.verify(&msg, &trailing),
+            "trailing bytes must fail closed"
+        );
         // Garbage / wrong-size key encodings.
-        assert!(!verifier.verify(&msg, &[0u8; 8]), "garbage signature must fail closed");
+        assert!(
+            !verifier.verify(&msg, &[0u8; 8]),
+            "garbage signature must fail closed"
+        );
         assert!(
             hybrid::HybridVerifier::from_encoded(&[0u8; 8], &mldsa_vk).is_none(),
             "malformed ECDSA key encoding must yield no verifier"
@@ -552,7 +588,8 @@ mod tests {
         let transcript = b64.decode(&v.transcript_b64).unwrap();
         let sig = b64.decode(&v.signature_b64).unwrap();
 
-        let verifier = mldsa::MlDsa65Verifier::from_encoded(&vk).expect("KAT verifying key decodes");
+        let verifier =
+            mldsa::MlDsa65Verifier::from_encoded(&vk).expect("KAT verifying key decodes");
         assert!(
             verifier.verify(&transcript, &sig),
             "the committed ML-DSA-65 KAT signature must verify"
@@ -560,11 +597,17 @@ mod tests {
 
         let mut bad_sig = sig.clone();
         bad_sig[0] ^= 0xFF;
-        assert!(!verifier.verify(&transcript, &bad_sig), "tampered KAT signature must fail closed");
+        assert!(
+            !verifier.verify(&transcript, &bad_sig),
+            "tampered KAT signature must fail closed"
+        );
 
         let mut bad_body = transcript.clone();
         bad_body[0] ^= 0xFF;
-        assert!(!verifier.verify(&bad_body, &sig), "tampered KAT body must fail closed");
+        assert!(
+            !verifier.verify(&bad_body, &sig),
+            "tampered KAT body must fail closed"
+        );
     }
 
     // --- full pre-rail data path (feature = "pq-rail-prep") --------------------
@@ -647,7 +690,10 @@ mod tests {
         // and never appeared in the sealed envelope.
         let cek_b64 = base64::engine::general_purpose::STANDARD.encode(cek);
         let meta_str = serde_json::to_string(&meta).unwrap();
-        assert!(!meta_str.contains(&cek_b64), "CEK must not surface in decrypt metadata");
+        assert!(
+            !meta_str.contains(&cek_b64),
+            "CEK must not surface in decrypt metadata"
+        );
         assert!(
             !env.to_bytes().windows(cek.len()).any(|w| w == cek),
             "CEK must not appear in the sealed PQ envelope"
@@ -667,7 +713,8 @@ mod tests {
         // The wrong session secret cannot unwrap the CEK -> the whole path fails
         // closed before any segment is decrypted.
         assert!(
-            super::decrypt_pq_sealed_segment(&secret_b, &env, &StubVerifier, &segment, None).is_err()
+            super::decrypt_pq_sealed_segment(&secret_b, &env, &StubVerifier, &segment, None)
+                .is_err()
         );
     }
 
@@ -695,7 +742,9 @@ mod tests {
         let segment = build_encrypted_segment(plaintext, &cek, &iv8);
 
         let v = crate::vector_format::PqVector {
-            description: "x25519+ML-KEM-768 hybrid seal -> CENC AES-128-CTR (elastos-pq-hybrid-threshold-v0)".to_string(),
+            description:
+                "x25519+ML-KEM-768 hybrid seal -> CENC AES-128-CTR (elastos-pq-hybrid-threshold-v0)"
+                    .to_string(),
             x25519_secret_b64: b64.encode(secret.x25519.to_bytes()),
             mlkem_dk_b64: b64.encode(&secret.mlkem_dk.as_bytes()[..]),
             eph_x25519_pub_b64: b64.encode(env.eph_x25519_pub),
@@ -736,11 +785,10 @@ mod tests {
         let segment = build_encrypted_segment(plaintext, &cek, &iv8);
 
         let v = crate::vector_format::RailCarrierVector {
-            description:
-                "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768): sealed CEK \
+            description: "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768): sealed CEK \
                  (PqSealedEnvelope::to_bytes) + segment -> decrypt_from_carrier PQ branch; \
                  runtime-only profile (no PC2 session counterpart, so no cross-impl layer)"
-                    .to_string(),
+                .to_string(),
             profile: "PqHybrid".to_string(),
             session_secret_key_b64: b64.encode(secret.x25519.to_bytes()),
             mlkem_dk_b64: Some(b64.encode(&secret.mlkem_dk.as_bytes()[..])),
@@ -780,12 +828,11 @@ mod tests {
         let segment = build_encrypted_segment(plaintext, &cek, &iv8);
 
         let v = crate::vector_format::RailCarrierVector {
-            description:
-                "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768 + REAL ML-DSA-65 \
+            description: "rail Option A carrier (PQ-hybrid x25519+ML-KEM-768 + REAL ML-DSA-65 \
                  signature): sealed CEK (PqSealedEnvelope::to_bytes, signature is a \
                  genuine FIPS 204 ML-DSA-65 sig) + segment -> decrypt_from_carrier PQ \
                  branch verified by MlDsa65Verifier(mldsa_vk_b64); runtime-only profile"
-                    .to_string(),
+                .to_string(),
             profile: "PqHybrid".to_string(),
             session_secret_key_b64: b64.encode(secret.x25519.to_bytes()),
             mlkem_dk_b64: Some(b64.encode(&secret.mlkem_dk.as_bytes()[..])),
@@ -805,7 +852,11 @@ mod tests {
     /// Reconstruct the typed session secret + sealed envelope from the committed
     /// flat bytes and replay the full PQ path — substrate-independent proof.
     #[cfg(all(feature = "vectors", not(feature = "gen-vectors")))]
-    fn load_pq_vector() -> (SessionKemSecret, PqSealedEnvelope, crate::vector_format::PqVector) {
+    fn load_pq_vector() -> (
+        SessionKemSecret,
+        PqSealedEnvelope,
+        crate::vector_format::PqVector,
+    ) {
         use base64::Engine as _;
         use ml_kem::{Encoded, EncodedSizeUser};
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -816,7 +867,11 @@ mod tests {
         )))
         .unwrap();
 
-        let x_bytes: [u8; 32] = b64.decode(&v.x25519_secret_b64).unwrap().try_into().unwrap();
+        let x_bytes: [u8; 32] = b64
+            .decode(&v.x25519_secret_b64)
+            .unwrap()
+            .try_into()
+            .unwrap();
         let x25519 = XStaticSecret::from(x_bytes);
         let dk_bytes = b64.decode(&v.mlkem_dk_b64).unwrap();
         let enc = Encoded::<MlKemDk>::try_from(dk_bytes.as_slice()).expect("ML-KEM dk size");
@@ -826,7 +881,11 @@ mod tests {
         let ct_bytes = b64.decode(&v.kem_ct_b64).unwrap();
         let kem_ct = Ciphertext::<MlKem768>::try_from(ct_bytes.as_slice()).expect("ML-KEM ct size");
         let env = PqSealedEnvelope {
-            eph_x25519_pub: b64.decode(&v.eph_x25519_pub_b64).unwrap().try_into().unwrap(),
+            eph_x25519_pub: b64
+                .decode(&v.eph_x25519_pub_b64)
+                .unwrap()
+                .try_into()
+                .unwrap(),
             kem_ct,
             nonce: b64.decode(&v.nonce_b64).unwrap().try_into().unwrap(),
             wrapped_cek: b64.decode(&v.wrapped_cek_b64).unwrap(),
@@ -844,10 +903,15 @@ mod tests {
 
         let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
         let (output, meta) =
-            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None).unwrap();
+            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None)
+                .unwrap();
         let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
         let mdat_off = segment.len() - expected.len();
-        assert_eq!(&output[mdat_off..], expected.as_slice(), "PQ vector plaintext recovered");
+        assert_eq!(
+            &output[mdat_off..],
+            expected.as_slice(),
+            "PQ vector plaintext recovered"
+        );
         assert_eq!(meta["is_protected"], serde_json::json!(true));
     }
 
@@ -861,7 +925,8 @@ mod tests {
 
         let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
         assert!(
-            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None).is_err(),
+            super::decrypt_pq_sealed_segment(&session, &env, &StubVerifier, &segment, None)
+                .is_err(),
             "a corrupted PQ vector must fail closed"
         );
     }
@@ -884,7 +949,10 @@ mod tests {
     #[test]
     fn harden_pq_from_bytes_truncations_fail_closed() {
         let bytes = valid_pq_envelope_bytes();
-        assert!(PqSealedEnvelope::from_bytes(&bytes).is_ok(), "the full wire form must decode");
+        assert!(
+            PqSealedEnvelope::from_bytes(&bytes).is_ok(),
+            "the full wire form must decode"
+        );
         for t in 0..bytes.len() {
             assert!(
                 PqSealedEnvelope::from_bytes(&bytes[..t]).is_err(),

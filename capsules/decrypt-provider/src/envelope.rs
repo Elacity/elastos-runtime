@@ -271,7 +271,10 @@ mod tests {
 
     #[test]
     fn truncated_envelope_rejected() {
-        assert_eq!(parse(&[0, 0, 0, 0x03]).unwrap_err(), EnvelopeError::BadEnvelope);
+        assert_eq!(
+            parse(&[0, 0, 0, 0x03]).unwrap_err(),
+            EnvelopeError::BadEnvelope
+        );
     }
 
     #[test]
@@ -301,7 +304,11 @@ mod tests {
     /// Minimal single-sample encrypted fMP4 segment, matching the decrypt-step
     /// golden, for emitting a portable vector.
     #[cfg(feature = "gen-vectors")]
-    fn build_encrypted_segment_for_vector(plaintext: &[u8], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+    fn build_encrypted_segment_for_vector(
+        plaintext: &[u8],
+        cek: &[u8; 16],
+        iv8: &[u8; 8],
+    ) -> Vec<u8> {
         use aes::cipher::{KeyIvInit, StreamCipher};
         type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -407,7 +414,10 @@ mod tests {
     /// Multi-sample segment: N samples, each with its own 8-byte IV + fresh CTR.
     /// `trun` carries per-sample sizes; `senc` has no subsamples.
     #[cfg(feature = "gen-vectors")]
-    fn build_multisample_segment(samples: &[(&[u8], [u8; 8])], cek: &[u8; 16]) -> (Vec<u8>, Vec<u8>) {
+    fn build_multisample_segment(
+        samples: &[(&[u8], [u8; 8])],
+        cek: &[u8; 16],
+    ) -> (Vec<u8>, Vec<u8>) {
         use aes::cipher::{KeyIvInit, StreamCipher};
         type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -446,7 +456,12 @@ mod tests {
     /// keystream is continuous across encrypted ranges only (clear bytes are
     /// skipped), matching CENC + PC2 `decrypt_subsamples`.
     #[cfg(feature = "gen-vectors")]
-    fn build_subsample_segment(plaintext: &[u8], subs: &[(u16, u32)], cek: &[u8; 16], iv8: &[u8; 8]) -> Vec<u8> {
+    fn build_subsample_segment(
+        plaintext: &[u8],
+        subs: &[(u16, u32)],
+        cek: &[u8; 16],
+        iv8: &[u8; 8],
+    ) -> Vec<u8> {
         use aes::cipher::{KeyIvInit, StreamCipher};
         type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
@@ -653,11 +668,10 @@ mod tests {
         )
         .unwrap();
         let carrier = crate::vector_format::RailCarrierVector {
-            description:
-                "rail Option A carrier (classical P-256): sealed CEK + segment -> \
+            description: "rail Option A carrier (classical P-256): sealed CEK + segment -> \
                  decrypt_from_carrier; sealed_cek byte-identical to classical_cenc.json \
                  (PC2-conformant via session unwrap_envelope + decrypt_segment)"
-                    .to_string(),
+                .to_string(),
             profile: "ClassicalP256".to_string(),
             session_secret_key_b64: classical.session_secret_key_b64,
             mlkem_dk_b64: None,
@@ -684,7 +698,11 @@ mod tests {
         let sealed = b64.decode(&v.sealed_envelope_b64).unwrap();
         let parsed = parse(&sealed).unwrap();
         let recovered = extract_cek(&ecdh_unwrap(&sk, &parsed).unwrap()).unwrap();
-        assert_eq!(b64.encode(recovered.as_slice()), v.cek_b64, "vector CEK recovered via ECDH");
+        assert_eq!(
+            b64.encode(recovered.as_slice()),
+            v.cek_b64,
+            "vector CEK recovered via ECDH"
+        );
 
         let cek_b64 = b64.encode(recovered.as_slice());
         let segment = b64.decode(&v.encrypted_segment_b64).unwrap();
@@ -693,7 +711,11 @@ mod tests {
             crate::decrypt_session_segment(&cek_b64, &segment, init.as_deref()).unwrap();
         let expected = b64.decode(&v.expected_plaintext_b64).unwrap();
         let mdat_off = segment.len() - expected.len();
-        assert_eq!(&output[mdat_off..], expected.as_slice(), "vector plaintext recovered via cenc");
+        assert_eq!(
+            &output[mdat_off..],
+            expected.as_slice(),
+            "vector plaintext recovered via cenc"
+        );
         assert_eq!(meta["is_protected"], serde_json::json!(true));
     }
 
@@ -749,9 +771,10 @@ mod tests {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
 
-        let v: crate::vector_format::ClassicalVector = serde_json::from_str(include_str!(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/vectors/classical_cenc.json")
-        ))
+        let v: crate::vector_format::ClassicalVector = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/classical_cenc.json"
+        )))
         .unwrap();
         let sk = SecretKey::from_slice(&b64.decode(&v.session_secret_key_b64).unwrap()).unwrap();
         let mut sealed = b64.decode(&v.sealed_envelope_b64).unwrap();
@@ -759,7 +782,10 @@ mod tests {
         sealed[n - 1] ^= 0xFF; // corrupt the encrypted-CEK tail
 
         let result = parse(&sealed).and_then(|p| ecdh_unwrap(&sk, &p));
-        assert!(result.is_err(), "a corrupted classical vector must fail closed");
+        assert!(
+            result.is_err(),
+            "a corrupted classical vector must fail closed"
+        );
     }
 
     // --- adversarial negative-space sweep (feature = "harden") ----------------
@@ -814,13 +840,19 @@ mod tests {
         let mut big_eph = env.clone();
         big_eph[4] = 0xFF;
         big_eph[5] = 0xFF;
-        assert!(parse(&big_eph).is_err(), "oversized eph_len must fail closed");
+        assert!(
+            parse(&big_eph).is_err(),
+            "oversized eph_len must fail closed"
+        );
 
         // sig_len lives right after eph_pub_key + IV (v=0x03): 4 + 2 + 33 + 16 = 55.
         let mut big_sig = env.clone();
         big_sig[55] = 0xFF;
         big_sig[56] = 0xFF;
-        assert!(parse(&big_sig).is_err(), "oversized sig_len must fail closed");
+        assert!(
+            parse(&big_sig).is_err(),
+            "oversized sig_len must fail closed"
+        );
     }
 
     /// Tampering anywhere in the envelope yields only a coarse `EnvelopeError`
@@ -836,7 +868,10 @@ mod tests {
                 if let Err(err) = ecdh_unwrap(&sk, &parsed) {
                     // The only surfaces are the two coarse variants.
                     assert!(
-                        matches!(err, EnvelopeError::BadEnvelope | EnvelopeError::DecryptFailed),
+                        matches!(
+                            err,
+                            EnvelopeError::BadEnvelope | EnvelopeError::DecryptFailed
+                        ),
                         "error surface must stay coarse"
                     );
                 }

@@ -51,7 +51,11 @@ pub struct DecryptResult {
 /// The CEK arrives base64-encoded inside `command_json`, is used only within this
 /// function, and is zeroized on every return path. Only the decrypted segment bytes
 /// (or a passthrough copy) and a metadata `DecryptResult` are returned.
-pub fn process(command_json: &str, segment_data: &[u8], init_data: Option<&[u8]>) -> (String, Option<Vec<u8>>) {
+pub fn process(
+    command_json: &str,
+    segment_data: &[u8],
+    init_data: Option<&[u8]>,
+) -> (String, Option<Vec<u8>>) {
     let cmd: DecryptCommand = match serde_json::from_str(command_json) {
         Ok(c) => c,
         Err(e) => return (error_result(&format!("invalid command: {e}")), None),
@@ -82,7 +86,10 @@ pub fn process(command_json: &str, segment_data: &[u8], init_data: Option<&[u8]>
 
     if cek_bytes.len() != 16 {
         cek_bytes.iter_mut().for_each(|b| *b = 0);
-        return (error_result(&format!("cek length {} (expected 16)", cek_bytes.len())), None);
+        return (
+            error_result(&format!("cek length {} (expected 16)", cek_bytes.len())),
+            None,
+        );
     }
 
     let iv_size = cmd.iv_size.unwrap_or(8);
@@ -123,7 +130,10 @@ pub fn process(command_json: &str, segment_data: &[u8], init_data: Option<&[u8]>
                 iv_size: Some(effective_iv_size),
                 is_protected: Some(false),
             };
-            return (serde_json::to_string(&result).unwrap(), Some(segment_data.to_vec()));
+            return (
+                serde_json::to_string(&result).unwrap(),
+                Some(segment_data.to_vec()),
+            );
         }
     };
 
@@ -139,7 +149,10 @@ pub fn process(command_json: &str, segment_data: &[u8], init_data: Option<&[u8]>
                 iv_size: Some(effective_iv_size),
                 is_protected: Some(false),
             };
-            return (serde_json::to_string(&result).unwrap(), Some(segment_data.to_vec()));
+            return (
+                serde_json::to_string(&result).unwrap(),
+                Some(segment_data.to_vec()),
+            );
         }
     };
 
@@ -215,7 +228,8 @@ fn error_result(msg: &str) -> String {
         sample_count: None,
         iv_size: None,
         is_protected: None,
-    }).unwrap()
+    })
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -283,7 +297,10 @@ mod golden_tests {
         expected[mdat_content_off..mdat_content_off + plaintext.len()].copy_from_slice(plaintext);
 
         let output = output.expect("expected decrypted output");
-        assert_eq!(output, expected, "decrypted segment must match plaintext mdat");
+        assert_eq!(
+            output, expected,
+            "decrypted segment must match plaintext mdat"
+        );
 
         // Metadata reports a protected, single-sample segment.
         assert!(result_json.contains("\"is_protected\":true"));
