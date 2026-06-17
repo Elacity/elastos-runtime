@@ -232,10 +232,11 @@ caller-identity injection) and `revoke` (needs the gateway capability plane).
   single-VM serve path.
 - `CatalogInspectSource` — the installed-capsule catalog on disk
   (`<data_dir>/capsules/<name>/capsule.json`). Reads each capsule's **full
-  manifest** (rich nine-field detail) and marks it `running` when the scheme it
-  `provides` is registered live, else `installed`. This is the rich,
-  manifest-backed source for the product. (`id = capsule:<name>`, with
-  path-traversal ids rejected.)
+  manifest** (rich nine-field detail), marks it `running` when the scheme it
+  `provides` is registered live (incl. sub-provider schemes), else `installed`,
+  and attaches the **content CID** from `<data_dir>/components.json` as the
+  provenance anchor (Principle #15). (`id = capsule:<name>`, path-traversal ids
+  rejected.)
 - `RegistryInspectSource` — the registered provider schemes from
   `ProviderRegistry`, including **sub-provider schemes** (`did`, `key`, `peer`,
   …) via `ProviderRegistry::sub_provider_schemes()`. Thin
@@ -357,6 +358,26 @@ The one mutating endpoint. Requires a **`Write`** inspect capability at
 `permission_denied` for a read-only or self-only caller; `invalid_token_id` for
 a malformed id. The action is audited (`inspect.revoke`) in addition to the
 capability manager's own revocation audit.
+
+### `elastos://inspect/plan` (params: `{ "id", "interface", "method", "args" }`) — read
+
+Metadata-driven invocation **preview** (read-only dry-run; dispatches no
+effect). Looks up the affordance's typed metadata, validates `args` against its
+`input_schema`, and returns the gate the call *would* require:
+
+```json
+{ "valid": true, "capability_action": "write", "approval": "user", "audit": "event" }
+```
+
+or, when the args don't satisfy the contract:
+
+```json
+{ "valid": false, "error": "missing_required_field", "field": "body" }
+```
+
+This is the reflective half of the CAR invoke kernel (`elastos-runtime::invoke`).
+Effect *dispatch* (and the location-agnostic Carrier / cross-language transport)
+is intentionally not implemented — that architecture is to be planned.
 
 ### Why `granted_capabilities` is observed, not enumerated
 

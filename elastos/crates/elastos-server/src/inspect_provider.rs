@@ -25,8 +25,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use elastos_common::CapsuleManifest;
+use elastos_common::{CapsuleAffordanceDescriptor, CapsuleManifest};
 use elastos_runtime::inspect::InspectScope;
+use elastos_runtime::invoke::{self, InvokeError};
 use elastos_runtime::provider::{Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse};
 use serde_json::{json, Value};
 
@@ -41,6 +42,9 @@ pub struct InspectEntry {
     pub capsule_type: String,
     /// Manifest the capsule was launched with, when retained.
     pub manifest: Option<CapsuleManifest>,
+    /// Content identity (IPFS CID) from the installed-capsule catalog, when
+    /// known — the provenance anchor (Principle #15).
+    pub cid: Option<String>,
 }
 
 /// Read-only source of inspectable capsules. Decouples the provider from the
@@ -149,6 +153,7 @@ fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
         status: info.status,
         capsule_type: format!("{:?}", info.capsule_type).to_lowercase(),
         manifest: Some(*info.manifest),
+        cid: None,
     }
 }
 
@@ -187,6 +192,7 @@ impl RegistryInspectSource {
             status: "running".to_string(),
             capsule_type: "provider".to_string(),
             manifest: None,
+            cid: None,
         }
     }
 }
@@ -254,10 +260,35 @@ impl CatalogInspectSource {
         }
     }
 
+    /// Content identities (capsule name → CID) from the installed-capsule
+    /// catalog (`<data_dir>/components.json`). Best-effort: empty if absent.
+    async fn catalog_cids(&self) -> std::collections::HashMap<String, String> {
+        let Some(path) = self
+            .capsules_dir
+            .parent()
+            .map(|p| p.join("components.json"))
+        else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(data) = tokio::fs::read_to_string(&path).await else {
+            return std::collections::HashMap::new();
+        };
+        match serde_json::from_str::<crate::setup::ComponentsManifest>(&data) {
+            Ok(manifest) => manifest
+                .capsules
+                .into_iter()
+                .filter(|(_, entry)| !entry.cid.is_empty())
+                .map(|(name, entry)| (name, entry.cid))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    }
+
     async fn read_entry(
         &self,
         name: &str,
         running: &std::collections::HashSet<String>,
+        cid: Option<String>,
     ) -> Option<InspectEntry> {
         let path = self.capsules_dir.join(name).join("capsule.json");
         let data = tokio::fs::read_to_string(&path).await.ok()?;
@@ -271,6 +302,7 @@ impl CatalogInspectSource {
             status: if is_running { "running" } else { "installed" }.to_string(),
             capsule_type: format!("{:?}", manifest.capsule_type).to_lowercase(),
             manifest: Some(manifest),
+            cid,
         })
     }
 }
@@ -279,6 +311,7 @@ impl CatalogInspectSource {
 impl InspectSource for CatalogInspectSource {
     async fn inspect_list(&self) -> Vec<InspectEntry> {
         let running = self.running_schemes().await;
+        let cids = self.catalog_cids().await;
         let mut out = Vec::new();
         if let Ok(mut rd) = tokio::fs::read_dir(&self.capsules_dir).await {
             while let Ok(Some(dir_entry)) = rd.next_entry().await {
@@ -291,7 +324,8 @@ impl InspectSource for CatalogInspectSource {
                     continue;
                 }
                 if let Some(name) = dir_entry.file_name().to_str() {
-                    if let Some(entry) = self.read_entry(name, &running).await {
+                    let cid = cids.get(name).cloned();
+                    if let Some(entry) = self.read_entry(name, &running, cid).await {
                         out.push(entry);
                     }
                 }
@@ -307,7 +341,8 @@ impl InspectSource for CatalogInspectSource {
             return None;
         }
         let running = self.running_schemes().await;
-        self.read_entry(name, &running).await
+        let cid = self.catalog_cids().await.get(name).cloned();
+        self.read_entry(name, &running, cid).await
     }
 }
 
@@ -395,6 +430,7 @@ impl InspectProvider {
             .get("signature")
             .map(|s| s.is_string())
             .unwrap_or(false);
+        let cid = entry.cid.clone();
 
         // Affordances: flatten declared interface methods.
         let mut affordances = Vec::new();
@@ -433,7 +469,7 @@ impl InspectProvider {
             "author": field(&manifest, "author"),
             "identity": {
                 "did": Value::Null,
-                "cid": Value::Null,
+                "cid": cid.clone(),
                 "trust_level": Value::Null,
                 "signature_present": signature_present,
                 "signed_by": Value::Null,
@@ -461,7 +497,7 @@ impl InspectProvider {
                 "signed_by": Value::Null,
                 "version": field(&manifest, "version"),
                 "installed_at": Value::Null,
-                "cid": Value::Null,
+                "cid": cid.clone(),
                 "signature_present": signature_present,
             },
             "audit": audit,
@@ -521,9 +557,83 @@ impl InspectProvider {
                 },
                 None => provider_error("invalid_request", "inspect/capsule requires an \"id\""),
             },
+            // Metadata-driven invocation *preview* (read-only, dry-run): given a
+            // capsule + interface + method + args, validate the args against the
+            // affordance's input_schema and derive the capability/approval/audit
+            // gate the call would require. Dispatches NO effect — this is the
+            // reflective half of the CAR invoke kernel.
+            "plan" => self.handle_plan(request).await,
             other => provider_error("unknown_op", &format!("unknown inspect op: {other}")),
         }
     }
+
+    async fn handle_plan(&self, request: &Value) -> Value {
+        let (id, interface, method) = match (
+            request.get("id").and_then(Value::as_str),
+            request.get("interface").and_then(Value::as_str),
+            request.get("method").and_then(Value::as_str),
+        ) {
+            (Some(id), Some(i), Some(m)) => (id, i, m),
+            _ => {
+                return provider_error(
+                    "invalid_request",
+                    "inspect/plan requires \"id\", \"interface\", and \"method\"",
+                )
+            }
+        };
+        let args = request.get("args").cloned().unwrap_or(json!({}));
+
+        let entry = match self.source.inspect_get(id).await {
+            Some(entry) => entry,
+            None => return provider_error("not_found", "no such capsule"),
+        };
+        let affordance = match entry
+            .manifest
+            .as_ref()
+            .and_then(|m| find_affordance(m, interface, method))
+        {
+            Some(a) => a,
+            None => return provider_error("not_found", "no such affordance"),
+        };
+
+        match invoke::plan(&affordance, &args) {
+            Ok(plan) => json!({
+                "status": "ok",
+                "data": {
+                    "valid": true,
+                    // The gate the runtime would enforce for this call.
+                    "capability_action": plan.capability_action.to_string(),
+                    "approval": serde_json::to_value(&plan.approval).ok(),
+                    "audit": serde_json::to_value(&plan.audit).ok(),
+                }
+            }),
+            // The query succeeded; the proposed args do not satisfy the contract.
+            Err(InvokeError::MissingRequiredField(field)) => json!({
+                "status": "ok",
+                "data": { "valid": false, "error": "missing_required_field", "field": field }
+            }),
+            Err(InvokeError::InputTypeMismatch { expected }) => json!({
+                "status": "ok",
+                "data": { "valid": false, "error": "input_type_mismatch", "expected": expected }
+            }),
+        }
+    }
+}
+
+/// Look up an affordance descriptor in a manifest by interface id + method id.
+fn find_affordance(
+    manifest: &CapsuleManifest,
+    interface: &str,
+    method: &str,
+) -> Option<CapsuleAffordanceDescriptor> {
+    manifest
+        .interfaces
+        .iter()
+        .find(|iface| iface.id == interface)?
+        .methods
+        .iter()
+        .find(|m| m.id == method)
+        .cloned()
 }
 
 #[async_trait]
@@ -600,6 +710,7 @@ mod tests {
             status: "running".to_string(),
             capsule_type: "wasm".to_string(),
             manifest: Some(probe_manifest()),
+            cid: None,
         }
     }
 
@@ -693,6 +804,7 @@ mod tests {
                     status: "running".to_string(),
                     capsule_type: "provider".to_string(),
                     manifest: None,
+                    cid: None,
                 },
             ],
         });
@@ -807,6 +919,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_previews_gate_for_valid_call() {
+        let resp = provider_with_probe()
+            .send_raw(&json!({
+                "op": "plan", "id": "cap_probe_1",
+                "interface": "elastos.probe/v1", "method": "ping", "args": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], true);
+        assert_eq!(resp["data"]["capability_action"], "read");
+        assert_eq!(resp["data"]["approval"], "none");
+    }
+
+    #[tokio::test]
+    async fn plan_reports_input_type_mismatch() {
+        // ping declares input_schema {type:object}; a scalar must fail validation.
+        let resp = provider_with_probe()
+            .send_raw(&json!({
+                "op": "plan", "id": "cap_probe_1",
+                "interface": "elastos.probe/v1", "method": "ping", "args": "scalar"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], false);
+        assert_eq!(resp["data"]["error"], "input_type_mismatch");
+    }
+
+    #[tokio::test]
+    async fn plan_unknown_affordance_is_not_found() {
+        let resp = provider_with_probe()
+            .send_raw(&json!({
+                "op": "plan", "id": "cap_probe_1",
+                "interface": "elastos.probe/v1", "method": "nope", "args": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "not_found");
+    }
+
+    #[tokio::test]
     async fn registry_dispatch_reaches_inspect_provider() {
         // The leg both product transports converge on: ProviderRegistry::send_raw
         // by scheme must resolve to the registered inspect provider.
@@ -840,6 +995,40 @@ mod tests {
             "sub-provider scheme must be listed"
         );
         assert!(source.inspect_get("provider:did").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn catalog_surfaces_content_cid_from_components_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capsules_dir = tmp.path().join("capsules");
+        write_capsule(
+            &capsules_dir,
+            "probe",
+            &serde_json::to_value(probe_manifest()).unwrap(),
+        );
+        // Seed the installed-capsule catalog with a content CID (provenance).
+        std::fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec(&json!({
+                "external": {},
+                "profiles": {},
+                "capsules": { "probe": { "cid": "bafyprobecid", "sha256": "deadbeef", "size": 0 } }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = InspectProvider::new(Arc::new(CatalogInspectSource::new(
+            capsules_dir,
+            Arc::downgrade(&registry),
+        )));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "capsule:probe" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["data"]["provenance"]["cid"], "bafyprobecid");
+        assert_eq!(resp["data"]["identity"]["cid"], "bafyprobecid");
     }
 
     // Minimal provider used only to register a scheme in the registry.

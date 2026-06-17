@@ -84,6 +84,10 @@ pub fn build_capability_resource(
         "wallet" => wallet_resource(op, request),
         "content" => content_resource(op),
         "did" | "peer" => Ok(format!("elastos://{scheme}/*")),
+        // Read-only Capsule Inspector. Use the concrete requested resource so it
+        // validates against an `elastos://inspect/*` capability the same way the
+        // gateway/handler path does (consistent across both transports).
+        "inspect" => Ok(format!("elastos://inspect/{op}")),
         _ => Ok(format!("{scheme}://*")),
     }
 }
@@ -265,6 +269,20 @@ mod tests {
         assert_eq!(
             build_capability_resource("ai", "chat_completions", &request).unwrap(),
             "elastos://ai/local/chat_completions"
+        );
+    }
+
+    #[test]
+    fn inspect_resource_uses_concrete_elastos_uri() {
+        // Consistent with the gateway/handler path: a concrete elastos://inspect
+        // resource that validates against an `elastos://inspect/*` capability.
+        assert_eq!(
+            build_capability_resource("inspect", "capsules", &serde_json::json!({})).unwrap(),
+            "elastos://inspect/capsules"
+        );
+        assert_eq!(
+            build_capability_resource("inspect", "capsule", &serde_json::json!({})).unwrap(),
+            "elastos://inspect/capsule"
         );
     }
 
