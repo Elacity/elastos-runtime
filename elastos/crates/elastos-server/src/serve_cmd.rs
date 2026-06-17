@@ -157,6 +157,7 @@ pub async fn run_serve(
                     name: handle.manifest.name.clone(),
                     status: "running".to_string(),
                     capsule_type: handle.manifest.capsule_type.clone(),
+                    manifest: Box::new(handle.manifest.clone()),
                     handle: Some(handle.clone()),
                 };
                 runtime_arc.register_capsule(capsule_info).await;
@@ -191,6 +192,22 @@ pub async fn run_serve(
                 let namespace_store = infra.namespace_store;
                 let identity_state = infra.identity_state;
                 let host_helpers = infra.host_helpers;
+
+                // Register the read-only Capsule Inspector on the shared
+                // provider registry — the one reached by both the API/gateway
+                // and the capsule carrier bridge. Its data source is this
+                // runtime's running-capsule registry.
+                {
+                    let source: Arc<dyn elastos_server::inspect_provider::InspectSource> =
+                        runtime_arc.clone();
+                    provider_registry
+                        .register(Arc::new(
+                            elastos_server::inspect_provider::InspectProvider::new(
+                                Arc::downgrade(&source),
+                            ),
+                        ))
+                        .await;
+                }
 
                 let api_handle = tokio::spawn({
                     let runtime = runtime_arc.clone();

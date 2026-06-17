@@ -24,6 +24,11 @@ pub struct RunningCapsuleInfo {
     pub status: String,
     /// Capsule type (WASM, MicroVM)
     pub capsule_type: CapsuleType,
+    /// Manifest the capsule was launched with. Retained so introspection
+    /// surfaces (the inspect provider) can project capabilities, affordances,
+    /// and provenance without re-reading capsule.json. Boxed to keep the
+    /// struct lean.
+    pub manifest: Box<CapsuleManifest>,
     /// Handle for stopping the capsule (optional, not all capsules have handles)
     pub handle: Option<CapsuleHandle>,
 }

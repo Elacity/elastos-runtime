@@ -194,20 +194,37 @@ Consequences for the plan:
 - "One canonical path" (#10) is a real cross-process bridging effort, not a
   provider registration.
 
-Open options (owner decision):
+### Product-side provider (built)
 
-1. **Registry view (feasible now):** a browser-facing inspect that enumerates
-   what the gateway actually has — registered providers/schemes and their
-   status from `ProviderRegistry`. Honest but a *services* view, not the rich
-   capsule view.
-2. **Keep rich inspect as the capsule/agent path** (already built/tested) and
-   defer the browser bridge.
-3. **Bridge gateway → runtime** so the browser can reach the rich
-   `CapsuleManager` inspect (the real convergence; needs the process-topology
-   decision first).
+The product home of inspect is now `elastos-server::inspect_provider` — an
+`inspect` scheme provider on the **shared `ProviderRegistry`** that both product
+transports dispatch through (`carrier_bridge` for capsules, the gateway for the
+browser), so one provider serves both — the real one-canonical-path
+convergence. It reuses `elastos_runtime::inspect::InspectScope` for the scope
+label and enforces the #16 no-leak guarantee (proven by test:
+`capsule_detail_renders_contract_without_leaking_authority`). Capsule data is
+read through an `InspectSource` trait (implemented for `runtime::Runtime`) so
+the provider is decoupled from where the server tracks capsules.
+
+Ops implemented: `capsules` (System list), `capsule` (System detail, rich
+nine-field projection from the retained manifest). Deferred: `self` (needs
+caller-identity injection) and `revoke` (needs the gateway capability plane).
+
+**Wired + populated:** the single-VM-capsule serve path
+(`elastos serve <microvm>`) registers the provider on the shared registry and
+its `running_capsules` source is populated, so inspect works end-to-end there.
+
+**Remaining data-source work (the honest gap):** the multi-capsule product
+path does not populate `runtime::running_capsules` (capsules there are launched
+as registry providers or supervisor/shell processes, and `register_capsule` is
+only called on the single-VM path). So on the main/browser path the provider
+returns an empty list until the server's capsule tracking is unified — e.g.
+aggregating `ProviderRegistry` schemes and supervisor-launched capsules into
+`InspectSource`. That unification is the next concrete step; the projection,
+scope, no-leak, and transport wiring are done.
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
-to sample data until one of these lands.
+to sample data until the data source is populated on the browser path.
 
 ## Wire contract: `elastos://inspect/*` (read-only)
 
