@@ -43,6 +43,7 @@ Planning and truth surfaces outside `docs/`:
 - [KEY_PROVIDER.md](KEY_PROVIDER.md) — protected-content key release and PQ-hybrid envelope boundary
 - [DECRYPT_PROVIDER.md](DECRYPT_PROVIDER.md) — protected-content decrypt/render session boundary
 - [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) — sealed objects, DRM provider boundary, and protected-content sequence
+- [ASSET_TIERS.md](ASSET_TIERS.md) — the 5-tier containment model + asset taxonomy for the marketplace (what's shipped, blind spots, North stars)
 - [GLOSSARY.md](GLOSSARY.md) — vocabulary only
 
 These should stay narrower than the canonical current docs. If they repeat the same story in different words, they should be merged or shortened rather than expanded.

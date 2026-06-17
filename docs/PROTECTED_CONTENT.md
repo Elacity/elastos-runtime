@@ -135,8 +135,10 @@ tier (PC2 `ddrm-renderer` parity): the asset is rasterised to flattened, buyer-w
 page **images** *inside the decrypt boundary*, and only those images egress.
 
 - Renderer placement: the `decrypt-provider` capsule (feature `pdf-render`), NOT the
-  trusted core. It uses `hayro` (pure-Rust, `#![forbid(unsafe_code)]` PDF rasteriser) +
-  `image`. The trusted core gains no PDF code — it only routes bytes (Principle 5/13).
+  trusted core. It uses pure-Rust rasterisers — `hayro` (PDF, `#![forbid(unsafe_code)]`),
+  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive) and
+  `font8x8` (watermark + text glyphs). The trusted core gains no render code — it only
+  routes bytes (Principle 5/13).
 - Containment: the `StreamSegment` op takes an optional `render` directive; when present
   for a pixel-lock mime, the boundary extracts the object from the decrypted fragment and
   returns a watermarked JPEG (`rendered_b64` + `total_pages`) — never the raw bytes. The
@@ -150,11 +152,25 @@ page **images** *inside the decrypt boundary*, and only those images egress.
   - `GET /api/viewers/ddrm-viewer/object/{session}/page?n=N` → one rendered page image
     (`image/jpeg`) + `X-Asset-Pages`/`X-Asset-Page` headers.
   - `GET …/object/{session}/bytes` → `403` for pixel-lock sessions.
-- Watermark: the buyer/owner principal is stamped onto every page (forensic provenance),
-  elided to first…last for long DIDs/wallets.
+- Watermark: the buyer/owner principal is stamped diagonally + tiled across every page
+  (forensic provenance, uncroppable), rendered with the full-ASCII `font8x8` so any
+  principal/DID/wallet is legible (long ids elided to first…last).
 
-Pixel-lock currently covers `application/pdf`; the renderer registry
-(`decrypt-provider/src/render`) is the extension point for images/text/code/EPUB next.
+Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
+- `application/pdf` → `pdf` (multi-page, `hayro`)
+- `application/vnd.comicbook+zip`, `application/x-cbz` → `cbz` (multi-page, natural page order)
+- `text/*` and source-code mimes (`application/json`, `application/javascript`,
+  `application/xml`, `application/x-yaml`, `application/toml`, `application/x-sh`) → `text`
+  (multi-page, rasterised so source can't be copied)
+- `image/svg+xml` → `svg` (rasterised to pixels — SVG is scriptable XML, never shipped raw)
+- other `image/*` → `image_page` (single page, re-encoded so source file + EXIF is stripped)
+
+The single source of truth for the set is `render::is_pixel_lock`; the media-authority
+helper (`scripts/dev/ddrm-media-authority/src/quorum.rs`) mirrors it and the two must stay
+in sync (Principle 12). EPUB, office docs, and 3D are tracked in `docs/ASSET_TIERS.md`.
+
+Audio/video are NOT pixel-lock — they take the stream-decrypt rail (DASH/CENC + MSE);
+`viewer_open::is_media_mime` routes `video/*` and `audio/*` to the media player.
 
 ## Remaining Sequence
 
