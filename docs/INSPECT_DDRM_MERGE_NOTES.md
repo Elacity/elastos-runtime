@@ -3,18 +3,54 @@
 How `feat/capsule-inspector` connects with `feat/ddrm-hardening-and-creator-parity`.
 Both branch from `main` (= `0.4.0`). Cross-branch analysis, non-destructive.
 
-## Verdict
+## Verdict — GO-WITH-NOTES (validated by merge dry-run)
 
 **No model divergence.** DDRM adds no competing inspect/introspection surface and
 does not restructure the capability or `ProviderRegistry` model the Inspector
 depends on. The Inspector is cleanly the **governance/visibility layer over
-DDRM's providers** — it reflects their authority/affordances and previews the
+DDRM's providers** — reflecting their authority/affordances and previewing the
 gate a call would require, adding no provider authority of its own. This is the
-agent-safe-computing commercial wedge, made concrete over real DDRM powers
-(key release, decrypt render, rights decisions, chain broadcast).
+agent-safe-computing commercial wedge, over real DDRM powers (key release,
+decrypt render, rights decisions, chain broadcast).
 
 **Merge order:** land DDRM first (hardening base + provider fleet), then
 rebase/merge `feat/capsule-inspector` on top.
+
+### Dry-run result (isolated worktree, nothing pushed)
+
+A real `git merge --no-commit` of our branch onto the DDRM tip was performed in
+an isolated worktree, reconciled, built, and tested. Outcome:
+
+- **The merge auto-merges with ZERO conflict markers** — *every* file, including
+  the HIGH `carrier_bridge.rs`. Git will report success. **The reconciliation
+  below is therefore mandatory *and invisible to git* — it must be applied by
+  hand even though nothing conflicts.**
+- After applying the recipe: `cargo build -p elastos-server` succeeds; **20
+  inspect tests + the carrier e2e test + runtime inspect/invoke tests all pass.**
+- The silent carrier-gate break was **empirically confirmed**: removing the
+  `required_action_for` inspect arm makes the carrier inspect test fail
+  `capability_denied`; restoring it passes.
+
+### Mandatory reconciliation recipe (apply in order at the real merge)
+
+1. **(critical, silent)** In `provider_resource.rs`, add to `required_action_for`
+   *before* the `_ => Action::Admin` default:
+   ```rust
+   "capsules" | "capsule" | "plan" | "self" => Action::Read,
+   "revoke" => Action::Write,
+   ```
+   Without this, DDRM's op→action gate fail-closes the carrier inspect leg to
+   `Admin`. Git does **not** flag it.
+2. **(compile-break, NOT previously documented)** DDRM added a new field
+   `audit_log: Arc<OnceLock<Arc<AuditLog>>>` to the shared `GatewayState`
+   (`api/gateway.rs`). Our `api/gateway_tests/inspect.rs` constructs
+   `GatewayState { … }` literally and must add
+   `audit_log: Arc::new(std::sync::OnceLock::new()),` (the idiom DDRM uses in its
+   other gateway test constructors). Otherwise the lib-test target won't compile.
+3. **No manual action needed** for `registry.rs`, the `carrier_bridge.rs` validate
+   block, and all `use`-line merges — git auto-merges these correctly, keeping
+   both sides' additions (the earlier note implying manual import reconciliation
+   was over-cautious).
 
 ## Conflict matrix (3 LOW, 1 HIGH)
 
