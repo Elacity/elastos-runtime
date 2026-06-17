@@ -198,14 +198,11 @@ pub async fn run_serve(
                 // and the capsule carrier bridge. Its data source is this
                 // runtime's running-capsule registry.
                 {
-                    let source: Arc<dyn elastos_server::inspect_provider::InspectSource> =
-                        runtime_arc.clone();
+                    use elastos_server::inspect_provider as ip;
+                    let source: Arc<dyn ip::InspectSource> =
+                        Arc::new(ip::RuntimeInspectSource::new(Arc::downgrade(&runtime_arc)));
                     provider_registry
-                        .register(Arc::new(
-                            elastos_server::inspect_provider::InspectProvider::new(
-                                Arc::downgrade(&source),
-                            ),
-                        ))
+                        .register(Arc::new(ip::InspectProvider::new(source)))
                         .await;
                 }
 
@@ -303,6 +300,26 @@ pub async fn run_serve(
         .await;
 
     let runtime = Arc::new(runtime);
+
+    // Register the read-only Capsule Inspector on the shared provider registry
+    // (the same Arc handed to the supervisor/gateway and the carrier bridge).
+    // The source aggregates this runtime's running capsules with the registered
+    // provider schemes, so the browser Inspector shows what the product knows.
+    {
+        use elastos_server::inspect_provider as ip;
+        let runtime_src: Arc<dyn ip::InspectSource> =
+            Arc::new(ip::RuntimeInspectSource::new(Arc::downgrade(&runtime)));
+        let registry_src: Arc<dyn ip::InspectSource> = Arc::new(ip::RegistryInspectSource::new(
+            Arc::downgrade(&infra.provider_registry),
+        ));
+        let source: Arc<dyn ip::InspectSource> =
+            Arc::new(ip::AggregateInspectSource::new(vec![runtime_src, registry_src]));
+        infra
+            .provider_registry
+            .register(Arc::new(ip::InspectProvider::new(source)))
+            .await;
+    }
+
     let docs_dir = std::env::current_dir().ok().and_then(|d| {
         let docs = d.join("..");
         if docs.join("ROADMAP.md").exists() {

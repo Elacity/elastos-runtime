@@ -16,17 +16,20 @@
 //! echoes a bearer token, a raw signature, or any mutation handle. The raw
 //! manifest `signature` is reduced to `signature_present`.
 //!
-//! Data is read through the [`InspectSource`] trait so the provider is
-//! decoupled from where the server tracks capsules; `runtime::Runtime`
-//! implements it.
+//! Data is read through the [`InspectSource`] trait. The provider holds a
+//! strong `Arc<dyn InspectSource>`; each concrete source holds only a `Weak`
+//! reference to the heavy runtime object it reads from, so registering the
+//! provider on the registry never creates a reference cycle.
 
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use elastos_common::CapsuleManifest;
 use elastos_runtime::inspect::InspectScope;
-use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
+use elastos_runtime::provider::{Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse};
 use serde_json::{json, Value};
+
+use crate::runtime::Runtime;
 
 /// One inspectable capsule, as seen by the provider.
 #[derive(Debug, Clone)]
@@ -40,19 +43,147 @@ pub struct InspectEntry {
 }
 
 /// Read-only source of inspectable capsules. Decouples the provider from the
-/// server's (currently fragmented) capsule tracking.
+/// server's (fragmented) capsule tracking, and lets sources be aggregated.
 #[async_trait]
 pub trait InspectSource: Send + Sync {
     async fn inspect_list(&self) -> Vec<InspectEntry>;
     async fn inspect_get(&self, id: &str) -> Option<InspectEntry>;
 }
 
+// ── Sources ─────────────────────────────────────────────────────────
+
+/// Source backed by the server `Runtime`'s running-capsule registry (the
+/// capsules launched with a retained manifest — e.g. the single-VM serve path).
+pub struct RuntimeInspectSource {
+    runtime: Weak<Runtime>,
+}
+
+impl RuntimeInspectSource {
+    pub fn new(runtime: Weak<Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
+    InspectEntry {
+        id: info.id,
+        name: info.name,
+        status: info.status,
+        capsule_type: format!("{:?}", info.capsule_type).to_lowercase(),
+        manifest: Some(*info.manifest),
+    }
+}
+
+#[async_trait]
+impl InspectSource for RuntimeInspectSource {
+    async fn inspect_list(&self) -> Vec<InspectEntry> {
+        match self.runtime.upgrade() {
+            Some(rt) => rt.list_capsules().await.into_iter().map(running_to_entry).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
+        self.runtime.upgrade()?.get_capsule(id).await.map(running_to_entry)
+    }
+}
+
+/// Source backed by the `ProviderRegistry`: the registered provider schemes
+/// (the running provider capsules/services). Always populated on the main
+/// product path. Thin — the registry does not carry per-provider manifests, so
+/// these entries have no manifest (affordances/capabilities are empty until a
+/// catalog/manifest source enriches them).
+pub struct RegistryInspectSource {
+    registry: Weak<ProviderRegistry>,
+}
+
+impl RegistryInspectSource {
+    pub fn new(registry: Weak<ProviderRegistry>) -> Self {
+        Self { registry }
+    }
+
+    fn scheme_entry(scheme: String) -> InspectEntry {
+        InspectEntry {
+            id: format!("provider:{scheme}"),
+            name: scheme,
+            status: "running".to_string(),
+            capsule_type: "provider".to_string(),
+            manifest: None,
+        }
+    }
+}
+
+#[async_trait]
+impl InspectSource for RegistryInspectSource {
+    async fn inspect_list(&self) -> Vec<InspectEntry> {
+        match self.registry.upgrade() {
+            Some(reg) => {
+                let mut schemes = reg.schemes().await;
+                schemes.sort();
+                schemes.into_iter().map(Self::scheme_entry).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
+        let scheme = id.strip_prefix("provider:")?;
+        let reg = self.registry.upgrade()?;
+        if reg.has_provider(scheme).await {
+            Some(Self::scheme_entry(scheme.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+/// Aggregates several sources into one. This is the unification point: the main
+/// product path composes the runtime source and the registry source so the
+/// browser Inspector shows every capsule any source knows about. De-duplicates
+/// by id (first source wins).
+pub struct AggregateInspectSource {
+    sources: Vec<Arc<dyn InspectSource>>,
+}
+
+impl AggregateInspectSource {
+    pub fn new(sources: Vec<Arc<dyn InspectSource>>) -> Self {
+        Self { sources }
+    }
+}
+
+#[async_trait]
+impl InspectSource for AggregateInspectSource {
+    async fn inspect_list(&self) -> Vec<InspectEntry> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for source in &self.sources {
+            for entry in source.inspect_list().await {
+                if seen.insert(entry.id.clone()) {
+                    out.push(entry);
+                }
+            }
+        }
+        out
+    }
+
+    async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
+        for source in &self.sources {
+            if let Some(entry) = source.inspect_get(id).await {
+                return Some(entry);
+            }
+        }
+        None
+    }
+}
+
+// ── Provider ────────────────────────────────────────────────────────
+
 pub struct InspectProvider {
-    source: Weak<dyn InspectSource>,
+    source: Arc<dyn InspectSource>,
 }
 
 impl InspectProvider {
-    pub fn new(source: Weak<dyn InspectSource>) -> Self {
+    pub fn new(source: Arc<dyn InspectSource>) -> Self {
         Self { source }
     }
 
@@ -151,23 +282,20 @@ impl InspectProvider {
     }
 
     async fn handle_op(&self, request: &Value) -> Value {
-        let source = match self.source.upgrade() {
-            Some(s) => s,
-            None => return provider_error("unavailable", "inspect source is gone"),
-        };
-
         match request.get("op").and_then(Value::as_str).unwrap_or("") {
             // System-scope list. Upstream (gateway allow-list / capability
             // contract) gates who may reach this op.
             "capsules" => {
-                let entries = source.inspect_list().await;
-                let capsules: Vec<Value> = entries
+                let capsules: Vec<Value> = self
+                    .source
+                    .inspect_list()
+                    .await
                     .iter()
                     .map(|e| {
                         json!({
                             "id": e.id,
                             "name": e.name,
-                            "role": e.manifest.as_ref().map(|m| serde_json::to_value(&m.role).ok()),
+                            "role": e.manifest.as_ref().and_then(|m| serde_json::to_value(&m.role).ok()),
                             "type": e.capsule_type,
                             "state": e.status,
                         })
@@ -180,7 +308,7 @@ impl InspectProvider {
             }
             // System-scope detail.
             "capsule" => match request.get("id").and_then(Value::as_str) {
-                Some(id) => match source.inspect_get(id).await {
+                Some(id) => match self.source.inspect_get(id).await {
                     Some(entry) => json!({ "status": "ok", "data": Self::project(&entry) }),
                     None => provider_error("not_found", "no such capsule"),
                 },
@@ -216,38 +344,9 @@ fn provider_error(code: &str, message: &str) -> Value {
     json!({ "status": "error", "code": code, "message": message })
 }
 
-/// The server's running-capsule registry is one inspect source. (Browser-hosted
-/// apps and registered provider schemes are additional sources to aggregate as
-/// the server's capsule tracking is unified.)
-#[async_trait]
-impl InspectSource for crate::runtime::Runtime {
-    async fn inspect_list(&self) -> Vec<InspectEntry> {
-        self.list_capsules()
-            .await
-            .into_iter()
-            .map(running_to_entry)
-            .collect()
-    }
-
-    async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
-        self.get_capsule(id).await.map(running_to_entry)
-    }
-}
-
-fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
-    InspectEntry {
-        id: info.id,
-        name: info.name,
-        status: info.status,
-        capsule_type: format!("{:?}", info.capsule_type).to_lowercase(),
-        manifest: Some(*info.manifest),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn probe_manifest() -> CapsuleManifest {
         serde_json::from_value(json!({
@@ -283,24 +382,23 @@ mod tests {
         }
     }
 
-    fn provider_with_probe() -> (InspectProvider, Arc<dyn InspectSource>) {
-        let source: Arc<dyn InspectSource> = Arc::new(MockSource {
-            entries: vec![InspectEntry {
-                id: "cap_probe_1".to_string(),
-                name: "probe".to_string(),
-                status: "running".to_string(),
-                capsule_type: "wasm".to_string(),
-                manifest: Some(probe_manifest()),
-            }],
-        });
-        // Keep the Arc alive in the caller; provider holds a Weak.
-        (InspectProvider::new(Arc::downgrade(&source)), source)
+    fn probe_entry() -> InspectEntry {
+        InspectEntry {
+            id: "cap_probe_1".to_string(),
+            name: "probe".to_string(),
+            status: "running".to_string(),
+            capsule_type: "wasm".to_string(),
+            manifest: Some(probe_manifest()),
+        }
+    }
+
+    fn provider_with_probe() -> InspectProvider {
+        InspectProvider::new(Arc::new(MockSource { entries: vec![probe_entry()] }))
     }
 
     #[tokio::test]
     async fn capsules_lists_with_system_scope() {
-        let (provider, _src) = provider_with_probe();
-        let resp = provider
+        let resp = provider_with_probe()
             .send_raw(&json!({ "op": "capsules" }))
             .await
             .unwrap();
@@ -312,8 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn capsule_detail_renders_contract_without_leaking_authority() {
-        let (provider, _src) = provider_with_probe();
-        let resp = provider
+        let resp = provider_with_probe()
             .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
             .await
             .unwrap();
@@ -339,8 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn capsule_detail_unknown_id_is_not_found() {
-        let (provider, _src) = provider_with_probe();
-        let resp = provider
+        let resp = provider_with_probe()
             .send_raw(&json!({ "op": "capsule", "id": "nope" }))
             .await
             .unwrap();
@@ -350,9 +446,61 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_op_is_rejected() {
-        let (provider, _src) = provider_with_probe();
-        let resp = provider.send_raw(&json!({ "op": "revoke" })).await.unwrap();
+        let resp = provider_with_probe()
+            .send_raw(&json!({ "op": "revoke" }))
+            .await
+            .unwrap();
         assert_eq!(resp["status"], "error");
         assert_eq!(resp["code"], "unknown_op");
+    }
+
+    #[tokio::test]
+    async fn registry_source_lists_registered_schemes() {
+        // A real registry with a registered provider scheme appears in inspect.
+        let registry = Arc::new(ProviderRegistry::new());
+        registry.register(Arc::new(MockSchemeProvider)).await;
+        let source = RegistryInspectSource::new(Arc::downgrade(&registry));
+
+        let entries = source.inspect_list().await;
+        assert!(entries.iter().any(|e| e.name == "wallet" && e.id == "provider:wallet"));
+        assert!(source.inspect_get("provider:wallet").await.is_some());
+        assert!(source.inspect_get("provider:nope").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn aggregate_source_unions_and_dedups() {
+        let a: Arc<dyn InspectSource> = Arc::new(MockSource { entries: vec![probe_entry()] });
+        let b: Arc<dyn InspectSource> = Arc::new(MockSource {
+            entries: vec![
+                probe_entry(), // duplicate id — should be deduped
+                InspectEntry {
+                    id: "provider:wallet".to_string(),
+                    name: "wallet".to_string(),
+                    status: "running".to_string(),
+                    capsule_type: "provider".to_string(),
+                    manifest: None,
+                },
+            ],
+        });
+        let agg = AggregateInspectSource::new(vec![a, b]);
+        let entries = agg.inspect_list().await;
+        assert_eq!(entries.len(), 2, "duplicate ids must be deduped");
+        assert!(agg.inspect_get("provider:wallet").await.is_some());
+    }
+
+    // Minimal provider used only to register a "wallet" scheme in the registry.
+    struct MockSchemeProvider;
+
+    #[async_trait]
+    impl Provider for MockSchemeProvider {
+        async fn handle(&self, _r: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider("unused".into()))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["wallet"]
+        }
+        fn name(&self) -> &'static str {
+            "mock-wallet"
+        }
     }
 }

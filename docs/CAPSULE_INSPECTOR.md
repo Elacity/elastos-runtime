@@ -210,18 +210,33 @@ Ops implemented: `capsules` (System list), `capsule` (System detail, rich
 nine-field projection from the retained manifest). Deferred: `self` (needs
 caller-identity injection) and `revoke` (needs the gateway capability plane).
 
-**Wired + populated:** the single-VM-capsule serve path
-(`elastos serve <microvm>`) registers the provider on the shared registry and
-its `running_capsules` source is populated, so inspect works end-to-end there.
+**Data sources (unified via `InspectSource`).** The provider reads through the
+`InspectSource` trait; sources are composable:
 
-**Remaining data-source work (the honest gap):** the multi-capsule product
-path does not populate `runtime::running_capsules` (capsules there are launched
-as registry providers or supervisor/shell processes, and `register_capsule` is
-only called on the single-VM path). So on the main/browser path the provider
-returns an empty list until the server's capsule tracking is unified — e.g.
-aggregating `ProviderRegistry` schemes and supervisor-launched capsules into
-`InspectSource`. That unification is the next concrete step; the projection,
-scope, no-leak, and transport wiring are done.
+- `RuntimeInspectSource` — the server `Runtime`'s running-capsule registry
+  (capsules launched with a retained manifest → rich detail). Populated on the
+  single-VM serve path.
+- `RegistryInspectSource` — the registered provider schemes from
+  `ProviderRegistry` (the running provider capsules/services). Always populated
+  on the main product path. Thin (`id = provider:<scheme>`, no manifest yet).
+- `AggregateInspectSource` — unions sources and de-dups by id.
+
+**Wired on both serve paths:**
+
+- Single-VM serve (`elastos serve <microvm>`): `RuntimeInspectSource` → rich,
+  populated end-to-end.
+- Main product path: `Aggregate[RuntimeInspectSource, RegistryInspectSource]`
+  on the shared registry the supervisor/gateway use — so the **browser
+  Inspector now lists the running provider services**.
+
+**Remaining enrichment (honest gap):** provider-scheme entries are thin
+(`manifest = None`) because the registry does not carry per-provider manifests,
+and `ProviderRegistry::schemes()` lists main providers only (sub-providers and
+their manifests are not yet enumerated). Restoring the full nine-field detail
+for provider capsules means adding a catalog-backed source that reads each
+installed capsule's `capsule.json`. The projection, scope, no-leak, transport
+wiring, and source aggregation are done; richer provider metadata is the next
+refinement.
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
 to sample data until the data source is populated on the browser path.
