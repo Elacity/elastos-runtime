@@ -44,7 +44,9 @@ fn signature_fingerprint(sig_b64: &str) -> Option<String> {
         return None;
     }
     let bytes = B64.decode(sig_b64).unwrap_or_else(|_| sig_b64.as_bytes().to_vec());
-    Some(hex::encode(Sha256::digest(&bytes))[..16].to_string())
+    // `.take(16)` rather than a `[..16]` slice: can never panic regardless of the
+    // digest's hex length (hex chars are single-byte ASCII, so no boundary risk).
+    Some(hex::encode(Sha256::digest(&bytes)).chars().take(16).collect())
 }
 
 /// Derive a fail-closed trust classification from what is actually verifiable
