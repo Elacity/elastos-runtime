@@ -82,6 +82,16 @@ defense-in-depth gate on top. Shell callers are always **System**, matching
 existing orchestrator privilege. A caller holding neither grant (and not the
 shell) is denied — the gate **fails closed**.
 
+### Read vs. write (Phase 2)
+
+Read endpoints require a `Read` inspect capability. The one mutating endpoint,
+`elastos://inspect/revoke`, requires a **`Write`** inspect capability at
+**System** scope. The two are separated by the *action* dimension of the
+capability, not just the resource: a read-only inspect grant (`Read`) can never
+satisfy a write endpoint, so the Inspector's normal read surface can never
+drive a mutation (Principles #3, #16). Revocation only ever *reduces* authority
+(fail-safe direction) and is audited (`inspect.revoke`).
+
 This decision is implemented as a pure, unit-tested unit in the trusted core:
 `elastos-runtime::inspect` (`authorize_view`, `InspectScope`). The runtime-side
 handler MUST call `authorize_view` before returning any per-capsule detail.
@@ -208,6 +218,15 @@ endpoint a `SelfOnly` capsule uses to introspect itself.
 The runtime-side handler maps these fields from existing sources:
 `CapsuleManager::list()` / `get()` (id, manifest, state, cid, trust_level) and
 `AuditLog::recent_events` (recent events + counts). No new state is introduced.
+
+### `elastos://inspect/revoke` (params: `{ "token_id": "<32 hex>" }`) — write
+
+The one mutating endpoint. Requires a **`Write`** inspect capability at
+**System** scope (or the shell). Revokes the capability token by id via
+`CapabilityManager::revoke`, reducing authority only. Returns `Ok` on success;
+`permission_denied` for a read-only or self-only caller; `invalid_token_id` for
+a malformed id. The action is audited (`inspect.revoke`) in addition to the
+capability manager's own revocation audit.
 
 ### Why `granted_capabilities` is observed, not enumerated
 

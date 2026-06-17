@@ -842,7 +842,12 @@ impl RequestHandler {
     // ===== Capsule Inspector (read-only) =====
 
     /// Dispatch an `elastos://inspect/*` request under a scoped, fail-closed
-    /// authorization gate. Every operation is read-only.
+    /// authorization gate.
+    ///
+    /// Read endpoints (`capsules`, `capsule`, `self`) require a `Read` inspect
+    /// capability; the write endpoint (`revoke`) requires a `Write` inspect
+    /// capability. The action dimension keeps the two strictly separated: a
+    /// read-only inspect grant can never drive a mutation (Principles #3, #16).
     async fn handle_inspect(
         &self,
         from: &CapsuleId,
@@ -853,9 +858,23 @@ impl RequestHandler {
         use crate::capability::token::CapabilityToken;
         use crate::inspect::{self, InspectScope};
 
+        let endpoint = uri
+            .strip_prefix("elastos://inspect")
+            .unwrap_or("")
+            .trim_start_matches('/');
+
+        // `revoke` mutates authority and demands a Write inspect capability;
+        // everything else is read-only.
+        let required_action = if endpoint == "revoke" {
+            Action::Write
+        } else {
+            Action::Read
+        };
+
         // Determine the caller's inspect scope. Shell is System by existing
         // orchestrator privilege; every other caller must present a valid
-        // inspect capability token, and the grant pattern fixes the tier.
+        // inspect capability token for the required action, and the grant
+        // pattern fixes the tier.
         let is_shell = self.is_shell(from).await;
         let scope = if is_shell {
             InspectScope::System
@@ -870,8 +889,9 @@ impl RequestHandler {
                 }
             };
             // Authoritative capability check: the token must grant the
-            // requested URI (a self-only grant cannot satisfy a system URI).
-            if let Err(e) = self.validate_token(token_str, from, Action::Read, uri).await {
+            // requested URI *and* action. A read grant fails a write endpoint;
+            // a self-only grant cannot satisfy a system URI.
+            if let Err(e) = self.validate_token(token_str, from, required_action, uri).await {
                 return e;
             }
             // Defense in depth: classify the granted pattern into a scope.
@@ -895,11 +915,6 @@ impl RequestHandler {
             }
         };
 
-        let endpoint = uri
-            .strip_prefix("elastos://inspect")
-            .unwrap_or("")
-            .trim_start_matches('/');
-
         match endpoint {
             "capsules" => self.inspect_list(scope, from).await,
             "self" => self.inspect_detail(scope, from, from.as_str()).await,
@@ -916,8 +931,73 @@ impl RequestHandler {
                     ),
                 }
             }
+            "revoke" => self.inspect_revoke(scope, from, params).await,
             _ => RuntimeResponse::error("not_found", "Unknown inspect endpoint"),
         }
+    }
+
+    /// Revoke a capability by token id. Write-gated and System-scoped: only a
+    /// holder of a `Write` inspect capability at System scope (or the shell)
+    /// reaches here. Revocation only ever *reduces* authority and is audited.
+    async fn inspect_revoke(
+        &self,
+        scope: crate::inspect::InspectScope,
+        from: &CapsuleId,
+        params: Option<serde_json::Value>,
+    ) -> RuntimeResponse {
+        use crate::capability::token::TokenId;
+        use crate::inspect::InspectScope;
+        use crate::primitives::audit::AuditEvent;
+
+        // A self-only inspect grant must never drive a system mutation.
+        if scope != InspectScope::System {
+            return RuntimeResponse::error(
+                "permission_denied",
+                "Revoke requires system-scope inspect authority",
+            );
+        }
+
+        let token_id = match params
+            .as_ref()
+            .and_then(|p| p.get("token_id"))
+            .and_then(|v| v.as_str())
+        {
+            Some(id) => id,
+            None => {
+                return RuntimeResponse::error(
+                    "invalid_input",
+                    "inspect/revoke requires a \"token_id\" parameter",
+                )
+            }
+        };
+
+        // Parse the 32-hex-char token id (same contract as RevokeCapability).
+        let parsed = match hex::decode(token_id) {
+            Ok(bytes) if bytes.len() == 16 => {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&bytes);
+                TokenId::from_bytes(arr)
+            }
+            _ => {
+                return RuntimeResponse::error(
+                    "invalid_token_id",
+                    "Token ID must be 32 hex characters",
+                )
+            }
+        };
+
+        self.capability_manager
+            .revoke(parsed, "Revoked via inspector")
+            .await;
+
+        // Audit who drove the revoke (the revoke itself is also audited by the
+        // capability manager).
+        self._audit_log.emit(AuditEvent::Custom {
+            event_type: "inspect.revoke".to_string(),
+            details: serde_json::json!({ "caller": from.as_str(), "token_id": token_id }),
+        });
+
+        RuntimeResponse::ok()
     }
 
     /// List capsules visible under the caller's scope.
@@ -1362,6 +1442,153 @@ mod tests {
                 assert_eq!(data["name"], "probe");
             }
             other => panic!("expected Ok with own record, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_revoke_rejects_read_only_token() {
+        // The crux of the read/write separation: a System *read* inspect grant
+        // must never be able to drive a mutation. The action dimension blocks
+        // it at the capability layer.
+        let (handler, _shell, caps, _cm) = create_test_handler_with_caps().await;
+        let caller = CapsuleId::new();
+        let victim_capsule = CapsuleId::new();
+        let victim = caps.grant(
+            victim_capsule.as_str(),
+            ResourceId::new("elastos://storage/x"),
+            Action::Read,
+            InternalConstraints::default(),
+            None,
+        );
+        let read_token = caps
+            .grant(
+                caller.as_str(),
+                ResourceId::new("elastos://inspect/*"),
+                Action::Read,
+                InternalConstraints::default(),
+                None,
+            )
+            .to_base64()
+            .expect("encode read token");
+
+        let resp = handler
+            .handle(
+                &caller,
+                inspect_request(
+                    "elastos://inspect/revoke",
+                    Some(read_token),
+                    Some(serde_json::json!({ "token_id": victim.id().to_string() })),
+                ),
+            )
+            .await;
+        match resp {
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "permission_denied"),
+            other => panic!("read token must not revoke, got {:?}", other),
+        }
+
+        // Victim capability is still valid — the revoke did not happen.
+        let res = ResourceId::new("elastos://storage/x");
+        assert!(caps
+            .validate(&victim, victim_capsule.as_str(), Action::Read, &res, None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn inspect_shell_can_revoke_token() {
+        let (handler, shell_id, caps, _cm) = create_test_handler_with_caps().await;
+        let victim_capsule = CapsuleId::new();
+        let res = ResourceId::new("elastos://storage/x");
+        let victim = caps.grant(
+            victim_capsule.as_str(),
+            res.clone(),
+            Action::Read,
+            InternalConstraints::default(),
+            None,
+        );
+        // Sanity: valid before revoke.
+        assert!(caps
+            .validate(&victim, victim_capsule.as_str(), Action::Read, &res, None)
+            .await
+            .is_ok());
+
+        let resp = handler
+            .handle(
+                &shell_id,
+                inspect_request(
+                    "elastos://inspect/revoke",
+                    None,
+                    Some(serde_json::json!({ "token_id": victim.id().to_string() })),
+                ),
+            )
+            .await;
+        assert!(matches!(resp, RuntimeResponse::Ok { .. }), "shell revoke should succeed");
+
+        // The capability is now revoked and fails validation.
+        assert!(caps
+            .validate(&victim, victim_capsule.as_str(), Action::Read, &res, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn inspect_write_token_at_system_scope_can_revoke() {
+        // A non-shell System operator holding a Write inspect grant can revoke.
+        let (handler, _shell, caps, _cm) = create_test_handler_with_caps().await;
+        let operator = CapsuleId::new();
+        let victim_capsule = CapsuleId::new();
+        let res = ResourceId::new("elastos://storage/x");
+        let victim = caps.grant(
+            victim_capsule.as_str(),
+            res.clone(),
+            Action::Read,
+            InternalConstraints::default(),
+            None,
+        );
+        let write_token = caps
+            .grant(
+                operator.as_str(),
+                ResourceId::new("elastos://inspect/*"),
+                Action::Write,
+                InternalConstraints::default(),
+                None,
+            )
+            .to_base64()
+            .expect("encode write token");
+
+        let resp = handler
+            .handle(
+                &operator,
+                inspect_request(
+                    "elastos://inspect/revoke",
+                    Some(write_token),
+                    Some(serde_json::json!({ "token_id": victim.id().to_string() })),
+                ),
+            )
+            .await;
+        assert!(matches!(resp, RuntimeResponse::Ok { .. }), "write-scope revoke should succeed");
+        assert!(caps
+            .validate(&victim, victim_capsule.as_str(), Action::Read, &res, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn inspect_revoke_rejects_bad_token_id() {
+        let (handler, shell_id, _caps, _cm) = create_test_handler_with_caps().await;
+        let resp = handler
+            .handle(
+                &shell_id,
+                inspect_request(
+                    "elastos://inspect/revoke",
+                    None,
+                    Some(serde_json::json!({ "token_id": "not-hex" })),
+                ),
+            )
+            .await;
+        match resp {
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "invalid_token_id"),
+            other => panic!("expected invalid_token_id, got {:?}", other),
         }
     }
 

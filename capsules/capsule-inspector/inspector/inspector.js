@@ -48,6 +48,18 @@ async function loadCapsuleDetail(id) {
   return SAMPLE_DATA.find((c) => c.id === id) || null;
 }
 
+// Phase 2 (write): revoke a capability by token id. This is a System-admin
+// mutation gated by a *write* inspect capability (`elastos://inspect/*` with
+// the write action). It is intentionally NOT driven from the read view above —
+// read summaries never carry bearer token ids (Principle #16). A dedicated
+// System admin surface supplies the token id and a write-scoped token.
+async function inspectRevoke(tokenId) {
+  const bridge = window.elastos && window.elastos.inspect;
+  if (!bridge || typeof bridge.invoke !== "function") return null;
+  // Mutating call: the host bridge must attach a write-scoped inspect token.
+  return await bridge.invoke("elastos://inspect/revoke", "write", { token_id: tokenId });
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
