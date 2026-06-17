@@ -143,6 +143,42 @@ This branch contains the Phase-1 starter:
   the live handler when present.
 - This doc — the architecture, security model, contract, and phasing.
 
+## Transports & Carrier alignment
+
+Per Principle #4 and `CARRIER.md`, the **capsule-facing contract is
+Carrier-shaped**: a target (`elastos://inspect`), an operation, a payload, a
+capability, and audit. The transport *underneath* is an adapter **below** the
+capsule contract — `CARRIER.md` "Where HTTP Fits" explicitly classifies the
+node-local HTTP control API as control-plane plumbing, *not* the Carrier
+substrate, and Principle #4 lists "local loopback, HTTP, WebSocket,
+postMessage, stdio, or in-process calls" as host adapters below the contract.
+So using HTTP as the *transport* is aligned; what would violate alignment is a
+capsule that *knows host routes*. The Inspector UI never does: all calls go
+through one Carrier-shaped `inspectInvoke(operation, payload)`; swapping the
+transport requires no UI change.
+
+There are two transports to the **one** authority decision
+(`crate::inspect::InspectScope`), satisfying Principle #7 (every path enforces
+the same authority boundary):
+
+| Caller | Transport (adapter) | Front door | Identity / scope |
+| --- | --- | --- | --- |
+| WASM / microVM capsule, agent | serial Carrier bridge → `carrier_invoke` | `RequestHandler::handle_inspect` | capability token → scope |
+| Browser-hosted UI (this capsule) | node-local control API (`POST /api/provider/inspect/<op>` + `x-elastos-home-token`) | gateway → provider registry | signed home launch token → app → scope |
+
+**Status (Principle #12 honesty):** the capsule/`carrier_invoke` path is
+implemented and tested (`RequestHandler::handle_inspect`). The browser path is
+**not yet wired in the runtime**: the gateway dispatches `/api/provider/<scheme>/<op>`
+via `ProviderRegistry::send_raw`, and `GatewayState` holds only the provider
+registry (no `CapsuleManager`/`AuditLog`). So serving the browser Inspector
+requires exposing inspect as a **registry provider** (`elastos://inspect/*`)
+that holds `CapsuleManager` + `AuditLog` and delegates the decision to
+`crate::inspect`. That provider would also let `RequestHandler::route_to_provider`
+reach the same code, converging on **one canonical path** (Principle #10) — at
+which point the bespoke `handle_inspect` intercept can retire. The UI adapter
+above already targets this `/api/provider/inspect/<op>` contract and degrades
+to sample data until the provider exists.
+
 ## Wire contract: `elastos://inspect/*` (read-only)
 
 All operations are `read`. Responses are JSON. Every response is **filtered by

@@ -9,30 +9,54 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// Live data source: elastos://inspect/* via the runtime bridge.
-// Returns null when no bridge is available so the UI can fall back to samples.
+// Host adapter for the inspect surface.
+//
+// The capsule-facing contract is Carrier-shaped (Principle #4): a provider
+// scheme (`inspect`), an operation, and a payload. The transport underneath is
+// an adapter *below* the capsule contract — here the runtime's node-local
+// control API (CARRIER.md "Where HTTP Fits" #1), the same door the `library`
+// and `browser` capsules use. Swapping that transport (postMessage, native
+// host, in-process) must not change capsule code, so all calls go through one
+// `inspectInvoke(operation, payload)`.
 // ---------------------------------------------------------------------------
-// Mirrors the runtime ResourceRequest: a read against an `elastos://inspect/*`
-// URI with params. The host bridge validates the capability token and routes
-// to RequestHandler::handle_inspect. Returns null when no bridge is present.
-async function inspectRead(uri, params) {
-  const bridge = window.elastos && window.elastos.inspect;
-  if (!bridge || typeof bridge.invoke !== "function") return null;
-  try {
-    return await bridge.invoke(uri, "read", params || {});
-  } catch (err) {
-    console.warn("inspect bridge error:", err);
-    return null;
+const HOME_TOKEN = new URLSearchParams(globalThis.location?.search || "").get("home_token") || "";
+
+async function inspectInvoke(operation, payload) {
+  // Prefer an injected host bridge (native/postMessage) when present.
+  const bridge = globalThis.elastos && globalThis.elastos.inspect;
+  if (bridge && typeof bridge.invoke === "function") {
+    return await bridge.invoke("elastos://inspect", operation, payload || {});
   }
+  // Otherwise use the node-local control API adapter, exactly as library does:
+  // POST /api/provider/inspect/<op> with the signed home launch token. The
+  // gateway derives identity from that token (never from page input) and maps
+  // the authenticated app to an inspect scope before dispatching.
+  if (!HOME_TOKEN) return null;
+  const res = await fetch("/api/provider/inspect/" + encodeURIComponent(operation), {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-elastos-home-token": HOME_TOKEN },
+    body: JSON.stringify(payload || {}),
+  });
+  const envelope = await res.json().catch(() => ({}));
+  if (!res.ok || envelope.status === "error") {
+    throw new Error(
+      envelope.message || envelope.error || `inspect ${operation} failed: ${res.status}`
+    );
+  }
+  return envelope.data || envelope;
 }
 
 async function loadCapsuleList() {
-  const live = await inspectRead("elastos://inspect/capsules", {});
-  if (live && Array.isArray(live.capsules)) {
-    setSourceBadge(true);
-    // Scope is reported by the runtime handler ("system" | "self").
-    setScopeBadge(live.scope || "system");
-    return live.capsules;
+  try {
+    const live = await inspectInvoke("capsules", {});
+    if (live && Array.isArray(live.capsules)) {
+      setSourceBadge(true);
+      // Scope is reported by the runtime ("system" | "self").
+      setScopeBadge(live.scope || "system");
+      return live.capsules;
+    }
+  } catch (err) {
+    console.warn("inspect capsules failed, showing sample:", err);
   }
   setSourceBadge(false);
   // Sample data illustrates the privileged System view.
@@ -43,21 +67,21 @@ async function loadCapsuleList() {
 }
 
 async function loadCapsuleDetail(id) {
-  const live = await inspectRead("elastos://inspect/capsule", { id });
-  if (live && live.id) return live;
+  try {
+    const live = await inspectInvoke("capsule", { id });
+    if (live && live.id) return live;
+  } catch (err) {
+    console.warn("inspect capsule failed, showing sample:", err);
+  }
   return SAMPLE_DATA.find((c) => c.id === id) || null;
 }
 
-// Phase 2 (write): revoke a capability by token id. This is a System-admin
-// mutation gated by a *write* inspect capability (`elastos://inspect/*` with
-// the write action). It is intentionally NOT driven from the read view above —
-// read summaries never carry bearer token ids (Principle #16). A dedicated
-// System admin surface supplies the token id and a write-scoped token.
+// Phase 2 (write): revoke a capability by token id. A System-admin mutation
+// requiring a *write* inspect capability. Intentionally NOT driven from the
+// read view — read summaries never carry bearer token ids (Principle #16); a
+// dedicated System admin surface supplies the id and a write-scoped token.
 async function inspectRevoke(tokenId) {
-  const bridge = window.elastos && window.elastos.inspect;
-  if (!bridge || typeof bridge.invoke !== "function") return null;
-  // Mutating call: the host bridge must attach a write-scoped inspect token.
-  return await bridge.invoke("elastos://inspect/revoke", "write", { token_id: tokenId });
+  return await inspectInvoke("revoke", { token_id: tokenId });
 }
 
 // ---------------------------------------------------------------------------
