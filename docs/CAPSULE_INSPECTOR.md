@@ -223,10 +223,19 @@ caller-identity injection) and `revoke` (needs the gateway capability plane).
   manifest-backed source for the product. (`id = capsule:<name>`, with
   path-traversal ids rejected.)
 - `RegistryInspectSource` — the registered provider schemes from
-  `ProviderRegistry` (thin, `id = provider:<scheme>`). Available as a source
-  for built-in schemes that have no on-disk capsule; not in the default
-  aggregate.
+  `ProviderRegistry`, including **sub-provider schemes** (`did`, `key`, `peer`,
+  …) via `ProviderRegistry::sub_provider_schemes()`. Thin
+  (`id = provider:<scheme>`); a source for built-in schemes with no on-disk
+  capsule; not in the default aggregate.
 - `AggregateInspectSource` — unions sources and de-dups by id.
+
+**Live audit.** The provider takes an optional `AuditSource`. `AuthAuditSource`
+reads the signed runtime audit log (`RuntimeAuditEventV1` in the auth state),
+correlates events by `capsule_id` (the capsule name), and fills the detail
+view's `audit` section — recent events (newest-first, capped) plus `total` and
+`denied` counts. Wired on both serve paths. Reads run on a blocking task so the
+async workers aren't stalled. Records are projected to safe fields only
+(timestamp, event type, reason, success) — no signatures or handles (#16).
 
 **Wired on both serve paths:**
 
@@ -237,12 +246,13 @@ caller-identity injection) and `revoke` (needs the gateway capability plane).
   Inspector lists installed capsules with their full manifests** and running
   status.
 
-**Remaining enrichment (honest gap):** `ProviderRegistry::schemes()` lists main
-providers only (sub-providers are not enumerated), so running-status detection
-in the catalog source is by `provides`-scheme match and may miss sub-provider
-schemes; and live audit/grant aggregation into the projection is still pending.
-Projection, scope, no-leak, transport wiring, source aggregation, and the rich
-manifest view are done.
+**Remaining enrichment (honest gap):** `granted_capabilities` is still empty on
+the product path. ElastOS capabilities are bearer tokens with no central
+per-capsule registry, and `RuntimeAuditEventV1` carries no resource/action — so
+deriving the observed grant list needs a capability-event source that records
+resource + action. Everything else is done: projection, scope, no-leak,
+transport wiring, source aggregation, rich manifest detail, sub-provider
+running-status coverage, and live audit (recent + counts).
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
 to sample data until the data source is populated on the browser path.

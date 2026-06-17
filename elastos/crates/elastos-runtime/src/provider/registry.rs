@@ -692,6 +692,14 @@ impl ProviderRegistry {
         providers.keys().cloned().collect()
     }
 
+    /// List all registered `elastos://` sub-provider schemes (e.g. `did`,
+    /// `key`, `peer`). These are dispatched hierarchically and are not included
+    /// in [`schemes`](Self::schemes), which lists only top-level providers.
+    pub async fn sub_provider_schemes(&self) -> Vec<String> {
+        let sub = self.sub_providers.read().await;
+        sub.keys().cloned().collect()
+    }
+
     /// Check if a scheme has a registered provider
     pub async fn has_provider(&self, scheme: &str) -> bool {
         let providers = self.providers.read().await;

@@ -51,6 +51,83 @@ pub trait InspectSource: Send + Sync {
     async fn inspect_get(&self, id: &str) -> Option<InspectEntry>;
 }
 
+/// A single audited event, projected for display (no signatures/handles).
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub ts: u64,
+    pub event: String,
+    pub detail: String,
+    pub success: bool,
+}
+
+/// A capsule's recent audit activity.
+#[derive(Debug, Clone, Default)]
+pub struct CapsuleAudit {
+    pub total: u64,
+    pub denied: u64,
+    pub recent: Vec<AuditRecord>,
+}
+
+/// Read-only source of per-capsule audit activity. Optional on the provider;
+/// when absent, the audit section is empty.
+#[async_trait]
+pub trait AuditSource: Send + Sync {
+    /// Audit for `capsule_key`, newest-first, capped at `recent_limit`.
+    async fn for_capsule(&self, capsule_key: &str, recent_limit: usize) -> CapsuleAudit;
+}
+
+/// Audit source backed by the signed runtime audit log in the auth state
+/// (`RuntimeAuditEventV1`). Correlates by `capsule_id`.
+pub struct AuthAuditSource {
+    data_dir: PathBuf,
+}
+
+impl AuthAuditSource {
+    pub fn new(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+}
+
+#[async_trait]
+impl AuditSource for AuthAuditSource {
+    async fn for_capsule(&self, capsule_key: &str, recent_limit: usize) -> CapsuleAudit {
+        let data_dir = self.data_dir.clone();
+        let key = capsule_key.to_string();
+        // Auth state load is blocking std::fs; keep it off the async worker.
+        tokio::task::spawn_blocking(move || {
+            let state = match crate::auth::load_auth_state(&data_dir) {
+                Ok(state) => state,
+                Err(_) => return CapsuleAudit::default(),
+            };
+            let mut total = 0u64;
+            let mut denied = 0u64;
+            let mut recent = Vec::new();
+            // Newest-first.
+            for event in state.audit.iter().rev() {
+                if event.capsule_id.as_deref() != Some(key.as_str()) {
+                    continue;
+                }
+                total += 1;
+                let success = matches!(event.result.as_str(), "ok" | "success" | "allowed");
+                if !success {
+                    denied += 1;
+                }
+                if recent.len() < recent_limit {
+                    recent.push(AuditRecord {
+                        ts: event.occurred_at,
+                        event: event.event_type.clone(),
+                        detail: event.reason.clone(),
+                        success,
+                    });
+                }
+            }
+            CapsuleAudit { total, denied, recent }
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
 // ── Sources ─────────────────────────────────────────────────────────
 
 /// Source backed by the server `Runtime`'s running-capsule registry (the
@@ -120,7 +197,9 @@ impl InspectSource for RegistryInspectSource {
         match self.registry.upgrade() {
             Some(reg) => {
                 let mut schemes = reg.schemes().await;
+                schemes.extend(reg.sub_provider_schemes().await);
                 schemes.sort();
+                schemes.dedup();
                 schemes.into_iter().map(Self::scheme_entry).collect()
             }
             None => Vec::new(),
@@ -130,11 +209,9 @@ impl InspectSource for RegistryInspectSource {
     async fn inspect_get(&self, id: &str) -> Option<InspectEntry> {
         let scheme = id.strip_prefix("provider:")?;
         let reg = self.registry.upgrade()?;
-        if reg.has_provider(scheme).await {
-            Some(Self::scheme_entry(scheme.to_string()))
-        } else {
-            None
-        }
+        let known =
+            reg.has_provider(scheme).await || reg.sub_provider_schemes().await.iter().any(|s| s == scheme);
+        known.then(|| Self::scheme_entry(scheme.to_string()))
     }
 }
 
@@ -167,7 +244,12 @@ impl CatalogInspectSource {
 
     async fn running_schemes(&self) -> std::collections::HashSet<String> {
         match self.registry.upgrade() {
-            Some(reg) => reg.schemes().await.into_iter().collect(),
+            Some(reg) => {
+                let mut set: std::collections::HashSet<String> =
+                    reg.schemes().await.into_iter().collect();
+                set.extend(reg.sub_provider_schemes().await);
+                set
+            }
             None => std::collections::HashSet::new(),
         }
     }
@@ -272,11 +354,18 @@ impl InspectSource for AggregateInspectSource {
 
 pub struct InspectProvider {
     source: Arc<dyn InspectSource>,
+    audit: Option<Arc<dyn AuditSource>>,
 }
 
 impl InspectProvider {
     pub fn new(source: Arc<dyn InspectSource>) -> Self {
-        Self { source }
+        Self { source, audit: None }
+    }
+
+    /// Attach a per-capsule audit source so detail views show live activity.
+    pub fn with_audit(mut self, audit: Arc<dyn AuditSource>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     fn scope_label(scope: InspectScope) -> &'static str {
@@ -289,7 +378,7 @@ impl InspectProvider {
     /// Project a capsule into the inspector wire contract (see
     /// docs/CAPSULE_INSPECTOR.md). Read-only; unknown fields are null rather
     /// than fabricated, and no bearer token / raw signature is ever included.
-    fn project(entry: &InspectEntry) -> Value {
+    fn project(entry: &InspectEntry, audit: Value) -> Value {
         fn field(v: &Value, key: &str) -> Value {
             v.get(key).cloned().unwrap_or(Value::Null)
         }
@@ -368,9 +457,25 @@ impl InspectProvider {
                 "cid": Value::Null,
                 "signature_present": signature_present,
             },
-            "audit": { "counts": { "total": 0, "denied": 0 }, "recent": [] },
+            "audit": audit,
             "processes": [{ "kind": entry.capsule_type, "status": entry.status }],
         })
+    }
+
+    /// Build the audit section for a capsule from the audit source (keyed by
+    /// the capsule name, which is how runtime audit events record `capsule_id`).
+    /// Empty when no audit source is attached.
+    async fn audit_value(&self, entry: &InspectEntry) -> Value {
+        let Some(audit) = &self.audit else {
+            return json!({ "counts": { "total": 0, "denied": 0 }, "recent": [] });
+        };
+        let a = audit.for_capsule(&entry.name, 20).await;
+        let recent: Vec<Value> = a
+            .recent
+            .iter()
+            .map(|r| json!({ "ts": r.ts, "event": r.event, "detail": r.detail, "success": r.success }))
+            .collect();
+        json!({ "counts": { "total": a.total, "denied": a.denied }, "recent": recent })
     }
 
     async fn handle_op(&self, request: &Value) -> Value {
@@ -401,7 +506,10 @@ impl InspectProvider {
             // System-scope detail.
             "capsule" => match request.get("id").and_then(Value::as_str) {
                 Some(id) => match self.source.inspect_get(id).await {
-                    Some(entry) => json!({ "status": "ok", "data": Self::project(&entry) }),
+                    Some(entry) => {
+                        let audit = self.audit_value(&entry).await;
+                        json!({ "status": "ok", "data": Self::project(&entry, audit) })
+                    }
                     None => provider_error("not_found", "no such capsule"),
                 },
                 None => provider_error("invalid_request", "inspect/capsule requires an \"id\""),
@@ -649,7 +757,60 @@ mod tests {
         assert!(source.inspect_get("capsule:../etc").await.is_none());
     }
 
-    // Minimal provider used only to register a "wallet" scheme in the registry.
+    #[tokio::test]
+    async fn detail_includes_live_audit_when_source_attached() {
+        struct MockAudit;
+        #[async_trait]
+        impl AuditSource for MockAudit {
+            async fn for_capsule(&self, key: &str, _limit: usize) -> CapsuleAudit {
+                if key == "probe" {
+                    CapsuleAudit {
+                        total: 3,
+                        denied: 1,
+                        recent: vec![AuditRecord {
+                            ts: 100,
+                            event: "capability.use".to_string(),
+                            detail: "did read".to_string(),
+                            success: true,
+                        }],
+                    }
+                } else {
+                    CapsuleAudit::default()
+                }
+            }
+        }
+
+        let provider = InspectProvider::new(Arc::new(MockSource { entries: vec![probe_entry()] }))
+            .with_audit(Arc::new(MockAudit));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["data"]["audit"]["counts"]["total"], 3);
+        assert_eq!(resp["data"]["audit"]["counts"]["denied"], 1);
+        assert_eq!(resp["data"]["audit"]["recent"][0]["event"], "capability.use");
+        assert_eq!(resp["data"]["audit"]["recent"][0]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn registry_source_includes_sub_providers() {
+        let registry = Arc::new(ProviderRegistry::new());
+        // "did" is a reserved sub-provider scheme.
+        registry
+            .register_sub_provider("did", Arc::new(MockSchemeProvider))
+            .await
+            .unwrap();
+        let source = RegistryInspectSource::new(Arc::downgrade(&registry));
+
+        let entries = source.inspect_list().await;
+        assert!(
+            entries.iter().any(|e| e.name == "did" && e.id == "provider:did"),
+            "sub-provider scheme must be listed"
+        );
+        assert!(source.inspect_get("provider:did").await.is_some());
+    }
+
+    // Minimal provider used only to register a scheme in the registry.
     struct MockSchemeProvider;
 
     #[async_trait]

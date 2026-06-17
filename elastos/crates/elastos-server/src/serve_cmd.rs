@@ -201,8 +201,11 @@ pub async fn run_serve(
                     use elastos_server::inspect_provider as ip;
                     let source: Arc<dyn ip::InspectSource> =
                         Arc::new(ip::RuntimeInspectSource::new(Arc::downgrade(&runtime_arc)));
+                    let audit = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
                     provider_registry
-                        .register(Arc::new(ip::InspectProvider::new(source)))
+                        .register(Arc::new(
+                            ip::InspectProvider::new(source).with_audit(audit),
+                        ))
                         .await;
                 }
 
@@ -317,9 +320,12 @@ pub async fn run_serve(
         ));
         let source: Arc<dyn ip::InspectSource> =
             Arc::new(ip::AggregateInspectSource::new(vec![runtime_src, catalog_src]));
+        let audit = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
         infra
             .provider_registry
-            .register(Arc::new(ip::InspectProvider::new(source)))
+            .register(Arc::new(
+                ip::InspectProvider::new(source).with_audit(audit),
+            ))
             .await;
     }
 
