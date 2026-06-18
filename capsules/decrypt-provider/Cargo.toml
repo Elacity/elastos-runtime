@@ -132,7 +132,7 @@ envelope-conformance = ["pq-mldsa"]
 # (only a flattened, buyer-watermarked page image egresses). Closes the "raw plaintext reaches
 # the browser" gap and is browser-agnostic (an image always renders). Pulls `hayro` + `image`
 # only when enabled; the default + security-critical builds stay lean. OFF by default.
-pdf-render = ["dep:hayro", "dep:image", "dep:font8x8", "dep:zip", "dep:resvg"]
+pdf-render = ["dep:hayro", "dep:image", "dep:font8x8", "dep:zip", "dep:resvg", "dep:roxmltree", "dep:ab_glyph"]
 
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
@@ -187,8 +187,20 @@ resvg = { version = "0.45", default-features = false, features = ["raster-images
 # Forensic-watermark glyphs (feature `pdf-render`). `font8x8` is public-domain const bitmap
 # data for the FULL printable-ASCII set (no font-file vendoring, no runtime, builds to
 # wasm32-wasip1), so any principal/DID/wallet stamps legibly. Replaces the prior hand-rolled
-# hex-only font that garbled non-hex characters. Optional → no footprint on the default build.
+# hex-only font that garbled non-hex characters. Used ONLY for the faint tiled watermark now;
+# document BODY text is rasterised with a real vector face (see `ab_glyph`). Optional.
 font8x8 = { version = "0.3", default-features = false, optional = true }
+# BODY-text rasteriser (feature `pdf-render`). `ab_glyph` is a pure-Rust, unsafe-free TrueType
+# glyph rasteriser (builds to wasm32-wasip1) that anti-aliases real vector glyphs — so the text
+# reader (proportional DejaVu Sans) and code reader (DejaVu Sans Mono) render as a friendly,
+# legible typeface instead of the blocky 8x8 bitmap. Fonts are vendored under `assets/fonts`
+# (DejaVu, a freely-redistributable Bitstream-Vera–derived family). Optional → no default footprint.
+ab_glyph = { version = "0.2", optional = true }
+# EPUB OPF/container parsing (feature `pdf-render`): pure-Rust, allocation-light XML reader
+# (already in-tree via resvg/usvg), used to read the spine order + manifest hrefs so EPUB
+# chapters are served in reading order. The chapter XHTML itself is sanitised by hand (no
+# html5ever) and displayed in a locked, script-less sandbox iframe (the "html-lock" tier).
+roxmltree = { version = "0.20", optional = true }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }

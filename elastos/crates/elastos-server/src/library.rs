@@ -3100,6 +3100,66 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
     }
 }
 
+/// Cheap projection of the public, non-secret fields the Library needs from a `.ddrm` capsule:
+/// the original content size (for the size column) and the cover-art reference. Parsing reads only
+/// these small header fields; the large `ciphertext_b64`/media payloads are skipped by serde.
+#[derive(Debug, Default, Deserialize)]
+struct DdrmCapsuleHints {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    content_size: Option<u64>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+}
+
+impl DdrmCapsuleHints {
+    fn has_thumbnail(&self) -> bool {
+        self.thumbnail
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Parse Library display hints from `.ddrm` capsule bytes. `None` for non-capsule/invalid JSON, so
+/// the caller falls back to the on-disk size + the generic type icon (fail-soft, never panics).
+fn parse_ddrm_capsule_hints(bytes: &[u8]) -> Option<DdrmCapsuleHints> {
+    let hints: DdrmCapsuleHints = serde_json::from_slice(bytes).ok()?;
+    if hints.schema != "elastos.ddrm.capsule/v1" {
+        return None;
+    }
+    Some(hints)
+}
+
+/// The authed gateway endpoint the Library browser fetches to render an asset's PUBLIC cover art.
+/// The route resolves the image bytes from the capsule `thumbnail` (IPFS, key-free) at fetch time.
+fn library_cover_endpoint(uri: &str) -> String {
+    let query: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("uri", uri)
+        .finish();
+    format!("/api/provider/object/cover?{query}")
+}
+
+/// Resolve the PUBLIC cover-art reference (`ipfs://<cid>`) for an owned `.ddrm` asset, or `None`.
+/// Reads ONLY the capsule's `thumbnail` field — never content or key material. Backs the gateway
+/// Library cover route, which fetches the referenced image via the ipfs provider.
+pub fn ddrm_cover_uri_for_object(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<Option<String>> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    if !target.uri.to_ascii_lowercase().ends_with(".ddrm") || fs::metadata(&target.path)?.is_dir() {
+        return Ok(None);
+    }
+    let bytes = read_library_file_bytes(data_dir, principal_id, &target)?;
+    Ok(parse_ddrm_capsule_hints(&bytes)
+        .and_then(|hints| hints.thumbnail)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
 fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
     let metadata = fs::metadata(&target.path)?;
@@ -3118,6 +3178,7 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     let modified_at = system_time_secs(metadata.modified().ok()).unwrap_or_else(now_ts);
     let created_at = system_time_secs(metadata.created().ok()).unwrap_or(modified_at);
     let mut blocked_reason = None;
+    let mut thumbnail_uri: Option<String> = None;
     let (size, revision, content_cid) = if is_dir {
         (0, directory_revision(&target.path, &target.uri)?, None)
     } else {
@@ -3125,7 +3186,22 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
             Ok(bytes) => {
                 let revision = format!("rev:{}", hex::encode(Sha256::digest(&bytes)));
                 let content_cid = raw_sha256_cid(&bytes)?;
-                (bytes.len() as u64, revision, Some(content_cid))
+                // For a `.ddrm` capsule the on-disk size is just the capsule (for media the encrypted
+                // segments live elsewhere), so show the ORIGINAL content size + a cover-art pointer —
+                // like a normal file manager (PC2 parity). Falls back to the on-disk size for legacy
+                // capsules minted before `content_size` existed.
+                let mut display_size = bytes.len() as u64;
+                if name.to_ascii_lowercase().ends_with(".ddrm") {
+                    if let Some(hints) = parse_ddrm_capsule_hints(&bytes) {
+                        if let Some(content_size) = hints.content_size {
+                            display_size = content_size;
+                        }
+                        if hints.has_thumbnail() {
+                            thumbnail_uri = Some(library_cover_endpoint(&target.uri));
+                        }
+                    }
+                }
+                (display_size, revision, Some(content_cid))
             }
             Err(err) if is_unencrypted_principal_root_object(&err) => {
                 blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
@@ -3261,7 +3337,7 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         revision,
         viewer,
         viewers,
-        thumbnail_uri: None,
+        thumbnail_uri,
         availability,
         blocked_reason,
         content_cid,
@@ -6188,6 +6264,25 @@ fn shared_access_open_contract(
     })
 }
 
+/// Map an asset's MIME to the Library folder a freshly-minted item is filed under, so the Finder
+/// shows it where the user expects: images in Pictures, video in Videos, audio in Music, and
+/// everything else (PDF, text/markdown, EPUB, comics, source code, 3D/AI models) in Documents.
+/// Placement keys off the ORIGINAL asset mime — the on-disk item is a `.ddrm` capsule whose own
+/// filename carries no type — mirroring PC2's typed catalog buckets. The folders in this set must
+/// exist as `library_roots` so the sidebar can reach them.
+pub(crate) fn library_folder_for_mime(mime: &str) -> &'static str {
+    let m = mime.trim().to_ascii_lowercase();
+    if m.starts_with("image/") {
+        "Pictures"
+    } else if m.starts_with("video/") {
+        "Videos"
+    } else if m.starts_with("audio/") {
+        "Music"
+    } else {
+        "Documents"
+    }
+}
+
 fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
     let root = crate::auth::principal_localhost_root(principal_id);
     let mut roots: Vec<_> = [
@@ -6206,6 +6301,7 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
             "directory",
         ),
         ("videos", "Videos", format!("{root}/Videos"), "directory"),
+        ("music", "Music", format!("{root}/Music"), "directory"),
         (
             "downloads",
             "Downloads",
@@ -6797,6 +6893,9 @@ fn now_nanos() -> u128 {
 fn mime_for_name(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     if lower.ends_with(".md") || lower.ends_with(".txt") {
+        // Markdown + plain text both render on the dDRM viewer's light prose reader (the code
+        // renderer is only for explicit source-code mimes), and the `documents` app + webspace
+        // adapter treat `.md` as text/plain — so keep one type for both.
         "text/plain"
     } else if lower.ends_with(".html") {
         "text/html"
@@ -6808,8 +6907,26 @@ fn mime_for_name(name: &str) -> &'static str {
         "image/jpeg"
     } else if lower.ends_with(".gif") {
         "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
     } else if lower.ends_with(".pdf") {
         "application/pdf"
+    } else if lower.ends_with(".epub") {
+        // An ebook — opened through the protected dDRM viewer's html-lock reader (quorum recover).
+        "application/epub+zip"
+    } else if lower.ends_with(".cbz") {
+        // A comic archive — opened through the protected dDRM viewer's pixel-lock pager.
+        "application/vnd.comicbook+zip"
+    } else if lower.ends_with(".glb") {
+        "model/gltf-binary"
+    } else if lower.ends_with(".gltf") {
+        "model/gltf+json"
+    } else if lower.ends_with(".stl") {
+        "model/stl"
+    } else if lower.ends_with(".obj") {
+        "model/obj"
     } else if lower.ends_with(".tar") {
         "application/x-tar"
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
@@ -6915,5 +7032,32 @@ mod tests {
         assert!(schemes.contains(&"object"));
         assert!(!schemes.contains(&"library"));
         assert_eq!(provider.name(), "object-provider");
+    }
+
+    #[test]
+    fn folder_for_mime_buckets_by_type() {
+        assert_eq!(library_folder_for_mime("image/png"), "Pictures");
+        assert_eq!(library_folder_for_mime("IMAGE/JPEG"), "Pictures");
+        assert_eq!(library_folder_for_mime("video/mp4"), "Videos");
+        assert_eq!(library_folder_for_mime("audio/mpeg"), "Music");
+        // Documents catch-all: PDF, text, EPUB, comics, code, 3D/AI models, unknown.
+        assert_eq!(library_folder_for_mime("application/pdf"), "Documents");
+        assert_eq!(library_folder_for_mime("text/plain"), "Documents");
+        assert_eq!(library_folder_for_mime("application/epub+zip"), "Documents");
+        assert_eq!(
+            library_folder_for_mime("application/vnd.comicbook+zip"),
+            "Documents"
+        );
+        assert_eq!(library_folder_for_mime("model/gltf-binary"), "Documents");
+        assert_eq!(library_folder_for_mime(""), "Documents");
+    }
+
+    #[test]
+    fn library_roots_include_typed_media_folders() {
+        let roots = library_roots(&PathBuf::from("/tmp/elastos-test"), "person:local:abc");
+        let ids: Vec<&str> = roots.iter().map(|r| r.id).collect();
+        for id in ["documents", "pictures", "videos", "music"] {
+            assert!(ids.contains(&id), "missing sidebar root: {id}");
+        }
     }
 }

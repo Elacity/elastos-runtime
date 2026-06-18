@@ -155,6 +155,138 @@ body {
   box-shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
 }
 
+/* Continuous-scroll pixel-lock reader: pages stack vertically and the stage scrolls through
+   them (the page indicator follows the scroll; Prev/Next jump-scroll). Overrides the centered
+   single-page grid above. */
+.pager-stage.pager-scroll {
+  display: block;
+  scroll-behavior: smooth;
+  text-align: center;
+}
+
+.pager-page-slot {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  /* Reserve height before the page image loads so the scrollbar reflects the whole document and
+     scroll-position → page tracking is stable. Once loaded the JS pins the slot to the page's
+     rendered height (inline min-height), so geometry never jumps. */
+  min-height: 60vh;
+  margin-bottom: 0.9rem;
+}
+
+.pager-page-slot:last-child {
+  margin-bottom: 0;
+}
+
+/* Loading state: a centered spinner + page number, shown until the page has actually decrypted
+   and decoded. Hidden the moment the image is ready, so a streaming page never shows a broken
+   glyph or a bare white box. */
+.page-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  color: #9aa0a6;
+  font: 0.8rem/1 ui-sans-serif, system-ui, sans-serif;
+  pointer-events: none;
+}
+
+.page-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(255, 255, 255, 0.16);
+  border-top-color: rgba(255, 255, 255, 0.7);
+  border-radius: 50%;
+  animation: page-spin 0.8s linear infinite;
+}
+
+@keyframes page-spin {
+  to { transform: rotate(360deg); }
+}
+
+.pager-page-slot.is-loaded .page-loading {
+  display: none;
+}
+
+/* Failed page (decrypt exhausted its retries): an honest error + a Retry the reader can act on,
+   rather than an endless spinner — fail closed, then explain. */
+.page-failed .page-loading-label {
+  color: #f08a8a;
+}
+
+.page-retry {
+  margin-top: 0.2rem;
+  padding: 0.3rem 0.85rem;
+  font: 0.78rem ui-sans-serif, system-ui, sans-serif;
+  color: #d7dade;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.page-retry:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* In scroll mode pages must keep their natural (often tall) height so they stack and scroll,
+   rather than being clamped to the viewport height like the single-page view. The image stays
+   invisible until decoded (no broken-glyph flash); the loader sits behind it meanwhile. */
+.pager-scroll .object-page {
+  max-width: 100%;
+  max-height: none;
+  height: auto;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.pager-page-slot.is-loaded .object-page {
+  opacity: 1;
+}
+
+/* HTML-lock reader (EPUB) in continuous scroll: each chapter is a locked sandbox iframe sized to
+   its own content height (measured by the parent), so chapters stack and scroll like pages. */
+.epub-slot {
+  display: block;
+  width: 100%;
+  max-width: 56rem;
+  margin: 0 auto 0.9rem;
+}
+
+.object-epub {
+  display: block;
+  width: 100%;
+  /* Placeholder height before the chapter is measured; the parent then sets an inline pixel
+     height equal to the rendered content (which overrides this). */
+  height: 60vh;
+  border: 0;
+  background: #fbfaf6;
+  box-shadow: 0 2px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* 3D viewer stage (bundled Three.js WebGL canvas). Fills the frame; orbit controls inside. */
+.object-3d {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle at 50% 40%, #1b2030, #0c0e14);
+  cursor: grab;
+}
+
+.object-3d:active {
+  cursor: grabbing;
+}
+
+.object-3d canvas {
+  display: block;
+}
+
 .object-text {
   margin: 0;
   width: 100%;

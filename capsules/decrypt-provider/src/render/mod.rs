@@ -13,6 +13,12 @@
 #[cfg(feature = "pdf-render")]
 pub mod cbz;
 #[cfg(feature = "pdf-render")]
+pub mod code;
+#[cfg(feature = "pdf-render")]
+pub mod epub;
+#[cfg(feature = "pdf-render")]
+pub mod font;
+#[cfg(feature = "pdf-render")]
 pub mod image_page;
 #[cfg(feature = "pdf-render")]
 pub mod pdf;
@@ -40,11 +46,19 @@ fn is_text_like(m: &str) -> bool {
         )
 }
 
-/// Whether a mime is served as a flattened, watermarked page image ("pixel-lock") rather than
-/// as its raw bytes. Pixel-lock content NEVER egresses this boundary in plaintext — only the
-/// rendered image does. Covers: PDF (multi-page), CBZ comics (multi-page), text/code
-/// (multi-page), SVG (rasterised, single page), and raster images (single page). SVG is
-/// rasterised rather than shipped raw precisely because it is scriptable XML.
+/// Whether a (lowercased) mime is a reflowable EPUB served via the "html-lock" tier (sanitised
+/// chapter HTML in a script-less sandbox iframe) rather than a rasterised page image.
+fn is_epub(m: &str) -> bool {
+    m == "application/epub+zip" || m == "application/epub"
+}
+
+/// Whether a mime is served as a flattened, watermarked page image ("pixel-lock") OR as a
+/// sanitised chapter HTML document (EPUB "html-lock") rather than as its raw bytes. Render-locked
+/// content NEVER egresses this boundary in plaintext — only the rendered representation does.
+/// Covers: PDF (multi-page), CBZ comics (multi-page), text/code (multi-page), SVG (rasterised,
+/// single page), raster images (single page), and EPUB (sanitised HTML chapters). SVG is
+/// rasterised rather than shipped raw precisely because it is scriptable XML; EPUB is sanitised +
+/// sandboxed for the same reason.
 ///
 /// IMPORTANT (Principle 12): the helper keeps a mirror of this predicate in
 /// `scripts/dev/ddrm-media-authority/src/quorum.rs::is_pixel_lock`. Keep the two in sync.
@@ -55,6 +69,7 @@ pub fn is_pixel_lock(mime: &str) -> bool {
         || m == "application/x-cbz"
         || is_text_like(&m)
         || m.starts_with("image/")
+        || is_epub(&m)
 }
 
 /// A WARM render session: the decrypted asset parsed ONCE plus an in-memory cache of the
@@ -85,7 +100,10 @@ enum Renderable {
     Image(image_page::ParsedImage),
     Cbz(cbz::ParsedCbz),
     Text(text::ParsedText),
+    Code(code::ParsedCode),
     Svg(Box<svg::ParsedSvg>),
+    // EPUB holds the whole container; box it so the enum stays small.
+    Epub(Box<epub::ParsedEpub>),
 }
 
 #[cfg(feature = "pdf-render")]
@@ -96,7 +114,9 @@ impl Renderable {
             Renderable::Image(p) => p.total_pages(),
             Renderable::Cbz(p) => p.total_pages(),
             Renderable::Text(p) => p.total_pages(),
+            Renderable::Code(p) => p.total_pages(),
             Renderable::Svg(p) => p.total_pages(),
+            Renderable::Epub(p) => p.total_pages(),
         }
     }
 
@@ -111,7 +131,18 @@ impl Renderable {
             Renderable::Image(p) => p.render_page(page, max_width, watermark),
             Renderable::Cbz(p) => p.render_page(page, max_width, watermark),
             Renderable::Text(p) => p.render_page(page, max_width, watermark),
+            Renderable::Code(p) => p.render_page(page, max_width, watermark),
             Renderable::Svg(p) => p.render_page(page, max_width, watermark),
+            Renderable::Epub(p) => p.render_page(page, max_width, watermark),
+        }
+    }
+
+    /// The content type of each rendered "page": a flattened JPEG image for the pixel-lock
+    /// renderers, or a sanitised HTML chapter document for the EPUB html-lock tier.
+    fn page_content_type(&self) -> &'static str {
+        match self {
+            Renderable::Epub(_) => epub::PAGE_CONTENT_TYPE,
+            _ => "image/jpeg",
         }
     }
 }
@@ -127,6 +158,9 @@ impl RenderSession {
             "application/vnd.comicbook+zip" | "application/x-cbz" => {
                 Renderable::Cbz(cbz::parse(object)?)
             }
+            m if is_epub(m) => Renderable::Epub(Box::new(epub::parse(object)?)),
+            // Source code → dark gutter view; prose (text/plain, text/markdown) → light reader.
+            m if code::is_code_mime(m) => Renderable::Code(code::parse(object, m)?),
             m if is_text_like(m) => Renderable::Text(text::parse(object)?),
             "image/svg+xml" => Renderable::Svg(Box::new(svg::parse(object)?)),
             m if m.starts_with("image/") => Renderable::Image(image_page::parse(object)?),
@@ -163,6 +197,14 @@ impl RenderSession {
         self.cache.insert(page, bytes.clone());
         self.order.push_back(page);
         Ok(bytes)
+    }
+
+    /// The content type each rendered page carries: `image/jpeg` for the pixel-lock renderers, or
+    /// `text/html; charset=utf-8` for the EPUB html-lock tier. The gateway surfaces this as the
+    /// session's `page_content_type` so the viewer knows whether to show an `<img>` or a sandbox
+    /// iframe — without ever receiving the source bytes.
+    pub fn page_content_type(&self) -> &'static str {
+        self.parsed.page_content_type()
     }
 }
 
@@ -235,6 +277,8 @@ mod tests {
         assert!(is_pixel_lock("application/javascript"));
         // SVG is pixel-lock too (rasterised, never shipped raw).
         assert!(is_pixel_lock("image/svg+xml"));
+        // EPUB is render-locked too (html-lock: sanitised chapter HTML, never shipped raw).
+        assert!(is_pixel_lock("application/epub+zip"));
         // Excluded: non-renderable / streamed types.
         assert!(!is_pixel_lock("application/zip"));
         assert!(!is_pixel_lock("video/mp4"));

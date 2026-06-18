@@ -10,6 +10,7 @@ import {
   shortUri,
   visibilityContract,
 } from "./model.js";
+import { getTag, tagColor } from "./tags.js";
 
 const LARGE_RENDER_THRESHOLD = 240;
 const INITIAL_RENDER_LIMIT = 120;
@@ -24,6 +25,7 @@ export function iconPlaceholder(src, className) {
 export function createLibraryRenderer({
   elements,
   isSelected,
+  loadCover,
   perf,
   selectedObjects,
   state,
@@ -153,24 +155,55 @@ export function createLibraryRenderer({
       inTrash(object) ? '<span class="badge badge-trash">Trash</span>' : "",
     ].join("");
     const badgesMarkup = badges ? `<span class="badges">${badges}</span>` : "";
+    const tag = getTag(object.uri);
+    const tagHex = tag ? tagColor(tag)?.hex || "#9aa0a6" : "";
+    // List view keeps the right-aligned badge dot (a separate cell). Grid view uses an inline dot
+    // placed just left of the centered filename — like Finder — so it never displaces the icon.
+    const tagMarkup = tag
+      ? `<span class="item-tag" style="--tag-color:${escapeHtml(tagHex)}" title="Tag: ${escapeHtml(tag)}" aria-label="Tag: ${escapeHtml(tag)}"></span>`
+      : "";
+    const tagDotInline = tag
+      ? `<span class="item-tag-inline" style="--tag-color:${escapeHtml(tagHex)}" aria-hidden="true"></span>`
+      : "";
     item.innerHTML = `
       ${iconPlaceholder(iconFor(object), "file-icon")}
-      <span class="item-name" data-name-uri="${escapeHtml(object.uri)}" title="${escapeHtml(object.name)}">${escapeHtml(object.name)}</span>
+      <span class="item-name" data-name-uri="${escapeHtml(object.uri)}" title="${escapeHtml(object.name)}">${tagDotInline}<span class="item-name-text">${escapeHtml(object.name)}</span></span>
+      ${tagMarkup}
       <span class="item-date">${escapeHtml(formatTime(object.modified_at))}</span>
       <span class="item-size">${escapeHtml(isDirectory(object) ? "-" : formatBytes(object.size))}</span>
       <span class="item-type">${escapeHtml(isDirectory(object) ? "Folder" : object.mime || "File")}</span>
       ${badgesMarkup}
     `;
+    applyCoverThumbnail(item, object);
     state.objectNodeCache.set(object.uri, { signature, node: item });
     return item;
+  }
+
+  // Protected `.ddrm` assets carry a `thumbnail_uri` (an authed cover endpoint). Swap the generic
+  // type icon for the asset's real cover once it loads, marking the icon framed/badged. The loader
+  // is cached, so this is cheap on re-render; failures silently keep the type icon (fail-soft).
+  function applyCoverThumbnail(item, object) {
+    if (!object.thumbnail_uri || typeof loadCover !== "function") return;
+    const icon = item.querySelector(".file-icon");
+    const img = icon?.querySelector("img");
+    if (!icon || !img) return;
+    loadCover(object.thumbnail_uri)
+      .then((url) => {
+        if (!url) return;
+        img.src = url;
+        icon.classList.add("has-cover");
+      })
+      .catch(() => {});
   }
 
   function objectRenderSignature(object) {
     return [
       object.uri,
+      getTag(object.uri),
       object.kind,
       object.name,
       object.mime || "",
+      object.thumbnail_uri || "",
       object.size || 0,
       object.modified_at || 0,
       object.revision || "",

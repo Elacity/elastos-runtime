@@ -122,10 +122,29 @@ pub(super) fn abi_word_u128(value: u128) -> Vec<u8> {
     word
 }
 
+/// The canonical internal content-id (KID) is BARE hex (no prefix — see `content_id_hex`/`kid`
+/// from the seal and the `.ddrm` capsule). The EVM ABI path needs `0x`-prefixed hex, so we
+/// normalize the prefix HERE at the adapter boundary (Principle 4/9: transport format is the
+/// adapter's job, not every caller's) rather than forcing callers to pre-format. This only
+/// tolerates the prefix — the value is still validated as EXACTLY a 16-byte hex KID downstream,
+/// so it does not relax the rights-gate check.
+fn content_id_with_0x(content_id: &str) -> String {
+    let s = content_id.trim();
+    if s.starts_with("0x") || s.starts_with("0X") {
+        s.to_string()
+    } else {
+        format!("0x{s}")
+    }
+}
+
 /// A `bytes16` left-aligned in a 32-byte word (data in the high 16 bytes, zero-padded
-/// right) — the on-chain `contentId == KID`. `content_id` is `0x` + 32 hex.
+/// right) — the on-chain `contentId == KID`. Accepts the KID with or without a `0x` prefix.
 pub(super) fn abi_word_bytes16(content_id: &str) -> Result<Vec<u8>, String> {
-    let bytes = decode_hex(content_id, Some(16), "bytes16 contentId")?;
+    let bytes = decode_hex(
+        &content_id_with_0x(content_id),
+        Some(16),
+        "bytes16 contentId",
+    )?;
     let mut word = vec![0u8; 32];
     word[0..16].copy_from_slice(&bytes);
     Ok(word)
@@ -391,6 +410,31 @@ pub(super) fn decode_mint_content_id(input: &str) -> Option<String> {
     Some(format!("0x{}", encode_hex(&payload[0..16])))
 }
 
+/// Robustly decide whether a mint transaction's calldata BINDS a given content id (a normalised,
+/// bare 32-hex `bytes16` KID). The canonical runtime mint (`mint(string,uint16,bytes,bytes)`)
+/// places the KID at the head of `opRawData`, so `decode_mint_content_id` reads it at a fixed
+/// offset — but on Base the mint is frequently RELAYED through a forwarder/factory (a DIFFERENT
+/// outer selector + ABI shape, e.g. the observed `0xcef6d209`, sent by a relayer rather than the
+/// owner), so the fixed-offset decode does not generalise and returns the wrong field. The KID is
+/// a 16-byte CONTENT-DERIVED value (collision ≈ 2^-128), so locating those exact 16 bytes anywhere
+/// in the calldata is a sound, ABI-agnostic binding check — and the candidate tx is ALREADY the
+/// one that emitted THIS `(creator, channel)` `AssetCreated` log, so it genuinely minted an asset
+/// for this owner; the search only disambiguates WHICH content id that tx carried. Fail-closed: a
+/// non-hex `want` or `input` yields `false`.
+pub(super) fn mint_input_binds_content_id(input: &str, want_content_id_norm: &str) -> bool {
+    let Ok(want) = decode_hex(
+        &content_id_with_0x(want_content_id_norm),
+        Some(16),
+        "bytes16 contentId",
+    ) else {
+        return false;
+    };
+    let Ok(bytes) = decode_hex(input, None, "tx input") else {
+        return false;
+    };
+    bytes.windows(16).any(|w| w == want.as_slice())
+}
+
 /// Read a 32-byte ABI word as a `usize` offset/length. Fail-closed if it does not fit in a
 /// `usize` or has non-zero high bytes beyond the low 8 (a malformed/hostile calldata word).
 fn word_to_usize(word: &[u8]) -> Option<usize> {
@@ -405,7 +449,12 @@ fn word_to_usize(word: &[u8]) -> Option<usize> {
 /// Normalise a `bytes16` content id to lowercase 32-hex (no `0x`). `None` if it is not a clean
 /// 16-byte hex value — so a caller can pin only on a real KID and fail closed otherwise.
 pub(super) fn normalize_content_id_bytes16(content_id: &str) -> Option<String> {
-    let bytes = decode_hex(content_id, Some(16), "bytes16 contentId").ok()?;
+    let bytes = decode_hex(
+        &content_id_with_0x(content_id),
+        Some(16),
+        "bytes16 contentId",
+    )
+    .ok()?;
     Some(encode_hex(&bytes))
 }
 
@@ -498,4 +547,87 @@ pub(super) fn decode_erc1271_magic_value(value: &Value) -> Result<String, String
         return Err("ERC-1271 result must contain bytes4 magic value".to_string());
     }
     Ok(format!("0x{}", encode_hex(&bytes[..4])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: the canonical KID is bare hex; the EVM bytes16 path must accept it with OR
+    // without a `0x` prefix and produce the identical word. (Before this, a bare-hex KID failed
+    // the open rights gate with "must start with 0x" and made the mint-confirmation poll hang.)
+    #[test]
+    fn content_id_bytes16_accepts_bare_and_prefixed() {
+        let bare = "958a37b2bb0e0123456789abcdef0011";
+        let prefixed = format!("0x{bare}");
+        let w_bare = abi_word_bytes16(bare).expect("bare hex KID");
+        let w_pref = abi_word_bytes16(&prefixed).expect("0x-prefixed KID");
+        assert_eq!(w_bare, w_pref, "prefix must not change the encoded word");
+        assert_eq!(w_bare.len(), 32);
+        assert_eq!(
+            &w_bare[16..],
+            &[0u8; 16],
+            "bytes16 is left-aligned, right zero-padded"
+        );
+
+        assert_eq!(
+            normalize_content_id_bytes16(bare),
+            normalize_content_id_bytes16(&prefixed),
+            "normalisation must collapse both forms to the same canonical KID"
+        );
+        assert_eq!(normalize_content_id_bytes16(bare), Some(bare.to_string()));
+    }
+
+    #[test]
+    fn content_id_bytes16_still_fails_closed_on_bad_input() {
+        assert!(abi_word_bytes16("nothex").is_err());
+        assert!(
+            abi_word_bytes16("958a37b2").is_err(),
+            "wrong length (not 16 bytes)"
+        );
+        assert!(normalize_content_id_bytes16("958a37b2").is_none());
+    }
+
+    // Regression for the mint-confirmation hang (Step 2 "Enable trading" never unlocking): the
+    // real Base mint is RELAYED through a forwarder with a DIFFERENT outer ABI (observed selector
+    // `0xcef6d209`, sent by a relayer, KID buried mid-calldata), so the fixed-offset
+    // `decode_mint_content_id` reads the wrong field and the per-asset scan never matched →
+    // `mint_not_confirmed` forever. The content-bound check must still recognise the KID.
+    #[test]
+    fn mint_input_binds_content_id_handles_relayed_calldata() {
+        let kid = "4ea167ed58461afdc6720e3ef67d9c18"; // a real bytes16 KID (bare hex)
+
+        // Canonical runtime mint: KID at the head of opRawData → both paths find it.
+        let op_raw = encode_op_raw_free(kid).unwrap();
+        let canonical_hex =
+            encode_mint_calldata("0x47cbeeb4", "ipfs://meta", 0, &op_raw, &[]).unwrap();
+        assert_eq!(
+            normalize_content_id_bytes16(&decode_mint_content_id(&canonical_hex).unwrap())
+                .as_deref(),
+            Some(kid),
+            "canonical mint decodes precisely"
+        );
+        assert!(mint_input_binds_content_id(&canonical_hex, kid));
+
+        // Relayed/wrapped mint: foreign selector, KID embedded at a non-head, non-word-aligned
+        // offset (as seen on-chain). The fixed-offset decoder MUST NOT match here, but the
+        // content-bound check MUST.
+        let kid_bytes = decode_hex(&format!("0x{kid}"), Some(16), "kid").unwrap();
+        let mut relayed = decode_hex("0xcef6d209", Some(4), "sel").unwrap();
+        relayed.extend_from_slice(&[0u8; 1412]); // pad so the KID lands mid-calldata, unaligned
+        relayed.extend_from_slice(&kid_bytes);
+        relayed.extend_from_slice(&[0u8; 64]);
+        let relayed_hex = format!("0x{}", encode_hex(&relayed));
+        assert!(
+            mint_input_binds_content_id(&relayed_hex, kid),
+            "relayed mint must bind via the content-derived KID search"
+        );
+
+        // Fail-closed: a DIFFERENT KID must not match the relayed calldata.
+        let other = "00112233445566778899aabbccddeeff";
+        assert!(!mint_input_binds_content_id(&relayed_hex, other));
+        // Fail-closed: garbage inputs.
+        assert!(!mint_input_binds_content_id("not-hex", kid));
+        assert!(!mint_input_binds_content_id(&relayed_hex, "deadbeef"));
+    }
 }

@@ -358,6 +358,15 @@ echo
 cap_bin() { echo "${CAPSULES}/$1/target/debug/$1"; }
 export ELASTOS_ENCRYPT_PROVIDER_BIN="$(cap_bin encrypt-provider)"
 export ELASTOS_MEDIA_PROVIDER_BIN="$(cap_bin media-provider)"
+# media-provider transcodes -> DASH (video/audio mint AND owned audio/video playback) and needs
+# ffmpeg + a scratch dir. Wire its narrow operator config from the ffmpeg already checked on PATH
+# above; the spawned media-provider inherits this env. ffprobe defaults to ffmpeg's sibling.
+# Unset ⇒ the provider's `package` op fails closed ("ffmpeg_path not configured").
+if command -v ffmpeg >/dev/null 2>&1; then
+  MEDIA_SCRATCH="${DATA_DIR}/media-scratch"
+  mkdir -p "$MEDIA_SCRATCH"
+  export ELASTOS_MEDIA_PROVIDER_CONFIG="{\"ffmpeg_path\":\"$(command -v ffmpeg)\",\"scratch_dir\":\"${MEDIA_SCRATCH}\"}"
+fi
 export ELASTOS_PUBLISH_PROVIDER_BIN="$(cap_bin publish-provider)"
 export ELASTOS_CHAIN_PROVIDER_BIN="$(cap_bin chain-provider)"
 export ELASTOS_WALLET_PROVIDER_BIN="$(cap_bin wallet-provider)"

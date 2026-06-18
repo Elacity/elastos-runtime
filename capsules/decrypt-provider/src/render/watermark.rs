@@ -135,37 +135,3 @@ fn blend(src: u8, target: u8, alpha: u16) -> u8 {
     let inv = 256 - alpha;
     ((src as u16 * inv + target as u16 * alpha) / 256) as u8
 }
-
-/// Draw one line of text in a SOLID `ink` colour (for rasterised document BODY text — e.g. the
-/// text/code renderer — as opposed to the translucent tiled watermark). Monospace `font8x8`
-/// glyphs, scaled, clipped to the image. Pixels outside the image are skipped.
-pub fn draw_solid(img: &mut RgbaImage, text: &str, x: i64, y: i64, scale: u32, ink: [u8; 3]) {
-    let (w, h) = img.dimensions();
-    for (i, ch) in text.chars().enumerate() {
-        let code = ch as usize;
-        let bitmap = BASIC_LEGACY[if code < 128 { code } else { '?' as usize }];
-        let cell_x = x + (i as i64) * (GLYPH * scale) as i64;
-        // Cheap horizontal clip: stop once a glyph starts past the right edge.
-        if cell_x >= w as i64 {
-            break;
-        }
-        for (gy, bits) in bitmap.iter().enumerate() {
-            for gx in 0..GLYPH {
-                if bits & (1 << gx) == 0 {
-                    continue;
-                }
-                for sy in 0..scale {
-                    for sx in 0..scale {
-                        let px = cell_x + (gx * scale + sx) as i64;
-                        let py = y + (gy as u32 * scale + sy) as i64;
-                        if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
-                            continue;
-                        }
-                        let p = img.get_pixel_mut(px as u32, py as u32);
-                        *p = Rgba([ink[0], ink[1], ink[2], p[3]]);
-                    }
-                }
-            }
-        }
-    }
-}

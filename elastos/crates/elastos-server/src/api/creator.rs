@@ -49,6 +49,20 @@ const CREATOR_APP: &str = "creator";
 const THRESHOLD_PROTECTION_TYPE: &str = "cenc:elastos-pq-hybrid-threshold-v0";
 const THRESHOLD_SCHEME: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// The canonical DASH manifest filename inside the published media directory. PC2 (and
+/// base.ela.city) fetch `{dirCid}/stream.mpd` (`pc2-node/src/services/media/dashPackager.ts`,
+/// `src/api/media.ts`), so runtime-minted media MUST use this exact name to index + play there.
+const DASH_MANIFEST_NAME: &str = "stream.mpd";
+
+/// The contract-facing KID/contentId form base.ela.city's indexer keys on: it maps
+/// `metadata.kid` -> the catalog `content_id` (`ContentIndexerService.ts`), which the marketplace
+/// then passes to the on-chain `hasAccessByContentId`. PC2 stores it `0x`-prefixed (32 hex =
+/// bytes16), matching the on-chain `contentId`, so the indexed item links to the access gate.
+/// (The MPD `default_KID` and our internal `.ddrm` capsule `kid` deliberately stay bare hex.)
+fn contract_kid_0x(kid_hex: &str) -> String {
+    format!("0x{}", kid_hex.trim().trim_start_matches("0x"))
+}
+
 /// The canonical Elacity token-metadata schemas — the EXACT URIs PC2's audited creator
 /// writes (`pc2-node/data/test-apps/elacity-creator/app.js`). The Elacity marketplace
 /// indexer (`pc2-node/src/services/ContentIndexerService.ts`) reads display fields from
@@ -314,6 +328,127 @@ pub struct PrepareMintRequest {
     file_b64: String,
     #[serde(default)]
     meta: MintMeta,
+    /// Optional client-generated job id. When present the server records coarse, stage-level
+    /// progress (analyze → package → encrypt → publish → sign) the creator UI polls live via
+    /// `GET /api/apps/creator/prepare-progress/:job_id` — PC2's default-open encode panel. The
+    /// mint itself stays a single blocking request (the wallet handshake depends on its result).
+    #[serde(default)]
+    job_id: Option<String>,
+}
+
+/// Coarse, stage-level mint progress, surfaced to the creator UI while the (blocking)
+/// prepare-mint runs. This is NOT per-frame ffmpeg telemetry (the media provider's
+/// request/response protocol returns the packaged DASH in one call); it reports which
+/// pipeline stage is active so the UI shows a live, PC2-style progress panel instead of a
+/// frozen spinner. Bounded in-memory store; entries self-prune after `PROGRESS_TTL_SECS`.
+pub mod mint_progress {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const PROGRESS_TTL_SECS: u64 = 900;
+
+    struct Job {
+        stages: Vec<(String, String)>, // (name, status: pending|active|done|err)
+        done: bool,
+        error: Option<String>,
+        updated: u64,
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn store() -> &'static Mutex<HashMap<String, Job>> {
+        static S: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Begin a job with an ordered stage list, all pending. Prunes stale entries first.
+    pub fn start(job_id: &str, stages: &[&str]) {
+        let mut g = store().lock().expect("mint progress store poisoned");
+        let cutoff = now().saturating_sub(PROGRESS_TTL_SECS);
+        g.retain(|_, j| j.updated >= cutoff);
+        g.insert(
+            job_id.to_string(),
+            Job {
+                stages: stages
+                    .iter()
+                    .map(|s| (s.to_string(), "pending".to_string()))
+                    .collect(),
+                done: false,
+                error: None,
+                updated: now(),
+            },
+        );
+    }
+
+    /// Mark `stage` active and every earlier stage done (no-op without a job id).
+    pub fn advance(job_id: Option<&str>, stage: &str) {
+        let Some(id) = job_id else { return };
+        let mut g = store().lock().expect("mint progress store poisoned");
+        if let Some(job) = g.get_mut(id) {
+            let mut reached = false;
+            for (name, status) in job.stages.iter_mut() {
+                if name == stage {
+                    *status = "active".to_string();
+                    reached = true;
+                } else if !reached {
+                    *status = "done".to_string();
+                }
+            }
+            job.updated = now();
+        }
+    }
+
+    /// All stages done.
+    pub fn complete(job_id: Option<&str>) {
+        let Some(id) = job_id else { return };
+        let mut g = store().lock().expect("mint progress store poisoned");
+        if let Some(job) = g.get_mut(id) {
+            for (_, status) in job.stages.iter_mut() {
+                *status = "done".to_string();
+            }
+            job.done = true;
+            job.updated = now();
+        }
+    }
+
+    /// Mark the currently-active stage failed and record the message.
+    pub fn fail(job_id: Option<&str>, message: &str) {
+        let Some(id) = job_id else { return };
+        let mut g = store().lock().expect("mint progress store poisoned");
+        if let Some(job) = g.get_mut(id) {
+            for (_, status) in job.stages.iter_mut() {
+                if status == "active" {
+                    *status = "err".to_string();
+                }
+            }
+            job.done = true;
+            job.error = Some(message.to_string());
+            job.updated = now();
+        }
+    }
+
+    /// JSON snapshot for the status route (`None` ⇒ unknown/expired job).
+    pub fn snapshot(job_id: &str) -> Option<Value> {
+        let g = store().lock().expect("mint progress store poisoned");
+        g.get(job_id).map(|job| {
+            json!({
+                "schema": "elastos.creator.progress/v1",
+                "done": job.done,
+                "error": job.error,
+                "stages": job.stages.iter().map(|(name, status)| json!({
+                    "name": name,
+                    "status": status,
+                })).collect::<Vec<_>>(),
+            })
+        })
+    }
 }
 
 // ── GET /api/apps/creator/status ───────────────────────────────────────────────
@@ -341,6 +476,32 @@ pub async fn creator_status(State(state): State<GatewayState>, headers: HeaderMa
             Json(json!({ "ready": false, "error": message })),
         )
             .into_response(),
+    }
+}
+
+// ── GET /api/apps/creator/prepare-progress/:job_id ─────────────────────────────
+/// Live, stage-level progress for an in-flight prepare-mint (PC2's default-open encode panel).
+/// Read-only and key-free; returns 404 for an unknown/expired job so the UI can stop polling.
+pub async fn creator_prepare_progress(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
+    {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid home launch token",
+        );
+    }
+    match mint_progress::snapshot(&job_id) {
+        Some(snapshot) => (
+            StatusCode::OK,
+            [("cache-control", "no-store")],
+            Json(snapshot),
+        )
+            .into_response(),
+        None => error_json(StatusCode::NOT_FOUND, "no such mint progress job"),
     }
 }
 
@@ -402,13 +563,44 @@ pub async fn creator_prepare_mint(
         Err(message) => return staged_error(StatusCode::SERVICE_UNAVAILABLE, "encrypt", &message),
     };
 
+    // Register the live progress job (if the UI sent a job id) with the right stage list.
+    let job_id = req.job_id.as_deref();
+    if let Some(id) = job_id {
+        if meta.is_media {
+            mint_progress::start(id, &["analyze", "package", "encrypt", "publish", "sign"]);
+        } else {
+            mint_progress::start(id, &["encrypt", "publish", "sign"]);
+        }
+    }
+
     // Media (video/audio) takes the DASH/CENC branch: package -> per-track CENC under ONE
     // asset CEK -> publish a DASH directory. Non-media objects take the single-segment branch.
     let outcome = if meta.is_media {
-        run_prepare_mint_media(registry, &ctx.principal_id, &file_bytes, &meta, &nodes).await
+        run_prepare_mint_media(
+            registry,
+            &ctx.principal_id,
+            &file_bytes,
+            &meta,
+            &nodes,
+            job_id,
+        )
+        .await
     } else {
-        run_prepare_mint(registry, &ctx.principal_id, &file_bytes, &meta, &nodes).await
+        run_prepare_mint(
+            registry,
+            &ctx.principal_id,
+            &file_bytes,
+            &meta,
+            &nodes,
+            job_id,
+        )
+        .await
     };
+
+    match &outcome {
+        Ok(_) => mint_progress::complete(job_id),
+        Err(staged) => mint_progress::fail(job_id, &staged.message),
+    }
 
     match outcome {
         Ok(result) => {
@@ -751,6 +943,55 @@ pub struct TradeApprovalRequest {
     /// reported tradable off an EARLIER, already-approved asset in the same channel.
     #[serde(default)]
     content_id: Option<String>,
+    /// The mint's wallet-approval `request_id`. Once the owner approves the mint in the Wallet app,
+    /// the completed approval records the broadcast `transaction_hash`; we resolve it from this id
+    /// and hand it to the chain provider so confirmation reads THAT tx's receipt directly (one cheap
+    /// call) instead of a wide `eth_getLogs` scan. The owner's wallet still signs+broadcasts the
+    /// mint — no delegation. Absent ⇒ the chain provider falls back to the log-scan resolution.
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+/// Resolve the broadcast mint TRANSACTION HASH for a completed wallet-approval `request_id`
+/// (read-only). After the owner approves the mint in the Wallet app, the completed approval records
+/// the broadcast tx hash; surfacing it lets confirmation read THAT transaction's receipt directly
+/// (one cheap `eth_getTransactionReceipt`) instead of a wide, rate-limited `eth_getLogs` scan. The
+/// owner's wallet still signs+broadcasts the mint — no delegation. `None` ⇒ approval unknown / not
+/// completed yet / no hash recorded → the caller falls back to the chain provider's log scan.
+async fn resolve_mint_tx_hash(
+    registry: &ProviderRegistry,
+    principal_id: &str,
+    request_id: &str,
+) -> Option<String> {
+    let data = provider_data(
+        registry,
+        "wallet",
+        &json!({
+            "op": "approval_requests",
+            "principal_id": principal_id,
+            "include_resolved": true,
+        }),
+    )
+    .await
+    .ok()?;
+    let request = data
+        .get("approval_requests")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("request_id").and_then(Value::as_str) == Some(request_id))?;
+    // The completion records the hash at the top level; some connectors nest it under
+    // `signed_result`. Accept either, fail-closed on absent/blank.
+    request
+        .get("transaction_hash")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            request
+                .get("signed_result")
+                .and_then(|s| s.get("transaction_hash"))
+                .and_then(Value::as_str)
+        })
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
 }
 
 // ── POST /api/apps/creator/mint-status ─────────────────────────────────────────
@@ -765,13 +1006,19 @@ pub async fn creator_mint_status(
     headers: HeaderMap,
     body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
-    {
-        return error_json(
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid home launch token",
-        );
-    }
+    let ctx = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[CREATOR_APP],
+    ) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return error_json(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid home launch token",
+            )
+        }
+    };
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
@@ -797,6 +1044,17 @@ pub async fn creator_mint_status(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // Fast-path: resolve the mint's broadcast tx hash from its wallet approval so the chain provider
+    // confirms via the receipt (one cheap call) rather than a wide log scan. None ⇒ provider scans.
+    let tx_hash = match req
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(request_id) => resolve_mint_tx_hash(registry, &ctx.principal_id, request_id).await,
+        None => None,
+    };
     match provider_data(
         registry,
         "chain",
@@ -806,6 +1064,7 @@ pub async fn creator_mint_status(
             "channel": channel,
             "creator": signer,
             "content_id": content_id,
+            "tx_hash": tx_hash,
         }),
     )
     .await
@@ -904,6 +1163,17 @@ async fn run_prepare_trade_approval(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // Fast-path: resolve the mint's broadcast tx hash from its wallet approval so the operative is
+    // read from the receipt (one cheap call) instead of a wide log scan. None ⇒ provider scans.
+    let tx_hash = match req
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(request_id) => resolve_mint_tx_hash(registry, principal_id, request_id).await,
+        None => None,
+    };
     let assembled = provider_data(
         registry,
         "chain",
@@ -913,6 +1183,7 @@ async fn run_prepare_trade_approval(
             "channel": channel,
             "creator": signer,
             "content_id": content_id,
+            "tx_hash": tx_hash,
         }),
     )
     .await?;
@@ -1067,8 +1338,10 @@ async fn run_prepare_mint(
     file_bytes: &[u8],
     meta: &MintMeta,
     nodes: &[QuorumNode],
+    job_id: Option<&str>,
 ) -> Result<Value, StagedError> {
     let b64 = base64::engine::general_purpose::STANDARD;
+    mint_progress::advance(job_id, "encrypt");
 
     // 1) escrow: mint CEK + CENC-encrypt + SHAMIR-split + seal a share to each node.
     let node_json: Vec<Value> = nodes
@@ -1108,6 +1381,7 @@ async fn run_prepare_mint(
         .ok_or_else(|| stage_err("encrypt", "escrow response missing sealed shares"))?;
 
     // 2) publish the encrypted segment, get the asset CID.
+    mint_progress::advance(job_id, "publish");
     let asset_filename = sanitize_filename(&meta.file_name);
     let publish_file = json!({
         "op": "publish",
@@ -1161,6 +1435,7 @@ async fn run_prepare_mint(
 
     // 5-8) prepare the unsigned mint, assemble Base calldata, bind to the owner's wallet,
     //       and enqueue the MetaMask approval. Shared verbatim with the media path.
+    mint_progress::advance(job_id, "sign");
     finalize_mint(
         registry,
         principal_id,
@@ -1173,6 +1448,7 @@ async fn run_prepare_mint(
             protections: &protections,
             ciphertext_b64: Some(&segment_b64),
             image: &image,
+            media_layout: None,
         },
     )
     .await
@@ -1195,6 +1471,13 @@ struct MintTail<'a> {
     /// The pinned cover thumbnail URI (`ipfs://<cid>`) or empty — persisted into the `.ddrm`
     /// capsule so the Library/Finder renders the protected-asset cover art.
     image: &'a str,
+    /// MEDIA only: the DASH directory layout the quorum-media open needs to recover + stream —
+    /// `{ manifest_path, init_path, segment_paths[], tracks[] }`. `segment_paths` is the flattened
+    /// CENC-counter order the segments were sealed in (the open MUST present that exact ordered
+    /// set to the decrypt boundary). `tracks[]` is the per-AdaptationSet grouping (each with its
+    /// own `init_path` + a subset of `segment_paths`) that drives per-track MSE SourceBuffers.
+    /// `None` for objects (their ciphertext is embedded).
+    media_layout: Option<&'a Value>,
 }
 
 /// The shared mint tail: `publish prepare_publish` (unsigned mint, contentId == bytes16
@@ -1393,6 +1676,8 @@ async fn finalize_mint(
         // The persisted single-sample ciphertext (object only) — fed into the `.ddrm` capsule so
         // the quorum consumer-open has the exact bytes to recover. Absent for media.
         "ciphertext_b64": tail.ciphertext_b64,
+        // MEDIA only: the DASH layout the quorum-media open recovers + streams from. Absent for objects.
+        "media": tail.media_layout.cloned().unwrap_or(Value::Null),
         "unsigned_mint": unsigned_mint,
         // The exact transaction the OWNER will sign — surfaced for offline inspection.
         "tx": { "to": to, "data": data, "value": value, "chain_id": mint_chain_id() },
@@ -1413,10 +1698,14 @@ async fn run_prepare_mint_media(
     file_bytes: &[u8],
     meta: &MintMeta,
     nodes: &[QuorumNode],
+    job_id: Option<&str>,
 ) -> Result<Value, StagedError> {
     let b64 = base64::engine::general_purpose::STANDARD;
+    mint_progress::advance(job_id, "analyze");
 
     // 1) DASH-package the source: per-track standalone inits + PLAINTEXT segments + manifest.
+    // This is the long pole (transcode + fragment); the UI shows "package" active throughout.
+    mint_progress::advance(job_id, "package");
     let pkg_req = json!({
         "op": "package_dash",
         "content_b64": b64.encode(file_bytes),
@@ -1462,10 +1751,17 @@ async fn run_prepare_mint_media(
 
     // Flatten every media segment across tracks IN ORDER (so the single-CEK CENC counter is
     // continuous), recording each segment's directory path + the plaintext per-track inits.
+    // ALSO record a per-track layout (`track_layouts`): each DASH AdaptationSet's own init +
+    // ordered segment paths + codec. The flat `seg_paths` stays the canonical seal/AAD order;
+    // the per-track lists reference the SAME path strings, so the quorum-media open maps each
+    // track's local segment index back to its global (flat) CENC counter position. This is what
+    // lets the player attach one MSE SourceBuffer per track (PC2's two-viewer model) for video,
+    // while audio stays a single-track degenerate case.
     let mut all_segments: Vec<String> = Vec::new();
     let mut seg_paths: Vec<String> = Vec::new(); // parallel to all_segments
     let mut init_files: Vec<(String, String)> = Vec::new(); // (path, plaintext b64)
     let mut first_init_b64: Option<String> = None;
+    let mut track_layouts: Vec<Value> = Vec::with_capacity(tracks.len());
     for t in tracks {
         let init_path = t
             .get("init_path")
@@ -1483,6 +1779,7 @@ async fn run_prepare_mint_media(
             .get("segments")
             .and_then(Value::as_array)
             .ok_or_else(|| stage_err("encrypt", "track missing segments"))?;
+        let mut track_seg_paths: Vec<String> = Vec::with_capacity(segs.len());
         for s in segs {
             let path = s
                 .get("path")
@@ -1494,7 +1791,14 @@ async fn run_prepare_mint_media(
                 .ok_or_else(|| stage_err("encrypt", "segment missing b64"))?;
             seg_paths.push(path.to_string());
             all_segments.push(data.to_string());
+            track_seg_paths.push(path.to_string());
         }
+        track_layouts.push(json!({
+            "kind": t.get("kind").and_then(Value::as_str).unwrap_or_default(),
+            "codec": t.get("codec").and_then(Value::as_str).unwrap_or_default(),
+            "init_path": init_path,
+            "segment_paths": track_seg_paths,
+        }));
     }
     if all_segments.is_empty() {
         return Err(stage_err("encrypt", "media package produced no segments"));
@@ -1510,6 +1814,7 @@ async fn run_prepare_mint_media(
             })
         })
         .collect();
+    mint_progress::advance(job_id, "encrypt");
     let seal_req = json!({
         "op": "seal_segments_threshold",
         "segments_b64": all_segments,
@@ -1553,9 +1858,10 @@ async fn run_prepare_mint_media(
             .ok_or_else(|| stage_err("encrypt", "encrypted segment not a string"))?;
         files.push(json!({ "path": seg_paths[i], "data": data }));
     }
-    files.push(json!({ "path": "manifest.mpd", "data": b64.encode(manifest.as_bytes()) }));
+    files.push(json!({ "path": DASH_MANIFEST_NAME, "data": b64.encode(manifest.as_bytes()) }));
 
     // 4) publish the whole DASH directory -> one dir CID (the asset CID).
+    mint_progress::advance(job_id, "publish");
     let publish_dir = json!({ "op": "publish", "kind": "directory", "files": files, "pin": true });
     let asset = provider_data(registry, "content", &publish_dir)
         .await
@@ -1573,7 +1879,7 @@ async fn run_prepare_mint_media(
     let envelope = build_media_envelope(MediaEnvelope {
         kid_hex: &kid_hex,
         dir_cid: &dir_cid,
-        manifest_path: "manifest.mpd",
+        manifest_path: DASH_MANIFEST_NAME,
         node_set_id_b64: &node_set_id_b64,
         shares: &shares,
         producer_vk_b64: &producer_vk_b64,
@@ -1605,7 +1911,22 @@ async fn run_prepare_mint_media(
         .ok_or_else(|| stage_err("publish", "metadata publish returned no CID"))?
         .to_string();
 
-    // 6) shared mint tail — the asset CID is the DASH directory CID.
+    // 6) shared mint tail — the asset CID is the DASH directory CID. Persist the DASH layout
+    //    (manifest + init + the flattened, CENC-ordered encrypted segment paths) so the
+    //    quorum-media open fetches exactly that ordered set from the directory and presents it
+    //    to the decrypt boundary in seal order (the CENC counter is continuous across segments).
+    let media_layout = json!({
+        "manifest_path": DASH_MANIFEST_NAME,
+        // Legacy single-track fields (first track's init + the flat CENC-ordered segment set):
+        // kept so already-minted assets and the local-muxed path keep opening unchanged.
+        "init_path": init_files.first().map(|(p, _)| p.as_str()).unwrap_or_default(),
+        "segment_paths": seg_paths,
+        // Per-track DASH layout (video/audio AdaptationSets) for multi-track playback. Each
+        // track's `segment_paths` are a subset of the flat list above; the quorum-media open
+        // resolves them to global indices for per-SourceBuffer streaming.
+        "tracks": track_layouts,
+    });
+    mint_progress::advance(job_id, "sign");
     finalize_mint(
         registry,
         principal_id,
@@ -1616,10 +1937,11 @@ async fn run_prepare_mint_media(
             asset_cid: &dir_cid,
             metadata_cid: &metadata_cid,
             protections: &protections,
-            // Media ciphertext is the DASH directory (multi-segment); quorum-open of DASH is a
-            // follow-on, so no single-segment ciphertext is persisted for media yet.
+            // Media ciphertext is the published DASH directory (multi-segment): the quorum-media
+            // open fetches the encrypted segments from `asset_cid` rather than embedding them.
             ciphertext_b64: None,
             image: &image,
+            media_layout: Some(&media_layout),
         },
     )
     .await
@@ -1720,10 +2042,12 @@ fn build_media_envelope(b: MediaEnvelope) -> Value {
             "tags": b.meta.tags.clone(),
             "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
             "legal": legal_property(b.meta),
-            "kid": b.kid_hex,
+            // Indexer-facing kid (base.ela.city maps this -> catalog content_id -> on-chain access):
+            // the `0x` bytes16 form. The bare-hex CENC key id lives in `media.defaultKID`.
+            "kid": contract_kid_0x(b.kid_hex),
         },
         "attributes": media_envelope_attributes(b.meta, mime, b.size, copies),
-        "kid": b.kid_hex,
+        "kid": contract_kid_0x(b.kid_hex),
     })
 }
 
@@ -2114,11 +2438,12 @@ fn build_metadata_envelope(b: BuildEnvelope) -> Value {
             "tags": b.meta.tags.clone(),
             "categories": if category.is_empty() { vec![] } else { vec![category.to_string()] },
             "legal": legal_property(b.meta),
-            "kid": b.kid_hex,
+            // Indexer-facing kid -> catalog content_id -> on-chain access: the `0x` bytes16 form.
+            "kid": contract_kid_0x(b.kid_hex),
         },
         "attributes": media_envelope_attributes(b.meta, mime, b.size, copies),
         // Top-level kid: the indexer keys on `metadata.kid || metadata.properties.kid`.
-        "kid": b.kid_hex,
+        "kid": contract_kid_0x(b.kid_hex),
     })
 }
 
@@ -2400,10 +2725,14 @@ fn to_wei(price: &str, currency: &str) -> Result<String, String> {
 /// Persist a freshly-prepared mint into the creator's Library so it lists at the correct
 /// location and opens on double-click — the runtime analogue of PC2 indexing a creator's own
 /// mint into their catalog. Two objects are written under the principal's `Documents`:
+/// Both are filed under the Library folder matching the asset type (see below). Two objects:
 ///   1. the asset itself — the openable owned object the protected viewer renders, and
 ///   2. a PC2-style `.ddrm` capsule carrying the dKMS escrow (`protections[0]`) + the on-chain
 ///      identities (contentId/KID, asset+metadata CIDs), i.e. exactly the fields the proven
 ///      quorum-open phase reloads from disk to recover the CEK 2-of-3.
+///
+/// Both are filed under the Library folder matching the asset's type (images→Pictures,
+/// video→Videos, audio→Music, everything else→Documents) via `library_folder_for_mime`.
 ///
 /// Best-effort: a persistence failure is logged but NEVER fails the mint (the tx is already
 /// prepared). Persisting at prepare-time (before the on-chain confirm) is a deliberate
@@ -2435,7 +2764,26 @@ fn persist_minted_asset_to_library(
         .get("ciphertext_b64")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    let quorum_openable = !meta.is_media && ciphertext_b64.is_some();
+    // The published DASH directory CID (media): the quorum-media open fetches the encrypted
+    // segments from here and CENC-decrypts them per-segment under the recovered CEK.
+    let asset_cid = prepared
+        .get("asset_cid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let has_escrow = prepared
+        .get("protections")
+        .map(|p| !p.is_null())
+        .unwrap_or(false);
+    // Both objects AND media now open from the 2-of-3 quorum. Objects embed the single-sample
+    // ciphertext in the capsule (recovered directly); media's ciphertext is the published DASH
+    // directory at `asset_cid` (the quorum-media open fetches it + per-segment CENC-decrypts under
+    // the recovered CEK). Either way the Library item is the `.ddrm` capsule — no plaintext at rest.
+    let quorum_openable = has_escrow
+        && if meta.is_media {
+            asset_cid.is_some()
+        } else {
+            ciphertext_b64.is_some()
+        };
 
     // The PC2-style `.ddrm` capsule carrying the dKMS escrow + on-chain identities (+ the sealed
     // ciphertext for the quorum open). This is the artifact `ddrm-media-authority --quorum` reads.
@@ -2454,15 +2802,34 @@ fn persist_minted_asset_to_library(
         // Cover thumbnail URI (PC2 `descriptor.thumbnail`) — the Library/Finder renders this as
         // the protected-asset cover art (framed + badged). Empty when no thumbnail was produced.
         "thumbnail": prepared.get("thumbnail").cloned().unwrap_or(Value::Null),
+        // Original plaintext content size in bytes (PC2 `descriptor.pinnedSizeBytes`). The `.ddrm`
+        // on disk is just the capsule (for media the encrypted segments live elsewhere), so the
+        // Library shows THIS as the file size — like a normal file manager — not the capsule size.
+        "content_size": file_bytes.len() as u64,
         // The dKMS escrow descriptor (scheme, node_set_id_b64, producer_verifying_key_b64,
         // shares[]) — the exact fields the quorum-open reloads.
         "protections": prepared.get("protections").cloned().unwrap_or(Value::Null),
     });
+    if meta.is_media {
+        // The DASH manifest filename inside the directory at `asset_cid` (PC2-canonical
+        // `stream.mpd`) — the quorum-media open reads it to learn track inits + segment order.
+        capsule["manifest_path"] = json!(DASH_MANIFEST_NAME);
+        // The DASH layout (init + flattened CENC-ordered segment paths) the quorum-media open
+        // fetches from `asset_cid` and presents to the decrypt boundary in seal order.
+        if let Some(media) = prepared.get("media").filter(|m| !m.is_null()) {
+            capsule["media"] = media.clone();
+        }
+    }
     if let Some(ct) = ciphertext_b64 {
         capsule["ciphertext_b64"] = json!(ct);
     }
+    // File the item under the Library folder that matches its type (images→Pictures, video→Videos,
+    // audio→Music, everything else→Documents), so the Finder shows it where the user expects. The
+    // write path creates the folder on demand. Placement keys off the original asset mime (the
+    // on-disk item is a `.ddrm` capsule whose own filename carries no type).
+    let folder = crate::library::library_folder_for_mime(meta.mime.trim());
     let capsule_bytes = serde_json::to_vec_pretty(&capsule).unwrap_or_default();
-    let capsule_uri = format!("{root}/Documents/{base}.ddrm");
+    let capsule_uri = format!("{root}/{folder}/{base}.ddrm");
 
     if quorum_openable {
         // PC2 parity, fail-closed: the Library item IS the `.ddrm` capsule — no plaintext copy at
@@ -2485,10 +2852,12 @@ fn persist_minted_asset_to_library(
             meta.title.trim()
         );
     } else {
-        // Media / no-ciphertext: keep the openable object + a `.ddrm` sidecar (the quorum-open of
-        // DASH media is a follow-on; until then these open via the local boundary).
+        // Fallback only: the prepare did not yield a recoverable artifact (no escrow, or no
+        // embedded ciphertext for an object). Keep the openable object + a `.ddrm` sidecar so the
+        // asset is at least visible/openable via the local boundary. Quorum-openable mints (the
+        // normal path for both objects and media) take the branch above with no plaintext at rest.
         let mime = Some(meta.mime.trim()).filter(|m| !m.is_empty());
-        let asset_uri = format!("{root}/Documents/{base}");
+        let asset_uri = format!("{root}/{folder}/{base}");
         if let Err(err) = crate::library::handle_library_upload_bytes(
             data_dir,
             principal_id,
@@ -2513,7 +2882,7 @@ fn persist_minted_asset_to_library(
             tracing::warn!("mint persist: could not write .ddrm capsule {capsule_uri}: {err}");
         }
         tracing::info!(
-            "mint persist: wrote owned asset + .ddrm sidecar for \"{}\" under {root}/Documents",
+            "mint persist: wrote owned asset + .ddrm sidecar for \"{}\" under {root}/{folder}",
             meta.title.trim()
         );
     }
@@ -2773,10 +3142,11 @@ mod tests {
         assert_eq!(env["asset"]["size"], json!(4096));
         assert_eq!(env["properties"]["publisher"], json!("0xCreatorWallet"));
         assert_eq!(env["properties"]["contract"], json!("self://contract.json"));
-        assert_eq!(env["kid"], json!("0123456789abcdef0123456789abcdef"));
+        // Indexer-facing kid is the `0x` bytes16 form (links to on-chain contentId at base.ela.city).
+        assert_eq!(env["kid"], json!("0x0123456789abcdef0123456789abcdef"));
         assert_eq!(
             env["properties"]["kid"],
-            json!("0123456789abcdef0123456789abcdef")
+            json!("0x0123456789abcdef0123456789abcdef")
         );
         // Supply attribute carries the creator's chosen edition count.
         let supply = env["attributes"]
@@ -2895,7 +3265,7 @@ mod tests {
         let env = build_media_envelope(MediaEnvelope {
             kid_hex: "0123456789abcdef0123456789abcdef",
             dir_cid: "bafydir",
-            manifest_path: "manifest.mpd",
+            manifest_path: DASH_MANIFEST_NAME,
             node_set_id_b64: "nsid",
             shares: &shares,
             producer_vk_b64: "dGVzdC12ag==",
@@ -2922,10 +3292,16 @@ mod tests {
         // The asset CID is the DASH directory; the media block is DASH with a single default_KID.
         assert_eq!(env["asset"]["cid"], json!("bafydir"));
         assert_eq!(env["media"]["mediaType"], json!("dash"));
-        assert_eq!(env["media"]["manifestPath"], json!("manifest.mpd"));
+        assert_eq!(env["media"]["manifestPath"], json!("stream.mpd"));
+        // CENC key id stays bare hex (mirrors the MPD `default_KID`); the indexer-facing kid is `0x`.
         assert_eq!(
             env["media"]["defaultKID"],
             json!("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(env["kid"], json!("0x0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            env["properties"]["kid"],
+            json!("0x0123456789abcdef0123456789abcdef")
         );
         assert_eq!(env["media"]["tracks"].as_array().unwrap().len(), 2);
         // CEK custody is the SAME dKMS escrow block as the object path (Lit's slot).

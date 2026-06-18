@@ -376,6 +376,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
             "/api/provider/object/download/raw",
             get(gateway_library_download),
         )
+        .route("/api/provider/object/cover", get(gateway_library_cover))
         .route(
             "/api/provider/object/upload",
             put(gateway_library_upload).layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
@@ -708,6 +709,10 @@ pub fn gateway_router(state: GatewayState) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
         )
         .route(
+            "/api/apps/creator/prepare-progress/:job_id",
+            get(super::creator::creator_prepare_progress),
+        )
+        .route(
             "/api/apps/creator/wallet",
             get(super::creator::creator_wallet),
         )
@@ -740,8 +745,20 @@ pub fn gateway_router(state: GatewayState) -> Router {
             get(super::viewer_media::viewer_media_init),
         )
         .route(
+            "/api/viewers/:viewer/media/:session/cover",
+            get(super::viewer_media::viewer_media_cover),
+        )
+        .route(
             "/api/viewers/:viewer/media/:session/segment/:index",
             get(super::viewer_media::viewer_media_segment),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/init",
+            get(super::viewer_media::viewer_media_track_init),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/segment/:index",
+            get(super::viewer_media::viewer_media_track_segment),
         )
         .route(
             "/api/viewers/ddrm-viewer/object/open",

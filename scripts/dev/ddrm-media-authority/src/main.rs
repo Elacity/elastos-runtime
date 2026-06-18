@@ -8,14 +8,14 @@
 //! `senc`-stripped segment bytes. The CEK never leaves this process unsealed and
 //! never reaches the gateway or the browser.
 //!
-//! Protocol (line-delimited JSON on stdio):
-//!   - On startup it prints exactly ONE descriptor line on stdout (no key material):
-//!       {"schema":"elastos.media-authority.session/v1","mime":...,
-//!        "segment_count":N,"init_b64":...,"expires_at":T}
-//!   - Then it reads request lines on stdin and replies one line each on stdout:
-//!       {"op":"segment","index":I}  -> {"status":"ok","segment_b64":...}
-//!                                    |  {"status":"error","message":...}
-//!       {"op":"shutdown"}           -> exits 0
+//! Protocol (line-delimited JSON on stdio). On startup it prints exactly ONE descriptor line on
+//! stdout (no key material), then reads request lines on stdin and replies one line each:
+//!
+//! ```text
+//! descriptor: {"schema":"elastos.media-authority.session/v1","mime":...,"segment_count":N,"init_b64":...,"expires_at":T}
+//! {"op":"segment","index":I}  -> {"status":"ok","segment_b64":...} | {"status":"error","message":...}
+//! {"op":"shutdown"}           -> exits 0
+//! ```
 //!
 //! Usage (spawned by the gateway):
 //!   ddrm-media-authority --principal <id> [--video PATH] [--decrypt-bin PATH]
@@ -141,6 +141,7 @@ fn run() -> Result<(), String> {
     let mut descriptor_path: Option<String> = None;
     let mut caller_seed_b64: Option<String> = None;
     let mut access_grant_b64: Option<String> = None;
+    let mut dash_dir: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -169,6 +170,9 @@ fn run() -> Result<(), String> {
             "--caller-seed" => caller_seed_b64 = args.next(),
             // OPTIONAL base64 of the wallet-signed AccessGrantV1 JSON (trustless authorization).
             "--access-grant" => access_grant_b64 = args.next(),
+            // MEDIA quorum-open: local path of the DASH directory the gateway pre-fetched from
+            // the asset CID (clear inits + ENCRYPTED segments + stream.mpd).
+            "--dash-dir" => dash_dir = args.next(),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -197,6 +201,7 @@ fn run() -> Result<(), String> {
             mime: object_mime.unwrap_or_else(|| "application/octet-stream".to_string()),
             ttl_secs,
             access_grant_b64,
+            dash_dir,
         });
     }
 

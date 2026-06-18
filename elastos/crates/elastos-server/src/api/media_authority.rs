@@ -81,14 +81,27 @@ pub(crate) fn resolve_key_bin() -> String {
 pub struct MediaAuthorityProc {
     child: Child,
     io: Mutex<ProcIo>,
-    /// MSE `addSourceBuffer` mime/codecs string (from the descriptor).
+    /// MSE `addSourceBuffer` mime/codecs string (from the descriptor). For multi-track sessions
+    /// this is track 0's mime; per-track mimes live in `tracks`.
     pub mime: String,
-    /// Number of addressable media segments.
+    /// Number of addressable media segments (track 0's count for multi-track sessions).
     pub segment_count: usize,
-    /// The clear init segment bytes (CENC init is unencrypted).
+    /// The clear init segment bytes (track 0's init for multi-track sessions).
     pub init_bytes: Vec<u8>,
     /// Unix expiry; reads after this fail closed.
     pub expires_at: u64,
+    /// Per-track playback model (video + audio for split DASH; one entry for muxed/audio). Empty
+    /// for the legacy local-muxed `launch` path, which uses the single fields above + `/segment`.
+    pub tracks: Vec<AuthorityTrack>,
+}
+
+/// One playable track relayed by the helper: its MSE mime, clear init, and segment count.
+/// The player attaches one `SourceBuffer` per entry (PC2's two-viewer model).
+pub struct AuthorityTrack {
+    pub kind: String,
+    pub mime: String,
+    pub segment_count: usize,
+    pub init_bytes: Vec<u8>,
 }
 
 struct ProcIo {
@@ -168,17 +181,161 @@ impl MediaAuthorityProc {
             segment_count,
             init_bytes,
             expires_at,
+            tracks: Vec::new(),
+        })
+    }
+
+    /// Spawn the helper in `--quorum` media mode (the dKMS consumer-open for DASH): it recovers
+    /// the asset's REAL CEK from the 2-of-3 quorum named by the `.ddrm` capsule, reads the
+    /// pre-fetched DASH directory (`dash_dir`), and serves CENC-decrypted fMP4 fragments over the
+    /// SAME descriptor + `segment` protocol as `launch`. The gateway never links the PQ crypto and
+    /// never sees the CEK; this is the production analogue of the local-test-KMS `launch` for media.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_quorum(
+        helper_bin: &str,
+        decrypt_bin: &str,
+        key_bin: &str,
+        principal_id: &str,
+        capsule_file: &str,
+        descriptor_file: &str,
+        caller_seed_b64: &str,
+        dash_dir: &str,
+        object_cid: &str,
+        mime: &str,
+        access_grant_b64: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(helper_bin);
+        cmd.args([
+            "--quorum",
+            "--principal",
+            principal_id,
+            "--decrypt-bin",
+            decrypt_bin,
+            "--key-bin",
+            key_bin,
+            "--capsule",
+            capsule_file,
+            "--descriptor",
+            descriptor_file,
+            "--caller-seed",
+            caller_seed_b64,
+            "--dash-dir",
+            dash_dir,
+            "--object-cid",
+            object_cid,
+            "--mime",
+            mime,
+        ]);
+        // TRUSTLESS AUTHORIZATION: forward the wallet-signed grant (base64 JSON) so the nodes
+        // verify the wallet + read the chain themselves. Absent => legacy enrolled-caller path.
+        if let Some(grant) = access_grant_b64.filter(|s| !s.trim().is_empty()) {
+            cmd.args(["--access-grant", grant]);
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn quorum media-authority ({helper_bin}): {e}"))?;
+        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+
+        let mut line = String::new();
+        let n = stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read descriptor: {e}"))?;
+        if n == 0 {
+            return Err("quorum media-authority exited before publishing a session".to_string());
+        }
+        let descriptor: Value = serde_json::from_str(line.trim())
+            .map_err(|e| format!("parse descriptor: {e} ({line})"))?;
+        let expires_at = descriptor
+            .get("expires_at")
+            .and_then(Value::as_u64)
+            .ok_or("descriptor missing expires_at")?;
+
+        // Multi-track descriptor (`tracks[]`): each AdaptationSet carries its own mime + clear init
+        // + segment count. The legacy single fields are populated from track 0 so existing readers
+        // keep working; the player drives per-track `/track/{t}/...` routes from `tracks`.
+        let decode_init = |d: &Value| -> Result<Vec<u8>, String> {
+            d.get("init_b64")
+                .and_then(Value::as_str)
+                .map(|b64| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| format!("decode init_b64: {e}"))
+                })
+                .transpose()
+                .map(Option::unwrap_or_default)
+        };
+        let mut tracks: Vec<AuthorityTrack> = Vec::new();
+        if let Some(arr) = descriptor.get("tracks").and_then(Value::as_array) {
+            for t in arr {
+                tracks.push(AuthorityTrack {
+                    kind: t
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    mime: t
+                        .get("mime")
+                        .and_then(Value::as_str)
+                        .unwrap_or(mime)
+                        .to_string(),
+                    segment_count: t
+                        .get("segment_count")
+                        .and_then(Value::as_u64)
+                        .ok_or("track descriptor missing segment_count")?
+                        as usize,
+                    init_bytes: decode_init(t)?,
+                });
+            }
+        }
+        let (mime, segment_count, init_bytes) = if let Some(t0) = tracks.first() {
+            (t0.mime.clone(), t0.segment_count, t0.init_bytes.clone())
+        } else {
+            // Legacy single-track descriptor (top-level mime/segment_count/init_b64).
+            let mime = descriptor
+                .get("mime")
+                .and_then(Value::as_str)
+                .unwrap_or(mime)
+                .to_string();
+            let segment_count = descriptor
+                .get("segment_count")
+                .and_then(Value::as_u64)
+                .ok_or("descriptor missing segment_count")?
+                as usize;
+            (mime, segment_count, decode_init(&descriptor)?)
+        };
+
+        Ok(Self {
+            child,
+            io: Mutex::new(ProcIo { stdin, stdout }),
+            mime,
+            segment_count,
+            init_bytes,
+            expires_at,
+            tracks,
         })
     }
 
     /// Relay one segment read; returns already-decrypted, `senc`-stripped bytes.
     pub fn segment(&self, index: usize) -> Result<Vec<u8>, String> {
+        self.segment_op(json!({ "op": "segment", "index": index }))
+    }
+
+    /// Relay one PER-TRACK segment read (`{track, index}`): the helper maps the track-local index
+    /// to the global flat CENC-counter position before decrypt. Used by multi-track playback.
+    pub fn segment_track(&self, track: usize, index: usize) -> Result<Vec<u8>, String> {
+        self.segment_op(json!({ "op": "segment", "track": track, "index": index }))
+    }
+
+    fn segment_op(&self, request: Value) -> Result<Vec<u8>, String> {
         let mut io = self
             .io
             .lock()
             .map_err(|_| "media-authority mutex poisoned")?;
-        writeln!(io.stdin, "{}", json!({ "op": "segment", "index": index }))
-            .map_err(|e| format!("write segment request: {e}"))?;
+        writeln!(io.stdin, "{request}").map_err(|e| format!("write segment request: {e}"))?;
         io.stdin.flush().map_err(|e| format!("flush: {e}"))?;
         let mut line = String::new();
         let n = io

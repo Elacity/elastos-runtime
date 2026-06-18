@@ -19,8 +19,8 @@
 //! silent skip (PRINCIPLE #11 — fail closed).
 //!
 //! Parity anchors (from PC2 source):
-//!   transcode: `libx264 -crf {ladder} -preset slow -profile:v <p> -pix_fmt yuv420p`
-//!              + `aac -b:a 128k`;
+//!   transcode: AV1 ladder (`av1_nvenc` GPU → `libsvtav1` CPU → `libx264` fallback,
+//!              probed from the ffmpeg build) + `aac -b:a 128k`;
 //!   fragment:  `-movflags +frag_keyframe+empty_moov+default_base_moof+separate_moof`
 //!              (`+separate_moof` ⇒ one `traf` per `moof`, which `ddrm-media::mp4`
 //!              and the CENC sample encryptor both assume);
@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
@@ -42,6 +43,49 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 
 const PACKAGE_RESPONSE_SCHEMA: &str = "elastos.media.package/v1";
 const CONFIG_ENV: &str = "ELASTOS_MEDIA_PROVIDER_CONFIG";
+
+/// Video encoder chosen by probing the ffmpeg build, mirroring PC2's `encoder.ts` ladder:
+/// AV1 via NVIDIA `av1_nvenc` if present, else CPU `libsvtav1`, else the universal `libx264`.
+/// PC2 transcodes to AV1 for ~30% better compression at equal quality; we match that and the
+/// `elacity-player` gates each track with `MediaSource.isTypeSupported`, failing closed (not
+/// silently) if a device can't decode the chosen codec.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VideoEncoder {
+    Av1Nvenc,
+    SvtAv1,
+    X264,
+}
+
+/// Probe the ffmpeg build once per process for its best available video encoder. The ffmpeg
+/// binary is fixed for the provider's lifetime, so the (possibly slow) `-encoders` call is cached.
+fn detect_video_encoder(ffmpeg: &str) -> VideoEncoder {
+    static CHOICE: OnceLock<VideoEncoder> = OnceLock::new();
+    *CHOICE.get_or_init(|| {
+        let listing = Command::new(ffmpeg)
+            .arg("-hide_banner")
+            .arg("-encoders")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if listing.contains("av1_nvenc") {
+            VideoEncoder::Av1Nvenc
+        } else if listing.contains("libsvtav1") {
+            VideoEncoder::SvtAv1
+        } else {
+            VideoEncoder::X264
+        }
+    })
+}
+
+/// AV1 CRF for a rung, derived from its x264 CRF (PC2's tiers: x264 23/24/26 ≈ svtav1 30/32/35).
+fn av1_crf(x264_crf: u32) -> u32 {
+    (x264_crf + 8).clamp(20, 40)
+}
+
+/// AV1 constant-quality for `av1_nvenc`, derived from the x264 CRF (PC2: x264 23/24/26 ≈ cq 15/16/18).
+fn av1_cq(x264_crf: u32) -> u32 {
+    x264_crf.saturating_sub(8).clamp(10, 30)
+}
 
 // ---------------------------------------------------------------------------
 // Operator config (PRINCIPLE #3: a narrow capability handed in, not discovered).
@@ -290,7 +334,11 @@ impl MediaProvider {
                 content_b64,
                 filename,
                 preview_duration,
-            } => self.package_dash(&content_b64, filename.as_deref(), preview_duration.unwrap_or(0)),
+            } => self.package_dash(
+                &content_b64,
+                filename.as_deref(),
+                preview_duration.unwrap_or(0),
+            ),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -469,18 +517,53 @@ impl MediaProvider {
         let mut tx = Command::new(&tools.ffmpeg);
         tx.arg("-y").arg("-i").arg(input);
         if has_video {
-            tx.arg("-vf")
-                .arg(format!("scale=-2:{}", r.height))
-                .arg("-c:v")
-                .arg("libx264")
-                .arg("-crf")
-                .arg(r.crf.to_string())
-                .arg("-preset")
-                .arg(&r.preset)
-                .arg("-profile:v")
-                .arg(&r.profile)
-                .arg("-pix_fmt")
-                .arg("yuv420p");
+            // Codec ladder (PC2 `encoder.ts`): AV1 (GPU `av1_nvenc`, else CPU `libsvtav1`) for
+            // ~30% better compression, falling back to the universal `libx264`. 8-bit `yuv420p`
+            // (not PC2's 10-bit) for the widest browser AV1 decode support; the player still
+            // gates each track with `isTypeSupported` and fails closed on an unplayable codec.
+            match detect_video_encoder(&tools.ffmpeg) {
+                VideoEncoder::Av1Nvenc => {
+                    tx.arg("-vf")
+                        .arg(format!(
+                            "format=yuv420p,hwupload_cuda,scale_cuda=w=-2:h={}",
+                            r.height
+                        ))
+                        .arg("-c:v")
+                        .arg("av1_nvenc")
+                        .arg("-cq:v")
+                        .arg(av1_cq(r.crf).to_string())
+                        .arg("-preset")
+                        .arg("p6");
+                }
+                VideoEncoder::SvtAv1 => {
+                    tx.arg("-vf")
+                        .arg(format!("scale=-2:{}", r.height))
+                        .arg("-c:v")
+                        .arg("libsvtav1")
+                        .arg("-crf")
+                        .arg(av1_crf(r.crf).to_string())
+                        .arg("-preset")
+                        .arg("6")
+                        .arg("-svtav1-params")
+                        .arg("tune=0:enable-overlays=1")
+                        .arg("-pix_fmt")
+                        .arg("yuv420p");
+                }
+                VideoEncoder::X264 => {
+                    tx.arg("-vf")
+                        .arg(format!("scale=-2:{}", r.height))
+                        .arg("-c:v")
+                        .arg("libx264")
+                        .arg("-crf")
+                        .arg(r.crf.to_string())
+                        .arg("-preset")
+                        .arg(&r.preset)
+                        .arg("-profile:v")
+                        .arg(&r.profile)
+                        .arg("-pix_fmt")
+                        .arg("yuv420p");
+                }
+            }
             if probe.has_audio {
                 tx.arg("-c:a").arg("aac").arg("-b:a").arg(&r.audio_bitrate);
             } else {
@@ -567,8 +650,7 @@ impl MediaProvider {
             .config
             .ladder()
             .into_iter()
-            .filter(|r| probe.height == 0 || r.height <= probe.height)
-            .next()
+            .find(|r| probe.height == 0 || r.height <= probe.height)
             .or_else(|| self.config.ladder().into_iter().next())
             .ok_or("empty ladder")?;
         if probe.height > 0 && top.height > probe.height {
@@ -772,7 +854,10 @@ fn make_preview_clip(
     } else {
         cmd.arg("-c:a").arg("aac").arg("-b:a").arg("96k").arg("-vn");
     }
-    cmd.arg("-movflags").arg("+faststart").arg("-y").arg(&preview_path);
+    cmd.arg("-movflags")
+        .arg("+faststart")
+        .arg("-y")
+        .arg(&preview_path);
     run_ffmpeg(&mut cmd, "preview clip")?;
     std::fs::read(&preview_path).map_err(|e| format!("read preview clip: {e}"))
 }
@@ -906,7 +991,10 @@ mod tests {
             renditions: vec![],
         };
         // /usr/bin/true exists on macOS/Linux; resolve() passes, so a bad b64 surfaces.
-        let resp = handle(&mut p, json!({ "op": "package", "content_b64": "!!!notb64!!!" }));
+        let resp = handle(
+            &mut p,
+            json!({ "op": "package", "content_b64": "!!!notb64!!!" }),
+        );
         assert_eq!(err_code(resp), "invalid_request");
     }
 

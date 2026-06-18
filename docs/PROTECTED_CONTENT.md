@@ -136,9 +136,10 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 
 - Renderer placement: the `decrypt-provider` capsule (feature `pdf-render`), NOT the
   trusted core. It uses pure-Rust rasterisers — `hayro` (PDF, `#![forbid(unsafe_code)]`),
-  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive) and
-  `font8x8` (watermark + text glyphs). The trusted core gains no render code — it only
-  routes bytes (Principle 5/13).
+  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive),
+  `ab_glyph` + vendored DejaVu fonts (anti-aliased body text — proportional for prose, mono
+  for code) and `font8x8` (the faint tiled watermark glyphs only). The trusted core gains no
+  render code — it only routes bytes (Principle 5/13).
 - Containment: the `StreamSegment` op takes an optional `render` directive; when present
   for a pixel-lock mime, the boundary extracts the object from the decrypted fragment and
   returns a watermarked JPEG (`rendered_b64` + `total_pages`) — never the raw bytes. The
@@ -149,9 +150,11 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 - Browser contract (served by `elastos-server`, routing only):
   - `GET /api/viewers/ddrm-viewer/object/{session}` → manifest adds
     `pixel_locked: true`, `total_pages`, `page_content_type`.
-  - `GET /api/viewers/ddrm-viewer/object/{session}/page?n=N` → one rendered page image
-    (`image/jpeg`) + `X-Asset-Pages`/`X-Asset-Page` headers.
-  - `GET …/object/{session}/bytes` → `403` for pixel-lock sessions.
+  - `GET /api/viewers/ddrm-viewer/object/{session}/page?n=N` → one rendered page (content type =
+    the manifest's `page_content_type`: `image/jpeg` for pixel-lock, `text/html` for an EPUB
+    chapter) + `X-Asset-Pages`/`X-Asset-Page` headers.
+  - `GET …/object/{session}/bytes` → `403` for render-locked (pixel-lock + html-lock) sessions;
+    decrypt-passthrough assets (3D `model/*`) are served here.
 - Watermark: the buyer/owner principal is stamped diagonally + tiled across every page
   (forensic provenance, uncroppable), rendered with the full-ASCII `font8x8` so any
   principal/DID/wallet is legible (long ids elided to first…last).
@@ -159,18 +162,49 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
 - `application/pdf` → `pdf` (multi-page, `hayro`)
 - `application/vnd.comicbook+zip`, `application/x-cbz` → `cbz` (multi-page, natural page order)
-- `text/*` and source-code mimes (`application/json`, `application/javascript`,
-  `application/xml`, `application/x-yaml`, `application/toml`, `application/x-sh`) → `text`
-  (multi-page, rasterised so source can't be copied)
+- `text/plain`, `text/markdown` (prose) → `text` (multi-page **light reading reader**: a real
+  anti-aliased PROPORTIONAL vector face (DejaVu Sans via `ab_glyph`) on a warm page with line
+  leading, true measured-width word-wrap and full Unicode — smart quotes/dashes/accents render as
+  themselves — rasterised so source can't be copied)
+- source-code mimes (`application/json`, `application/javascript`, `application/xml`,
+  `application/x-yaml`, `application/toml`, `application/x-sh`) → `code` (multi-page **dark code
+  view**: anti-aliased fixed-pitch face (DejaVu Sans Mono via `ab_glyph`) with a line-number gutter
+  + conservative per-language colour for comments/strings/numbers/XML tags, base16-ocean theme —
+  mirrors PC2 `render::code` intent)
 - `image/svg+xml` → `svg` (rasterised to pixels — SVG is scriptable XML, never shipped raw)
 - other `image/*` → `image_page` (single page, re-encoded so source file + EXIF is stripped)
 
-The single source of truth for the set is `render::is_pixel_lock`; the media-authority
-helper (`scripts/dev/ddrm-media-authority/src/quorum.rs`) mirrors it and the two must stay
-in sync (Principle 12). EPUB, office docs, and 3D are tracked in `docs/ASSET_TIERS.md`.
+A second render-lock variant, **html-lock**, serves reflowable EPUB without rasterising:
+- `application/epub+zip`, `application/epub` → `epub` (one "page" per spine chapter). The boundary
+  reads the EPUB ZIP, resolves the OPF spine order (`roxmltree`), and for each chapter emits a
+  **sanitised, self-contained HTML document** (scripts/styles/handlers/dangerous tags stripped,
+  `javascript:` URLs neutralised, images inlined as `data:` URIs, our reader CSS + a tiled
+  forensic watermark + `user-select:none` + a strict CSP `<meta>`). The page is served with
+  `page_content_type: text/html; charset=utf-8`; the viewer renders it in a **script-less sandbox
+  iframe** (`sandbox=""` — no allow-scripts, no allow-same-origin), so a hostile book is fully
+  inert. The raw EPUB ZIP never egresses (`/bytes` is refused like any render-lock asset). This
+  mirrors PC2's `EpubRenderer` html-lock tier rather than a pixel-lock rasterise.
+
+The single source of truth for the render-locked set is `render::is_pixel_lock` (covers pixel-lock
+**and** html-lock mimes); the media-authority helper (`scripts/dev/ddrm-media-authority/src/quorum.rs`)
+mirrors it and the two must stay in sync (Principle 12). The `page_content_type` is decided by the
+renderer (`RenderSession::page_content_type` → `image/jpeg` or `text/html`) and threaded through the
+helper descriptor to the viewer. Office docs remain tracked in `docs/ASSET_TIERS.md`.
+
+3D (`model/*`: glTF/GLB/STL/OBJ) is NOT render-locked — it is **decrypt-passthrough** (Tier 5):
+the boundary decrypts the mesh and serves the cleartext bytes via `/bytes`, which the `ddrm-viewer`
+renders with a **bundled, local Three.js** WebGL viewer (no CDN, vendored under the capsule's
+`/vendor`). Like PC2's 3D path, the cleartext mesh reaches the browser; frames are not watermarked
+yet (see `docs/ASSET_TIERS.md` North star 2 for the render-only-containment upgrade).
 
 Audio/video are NOT pixel-lock — they take the stream-decrypt rail (DASH/CENC + MSE);
-`viewer_open::is_media_mime` routes `video/*` and `audio/*` to the media player.
+`viewer_open::is_media_mime` routes `video/*` and `audio/*` to the media player. A minted dDRM
+media `.ddrm` opens via the **quorum-media** path (`viewer_open::open_quorum_media`): the gateway
+fetches the published DASH directory by its `asset_cid`, then `ddrm-media-authority --quorum
+--dash-dir` recovers the CEK 2-of-3 and serves CENC-decrypted fragments per-segment over the same
+descriptor/`segment` protocol as the local media path. The whole ordered segment set is welded
+into the transcript AAD (`to_aad_with_segments`), so a substituted/reordered fragment fails the
+CEK unwrap closed before any byte is decrypted; the recovered CEK never leaves the decrypt VM.
 
 ## Remaining Sequence
 

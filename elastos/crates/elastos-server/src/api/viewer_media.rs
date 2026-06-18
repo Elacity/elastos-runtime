@@ -111,6 +111,26 @@ pub struct MediaSession {
     /// sealed the CEK to it). Segment reads relay to that helper, which returns
     /// already-decrypted, `senc`-stripped bytes. The CEK never reaches the gateway.
     pub authority: Option<Arc<super::media_authority::MediaAuthorityProc>>,
+    /// Per-track playback model (video + audio for split DASH; empty for the legacy
+    /// single-buffer path). When non-empty the player attaches one MSE `SourceBuffer`
+    /// per track and drives the `/track/{t}/init` + `/track/{t}/segment/{i}` routes.
+    pub tracks: Vec<MediaTrackInfo>,
+    /// Public cover-art URI (`ipfs://<cid>`) — the degraded teaser pinned at mint as
+    /// `metadata.image` and persisted in the `.ddrm` capsule's `thumbnail`. Surfaced to the
+    /// player (audio poster) via the `/cover` route. It is PUBLIC, key-free imagery (no plaintext
+    /// content, no key material). `None` for raw local opens / assets with no cover.
+    pub cover_uri: Option<String>,
+    /// The asset's public display title (from the `.ddrm` capsule). Surfaced in the manifest so the
+    /// player can label a generated cover placeholder with the asset name (not the player app name).
+    pub title: String,
+}
+
+/// One playable track surfaced to the viewer: MSE mime, clear init, and segment count.
+pub struct MediaTrackInfo {
+    pub kind: String,
+    pub mime: String,
+    pub segment_count: usize,
+    pub init_bytes: Vec<u8>,
 }
 
 impl MediaSession {
@@ -121,6 +141,16 @@ impl MediaSession {
         principal_id: impl Into<String>,
         authority: Arc<super::media_authority::MediaAuthorityProc>,
     ) -> Self {
+        let tracks = authority
+            .tracks
+            .iter()
+            .map(|t| MediaTrackInfo {
+                kind: t.kind.clone(),
+                mime: t.mime.clone(),
+                segment_count: t.segment_count,
+                init_bytes: t.init_bytes.clone(),
+            })
+            .collect();
         Self {
             viewer: viewer.into(),
             principal_id: principal_id.into(),
@@ -133,6 +163,9 @@ impl MediaSession {
             decrypt_request: Value::Null,
             sealed_material: Value::Null,
             authority: Some(authority),
+            tracks,
+            cover_uri: None,
+            title: String::new(),
         }
     }
 }
@@ -193,6 +226,113 @@ pub async fn viewer_media_manifest(
         Json(manifest),
     )
         .into_response()
+}
+
+/// GET /api/viewers/:viewer/media/:session/cover — the asset's PUBLIC cover art.
+///
+/// The cover is the degraded teaser pinned at mint as `metadata.image` and persisted in the
+/// `.ddrm` capsule's `thumbnail` (audio → synthetic waveform; or the creator's custom upload).
+/// The player shows it as the audio poster. This serves PUBLIC, key-free imagery fetched from
+/// IPFS by CID — it carries no plaintext content and no key material — so it is safe to surface
+/// over the same launch-token-authed seam as the rest of the media routes. 404 when none exists.
+pub async fn viewer_media_cover(
+    State(state): State<GatewayState>,
+    Path((viewer, session_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authorize_media_session(&state.data_dir, &headers, &viewer, &session_id) {
+        Ok(session) => session,
+        Err(resp) => return *resp,
+    };
+    let Some(cover_uri) = session
+        .cover_uri
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return media_error(StatusCode::NOT_FOUND, "this asset has no cover art");
+    };
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return media_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content provider unavailable",
+        );
+    };
+    match fetch_public_cover_bytes(registry, cover_uri).await {
+        Ok(bytes) => cover_image_response(bytes),
+        Err((code, message)) => media_error(code, message),
+    }
+}
+
+/// Resolve a PUBLIC `ipfs://<cid>` cover reference to image bytes via the ipfs provider. This is the
+/// ONE canonical cover-fetch path, shared by the media-session cover route and the Library cover
+/// route (so cover handling never forks). It serves only key-free, public imagery addressed by CID
+/// and fails closed on anything unexpected.
+pub(crate) async fn fetch_public_cover_bytes(
+    registry: &ProviderRegistry,
+    cover_uri: &str,
+) -> Result<Vec<u8>, (StatusCode, &'static str)> {
+    // Only pinned IPFS art is served: accept `ipfs://<cid>` (or a bare cid), reject anything with
+    // a path/scheme we don't expect rather than fetch an arbitrary reference.
+    let cid = cover_uri
+        .trim()
+        .strip_prefix("ipfs://")
+        .unwrap_or_else(|| cover_uri.trim());
+    if cid.is_empty() || cid.contains('/') || cid.contains(':') {
+        return Err((StatusCode::NOT_FOUND, "this asset has no cover art"));
+    }
+    let resp = registry
+        .send_raw("ipfs", &json!({ "op": "cat", "cid": cid }))
+        .await;
+    match resp {
+        Ok(v) if v.get("status").and_then(Value::as_str) != Some("error") => {
+            // The ipfs provider wraps the payload as `{status:ok, data:{data:<base64>}}`, so the
+            // bytes live at `data.data` (same nesting every other byte-reading caller uses).
+            match v
+                .get("data")
+                .and_then(|data| data.get("data"))
+                .and_then(Value::as_str)
+            {
+                Some(b64) => base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|_| (StatusCode::BAD_GATEWAY, "cover art was not decodable")),
+                None => Err((StatusCode::BAD_GATEWAY, "cover art unavailable")),
+            }
+        }
+        _ => Err((StatusCode::BAD_GATEWAY, "cover art unavailable")),
+    }
+}
+
+/// Wrap decoded cover bytes in the standard image response (sniffed content-type + cacheable since
+/// the art is immutable by CID). Shared by both cover routes.
+pub(crate) fn cover_image_response(bytes: Vec<u8>) -> Response {
+    let content_type = sniff_image_mime(&bytes);
+    (
+        StatusCode::OK,
+        [
+            ("content-type", content_type),
+            // Immutable by CID; safe to cache (still launch-token-scoped to the owner).
+            ("cache-control", "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Best-effort image content-type sniff from magic bytes (cover art is JPEG/PNG/WebP/GIF). Falls
+/// back to a generic type so the browser still attempts to render it.
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        "image/jpeg"
+    } else if bytes.len() >= 8 && bytes[0..8] == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']
+    {
+        "image/png"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.len() >= 6 && (&bytes[0..6] == b"GIF87a" || &bytes[0..6] == b"GIF89a") {
+        "image/gif"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 /// GET /api/viewers/:viewer/media/:session/init — clear init segment bytes.
@@ -270,16 +410,123 @@ pub async fn viewer_media_segment(
     }
 }
 
-/// Compose the browser-facing play manifest — metadata ONLY, never key material.
+/// GET /api/viewers/:viewer/media/:session/track/:track/init — clear init for one track.
+pub async fn viewer_media_track_init(
+    State(state): State<GatewayState>,
+    Path((viewer, session_id, track)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authorize_media_session(&state.data_dir, &headers, &viewer, &session_id) {
+        Ok(session) => session,
+        Err(resp) => return *resp,
+    };
+    let track: usize = match track.parse() {
+        Ok(t) => t,
+        Err(_) => {
+            return media_error(StatusCode::BAD_REQUEST, "track index must be an integer");
+        }
+    };
+    let Some(info) = session.tracks.get(track) else {
+        return media_error(StatusCode::NOT_FOUND, "no such track");
+    };
+    if info.init_bytes.is_empty() {
+        return media_error(StatusCode::NOT_FOUND, "this track has no init segment");
+    }
+    octet_stream(info.init_bytes.clone())
+}
+
+/// GET /api/viewers/:viewer/media/:session/track/:track/segment/:index — decrypted bytes for
+/// one track's segment. The gateway relays `(track, index)` to the local key-authority, which
+/// maps the track-local index to the global flat CENC position and decrypts in its own boundary.
+pub async fn viewer_media_track_segment(
+    State(state): State<GatewayState>,
+    Path((viewer, session_id, track, index)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match authorize_media_session(&state.data_dir, &headers, &viewer, &session_id) {
+        Ok(session) => session,
+        Err(resp) => return *resp,
+    };
+    let (track, index): (usize, usize) = match (track.parse(), index.parse()) {
+        (Ok(t), Ok(i)) => (t, i),
+        _ => {
+            return media_error(
+                StatusCode::BAD_REQUEST,
+                "track and segment index must be non-negative integers",
+            )
+        }
+    };
+    if crate::auth::now_ts() > session.expires_at {
+        return media_error(StatusCode::FORBIDDEN, "this media session has expired");
+    }
+    let Some(info) = session.tracks.get(track) else {
+        return media_error(StatusCode::NOT_FOUND, "no such track");
+    };
+    if index >= info.segment_count {
+        return media_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "segment index is past the end of the track",
+        );
+    }
+    // Per-track playback only exists on the gateway-spawned local key-authority path.
+    let Some(authority) = session.authority.clone() else {
+        return media_error(
+            StatusCode::BAD_GATEWAY,
+            "this session does not support per-track streaming",
+        );
+    };
+    let decrypted =
+        tokio::task::spawn_blocking(move || authority.segment_track(track, index)).await;
+    match decrypted {
+        Ok(Ok(bytes)) => octet_stream(bytes),
+        Ok(Err(err)) => {
+            tracing::warn!(track, index, "media track segment fail-closed: {err}");
+            media_error(
+                StatusCode::BAD_GATEWAY,
+                "the decrypt provider could not serve this segment",
+            )
+        }
+        Err(_) => media_error(
+            StatusCode::BAD_GATEWAY,
+            "the decrypt provider could not serve this segment",
+        ),
+    }
+}
+
+/// Compose the browser-facing play manifest — metadata ONLY, never key material. Carries the
+/// legacy single-track fields (for the muxed/local path + back-compat) AND, when the session is
+/// multi-track, a `tracks[]` array the player uses to attach one MSE `SourceBuffer` per track.
 fn media_manifest_value(session: &MediaSession) -> Value {
-    json!({
+    let mut manifest = json!({
         "schema": MEDIA_MANIFEST_SCHEMA,
         "mime": session.mime,
         "segment_count": session.segment_count,
         "has_init": session.has_init,
         "is_protected": session.is_protected,
         "expires_at": session.expires_at,
-    })
+        // True when public cover art is available at `/cover` (no URL/key material is leaked here).
+        "has_cover": session.cover_uri.as_deref().is_some_and(|s| !s.trim().is_empty()),
+        // Public asset title — lets the player label a generated placeholder with the asset name.
+        "title": session.title,
+    });
+    if !session.tracks.is_empty() {
+        let tracks: Vec<Value> = session
+            .tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                json!({
+                    "index": i,
+                    "kind": t.kind,
+                    "mime": t.mime,
+                    "segment_count": t.segment_count,
+                    "has_init": !t.init_bytes.is_empty(),
+                })
+            })
+            .collect();
+        manifest["tracks"] = json!(tracks);
+    }
+    manifest
 }
 
 /// Enforce the per-segment read guard: in-range index AND a live (un-expired) grant.
@@ -460,7 +707,45 @@ mod tests {
             decrypt_request: json!({ "session_id": "s1", "output_kind": "stream" }),
             sealed_material: json!({ "suite": "elastos-pq-hybrid-threshold-v0" }),
             authority: None,
+            tracks: Vec::new(),
+            cover_uri: None,
+            title: "Test asset".to_string(),
         }
+    }
+
+    #[test]
+    fn multi_track_manifest_lists_each_track_and_stays_key_free() {
+        let mut s = session(5, 9_000_000_000);
+        s.tracks = vec![
+            MediaTrackInfo {
+                kind: "video".to_string(),
+                mime: "video/mp4; codecs=\"avc1.640028\"".to_string(),
+                segment_count: 3,
+                init_bytes: vec![0xAA],
+            },
+            MediaTrackInfo {
+                kind: "audio".to_string(),
+                mime: "audio/mp4; codecs=\"mp4a.40.2\"".to_string(),
+                segment_count: 2,
+                init_bytes: vec![],
+            },
+        ];
+        let manifest = media_manifest_value(&s);
+        let tracks = manifest["tracks"].as_array().expect("tracks array");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0]["index"], json!(0));
+        assert_eq!(tracks[0]["kind"], json!("video"));
+        assert_eq!(tracks[0]["segment_count"], json!(3));
+        assert_eq!(tracks[0]["has_init"], json!(true));
+        assert_eq!(tracks[1]["kind"], json!("audio"));
+        assert_eq!(tracks[1]["has_init"], json!(false));
+        // The manifest advertises has_init but never carries the init bytes themselves.
+        assert!(tracks[0].get("init_bytes").is_none());
+        assert!(tracks[0].get("init_b64").is_none());
+        assert!(
+            assert_no_key_material(&manifest).is_ok(),
+            "multi-track manifest must be key-free"
+        );
     }
 
     #[test]

@@ -1184,6 +1184,7 @@ impl DecryptProvider {
             // The object plaintext (`object`) is dropped after this call; only the parsed handle
             // (which owns its own copy) stays warm. Render the requested page from the warm doc.
             let session = cache.as_mut().expect("warm session just established");
+            let content_type = session.page_content_type();
             match session.page(page, directive.max_width, directive.watermark.as_deref()) {
                 Ok(image) => Response::ok(json!({
                     "schema": "elastos.decrypt.render-page/v1",
@@ -1194,7 +1195,7 @@ impl DecryptProvider {
                     "segment_index": index,
                     "page_index": page,
                     "total_pages": session.total_pages,
-                    "content_type": "image/jpeg",
+                    "content_type": content_type,
                     "rendered_b64": b64.encode(image),
                 })),
                 // Fail closed: a render miss returns the reason only, never the plaintext.
@@ -1228,6 +1229,7 @@ impl DecryptProvider {
                     )
                 }
             };
+            let content_type = session.page_content_type();
             match session.page(page, max_width, watermark) {
                 Ok(image) => Response::ok(json!({
                     "schema": "elastos.decrypt.render-page/v1",
@@ -1235,7 +1237,7 @@ impl DecryptProvider {
                     "output_kind": "stream",
                     "page_index": page,
                     "total_pages": session.total_pages,
-                    "content_type": "image/jpeg",
+                    "content_type": content_type,
                     "rendered_b64": b64.encode(image),
                 })),
                 Err(e) => Response::error("invalid_request", e),

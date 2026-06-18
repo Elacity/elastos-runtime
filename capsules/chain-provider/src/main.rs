@@ -52,6 +52,44 @@ const DEFAULT_CHANNEL_FROM_BLOCK: u64 = 43_892_000;
 /// asset's operative contract for the trade-enabling approval.
 const ASSET_CREATED_TOPIC0: &str =
     "0xc0a995e4052be044599af577ab2f3382d67bd34df95a76226e7c464e9d4dba46";
+
+/// From a transaction receipt's `logs` array, return the NEWEST (by `logIndex`) `AssetCreated`
+/// `(operative, token_id_hex)` whose topics match `(creator_topic, channel_topic)`. The receipt's
+/// logs are that ONE transaction's own, so unlike the `eth_getLogs` scan (which pre-filters in the
+/// query) we topic-match each log here. Pure (no RPC) so it is unit-testable; `None` if no matching
+/// `AssetCreated` is present.
+fn newest_asset_created_in_logs(
+    logs: &[Value],
+    creator_topic: &str,
+    channel_topic: &str,
+) -> Option<(String, String)> {
+    let mut best: Option<(String, String, u64)> = None;
+    for log in logs {
+        let Some(topics) = log.get("topics").and_then(Value::as_array) else {
+            continue;
+        };
+        let t0 = topics.first().and_then(Value::as_str).unwrap_or_default();
+        let t1 = topics.get(1).and_then(Value::as_str).unwrap_or_default();
+        let t2 = topics.get(2).and_then(Value::as_str).unwrap_or_default();
+        if !t0.eq_ignore_ascii_case(ASSET_CREATED_TOPIC0)
+            || !t1.eq_ignore_ascii_case(creator_topic)
+            || !t2.eq_ignore_ascii_case(channel_topic)
+        {
+            continue;
+        }
+        let Some((operative, token_id, _block, log_index)) = decode_asset_created_log(log) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(_, _, l)| log_index > *l)
+            .unwrap_or(true)
+        {
+            best = Some((operative, token_id, log_index));
+        }
+    }
+    best.map(|(operative, token_id, _)| (operative, token_id))
+}
 /// `authority()` selector — reads the channel's gateway (the operative authority). Pinned.
 const AUTHORITY_SELECTOR: &str = "0xbf7e214f";
 /// `isApprovedForAll(address,address)` selector — reads whether the gateway is already an
@@ -227,7 +265,14 @@ impl ChainProvider {
                 channel,
                 creator,
                 content_id,
-            } => self.assemble_trade_approval(&network, &channel, &creator, content_id.as_deref()),
+                tx_hash,
+            } => self.assemble_trade_approval(
+                &network,
+                &channel,
+                &creator,
+                content_id.as_deref(),
+                tx_hash.as_deref(),
+            ),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -1476,6 +1521,7 @@ impl ChainProvider {
         channel: &str,
         creator: &str,
         content_id: Option<&str>,
+        tx_hash: Option<&str>,
     ) -> Response {
         let network = match self.evm_network(network_id) {
             Ok(network) => network.clone(),
@@ -1507,6 +1553,27 @@ impl ChainProvider {
                 },
                 None => None,
             };
+        // FAST PATH (PC2 `tx.wait()` parity): if the caller knows the broadcast mint tx hash, the
+        // asset's `AssetCreated` event is in THAT transaction's own receipt — resolve the operative
+        // in one `eth_getTransactionReceipt` instead of a wide `eth_getLogs` scan (which public RPCs
+        // rate-limit/range-cap, the cause of Step 2 never unlocking). A pending/mismatched receipt
+        // falls through to the scan below, so nothing regresses when the hash is absent/not-yet-mined.
+        if let Some(hash) = tx_hash.map(str::trim).filter(|h| !h.is_empty()) {
+            match self.resolve_mint_from_receipt(
+                &network,
+                hash,
+                &creator_topic,
+                &channel_topic,
+                want_content_id.as_deref(),
+            ) {
+                Ok(Some((operative, token_id))) => {
+                    return self
+                        .finish_trade_approval(&network, channel, creator, operative, token_id)
+                }
+                Ok(None) => { /* receipt pending / no match → fall back to the scan */ }
+                Err(response) => return response,
+            }
+        }
         let latest = match self.evm_latest_block(&network) {
             Ok(latest) => latest,
             Err(response) => return response,
@@ -1561,15 +1628,29 @@ impl ChainProvider {
                 return Response::error("mint_not_confirmed", detail);
             }
         };
+        self.finish_trade_approval(&network, channel, creator, operative, token_id)
+    }
 
+    /// Given the resolved `(operative, token_id)` for a confirmed mint, read the channel authority,
+    /// short-circuit if the gateway is already approved, and otherwise assemble the unsigned
+    /// `setApprovalForAll(gateway, true)` calldata. Shared by the receipt fast-path and the
+    /// log-scan path so both return the identical assembly shape.
+    fn finish_trade_approval(
+        &self,
+        network: &ChainNetwork,
+        channel: &str,
+        creator: &str,
+        operative: String,
+        token_id: String,
+    ) -> Response {
         // The channel's `authority()` is the gateway that needs operator rights; fall back to
         // the configured default if the read misses (PC2 does the same — app.js:1674).
         let gateway = self
-            .read_authority(&network, channel)
+            .read_authority(network, channel)
             .unwrap_or_else(|| DEFAULT_AUTHORITY_GATEWAY.to_string());
 
         // Idempotent: already approved => no second signature needed.
-        match self.read_is_approved_for_all(&network, &operative, creator, &gateway) {
+        match self.read_is_approved_for_all(network, &operative, creator, &gateway) {
             Ok(true) => {
                 return Response::ok(json!({
                     "schema": "elastos.chain.trade_approval_assembly/v1",
@@ -1605,6 +1686,65 @@ impl ChainProvider {
             "signed": false,
             "next_required_providers": ["wallet-provider", "chain-provider"],
         }))
+    }
+
+    /// FAST PATH resolver: read the mint's `(operative, token_id)` straight from its TRANSACTION
+    /// RECEIPT (`eth_getTransactionReceipt`) instead of scanning `eth_getLogs` windows. The mint's
+    /// `AssetCreated` event is in this tx's OWN receipt logs, so one cheap call confirms it — which
+    /// also works on rate-limited public RPCs where wide scans fail. Returns:
+    ///   `Ok(Some((operative, token_id)))` — receipt mined + succeeded + a matching `AssetCreated`,
+    ///   `Ok(None)`                        — receipt not available yet (pending) OR no matching log
+    ///                                       (caller falls back to the scan),
+    ///   `Err(Response)`                   — RPC error, or the mint transaction REVERTED.
+    fn resolve_mint_from_receipt(
+        &self,
+        network: &ChainNetwork,
+        tx_hash: &str,
+        creator_topic: &str,
+        channel_topic: &str,
+        want_content_id: Option<&str>,
+    ) -> Result<Option<(String, String)>, Response> {
+        // A malformed hash is not fatal — just decline the fast path so the scan still runs.
+        if validate_evm_hash(tx_hash).is_err() {
+            return Ok(None);
+        }
+        let receipt = self.evm_rpc(network, "eth_getTransactionReceipt", json!([tx_hash]))?;
+        // `null` receipt ⇒ the tx is not mined yet (still pending) — not confirmed, not an error.
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        // A reverted mint has `status == 0x0`: the asset was NOT created — fail closed.
+        if let Some(status) = receipt.get("status").and_then(Value::as_str) {
+            if parse_hex_u64(status.trim()).unwrap_or(1) == 0 {
+                return Err(Response::error(
+                    "mint_reverted",
+                    "the mint transaction reverted on-chain",
+                ));
+            }
+        }
+        let Some(logs) = receipt.get("logs").and_then(Value::as_array) else {
+            return Ok(None);
+        };
+        let Some((operative, token_id)) =
+            newest_asset_created_in_logs(logs, creator_topic, channel_topic)
+        else {
+            return Ok(None);
+        };
+        // Optional content-id binding (defense in depth): the receipt is already the owner's own
+        // mint, but if a KID is pinned, confirm the tx calldata embeds it before trusting the hash.
+        if let Some(want) = want_content_id {
+            if let Some(input) = self.tx_input(network, tx_hash)? {
+                let bound = decode_mint_content_id(&input)
+                    .and_then(|c| normalize_content_id_bytes16(&c))
+                    .as_deref()
+                    == Some(want)
+                    || mint_input_binds_content_id(&input, want);
+                if !bound {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some((operative, token_id)))
     }
 
     /// Scan `[from, to]` for `AssetCreated` logs matching `(to == creator, channel)` and return
@@ -1709,10 +1849,14 @@ impl ChainProvider {
             let Some(input) = self.tx_input(network, &tx_hash)? else {
                 continue;
             };
-            let Some(cid) = decode_mint_content_id(&input) else {
-                continue;
-            };
-            if normalize_content_id_bytes16(&cid).as_deref() == Some(want_content_id) {
+            // Precise decode for the canonical runtime mint; fall back to a content-bound
+            // substring match for RELAYED/forwarded mints whose OUTER ABI differs (the KID is
+            // still embedded in the calldata, just not at the canonical opRawData head offset).
+            let precise = decode_mint_content_id(&input)
+                .and_then(|cid| normalize_content_id_bytes16(&cid))
+                .as_deref()
+                == Some(want_content_id);
+            if precise || mint_input_binds_content_id(&input, want_content_id) {
                 return Ok(Some((operative, token_id)));
             }
         }

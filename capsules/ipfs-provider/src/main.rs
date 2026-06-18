@@ -228,7 +228,7 @@ impl IpfsProvider {
     fn fetch_bytes(&mut self, arg: &str) -> Result<Vec<u8>, String> {
         let mut failures = Vec::new();
 
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             match self.kubo_cat_bytes(arg, LARGE_HTTP_TIMEOUT) {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => failures.push(err),
@@ -301,7 +301,7 @@ impl IpfsProvider {
 
         // Check coord file for running Kubo instance
         if let Some(coord) = read_coord_file(&self.data_dir) {
-            if is_pid_alive(coord.kubo_pid) {
+            if is_kubo_usable(coord.kubo_pid, coord.api_port) {
                 eprintln!(
                     "ipfs-provider: reusing existing Kubo (pid={}, api={})",
                     coord.kubo_pid, coord.api_port
@@ -312,8 +312,8 @@ impl IpfsProvider {
                 update_coord_last_used(&self.data_dir);
             } else {
                 eprintln!(
-                    "ipfs-provider: stale coord file (pid {} dead), removing",
-                    coord.kubo_pid
+                    "ipfs-provider: stale coord file (pid {} dead/unresponsive on api={}), removing",
+                    coord.kubo_pid, coord.api_port
                 );
                 remove_coord_file(&self.data_dir);
             }
@@ -331,14 +331,14 @@ impl IpfsProvider {
         if self.state == KuboState::Ready {
             // Verify still alive
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_pid_alive(coord.kubo_pid) {
+                if is_kubo_usable(coord.kubo_pid, coord.api_port) {
                     update_coord_last_used(&self.data_dir);
                     return Ok(());
                 }
-                // PID died — remove stale coord and re-start
+                // PID gone OR zombie/unresponsive on its port — evict stale coord and re-start.
                 eprintln!(
-                    "ipfs-provider: Kubo pid {} died, restarting",
-                    coord.kubo_pid
+                    "ipfs-provider: Kubo pid {} dead/unresponsive on api={}, restarting",
+                    coord.kubo_pid, coord.api_port
                 );
                 remove_coord_file(&self.data_dir);
             }
@@ -374,7 +374,7 @@ impl IpfsProvider {
         if try_flock_exclusive(&lockfile) {
             // We got the lock — check coord file again (another process may have finished)
             if let Some(coord) = read_coord_file(&self.data_dir) {
-                if is_pid_alive(coord.kubo_pid) {
+                if is_kubo_usable(coord.kubo_pid, coord.api_port) {
                     self.api_port = coord.api_port;
                     self.gateway_port = coord.gateway_port;
                     self.state = KuboState::Ready;
@@ -394,7 +394,7 @@ impl IpfsProvider {
             loop {
                 std::thread::sleep(LOCKFILE_POLL_INTERVAL);
                 if let Some(coord) = read_coord_file(&self.data_dir) {
-                    if is_pid_alive(coord.kubo_pid) {
+                    if is_kubo_usable(coord.kubo_pid, coord.api_port) {
                         self.api_port = coord.api_port;
                         self.gateway_port = coord.gateway_port;
                         self.state = KuboState::Ready;
@@ -637,7 +637,7 @@ impl IpfsProvider {
 
     fn ls(&mut self, cid: &str) -> Response {
         // Try Kubo first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -691,14 +691,20 @@ impl IpfsProvider {
 
             let file_dest = dest_path.join(file_path);
 
-            // Validate resolved path stays within dest
+            // Validate resolved path stays within dest. The file does not exist yet, so we
+            // canonicalize its PARENT (created just below) and re-join the name. On macOS the
+            // temp root is a symlink (`/var` -> `/private/var`), so comparing a NON-canonical
+            // child path against a canonicalized dest would always look like an escape and
+            // silently skip EVERY file — leaving an empty dir that breaks the media open.
             if let Ok(canonical_dest) = fs::canonicalize(dest_path) {
                 if let Some(parent) = file_dest.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
                 let canonical_file = file_dest
-                    .canonicalize()
-                    .unwrap_or_else(|_| dest_path.join(file_path));
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .map(|p| p.join(file_dest.file_name().unwrap_or_default()))
+                    .unwrap_or_else(|| file_dest.clone());
                 if !canonical_file.starts_with(&canonical_dest) {
                     eprintln!("ipfs-provider: path escapes destination: {}", file_path);
                     continue;
@@ -707,7 +713,7 @@ impl IpfsProvider {
 
             let arg = format!("{}/{}", cid, file_path);
 
-            let bytes = if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+            let bytes = if self.ensure_kubo().is_ok() {
                 let url = format!("{}/api/v0/cat?arg={}", self.api_url(), arg);
                 match ureq::post(&url).timeout(LARGE_HTTP_TIMEOUT).call() {
                     Ok(resp) if resp.status() == 200 => {
@@ -747,6 +753,18 @@ impl IpfsProvider {
             return Response::error(
                 "download_failed",
                 &format!("All downloads failed: {}", errors.join("; ")),
+            );
+        }
+        // Fail closed if the directory listed files but NONE were written (e.g. every file
+        // rejected by the path-safety guard) — otherwise the caller proceeds with an empty
+        // directory and fails later with a confusing downstream error.
+        if downloaded.is_empty() && !files.is_empty() {
+            return Response::error(
+                "download_failed",
+                &format!(
+                    "directory {cid} listed {} file(s) but none were downloaded",
+                    files.len()
+                ),
             );
         }
 
@@ -1019,7 +1037,7 @@ impl IpfsProvider {
 
     fn list_dir_files(&mut self, cid: &str) -> Result<Vec<String>, String> {
         // Try Kubo API first
-        if self.state == KuboState::Ready || self.ensure_kubo().is_ok() {
+        if self.ensure_kubo().is_ok() {
             let url = format!("{}/api/v0/ls?arg={}", self.api_url(), cid);
             if let Ok(resp) = ureq::post(&url).timeout(HTTP_TIMEOUT).call() {
                 if resp.status() == 200 {
@@ -1149,6 +1167,28 @@ fn update_coord_last_used(data_dir: &Path) {
 
 // ── Process helpers ─────────────────────────────────────────────────
 
+/// True only when the coord's Kubo is genuinely usable: the PID exists AND its API port
+/// accepts a connection.
+///
+/// PID existence alone is a trap. A crashed Kubo lingers as a `<defunct>` zombie until its
+/// parent reaps it, and `kill(pid, 0)` reports a zombie (or a wedged-but-unresponsive daemon)
+/// as still-alive. Reusing such a coord makes every fetch loop on connection-refused against a
+/// dead port — surfacing to the viewer as "502 could not fetch media directory from IPFS" with
+/// no self-recovery. Probing the port turns that into a clean stale-coord eviction + respawn.
+fn is_kubo_usable(pid: u32, api_port: u16) -> bool {
+    is_pid_alive(pid) && is_port_listening(api_port)
+}
+
+/// Cheap liveness probe: can we open a TCP connection to `127.0.0.1:port`? A refused connection
+/// means the daemon that owned the port is gone, regardless of any lingering PID.
+fn is_port_listening(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok()
+}
+
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -1202,9 +1242,14 @@ fn validate_dest_path(dest: &Path) -> Result<(), String> {
         dest.to_path_buf()
     };
 
-    // Allowed prefixes
+    // Allowed prefixes. Canonicalize the roots too: `resolved` above is canonicalized, and on
+    // macOS the temp root is a symlink (`/var` → `/private/var`), so an un-canonicalized root
+    // would never `starts_with`-match a canonicalized dest. Fall back to the raw path if a root
+    // does not exist yet.
     let data_dir = data_dir();
     let tmp_dir = std::env::temp_dir();
+    let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+    let tmp_dir = tmp_dir.canonicalize().unwrap_or(tmp_dir);
 
     if !resolved.starts_with(&data_dir) && !resolved.starts_with(&tmp_dir) {
         return Err(format!(

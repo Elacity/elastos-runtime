@@ -155,6 +155,44 @@ impl Drop for PlaintextTemp {
     }
 }
 
+/// A 0700 temp DIRECTORY that is removed (recursively) on drop — the staging area into which the
+/// gateway fetches a media asset's DASH directory (clear inits + ENCRYPTED segments + manifest)
+/// before handing its path to the quorum-media helper. The helper reads the whole set into its
+/// recovery material at launch, so the directory is deleted as soon as `launch_quorum` returns.
+struct PlaintextTempDir {
+    path: PathBuf,
+}
+
+impl PlaintextTempDir {
+    fn create(tag: &str) -> Result<Self, String> {
+        use rand::RngCore;
+        let mut rnd = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut rnd);
+        let name = format!(
+            "elastos-{tag}-{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rnd)
+        );
+        let path = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&path).map_err(|e| format!("temp dir create: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path })
+    }
+
+    fn path_str(&self) -> String {
+        self.path.to_string_lossy().to_string()
+    }
+}
+
+impl Drop for PlaintextTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// POST /api/viewers/open — open an owned Library object in the right protected viewer.
 pub async fn open_owned_in_viewer(
     State(state): State<GatewayState>,
@@ -921,9 +959,22 @@ fn dkms_capsule(bytes: &[u8]) -> Option<serde_json::Value> {
     if v.get("schema").and_then(|s| s.as_str()) != Some("elastos.ddrm.capsule/v1") {
         return None;
     }
-    v.get("ciphertext_b64")
+    // The recoverable payload is EITHER an embedded single-sample ciphertext (object) OR a media
+    // DASH layout pointing at the published directory at `asset_cid` (media). One must be present
+    // or the asset is unrecoverable (and not a quorum-openable item).
+    let has_object_ciphertext = v
+        .get("ciphertext_b64")
         .and_then(|c| c.as_str())
-        .filter(|s| !s.is_empty())?;
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_media_layout = v.get("media").map(|m| !m.is_null()).unwrap_or(false)
+        && v.get("asset_cid")
+            .and_then(|c| c.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+    if !has_object_ciphertext && !has_media_layout {
+        return None;
+    }
     let prot = v
         .get("protections")
         .and_then(|p| p.as_array())
@@ -1012,45 +1063,105 @@ async fn open_quorum(
                 .into_response()
         }
     };
-    let object_cid_c = object_cid.clone();
-    let mime_c = mime.clone();
-    let grant_c = access_grant_b64.clone();
-    let t_recover = std::time::Instant::now();
-    let built = tokio::task::spawn_blocking(move || {
-        // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
-        // temp file, unlinked as soon as the helper has read it at launch.
-        let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
-        let capsule_file = temp.path_str();
-        ObjectAuthorityProc::launch_quorum(
-            &helper_bin,
-            &decrypt_bin,
-            &key_bin,
-            &principal_id,
-            &capsule_file,
-            &descriptor,
-            &caller_seed,
-            &object_cid_c,
-            &mime_c,
-            grant_c.as_deref(),
+
+    // MEDIA (DASH): the capsule carries a `media` layout and the mime is audio/video. Recover the
+    // CEK 2-of-3 and stream CENC-decrypted fMP4 fragments to the MSE player (the PC2 two-viewer
+    // split: media routes to `elacity-player`, never the object viewer). Objects fall through.
+    if is_media_mime(&mime) && capsule.get("media").map(|m| !m.is_null()).unwrap_or(false) {
+        return open_quorum_media(
+            state,
+            context,
+            capsule,
+            capsule_bytes,
+            object_cid,
+            mime,
+            helper_bin,
+            decrypt_bin,
+            key_bin,
+            descriptor,
+            caller_seed,
+            session_id,
+            rights_binding,
+            access_grant_b64,
         )
-    })
-    .await;
-    let proc = match built {
-        Ok(Ok(proc)) => Arc::new(proc),
-        Ok(Err(err)) => {
-            tracing::warn!("dKMS quorum open failed: {err}");
+        .await;
+    }
+
+    let t_recover = std::time::Instant::now();
+    // The LIVE remote quorum (Carrier/geo nodes) intermittently drops a node mid-recover ("node
+    // closed its connection unexpectedly" → only 0/3 or 1/3 served → sub-quorum refused). That is
+    // transient transport flakiness, not a real denial: the next attempt usually meets 2-of-3.
+    // Retry a bounded number of times with a short backoff before surfacing a 502. EVERY attempt
+    // re-runs the SAME on-chain authorization + full 2-of-3 recover, so this only masks flaky
+    // transport — it never weakens the gate, never accepts a sub-quorum, and stays fail-closed.
+    const MAX_QUORUM_ATTEMPTS: usize = 3;
+    let mut launched = None;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_QUORUM_ATTEMPTS {
+        let helper_bin = helper_bin.clone();
+        let decrypt_bin = decrypt_bin.clone();
+        let key_bin = key_bin.clone();
+        let principal_id = principal_id.clone();
+        let descriptor = descriptor.clone();
+        let caller_seed = caller_seed.clone();
+        let object_cid_c = object_cid.clone();
+        let mime_c = mime.clone();
+        let grant_c = access_grant_b64.clone();
+        let capsule_bytes = capsule_bytes.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
+            // temp file, unlinked as soon as the helper has read it at launch.
+            let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
+            let capsule_file = temp.path_str();
+            ObjectAuthorityProc::launch_quorum(
+                &helper_bin,
+                &decrypt_bin,
+                &key_bin,
+                &principal_id,
+                &capsule_file,
+                &descriptor,
+                &caller_seed,
+                &object_cid_c,
+                &mime_c,
+                grant_c.as_deref(),
+            )
+        })
+        .await;
+        match built {
+            Ok(Ok(proc)) => {
+                launched = Some(Arc::new(proc));
+                break;
+            }
+            Ok(Err(err)) => {
+                last_err = err.to_string();
+                tracing::warn!(
+                    "dKMS quorum open attempt {attempt}/{MAX_QUORUM_ATTEMPTS} failed: {last_err}"
+                );
+                if attempt < MAX_QUORUM_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                        .await;
+                }
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "quorum open task panicked",
+                )
+                    .into_response()
+            }
+        }
+    }
+    let proc = match launched {
+        Some(proc) => proc,
+        None => {
+            tracing::warn!(
+                "dKMS quorum open failed after {MAX_QUORUM_ATTEMPTS} attempts: {last_err}"
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 "could not open owned asset from the dKMS quorum",
             )
                 .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "quorum open task panicked",
-            )
-                .into_response()
         }
     };
     // This single span covers helper spawn + key-provider/decrypt-provider spawn + the 2-of-3
@@ -1084,6 +1195,230 @@ async fn open_quorum(
         &session_id,
         &title,
         &view_url,
+        &rights_binding,
+    )
+}
+
+/// MEDIA dKMS consumer-open: fetch the published DASH directory by its asset CID, recover the
+/// CEK 2-of-3 from the quorum named by the `.ddrm` capsule, and stream CENC-decrypted fMP4
+/// fragments to `elacity-player` (MSE). The gateway never links the PQ crypto and never sees the
+/// CEK; the recovered plaintext fragments are served per-segment through a principal-bound
+/// `MediaSession`. This is the media half of PC2's two-viewer split (the object viewer is the
+/// other half) — the analogue of the local-test-KMS `open_media`, but recovering the REAL CEK.
+#[allow(clippy::too_many_arguments)]
+async fn open_quorum_media(
+    state: GatewayState,
+    context: HomeLaunchTokenContext,
+    capsule: serde_json::Value,
+    capsule_bytes: Vec<u8>,
+    object_cid: String,
+    mime: String,
+    helper_bin: String,
+    decrypt_bin: String,
+    key_bin: String,
+    descriptor: String,
+    caller_seed: String,
+    session_id: String,
+    rights_binding: String,
+    access_grant_b64: Option<String>,
+) -> Response {
+    let principal_id = context.principal_id.clone();
+    let title = capsule
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Protected media")
+        .to_string();
+
+    // The DASH directory CID (the asset CID): clear per-track inits + ENCRYPTED segments + MPD.
+    let asset_cid = match capsule
+        .get("asset_cid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(c) => c.to_string(),
+        None => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "media capsule missing asset_cid",
+            )
+                .into_response()
+        }
+    };
+
+    let registry = match state.provider_registry.as_ref() {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "content provider unavailable for media fetch",
+            )
+                .into_response()
+        }
+    };
+    let dash_dir = match PlaintextTempDir::create("ddrm-dash") {
+        Ok(d) => d,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not stage media dir: {err}"),
+            )
+                .into_response()
+        }
+    };
+    let dash_dir_path = dash_dir.path_str();
+
+    // Fetch the whole DASH directory by CID into the 0700 temp dir (the helper reads inits +
+    // encrypted segments from it at recovery; nothing decrypted is fetched here).
+    let t_fetch = std::time::Instant::now();
+    let dl = registry
+        .send_raw(
+            "ipfs",
+            &json!({ "op": "download_directory", "cid": asset_cid, "dest": dash_dir_path }),
+        )
+        .await;
+    match dl {
+        Ok(resp) if resp.get("status").and_then(serde_json::Value::as_str) != Some("error") => {}
+        Ok(resp) => {
+            tracing::warn!("quorum media open: DASH fetch failed: {resp}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "could not fetch media directory from IPFS",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::warn!("quorum media open: DASH fetch error: {err}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                "could not fetch media directory from IPFS",
+            )
+                .into_response();
+        }
+    }
+    tracing::info!(
+        "open timing: DASH directory fetch {} ms",
+        t_fetch.elapsed().as_millis()
+    );
+
+    let t_recover = std::time::Instant::now();
+    // Same transient-quorum resilience as the object open: the LIVE remote nodes occasionally drop
+    // a connection mid-recover, refusing the (real) sub-quorum. Retry a bounded number of times
+    // before a 502. Every attempt re-runs the SAME on-chain authorization + full 2-of-3 recover, so
+    // this only masks flaky Carrier transport — it never weakens the gate or accepts a sub-quorum.
+    const MAX_QUORUM_ATTEMPTS: usize = 3;
+    let mut launched = None;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_QUORUM_ATTEMPTS {
+        let helper_bin = helper_bin.clone();
+        let decrypt_bin = decrypt_bin.clone();
+        let key_bin = key_bin.clone();
+        let principal_id = principal_id.clone();
+        let descriptor = descriptor.clone();
+        let caller_seed = caller_seed.clone();
+        let object_cid_c = object_cid.clone();
+        let mime_c = mime.clone();
+        let grant_c = access_grant_b64.clone();
+        let dash_dir_c = dash_dir_path.clone();
+        let capsule_bytes = capsule_bytes.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            // The capsule (escrow + identities, never plaintext) goes to the helper as a 0600 temp
+            // file; the helper reads it + the DASH dir at launch, recovers the CEK, and warms the
+            // boundary. `temp` is unlinked when this closure returns.
+            let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
+            let capsule_file = temp.path_str();
+            MediaAuthorityProc::launch_quorum(
+                &helper_bin,
+                &decrypt_bin,
+                &key_bin,
+                &principal_id,
+                &capsule_file,
+                &descriptor,
+                &caller_seed,
+                &dash_dir_c,
+                &object_cid_c,
+                &mime_c,
+                grant_c.as_deref(),
+            )
+        })
+        .await;
+        match built {
+            Ok(Ok(proc)) => {
+                launched = Some(Arc::new(proc));
+                break;
+            }
+            Ok(Err(err)) => {
+                last_err = err.to_string();
+                tracing::warn!(
+                    "dKMS quorum media open attempt {attempt}/{MAX_QUORUM_ATTEMPTS} failed: {last_err}"
+                );
+                if attempt < MAX_QUORUM_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64))
+                        .await;
+                }
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "quorum media open task panicked",
+                )
+                    .into_response()
+            }
+        }
+    }
+    let proc = match launched {
+        Some(proc) => proc,
+        None => {
+            tracing::warn!(
+                "dKMS quorum media open failed after {MAX_QUORUM_ATTEMPTS} attempts: {last_err}"
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                "could not open owned media from the dKMS quorum",
+            )
+                .into_response();
+        }
+    };
+    tracing::info!(
+        "open timing: quorum media recover (2-of-3 + CENC over the segment set) {} ms",
+        t_recover.elapsed().as_millis()
+    );
+    // The helper read the whole DASH set into its recovery material at launch; drop the staging
+    // directory now (removes the encrypted segments from disk for the rest of the session).
+    drop(dash_dir);
+
+    let mut session =
+        MediaSession::from_authority(MEDIA_VIEWER_CAPSULE, context.principal_id.clone(), proc);
+    // Surface the asset's PUBLIC cover art (the teaser pinned at mint, persisted in the capsule as
+    // `thumbnail`) so the player can show it as the audio poster. Key-free, public imagery only.
+    session.cover_uri = capsule
+        .get("thumbnail")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Public asset title — lets the player label a generated cover placeholder with the asset name.
+    session.title = title.clone();
+    put_media_session(session_id.clone(), session);
+
+    let token =
+        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context)
+        {
+            Ok(token) => token,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not mint launch token: {err}"),
+                )
+                    .into_response()
+            }
+        };
+    let play_url = format!("{}&home_token={}", media_play_route(&session_id), token);
+    open_ok(
+        MEDIA_VIEWER_CAPSULE,
+        &session_id,
+        &title,
+        &play_url,
         &rights_binding,
     )
 }

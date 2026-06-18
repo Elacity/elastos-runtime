@@ -48,6 +48,11 @@ pub struct QuorumArgs {
     pub object_cid: String,
     pub mime: String,
     pub ttl_secs: u64,
+    /// MEDIA only: the local path of the DASH directory the gateway pre-fetched from `asset_cid`
+    /// (contains the clear per-track inits + the ENCRYPTED segments + `stream.mpd`). When set and
+    /// the capsule carries a `media` layout, the open recovers the CEK 2-of-3 and serves the
+    /// CENC-decrypted fMP4 segments to the MSE player (instead of the single-blob object path).
+    pub dash_dir: Option<String>,
     /// OPTIONAL wallet-signed access grant (base64 of the AccessGrantV1 JSON). When present the
     /// dkms nodes authorize TRUSTLESSLY (verify the wallet/session signatures + read
     /// `hasAccessByContentId` themselves) instead of trusting the unsigned rights receipt. The
@@ -284,11 +289,9 @@ fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
         .and_then(Value::as_str)
         .ok_or("capsule missing kid")?
         .to_string();
-    let segment_b64 = capsule
-        .get("ciphertext_b64")
-        .and_then(Value::as_str)
-        .ok_or("capsule missing ciphertext_b64 — re-mint to persist the sealed segment")?
-        .to_string();
+    // The ciphertext the boundary will decrypt: a single embedded sample (object) OR the
+    // flattened, CENC-ordered DASH segment set fetched from the published directory (media).
+    let payload = compute_open_payload(&capsule, args)?;
     let node_set_id = B64
         .decode(&node_set_id_b64)
         .map_err(|e| format!("node_set_id_b64: {e}"))?;
@@ -468,7 +471,11 @@ fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
         nonce: &nonce,
         node_set_id: Some(&node_set_id),
     }
-    .to_aad();
+    // MEDIA: the WHOLE ordered, content-addressed segment set is welded into the transcript AAD
+    // (the decrypt boundary recomputes the identical digest from the segments in the material, so
+    // a substituted/reordered fragment fails the CEK unwrap closed before any byte is decrypted).
+    // OBJECT (no digests): byte-identical to the single-segment `to_aad()`.
+    .to_aad_with_segments(payload.segment_digests.as_deref());
 
     // --- key-provider (dkms): recover 2-of-3 from the live nodes + re-seal to the session. ---
     let mut session_ctx = json!({
@@ -478,13 +485,22 @@ fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
         "producer_vk2_b64": producer_vk_b64,
         "producer_vk3_b64": producer_vk_b64,
         "aad_b64": B64.encode(&aad),
-        "ciphertext_b64": segment_b64,
+        "ciphertext_b64": payload.ciphertext_b64,
         "content_hash_b64": B64.encode(&content_hash),
         "nonce_b64": B64.encode(&nonce),
         "wrapped_cek_share2_b64": share2,
         "wrapped_cek_share3_b64": share3,
         "now_unix": now,
     });
+    // MEDIA multi-segment: segments 1..N ride as `extra_segments_b64` and the clear init/moov as
+    // `init_segment_b64`. They never reach the dkms nodes (the key-provider strips content to the
+    // nodes); they are welded back into the material AFTER recovery and feed the in-VM decrypt.
+    if !payload.extra_segments_b64.is_empty() {
+        session_ctx["extra_segments_b64"] = json!(payload.extra_segments_b64);
+    }
+    if let Some(init_b64) = &payload.init_b64 {
+        session_ctx["init_segment_b64"] = json!(init_b64);
+    }
     // PRE-AUDIT #1: forward the published commitment so the key-provider welds it into the merged
     // material and the decrypt boundary fails closed if the reconstructed CEK does not match.
     if let Some(commit) = &cek_commitment_b64 {
@@ -519,7 +535,245 @@ fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
         decrypt_request,
         material,
         now,
+        media: payload.media,
     })
+}
+
+/// The decryptable payload for an open: a single embedded sample (object) or the flattened,
+/// CENC-ordered DASH segment set fetched from the published directory (media).
+struct OpenPayload {
+    /// Segment 0 (object: the only sample; media: the first fragment in seal order).
+    ciphertext_b64: String,
+    /// Segments 1..N in seal order (media only; empty for an object).
+    extra_segments_b64: Vec<String>,
+    /// The clear init/moov fragment (media only) — CENC encrypts media fragments, not the init.
+    init_b64: Option<String>,
+    /// The whole-set segment-digest binding for the transcript AAD (media only; `None` ⇒ object).
+    segment_digests: Option<Vec<u8>>,
+    /// Media presentation info for the streaming descriptor (`None` for objects).
+    media: Option<MediaInfo>,
+}
+
+/// One playable DASH track (AdaptationSet) for the MSE player: its clear init, the MSE
+/// `addSourceBuffer` mime/codecs string derived from that init, and the GLOBAL (flat,
+/// CENC-counter) indices of its segments in playback order. The player attaches one
+/// `SourceBuffer` per track (PC2's two-viewer model) and asks for `(track, local_index)`;
+/// the serve loop maps that to `global_indices[local_index]` to decrypt the right fragment.
+struct MediaTrack {
+    kind: String,
+    mime: String,
+    init: Vec<u8>,
+    global_indices: Vec<usize>,
+}
+
+/// What the media descriptor + segment-serve loop need: one or more tracks (a single track
+/// for audio / muxed video; two — video + audio — for split DASH). Per-track segment ranges are
+/// the source of truth; the flat sealed set is addressed via each track's `global_indices`.
+struct MediaInfo {
+    tracks: Vec<MediaTrack>,
+}
+
+/// Derive the MSE `addSourceBuffer` mime/codecs string from the clear DASH init segment.
+///
+/// The capsule records the ORIGINAL upload type (e.g. `audio/mpeg` for an MP3), but the streamed
+/// asset is transcoded fragmented MP4 (`audio/mp4` / `video/mp4` carrying AAC / AVC). Handing the
+/// original type to `MediaSource.addSourceBuffer` makes the browser create a buffer it then refuses
+/// to decode the fMP4 fragments into — the player "plays" silence at 0:00. Parse the init's `moov`
+/// for its tracks (PC2's `extractTrackInfo`) and emit the same container + codecs string the MPD
+/// advertises. Falls back to `fallback` only if the init has no parseable track, in which case the
+/// player surfaces an explicit unsupported-type error rather than silent playback.
+fn mse_mime_from_init(init: &[u8], fallback: &str) -> String {
+    use ddrm_media::mpd::TrackKind;
+    let Ok(meta) = ddrm_media::mp4::parse_fragment_metadata(init) else {
+        return fallback.to_string();
+    };
+    let codecs: Vec<String> = meta
+        .tracks
+        .iter()
+        .map(|t| t.codec.clone())
+        .filter(|c| c != "unknown")
+        .collect();
+    if codecs.is_empty() {
+        return fallback.to_string();
+    }
+    let container = if meta.tracks.iter().any(|t| t.kind == TrackKind::Video) {
+        "video/mp4"
+    } else {
+        "audio/mp4"
+    };
+    format!("{container}; codecs=\"{}\"", codecs.join(","))
+}
+
+/// Resolve the open payload from the `.ddrm` capsule (+ the pre-fetched DASH dir for media).
+fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayload, String> {
+    // MEDIA: the capsule carries a `media` layout and the gateway pre-fetched the DASH directory.
+    if let (Some(media), Some(dir)) = (
+        capsule.get("media").filter(|m| !m.is_null()),
+        args.dash_dir.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        let dir = std::path::Path::new(dir);
+        let init_path = media
+            .get("init_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let seg_paths = media
+            .get("segment_paths")
+            .and_then(Value::as_array)
+            .ok_or("capsule media layout missing segment_paths")?;
+        if seg_paths.is_empty() {
+            return Err("capsule media layout has no segments".to_string());
+        }
+        // Read each ENCRYPTED segment from the fetched directory in the sealed (flattened
+        // CENC-counter) order. The decrypt boundary recomputes the segment-digest AAD over
+        // exactly this ordered set, so the order MUST match the seal — hence the persisted list.
+        let mut segments: Vec<Vec<u8>> = Vec::with_capacity(seg_paths.len());
+        for p in seg_paths {
+            let rel = p.as_str().ok_or("segment_paths entry is not a string")?;
+            segments.push(read_dash_file(dir, rel)?);
+        }
+        let init_bytes = if init_path.is_empty() {
+            Vec::new()
+        } else {
+            read_dash_file(dir, init_path)?
+        };
+        // Weld the ordered segment set into the transcript AAD ONLY when there is more than one
+        // segment — this MUST match the decrypt boundary, which computes `segment_digests` iff
+        // `extra_segments` is non-empty (`decrypt-provider/src/main.rs`). For a single-segment
+        // asset both sides use `None` (the lone ciphertext is already bound); a mismatch here
+        // makes the CEK unwrap fail closed (`decrypt_failed`) before any byte is decrypted.
+        let segment_digests = if segments.len() > 1 {
+            let ordered: Vec<&[u8]> = segments.iter().map(|s| s.as_slice()).collect();
+            Some(ddrm_envelope::segment_digests(&ordered))
+        } else {
+            None
+        };
+        let ciphertext_b64 = B64.encode(&segments[0]);
+        let extra_segments_b64 = segments[1..].iter().map(|s| B64.encode(s)).collect();
+        // The seal binds the FIRST track's init (`creator.rs` `first_init_b64`); keep it for the
+        // decrypt material/AAD. Per-track inits for MSE are resolved separately in the track model.
+        let init_b64 = if init_bytes.is_empty() {
+            None
+        } else {
+            Some(B64.encode(&init_bytes))
+        };
+        let tracks = build_media_tracks(media, dir, seg_paths, &init_bytes, args)?;
+        return Ok(OpenPayload {
+            ciphertext_b64,
+            extra_segments_b64,
+            init_b64,
+            segment_digests,
+            media: Some(MediaInfo { tracks }),
+        });
+    }
+
+    // OBJECT: the single sealed sample is embedded in the capsule (no IPFS fetch at open).
+    let segment_b64 = capsule
+        .get("ciphertext_b64")
+        .and_then(Value::as_str)
+        .ok_or("capsule missing ciphertext_b64 — re-mint to persist the sealed segment")?
+        .to_string();
+    Ok(OpenPayload {
+        ciphertext_b64: segment_b64,
+        extra_segments_b64: Vec::new(),
+        init_b64: None,
+        segment_digests: None,
+        media: None,
+    })
+}
+
+/// Build the per-track MSE grouping from the capsule's `media.tracks[]` (the per-AdaptationSet
+/// layout minted alongside the flat seal order). Each track's segment paths are mapped to their
+/// GLOBAL (flat) CENC-counter index via `seg_paths` so the serve loop can decrypt `(track, i)` by
+/// the right global index. Falls back to a SINGLE track over the whole flat set (init = the first
+/// init) for older capsules minted before per-track layout existed, or for muxed single-track
+/// assets — so existing `.ddrm` keep opening unchanged.
+fn build_media_tracks(
+    media: &Value,
+    dir: &std::path::Path,
+    seg_paths: &[Value],
+    first_init: &[u8],
+    args: &QuorumArgs,
+) -> Result<Vec<MediaTrack>, String> {
+    // path -> global flat index (position in the sealed segment order).
+    let mut global_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, p) in seg_paths.iter().enumerate() {
+        if let Some(s) = p.as_str() {
+            global_of.entry(s).or_insert(i);
+        }
+    }
+    if let Some(track_arr) = media
+        .get("tracks")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+    {
+        let mut tracks = Vec::with_capacity(track_arr.len());
+        for t in track_arr {
+            let kind = t
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let init_path = t
+                .get("init_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let init = if init_path.is_empty() {
+                Vec::new()
+            } else {
+                read_dash_file(dir, init_path)?
+            };
+            let seg_list = t
+                .get("segment_paths")
+                .and_then(Value::as_array)
+                .ok_or("capsule track missing segment_paths")?;
+            let mut global_indices = Vec::with_capacity(seg_list.len());
+            for p in seg_list {
+                let rel = p
+                    .as_str()
+                    .ok_or("track segment_paths entry is not a string")?;
+                let idx = *global_of
+                    .get(rel)
+                    .ok_or_else(|| format!("track segment {rel:?} not in sealed segment set"))?;
+                global_indices.push(idx);
+            }
+            // Per-track container fallback (used only if the init has no parseable codec):
+            // a video AdaptationSet is `video/mp4`, audio is `audio/mp4`.
+            let fallback = match kind.as_str() {
+                "video" => "video/mp4",
+                "audio" => "audio/mp4",
+                _ => args.mime.as_str(),
+            };
+            tracks.push(MediaTrack {
+                mime: mse_mime_from_init(&init, fallback),
+                kind,
+                init,
+                global_indices,
+            });
+        }
+        return Ok(tracks);
+    }
+    // Back-compat: a single track spanning the whole flat set, with the first (only) init.
+    let kind = if args.mime.starts_with("video") {
+        "video"
+    } else {
+        "audio"
+    };
+    Ok(vec![MediaTrack {
+        kind: kind.to_string(),
+        mime: mse_mime_from_init(first_init, &args.mime),
+        init: first_init.to_vec(),
+        global_indices: (0..seg_paths.len()).collect(),
+    }])
+}
+
+/// Read a DASH directory file at relative `rel` under the pre-fetched `dir`, rejecting any
+/// path-escape. `rel` comes from the (owner-minted) capsule layout; the guard is defence-in-depth.
+fn read_dash_file(dir: &std::path::Path, rel: &str) -> Result<Vec<u8>, String> {
+    if rel.is_empty() || rel.split(['/', '\\']).any(|c| c == ".." || c.is_empty()) {
+        return Err(format!("rejecting unsafe DASH path: {rel:?}"));
+    }
+    let path = dir.join(rel);
+    std::fs::read(&path).map_err(|e| format!("read DASH file {}: {e}", path.display()))
 }
 
 /// A warm quorum open: the CEK is recovered + sealed into the live decrypt boundary. Drives
@@ -530,6 +784,9 @@ struct QuorumOpen {
     decrypt_request: Value,
     material: Value,
     now: u64,
+    /// MEDIA: the clear init + streamable segment count (set when the open recovered a DASH
+    /// segment set). `None` for the object / pixel-lock paths.
+    media: Option<MediaInfo>,
 }
 
 /// A rendered page returned from the decrypt boundary: the watermarked image plus the
@@ -562,6 +819,31 @@ impl QuorumOpen {
             .ok_or_else(|| format!("stream_segment returned no segment_b64: {rendered}"))?;
         let segment = B64.decode(segment_b64).map_err(|e| e.to_string())?;
         extract_mdat(&segment)
+    }
+
+    /// Decrypt DASH media segment `index` from the recovered set. Reconstructs the CEK in-VM and
+    /// returns the CENC-decrypted (senc-stripped) fMP4 fragment — the byte unit the MSE player
+    /// appends after the init. The whole ordered set is bound into the transcript AAD, so a
+    /// substituted/reordered fragment fails the unwrap closed before any byte is returned. Unlike
+    /// `decrypt_object` this does NOT extract `mdat`: the fragment IS the playable presentation unit.
+    fn decrypt_media_segment(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        let (request, material, now) = (
+            self.decrypt_request.clone(),
+            self.material.clone(),
+            self.now,
+        );
+        let resp = self.decrypt.call(&json!({
+            "op": "stream_segment",
+            "request": request,
+            "material": material,
+            "index": index,
+            "now_unix": now,
+        }))?;
+        let data = ok_data(&resp, "decrypt stream_segment (quorum media)")?;
+        let segment_b64 = data["segment_b64"]
+            .as_str()
+            .ok_or_else(|| format!("stream_segment returned no segment_b64: {resp}"))?;
+        B64.decode(segment_b64).map_err(|e| e.to_string())
     }
 
     /// FIRST page render: ships the sealed material ONCE so the boundary reconstructs the CEK,
@@ -628,15 +910,18 @@ impl QuorumOpen {
     }
 }
 
-/// Whether a mime is served as flattened, watermarked page images ("pixel-lock") rather than
+/// Whether a mime is served as a rendered representation ("pixel-lock"/"html-lock") rather than
 /// as its raw bytes. MUST mirror the decrypt boundary's `render::is_pixel_lock` (Principle 12):
 /// PDF (multi-page), CBZ comics (multi-page), text/code (multi-page), SVG (rasterised), raster
-/// images (single page). SVG is rasterised rather than shipped raw (it is scriptable XML).
+/// images (single page), and EPUB (sanitised chapter HTML — "html-lock"). SVG and EPUB are
+/// rendered rather than shipped raw because both are scriptable.
 fn is_pixel_lock(mime: &str) -> bool {
     let m = mime.trim().to_ascii_lowercase();
     m == "application/pdf"
         || m == "application/vnd.comicbook+zip"
         || m == "application/x-cbz"
+        || m == "application/epub+zip"
+        || m == "application/epub"
         || m.starts_with("text/")
         || matches!(
             m.as_str(),
@@ -667,6 +952,13 @@ fn watermark_for(principal: &str) -> String {
 /// decrypted bytes over the same stdio protocol the gateway's object viewer already drives.
 pub fn run_quorum(args: QuorumArgs) -> Result<(), String> {
     let mut open = recover_quorum(&args)?;
+
+    // MEDIA (audio/video): the CEK was recovered over the DASH segment set. Serve the
+    // CENC-decrypted fMP4 fragments to the MSE player (init + per-index segments) over the
+    // SAME descriptor/segment protocol the local media path uses, so the gateway relay is shared.
+    if open.media.is_some() {
+        return serve_media(&mut open, &args);
+    }
 
     // PIXEL-LOCK (e.g. PDF): the raw file NEVER leaves the decrypt boundary. We render page 0
     // in-VM to learn the page count + serve the first image, then answer `{"op":"page","n":I}`
@@ -716,6 +1008,117 @@ pub fn run_quorum(args: QuorumArgs) -> Result<(), String> {
                 &mut out,
                 &json!({ "status": "ok", "object_b64": B64.encode(&object) }),
             )?,
+            other => reply(
+                &mut out,
+                &json!({"status": "error", "message": format!("unknown op: {other:?}")}),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Serve a quorum-recovered DASH asset to the MSE player: publish a multi-track media descriptor
+/// (`tracks[]`, each with its own mime + clear init + per-track segment count) then answer
+/// `{"op":"segment","track":T,"index":I}` by CENC-decrypting that track's fragment in the warm
+/// decrypt boundary under the recovered CEK. A `(track, local_index)` is mapped to its GLOBAL
+/// (flat) CENC-counter position before decrypt, so the continuous-counter seal still verifies.
+/// Audio is the single-track degenerate case (`tracks.len() == 1`). The recovered CEK never
+/// leaves the decrypt VM.
+fn serve_media(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), String> {
+    // Snapshot the track model up front: the descriptor tracks (key-free) and each track's global
+    // flat indices. Snapshotting lets the segment loop take `&mut open` without holding a borrow of
+    // `open.media`.
+    let (descriptor_tracks, track_global): (Vec<Value>, Vec<Vec<usize>>) = {
+        let m = open
+            .media
+            .as_ref()
+            .ok_or("serve_media called without recovered media info")?;
+        let mut desc = Vec::with_capacity(m.tracks.len());
+        let mut globals = Vec::with_capacity(m.tracks.len());
+        for t in &m.tracks {
+            desc.push(json!({
+                "kind": t.kind,
+                "mime": t.mime,
+                "init_b64": B64.encode(&t.init),
+                "segment_count": t.global_indices.len(),
+            }));
+            globals.push(t.global_indices.clone());
+        }
+        (desc, globals)
+    };
+
+    // Emit the LEGACY single-track fields (from track 0) alongside `tracks[]`. A gateway that
+    // predates multi-track reads the top-level `mime`/`segment_count`/`init_b64` and still plays
+    // (track 0 = the whole asset for audio); a multi-track-aware gateway reads `tracks[]`. This
+    // keeps the descriptor robust to gateway/helper version skew (the helper is respawned per
+    // open, the gateway is long-lived) instead of failing closed on a missing field.
+    let mut descriptor = json!({
+        "schema": "elastos.media-authority.session/v1",
+        "kind": "media",
+        "tracks": descriptor_tracks,
+        "expires_at": now_unix() + args.ttl_secs.max(60),
+    });
+    if let Some(first) = descriptor
+        .get("tracks")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+    {
+        descriptor["mime"] = first.get("mime").cloned().unwrap_or(Value::Null);
+        descriptor["segment_count"] = first.get("segment_count").cloned().unwrap_or(json!(0));
+        descriptor["init_b64"] = first.get("init_b64").cloned().unwrap_or(Value::Null);
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{descriptor}").map_err(|e| format!("write descriptor: {e}"))?;
+    out.flush().map_err(|e| format!("flush descriptor: {e}"))?;
+
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| format!("read stdin: {e}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let req: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                reply(
+                    &mut out,
+                    &json!({"status": "error", "message": format!("bad request json: {e}")}),
+                )?;
+                continue;
+            }
+        };
+        match req.get("op").and_then(Value::as_str) {
+            Some("shutdown") => return Ok(()),
+            Some("segment") => {
+                // `track` defaults to 0 (single-track / legacy callers). `index` is the track-local
+                // segment number; we map it to the global flat CENC-counter position to decrypt.
+                let track = req.get("track").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let index = req.get("index").and_then(Value::as_u64).unwrap_or(u64::MAX) as usize;
+                let Some(globals) = track_global.get(track) else {
+                    reply(
+                        &mut out,
+                        &json!({"status": "error", "message": "track index out of range"}),
+                    )?;
+                    continue;
+                };
+                let Some(&global) = globals.get(index) else {
+                    reply(
+                        &mut out,
+                        &json!({"status": "error", "message": "segment index past end of track"}),
+                    )?;
+                    continue;
+                };
+                match open.decrypt_media_segment(global) {
+                    Ok(bytes) => reply(
+                        &mut out,
+                        &json!({ "status": "ok", "segment_b64": B64.encode(&bytes) }),
+                    )?,
+                    Err(e) => reply(&mut out, &json!({"status": "error", "message": e}))?,
+                }
+            }
             other => reply(
                 &mut out,
                 &json!({"status": "error", "message": format!("unknown op: {other:?}")}),

@@ -90,6 +90,7 @@ const els = {
   status: document.getElementById("status"),
   enableTrading: document.getElementById("enable-trading"),
   enableTradingHint: document.getElementById("enable-trading-hint"),
+  mintAnother: document.getElementById("mint-another"),
 };
 
 // The sentinel channel option that reveals the inline create-channel form.
@@ -106,6 +107,11 @@ let mintWatchToken = 0;
 // it so a fresh mint is never reported tradable off an EARLIER asset in the same channel
 // (each asset is its own operative contract and needs its own gateway approval).
 let currentMintContentId = "";
+// The mint's wallet-approval request id. Once the owner approves the mint in the Wallet app, the
+// completed approval records the broadcast tx hash; passing this id lets the host resolve that hash
+// and confirm via the tx RECEIPT (one cheap call) instead of a slow log scan — so Step 2 unlocks
+// the moment the mint mines (PC2 `tx.wait()` immediacy). Empty ⇒ host falls back to the log scan.
+let currentMintRequestId = "";
 // True while a freshly-minted asset's first tx (mint) is still pending confirmation: Step 2
 // stays visible-but-disabled until the chain confirms it (PC2 gates the 2nd tx the same way).
 let tradeGated = false;
@@ -140,20 +146,132 @@ function setStep(name, state) {
   if (li) li.className = state || "";
 }
 
+// ── Live encode/publish progress (PC2's default-open tech panel) ──────────────
+// The mint stays a single blocking POST; the server records coarse stage progress
+// (analyze → package → encrypt → publish → sign) under a client job id, which we
+// poll @1.5s to drive the panel instead of showing a frozen spinner.
+let techPollTimer = null;
+
+function setTechStep(name, state) {
+  const li = document.querySelector('#tech-steps li[data-tech="' + name + '"]');
+  if (li) li.className = state || "";
+}
+
+function stopTechProgress() {
+  if (techPollTimer) {
+    clearInterval(techPollTimer);
+    techPollTimer = null;
+  }
+}
+
+function startTechProgress(jobId) {
+  const panel = document.getElementById("tech-progress");
+  if (!panel) return;
+  ["analyze", "package", "encrypt", "publish", "sign"].forEach((s) => setTechStep(s, ""));
+  panel.hidden = false;
+  panel.open = true;
+  stopTechProgress();
+  const poll = async () => {
+    try {
+      const resp = await fetch(
+        appUrl("/prepare-progress/" + encodeURIComponent(jobId)),
+        { headers: { ...launchHeaders() } },
+      );
+      if (!resp.ok) return; // 404 until the job registers / after it prunes
+      const data = await resp.json();
+      if (Array.isArray(data.stages)) {
+        for (const st of data.stages) {
+          const cls = st.status === "done" || st.status === "active" || st.status === "err"
+            ? st.status
+            : "";
+          setTechStep(st.name, cls);
+        }
+      }
+      if (data.done) stopTechProgress();
+    } catch (_err) {
+      /* transient; keep polling */
+    }
+  };
+  poll();
+  techPollTimer = setInterval(poll, 1500);
+}
+
 function resetSteps() {
   mintWatchToken += 1; // cancel any in-flight mint-confirmation watcher from a prior mint
   tradeGated = false;
   ["encrypt", "publish", "sign", "broadcast", "approve"].forEach((s) => setStep(s, ""));
+  stopTechProgress();
+  ["analyze", "package", "encrypt", "publish", "sign"].forEach((s) => setTechStep(s, ""));
+  const techPanel = document.getElementById("tech-progress");
+  if (techPanel) techPanel.hidden = true;
   if (els.enableTrading) els.enableTrading.classList.remove("is-ready");
   if (els.enableTrading) els.enableTrading.disabled = false;
   if (els.enableTradingHint) els.enableTradingHint.textContent = DEFAULT_TRADE_HINT;
+  if (els.mintAnother) els.mintAnother.hidden = true;
   // Button visibility is governed by the wallet+channel selection (refreshTradeEnabled),
   // so it stays available for the latest minted asset; only re-enable it here.
   refreshTradeEnabled();
 }
 
+// Reset the asset-specific fields so the creator can mint another without reloading. The wallet
+// and channel selections are KEPT (the next asset usually targets the same channel); only the
+// file, title/description, cover, category, preview and progress are cleared.
+function resetForMintAnother() {
+  selectedFile = null;
+  customThumbnail = null;
+  currentMintContentId = "";
+  currentMintRequestId = "";
+  if (els.file) els.file.value = "";
+  if (els.dropTitle) els.dropTitle.textContent = "Choose a file";
+  if (els.dropMeta) els.dropMeta.innerHTML = "media or any document &middot; click or drop";
+  if (els.title) els.title.value = "";
+  if (els.desc) els.desc.value = "";
+  if (els.category) els.category.value = "";
+  // Cover thumbnail back to "auto-generate".
+  if (els.thumbInput) els.thumbInput.value = "";
+  if (els.thumbPreviewWrap) els.thumbPreviewWrap.classList.add("hidden");
+  if (els.thumbDrop) els.thumbDrop.classList.remove("hidden");
+  // Free-preview section hides until a new media file is chosen.
+  if (els.previewSettings) els.previewSettings.classList.add("hidden");
+  if (els.previewControls) els.previewControls.classList.add("hidden");
+  if (els.previewEnabled) els.previewEnabled.checked = false;
+  resetSteps();
+  setStatus("", "");
+  refreshMintEnabled();
+  // Bring the file picker back into view so the next mint starts where the eye is.
+  if (els.drop) els.drop.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 function classifyMedia(mime) {
   return MEDIA_PREFIXES.some((p) => (mime || "").startsWith(p));
+}
+
+// Extension → MIME for types browsers report unreliably (often "" or octet-stream). The MIME we
+// persist drives the viewer routing (EPUB→html-lock reader, CBZ→comic pager, 3D→model viewer,
+// PDF/image/text→pixel-lock), so a correct type here is what makes each asset open in the right
+// viewer. Mirrors PC2's creator (elacity-creator app.js) so the on-chain metadata stays aligned.
+const EXT_MIME = {
+  epub: "application/epub+zip",
+  cbz: "application/vnd.comicbook+zip",
+  pdf: "application/pdf",
+  svg: "image/svg+xml",
+  md: "text/markdown",
+  markdown: "text/markdown",
+  txt: "text/plain",
+  json: "application/json",
+  glb: "model/gltf-binary",
+  gltf: "model/gltf+json",
+  stl: "model/stl",
+  obj: "model/obj",
+  ply: "model/mesh",
+};
+
+// Resolve the canonical MIME for a file: trust our extension map for the known set (we classify
+// these better than the browser), else fall back to the browser type, else octet-stream.
+function resolveMime(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  if (EXT_MIME[ext]) return EXT_MIME[ext];
+  return file.type || "application/octet-stream";
 }
 
 function assertNoKeyMaterial(payload) {
@@ -174,31 +292,56 @@ function humanSize(bytes) {
 function onFile(file) {
   if (!file) return;
   selectedFile = file;
-  const mime = file.type || "application/octet-stream";
+  const mime = resolveMime(file);
   const kind = classifyMedia(mime) ? "media" : "object";
   els.dropTitle.textContent = file.name;
   els.dropMeta.innerHTML =
     humanSize(file.size) + " &middot; " + mime + ' <span class="badge">' + kind + "</span>";
   if (!els.title.value) els.title.value = file.name.replace(/\.[^.]+$/, "");
-  // The free-preview clip only applies to time-based media (video/audio).
-  if (els.previewSettings) els.previewSettings.classList.toggle("hidden", kind !== "media");
+  // The free-preview clip only applies to time-based media (video/audio). Auto-SELECT it for
+  // media (a free preview is the expected default for a sellable track) and reveal its controls;
+  // the creator can still untick it. Non-media hides the whole section.
+  const isMedia = kind === "media";
+  if (els.previewSettings) els.previewSettings.classList.toggle("hidden", !isMedia);
+  if (els.previewEnabled) els.previewEnabled.checked = isMedia;
+  if (els.previewControls) els.previewControls.classList.toggle("hidden", !isMedia);
   autoDetectCategory(file, mime);
   refreshMintEnabled();
 }
 
-// Auto-pick the category dropdown from the file when the creator hasn't chosen one
-// (PC2 app.js:992-995 — `.glb/.gltf/.obj/.fbx` => 3d-model, model files => ai-model).
+// Source-code mimes that should land in the "document" category (mirrors the dDRM viewer's code
+// renderer set). Kept here so the category auto-detect matches what actually renders.
+const CODE_MIMES = [
+  "application/json",
+  "application/javascript",
+  "application/xml",
+  "application/x-yaml",
+  "application/yaml",
+  "application/toml",
+  "application/x-sh",
+];
+
+// Auto-pick the category dropdown from the file when the creator hasn't chosen one. Every type we
+// can actually open in the viewer maps to a category here (3D, AI model, ebook, comic, video,
+// music, image, document for PDF/text/markdown/code). PC2 app.js:992-995 seeds the model rules.
 function autoDetectCategory(file, mime) {
   if (!els.category || els.category.value) return;
   const ext = (file.name.split(".").pop() || "").toLowerCase();
   let cat = "";
-  if (["glb", "gltf", "obj", "fbx", "stl", "usdz"].includes(ext)) cat = "3d-model";
+  if (["glb", "gltf", "obj", "fbx", "stl", "usdz", "ply"].includes(ext)) cat = "3d-model";
   else if (["safetensors", "ckpt", "gguf", "onnx", "pt", "pth", "bin"].includes(ext))
     cat = "ai-model";
+  else if (ext === "epub" || mime === "application/epub+zip") cat = "ebook";
+  else if (
+    ext === "cbz"
+    || mime === "application/vnd.comicbook+zip"
+    || mime === "application/x-cbz"
+  ) cat = "comic";
   else if (mime.startsWith("video/")) cat = "video";
   else if (mime.startsWith("audio/")) cat = "music";
   else if (mime.startsWith("image/")) cat = "image";
   else if (mime === "application/pdf") cat = "document";
+  else if (mime.startsWith("text/") || CODE_MIMES.includes(mime)) cat = "document";
   if (cat) els.category.value = cat;
 }
 
@@ -513,6 +656,32 @@ async function canvasToThumb(canvas, quality) {
   return { b64: await blobToBase64(blob), mime: "image/jpeg" };
 }
 
+// Brand placeholder tokens (canvas literals; see the design-token contract). The card is a dark
+// graphite surface with a soft hairline border; the only accent (#b7ff5a lime) is reserved for
+// verified/active/success states and must NEVER appear on a placeholder.
+const PLACEHOLDER_BG = "#111111"; // --color-graphite
+const PLACEHOLDER_BORDER = "rgba(255,255,255,0.10)"; // --color-border-soft
+const PLACEHOLDER_CHIP_BG = "rgba(255,255,255,0.08)"; // muted surface
+const PLACEHOLDER_CHIP_TEXT = "rgba(255,255,255,0.48)"; // muted label
+const PLACEHOLDER_TITLE = "rgba(255,255,255,0.72)";
+const PLACEHOLDER_SUBTLE = "rgba(255,255,255,0.40)";
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawCardBorder(ctx, w, h) {
+  ctx.strokeStyle = PLACEHOLDER_BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+}
+
 async function thumbFromCustom(file) {
   const img = await createImageBitmap(file);
   const max = 1280;
@@ -576,28 +745,6 @@ function thumbFromVideo(file) {
   });
 }
 
-async function thumbFromAudio(file) {
-  // Synthetic waveform placeholder (no decode needed) with the filename.
-  const c = document.createElement("canvas");
-  c.width = 640;
-  c.height = 360;
-  const ctx = c.getContext("2d");
-  ctx.fillStyle = "#1a1a2e";
-  ctx.fillRect(0, 0, 640, 360);
-  const bars = 48;
-  const bw = 640 / bars;
-  for (let i = 0; i < bars; i++) {
-    const h = 40 + Math.random() * 140;
-    ctx.fillStyle = "rgba(99, 102, 241, " + (0.5 + Math.random() * 0.5) + ")";
-    ctx.fillRect(i * bw + bw * 0.2, (360 - h) / 2, bw * 0.6, h);
-  }
-  ctx.fillStyle = "#e2e8f0";
-  ctx.font = "bold 18px sans-serif";
-  ctx.textAlign = "center";
-  ctx.fillText((file.name || "audio").substring(0, 40), 320, 340);
-  return canvasToThumb(c, 0.85);
-}
-
 async function thumbFromText(file) {
   // Teaser: first lines with a fade-out gradient so the bottom is unreadable.
   const text = await file.text();
@@ -630,31 +777,34 @@ async function thumbFromText(file) {
 }
 
 async function thumbGeneric(file, mime) {
-  // Generative gradient template with the file extension + name + mime.
+  // Brand placeholder card: graphite surface + soft border, a muted file-type chip (e.g. "CBZ",
+  // "STL") and the name/mime in muted white. No purple, no accent — matches every other surface.
   const c = document.createElement("canvas");
   c.width = 640;
   c.height = 360;
   const ctx = c.getContext("2d");
-  const grad = ctx.createLinearGradient(0, 0, 640, 360);
-  grad.addColorStop(0, "#1e1b4b");
-  grad.addColorStop(1, "#312e81");
-  ctx.fillStyle = grad;
+  ctx.fillStyle = PLACEHOLDER_BG;
   ctx.fillRect(0, 0, 640, 360);
-  ctx.fillStyle = "rgba(99,102,241,0.15)";
-  ctx.beginPath();
-  ctx.arc(320, 150, 60, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = "#a5b4fc";
-  ctx.font = "bold 36px sans-serif";
+  // File-type chip on a muted surface.
+  const badge = (file.name.split(".").pop() || "?").toUpperCase().slice(0, 5);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(((file.name.split(".").pop() || "?")).toUpperCase(), 320, 150);
-  ctx.fillStyle = "#e2e8f0";
+  ctx.font = "bold 40px sans-serif";
+  const chipW = Math.max(ctx.measureText(badge).width + 56, 120);
+  const chipH = 84;
+  roundRectPath(ctx, 320 - chipW / 2, 150 - chipH / 2, chipW, chipH, 16);
+  ctx.fillStyle = PLACEHOLDER_CHIP_BG;
+  ctx.fill();
+  ctx.fillStyle = PLACEHOLDER_CHIP_TEXT;
+  ctx.fillText(badge, 320, 152);
+  // Name + mime.
+  ctx.fillStyle = PLACEHOLDER_TITLE;
   ctx.font = "16px sans-serif";
-  ctx.fillText((file.name || "").substring(0, 44), 320, 240);
-  ctx.fillStyle = "#94a3b8";
+  ctx.fillText((file.name || "").substring(0, 44), 320, 244);
+  ctx.fillStyle = PLACEHOLDER_SUBTLE;
   ctx.font = "13px sans-serif";
-  ctx.fillText(mime || "unknown", 320, 268);
+  ctx.fillText(mime || "unknown", 320, 270);
+  drawCardBorder(ctx, 640, 360);
   return canvasToThumb(c, 0.85);
 }
 
@@ -666,9 +816,6 @@ async function generateThumbnail(file, mime) {
     if (mime.startsWith("image/")) return await thumbFromImage(file);
     if (mime.startsWith("video/")) {
       const t = await thumbFromVideo(file);
-      if (t) return t;
-    } else if (mime.startsWith("audio/")) {
-      const t = await thumbFromAudio(file);
       if (t) return t;
     } else if (mime === "text/plain" || mime.startsWith("text/")) {
       const t = await thumbFromText(file);
@@ -717,7 +864,7 @@ async function mint() {
   setStatus("Encrypting…", null);
   setStep("encrypt", "active");
 
-  const mime = selectedFile.type || "application/octet-stream";
+  const mime = resolveMime(selectedFile);
   // Access-token supply: how many editions/holders can be granted access. Clamp to >=1;
   // the host falls back to its default when unset.
   const copies = Math.max(1, parseInt(els.copies && els.copies.value, 10) || 0) || undefined;
@@ -804,21 +951,35 @@ async function mint() {
     return;
   }
 
+  // One job id per mint: the server keys live stage progress on it; we poll it for the
+  // media pipeline panel (analyze → package → encrypt → publish → sign).
+  const jobId =
+    (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
+    "job-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  if (meta.isMedia) {
+    startTechProgress(jobId);
+  }
+
   try {
     const resp = await fetch(appUrl("/prepare-mint"), {
       method: "POST",
       headers: { ...launchHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ file_b64: fileB64, meta: meta }),
+      body: JSON.stringify({ file_b64: fileB64, meta: meta, job_id: jobId }),
     });
     const result = await resp.json().catch(() => ({}));
     assertNoKeyMaterial(result);
+    stopTechProgress();
 
     if (!resp.ok) {
       const stage = result.stage || "encrypt";
       setStep(stage, "err");
+      if (meta.isMedia) setTechStep(stage, "err");
       setStatus(result.error || "Prepare failed: " + resp.status, "err");
       els.mint.disabled = false;
       return;
+    }
+    if (meta.isMedia) {
+      ["analyze", "package", "encrypt", "publish", "sign"].forEach((s) => setTechStep(s, "done"));
     }
 
     setStep("encrypt", "done");
@@ -830,6 +991,9 @@ async function mint() {
     // Pin every subsequent confirm/approve check to THIS asset's KID.
     currentMintContentId = id;
     const approval = result.mint_approval || {};
+    // Remember the mint's approval id so the confirmation poll can resolve its broadcast tx hash
+    // and confirm via the receipt (fast) instead of a log scan.
+    currentMintRequestId = approval.request_id || "";
     if (approval.request_id) {
       setStep("sign", "done");
       setStep("broadcast", "active");
@@ -842,6 +1006,9 @@ async function mint() {
       // Show Step 2 but keep it disabled until the chain confirms tx1 — the watcher below lifts
       // the gate (and promotes the button) the moment the mint's `AssetCreated` event lands.
       gateTradeUntilConfirmed();
+      // The mint is on its way — let the creator start the next asset right away (Step 2 for this
+      // one stays available and is confirmation-gated independently).
+      if (els.mintAnother) els.mintAnother.hidden = false;
       // Poll the chain (read-only) so the Broadcast step advances to "done" the moment the mint
       // lands on-chain, and Step 2 is visibly promoted — instead of a dead spinner that never
       // updates after you approve the tx in the Wallet app. Pinned to THIS asset's KID.
@@ -856,6 +1023,7 @@ async function mint() {
     }
     els.mint.disabled = false;
   } catch (err) {
+    stopTechProgress();
     setStatus("Prepare failed: " + err.message, "err");
     els.mint.disabled = false;
   }
@@ -891,7 +1059,8 @@ async function enableTrading() {
       headers: { ...launchHeaders(), "Content-Type": "application/json" },
       // Pin the approval to THIS asset's operative (its own contract) — never the channel's
       // newest mint — so each asset gets its own gateway approval (PC2's per-asset 2nd tx).
-      body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: currentMintContentId || undefined }),
+      // requestId lets the host resolve the operative from the mint receipt (fast) vs a log scan.
+      body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: currentMintContentId || undefined, requestId: currentMintRequestId || undefined }),
     });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -978,7 +1147,8 @@ async function watchMintConfirmation(channel, creatorAddress, contentId) {
         // Pin to THIS asset: the host only reports confirmed/already_approved for the mint
         // whose KID matches, so an earlier approved asset can't end the watch prematurely.
         // Omitted when unknown (falls back to the legacy newest-in-channel resolution).
-        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined }),
+        // requestId lets the host confirm via the broadcast tx receipt (fast) vs a log scan.
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined, requestId: currentMintRequestId || undefined }),
       });
       const result = await resp.json().catch(() => ({}));
       if (resp.ok) {
@@ -1027,7 +1197,7 @@ async function watchTradeApproval(channel, creatorAddress, contentId) {
         method: "POST",
         headers: { ...launchHeaders(), "Content-Type": "application/json" },
         // Pinned to THIS asset's operative: isApprovedForAll is read on the just-minted contract.
-        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined }),
+        body: JSON.stringify({ channel: channel, creatorAddress: creatorAddress, contentId: contentId || undefined, requestId: currentMintRequestId || undefined }),
       });
       const result = await resp.json().catch(() => ({}));
       if (resp.ok) approved = Boolean(result.already_approved);
@@ -1233,6 +1403,7 @@ syncMethodUI();
 els.createChannelBtn.addEventListener("click", createChannel);
 els.mint.addEventListener("click", mint);
 if (els.enableTrading) els.enableTrading.addEventListener("click", enableTrading);
+if (els.mintAnother) els.mintAnother.addEventListener("click", resetForMintAnother);
 
 preflight().then((ok) => {
   if (ok) loadWallets();

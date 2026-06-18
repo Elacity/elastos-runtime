@@ -1791,3 +1791,41 @@ fn list_channels_discovers_via_scan_then_serves_from_persisted_cursor() {
     }));
     assert_eq!(second["channels"].as_array().unwrap().len(), 1);
 }
+
+// Receipt fast-path decode: from a mint TRANSACTION RECEIPT's own logs, pick the newest
+// `AssetCreated (operative, token_id)` matching (creator, channel) — the single cheap read that
+// replaces the wide `eth_getLogs` scan and makes Step 2 (enable trading) unlock immediately.
+#[test]
+fn newest_asset_created_in_logs_picks_matching_newest() {
+    let creator = "0x1111111111111111111111111111111111111111";
+    let channel = "0x2222222222222222222222222222222222222222";
+    let creator_topic = address_topic(creator).unwrap();
+    let channel_topic = address_topic(channel).unwrap();
+    let op1 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let op2 = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let op_topic = |addr: &str| format!("0x000000000000000000000000{}", &addr[2..]);
+    let token = |n: u8| format!("0x{n:064x}");
+
+    let logs = vec![
+        // Unrelated event (different topic0) → ignored.
+        json!({ "topics": ["0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", creator_topic, channel_topic, op_topic(op1)], "data": token(1), "logIndex": "0x0" }),
+        // AssetCreated for (creator, channel), logIndex 1.
+        json!({ "topics": [ASSET_CREATED_TOPIC0, creator_topic, channel_topic, op_topic(op1)], "data": token(7), "logIndex": "0x1" }),
+        // AssetCreated for (creator, channel), logIndex 3 — the NEWEST, must win.
+        json!({ "topics": [ASSET_CREATED_TOPIC0, creator_topic, channel_topic, op_topic(op2)], "data": token(9), "logIndex": "0x3" }),
+        // AssetCreated but for a DIFFERENT channel → ignored even though logIndex is highest.
+        json!({ "topics": [ASSET_CREATED_TOPIC0, creator_topic, address_topic("0x3333333333333333333333333333333333333333").unwrap(), op_topic(op1)], "data": token(5), "logIndex": "0x9" }),
+    ];
+    assert_eq!(
+        newest_asset_created_in_logs(&logs, &creator_topic, &channel_topic),
+        Some((op2.to_string(), token(9))),
+        "newest matching AssetCreated wins; other channels are excluded"
+    );
+
+    // A receipt with no matching AssetCreated → None (caller keeps waiting / falls back to scan).
+    let none = vec![json!({ "topics": ["0x00"], "data": token(1), "logIndex": "0x0" })];
+    assert_eq!(
+        newest_asset_created_in_logs(&none, &creator_topic, &channel_topic),
+        None
+    );
+}

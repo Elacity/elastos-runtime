@@ -90,6 +90,19 @@
         cursor: pointer;
       }
       button.primary:disabled { background: #b9c6e8; cursor: not-allowed; }
+      /* "Mint another" — a calm secondary action shown after a mint is broadcast. */
+      button.secondary {
+        width: 100%;
+        margin-top: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--accent);
+        padding: 11px 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary:hover { background: #f4f7ff; }
       /* Promote "Enable trading" once the mint confirms on-chain so it reads as the next action. */
       button.primary.is-ready {
         animation: enable-trading-pulse 1.6s ease-in-out infinite;
@@ -119,6 +132,23 @@
       .steps li.done .dot { border-color: var(--ok); background: var(--ok); }
       .steps li.err { color: var(--err); }
       .steps li.err .dot { border-color: var(--err); background: var(--err); }
+      .tech-progress {
+        margin: 12px 0;
+        padding: 10px 12px;
+        border: 1px solid var(--border, #2a2a2a);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .tech-progress > summary {
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 8px;
+      }
+      .tech-progress .steps li.active .dot {
+        animation: tech-pulse 1s ease-in-out infinite;
+      }
+      @keyframes tech-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
       .status { font-size: 13px; margin-top: 14px; min-height: 18px; }
       .status.err { color: var(--err); }
       .status.ok { color: var(--ok); }
@@ -238,6 +268,8 @@
               <option value="video">Video</option>
               <option value="image">Image</option>
               <option value="document">Document</option>
+              <option value="ebook">eBook</option>
+              <option value="comic">Comic</option>
               <option value="3d-model">3D model</option>
               <option value="ai-model">AI model</option>
             </select>
@@ -326,6 +358,16 @@
 
       <section class="card">
         <button id="mint" class="primary" disabled>Mint</button>
+        <details id="tech-progress" class="tech-progress" hidden open>
+          <summary>Encoding &amp; publishing progress</summary>
+          <ul class="steps" id="tech-steps">
+            <li data-tech="analyze"><span class="dot"></span> Analyze source</li>
+            <li data-tech="package"><span class="dot"></span> Transcode &amp; fragment (DASH)</li>
+            <li data-tech="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
+            <li data-tech="publish"><span class="dot"></span> Publish to IPFS</li>
+            <li data-tech="sign"><span class="dot"></span> Assemble mint</li>
+          </ul>
+        </details>
         <ul class="steps" id="steps">
           <li data-step="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
           <li data-step="publish"><span class="dot"></span> Assemble mint</li>
@@ -338,8 +380,9 @@
         <div id="enable-trading-hint" class="hint" hidden>
           Once the mint confirms on-chain, approve the gateway so others can trade your asset.
         </div>
+        <button id="mint-another" class="secondary" type="button" hidden>+ Mint another asset</button>
       </section>
     </main>
-    <script src="creator.js?v=creator-20260615e"></script>
+    <script src="creator.js?v=creator-20260618a"></script>
   </body>
 </html>

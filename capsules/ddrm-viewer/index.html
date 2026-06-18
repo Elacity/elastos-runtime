@@ -5,7 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Viewer · ElastOS</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20260618-scrollfast">
+  <!-- Locally-vendored Three.js (no CDN at runtime): the 3D tier loads from the capsule's own
+       /vendor. The bare `three` specifier the addon loaders import resolves here. -->
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three.module.js" } }
+  </script>
 </head>
 <body>
   <script>
@@ -35,6 +40,6 @@
       <p id="status" class="status" aria-live="polite" hidden></p>
     </section>
   </main>
-  <script type="module" src="viewer.js"></script>
+  <script type="module" src="viewer.js?v=20260618-scrollfast"></script>
 </body>
 </html>

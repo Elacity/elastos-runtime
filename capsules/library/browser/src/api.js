@@ -180,6 +180,32 @@ export function createLibraryRuntime({ getHomeToken }) {
     return body || `Library upload failed: ${xhr.status}`;
   }
 
+  // Cover-art loader for protected `.ddrm` assets. Fetches the asset's PUBLIC cover (resolved by
+  // the gateway from the capsule `thumbnail`, served via the ipfs provider) using the home-token
+  // header — never a token in the URL — and returns an object URL. Cached per endpoint so a row
+  // re-render (or scroll) never refetches. Resolves to null when there's no cover (caller keeps the
+  // type icon).
+  const coverCache = new Map();
+  function loadCover(coverEndpoint) {
+    if (!coverEndpoint) return Promise.resolve(null);
+    if (coverCache.has(coverEndpoint)) return coverCache.get(coverEndpoint);
+    const promise = (async () => {
+      try {
+        const response = await fetch(coverEndpoint, {
+          headers: { "x-elastos-home-token": getHomeToken() },
+        });
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        if (!blob || blob.size === 0) return null;
+        return URL.createObjectURL(blob);
+      } catch {
+        return null;
+      }
+    })();
+    coverCache.set(coverEndpoint, promise);
+    return promise;
+  }
+
   async function downloadObjectRaw({ uri, uris, archive }) {
     const url = new URL("/api/provider/object/download/raw", window.location.origin);
     const list = Array.isArray(uris) ? uris : [uri];
@@ -248,6 +274,7 @@ export function createLibraryRuntime({ getHomeToken }) {
     providerApi,
     uploadObject,
     downloadObjectRaw,
+    loadCover,
     openTarget,
     openPublishedUri,
     deliverToTarget,

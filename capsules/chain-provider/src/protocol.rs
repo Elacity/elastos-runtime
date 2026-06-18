@@ -239,6 +239,14 @@ pub(super) enum Request {
         /// the same channel was already approved. Absent ⇒ legacy newest-in-channel resolution.
         #[serde(default)]
         content_id: Option<String>,
+        /// FAST PATH: the broadcast mint TRANSACTION hash (from the owner's wallet approval). When
+        /// present, the operative + token id are resolved from THAT transaction's own receipt
+        /// (`eth_getTransactionReceipt` → its `AssetCreated` log) in ONE cheap call, instead of a
+        /// wide `eth_getLogs` scan that public RPCs rate-limit/range-cap. The owner's wallet still
+        /// signs+broadcasts the mint (no delegation); this only READS the receipt of that tx. If
+        /// the receipt is not available yet (pending) or does not match, it falls back to the scan.
+        #[serde(default)]
+        tx_hash: Option<String>,
     },
     Shutdown,
 }

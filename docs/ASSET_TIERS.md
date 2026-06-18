@@ -27,11 +27,12 @@ experience without releasing the bytes. Pick the tier first; the file format is 
 
 | Tier | How it protects | Asset types | Status |
 |------|-----------------|-------------|--------|
-| **1. Stream-decrypt** | CENC, decrypt per-segment **in-boundary**, feed MSE; CEK never leaves | video, audio | ✅ shipped (DASH/ffmpeg + `elacity-player`) |
-| **2. Pixel-lock (rasterize)** | render server-side → flattened, **watermarked image**; ship pixels, never source | PDF, images, comics, **text/code**, **SVG**, EPUB, office docs | ✅ PDF, images, comics, text/code, SVG · ⏳ EPUB, office |
+| **1. Stream-decrypt** | CENC, decrypt per-segment **in-boundary**, feed MSE; CEK never leaves | video, audio | ✅ shipped — local **and** dKMS quorum-open (DASH/ffmpeg + `elacity-player`) |
+| **2. Pixel-lock (rasterize)** | render server-side → flattened, **watermarked image**; ship pixels, never source | PDF, images, comics, **text/code**, **SVG**, office docs | ✅ PDF, images, comics, text (light reader), code (dark syntax view), SVG · ⏳ office |
+| **2b. HTML-lock (reflow)** | sanitise reflowable markup **in-boundary** → inert chapter HTML in a **script-less sandbox iframe** + watermark; source ZIP never egresses | EPUB ebooks | ✅ EPUB (mirrors PC2 `EpubRenderer`) |
 | **3. Sandboxed-execute** | run the decrypted bundle **inside a contained runtime**; source never exposed | apps, games, plugins, notebooks, AI models | 🔭 North star (the capsule moat) |
 | **4. Entitlement-only** | no content render; a verifiable on-chain **right** | tickets, licenses, credentials, memberships, keys | ⏳ small build (needs a schema decision) |
-| **5. Contained-native viewer** | a bundled in-capsule renderer, **no source egress** | 3D (WebGL), fonts | ⚠️ placeholder today |
+| **5. Contained-native viewer** | a bundled in-capsule renderer, **no source egress** | 3D (WebGL), fonts | ✅ 3D (glTF/GLB/STL/OBJ via bundled Three.js) |
 
 Why this matters: Tiers 1, 2, and 4 together already cover **all of media + documents +
 entitlements** — that is an Amazon-for-media. Tier 3 (apps/games via the runtime sandbox) is
@@ -46,20 +47,27 @@ the differentiator competitors structurally cannot copy, because it *is* the cap
 - **Object rail** (`creator.rs::run_prepare_mint`): everything else is sealed as **one inline
   encrypted object**, content-type agnostic, escrowed to the quorum (`quorum_openable`).
 
+Both rails now persist a **quorum-openable `.ddrm` capsule** (no plaintext at rest). Media's
+capsule carries the DASH layout (`media.init_path` + flattened, CENC-ordered `segment_paths`)
+and the directory `asset_cid`; the consumer-open fetches that directory and recovers the CEK
+2-of-3 (it does not embed the bytes the way the object rail embeds its single sample).
+
 So *packaging already accepts any bytes.* The differentiation is all at playback.
 
 ### Playback — by tier
 | Asset | Today | Tier |
 |-------|-------|------|
-| `video/*` | `elacity-player` (MSE/DASH) | 1 ✅ |
-| `audio/*` | `elacity-player` (single SourceBuffer) — **routing fixed** so audio no longer falls to the object viewer | 1 ✅ |
+| `video/*` | `elacity-player` (MSE/DASH); minted assets open via the dKMS **quorum-media** path (`viewer_open::open_quorum_media` → `ddrm-media-authority --quorum --dash-dir`) | 1 ✅ |
+| `audio/*` | `elacity-player` (single SourceBuffer); same quorum-media path — audio routes to the media viewer, never the object viewer | 1 ✅ |
 | `application/pdf` | `ddrm-viewer` pixel-lock pager | 2 ✅ |
 | `image/*` (raster) | pixel-lock single page (watermark + EXIF strip) | 2 ✅ |
 | `application/x-cbz`, `…comicbook+zip` | pixel-lock pager (natural page order) | 2 ✅ |
-| `text/*`, code mimes | pixel-lock rasterised text (anti-copy + watermark) | 2 ✅ |
+| `text/plain`, `text/markdown` | pixel-lock **light reading reader** (anti-aliased proportional vector font (DejaVu Sans), warm page, leading, true word-wrap, full Unicode, watermark) | 2 ✅ |
+| code mimes (`json`/`js`/`xml`/`yaml`/`toml`/`sh`) | pixel-lock **dark code view** (line-number gutter + comment/string/number/tag colour, watermark) | 2 ✅ |
 | `image/svg+xml` | pixel-lock rasterised (no raw scriptable XML) | 2 ✅ |
-| 3D / `application/octet-stream` | honest placeholder | 5 ⚠️ |
-| EPUB, office docs | not yet (object rail packages them; no secure view) | 2 ⏳ |
+| `application/epub+zip` | `ddrm-viewer` **html-lock reader** — sanitised chapter HTML in a script-less sandbox iframe, tiled watermark, `user-select:none`; raw ZIP never egresses | 2b ✅ |
+| 3D (`model/*`: glTF/GLB/STL/OBJ) | `ddrm-viewer` **bundled Three.js** WebGL viewer (orbit controls); decrypt-passthrough (cleartext mesh reaches the browser, as in PC2) | 5 ✅ |
+| office docs | not yet (object rail packages them; no secure view) | 2 ⏳ |
 | tickets / licenses | not yet | 4 ⏳ |
 
 The pixel-lock set is one predicate, `render::is_pixel_lock`, mirrored by the helper
@@ -75,9 +83,12 @@ response — only `rendered_b64`/`segment_b64` egress.
 | ~~Audio routed to object viewer~~ | ~~audio wouldn't play~~ | **DONE** — `is_media_mime` includes `audio/*` | — |
 | ~~Text/code shipped raw~~ | ~~copyable, no watermark~~ | **DONE** — Tier-2 rasterise | — |
 | ~~SVG shipped raw~~ | ~~scriptable XML + unwatermarked~~ | **DONE** — Tier-2 rasterise via `resvg` | — |
+| ~~Minted dDRM media not quorum-openable~~ | ~~minted audio/video had no consumer-open (only local owned media played)~~ | **DONE** — media `.ddrm` is `quorum_openable`; `open_quorum_media` fetches the DASH dir + recovers CEK 2-of-3, decrypting fragments per-segment in-boundary | — |
 | **Office docs** (docx/pptx/xlsx) | huge catalog category missing | convert → PDF → Tier 2 (sandboxed headless converter — must respect "no ambient authority": run the converter as an explicit, capability-scoped provider, never a bare shell-out) | M |
 | **Entitlement-only assets** | can't sell tickets/licenses/memberships | Tier 4: a mint "kind" + a signed-right manifest + a receipt view (needs a schema decision; see §5) | S–M |
-| **EPUB** | ebooks unsupported | Tier 2 with HTML/CSS layout (the only Tier-2 type that needs a layout engine) | L |
+| ~~**EPUB**~~ | ~~ebooks unsupported~~ | **DONE** — Tier-2b **html-lock** (sanitise chapter XHTML in-boundary → inert HTML in a script-less sandbox iframe), not rasterised. Chose html-lock over a pure-Rust HTML/CSS layout engine to match PC2's `EpubRenderer` and keep reflowable text readable. | — |
+| ~~**3D secure viewer**~~ | ~~raw mesh egress / placeholder~~ | **DONE (Tier 5)** — bundled, LOCAL Three.js viewer (no CDN) for glTF/GLB/STL/OBJ. Decrypt-passthrough: cleartext mesh reaches the browser (same trade-off PC2 makes); frames are not watermarked yet. | — |
+| ~~**Code shipped as plain raster**~~ | ~~no syntax affordance~~ | **DONE** — dedicated dark code view (gutter + per-language colour), prose stays on the light reader | — |
 
 ## 4. North stars (the big, defensible bets)
 
@@ -85,8 +96,10 @@ response — only `rendered_b64`/`segment_b64` egress.
    binary never leaves protected space." No incumbent DRM does decentralized execute-containment;
    this *is* the runtime/capsule thesis. Depends on: a metered, capability-scoped execution
    capsule + a decrypt→execute handoff that never writes plaintext to a shared surface.
-2. **3D secure viewer (Tier 5).** Bundled in-capsule WebGL renderer, no source-mesh egress
-   (leapfrogs PC2, which ships raw GLB). Net-policy: the renderer ships *with* the capsule (no CDN).
+2. **3D secure viewer (Tier 5).** ✅ Shipped as decrypt-passthrough + a bundled, local Three.js
+   viewer (glTF/GLB/STL/OBJ; net-policy honoured — vendored in the capsule, no CDN). Parity with
+   PC2 today (both pass cleartext mesh to the client). North-star *upgrade*: render-only
+   containment (no source-mesh egress + watermarked frames) would leapfrog PC2.
 3. **AI models & datasets — decrypt-to-inference inside a TEE.** Ties directly to
    [CONFIDENTIAL_COMPUTE.md](CONFIDENTIAL_COMPUTE.md): the buyer runs the model, never sees the
    weights. The highest-value Tier-3 specialization.
