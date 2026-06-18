@@ -986,6 +986,46 @@ mod tests {
         assert_ne!(fp, "SECRET_SIGNATURE_MUST_NOT_LEAK");
     }
 
+    // ── KNOWN_GAPS ratchet tests ────────────────────────────────────────
+    // These encode the desired end-state of an OPEN gap (see docs/KNOWN_GAPS.md)
+    // and fail today, so they are #[ignore]d (non-blocking in a shared tree).
+    // Closing a gap = wire the feature, delete the #[ignore], the test goes
+    // green. Run `cargo test -- --ignored` to see them fail (proving they are
+    // real ratchets, not vacuous passes).
+
+    #[tokio::test]
+    #[ignore = "KNOWN_GAPS G1: granted_capabilities not yet wired (no resource/action in audit events); see docs/KNOWN_GAPS.md"]
+    async fn ratchet_granted_capabilities_populated() {
+        // Desired: a capsule with grants reports them. Today the projection
+        // always returns []. When an observed-grant source is wired, delete the
+        // #[ignore] and this goes green.
+        let resp = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        let granted = resp["data"]["granted_capabilities"].as_array().unwrap();
+        assert!(
+            !granted.is_empty(),
+            "granted_capabilities should be populated once an observed-grant source exists"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "KNOWN_GAPS G2: signer verification not yet wired (manifest has no signer DID); see docs/KNOWN_GAPS.md"]
+    async fn ratchet_provenance_verified_signer_present() {
+        // Desired: a signed capsule reports a *verified* signer. Today signed_by
+        // is null (we refuse to present the declared author as verified). When a
+        // signature-verification source is wired, delete the #[ignore].
+        let resp = provider_with_probe()
+            .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
+            .await
+            .unwrap();
+        assert!(
+            !resp["data"]["provenance"]["signed_by"].is_null(),
+            "provenance.signed_by should carry a verified signer once verification is wired"
+        );
+    }
+
     #[tokio::test]
     async fn provenance_surfaces_did_when_genuinely_present() {
         // A capsule whose id IS a DID: surface it (not fabricated — it exists).
