@@ -226,6 +226,13 @@ descriptor/`segment` protocol as the local media path. The whole ordered segment
 into the transcript AAD (`to_aad_with_segments`), so a substituted/reordered fragment fails the
 CEK unwrap closed before any byte is decrypted; the recovered CEK never leaves the decrypt VM.
 
+AV is therefore **key-protected, not yet fingerprinted**: the decrypted segment bytes that reach
+MSE carry no per-buyer mark (the browser-MSE ceiling without EME/Widevine — exactly PC2's model).
+The forensic upgrade (A/B variant watermarking for video, spread-spectrum/echo-hiding for audio,
+chosen per buyer from their signed grant at serve time) is a transcode-pipeline roadmap item, not a
+patch — see [AV_WATERMARKING.md](AV_WATERMARKING.md). Until it ships, UI/docs must not claim AV is
+watermarked.
+
 ## Remaining Sequence
 
 1. Wire real `elastos://drm/open` orchestration behind the declared sequence:

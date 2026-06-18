@@ -878,6 +878,13 @@ clean.
 Encrypted capsules, remote trust, reproducible builds, TPM/TEE-backed attestation, and dDRM-like flows remain future work.
 They matter, but they should not distort the core runtime contract before the local base is stable.
 
+Forensic watermarking for **audio/video** is a dedicated track: rasterizable types already ship a
+two-layer (visible + invisible) per-buyer mark, but AV is key-protected, not yet fingerprinted. The
+plan — A/B forensic variant watermarking (video) and spread-spectrum/echo-hiding (audio), produced
+once at mint and selected per buyer from their signed grant at serve time, keeping the CEK boundary
+and one canonical path intact — is designed in [docs/AV_WATERMARKING.md](docs/AV_WATERMARKING.md).
+The heavy lift is a mint-time transcode pipeline, so it is a roadmap item, not a patch.
+
 ### AI and operator surfaces
 
 Agent and AI provider surfaces should keep moving toward one stable runtime contract with explicit policy, identity, and budget boundaries instead of ad hoc special cases.
