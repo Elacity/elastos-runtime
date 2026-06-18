@@ -77,6 +77,29 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Maximum page entries we will index from one archive (defense against a hostile/huge CBZ).
 const MAX_PAGES: usize = 5000;
+/// Max UNCOMPRESSED bytes for a single page image (zip-bomb / pixel-bomb feed defense).
+const MAX_ENTRY_BYTES: u64 = 64 << 20; // 64 MiB
+/// Max UNCOMPRESSED bytes summed across all decoded page entries. Also bounds the warm session
+/// memory, since `ParsedCbz` holds every page's raw bytes (`pages: Vec<Vec<u8>>`) for the open.
+const MAX_TOTAL_BYTES: u64 = 512 << 20; // 512 MiB
+
+/// Pure per-entry accounting: given this entry's uncompressed length and the running total BEFORE
+/// it, return the new running total or fail closed if either the per-entry or the aggregate cap is
+/// exceeded. Unit-testable without building a ZIP.
+fn account_entry(entry_len: u64, running_total: u64) -> Result<u64, String> {
+    if entry_len > MAX_ENTRY_BYTES {
+        return Err(format!(
+            "cbz page too large ({entry_len} > {MAX_ENTRY_BYTES} bytes)"
+        ));
+    }
+    let total = running_total.saturating_add(entry_len);
+    if total > MAX_TOTAL_BYTES {
+        return Err(format!(
+            "cbz archive exceeds total cap ({total} > {MAX_TOTAL_BYTES} bytes)"
+        ));
+    }
+    Ok(total)
+}
 
 /// Open the CBZ archive once and collect its page images in reading order. Fails closed on a
 /// malformed archive or one with no image pages.
@@ -105,14 +128,26 @@ pub fn parse(object: &[u8]) -> Result<ParsedCbz, String> {
     indexed.sort_by(|x, y| natural_cmp(&x.0, &y.0));
 
     let mut pages = Vec::with_capacity(indexed.len());
+    let mut total: u64 = 0;
     for (_, i) in &indexed {
         let mut entry = archive
             .by_index(*i)
             .map_err(|e| format!("cbz read entry {i}: {e}"))?;
+        // Reject early on a declared (header) size over the per-entry cap — cheap, before reading.
+        if entry.size() > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "cbz entry {i} too large ({} > {MAX_ENTRY_BYTES} bytes)",
+                entry.size()
+            ));
+        }
+        // Headers can lie: read at most one byte past the cap so an under-declared bomb is still
+        // caught by the actual read length, never by trusting the declared size.
         let mut buf = Vec::new();
-        entry
+        let read = (&mut entry)
+            .take(MAX_ENTRY_BYTES + 1)
             .read_to_end(&mut buf)
-            .map_err(|e| format!("cbz read entry {i}: {e}"))?;
+            .map_err(|e| format!("cbz read entry {i}: {e}"))? as u64;
+        total = account_entry(read, total).map_err(|e| format!("{e} (entry {i})"))?;
         pages.push(buf);
     }
     Ok(ParsedCbz { pages })
@@ -136,9 +171,8 @@ impl ParsedCbz {
                 self.pages.len()
             )
         })?;
-        let decoded = image::load_from_memory(raw)
-            .map_err(|e| format!("cbz page {} decode: {e}", page + 1))?
-            .to_rgba8();
+        let decoded =
+            super::decode_bounded(raw).map_err(|e| format!("cbz page {}: {e}", page + 1))?;
         let img = watermark::fit_width(decoded, max_width.or(Some(1600)));
         watermark::finalize(img, watermark)
     }
@@ -203,5 +237,21 @@ mod tests {
     #[test]
     fn garbage_input_fails_closed() {
         assert!(parse(b"not a zip").is_err());
+    }
+
+    #[test]
+    fn account_entry_enforces_per_entry_and_total_caps() {
+        // A normal entry accumulates into the running total.
+        assert_eq!(account_entry(1_000, 0).unwrap(), 1_000);
+        assert_eq!(account_entry(2_000, 1_000).unwrap(), 3_000);
+
+        // A single oversized page is rejected.
+        assert!(account_entry(MAX_ENTRY_BYTES + 1, 0).is_err());
+
+        // An in-cap page that pushes the AGGREGATE over the total is rejected.
+        assert!(account_entry(MAX_ENTRY_BYTES, MAX_TOTAL_BYTES).is_err());
+
+        // The largest single allowed page is accepted when it fits the total.
+        assert!(account_entry(MAX_ENTRY_BYTES, 0).is_ok());
     }
 }

@@ -74,6 +74,54 @@ pub fn is_pixel_lock(mime: &str) -> bool {
         || is_epub(&m)
 }
 
+/// Bound-before-you-allocate constants for the pixel-lock renderers. A creator controls the source
+/// file, so a tiny crafted input can declare enormous dimensions and force a multi-GB allocation in
+/// the decrypt boundary (the most security-sensitive process) — a "pixel bomb". Every raster decode
+/// and rasterisation is bounded by these BEFORE allocating. (SVG keeps its own local `MAX_DIM`; this
+/// brings the raster/PDF/CBZ paths to the same bar.)
+#[cfg(feature = "pdf-render")]
+pub(crate) const MAX_DIM: u32 = 10_000;
+/// Max rasterised/decoded page AREA (px). ~48 MP — generous for real documents, fatal to a bomb.
+#[cfg(feature = "pdf-render")]
+pub(crate) const MAX_PIXELS: u64 = 48_000_000;
+/// Hard cap on a single decode's working allocation (bytes), handed to `image::Limits::max_alloc`.
+#[cfg(feature = "pdf-render")]
+pub(crate) const MAX_DECODE_BYTES: u64 = 256 << 20;
+
+/// Decode already-decrypted raster bytes with the production pixel-bomb bounds applied. Shared by
+/// the single-image and CBZ-page paths so the bound lives in exactly one place. Fails closed (no
+/// plaintext echoed) on an oversized, malformed, or zero-dimension image.
+#[cfg(feature = "pdf-render")]
+pub(crate) fn decode_bounded(bytes: &[u8]) -> Result<image::RgbaImage, String> {
+    // `Limits` is `#[non_exhaustive]`, so it must be built by mutating a `default()` (no struct
+    // literal). `default()` already caps `max_alloc` at 512 MiB; we tighten all three explicitly.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIM);
+    limits.max_image_height = Some(MAX_DIM);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    decode_with_limits(bytes, limits)
+}
+
+/// Inner decode with caller-supplied limits — factored out so the rejection path is unit-testable
+/// with a deliberately tiny limit (so CI never has to build a real pixel bomb). The strict
+/// width/height limits make `image` reject an oversized image at header time, BEFORE the pixel
+/// buffer is allocated.
+#[cfg(feature = "pdf-render")]
+fn decode_with_limits(bytes: &[u8], limits: image::Limits) -> Result<image::RgbaImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("image format: {e}"))?;
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|e| format!("image decode: {e}"))?
+        .to_rgba8();
+    if img.width() == 0 || img.height() == 0 {
+        return Err("image has zero dimensions".to_string());
+    }
+    Ok(img)
+}
+
 /// A WARM render session: the decrypted asset parsed ONCE plus an in-memory cache of the
 /// page images already rendered. It lives entirely inside the decrypt boundary for the
 /// duration of one open, so the quorum is contacted once, the object is decrypted +
@@ -290,6 +338,38 @@ mod tests {
     #[test]
     fn extract_mdat_fails_closed_on_garbage() {
         assert!(extract_object_mdat(b"no boxes here").is_err());
+    }
+
+    /// A small RGBA PNG encoded in-memory (no fixture file needed).
+    #[cfg(feature = "pdf-render")]
+    fn small_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([12, 34, 56, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    #[cfg(feature = "pdf-render")]
+    #[test]
+    fn decode_bounded_accepts_normal_and_rejects_oversized() {
+        // A normal small image decodes to a non-empty buffer under the production bounds.
+        let png = small_png(8, 8);
+        let img = decode_bounded(&png).expect("a normal small image decodes");
+        assert_eq!((img.width(), img.height()), (8, 8));
+
+        // The SAME image, given a deliberately tiny width limit, is REJECTED at header time — so
+        // the limit fires before any large buffer is allocated (no pixel bomb is built in CI).
+        let mut tiny = image::Limits::default();
+        tiny.max_image_width = Some(4);
+        assert!(
+            decode_with_limits(&png, tiny).is_err(),
+            "an image wider than the limit must be refused before allocation"
+        );
+
+        // Garbage still fails closed.
+        assert!(decode_bounded(b"not an image").is_err());
     }
 }
 

@@ -61,12 +61,22 @@ impl ParsedPdf {
         let page = &pages[page_idx];
 
         let max_w = max_width.unwrap_or(800);
-        let (native_w, _native_h) = page.render_dimensions();
-        let scale = if native_w > 0.0 {
-            (max_w as f32 / native_w).min(3.0)
-        } else {
-            1.0
-        };
+        let (native_w, native_h) = page.render_dimensions();
+        // Pixel-bomb defense: bound the scale on BOTH axes and by total area, not width alone — an
+        // extreme aspect (tiny width × huge height) would otherwise rasterise to a gigapixel pixmap.
+        let scale = bounded_scale(native_w, native_h, max_w);
+        // Defensive backstop: even after scaling, refuse a page whose predicted raster would exceed
+        // the per-side or area budget (guards against float-rounding at the extremes). Fails closed.
+        let pred_w = (native_w * scale).ceil().max(1.0) as u64;
+        let pred_h = (native_h * scale).ceil().max(1.0) as u64;
+        if pred_w > super::MAX_DIM as u64
+            || pred_h > super::MAX_DIM as u64
+            || pred_w.saturating_mul(pred_h) > super::MAX_PIXELS
+        {
+            return Err(format!(
+                "pdf page exceeds max render size ({pred_w}x{pred_h})"
+            ));
+        }
 
         let interpreter_settings = InterpreterSettings::default();
         let render_settings = RenderSettings {
@@ -87,6 +97,25 @@ impl ParsedPdf {
 
         watermark::finalize(img, watermark)
     }
+}
+
+/// Largest render scale that keeps the page within `max_w`, `MAX_DIM` on BOTH axes, and `MAX_PIXELS`
+/// of area, never upscaling past the caller's 3.0 request cap. Pure → unit-testable without `hayro`.
+/// Mirrors `svg.rs`'s scale-down-never-(over)-up clamp, extended with an area bound.
+fn bounded_scale(native_w: f32, native_h: f32, max_w: u32) -> f32 {
+    if !(native_w.is_finite() && native_h.is_finite()) || native_w <= 0.0 || native_h <= 0.0 {
+        return 1.0;
+    }
+    let by_req = max_w as f32 / native_w;
+    let by_dim_w = super::MAX_DIM as f32 / native_w;
+    let by_dim_h = super::MAX_DIM as f32 / native_h;
+    let by_area = (super::MAX_PIXELS as f32 / (native_w * native_h)).sqrt();
+    by_req
+        .min(by_dim_w)
+        .min(by_dim_h)
+        .min(by_area)
+        .min(3.0)
+        .clamp(f32::MIN_POSITIVE, 3.0)
 }
 
 /// Build a structurally-valid, single-page PDF with an accurate xref table at runtime
@@ -165,5 +194,41 @@ mod tests {
             parsed.render_page(99, None, None).is_err(),
             "an out-of-range page must fail closed"
         );
+    }
+
+    #[test]
+    fn bounded_scale_keeps_every_predicted_page_within_budget() {
+        // Adversarial native sizes (incl. extreme aspect ratios) must all yield predicted dims
+        // within MAX_DIM per side AND MAX_PIXELS of area — never a gigapixel pixmap.
+        let cases = [
+            (1.0_f32, 1_000_000.0_f32), // tiny width, huge height
+            (1_000_000.0, 1.0),         // huge width, tiny height
+            (100_000.0, 100_000.0),     // huge square (10 gigapixel)
+            (612.0, 792.0),             // a normal US-Letter PDF point size
+            (2384.0, 3370.0),           // A0-ish
+        ];
+        for (nw, nh) in cases {
+            let scale = bounded_scale(nw, nh, 800);
+            let pw = (nw * scale).ceil().max(1.0) as u64;
+            let ph = (nh * scale).ceil().max(1.0) as u64;
+            assert!(
+                pw <= super::super::MAX_DIM as u64 && ph <= super::super::MAX_DIM as u64,
+                "native {nw}x{nh} -> predicted {pw}x{ph} exceeds MAX_DIM",
+            );
+            assert!(
+                pw.saturating_mul(ph) <= super::super::MAX_PIXELS,
+                "native {nw}x{nh} -> predicted area {} exceeds MAX_PIXELS",
+                pw.saturating_mul(ph),
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_scale_is_defensive_on_degenerate_dimensions() {
+        // Non-finite / non-positive native sizes fall back to 1.0 rather than producing NaN/inf.
+        assert_eq!(bounded_scale(f32::NAN, 100.0, 800), 1.0);
+        assert_eq!(bounded_scale(0.0, 100.0, 800), 1.0);
+        assert_eq!(bounded_scale(-5.0, 100.0, 800), 1.0);
+        assert_eq!(bounded_scale(100.0, f32::INFINITY, 800), 1.0);
     }
 }

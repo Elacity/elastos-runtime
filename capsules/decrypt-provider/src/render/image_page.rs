@@ -19,11 +19,9 @@ pub struct ParsedImage {
 /// Decode the already-decrypted image bytes once. Fails closed (no plaintext echoed) on a
 /// format we cannot decode or a zero-dimension image.
 pub fn parse(object: &[u8]) -> Result<ParsedImage, String> {
-    let decoded = image::load_from_memory(object).map_err(|e| format!("image decode: {e}"))?;
-    let img = decoded.to_rgba8();
-    if img.width() == 0 || img.height() == 0 {
-        return Err("image has zero dimensions".to_string());
-    }
+    // Bounded decode (pixel-bomb defense): rejects oversized dimensions/allocation before the pixel
+    // buffer is built, and fails closed on a zero-dimension image.
+    let img = super::decode_bounded(object)?;
     Ok(ParsedImage { img })
 }
 
