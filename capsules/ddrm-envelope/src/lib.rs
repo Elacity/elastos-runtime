@@ -58,6 +58,26 @@ const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
 /// The decrypt-material suite tag this envelope implements.
 pub const SUITE_PQ_HYBRID: &str = "elastos-pq-hybrid-threshold-v0";
 
+/// Forensic-watermark anchor: the 16-byte SHA-256 prefix over a grant's EIP-191 delegation
+/// signature hex. The invisible pixel-lock watermark embeds this digest (not the raw wallet) so the
+/// mark is **authenticated by the buyer's own signature** — to plant it against a victim wallet an
+/// attacker would need a valid grant signed by that wallet (unforgeable), and the accused cannot
+/// repudiate a signature their wallet produced. Verification recomputes this from the retained
+/// grant. Lives HERE (shared) so the embedder (`ddrm-media-authority`) and the verifier
+/// (`decrypt-provider --extract-watermark`) compute the identical 16 bytes and can never drift
+/// (Principle 12). Input is normalised (trim + lowercase hex) so re-serialisation casing can't break
+/// the match. NOTE the honest bound: the delegation signature is not a hard secret, so possession of
+/// the victim's grant still enables framing — this raises the bar from "anyone can plant any wallet"
+/// to "only someone holding the victim's signed grant," and gives true non-repudiation; a server-key
+/// MAC or opaque-token-via-custody-log is the stronger follow-up.
+pub fn grant_watermark_digest16(delegation_sig_hex: &str) -> [u8; 16] {
+    let normalized = delegation_sig_hex.trim().to_ascii_lowercase();
+    let full = Sha256::digest(normalized.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
+
 /// Canonical decrypt-transcript binding (Anders' Day-45 decision) — the single
 /// encoder BOTH sides of the rail must agree on:
 ///   - the **key authority** computes [`DecryptTranscriptV1::to_aad`] and seals the
@@ -2024,6 +2044,17 @@ mod tests {
 
     fn cek() -> Vec<u8> {
         (0u8..16).collect()
+    }
+
+    #[test]
+    fn grant_watermark_digest_is_deterministic_and_normalised() {
+        let a = grant_watermark_digest16("0x1234ABCD");
+        // Deterministic.
+        assert_eq!(a, grant_watermark_digest16("0x1234ABCD"));
+        // Case- and whitespace-insensitive (re-serialisation can't break the embedder↔verifier match).
+        assert_eq!(a, grant_watermark_digest16("  0x1234abcd  "));
+        // Distinct inputs ⇒ distinct anchors (different wallet signatures don't collide).
+        assert_ne!(a, grant_watermark_digest16("0x1234abce"));
     }
 
     #[test]

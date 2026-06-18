@@ -128,6 +128,15 @@ fn crc16(data: &[u8]) -> u16 {
 const TAG_EVM: u8 = 0x01;
 /// Tag byte: payload is short UTF-8 (render back verbatim) — fallback for non-address watermarks.
 const TAG_UTF8: u8 = 0x00;
+/// Tag byte: payload is the AUTHENTICATED forensic anchor `[wallet_prefix(4) | grant_digest(16)]`.
+/// The invisible layer carries the 16-byte SHA-256 digest of the buyer's wallet-signed grant
+/// signature (see [`ddrm_envelope::grant_watermark_digest16`]) instead of the raw wallet, so a
+/// leaked frame is VERIFIED against the retained signed grant rather than merely read off — making
+/// the mark unforgeable-without-the-grant and non-repudiable. The 4-byte wallet prefix narrows the
+/// candidate set and cross-checks the visible stamp; the full wallet stays in the visible mark.
+const TAG_GRANT_DIGEST: u8 = 0x02;
+const GRANT_PREFIX_LEN: usize = 4;
+const GRANT_DIGEST_LEN: usize = 16;
 
 #[inline]
 fn hex_nibble(c: u8) -> Option<u8> {
@@ -174,13 +183,64 @@ fn compact_encode(payload: &str) -> Vec<u8> {
     }
 }
 
-/// Decode the compact payload bytes back to a human string (`0x…` for an address, else UTF-8).
+/// Build the compact invisible payload. When an AUTHENTICATED grant digest is supplied AND the
+/// stamp leads with an EVM address, embed `[TAG_GRANT_DIGEST | wallet[..4] | digest(16)]` (21 B ≤
+/// [`CAP`]) so a leaked frame is verifiable against the signed grant. Otherwise fall back to the
+/// raw-wallet / UTF-8 [`compact_encode`] (local dev / no-grant opens).
+fn encode_payload(payload: &str, grant_digest: Option<[u8; GRANT_DIGEST_LEN]>) -> Vec<u8> {
+    if let (Some(digest), Some(addr)) = (grant_digest, leading_evm_address(payload)) {
+        let mut v = Vec::with_capacity(1 + GRANT_PREFIX_LEN + GRANT_DIGEST_LEN);
+        v.push(TAG_GRANT_DIGEST);
+        v.extend_from_slice(&addr[..GRANT_PREFIX_LEN]);
+        v.extend_from_slice(&digest);
+        v
+    } else {
+        compact_encode(payload)
+    }
+}
+
+/// Pull `(wallet_prefix, grant_digest)` out of a decoded grant-digest payload, or `None` if the
+/// payload is any other tag/shape. The verifier (`--extract-watermark --verify-grant`) recomputes
+/// the digest from a candidate grant and compares against this.
+pub fn parse_grant_mark(bytes: &[u8]) -> Option<([u8; GRANT_PREFIX_LEN], [u8; GRANT_DIGEST_LEN])> {
+    match bytes.split_first() {
+        Some((&TAG_GRANT_DIGEST, rest)) if rest.len() == GRANT_PREFIX_LEN + GRANT_DIGEST_LEN => {
+            let mut prefix = [0u8; GRANT_PREFIX_LEN];
+            let mut digest = [0u8; GRANT_DIGEST_LEN];
+            prefix.copy_from_slice(&rest[..GRANT_PREFIX_LEN]);
+            digest.copy_from_slice(&rest[GRANT_PREFIX_LEN..]);
+            Some((prefix, digest))
+        }
+        _ => None,
+    }
+}
+
+/// Render recovered raw payload bytes ([`extract_raw`]) to the human display string — the public
+/// form of the internal codec, so the offline verifier reuses one extraction pass.
+pub fn payload_string(bytes: &[u8]) -> Option<String> {
+    compact_decode(bytes)
+}
+
+/// Decode the compact payload bytes back to a human string (`0x…` for an address, the
+/// `0x<prefix>… gd:<digest>` anchor for a grant-digest mark, else UTF-8).
 fn compact_decode(bytes: &[u8]) -> Option<String> {
     match bytes.split_first() {
         Some((&TAG_EVM, addr)) if addr.len() == 20 => {
             let mut s = String::with_capacity(2 + 40);
             s.push_str("0x");
             for b in addr {
+                s.push_str(&format!("{b:02x}"));
+            }
+            Some(s)
+        }
+        Some((&TAG_GRANT_DIGEST, rest)) if rest.len() == GRANT_PREFIX_LEN + GRANT_DIGEST_LEN => {
+            let mut s = String::with_capacity(2 + 8 + 6 + 32);
+            s.push_str("0x");
+            for b in &rest[..GRANT_PREFIX_LEN] {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s.push_str("\u{2026} gd:");
+            for b in &rest[GRANT_PREFIX_LEN..] {
                 s.push_str(&format!("{b:02x}"));
             }
             Some(s)
@@ -282,7 +342,7 @@ fn activity(blk: &[[f32; BLK]; BLK]) -> f32 {
 
 /// Embed `payload` invisibly into `img`'s luminance. No-op for images smaller than one 8×8 block.
 /// Idempotent in spirit (re-embedding the same payload just re-enforces the margins).
-pub fn embed(img: &mut RgbaImage, payload: &str) {
+pub fn embed(img: &mut RgbaImage, payload: &str, grant_digest: Option<[u8; GRANT_DIGEST_LEN]>) {
     let (w, h) = img.dimensions();
     let nbx = (w / BLK as u32) as usize;
     let nby = (h / BLK as u32) as usize;
@@ -290,7 +350,7 @@ pub fn embed(img: &mut RgbaImage, payload: &str) {
         return;
     }
 
-    let code = build_codeword(&compact_encode(payload));
+    let code = build_codeword(&encode_payload(payload, grant_digest));
     let phi_a = basis(POS_A.0, POS_A.1);
     let phi_b = basis(POS_B.0, POS_B.1);
     // Pre-mix φA − φB: adding `(need/2)·(φA−φB)` shifts A by +need/2 and B by −need/2.
@@ -345,8 +405,9 @@ fn read_bits(bits: &[bool], start: usize, width: usize) -> u32 {
 }
 
 /// Try to decode a frame from the folded `bits` (length [`PERIOD`]) at every codeword rotation.
-/// Returns the recovered payload string when SYNC aligns AND the CRC verifies.
-fn decode(bits: &[bool]) -> Option<String> {
+/// Returns the recovered RAW compact payload bytes when SYNC aligns AND the CRC verifies. Callers
+/// map this to a human string ([`extract`]) or read the authenticated anchor ([`extract_raw`]).
+fn decode(bits: &[bool]) -> Option<Vec<u8>> {
     if bits.len() != PERIOD {
         return None;
     }
@@ -372,17 +433,29 @@ fn decode(bits: &[bool]) -> Option<String> {
         if crc16(&framed) != crc {
             continue;
         }
-        if let Some(s) = compact_decode(&data[..len]) {
-            return Some(s);
+        // CRC-gated: only accept frames whose payload also decodes to a known tag/shape.
+        let payload = data[..len].to_vec();
+        if compact_decode(&payload).is_some() {
+            return Some(payload);
         }
     }
     None
 }
 
-/// Blindly recover the embedded payload from `img`, or `None` if no valid frame is found. Searches
-/// all 64 sub-block pixel offsets (re-syncs after a same-resolution screenshot / translation) and,
-/// per offset, majority-folds every block's bit before the CRC-gated [`decode`].
+/// Blindly recover the embedded payload from `img` as a human string (`0x…` wallet, the
+/// `0x<prefix>… gd:<digest>` anchor, or UTF-8), or `None` if no valid frame is found. The
+/// forensic CLI uses [`extract_raw`] + [`payload_string`] directly (one pass, plus the raw bytes
+/// for [`parse_grant_mark`]); this wrapper is the string-form convenience for callers/tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract(img: &RgbaImage) -> Option<String> {
+    extract_raw(img).and_then(|b| compact_decode(&b))
+}
+
+/// Blindly recover the RAW compact payload bytes from `img`, or `None` if no valid frame is found.
+/// Searches all 64 sub-block pixel offsets (re-syncs after a same-resolution screenshot /
+/// translation) and, per offset, majority-folds every block's bit before the CRC-gated [`decode`].
+/// The verifier reads these bytes via [`parse_grant_mark`] to authenticate against a signed grant.
+pub fn extract_raw(img: &RgbaImage) -> Option<Vec<u8>> {
     let (w, h) = img.dimensions();
     if w < BLK as u32 || h < BLK as u32 {
         return None;
@@ -422,8 +495,8 @@ pub fn extract(img: &RgbaImage) -> Option<String> {
                 );
             }
             let bits: Vec<bool> = votes.iter().map(|&v| v > 0).collect();
-            if let Some(text) = decode(&bits) {
-                return Some(text);
+            if let Some(bytes) = decode(&bits) {
+                return Some(bytes);
             }
         }
     }
@@ -479,14 +552,45 @@ mod tests {
     #[test]
     fn roundtrip_in_memory() {
         let mut img = textured(1024, 768);
-        embed(&mut img, STAMP);
+        embed(&mut img, STAMP, None);
         assert_eq!(extract(&img).as_deref(), Some(STAMP_ADDR));
+    }
+
+    #[test]
+    fn grant_digest_payload_fits_and_roundtrips() {
+        // The authenticated anchor `[tag | wallet[..4] | digest(16)]` is 21 B — within CAP, so the
+        // 232-bit PERIOD (and thus sparse-page recovery) is unchanged.
+        let digest = [0xABu8; GRANT_DIGEST_LEN];
+        let payload = encode_payload(STAMP, Some(digest));
+        assert_eq!(payload.len(), 1 + GRANT_PREFIX_LEN + GRANT_DIGEST_LEN);
+        assert!(payload.len() <= CAP, "grant-digest payload must fit CAP");
+        assert_eq!(PERIOD, SYNC_BITS + LEN_BITS + CAP * 8 + CRC_BITS);
+
+        let mut img = textured(1024, 768);
+        embed(&mut img, STAMP, Some(digest));
+        let raw = extract_raw(&img).expect("recover frame");
+        let (prefix, recovered) = parse_grant_mark(&raw).expect("grant-digest mark");
+        // The 4-byte prefix is the leading wallet bytes (0xabc12300… -> ab c1 23 00).
+        assert_eq!(prefix, [0xab, 0xc1, 0x23, 0x00]);
+        assert_eq!(
+            recovered, digest,
+            "the authenticated digest must survive embed/extract"
+        );
+    }
+
+    #[test]
+    fn non_grant_marks_are_not_parsed_as_grant_anchors() {
+        // A plain wallet (no grant digest) must NOT be mistaken for an authenticated anchor.
+        let mut img = textured(1024, 768);
+        embed(&mut img, STAMP, None);
+        let raw = extract_raw(&img).expect("recover frame");
+        assert!(parse_grant_mark(&raw).is_none());
     }
 
     #[test]
     fn survives_q85_encode() {
         let mut img = textured(1024, 768);
-        embed(&mut img, STAMP);
+        embed(&mut img, STAMP, None);
         let out = reencode(&img, 85);
         assert_eq!(extract(&out).as_deref(), Some(STAMP_ADDR));
     }
@@ -494,7 +598,7 @@ mod tests {
     #[test]
     fn survives_recompression_q85_then_q70() {
         let mut img = textured(1280, 960);
-        embed(&mut img, STAMP);
+        embed(&mut img, STAMP, None);
         let out = reencode(&reencode(&img, 85), 70);
         assert_eq!(extract(&out).as_deref(), Some(STAMP_ADDR));
     }
@@ -506,7 +610,7 @@ mod tests {
         // top — full width retained, so the block columns still line up). Horizontal width changes
         // are explicitly out of scope (documented), so we do not test them.
         let mut img = textured(1280, 960);
-        embed(&mut img, STAMP);
+        embed(&mut img, STAMP, None);
         let out = reencode(&img, 85);
         let shifted = image::imageops::crop_imm(&out, 0, 3, 1280, 960 - 3).to_image();
         assert_eq!(extract(&shifted).as_deref(), Some(STAMP_ADDR));
@@ -524,7 +628,7 @@ mod tests {
         // to be imperceptible in practice (Weber masking) — well under ~2 levels out of 255.
         let orig = textured(512, 512);
         let mut marked = orig.clone();
-        embed(&mut marked, STAMP);
+        embed(&mut marked, STAMP, None);
         let (w, h) = orig.dimensions();
         let mut total = 0.0f64;
         let mut peak = 0.0f32;
@@ -549,7 +653,7 @@ mod tests {
         // such areas completely UNTOUCHED — no faint texture injected onto white.
         let mut img = RgbaImage::from_pixel(512, 512, Rgba([255, 255, 255, 255]));
         let before = img.clone();
-        embed(&mut img, STAMP);
+        embed(&mut img, STAMP, None);
         assert_eq!(
             img, before,
             "flat white must not be modified by the invisible mark"
@@ -610,7 +714,7 @@ mod tests {
             }
             (n, tot)
         };
-        embed(&mut page, STAMP);
+        embed(&mut page, STAMP, None);
         assert_eq!(
             extract(&page).as_deref(),
             Some(STAMP_ADDR),
@@ -631,7 +735,7 @@ mod tests {
         // The wide white margins of a text page must be left untouched (eye is most sensitive there).
         let mut page = sparse_text_page(1000, 1300);
         let before = page.clone();
-        embed(&mut page, STAMP);
+        embed(&mut page, STAMP, None);
         for &(x, y) in &[(8u32, 8u32), (980, 8), (8, 1280), (980, 1280), (500, 10)] {
             assert_eq!(
                 page.get_pixel(x, y),

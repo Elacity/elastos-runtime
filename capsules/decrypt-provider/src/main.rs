@@ -1759,11 +1759,13 @@ fn require_identifier(value: &str, field: &str) -> Result<(), String> {
 }
 
 /// Offline forensic extraction: read the INVISIBLE watermark from a (possibly leaked/re-saved)
-/// rendered image and print the recovered `wallet · content · time` identity. Read-only, no key
-/// material — a pure analysis tool over an already-public image. `decrypt-provider
-/// --extract-watermark <image>`; exit 0 + the string on success, exit 1 if none is recoverable.
+/// rendered image and print the recovered identity. Read-only, no key material — a pure analysis
+/// tool over an already-public image. `decrypt-provider --extract-watermark <image>
+/// [--verify-grant <grant.json>]`; exit 0 + the string on success, exit 1 if none is recoverable.
+/// When the mark is an AUTHENTICATED grant-digest anchor, also prints the wallet prefix + digest;
+/// with `--verify-grant`, recomputes the digest from the candidate grant and reports MATCH/NO MATCH.
 #[cfg(feature = "pdf-render")]
-fn run_extract_watermark(path: &str) -> i32 {
+fn run_extract_watermark(path: &str, verify_grant: Option<&str>) -> i32 {
     let img = match image::open(path) {
         Ok(img) => img.to_rgba8(),
         Err(e) => {
@@ -1771,16 +1773,94 @@ fn run_extract_watermark(path: &str) -> i32 {
             return 2;
         }
     };
-    match render::invisible::extract(&img) {
-        Some(stamp) => {
-            println!("{stamp}");
-            0
-        }
+    let raw = match render::invisible::extract_raw(&img) {
+        Some(raw) => raw,
         None => {
             eprintln!("decrypt-provider: no recoverable forensic watermark in {path}");
-            1
+            return 1;
+        }
+    };
+    if let Some(stamp) = render::invisible::payload_string(&raw) {
+        println!("{stamp}");
+    }
+    let mark = render::invisible::parse_grant_mark(&raw);
+    if let Some((prefix, digest)) = mark {
+        println!("wallet-prefix: 0x{}", hex_lower(&prefix));
+        println!("grant-digest:  {}", hex_lower(&digest));
+    }
+    match verify_grant {
+        Some(grant_src) => verify_extracted_against_grant(mark, grant_src),
+        None => 0,
+    }
+}
+
+/// Lower-case hex of a byte slice (for the forensic CLI's human output).
+#[cfg(feature = "pdf-render")]
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Read a candidate grant's EIP-191 delegation signature hex: accepts a JSON grant file (reads
+/// `delegation_sig_hex`) or a file whose contents are the raw signature hex.
+#[cfg(all(feature = "pdf-render", feature = "pq-envelope"))]
+fn read_grant_sig_hex(grant_src: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(grant_src).ok()?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+        if let Some(sig) = v.get("delegation_sig_hex").and_then(|s| s.as_str()) {
+            return Some(sig.to_string());
         }
     }
+    let trimmed = contents.trim();
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Verify a recovered grant-digest mark against a candidate grant: recompute the digest from the
+/// grant's signature via the SHARED `ddrm_envelope::grant_watermark_digest16` (no drift with the
+/// embedder) and compare. MATCH ⇒ the buyer's own signature authenticates this leaked frame.
+#[cfg(all(feature = "pdf-render", feature = "pq-envelope"))]
+fn verify_extracted_against_grant(mark: Option<([u8; 4], [u8; 16])>, grant_src: &str) -> i32 {
+    let (_prefix, digest) = match mark {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "decrypt-provider: the recovered mark is not an authenticated grant-digest anchor; \
+                 nothing to verify"
+            );
+            return 1;
+        }
+    };
+    let sig_hex = match read_grant_sig_hex(grant_src) {
+        Some(s) => s,
+        None => {
+            eprintln!("decrypt-provider: could not read a delegation signature from {grant_src}");
+            return 2;
+        }
+    };
+    if ddrm_envelope::grant_watermark_digest16(&sig_hex) == digest {
+        println!("VERIFY: MATCH — the grant's signature authenticates this mark");
+        0
+    } else {
+        println!("VERIFY: NO MATCH — this grant did not produce this mark");
+        1
+    }
+}
+
+/// `--verify-grant` needs the envelope crate (the shared digest fn). Without `pq-envelope` the
+/// forensic CLI still EXTRACTS, but cannot verify — say so rather than silently passing.
+#[cfg(all(feature = "pdf-render", not(feature = "pq-envelope")))]
+fn verify_extracted_against_grant(_mark: Option<([u8; 4], [u8; 16])>, _grant_src: &str) -> i32 {
+    eprintln!(
+        "decrypt-provider: --verify-grant requires a build with the `pq-envelope` feature \
+         (the shared grant-digest function)"
+    );
+    2
 }
 
 fn main() {
@@ -1791,10 +1871,17 @@ fn main() {
         if let Some(pos) = args.iter().position(|a| a == "--extract-watermark") {
             let path = args.get(pos + 1).cloned().unwrap_or_default();
             if path.is_empty() {
-                eprintln!("usage: decrypt-provider --extract-watermark <image-path>");
+                eprintln!(
+                    "usage: decrypt-provider --extract-watermark <image-path> \
+                     [--verify-grant <grant.json>]"
+                );
                 std::process::exit(2);
             }
-            std::process::exit(run_extract_watermark(&path));
+            let verify_grant = args
+                .iter()
+                .position(|a| a == "--verify-grant")
+                .and_then(|p| args.get(p + 1).cloned());
+            std::process::exit(run_extract_watermark(&path, verify_grant.as_deref()));
         }
     }
 

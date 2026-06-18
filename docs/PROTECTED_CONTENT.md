@@ -174,36 +174,47 @@ page **images** *inside the decrypt boundary*, and only those images egress.
      the parity of `round((A−B)/STEP)` for two symmetric mid-band coefficients `A=(1,2)`, `B=(2,1)`;
      QIM (vs a fixed margin) bounds the per-block nudge so a high-contrast block can never end up
      carrying the wrong bit. To keep the codeword recoverable from CONTENT-SPARSE pages (a short
-     snippet on a mostly-empty page), the invisible layer carries a COMPACT identity — the 20-byte
-     owner EVM wallet (the visible mark + audit log keep the full `wallet · content · time` tuple) —
-     framed as `SYNC|LEN|DATA|CRC-16` (232-bit period), raster-tiled and majority-vote folded, so a
-     LEAKED frame still yields the wallet even if the visible mark is cropped/painted out — a
-     **tracer, not tamper-proof evidence** (see *Forensic strength & privacy* below).
+     snippet on a mostly-empty page), the invisible layer carries a COMPACT, self-describing payload
+     framed as `SYNC|LEN|DATA|CRC-16` (232-bit period), raster-tiled and majority-vote folded. On a
+     production (grant-bearing) open `DATA` is the **authenticated anchor** `[wallet_prefix(4) +
+     grant_digest(16)]` (21 B ≤ the 24-byte cap, so the period is unchanged); on a no-grant/local-dev
+     open it falls back to the compact 20-byte wallet. Either way a LEAKED frame stays attributable
+     even if the visible mark is cropped/painted out — but it is a **tracer with non-repudiation, not
+     tamper-proof evidence**, and (production case) the invisible layer no longer reveals the full
+     wallet — only a digest that *commits to* it (see *Forensic strength & privacy* below).
      Recovers through our q85 encode, moderate recompression, brightness/contrast shifts,
      same-resolution screenshots, and vertical offsets; does NOT survive rescaling/rotation/
      width-changing crops (a geometric-sync layer is future work). Validated end-to-end against the
      actual rendered text AND (sparse) code pages, not just synthetic images. Offline read:
-     `decrypt-provider --extract-watermark <image>` (prints the recovered `0x…` wallet).
+     `decrypt-provider --extract-watermark <image> [--verify-grant <grant.json>]` — prints the wallet
+     prefix + grant digest (or the `0x…` wallet for a legacy compact mark) and, given a candidate
+     grant, reports MATCH / NO MATCH by recomputing via the shared `grant_watermark_digest16`.
 - **Fail closed**: the single pixel-lock egress (`watermark::finalize`) and the HTML-lock egress
   (EPUB) both REFUSE to emit a protected page without a non-empty forensic stamp — no identity, no
   image. There is no code path that emits protected pixels without a traceable mark.
 - **Forensic strength & privacy (honest scope — state it exactly, like the threat model does).** Two
   things this watermark is deliberately NOT:
-  1. **Not unforgeable evidence.** The scheme is **unkeyed** and the invisible payload is protected
-     only by a **CRC-16** (error detection, not a signature); the algorithm is public in this repo.
-     So anyone can embed *any* wallet into *any* image: the mark is **forgeable** (a third party can
-     plant a wallet to frame it) and **repudiable** (an accused wallet can credibly deny it). It is a
-     **deterrent and a first-line tracer against casual re-sharing**, not court-grade attribution.
-     The authenticated, tamper-evident record is the hash-chained, signed **custody audit log**
-     ([THREAT_MODEL.md](THREAT_MODEL.md) §4) — the watermark *complements* it, it does not replace
-     it. The upgrade that would make the mark evidence is **authenticating the payload** (a
-     media-authority MAC/signature over `wallet · content · time`, or an opaque token resolved via
-     the audit log so the literal wallet never rides in the mark). Tracked; not yet done.
-  2. **Not anonymous.** Both layers embed the FULL wallet that opened the page (the visible layer is
-     human-readable). Anyone who sees a rendered page — a screenshot, a screen-share, a photo, a
-     leaked frame — recovers the buyer's on-chain identity. This is the deliberate trade:
-     leak-attribution in exchange for buyer anonymity at view time ([THREAT_MODEL.md](THREAT_MODEL.md)
-     §3, §6).
+  1. **Authenticated (non-repudiable), but not yet unforgeable by a third party.** The invisible
+     layer embeds an **authenticated grant digest** — `ddrm_envelope::grant_watermark_digest16` =
+     SHA-256 of the buyer's wallet-signed delegation signature, truncated to 16 bytes — alongside a
+     4-byte wallet prefix (a 21-byte payload, ≤ the 24-byte cap, so sparse-page recovery is
+     unchanged). This gives **non-repudiation** — only the buyer's own wallet signature reproduces
+     that digest — and raises forgery from *"anyone can plant any wallet"* to *"only a party holding
+     the victim's signed grant can."* It is **not** the full anti-framing guarantee: the delegation
+     signature is not a hard secret (it transits the recover flow), so whoever obtains a victim's
+     grant could still replant it; the frame `SYNC|LEN|DATA|CRC` still uses a CRC for frame
+     *integrity*, not authenticity. Treat the mark as a **strong tracer with non-repudiation**, not
+     yet court-grade against a determined framer. North-star upgrade: a **server-key MAC**, or an
+     **opaque token resolved via the custody log**, so no identity-derived value rides in the mark at
+     all. The authenticated, tamper-evident system-of-record remains the hash-chained, signed
+     **custody audit log** ([THREAT_MODEL.md](THREAT_MODEL.md) §4), which also retains the grant
+     digest (minimized — option C) so a leaked frame can be *verified* against a candidate grant.
+  2. **Not anonymous (the visible layer).** The **visible** stamp embeds the **full** opening wallet
+     (human-readable); the **invisible** layer carries only the 4-byte prefix + grant digest, not the
+     full wallet. So anyone who sees a rendered page — a screenshot, a screen-share, a photo, a leaked
+     frame — recovers the buyer's on-chain identity **from the visible mark**. This is the deliberate
+     trade: leak-attribution in exchange for buyer anonymity at view time
+     ([THREAT_MODEL.md](THREAT_MODEL.md) §3, §6).
 
 Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
 - `application/pdf` → `pdf` (multi-page, `hayro`)

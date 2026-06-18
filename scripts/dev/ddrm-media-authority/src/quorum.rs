@@ -947,10 +947,39 @@ fn is_pixel_lock(mime: &str) -> bool {
 /// dev rights mode), so the stamp is never empty (the renderer fails closed on an empty stamp).
 fn watermark_for(args: &QuorumArgs, opened_at: u64) -> String {
     let (identity, content) = forensic_identity(args);
-    format!(
+    let human = format!(
         "{identity} \u{00b7} {content} \u{00b7} {}",
         format_utc_minute(opened_at)
-    )
+    );
+    // Append the AUTHENTICATED grant-digest token for the invisible layer only (the decrypt boundary
+    // splits it back off before the visible compositor). When no wallet-signed grant is attached
+    // (local-dev rights mode), the stamp stays the plain human string and the invisible layer falls
+    // back to the unauthenticated compact wallet.
+    match grant_digest_hex(args) {
+        Some(hex) => format!("{human}\u{1F}gd:{hex}"),
+        None => human,
+    }
+}
+
+/// The 32-hex authenticated forensic anchor for this open: SHA-256 of the wallet-signed grant's
+/// EIP-191 delegation signature, truncated to 16 bytes. Computed via the SHARED
+/// [`ddrm_envelope::grant_watermark_digest16`] so the verifier (`decrypt-provider
+/// --extract-watermark --verify-grant`) derives the identical value (no drift, Principle 12).
+/// `None` when no parseable grant is attached.
+fn grant_digest_hex(args: &QuorumArgs) -> Option<String> {
+    let grant_b64 = args
+        .access_grant_b64
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())?;
+    let bytes = B64.decode(grant_b64.trim()).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let sig = v.get("delegation_sig_hex")?.as_str()?;
+    let digest = ddrm_envelope::grant_watermark_digest16(sig);
+    let mut hex = String::with_capacity(32);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Some(hex)
 }
 
 /// `(display identity, short content id)` for the stamp. Prefers the wallet address + on-chain
@@ -1403,5 +1432,49 @@ mod watermark_tests {
         let stamp = watermark_for(&args_with_grant(None), 1_781_516_433);
         assert!(stamp.contains('\u{00b7}'));
         assert!(!stamp.trim().is_empty());
+    }
+
+    fn signed_grant_b64(owner: &str, kid: &str, sig_hex: &str) -> String {
+        let v = json!({
+            "delegation": { "owner_address": owner, "kid_hex": kid },
+            "delegation_sig_hex": sig_hex,
+        });
+        B64.encode(serde_json::to_vec(&v).unwrap())
+    }
+
+    fn signed_args(sig_hex: &str) -> QuorumArgs {
+        args_with_grant(Some(signed_grant_b64(
+            "0xAbC1230000000000000000000000000000009f0e",
+            "0xdeadbeefcafef00d",
+            sig_hex,
+        )))
+    }
+
+    #[test]
+    fn no_grant_digest_token_without_a_signature() {
+        // A grant without `delegation_sig_hex` (or no grant) yields the plain human stamp.
+        assert!(grant_digest_hex(&args_with_grant(None)).is_none());
+        let unsigned = args_with_grant(Some(grant_b64("0xabc", "0xdead")));
+        assert!(grant_digest_hex(&unsigned).is_none());
+        assert!(!watermark_for(&unsigned, 1_700_000_000).contains('\u{1F}'));
+    }
+
+    #[test]
+    fn signed_grant_appends_authenticated_digest_token() {
+        let sig = "0x1234567890abcdef";
+        let args = signed_args(sig);
+        // The token's hex matches the SHARED digest fn (no drift with the decrypt-provider verifier).
+        let expect: String = ddrm_envelope::grant_watermark_digest16(sig)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(grant_digest_hex(&args).as_deref(), Some(expect.as_str()));
+
+        let stamp = watermark_for(&args, 1_700_000_000);
+        let (human, token) = stamp.split_once('\u{1F}').expect("grant token present");
+        // Human half stays a clean `wallet · content · time` stamp.
+        assert!(human.ends_with("2023-11-14 22:13Z"));
+        assert!(!human.contains('\u{1F}'));
+        assert_eq!(token, format!("gd:{expect}"));
     }
 }

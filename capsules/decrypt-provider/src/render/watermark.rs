@@ -18,14 +18,22 @@ use image::RgbaImage;
 /// bytes. Fails closed if no (non-empty) watermark is supplied — protected pixel output without a
 /// traceable stamp must not exist.
 pub fn finalize(mut img: RgbaImage, watermark: Option<&str>) -> Result<Vec<u8>, String> {
-    let stamp = watermark
+    let raw = watermark
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or("refusing to emit a protected page without a forensic watermark")?;
-    // Visible (quiet) mark first, then the INVISIBLE forensic layer carrying the identical identity
-    // string — so a leaked frame stays attributable even if the visible mark is cropped/painted out.
-    apply_watermark(&mut img, stamp);
-    super::invisible::embed(&mut img, stamp);
+    // The wire mark is `<display>` or `<display>\u{1F}gd:<32 hex>`: the display half is the human
+    // `wallet · content · time` stamp; the optional trailing token is the AUTHENTICATED grant-digest
+    // anchor (`ddrm_envelope::grant_watermark_digest16`) for the invisible layer only.
+    let (display, grant_digest) = split_mark(raw);
+    if display.is_empty() {
+        return Err("refusing to emit a protected page without a forensic watermark".into());
+    }
+    // Visible (quiet) human mark first, then the INVISIBLE forensic layer — which carries the
+    // grant-digest anchor when present (verifiable, non-repudiable) else the compact wallet — so a
+    // leaked frame stays attributable even if the visible mark is cropped/painted out.
+    apply_watermark(&mut img, display);
+    super::invisible::embed(&mut img, display, grant_digest);
 
     let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
     let mut buf = Vec::new();
@@ -39,6 +47,46 @@ pub fn finalize(mut img: RgbaImage, watermark: Option<&str>) -> Result<Vec<u8>, 
         )
         .map_err(|e| format!("jpeg encode: {e}"))?;
     Ok(buf)
+}
+
+/// Separator between the human display stamp and the invisible-only grant-digest token. US (0x1F)
+/// is a non-printable control char that never occurs in a `wallet · content · time` stamp.
+const MARK_SEP: char = '\u{1F}';
+
+/// Split a wire watermark into `(visible display text, optional 16-byte grant digest)`. The
+/// media-authority appends `\u{1F}gd:<32 hex>` when a wallet-signed grant is present; a plain string
+/// (no separator) carries no digest (local-dev / no-grant opens — back-compat).
+fn split_mark(s: &str) -> (&str, Option<[u8; 16]>) {
+    match s.split_once(MARK_SEP) {
+        Some((display, tail)) => {
+            let digest = tail.trim().strip_prefix("gd:").and_then(parse_hex16);
+            (display.trim(), digest)
+        }
+        None => (s.trim(), None),
+    }
+}
+
+/// Parse exactly 32 hex chars into 16 bytes, or `None` (the mark then falls back to the unauthenticated
+/// compact wallet rather than failing the whole render).
+fn parse_hex16(hex: &str) -> Option<[u8; 16]> {
+    let hex = hex.trim();
+    if hex.len() != 32 {
+        return None;
+    }
+    let b = hex.as_bytes();
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = (nibble(b[2 * i])? << 4) | nibble(b[2 * i + 1])?;
+    }
+    Some(out)
 }
 
 /// Downscale `img` so its width is at most `max_width` (preserving aspect ratio); never
@@ -122,6 +170,42 @@ mod tests {
     fn finalize_emits_jpeg_with_a_watermark() {
         let jpeg = finalize(white(400, 300), Some("0x1a2b..9f0e")).expect("jpeg");
         // JPEG SOI marker.
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn split_mark_separates_display_from_grant_digest() {
+        // Plain stamp: all display, no digest (back-compat).
+        let (d, g) = split_mark("0xabc \u{00b7} c0ffee \u{00b7} 2026-06-18 09:40Z");
+        assert_eq!(d, "0xabc \u{00b7} c0ffee \u{00b7} 2026-06-18 09:40Z");
+        assert!(g.is_none());
+
+        // Stamp + grant-digest token: display is clean (no token), digest parsed.
+        let hex = "00112233445566778899aabbccddeeff";
+        let wire = format!("0xabc \u{00b7} c0ffee \u{00b7} t\u{1F}gd:{hex}");
+        let (d, g) = split_mark(&wire);
+        assert_eq!(d, "0xabc \u{00b7} c0ffee \u{00b7} t");
+        assert_eq!(
+            g,
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+
+        // Malformed token degrades gracefully to no-digest (render still succeeds, unauthenticated).
+        let (_, g) = split_mark("0xabc\u{1F}gd:nothex");
+        assert!(g.is_none());
+    }
+
+    #[test]
+    fn finalize_strips_the_grant_token_from_visible_output() {
+        // The 0x1F token must never reach the visible compositor; finalize must still emit a JPEG.
+        let jpeg = finalize(
+            white(400, 300),
+            Some("0x1a2b..9f0e\u{1F}gd:00112233445566778899aabbccddeeff"),
+        )
+        .expect("jpeg");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
     }
 

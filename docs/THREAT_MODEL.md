@@ -57,7 +57,7 @@ because hiding it would be dishonest and an auditor will find it anyway.
 | **The chain / Base RPC provider** | The rights query `hasAccessByContentId(content_id, wallet)` as an `eth_call`. | The configured RPC endpoint sees `(content_id, wallet)` lookups. On-chain ownership/rights are inherently public. See `capsules/dkms-authority/src/node_chain.rs`. |
 | **An on-path network observer** | TLS/connection metadata: peer addresses, connection timing, frame **counts** and **sizes**. | The channel payloads are sealed (hybrid x25519+ML-KEM-768 AEAD, ML-DSA-65 signed). Frame **lengths** *can* be bucket-padded (see §5) to leak only a size *class*, but padding is a negotiated feature that is **off by default** today, so an observer currently sees exact sealed frame sizes; timing and frame *count* leak regardless. |
 | **The local runtime / gateway** | Plaintext, the wallet linkage, the CEK transiently. | This is the **owner's own trusted local boundary** (PRINCIPLES §1, §5). It is trusted on behalf of the signed-in principal; it is not a remote adversary. A *compromised* runtime is out of scope for confidentiality (it is the thing serving the owner). |
-| **Anyone who obtains a rendered page** (screenshot, screen-share, photo, or a leaked frame) | The **full EVM address of the wallet that opened it** — both as a faint but **human-readable** visible stamp and as a recoverable invisible DCT mark. | The pixel-lock forensic watermark (`docs/PROTECTED_CONTENT.md`) embeds the opening wallet into every protected page so a leak is *traceable*. The deliberate cost: viewing **de-anonymizes the buyer** to anyone who sees the page. The mark is a tracer/deterrent, **not** unforgeable evidence — it is unkeyed and CRC-protected (not signed), so it is **forgeable and repudiable** (§6.6); the authenticated record is the §4 audit log. |
+| **Anyone who obtains a rendered page** (screenshot, screen-share, photo, or a leaked frame) | The **full EVM address of the wallet that opened it** from the **visible** stamp (faint but **human-readable**); the **invisible** DCT mark yields only a 4-byte wallet prefix + an **authenticated grant digest** (not the full address). | The pixel-lock forensic watermark (`docs/PROTECTED_CONTENT.md`) embeds the opening wallet into every protected page so a leak is *traceable*. The deliberate cost: viewing **de-anonymizes the buyer** (via the visible mark) to anyone who sees the page. The invisible layer is **authenticated** — the grant digest gives **non-repudiation** and raises forgery to "needs the victim's signed grant," but is **not** full anti-framing (§6.6); the authenticated system-of-record is the §4 audit log. |
 
 ### The `(wallet, content_id, time)` access pattern
 
@@ -84,6 +84,19 @@ incidental spread (§4, §5); fully blinding it is roadmap (§6).
     Defending that requires **external anchoring** (periodically checkpointing the chain head to the
     Base chain or an external witness). That is a deliberate follow-on; until it lands, do not claim
     more than "tamper-evident against external editing + non-repudiable."
+- **Forensic grant-anchor retention — minimized by design (pending the forensic-retention chunk).**
+  To *verify* a leaked frame, the watermark's authenticated grant digest (§6.6) must be matchable to
+  an open. The decision (option **C**): **fold the 16-byte digest into the existing tamper-evident
+  audit record above — NOT a new forensic log, and NEVER the full grant or full wallet.** It rides
+  alongside the already-fingerprinted `(wallet, content_id)` (`fp:` truncated SHA-256), so the
+  retained surface gains only a digest that *commits to, but does not reveal,* the buyer's signature.
+  This yields **verification, not cold de-anonymization**: a leaked frame's digest is matched to an
+  audit row, and attribution is *confirmed* by re-presenting the suspect's grant and recomputing —
+  the log alone names no one. Because this re-adds the §6.1 access pattern in minimized form, it is a
+  conscious, bounded decision: retention is **access-controlled** and **bounded by an explicit TTL**,
+  not an unbounded archive. *Fallback if the audit record cannot carry it:* a dedicated minimal log
+  of `{time, wallet_prefix (4 B), content_id, grant_digest}` only — same conditions, still never the
+  full grant/wallet. **Status: design agreed (C); until it is wired, no grant digest is persisted.**
 
 ## 5. Channel metadata minimization (coarse, negotiated, off by default today)
 
@@ -121,15 +134,20 @@ scoped by the external firm:
    the rights answer is defended (quorum/agreement over a configured RPC pool; a disagreeing or
    unavailable pool fails closed), but the RPC operator's *visibility* of `(content_id, wallet)` is
    not hidden.
-6. **The buyer's anonymity at view time, and forgery/repudiation of the forensic watermark.** The
-   pixel-lock watermark (§3 row; `docs/PROTECTED_CONTENT.md`) embeds the opening wallet's full
-   address — **visibly (human-readable) and invisibly** — into every rendered page, so anyone who
-   sees a rendered page learns who opened it. This is **by design** (leak-attribution), not a fixable
-   gap. Separately, the mark is **unkeyed and CRC-protected, not signed**, so it is **forgeable** (a
-   third party can plant any wallet to frame it) and **repudiable** (an accused wallet can deny it);
-   treat it as a deterrent/tracer, **not** evidence. The authenticated record is the §4 custody log.
-   *Authenticating the payload* (a media-authority MAC/signature, or an opaque token resolved via the
-   audit log) is the roadmap upgrade that would make the mark stand as evidence.
+6. **The buyer's anonymity at view time, and residual forgery of the forensic watermark.** The
+   pixel-lock watermark (§3 row; `docs/PROTECTED_CONTENT.md`) embeds buyer identity into every
+   rendered page. The **visible** layer carries the opening wallet's **full address**
+   (human-readable), so anyone who sees a rendered page learns who opened it — **by design**
+   (leak-attribution), not a fixable gap. The **invisible** layer carries only a 4-byte wallet
+   prefix plus an **authenticated grant digest** (`grant_watermark_digest16` = SHA-256 of the
+   buyer's wallet-signed delegation signature, truncated to 16 bytes; §7) — *not* the full wallet.
+   That digest gives **non-repudiation** (only the buyer's own wallet signature produces it) and
+   raises forgery from *"anyone can plant any wallet"* to *"only a party holding the victim's signed
+   grant can."* It is **not** the full anti-framing guarantee: the delegation signature is not a
+   hard secret (it transits the recover flow), so a party who obtains a victim's grant could still
+   replant it. A **server-key MAC**, or an **opaque token resolved via the custody log** (so no
+   identity-derived value rides in the mark at all), remains the north-star upgrade. Verifying a
+   leaked frame depends on the retained grant digest (§4).
 
 ## 7. Cryptographic trust roots (for completeness)
 
