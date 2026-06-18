@@ -21,6 +21,8 @@ pub mod font;
 #[cfg(feature = "pdf-render")]
 pub mod image_page;
 #[cfg(feature = "pdf-render")]
+pub mod invisible;
+#[cfg(feature = "pdf-render")]
 pub mod pdf;
 #[cfg(feature = "pdf-render")]
 pub mod svg;

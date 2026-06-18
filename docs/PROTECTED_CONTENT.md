@@ -136,10 +136,10 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 
 - Renderer placement: the `decrypt-provider` capsule (feature `pdf-render`), NOT the
   trusted core. It uses pure-Rust rasterisers — `hayro` (PDF, `#![forbid(unsafe_code)]`),
-  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive),
+  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive), and
   `ab_glyph` + vendored DejaVu fonts (anti-aliased body text — proportional for prose, mono
-  for code) and `font8x8` (the faint tiled watermark glyphs only). The trusted core gains no
-  render code — it only routes bytes (Principle 5/13).
+  for code — AND the faint tiled forensic watermark, same vector face). The trusted core gains
+  no render code — it only routes bytes (Principle 5/13).
 - Containment: the `StreamSegment` op takes an optional `render` directive; when present
   for a pixel-lock mime, the boundary extracts the object from the decrypted fragment and
   returns a watermarked JPEG (`rendered_b64` + `total_pages`) — never the raw bytes. The
@@ -155,9 +155,29 @@ page **images** *inside the decrypt boundary*, and only those images egress.
     chapter) + `X-Asset-Pages`/`X-Asset-Page` headers.
   - `GET …/object/{session}/bytes` → `403` for render-locked (pixel-lock + html-lock) sessions;
     decrypt-passthrough assets (3D `model/*`) are served here.
-- Watermark: the buyer/owner principal is stamped diagonally + tiled across every page
-  (forensic provenance, uncroppable), rendered with the full-ASCII `font8x8` so any
-  principal/DID/wallet is legible (long ids elided to first…last).
+- Watermark (two layers, both carrying the SAME identity — `wallet · content · time`, where
+  `wallet` is the FULL owner EVM address recovered from the wallet-signed access grant, `content`
+  the short on-chain content id, and `time` the UTC open-minute):
+  1. **Visible**: stamped diagonally + tiled across every page (forensic provenance, uncroppable),
+     rendered in the anti-aliased DejaVu mono face at low opacity (a quiet caption, not the old
+     blocky bitmap).
+  2. **Invisible** (`render/invisible.rs`): a blind **DCT-domain QIM** stamp embedded in luminance
+     under perceptual masking (flat white margins left pristine). Each 8×8 block carries one bit in
+     the parity of `round((A−B)/STEP)` for two symmetric mid-band coefficients `A=(1,2)`, `B=(2,1)`;
+     QIM (vs a fixed margin) bounds the per-block nudge so a high-contrast block can never end up
+     carrying the wrong bit. To keep the codeword recoverable from CONTENT-SPARSE pages (a short
+     snippet on a mostly-empty page), the invisible layer carries a COMPACT identity — the 20-byte
+     owner EVM wallet (the visible mark + audit log keep the full `wallet · content · time` tuple) —
+     framed as `SYNC|LEN|DATA|CRC-16` (232-bit period), raster-tiled and majority-vote folded, so a
+     LEAKED frame stays attributable to the wallet even if the visible mark is cropped/painted out.
+     Recovers through our q85 encode, moderate recompression, brightness/contrast shifts,
+     same-resolution screenshots, and vertical offsets; does NOT survive rescaling/rotation/
+     width-changing crops (a geometric-sync layer is future work). Validated end-to-end against the
+     actual rendered text AND (sparse) code pages, not just synthetic images. Offline read:
+     `decrypt-provider --extract-watermark <image>` (prints the recovered `0x…` wallet).
+- **Fail closed**: the single pixel-lock egress (`watermark::finalize`) and the HTML-lock egress
+  (EPUB) both REFUSE to emit a protected page without a non-empty forensic stamp — no identity, no
+  image. There is no code path that emits protected pixels without a traceable mark.
 
 Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
 - `application/pdf` → `pdf` (multi-page, `hayro`)

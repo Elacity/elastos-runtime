@@ -937,15 +937,122 @@ fn is_pixel_lock(mime: &str) -> bool {
         || m.starts_with("image/")
 }
 
-/// A short, readable forensic stamp from a principal id (the full-ASCII watermark font renders
-/// any principal; long DIDs/wallets are elided to first…last so a stamp always fits + shows).
-fn watermark_for(principal: &str) -> String {
+/// Build the forensic stamp for THIS open. The mark is traceable to (1) the WALLET that authorized
+/// the view — recovered from the wallet-signed access grant when present, so it is the real on-chain
+/// owner identity rather than the local principal — (2) the short content id of the asset, and (3)
+/// the UTC minute the view was opened. Tiled across the page by the renderer so it cannot be cropped
+/// off, this answers "who opened WHAT and WHEN" from any leaked frame.
+///
+/// Falls back to the local principal + object cid when no wallet grant is attached (e.g. the local
+/// dev rights mode), so the stamp is never empty (the renderer fails closed on an empty stamp).
+fn watermark_for(args: &QuorumArgs, opened_at: u64) -> String {
+    let (identity, content) = forensic_identity(args);
+    format!(
+        "{identity} \u{00b7} {content} \u{00b7} {}",
+        format_utc_minute(opened_at)
+    )
+}
+
+/// `(display identity, short content id)` for the stamp. Prefers the wallet address + on-chain
+/// `contentId` carried by the wallet-signed [`AccessGrantV1`]; falls back to the principal + cid.
+fn forensic_identity(args: &QuorumArgs) -> (String, String) {
+    if let Some(grant_b64) = args
+        .access_grant_b64
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        if let Some((wallet, kid)) = grant_owner_and_content(grant_b64) {
+            let content = if kid.trim().is_empty() {
+                short_id(&args.object_cid)
+            } else {
+                short_id(&kid)
+            };
+            // FULL wallet address — a half-elided address is not directly traceable on-chain; the
+            // complete `0x…` can be looked up + matched against the access grant. (The invisible
+            // forensic layer carries the identical string, so a leaked frame is attributable.)
+            return (normalize_addr(&wallet), content);
+        }
+    }
+    (elide_principal(&args.principal), short_id(&args.object_cid))
+}
+
+/// Decode the base64 [`AccessGrantV1`] JSON and read the wallet `owner_address` + `kid_hex`
+/// (on-chain content id) from its delegation. Returns `None` if the grant is not parseable (the
+/// caller then falls back to the principal-derived stamp).
+fn grant_owner_and_content(grant_b64: &str) -> Option<(String, String)> {
+    let bytes = B64.decode(grant_b64.trim()).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let delegation = v.get("delegation")?;
+    let owner = delegation.get("owner_address")?.as_str()?.to_string();
+    let kid = delegation
+        .get("kid_hex")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((owner, kid))
+}
+
+/// Normalise an EVM wallet address for the stamp: trim and lower-case the `0x…` hex so the FULL,
+/// directly-searchable address is shown (no elision) and renders consistently. Non-`0x` inputs
+/// pass through trimmed.
+fn normalize_addr(addr: &str) -> String {
+    let a = addr.trim();
+    if let Some(h) = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")) {
+        format!("0x{}", h.to_ascii_lowercase())
+    } else {
+        a.to_string()
+    }
+}
+
+/// Short content id: strip any `0x` and take the leading 10 hex chars (enough to disambiguate an
+/// asset in a marketplace of this size while keeping the stamp compact).
+fn short_id(id: &str) -> String {
+    let s = id.trim();
+    let body = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    let take = body.chars().take(10).collect::<String>();
+    if take.is_empty() {
+        s.to_string()
+    } else {
+        take
+    }
+}
+
+/// Elide a long principal id to `first..last` (the no-wallet fallback identity).
+fn elide_principal(principal: &str) -> String {
     let p = principal.trim();
     if p.len() <= 22 {
         p.to_string()
     } else {
         format!("{}..{}", &p[..10], &p[p.len() - 8..])
     }
+}
+
+/// Format a unix timestamp as a compact UTC `YYYY-MM-DD HH:MMZ` (minute precision is enough for a
+/// per-open forensic mark, and avoids implying false precision). Dependency-free civil-date
+/// conversion (Howard Hinnant's algorithm) so the helper pulls no date crate.
+fn format_utc_minute(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hour, minute) = (rem / 3600, (rem % 3600) / 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}Z")
+}
+
+/// Convert days-since-Unix-epoch to `(year, month, day)` in the proleptic Gregorian calendar.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// `--quorum` entrypoint: recover the asset once, print the object descriptor, then serve the
@@ -1132,7 +1239,9 @@ fn serve_media(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), String> {
 /// `pixel_locked: true` + `total_pages`; the gateway's page route drives `{"op":"page","n":I}`.
 /// The decrypt boundary stays warm so each page renders in-VM without another quorum recovery.
 fn serve_pixel_lock(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), String> {
-    let watermark = watermark_for(&args.principal);
+    // Stamp = wallet (from the signed grant) · short content id · UTC open minute. Built ONCE so
+    // every page of this open carries the same per-open mark (constant open time across pages).
+    let watermark = watermark_for(args, now_unix());
 
     // Render page 0 up front: ships material ONCE, warms the in-VM parsed-document session, and
     // yields the page count for the descriptor. Every later page reuses that warm session.
@@ -1212,4 +1321,87 @@ fn serve_pixel_lock(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), Stri
 fn reply(out: &mut impl Write, value: &Value) -> Result<(), String> {
     writeln!(out, "{value}").map_err(|e| format!("write reply: {e}"))?;
     out.flush().map_err(|e| format!("flush reply: {e}"))
+}
+
+#[cfg(test)]
+mod watermark_tests {
+    use super::*;
+
+    fn args_with_grant(grant_b64: Option<String>) -> QuorumArgs {
+        QuorumArgs {
+            principal: "person:local:0123456789abcdef0123456789abcdef".to_string(),
+            decrypt_bin: String::new(),
+            key_bin: String::new(),
+            capsule_path: String::new(),
+            descriptor_path: String::new(),
+            caller_seed_b64: String::new(),
+            object_cid: "0xCAFEBABEdeadbeef00112233".to_string(),
+            mime: "application/pdf".to_string(),
+            ttl_secs: 60,
+            dash_dir: None,
+            access_grant_b64: grant_b64,
+        }
+    }
+
+    fn grant_b64(owner: &str, kid: &str) -> String {
+        let v = json!({ "delegation": { "owner_address": owner, "kid_hex": kid } });
+        B64.encode(serde_json::to_vec(&v).unwrap())
+    }
+
+    #[test]
+    fn normalize_addr_keeps_full_lowercased_address() {
+        assert_eq!(
+            normalize_addr("0x1234567890ABCDEF1234567890abcdef12345678"),
+            "0x1234567890abcdef1234567890abcdef12345678"
+        );
+        // Non-0x inputs pass through trimmed.
+        assert_eq!(normalize_addr("  anon  "), "anon");
+    }
+
+    #[test]
+    fn short_id_strips_0x_and_truncates() {
+        assert_eq!(short_id("0xCAFEBABEdeadbeef"), "CAFEBABEde");
+        assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn utc_minute_formats_known_epoch() {
+        // 1700000000 == 2023-11-14 22:13:20 UTC (well-known epoch).
+        assert_eq!(format_utc_minute(1_700_000_000), "2023-11-14 22:13Z");
+        // Unix epoch.
+        assert_eq!(format_utc_minute(0), "1970-01-01 00:00Z");
+    }
+
+    #[test]
+    fn full_stamp_uses_the_open_time() {
+        let stamp = watermark_for(&args_with_grant(None), 1_700_000_000);
+        assert!(stamp.ends_with("2023-11-14 22:13Z"), "stamp: {stamp}");
+    }
+
+    #[test]
+    fn stamp_prefers_wallet_and_content_from_grant() {
+        let args = args_with_grant(Some(grant_b64(
+            "0xAbC1230000000000000000000000000000009f0e",
+            "0xdeadbeefcafef00d",
+        )));
+        let (identity, content) = forensic_identity(&args);
+        assert_eq!(identity, "0xabc1230000000000000000000000000000009f0e");
+        assert_eq!(content, "deadbeefca");
+    }
+
+    #[test]
+    fn stamp_falls_back_to_principal_without_a_grant() {
+        let args = args_with_grant(None);
+        let (identity, content) = forensic_identity(&args);
+        // Principal is elided (first10..last8); content from the object cid.
+        assert!(identity.contains(".."));
+        assert_eq!(content, "CAFEBABEde");
+    }
+
+    #[test]
+    fn full_stamp_is_never_empty() {
+        let stamp = watermark_for(&args_with_grant(None), 1_781_516_433);
+        assert!(stamp.contains('\u{00b7}'));
+        assert!(!stamp.trim().is_empty());
+    }
 }

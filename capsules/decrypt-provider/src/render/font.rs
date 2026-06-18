@@ -62,6 +62,27 @@ pub fn draw_line<F: Font>(
     px: f32,
     ink: [u8; 3],
 ) -> f32 {
+    draw_line_opacity(img, font, text, x, baseline_y, px, ink, 1.0)
+}
+
+/// Like [`draw_line`] but every glyph's coverage is scaled by `opacity` in `[0,1]`. Used by the
+/// faint tiled forensic watermark ([`super::watermark`]) so the stamp is rendered in the SAME
+/// anti-aliased vector face as the body text — legible but non-destructive — instead of the old
+/// 1-bit bitmap. `opacity = 1.0` is identical to [`draw_line`].
+// Mirrors `draw_line`'s positional layout (image, face, text, x, baseline, px, ink) plus the
+// opacity scalar — a params struct would just obscure this hot per-glyph call.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_line_opacity<F: Font>(
+    img: &mut RgbaImage,
+    font: &F,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    px: f32,
+    ink: [u8; 3],
+    opacity: f32,
+) -> f32 {
+    let opacity = opacity.clamp(0.0, 1.0);
     let sf = font.as_scaled(PxScale::from(px));
     let (w, h) = img.dimensions();
     let mut caret = x;
@@ -85,7 +106,7 @@ pub fn draw_line<F: Font>(
                     return;
                 }
                 let p = img.get_pixel_mut(px_x as u32, px_y as u32);
-                let a = cov.clamp(0.0, 1.0);
+                let a = (cov * opacity).clamp(0.0, 1.0);
                 p[0] = blend(p[0], ink[0], a);
                 p[1] = blend(p[1], ink[1], a);
                 p[2] = blend(p[2], ink[2], a);

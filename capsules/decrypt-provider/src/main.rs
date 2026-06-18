@@ -1758,7 +1758,46 @@ fn require_identifier(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
+/// Offline forensic extraction: read the INVISIBLE watermark from a (possibly leaked/re-saved)
+/// rendered image and print the recovered `wallet · content · time` identity. Read-only, no key
+/// material — a pure analysis tool over an already-public image. `decrypt-provider
+/// --extract-watermark <image>`; exit 0 + the string on success, exit 1 if none is recoverable.
+#[cfg(feature = "pdf-render")]
+fn run_extract_watermark(path: &str) -> i32 {
+    let img = match image::open(path) {
+        Ok(img) => img.to_rgba8(),
+        Err(e) => {
+            eprintln!("decrypt-provider: could not read image {path}: {e}");
+            return 2;
+        }
+    };
+    match render::invisible::extract(&img) {
+        Some(stamp) => {
+            println!("{stamp}");
+            0
+        }
+        None => {
+            eprintln!("decrypt-provider: no recoverable forensic watermark in {path}");
+            1
+        }
+    }
+}
+
 fn main() {
+    // Offline forensic-extraction mode (read-only analysis; no stdio protocol, no key material).
+    #[cfg(feature = "pdf-render")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--extract-watermark") {
+            let path = args.get(pos + 1).cloned().unwrap_or_default();
+            if path.is_empty() {
+                eprintln!("usage: decrypt-provider --extract-watermark <image-path>");
+                std::process::exit(2);
+            }
+            std::process::exit(run_extract_watermark(&path));
+        }
+    }
+
     eprintln!(
         "decrypt-provider: starting v{} (protected content decrypt/render)",
         PROVIDER_VERSION

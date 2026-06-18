@@ -367,7 +367,6 @@ dependencies = [
  "ddrm-envelope",
  "elastos-common",
  "elliptic-curve",
- "font8x8",
  "getrandom",
  "hayro",
  "image",
@@ -602,12 +601,6 @@ checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
 dependencies = [
  "bytemuck",
 ]
-
-[[package]]
-name = "font8x8"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "generic-array"

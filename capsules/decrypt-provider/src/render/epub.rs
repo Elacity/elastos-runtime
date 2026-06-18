@@ -110,6 +110,14 @@ impl ParsedEpub {
         _max_width: Option<u32>,
         watermark: Option<&str>,
     ) -> Result<Vec<u8>, String> {
+        // Fail closed: a protected chapter must never egress without a traceable forensic stamp,
+        // exactly like the pixel-lock egress path (`watermark::finalize`).
+        let watermark = watermark
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("refusing to emit a protected chapter without a forensic watermark")?;
+        let watermark = Some(watermark);
+
         let total = self.total_pages();
         if page >= total {
             return Err(format!(

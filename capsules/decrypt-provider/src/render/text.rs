@@ -173,7 +173,11 @@ mod tests {
         // (121 wrapped lines), so at 40 lines/page that is 4 pages.
         let body: String = (0..120).map(|i| format!("line {i}\n")).collect();
         let parsed = parse(body.as_bytes()).expect("parse");
-        assert_eq!(parsed.total_pages(), 4, "121 wrapped lines / 40 per page = 4 pages");
+        assert_eq!(
+            parsed.total_pages(),
+            4,
+            "121 wrapped lines / 40 per page = 4 pages"
+        );
         let bytes = parsed
             .render_page(0, Some(800), Some("0xBUYER"))
             .expect("render page 1");
@@ -227,7 +231,16 @@ mod tests {
     fn empty_input_is_one_page() {
         let parsed = parse(b"").expect("parse empty");
         assert_eq!(parsed.total_pages(), 1);
-        assert!(parsed.render_page(0, None, None).is_ok());
+        // A real render carries the forensic stamp; with one supplied page 0 renders fine.
+        assert!(parsed.render_page(0, None, Some("0xBUYER..a1b2")).is_ok());
+    }
+
+    #[test]
+    fn render_fails_closed_without_a_watermark() {
+        // Fail closed: a protected page must never egress without a traceable forensic stamp.
+        let parsed = parse(b"protected body").expect("parse");
+        assert!(parsed.render_page(0, None, None).is_err());
+        assert!(parsed.render_page(0, None, Some("   ")).is_err());
     }
 
     /// Dev-only visual check: `ELASTOS_RENDER_SAMPLE=1 cargo test --features pdf-render
