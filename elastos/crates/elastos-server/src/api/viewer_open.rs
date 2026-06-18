@@ -63,6 +63,22 @@ fn log_fp(value: &str) -> String {
     format!("fp:{}", hex::encode(&digest[..4]))
 }
 
+/// The forensic-watermark grant anchor (hex) for a wallet-signed grant: `SHA-256(normalized
+/// delegation signature)[..16]`. A NON-reversible commitment to the buyer's EIP-191 delegation
+/// signature — the same value the invisible pixel-lock mark embeds — so a leaked frame can be
+/// verified against the §4 custody record (`audit_log().content_open`). MUST stay byte-identical to
+/// `ddrm_envelope::grant_watermark_digest16` (the embedder side); elastos-server deliberately does
+/// NOT link the PQ `ddrm-envelope` crate, so this is the no-shared-dep twin guarded by the
+/// `grant_watermark_digest_matches_envelope_golden` cross-check (the `is_pixel_lock` pattern).
+/// Normalization (trim + lowercase) is pinned by that golden so the two sides cannot silently
+/// disagree on input handling.
+fn grant_watermark_digest16_hex(delegation_sig_hex: &str) -> String {
+    use sha2::Digest as _;
+    let normalized = delegation_sig_hex.trim().to_ascii_lowercase();
+    let digest = sha2::Sha256::digest(normalized.as_bytes());
+    hex::encode(&digest[..16])
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OpenOwnedRequest {
     /// The Library object URI to open (e.g. `localhost://Users/<principal>/…/clip.mp4`).
@@ -369,6 +385,7 @@ pub async fn open_owned_in_viewer(
             "open",
             "denied",
             &rights.source,
+            None,
         ) {
             tracing::error!("AUDIT content_open(denied) append failed: {e}");
         }
@@ -380,31 +397,18 @@ pub async fn open_owned_in_viewer(
     }
     let rights_binding = rights.receipt_hash_hex.clone();
 
-    // GAP-8: the who-opened-what-when CUSTODY record. We are now AUTHORIZED and committed to opening
-    // (mint session → decrypt). Write it to the tamper-evident log BEFORE the open proceeds, and
-    // FAIL CLOSED if it cannot be durably committed: an open that cannot be recorded in the custody
-    // trail does not happen (custody integrity over availability — fail closed, then explain).
-    if let Err(e) = state.audit_log().content_open(
-        &session_id,
-        &context.principal_id,
-        &object_cid,
-        "open",
-        "opened",
-        &rights.source,
-    ) {
-        tracing::error!("AUDIT content_open(opened) append failed; refusing the open: {e}");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audit log unavailable; refusing to open without a custody record",
-        )
-            .into_response();
-    }
-
-    if let Some(capsule) = capsule {
+    // Resolve the wallet-signed grant for a QUORUM (capsule) open BEFORE the custody write, so the
+    // §4 record can carry the forensic grant anchor (`grant_digest`) bound to the EXACT grant
+    // forwarded to the dKMS nodes (a non-reversible commitment to the buyer's delegation signature
+    // that the invisible watermark also embeds — see docs/THREAT_MODEL.md §4). A malformed fresh
+    // grant is rejected here, before any custody "opened" record is written. Media / no-grant opens
+    // resolve to `None` (no anchor). `grant_digest` is set from the SAME signature each path uses.
+    let mut grant_digest: Option<String> = None;
+    let capsule_access_grant_b64: Option<String> = if capsule.is_some() {
         // TRUSTLESS open: if the browser collected a wallet signature (phase 2), assemble the
         // wallet-signed grant here and forward it so the dKMS nodes authorize themselves. Absent
         // (or malformed) => fall through to the legacy enrolled-caller path (None).
-        let access_grant_b64 = match (
+        match (
             req.grant_handle.as_deref(),
             req.delegation_sig_hex.as_deref(),
         ) {
@@ -414,6 +418,7 @@ pub async fn open_owned_in_viewer(
                     .and_then(|g| super::access_grant::grant_to_b64(&g))
                 {
                     Ok(b64) => {
+                        grant_digest = Some(grant_watermark_digest16_hex(sig));
                         tracing::info!(
                             "trustless open: assembled wallet-signed grant for cid {object_cid}"
                         );
@@ -437,16 +442,24 @@ pub async fn open_owned_in_viewer(
             _ => {
                 let kid_for_grant = normalize_kid_0x(&object_cid);
                 match super::access_grant::assemble_cached(&subject, &kid_for_grant) {
-                    Ok(Some(grant)) => match super::access_grant::grant_to_b64(&grant) {
-                        Ok(b64) => {
-                            tracing::info!("trustless open: reused cached delegation (no wallet popup) for cid {}", log_fp(&object_cid));
-                            Some(b64)
+                    Ok(Some(grant)) => {
+                        // Anchor from the cached delegation's own signature (the one being forwarded).
+                        grant_digest = grant
+                            .get("delegation_sig_hex")
+                            .and_then(|v| v.as_str())
+                            .map(grant_watermark_digest16_hex);
+                        match super::access_grant::grant_to_b64(&grant) {
+                            Ok(b64) => {
+                                tracing::info!("trustless open: reused cached delegation (no wallet popup) for cid {}", log_fp(&object_cid));
+                                Some(b64)
+                            }
+                            Err(err) => {
+                                tracing::warn!("trustless open: cached grant serialize failed ({err}); falling back to enrolled path");
+                                grant_digest = None;
+                                None
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!("trustless open: cached grant serialize failed ({err}); falling back to enrolled path");
-                            None
-                        }
-                    },
+                    }
                     Ok(None) => None,
                     Err(err) => {
                         tracing::warn!("trustless open: cached grant assemble failed ({err}); falling back to enrolled path");
@@ -454,7 +467,34 @@ pub async fn open_owned_in_viewer(
                     }
                 }
             }
-        };
+        }
+    } else {
+        None
+    };
+
+    // GAP-8: the who-opened-what-when CUSTODY record. We are now AUTHORIZED and committed to opening
+    // (mint session → decrypt). Write it to the tamper-evident log BEFORE the open proceeds, and
+    // FAIL CLOSED if it cannot be durably committed: an open that cannot be recorded in the custody
+    // trail does not happen (custody integrity over availability — fail closed, then explain). The
+    // forensic grant anchor rides here (non-reversible; `None` for media/no-grant opens).
+    if let Err(e) = state.audit_log().content_open(
+        &session_id,
+        &context.principal_id,
+        &object_cid,
+        "open",
+        "opened",
+        &rights.source,
+        grant_digest.as_deref(),
+    ) {
+        tracing::error!("AUDIT content_open(opened) append failed; refusing the open: {e}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit log unavailable; refusing to open without a custody record",
+        )
+            .into_response();
+    }
+
+    if let Some(capsule) = capsule {
         return open_quorum(
             state,
             context,
@@ -465,7 +505,7 @@ pub async fn open_owned_in_viewer(
             decrypt_bin,
             session_id,
             rights_binding,
-            access_grant_b64,
+            capsule_access_grant_b64,
         )
         .await;
     }
@@ -1492,4 +1532,24 @@ async fn resolve_subject_address(state: &GatewayState, principal_id: &str) -> St
         .and_then(|acct| acct.get("address").and_then(|v| v.as_str()))
         .map(str::to_string)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GOLDEN cross-check: this no-shared-dep twin MUST equal `ddrm_envelope::grant_watermark_digest16`
+    /// (the embedder). The same `(sig -> digest)` pair is asserted in `ddrm-envelope`'s test, so if
+    /// either side changes its hashing or normalization, one of the two assertions fails. The pinned
+    /// input exercises the normalization edge cases (mixed-case hex + surrounding whitespace).
+    #[test]
+    fn grant_watermark_digest_matches_envelope_golden() {
+        const GOLDEN: &str = "a9e8be55b175d58849e16689d09a746f";
+        // Canonical input.
+        assert_eq!(grant_watermark_digest16_hex("0x1234abcd"), GOLDEN);
+        // Mixed case + whitespace must normalize to the SAME digest (the only place A could drift).
+        assert_eq!(grant_watermark_digest16_hex("  0x1234ABCD  "), GOLDEN);
+        // 16 bytes => 32 hex chars.
+        assert_eq!(grant_watermark_digest16_hex("anything").len(), 32);
+    }
 }

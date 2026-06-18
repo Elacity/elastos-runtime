@@ -190,6 +190,13 @@ pub enum AuditEvent {
         decision: String,
         /// The rights-decision provenance (e.g. `chain-provider (live RPC: …)`), for the trail.
         source: String,
+        /// The forensic-watermark grant anchor for this open (`grant_watermark_digest16` hex): a
+        /// NON-reversible commitment to the buyer's signed delegation that the invisible pixel-lock
+        /// mark also carries, so a leaked frame is verifiable against this custody row (see
+        /// `docs/THREAT_MODEL.md` §4). `None` for opens with no wallet-signed grant (e.g. media /
+        /// legacy enrolled-caller). Skipped when absent so prior records hash-verify unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_digest: Option<String>,
     },
 
     /// Authentication attempt
@@ -614,6 +621,7 @@ impl AuditLog {
         action: &str,
         decision: &str,
         source: &str,
+        grant_digest: Option<&str>,
     ) -> Result<(), AuditError> {
         self.emit(AuditEvent::ContentOpen {
             timestamp: SecureTimestamp::now(),
@@ -623,6 +631,7 @@ impl AuditLog {
             action: action.to_string(),
             decision: decision.to_string(),
             source: source.to_string(),
+            grant_digest: grant_digest.map(str::to_string),
         })
     }
 
@@ -1171,6 +1180,7 @@ mod tests {
             "view",
             "opened",
             "chain-provider",
+            None,
         )
         .expect("content_open must commit");
         log.runtime_stop();
@@ -1211,6 +1221,47 @@ mod tests {
     }
 
     #[test]
+    fn content_open_grant_digest_is_optional_and_chain_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_file(&path).unwrap();
+        // One open WITHOUT a grant (media/legacy) and one WITH the forensic anchor.
+        log.content_open("s1", "p:alice", "c/1", "view", "opened", "src", None)
+            .unwrap();
+        log.content_open(
+            "s2",
+            "p:bob",
+            "c/2",
+            "view",
+            "opened",
+            "src",
+            Some("00112233445566778899aabbccddeeff"),
+        )
+        .unwrap();
+        let vk = read_verifying_key(&log);
+        assert_eq!(
+            log.verify_chain(Some(&vk)).unwrap(),
+            2,
+            "both records verify"
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let recs: Vec<&str> = content.lines().collect();
+        // Backward-compat: a no-grant open omits the field entirely (prior records hash unchanged).
+        assert!(
+            !recs[0].contains("grant_digest"),
+            "absent digest must be skipped: {}",
+            recs[0]
+        );
+        // A grant-bearing open carries the non-reversible commitment.
+        assert!(
+            recs[1].contains("\"grant_digest\":\"00112233445566778899aabbccddeeff\""),
+            "present digest must be recorded: {}",
+            recs[1]
+        );
+    }
+
+    #[test]
     fn flipping_a_byte_in_a_record_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.log");
@@ -1222,6 +1273,7 @@ mod tests {
             "view",
             "opened",
             "src",
+            None,
         )
         .unwrap();
         log.runtime_stop();
@@ -1254,6 +1306,7 @@ mod tests {
             "view",
             "opened",
             "src",
+            None,
         )
         .unwrap();
         log.runtime_stop();

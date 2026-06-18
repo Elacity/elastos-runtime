@@ -2057,6 +2057,26 @@ mod tests {
         assert_ne!(a, grant_watermark_digest16("0x1234abce"));
     }
 
+    /// GOLDEN cross-check shared with `elastos-server`'s no-shared-dep twin
+    /// (`grant_watermark_digest16_hex`, asserted there against the SAME `(sig → digest)` pair). These
+    /// two crates do not share a dependency, so this pinned vector is what keeps them from drifting: a
+    /// change to the hashing OR the trim/lowercase normalization on either side fails one assertion.
+    #[test]
+    fn grant_watermark_digest_golden_vector() {
+        const GOLDEN: &str = "a9e8be55b175d58849e16689d09a746f";
+        let hex: String = grant_watermark_digest16("0x1234abcd")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, GOLDEN);
+        // Same digest under mixed case + whitespace (pins the normalization the twin must match).
+        let norm: String = grant_watermark_digest16("  0x1234ABCD  ")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(norm, GOLDEN);
+    }
+
     #[test]
     fn mint_session_from_seed_is_deterministic_and_usable() {
         let seed = [0x4Du8; 32];

@@ -84,19 +84,22 @@ incidental spread (§4, §5); fully blinding it is roadmap (§6).
     Defending that requires **external anchoring** (periodically checkpointing the chain head to the
     Base chain or an external witness). That is a deliberate follow-on; until it lands, do not claim
     more than "tamper-evident against external editing + non-repudiable."
-- **Forensic grant-anchor retention — minimized by design (pending the forensic-retention chunk).**
+- **Forensic grant-anchor retention — minimized by design (option C, wired).**
   To *verify* a leaked frame, the watermark's authenticated grant digest (§6.6) must be matchable to
   an open. The decision (option **C**): **fold the 16-byte digest into the existing tamper-evident
   audit record above — NOT a new forensic log, and NEVER the full grant or full wallet.** It rides
-  alongside the already-fingerprinted `(wallet, content_id)` (`fp:` truncated SHA-256), so the
-  retained surface gains only a digest that *commits to, but does not reveal,* the buyer's signature.
-  This yields **verification, not cold de-anonymization**: a leaked frame's digest is matched to an
-  audit row, and attribution is *confirmed* by re-presenting the suspect's grant and recomputing —
-  the log alone names no one. Because this re-adds the §6.1 access pattern in minimized form, it is a
-  conscious, bounded decision: retention is **access-controlled** and **bounded by an explicit TTL**,
-  not an unbounded archive. *Fallback if the audit record cannot carry it:* a dedicated minimal log
-  of `{time, wallet_prefix (4 B), content_id, grant_digest}` only — same conditions, still never the
-  full grant/wallet. **Status: design agreed (C); until it is wired, no grant digest is persisted.**
+  alongside the already-fingerprinted `(wallet, content_id)` (`fp:` truncated SHA-256) as an optional
+  `grant_digest` field on the `content_open` record (`elastos-runtime/.../primitives/audit.rs`;
+  written by `viewer_open.rs` from the exact grant forwarded to the quorum). This yields
+  **verification, not cold de-anonymization**: a leaked frame's digest is matched to an audit row,
+  and attribution is *confirmed* by re-presenting the suspect's grant and recomputing — the log alone
+  names no one. It is a conscious decision: retention is **access-controlled**, and the digest is a
+  **non-reversible commitment** (it commits to, but does not reveal, the signature) stored only as
+  the append-only custody chain's own retention — **not TTL-bounded**, because the chain is
+  intentionally permanent and tamper-evident, and because the digest adds **no raw identity** to
+  records that are already fingerprinted. (A TTL-prunable index was rejected: it would be a second
+  who-opened record (Principle 10) and would retain a raw wallet prefix the chain does not.) Media /
+  no-grant opens carry no digest (the field is omitted, so prior records hash-verify unchanged).
 
 ## 5. Channel metadata minimization (coarse, negotiated, off by default today)
 
