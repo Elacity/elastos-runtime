@@ -608,6 +608,59 @@ impl Drop for DkmsNodeConn {
     }
 }
 
+/// THRESHOLD-WITH-GRACE collector for the parallel 2-of-N quorum recover. Drains `rx` (one outcome
+/// per spawned recover thread, `expected` total) and returns the moment `needed` SERVED shares
+/// (`Ok` outcomes) have landed PLUS a short `grace` window to admit one more promptly-arriving share
+/// for the downstream cheater cross-check — rather than waiting for every thread. It also returns
+/// early if all `expected` outcomes arrive, or if `hard_cap` elapses (a safety net for a wedged
+/// thread that never reports; live threads always report within their own per-node timeout). This
+/// is what lets a single dead/slow node stop being waited on instead of holding the whole release
+/// hostage. Pure with respect to the channel + clock, so the resilience behaviour is unit-testable.
+/// Returns `(collected_outcomes, served_count)`; the caller fails closed if `served_count < needed`.
+/// One node's recover outcome: its index in the candidate set, and either its served share (`Ok`)
+/// or a fault (`Err`). Selecting in index order below keeps the merge input deterministic.
+#[cfg(all(feature = "key-authority-ref", unix))]
+type RecoverOutcome = (usize, Result<Value, String>);
+
+#[cfg(all(feature = "key-authority-ref", unix))]
+fn collect_quorum_shares(
+    rx: &std::sync::mpsc::Receiver<RecoverOutcome>,
+    expected: usize,
+    needed: usize,
+    grace: std::time::Duration,
+    hard_cap: std::time::Duration,
+) -> (Vec<RecoverOutcome>, usize) {
+    let mut results: Vec<RecoverOutcome> = Vec::with_capacity(expected);
+    let mut served = 0usize;
+    // Set once the threshold is met: the latest instant we'll keep waiting for one extra share.
+    let mut grace_until: Option<std::time::Instant> = None;
+    let deadline = std::time::Instant::now() + hard_cap;
+    while results.len() < expected {
+        let budget = match grace_until {
+            Some(g) => g.saturating_duration_since(std::time::Instant::now()),
+            None => deadline.saturating_duration_since(std::time::Instant::now()),
+        };
+        if budget.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(budget) {
+            Ok((idx, share)) => {
+                if share.is_ok() {
+                    served += 1;
+                }
+                results.push((idx, share));
+                if served >= needed && grace_until.is_none() {
+                    grace_until = Some(std::time::Instant::now() + grace);
+                }
+            }
+            // Grace/hard-cap elapsed, or every live thread already reported (sender dropped) — stop
+            // waiting and let the fail-closed quorum math adjudicate whatever shares we have.
+            Err(_) => break,
+        }
+    }
+    (results, served)
+}
+
 /// OPEN the long-lived node connection + establish the handshake session ONCE: spawn the granted
 /// `endpoint`, `init` it (the node resolves its OWN master store), then run the identity handshake —
 /// send a fresh challenge, require a signature over it under the descriptor-PINNED verifying key
@@ -1944,65 +1997,103 @@ impl KeyProvider {
         // latency AND resilience. Still strictly FAIL-CLOSED: the quorum math below refuses any release
         // with fewer than two served shares, and a panicked recover thread is counted a fault, never a
         // share. Shares are selected in node order (A,B,C) so the merge input is deterministic.
+        // THRESHOLD-WITH-GRACE quorum recover. Dial + handshake + recover ALL THREE nodes
+        // CONCURRENTLY (as before), but on DETACHED threads feeding an mpsc channel, and RETURN the
+        // instant the 2-of-3 threshold is met — plus a short GRACE window to admit a promptly-arriving
+        // third share for the cheater cross-check — instead of JOINING all three. This realizes the
+        // long-documented "slowest of the two fastest" intent: previously the collector join()ed every
+        // handle, so a single dead/wedged node held the whole release hostage for its full per-node
+        // carrier timeout (~20 s), blowing past the caller's open deadline and wedging the open even
+        // though two healthy shares were already in hand. Now the dead node simply stops being waited
+        // on; its thread finishes (or times out) and cleans up its own pooled connection on its own.
+        //
+        // Invariants preserved: STILL FAIL-CLOSED (the quorum math below refuses any release with
+        // fewer than two served shares); a recover that panics is caught and COUNTED AS A FAULT, never
+        // a share, so a single-threaded warm-daemon accept loop can't be aborted by one bad node
+        // (DEV_MODE_GUARD_SPEC defense-in-depth); a spawn FAILURE is likewise a fault, not a panic.
+        // The 16 MiB stack stays — the PQ-hybrid recover (ML-KEM-768 unseal + ML-DSA-65 verify, with
+        // sizable in-frame buffers) overflows a default 2 MiB stack. Shares stay selected in node
+        // order (A,B,C) below so the merge input is deterministic.
+        const QUORUM_NEEDED: usize = 2;
+        // Once two shares land, wait briefly for a third (for the cheater cross-check) before
+        // proceeding. Healthy nodes answer within ~1-2 s of each other, so this is enough to admit a
+        // live third while never blocking on a dead one.
+        const THIRD_SHARE_GRACE_MS: u64 = 1_500;
+        // Safety net only: every recover thread always sends (success or error) within its own per-node
+        // carrier timeout, so this just bounds a pathologically wedged thread that never reports. Kept
+        // just above the worst-case per-node time so a genuinely slow-but-alive node is never cut off.
+        const RECOVER_HARD_CAP_MS: u64 = 24_000;
+
         let t_par = std::time::Instant::now();
-        let pool = &self.dkms_pool;
-        let results: Vec<(usize, Result<Value, String>)> = std::thread::scope(|scope| {
-            let decrypt_pub = session.decrypt_session_pub_b64.as_str();
-            let cid = content_id.as_str();
-            // The PQ-hybrid recover (ML-KEM-768 unseal + ML-DSA-65 verify, with sizable in-frame
-            // buffers) is a STACK HOG. A default-stack scoped thread (2 MiB) overflows it; the serial
-            // path got away with it only by running on the 8 MiB main thread. Give each recover thread
-            // an explicit 16 MiB stack so the concurrent rail matches the main-thread headroom.
-            // Spawn each recover thread; a spawn FAILURE (e.g. thread/memory/ulimit pressure —
-            // the 16 MiB×3 reservation enlarges that surface) is COUNTED AS A FAULT for that node,
-            // never an `.expect()` panic. In the single-threaded warm-daemon accept loop a panic
-            // here would abort the whole daemon; the quorum math below still fails closed if fewer
-            // than two shares are served. (DEV_MODE_GUARD_SPEC defense-in-depth.)
-            type SpawnOutcome<'s> = Result<
-                std::thread::ScopedJoinHandle<'s, (usize, Result<Value, String>)>,
-                (usize, String),
-            >;
-            let handles: Vec<SpawnOutcome> = candidates
-                .iter()
-                .enumerate()
-                .map(|(idx, (client, req, _label))| {
-                    std::thread::Builder::new()
-                        .name(format!("dkms-recover-{idx}"))
-                        .stack_size(16 * 1024 * 1024)
-                        .spawn_scoped(scope, move || {
-                            (
-                                idx,
-                                Self::recover_one_node_pooled(
-                                    pool,
-                                    *client,
-                                    req,
-                                    kid_hex,
-                                    decrypt_pub,
-                                    cid,
-                                    now,
-                                ),
-                            )
-                        })
-                        .map_err(|e| {
-                            (
-                                idx,
-                                format!("failed to spawn recover thread for node {idx}: {e}"),
-                            )
-                        })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|outcome| match outcome {
-                    Ok(h) => h
-                        .join()
-                        .unwrap_or((usize::MAX, Err("recover thread panicked".to_string()))),
-                    Err((idx, e)) => (idx, Err(e)),
-                })
-                .collect()
-        });
+        let pool = self.dkms_pool.clone();
+        let decrypt_pub = session.decrypt_session_pub_b64.clone();
+        let cid = content_id.clone();
+        let kid = kid_hex.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel::<RecoverOutcome>();
+        let mut results: Vec<RecoverOutcome> = Vec::with_capacity(3);
+        let mut expected = 0usize;
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let tx = tx.clone();
+            let pool = pool.clone();
+            let client: DkmsClientAuthority = candidate.0.clone();
+            let req: Value = candidate.1.clone();
+            let kid = kid.clone();
+            let decrypt_pub = decrypt_pub.clone();
+            let cid = cid.clone();
+            match std::thread::Builder::new()
+                .name(format!("dkms-recover-{idx}"))
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let share = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::recover_one_node_pooled(
+                            &pool,
+                            &client,
+                            &req,
+                            &kid,
+                            &decrypt_pub,
+                            &cid,
+                            now,
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err("recover thread panicked".to_string()));
+                    // The receiver may have already moved on (threshold met); a closed channel is
+                    // expected and harmless — the share is simply discarded.
+                    let _ = tx.send((idx, share));
+                }) {
+                Ok(_) => expected += 1,
+                Err(e) => results.push((
+                    idx,
+                    Err(format!(
+                        "failed to spawn recover thread for node {idx}: {e}"
+                    )),
+                )),
+            }
+        }
+        // Drop our own sender so the channel disconnects once all live threads have reported.
+        drop(tx);
+
+        let (mut served, successes) = collect_quorum_shares(
+            &rx,
+            expected,
+            QUORUM_NEEDED,
+            std::time::Duration::from_millis(THIRD_SHARE_GRACE_MS),
+            std::time::Duration::from_millis(RECOVER_HARD_CAP_MS),
+        );
+        results.append(&mut served);
+        // Any node that never reported within the window (a slow/wedged straggler we stopped waiting
+        // on) is recorded as a timeout fault so a fail-closed message names every node. Its detached
+        // thread keeps running and cleans up its own pooled connection independently.
+        for (idx, _candidate) in candidates.iter().enumerate() {
+            if !results.iter().any(|(i, _)| *i == idx) {
+                results.push((
+                    idx,
+                    Err("no share within the recover window (slow/unreachable)".to_string()),
+                ));
+            }
+        }
         eprintln!(
-            "key-provider timing: parallel quorum recover (3 nodes concurrent) {} ms",
+            "key-provider timing: threshold-with-grace quorum recover ({successes}/{expected} served) {} ms",
             t_par.elapsed().as_millis()
         );
 
@@ -2868,6 +2959,131 @@ mod tests {
         DEFAULT_PROTECTED_CONTENT_CIPHER, DEFAULT_PROTECTED_CONTENT_KEMS,
         DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME, DEFAULT_PROTECTED_CONTENT_SIGNATURES,
     };
+
+    /// THRESHOLD-WITH-GRACE collector resilience: a single dead/slow node must never hold a release
+    /// hostage once two healthy shares are in hand. These drive `collect_quorum_shares` directly over
+    /// an mpsc channel (no live carrier needed), simulating fast/slow/dead nodes via timed sends.
+    #[cfg(all(feature = "key-authority-ref", unix))]
+    mod quorum_collect {
+        use super::super::collect_quorum_shares;
+        use serde_json::json;
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        fn ok() -> Result<serde_json::Value, String> {
+            Ok(json!({"share": "ok"}))
+        }
+        fn fault() -> Result<serde_json::Value, String> {
+            Err("node fault".to_string())
+        }
+
+        #[test]
+        fn returns_at_threshold_without_waiting_for_a_dead_node() {
+            // Three expected; two answer immediately, the third NEVER reports (its sender stays alive,
+            // simulating a wedged-but-connected node). With a 10 s hard cap, the collector must still
+            // return promptly — proving it does NOT join the dead node.
+            let (tx, rx) = channel::<(usize, Result<serde_json::Value, String>)>();
+            let dead_sender = tx.clone(); // held open: the third node is alive-but-silent
+            tx.send((0, ok())).unwrap();
+            tx.send((1, ok())).unwrap();
+            drop(tx);
+
+            let started = Instant::now();
+            let (results, served) = collect_quorum_shares(
+                &rx,
+                3,
+                2,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            );
+            let elapsed = started.elapsed();
+
+            assert_eq!(served, 2, "two healthy shares served");
+            assert_eq!(results.len(), 2, "the dead third is not waited on");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "must return at threshold+grace (~50ms), not the 10s hard cap; took {elapsed:?}",
+            );
+            drop(dead_sender);
+        }
+
+        #[test]
+        fn admits_a_prompt_third_share_within_grace() {
+            // Two land immediately; a third lands shortly after — within the grace window — so the
+            // cheater cross-check still sees all three.
+            let (tx, rx) = channel::<(usize, Result<serde_json::Value, String>)>();
+            tx.send((0, ok())).unwrap();
+            tx.send((1, ok())).unwrap();
+            let late = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = late.send((2, ok()));
+            });
+            drop(tx);
+
+            let (results, served) = collect_quorum_shares(
+                &rx,
+                3,
+                2,
+                Duration::from_millis(500),
+                Duration::from_secs(10),
+            );
+            assert_eq!(served, 3, "the prompt third is admitted within grace");
+            assert_eq!(results.len(), 3);
+        }
+
+        #[test]
+        fn all_three_fast_return_with_every_share() {
+            let (tx, rx) = channel::<(usize, Result<serde_json::Value, String>)>();
+            for idx in 0..3 {
+                tx.send((idx, ok())).unwrap();
+            }
+            drop(tx);
+            let (results, served) = collect_quorum_shares(
+                &rx,
+                3,
+                2,
+                Duration::from_millis(500),
+                Duration::from_secs(10),
+            );
+            assert_eq!(served, 3);
+            assert_eq!(results.len(), 3);
+        }
+
+        #[test]
+        fn faults_do_not_count_toward_the_threshold() {
+            // One success + one fault should NOT trip the 2-of-3 threshold; the collector keeps the
+            // grace timer unset and waits out the (short) hard cap, then reports a sub-threshold set
+            // that the caller will fail closed on. The silent third stays alive-but-connected.
+            let (tx, rx) = channel::<(usize, Result<serde_json::Value, String>)>();
+            let silent = tx.clone();
+            tx.send((0, ok())).unwrap();
+            tx.send((1, fault())).unwrap();
+            drop(tx);
+
+            let started = Instant::now();
+            let (results, served) = collect_quorum_shares(
+                &rx,
+                3,
+                2,
+                Duration::from_millis(50),
+                Duration::from_millis(300),
+            );
+            let elapsed = started.elapsed();
+
+            assert_eq!(served, 1, "a fault is never a served share");
+            assert_eq!(
+                results.len(),
+                2,
+                "the success and the fault are both recorded"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(250),
+                "without a threshold the collector waits the hard cap, not the grace; took {elapsed:?}",
+            );
+            drop(silent);
+        }
+    }
 
     fn key_release_request() -> KeyReleaseRequestV1 {
         KeyReleaseRequestV1 {
