@@ -147,6 +147,14 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 - Fail-closed: a non-pixel-lock mime, an unparseable object, or a render error returns an
   error with no bytes (Principle 11). There is **one canonical path** per mime — the raw
   `/bytes` egress is refused for pixel-lock sessions (Principle 10).
+- Resource bounds (bound-before-you-allocate): a creator controls the source file, so every
+  raster decode and rasterisation is bounded BEFORE allocating, to stop a tiny crafted "pixel
+  bomb" from forcing a multi-GB allocation in the boundary. Raster decode (single image + CBZ
+  pages) runs through `decode_bounded` with strict `image::Limits` (max dims `MAX_DIM`, max
+  alloc `MAX_DECODE_BYTES`); the PDF rasteriser bounds its scale on both axes and by area
+  (`MAX_PIXELS`) with a final predicted-size guard; CBZ caps each page and the archive total
+  (which also bounds warm session memory). Not yet bounded: per-format decode *time* (a
+  CPU-pathological but small file) — a wall-clock/watchdog follow-up, called out, not assumed.
 - Browser contract (served by `elastos-server`, routing only):
   - `GET /api/viewers/ddrm-viewer/object/{session}` → manifest adds
     `pixel_locked: true`, `total_pages`, `page_content_type`.
@@ -169,7 +177,8 @@ page **images** *inside the decrypt boundary*, and only those images egress.
      snippet on a mostly-empty page), the invisible layer carries a COMPACT identity — the 20-byte
      owner EVM wallet (the visible mark + audit log keep the full `wallet · content · time` tuple) —
      framed as `SYNC|LEN|DATA|CRC-16` (232-bit period), raster-tiled and majority-vote folded, so a
-     LEAKED frame stays attributable to the wallet even if the visible mark is cropped/painted out.
+     LEAKED frame still yields the wallet even if the visible mark is cropped/painted out — a
+     **tracer, not tamper-proof evidence** (see *Forensic strength & privacy* below).
      Recovers through our q85 encode, moderate recompression, brightness/contrast shifts,
      same-resolution screenshots, and vertical offsets; does NOT survive rescaling/rotation/
      width-changing crops (a geometric-sync layer is future work). Validated end-to-end against the
@@ -178,6 +187,23 @@ page **images** *inside the decrypt boundary*, and only those images egress.
 - **Fail closed**: the single pixel-lock egress (`watermark::finalize`) and the HTML-lock egress
   (EPUB) both REFUSE to emit a protected page without a non-empty forensic stamp — no identity, no
   image. There is no code path that emits protected pixels without a traceable mark.
+- **Forensic strength & privacy (honest scope — state it exactly, like the threat model does).** Two
+  things this watermark is deliberately NOT:
+  1. **Not unforgeable evidence.** The scheme is **unkeyed** and the invisible payload is protected
+     only by a **CRC-16** (error detection, not a signature); the algorithm is public in this repo.
+     So anyone can embed *any* wallet into *any* image: the mark is **forgeable** (a third party can
+     plant a wallet to frame it) and **repudiable** (an accused wallet can credibly deny it). It is a
+     **deterrent and a first-line tracer against casual re-sharing**, not court-grade attribution.
+     The authenticated, tamper-evident record is the hash-chained, signed **custody audit log**
+     ([THREAT_MODEL.md](THREAT_MODEL.md) §4) — the watermark *complements* it, it does not replace
+     it. The upgrade that would make the mark evidence is **authenticating the payload** (a
+     media-authority MAC/signature over `wallet · content · time`, or an opaque token resolved via
+     the audit log so the literal wallet never rides in the mark). Tracked; not yet done.
+  2. **Not anonymous.** Both layers embed the FULL wallet that opened the page (the visible layer is
+     human-readable). Anyone who sees a rendered page — a screenshot, a screen-share, a photo, a
+     leaked frame — recovers the buyer's on-chain identity. This is the deliberate trade:
+     leak-attribution in exchange for buyer anonymity at view time ([THREAT_MODEL.md](THREAT_MODEL.md)
+     §3, §6).
 
 Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
 - `application/pdf` → `pdf` (multi-page, `hayro`)
@@ -200,10 +226,16 @@ A second render-lock variant, **html-lock**, serves reflowable EPUB without rast
   **sanitised, self-contained HTML document** (scripts/styles/handlers/dangerous tags stripped,
   `javascript:` URLs neutralised, images inlined as `data:` URIs, our reader CSS + a tiled
   forensic watermark + `user-select:none` + a strict CSP `<meta>`). The page is served with
-  `page_content_type: text/html; charset=utf-8`; the viewer renders it in a **script-less sandbox
-  iframe** (`sandbox=""` — no allow-scripts, no allow-same-origin), so a hostile book is fully
-  inert. The raw EPUB ZIP never egresses (`/bytes` is refused like any render-lock asset). This
-  mirrors PC2's `EpubRenderer` html-lock tier rather than a pixel-lock rasterise.
+  `page_content_type: text/html; charset=utf-8` **and an enforced HTTP `Content-Security-Policy`
+  response header carrying a `sandbox` directive** (`default-src 'none'; … ; sandbox`), plus
+  `X-Content-Type-Options: nosniff` — so the document is sandboxed **at the resource level by the
+  browser even if loaded directly or framed without the attribute** (no script, no same-origin, no
+  network, no form post). The viewer additionally renders it in a `sandbox=""` iframe. The
+  containment order is now: **enforced HTTP CSP `sandbox` (true layer) ▸ inline `<meta>` CSP +
+  iframe attribute (belt) ▸ the hand-rolled sanitiser (defence-in-depth)** — the sanitiser is no
+  longer the sole barrier. The raw EPUB ZIP never egresses (`/bytes` is refused like any
+  render-lock asset). This mirrors PC2's `EpubRenderer` html-lock tier rather than a pixel-lock
+  rasterise.
 
 The single source of truth for the render-locked set is `render::is_pixel_lock` (covers pixel-lock
 **and** html-lock mimes); the media-authority helper (`scripts/dev/ddrm-media-authority/src/quorum.rs`)

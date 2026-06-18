@@ -57,6 +57,7 @@ because hiding it would be dishonest and an auditor will find it anyway.
 | **The chain / Base RPC provider** | The rights query `hasAccessByContentId(content_id, wallet)` as an `eth_call`. | The configured RPC endpoint sees `(content_id, wallet)` lookups. On-chain ownership/rights are inherently public. See `capsules/dkms-authority/src/node_chain.rs`. |
 | **An on-path network observer** | TLS/connection metadata: peer addresses, connection timing, frame **counts** and **sizes**. | The channel payloads are sealed (hybrid x25519+ML-KEM-768 AEAD, ML-DSA-65 signed). Frame **lengths** *can* be bucket-padded (see §5) to leak only a size *class*, but padding is a negotiated feature that is **off by default** today, so an observer currently sees exact sealed frame sizes; timing and frame *count* leak regardless. |
 | **The local runtime / gateway** | Plaintext, the wallet linkage, the CEK transiently. | This is the **owner's own trusted local boundary** (PRINCIPLES §1, §5). It is trusted on behalf of the signed-in principal; it is not a remote adversary. A *compromised* runtime is out of scope for confidentiality (it is the thing serving the owner). |
+| **Anyone who obtains a rendered page** (screenshot, screen-share, photo, or a leaked frame) | The **full EVM address of the wallet that opened it** — both as a faint but **human-readable** visible stamp and as a recoverable invisible DCT mark. | The pixel-lock forensic watermark (`docs/PROTECTED_CONTENT.md`) embeds the opening wallet into every protected page so a leak is *traceable*. The deliberate cost: viewing **de-anonymizes the buyer** to anyone who sees the page. The mark is a tracer/deterrent, **not** unforgeable evidence — it is unkeyed and CRC-protected (not signed), so it is **forgeable and repudiable** (§6.6); the authenticated record is the §4 audit log. |
 
 ### The `(wallet, content_id, time)` access pattern
 
@@ -120,6 +121,15 @@ scoped by the external firm:
    the rights answer is defended (quorum/agreement over a configured RPC pool; a disagreeing or
    unavailable pool fails closed), but the RPC operator's *visibility* of `(content_id, wallet)` is
    not hidden.
+6. **The buyer's anonymity at view time, and forgery/repudiation of the forensic watermark.** The
+   pixel-lock watermark (§3 row; `docs/PROTECTED_CONTENT.md`) embeds the opening wallet's full
+   address — **visibly (human-readable) and invisibly** — into every rendered page, so anyone who
+   sees a rendered page learns who opened it. This is **by design** (leak-attribution), not a fixable
+   gap. Separately, the mark is **unkeyed and CRC-protected, not signed**, so it is **forgeable** (a
+   third party can plant any wallet to frame it) and **repudiable** (an accused wallet can deny it);
+   treat it as a deterrent/tracer, **not** evidence. The authenticated record is the §4 custody log.
+   *Authenticating the payload* (a media-authority MAC/signature, or an opaque token resolved via the
+   audit log) is the roadmap upgrade that would make the mark stand as evidence.
 
 ## 7. Cryptographic trust roots (for completeness)
 
