@@ -203,6 +203,28 @@ pub async fn viewer_object_bytes(
                     "the decrypt provider returned an unexpected object length",
                 );
             }
+            // ③ serve-time content sniff (defence-in-depth over the mint-time `pixel_locked`
+            // flag, which trusts the creator-declared mime): a renderable/scriptable document
+            // mislabeled with a non-pixel-lock mime would otherwise egress here as raw plaintext.
+            // If the decrypted bytes LOOK like a pixel-lockable type, fail closed. The one
+            // exception is an explicitly-declared generic `application/zip` archive — a CBZ/EPUB
+            // sniffs as zip too, so we only honour a raw zip the creator labelled as such.
+            if let Some(sniffed) = sniffs_as_lockable(&bytes) {
+                let declared = session.mime.trim().to_ascii_lowercase();
+                let explicit_zip = sniffed == "application/zip" && declared == "application/zip";
+                if !explicit_zip {
+                    tracing::warn!(
+                        declared = %declared,
+                        sniffed,
+                        "object content sniffs as a pixel-lockable type but was routed to the raw \
+                         bytes path — fail closed (mislabeled asset)"
+                    );
+                    return object_error(
+                        StatusCode::FORBIDDEN,
+                        "this asset's content requires pixel-lock; fetch rendered pages via /page?n=",
+                    );
+                }
+            }
             octet_stream(bytes, &session.mime)
         }
         Ok(Err(err)) => {
@@ -357,6 +379,49 @@ fn octet_stream(bytes: Vec<u8>, mime: &str) -> Response {
         .into_response()
 }
 
+/// Best-effort magic-byte sniff of DECRYPTED object bytes: does the content look like a type that
+/// MUST be pixel-locked (a renderable/scriptable document)? The serve-time backstop for a
+/// mislabeled asset — every type below is in `is_pixel_lock`, so its bytes reaching the RAW path
+/// means the declared mime lied. Pure (no `image` dependency) so it adds no footprint to the
+/// gateway. Returns the sniffed family (`application/pdf` / `application/zip` / `image/*` /
+/// `image/svg+xml`), or `None` for genuinely non-renderable bytes (3D models, media, arbitrary).
+///
+/// Fail-closed bias: a false positive merely refuses a RAW byte download (the creator relabels and
+/// the asset gets pixel-locked); a false negative would leak source. We err toward refusing.
+fn sniffs_as_lockable(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| bytes.len() >= sig.len() && &bytes[..sig.len()] == sig;
+
+    if starts(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    // ZIP container — CBZ / EPUB / any zip-based document (local-file / central-dir / spanned sig).
+    if starts(b"PK\x03\x04") || starts(b"PK\x05\x06") || starts(b"PK\x07\x08") {
+        return Some("application/zip");
+    }
+    // Raster image signatures. (BMP's `BM` is only 2 bytes — the weakest signal — so we also
+    // require a plausible header length to avoid matching short non-image blobs.)
+    if starts(b"\x89PNG\r\n\x1a\n")                                  // PNG
+        || starts(b"\xFF\xD8\xFF")                                  // JPEG
+        || starts(b"GIF87a") || starts(b"GIF89a")                   // GIF
+        || starts(b"II*\x00") || starts(b"MM\x00*")                 // TIFF (little/big-endian)
+        || (starts(b"BM") && bytes.len() >= 26)                     // BMP
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")  // WebP
+    {
+        return Some("image/*");
+    }
+    // SVG / XML (scriptable markup) — skip a UTF-8 BOM + leading whitespace, then look for the tag.
+    let mut s = bytes;
+    if s.starts_with(b"\xEF\xBB\xBF") {
+        s = &s[3..];
+    }
+    let nws = s.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let s = &s[nws..];
+    if s.starts_with(b"<?xml") || s.starts_with(b"<svg") {
+        return Some("image/svg+xml");
+    }
+    None
+}
+
 /// A rendered page image response: the watermarked bytes, the page's content type, no-store,
 /// and `X-Asset-Pages`/`X-Asset-Page` so the viewer can build its pager. The bytes are an
 /// opaque flattened image — never the source document.
@@ -366,6 +431,35 @@ fn image_page(bytes: Vec<u8>, content_type: &str, total_pages: u32, page_index: 
     } else {
         content_type.to_string()
     };
+    // ⑤ The EPUB "html-lock" tier serves sanitised chapter HTML. Enforce the sandbox at the
+    // RESOURCE level with an HTTP `Content-Security-Policy` (not merely the inline `<meta>` + the
+    // viewer's iframe attribute): even if this document is loaded directly or framed without
+    // `sandbox`, the `sandbox` directive means no script runs, no same-origin access, no form
+    // post, and `default-src 'none'` means no network — so the hand-rolled sanitiser is strictly
+    // defence-in-depth BEHIND this, not the sole containment. JPEG pages get no CSP (an image
+    // never executes) but DO get `nosniff` so a response is never content-sniffed into an active
+    // type.
+    if content_type.starts_with("text/html") {
+        return (
+            StatusCode::OK,
+            [
+                ("content-type", content_type),
+                ("cache-control", "no-store".to_string()),
+                ("x-asset-pages", total_pages.to_string()),
+                ("x-asset-page", page_index.to_string()),
+                ("x-content-type-options", "nosniff".to_string()),
+                ("referrer-policy", "no-referrer".to_string()),
+                (
+                    "content-security-policy",
+                    "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; \
+                     base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox"
+                        .to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         [
@@ -373,6 +467,7 @@ fn image_page(bytes: Vec<u8>, content_type: &str, total_pages: u32, page_index: 
             ("cache-control", "no-store".to_string()),
             ("x-asset-pages", total_pages.to_string()),
             ("x-asset-page", page_index.to_string()),
+            ("x-content-type-options", "nosniff".to_string()),
         ],
         bytes,
     )
@@ -428,5 +523,69 @@ mod tests {
         assert!(clean_capsule_ref("a/b").is_err());
         assert!(clean_capsule_ref("").is_err());
         assert!(clean_capsule_ref("..").is_err());
+    }
+
+    #[test]
+    fn sniff_flags_renderable_document_types() {
+        assert_eq!(sniffs_as_lockable(b"%PDF-1.7\n..."), Some("application/pdf"));
+        assert_eq!(sniffs_as_lockable(b"PK\x03\x04rest"), Some("application/zip"));
+        assert_eq!(
+            sniffs_as_lockable(b"\x89PNG\r\n\x1a\n...."),
+            Some("image/*")
+        );
+        assert_eq!(sniffs_as_lockable(b"\xFF\xD8\xFF\xE0...."), Some("image/*"));
+        assert_eq!(sniffs_as_lockable(b"GIF89a...."), Some("image/*"));
+        let mut webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ".to_vec();
+        webp.extend_from_slice(&[0u8; 8]);
+        assert_eq!(sniffs_as_lockable(&webp), Some("image/*"));
+        assert_eq!(
+            sniffs_as_lockable(b"  <?xml version=\"1.0\"?><svg/>"),
+            Some("image/svg+xml")
+        );
+        assert_eq!(sniffs_as_lockable(b"<svg xmlns=...>"), Some("image/svg+xml"));
+        // UTF-8 BOM before the markup must not hide it.
+        assert_eq!(
+            sniffs_as_lockable(b"\xEF\xBB\xBF<svg>"),
+            Some("image/svg+xml")
+        );
+    }
+
+    #[test]
+    fn html_lock_page_enforces_sandbox_csp_and_nosniff() {
+        let resp = image_page(b"<html><body>chapter</body></html>".to_vec(), "text/html; charset=utf-8", 5, 1);
+        let h = resp.headers();
+        let csp = h
+            .get("content-security-policy")
+            .expect("html-lock must carry an HTTP CSP")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("sandbox"), "CSP must enforce the sandbox at the resource level");
+        assert!(csp.contains("default-src 'none'"), "CSP must lock default-src to none");
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+    }
+
+    #[test]
+    fn image_page_has_nosniff_but_no_csp() {
+        let resp = image_page(vec![0xFF, 0xD8, 0xFF], "image/jpeg", 1, 0);
+        let h = resp.headers();
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+        assert!(
+            h.get("content-security-policy").is_none(),
+            "a flattened JPEG never executes; it needs no CSP"
+        );
+    }
+
+    #[test]
+    fn sniff_passes_genuinely_non_renderable_bytes() {
+        // glTF binary (3D) and JSON glTF are legit raw passthrough — must NOT be flagged.
+        assert_eq!(sniffs_as_lockable(b"glTF\x02\x00\x00\x00"), None);
+        assert_eq!(sniffs_as_lockable(b"{\"asset\":{\"version\":\"2.0\"}}"), None);
+        // An fMP4 media segment (box-size dword + `ftyp`) is not a document.
+        assert_eq!(sniffs_as_lockable(b"\x00\x00\x00\x18ftypisom"), None);
+        // Short non-image blob starting with "BM" must not trip the BMP magic.
+        assert_eq!(sniffs_as_lockable(b"BMP file? no."), None);
+        assert_eq!(sniffs_as_lockable(b""), None);
+        assert_eq!(sniffs_as_lockable(b"just some text"), None);
     }
 }
