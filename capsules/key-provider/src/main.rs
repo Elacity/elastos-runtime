@@ -103,7 +103,7 @@ impl KeyAuthorityBackend {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Init {
@@ -180,6 +180,37 @@ enum Request {
     Shutdown,
 }
 
+// Manual Debug (NOT derived): several variants carry secret material — a raw CEK
+// (`ReleaseRef.cek_b64`), producer escrow blobs (`ReleaseFromEscrowRef.wrapped_cek_b64`), and
+// the boxed `KeyReleaseRequestV1` / session context. Never echo field contents; print only the
+// op name so a stray `{:?}` cannot leak key material. Defense-in-depth: there is no `{:?}` on a
+// `Request` today.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let op = match self {
+            Request::Init { .. } => "init",
+            Request::Status => "status",
+            Request::Release { .. } => "release",
+            #[cfg(feature = "key-authority-ref")]
+            Request::ReleaseRef { .. } => "release_ref",
+            #[cfg(feature = "key-authority-ref")]
+            Request::ReleaseFromEscrowRef { .. } => "release_from_escrow_ref",
+            Request::Shutdown => "shutdown",
+        };
+        f.debug_struct("Request")
+            .field("op", &op)
+            .finish_non_exhaustive()
+    }
+}
+
+// Manual Debug (NOT derived): carries escrow-adjacent material (producer escrow share(s),
+// transcript AAD, content bytes). Redact wholesale — no field contents in `{:?}`.
+impl std::fmt::Debug for ReleaseSessionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseSessionContext").finish_non_exhaustive()
+    }
+}
+
 /// Runtime-injected session context for the canonical `release` op (reference backend).
 ///
 /// The CEK source (the producer's escrow blob), the KID, and the scheme all come from the
@@ -190,7 +221,7 @@ enum Request {
 /// decrypt-transcript binding. Mirrors the jsParams PC2's client assembles for the Lit
 /// action (`recoverCEKEnvelope`, `chipotle-client.ts:1486-1510`): a session public key,
 /// a signed request, and the content references — never a raw CEK.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // fields are read only in the `key-authority-ref` build
 struct ReleaseSessionContext {

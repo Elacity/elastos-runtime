@@ -169,6 +169,18 @@ scoped by the external firm:
 - **CEK transport / re-seal:** hybrid x25519 + ML-KEM-768 KEM → AES-256-GCM, ML-DSA-65 signatures,
   per-seal CSPRNG nonces, length-prefixed domain-separated KDF/AAD. PQ-conscious for the
   harvest-now-decrypt-later threat on confidential material.
+  > **Known invariant (pre-mainnet, scoped with the external auditor).** When a dKMS node re-seals
+  > the recovered CEK to the decrypt session (`dkms-authority::main` `recover` → `seal_bound`), the
+  > re-seal **AAD is the caller-supplied `aad_b64`** and is **not** bound into the recover
+  > possession-proof. The node verifies the *escrow* and the *producer*, but does **not**
+  > independently verify that this AAD matches the segment-bound transcript / node-set the open
+  > claims — so **the node's re-seal AAD is not independently trustworthy.** This is safe today only
+  > because the single consumer, the decrypt boundary, **rebuilds the segment-bound AAD itself and
+  > fails closed on a mismatch** (it never trusts this value). Do **not** add a consumer that trusts
+  > the node's re-seal AAD without first binding `aad_b64`/`segment_digests`/`node_set_id` into the
+  > recover possession-proof (so a tampered `aad_b64` fails the proof closed at the node). The fix is
+  > scoped with the external auditor; the test on landing is *recover with a tampered `aad_b64` fails
+  > the possession-proof closed.*
 - **Rights anchor:** wallet EIP-191/1271 signature on an `AccessGrantV1`, bound to
   kid/node-set/chain/≤24h window + per-request nonce, **re-verified and re-checked on-chain inside the
   dKMS node's own boundary**.

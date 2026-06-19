@@ -420,7 +420,8 @@ pub async fn open_owned_in_viewer(
                     Ok(b64) => {
                         grant_digest = Some(grant_watermark_digest16_hex(sig));
                         tracing::info!(
-                            "trustless open: assembled wallet-signed grant for cid {object_cid}"
+                            "trustless open: assembled wallet-signed grant for cid {}",
+                            log_fp(&object_cid)
                         );
                         Some(b64)
                     }

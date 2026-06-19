@@ -31,6 +31,27 @@ use std::io::{self, BufRead, Write};
 /// gate (verify the wallet-signed grant here, evaluate `hasAccessByContentId` here).
 mod node_chain;
 
+// RELEASE-BUILD INVARIANT (pre-mainnet deploy gate — fix-pack ②).
+// The legacy unsigned-receipt path (`legacy-receipt-authz`) and the broader `dev-modes` opt-in that
+// pulls it in are migration/test scaffolds only (see Cargo.toml). A PRODUCTION node — a release
+// build — MUST NOT compile them: with them on, a missing wallet grant can fall back to the legacy
+// receipt path AND the node-set pin (`DKMS_AUTHORITY_NODE_SET_ID_B64`, see `authorize`) stops being
+// mandatory — both cross-quorum-replay defenses. We detect "release" by the ABSENCE of
+// `debug_assertions` (on for dev/test, off for `cargo build --release`); a production deploy builds
+// with DEFAULT features, so this fails the build the instant a deploy command leaks
+// `dev-modes`/`legacy-receipt-authz` into a release node. Dev/CI keep building DEBUG with
+// `--features dev-modes`, which is unaffected. CI actively asserts both directions; see
+// `.github/workflows/ci.yml` and `docs/DEPLOY_CHECKLIST.md`.
+#[cfg(all(
+    not(debug_assertions),
+    not(test),
+    any(feature = "legacy-receipt-authz", feature = "dev-modes")
+))]
+compile_error!(
+    "release build must not enable `dev-modes`/`legacy-receipt-authz` (dev/migration-only): \
+     build a production dkms-authority with default features"
+);
+
 const PROVIDER_VERSION: &str = "0.1.0-dev";
 
 /// Env var selecting the SOCKET serve transport: when set to a path, the node binds + listens there
@@ -1004,6 +1025,16 @@ impl DkmsAuthorityNode {
             }
         };
 
+        // SECURITY INVARIANT (pre-mainnet, scoped with the external auditor): `aad` here is the
+        // CALLER-SUPPLIED `args.aad_b64` (decoded above), and it is NOT bound into the recover
+        // possession-proof — the node verifies the escrow (recover_escrowed_cek) and the producer,
+        // but does NOT independently verify that this re-seal AAD matches the segment-bound
+        // transcript / node-set the open claims. Therefore the node's re-seal AAD is NOT
+        // independently trustworthy. This is safe TODAY only because the single consumer — the
+        // decrypt boundary — rebuilds the segment-bound AAD itself and fails closed on a mismatch;
+        // it does not trust this value. DO NOT add a consumer that trusts this re-seal AAD without
+        // first binding aad_b64 / segment_digests / node_set_id into the recover possession-proof
+        // (so a tampered aad_b64 fails the proof closed here). See docs/THREAT_MODEL.md.
         let envelope = ddrm_envelope::seal::seal_bound(&public, cek.as_slice(), &aad, &authority.signer);
         let mut material = json!({
             "suite": ddrm_envelope::SUITE_PQ_HYBRID,

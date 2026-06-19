@@ -82,6 +82,39 @@ dKMS recovery through the runtime's single Carrier endpoint via the carrier-prov
   until the carrier path is proven, then the WireGuard step is dropped from the runtime
   path (kept on nodes as rollback).
 
+## Local testing checklist — opening a minted asset
+
+> The invariant that makes an open succeed: **an asset's CEK is sealed to the quorum +
+> rights posture it was MINTED against, and the open must use the SAME rail.** A mismatch
+> fails closed (it never silently downgrades). Tick these before reporting an open bug.
+
+1. **Rights mode must match how the asset was minted.** On-chain-minted assets need a
+   wallet-signed grant: launch with `ELASTOS_DDRM_RIGHTS=chain` (real Base ownership,
+   `chain_id 8453`) or `chain-mock` (mocked chain, wallet grant still required). The
+   default `dev` mode uses local attestation and **skips the wallet "sign the session"
+   step**, so the grant never reaches the dKMS nodes and quorum recover fails.
+2. **Quorum rail must match where the asset was sealed.** Assets sealed to the live geo
+   nodes (`~/.elastos-dkms/dkms-authority.carrier.json`) need `ELASTOS_DKMS_CARRIER=1`.
+   The default LOCAL daemons (`<data>/dkms/node-*.store.json`) do not hold the geo shares,
+   so a geo-sealed asset opened locally returns "foreign escrow."
+3. **Canonical launch for a geo-sealed, on-chain asset** (the PC2-parity rail):
+
+   ```bash
+   ELASTOS_DKMS_CARRIER=1 ELASTOS_DDRM_RIGHTS=chain ./scripts/dev/run-creator-gateway.sh
+   ```
+
+   Then open `http://localhost:8090/apps/home/` (use `localhost`, not `127.0.0.1` —
+   WebAuthn rejects bare IPs). First open is ~5 s cold (cross-continent dial), then warm.
+
+**Symptom → cause (fail-closed, so the error names the mismatch):**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No wallet "sign the session" prompt | rights mode is `dev` (local attestation) | relaunch with `ELASTOS_DDRM_RIGHTS=chain` / `chain-mock` |
+| 502 "could not open owned asset from the dKMS quorum" + node "foreign/tampered escrow, wrong KID/scheme" | open rail ≠ seal rail (e.g. local daemons but asset sealed to geo) | match the mint rail — `ELASTOS_DKMS_CARRIER=1` for geo-sealed |
+| `access grant rejected: replayed` on open attempts 2–3 | the open retry loop re-sends a single-use grant nonce (attempt 1 is the real signal) | known robustness gap — re-mint a fresh grant per attempt (tracked) |
+| rights **denied** (not a 502) | the connected wallet does not currently hold on-chain access for that `contentId` on Base mainnet (sell/transfer revokes) | open with the wallet that holds the token |
+
 ## Validation
 
 - Local full-stack: `scripts/dev/ddrm-producer-smoke/live-producer-carrier-verify.sh`

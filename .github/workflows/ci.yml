@@ -115,3 +115,45 @@ jobs:
       - uses: extractions/setup-just@v2
       - name: just verify-capsules
         run: just verify-capsules
+
+  # Pre-mainnet deploy invariant (fix-pack ②): a PRODUCTION dkms-authority node must be a release
+  # build with DEFAULT features — the legacy unsigned-receipt path (`legacy-receipt-authz`) and the
+  # `dev-modes` opt-in that pulls it in must NEVER ship. The crate enforces this with a
+  # `compile_error!` keyed on a release build (no `debug_assertions`); this job asserts BOTH
+  # directions so the guard can't silently rot. See `docs/DEPLOY_CHECKLIST.md`.
+  # `dkms-authority` lives OUTSIDE the elastos workspace, so the other jobs never reach it.
+  dkms-release-invariant:
+    name: dKMS Release Invariant (no dev-modes/legacy)
+    runs-on: ubuntu-latest
+    # Assert the FEATURE invariant only; do not let unrelated pre-existing rustc warnings in this
+    # out-of-workspace crate mask it (the rest of CI keeps -D warnings).
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: capsules/dkms-authority
+      - name: Release build with DEFAULT features must succeed (no legacy path compiled)
+        run: cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml
+      - name: Release build with legacy-receipt-authz must FAIL closed (compile guard)
+        run: |
+          if out=$(cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml --features legacy-receipt-authz 2>&1); then
+            echo "::error::release build ACCEPTED legacy-receipt-authz — the release-invariant guard is missing"
+            exit 1
+          fi
+          echo "$out" | grep -q "release build must not enable" || {
+            echo "::error::release build failed, but NOT via the release-invariant guard:"; echo "$out"; exit 1;
+          }
+          echo "ok: release + legacy-receipt-authz rejected at compile time"
+      - name: Release build with dev-modes must FAIL closed (compile guard)
+        run: |
+          if out=$(cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml --features dev-modes 2>&1); then
+            echo "::error::release build ACCEPTED dev-modes — the release-invariant guard is missing"
+            exit 1
+          fi
+          echo "$out" | grep -q "release build must not enable" || {
+            echo "::error::release build failed, but NOT via the release-invariant guard:"; echo "$out"; exit 1;
+          }
+          echo "ok: release + dev-modes rejected at compile time"
