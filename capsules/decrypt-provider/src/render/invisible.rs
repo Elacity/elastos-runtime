@@ -29,6 +29,10 @@
 //! Does NOT survive (by design — out of scope here): geometric RESCALING (zoomed screenshots),
 //! rotation, or horizontal crops that change the pixel width. Those require a geometric-sync
 //! (log-polar/template) layer, a separate, larger effort.
+//! NB "same-resolution screenshot" means a capture that preserves the pixel grid 1:1. A screenshot
+//! taken on a HiDPI / Retina display resamples (typically ≈2× upscale) — that is RESCALING, so it
+//! falls under the unsupported case above and will generally NOT recover. Most real-world
+//! screenshots on HiDPI screens are therefore out of envelope; do not rely on this layer for them.
 
 use image::RgbaImage;
 use std::f32::consts::PI;
@@ -146,6 +150,20 @@ fn hex_nibble(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+/// Canonicalise an EVM address for COMPARISON: trim, drop a `0x`/`0X` prefix, lowercase. The
+/// invisible mark recovers wallet bytes LOWERCASED (the 20 raw bytes carry no EIP-55 checksum
+/// casing), so any attribution compare against a stored/expected address MUST normalise BOTH sides
+/// here — otherwise a checksummed (mixed-case) expected address would FALSE-mismatch the recovered
+/// lowercase one. Used by the offline `--verify-grant` wallet cross-check.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn normalize_evm_hex(s: &str) -> String {
+    let t = s.trim();
+    t.strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t)
+        .to_ascii_lowercase()
 }
 
 /// Parse a leading `0x`-prefixed 40-hex-digit EVM address from `s` into 20 raw bytes, if present.
@@ -542,6 +560,16 @@ mod tests {
     /// What the COMPACT invisible layer recovers from `STAMP`: the lowercased 20-byte EVM wallet
     /// (the visible mark + audit log keep the full `wallet · content · time` tuple).
     const STAMP_ADDR: &str = "0xabc1230000000000000000000000000000009f0e";
+
+    #[test]
+    fn normalize_evm_hex_makes_checksum_casing_compare_equal() {
+        // An EIP-55 checksummed (mixed-case) expected address must compare EQUAL to the lowercase
+        // wallet the mark recovers — normalising both sides is what prevents the false mismatch.
+        assert_eq!(
+            normalize_evm_hex(STAMP_ADDR),
+            normalize_evm_hex("  0xABC1230000000000000000000000000000009F0E ")
+        );
+    }
 
     #[test]
     fn crc16_matches_known_vector() {

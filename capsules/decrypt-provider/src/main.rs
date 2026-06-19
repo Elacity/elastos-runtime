@@ -1821,12 +1821,23 @@ fn read_grant_sig_hex(grant_src: &str) -> Option<String> {
     None
 }
 
+/// Read a candidate grant's declared `owner_address` (the buyer wallet), when the source is a JSON
+/// grant. `None` for a raw-signature file (no wallet to cross-check against).
+#[cfg(all(feature = "pdf-render", feature = "pq-envelope"))]
+fn read_grant_owner_address(grant_src: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(grant_src).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    v.get("owner_address")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+}
+
 /// Verify a recovered grant-digest mark against a candidate grant: recompute the digest from the
 /// grant's signature via the SHARED `ddrm_envelope::grant_watermark_digest16` (no drift with the
 /// embedder) and compare. MATCH ⇒ the buyer's own signature authenticates this leaked frame.
 #[cfg(all(feature = "pdf-render", feature = "pq-envelope"))]
 fn verify_extracted_against_grant(mark: Option<([u8; 4], [u8; 16])>, grant_src: &str) -> i32 {
-    let (_prefix, digest) = match mark {
+    let (prefix, digest) = match mark {
         Some(m) => m,
         None => {
             eprintln!(
@@ -1843,6 +1854,20 @@ fn verify_extracted_against_grant(mark: Option<([u8; 4], [u8; 16])>, grant_src: 
             return 2;
         }
     };
+    // Secondary cross-check (advisory): the mark carries the first 4 wallet bytes; if the grant
+    // declares an `owner_address`, confirm they agree. Normalise BOTH sides to lowercase hex first
+    // (the mark is lowercase by construction; a checksummed owner_address would otherwise mismatch).
+    if let Some(owner) = read_grant_owner_address(grant_src) {
+        let owner_hex = render::invisible::normalize_evm_hex(&owner);
+        let mark_prefix = hex_lower(&prefix);
+        if owner_hex.starts_with(&mark_prefix) {
+            println!("wallet cross-check: MATCH — mark prefix 0x{mark_prefix} matches grant owner {owner}");
+        } else {
+            println!(
+                "wallet cross-check: MISMATCH — mark prefix 0x{mark_prefix} vs grant owner {owner}"
+            );
+        }
+    }
     if ddrm_envelope::grant_watermark_digest16(&sig_hex) == digest {
         println!("VERIFY: MATCH — the grant's signature authenticates this mark");
         0

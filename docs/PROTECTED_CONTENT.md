@@ -184,7 +184,10 @@ page **images** *inside the decrypt boundary*, and only those images egress.
      wallet — only a digest that *commits to* it (see *Forensic strength & privacy* below).
      Recovers through our q85 encode, moderate recompression, brightness/contrast shifts,
      same-resolution screenshots, and vertical offsets; does NOT survive rescaling/rotation/
-     width-changing crops (a geometric-sync layer is future work). Validated end-to-end against the
+     width-changing crops (a geometric-sync layer is future work). NB "same-resolution screenshot"
+     means a 1:1 pixel-grid capture — a HiDPI/Retina screenshot resamples (≈2× upscale), which is
+     rescaling, so it falls under the unsupported case and generally will NOT recover; most
+     real-world screenshots on HiDPI displays are out of envelope. Validated end-to-end against the
      actual rendered text AND (sparse) code pages, not just synthetic images. Offline read:
      `decrypt-provider --extract-watermark <image> [--verify-grant <grant.json>]` — prints the wallet
      prefix + grant digest (or the `0x…` wallet for a legacy compact mark) and, given a candidate

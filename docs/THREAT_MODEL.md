@@ -152,6 +152,18 @@ scoped by the external firm:
    identity-derived value rides in the mark at all), remains the north-star upgrade. Verifying a
    leaked frame depends on the retained grant digest (§4).
 
+> **Closed by construction — media/stream tier has no raw-document egress.** The pixel-lock
+> guarantee (a document never egresses raw — see the object-tier content sniff,
+> `elastos-server/src/api/viewer_object.rs`) is **not bypassable via streaming**. The media tier
+> serves only fMP4 produced by the ffmpeg transcode+fragment ingest (`media-provider` in prod,
+> `ddrm-media-authority` in dev): a non-media file **fails transcoding** (no asset is produced), and
+> the pipeline **re-encodes (AV1/AAC) rather than `-c copy`**, so source bytes never survive into the
+> served segments — even for a polyglot. With documents confined to the ③-guarded object tier, there
+> is no route for a document to egress raw via streaming, so no media-tier sniff guard is needed.
+> **Re-open only** if a future change adds (a) a bring-your-own pre-segmented ingest that bypasses
+> transcode, or (b) an ffmpeg `-c copy`/remux fast-path — either would warrant a segment-0 `mdat`
+> content-sniff at media-session open.
+
 ## 7. Cryptographic trust roots (for completeness)
 
 - **CEK transport / re-seal:** hybrid x25519 + ML-KEM-768 KEM → AES-256-GCM, ML-DSA-65 signatures,
