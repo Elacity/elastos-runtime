@@ -80,6 +80,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          # The carrier smoke builds the Home capsules (home-cli etc.) to wasm32-wasip1,
+          # so that target's std must be installed or the build fails with E0463.
+          targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
