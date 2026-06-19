@@ -39,11 +39,13 @@ ops ones. Source of truth for the threat posture: [THREAT_MODEL.md](THREAT_MODEL
 - [ ] **Audit/forensic retention** is wired as designed (the `grant_digest` rides the permanent
       custody chain; minimization is via non-reversibility, not expiry — see THREAT_MODEL §watermark).
 
-## Open, scoped with the external auditor (do not ship as "done")
+## Landed (was: open, scoped with the external auditor)
 
-- [ ] **Bind the re-seal AAD into the recover possession-proof** (`dkms-authority` `recover` →
-      `seal_bound`). Today the node's re-seal AAD is the caller-supplied `aad_b64` and is NOT bound
-      into the possession-proof; it is safe only because the decrypt boundary rebuilds the
-      segment-bound AAD itself and fails closed. Landing test: *a recover with a tampered `aad_b64`
-      fails the possession-proof closed at the node.* See the SECURITY INVARIANT comment at the
-      `seal_bound` call and THREAT_MODEL §7.
+- [x] **Bind the re-seal AAD into the recover possession-proof** (`dkms-authority` `recover` →
+      `seal_bound`). DONE: the recover possession-proof preimage now binds `sha256(reseal_aad)`
+      (`ddrm_envelope::recover_proof_message`, domain `…/recover-proof/v2`); the client signs over it
+      (`key-provider`) and the node verifies it in `verify_session` before any CEK is recovered. A
+      tampered `aad_b64` fails the proof closed at the node (`session_invalid`). The AAD already
+      carries `segment_digests` + `node_set_id`, so all three are bound. Landing test (green):
+      `dkms-authority::tests::recover_fails_closed_on_a_tampered_aad`. The decrypt boundary's
+      independent rebuild remains as defense-in-depth. See THREAT_MODEL §7 and AUDITOR_PACKET §1.

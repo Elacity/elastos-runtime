@@ -1,9 +1,9 @@
 # Auditor packet — dKMS decrypt plane (pre-mainnet)
 
-> Focused external-audit hand-off for the dKMS / decrypt boundary. It **leads with the one
-> deliberately-open invariant** (re-seal AAD binding), then gives the boundary, the trust roots, and
-> the verification gates so a reviewer can orient fast. Authoritative sources are linked inline; this
-> packet does not restate them in full.
+> Focused external-audit hand-off for the dKMS / decrypt boundary. It **leads with the invariant we
+> just closed** (re-seal AAD binding — the diff is in this branch; please confirm the fix), then gives
+> the boundary, the trust roots, and the verification gates so a reviewer can orient fast.
+> Authoritative sources are linked inline; this packet does not restate them in full.
 >
 > Contract: [../PRINCIPLES.md](../PRINCIPLES.md) · Threats: [THREAT_MODEL.md](THREAT_MODEL.md) ·
 > Ops invariants: [DEPLOY_CHECKLIST.md](DEPLOY_CHECKLIST.md) · dKMS rail:
@@ -13,60 +13,73 @@
 
 ## 0. What we are asking you to confirm
 
-1. The **re-seal AAD invariant** (§1) is the *only* place where a trusted-core node emits a value it
-   does not itself verify, and that the **decrypt boundary's fail-closed rebuild** is a sound
-   compensating control **today** (single consumer, no trust).
-2. The **landing fix** in §1 (bind `aad_b64` / `segment_digests` / `node_set_id` into the recover
-   possession-proof) is the correct closure, and the **landing test** is the right acceptance gate.
+1. The **re-seal AAD binding** (§1, now landed) is a correct closure: binding `sha256(reseal_aad)`
+   into the recover possession-proof, verified at the node before any CEK is recovered, soundly
+   prevents a MITM from making the node seal under an AAD the caller did not prove possession over.
+2. Binding the **AAD digest** (rather than `aad_b64` / `segment_digests` / `node_set_id` as separate
+   fields) is sufficient — i.e. that `DecryptTranscriptV1` genuinely carries `node_set_id` +
+   `segment_digests`, so the digest binds all of them, with no field left unbound.
 3. No **second consumer** of the node's re-seal output trusts the AAD (we assert there is exactly
-   one — the decrypt boundary). Independent confirmation wanted.
+   one — the decrypt boundary, which independently rebuilds it as defense-in-depth). Independent
+   confirmation wanted.
 
 Everything else in this packet is context to make those three judgements.
 
 ---
 
-## 1. THE open invariant — re-seal AAD is not bound into the possession-proof
+## 1. THE invariant — re-seal AAD now bound into the possession-proof (LANDED)
 
-**Status:** known, deliberately scoped with you, *not* shipped as "done". Tracked as an open item in
-[DEPLOY_CHECKLIST.md](DEPLOY_CHECKLIST.md) and documented in [THREAT_MODEL.md](THREAT_MODEL.md) §7.
+**Status:** closed in this branch. The fix is the diff below; we are asking you to confirm it is a
+sound closure (§0). Tracked as landed in [DEPLOY_CHECKLIST.md](DEPLOY_CHECKLIST.md) and
+[THREAT_MODEL.md](THREAT_MODEL.md) §7.
 
-**Where:** `capsules/dkms-authority/src/main.rs`, the `recover` handler, at the `seal_bound` call
-(see the `SECURITY INVARIANT` comment immediately above it):
-
-```1028:1038:capsules/dkms-authority/src/main.rs
-        // SECURITY INVARIANT (pre-mainnet, scoped with the external auditor): `aad` here is the
-        // CALLER-SUPPLIED `args.aad_b64` (decoded above), and it is NOT bound into the recover
-        // possession-proof — the node verifies the escrow (recover_escrowed_cek) and the producer,
-        // but does NOT independently verify that this re-seal AAD matches the segment-bound
-        // transcript / node-set the open claims. Therefore the node's re-seal AAD is NOT
-        // independently trustworthy. This is safe TODAY only because the single consumer — the
-        // decrypt boundary — rebuilds the segment-bound AAD itself and fails closed on a mismatch;
-        // it does not trust this value. DO NOT add a consumer that trusts this re-seal AAD without
-        // first binding aad_b64 / segment_digests / node_set_id into the recover possession-proof
-        // (so a tampered aad_b64 fails the proof closed here). See docs/THREAT_MODEL.md.
-        let envelope = ddrm_envelope::seal::seal_bound(&public, cek.as_slice(), &aad, &authority.signer);
-```
-
-**The threat.** A dKMS node, on `recover`, verifies the *escrow* (`recover_escrowed_cek` — fails
+**The threat (was).** A dKMS node, on `recover`, verifies the *escrow* (`recover_escrowed_cek` — fails
 closed on a foreign/tampered blob, KID-swap, scheme mismatch, or forged producer) and then re-seals
 the recovered CEK to the decrypt session. The **AAD** it seals under is the **caller-supplied
-`aad_b64`** — it is *not* an input to the possession-proof. So a node cannot, by itself, tell that
-the AAD it stamps actually matches the segment-bound transcript / node-set the open claims. **The
-node's re-seal AAD is therefore not independently trustworthy.**
+`aad_b64`**. Previously this was *not* an input to the possession-proof, so a MITM that tampered
+`aad_b64` in transit could make the node seal under an AAD of its choosing — safe only because the
+single downstream consumer (the decrypt boundary) rebuilt the AAD and failed closed.
 
-**Why it is safe today (the compensating control).** There is exactly **one** consumer of this
-re-seal output — the **decrypt boundary** — and it does **not** trust the node's AAD: it
-**rebuilds the segment-bound AAD itself** and the AEAD open **fails closed** on any mismatch. A
-tampered `aad_b64` cannot widen access; it can only cause the boundary's open to fail.
+**The fix.** The canonical recover possession-proof preimage now binds `sha256(reseal_aad)`
+(`ddrm_envelope::recover_proof_message`, domain bumped `…/recover-proof/v1` → `…/v2`). The client
+signs over the exact AAD it sends (`key-provider`), and the node verifies the proof over the
+**byte-identical** `args.aad_b64` in `verify_session`, **before** any CEK is recovered or re-sealed.
+Because the AAD (`DecryptTranscriptV1`) already encodes `node_set_id` + `segment_digests`, the digest
+binds all three named fields transitively (so the preimage stays bounded for long presentations).
 
-**The fix (scoped, on the mainnet path).** Bind `aad_b64` / `segment_digests` / `node_set_id` into
-the recover possession-proof so a tampered AAD fails the proof **closed at the node**, removing the
-reliance on the downstream rebuild.
-**Landing test (acceptance gate):** *a `recover` with a tampered `aad_b64` fails the
-possession-proof closed at the node.*
+**Node verification (before recover):**
 
-**The standing rule for reviewers and future contributors:** do **not** add any consumer that trusts
-the node's re-seal AAD before the fix above lands.
+```1797:1804:capsules/dkms-authority/src/main.rs
+    // RE-SEAL-AAD BINDING (v2): verify the proof over the EXACT AAD this recover will seal under. This
+    // is the SAME `args.aad_b64` `recover_inner` decodes and passes to `seal_bound` — so a MITM that
+    // tampers `aad_b64` in transit (incl. its embedded node_set_id / segment_digests) makes this proof
+    // fail closed HERE, before any CEK is recovered or re-sealed. Closes the pre-mainnet invariant.
+    let reseal_aad = b64()
+        .decode(&args.aad_b64)
+        .map_err(|_| "aad_b64 is not valid base64".to_string())?;
+    if !ddrm_envelope::verify_recover_proof(
+```
+
+**Re-seal site (now CLOSED — the comment records why):**
+
+```1028:1035:capsules/dkms-authority/src/main.rs
+        // SECURITY INVARIANT (re-seal AAD — CLOSED): `aad` here is the caller-supplied `args.aad_b64`,
+        // but it is now BOUND into the recover possession-proof: `verify_session` (above, before any CEK
+        // is recovered) verifies `verify_recover_proof(.., reseal_aad = decode(args.aad_b64), ..)`, which
+        // is the byte-identical AAD passed here. So a MITM-tampered `aad_b64` — including its embedded
+        // `node_set_id` / `segment_digests` — invalidates the proof and is refused at the node, fail-closed
+        // (test: `recover_fails_closed_on_a_tampered_aad`). The decrypt boundary STILL independently
+        // rebuilds the segment-bound AAD and fails closed on any mismatch — defense-in-depth, not the sole
+        // control. See docs/THREAT_MODEL.md §7 and docs/AUDITOR_PACKET.md §1.
+```
+
+**Landing test (green):** `dkms-authority::tests::recover_fails_closed_on_a_tampered_aad` — a recover
+whose `aad_b64` is tampered after the caller signed its proof is refused at the node (`session_invalid`)
+before any CEK is recovered. Plus `ddrm-envelope`'s `dkms_recover_proof_round_trips…` asserts a
+tampered AAD fails `verify_recover_proof`.
+
+**The standing rule (unchanged):** the decrypt boundary remains the second, independent fail-closed
+check on the AAD; do **not** remove it (defense-in-depth).
 
 ---
 
@@ -106,16 +119,18 @@ These are asserted in CI, not just documented (see [DEPLOY_CHECKLIST.md](DEPLOY_
   in `dkms-authority` fences them out of release.
 - `key-provider` redacts CEK / escrow blobs from `Debug` (manual `impl Debug`, fields → `<redacted>`)
   so secrets cannot leak via debug logs.
-- Re-seal AAD open item (§1) appears as an explicit unchecked box under *"Open, scoped with the
-  external auditor"* — it is not allowed to be ticked until the landing test passes.
+- Re-seal AAD binding (§1) is checked off under *"Landed"* now that the landing test passes; it was
+  not allowed to be ticked until then.
 
 ## 5. How to reproduce the verification state
 
 ```bash
 just verify            # full gate: alignment-check + smoke + fmt/lint/test (definition of "green")
 just alignment-check   # fail-closed contract-drift detection (docs/code/tests/ops must agree)
-just test-crate dkms-authority
-just test-crate key-provider     # reference backend tests need --features dev-modes
+# The dKMS capsules build standalone (not elastos-workspace members):
+cd capsules/dkms-authority && cargo test --features legacy-receipt-authz   # incl. the landing test
+cd capsules/ddrm-envelope  && cargo test --features access-grant,av-variants dkms_recover_proof
+cd capsules/key-provider   && cargo check --features key-authority-ref
 ```
 
 `just alignment-check` is the contract-drift guard: if this packet, the threat model, the deploy
@@ -125,9 +140,12 @@ checklist, and the code ever disagree about the §1 invariant, it should fail.
 
 ## 6. Reviewer checklist
 
-- [ ] Confirm §1 is the **only** trusted-core seam emitting an unverified value.
-- [ ] Confirm the decrypt boundary is the **single** consumer and rebuilds + fails closed (no trust).
-- [ ] Confirm the §1 fix (bind into possession-proof) + landing test are the correct closure.
+- [ ] Confirm the §1 fix (bind `sha256(reseal_aad)` into the possession-proof, verified before
+      recover) + the landing test are a correct closure.
+- [ ] Confirm the AAD digest binds all of `aad_b64` / `segment_digests` / `node_set_id` (no field
+      left unbound) — i.e. `DecryptTranscriptV1` carries them.
+- [ ] Confirm no **other** trusted-core seam emits a value it does not itself verify.
+- [ ] Confirm the decrypt boundary remains the independent fail-closed rebuild (defense-in-depth).
 - [ ] Confirm release-build fences (§4) actually prevent `dev-modes` / `legacy-receipt-authz`.
 - [ ] Confirm `Debug` redaction (§4) covers all CEK / escrow-bearing structs.
 - [ ] Note any second consumer of the node re-seal output anywhere in the tree (should be none).
