@@ -412,6 +412,53 @@ pub fn extract_mdat(frag: &[u8]) -> Result<Vec<u8>, String> {
     Ok(frag[start..end].to_vec())
 }
 
+/// The ISO-BMFF `free`-box marker used by [`embed_placeholder_variant`] — a domain tag the reader
+/// matches so an unrelated `free` box is never mistaken for a variant marker.
+const AV_PLACEHOLDER_MARK: &[u8] = b"elastos-av-variant/v1";
+
+/// Append an ISO-BMFF `free` box carrying a single variant `symbol` to a (plaintext) media
+/// fragment. `free` boxes are defined as ignorable free space, so the result is still a valid,
+/// playable `moof`+`mdat` fragment the browser decodes unchanged — but its bytes differ per symbol,
+/// which is all the chunk-3/4/5 *routing + weld* needs: distinct, attributable served bytes welded
+/// into the transcript AAD. Because the box is appended AFTER the `mdat`, [`encrypt_fragment`] (CENC)
+/// and [`strip_senc`] (decrypt) both carry it through verbatim, so the selected variant stays
+/// byte-distinct end-to-end and the marker survives back to the clean fragment.
+///
+/// **THIS IS A BOUNDED PLACEHOLDER, NOT A WATERMARK.** It carries no perceptual signal and does NOT
+/// survive transcode / re-encode / screen-capture. Its only job is to make the mint→serve→select→weld
+/// pipeline real and testable. The certified per-variant DSP embed (which modifies media *samples*)
+/// swaps in behind this same `(fragment, symbol) -> fragment` interface ONLY after media-survival
+/// certification — see `docs/AV_WATERMARKING.md`.
+pub fn embed_placeholder_variant(fragment: &[u8], symbol: u8) -> Vec<u8> {
+    let payload_len = AV_PLACEHOLDER_MARK.len() + 1;
+    let box_size = 8 + payload_len;
+    let mut out = Vec::with_capacity(fragment.len() + box_size);
+    out.extend_from_slice(fragment);
+    out.extend_from_slice(&(box_size as u32).to_be_bytes());
+    out.extend_from_slice(b"free");
+    out.extend_from_slice(AV_PLACEHOLDER_MARK);
+    out.push(symbol);
+    out
+}
+
+/// Recover the variant `symbol` written by [`embed_placeholder_variant`], if present — the trailing
+/// `free` box whose payload starts with [`AV_PLACEHOLDER_MARK`]. Returns `None` for an unmarked
+/// (single-encode) fragment. This is the placeholder's stand-in for the offline forensic extractor:
+/// it confirms WHICH variant was served end-to-end. The real extractor (`tools/av-forensics`)
+/// recovers the symbol from the media samples instead, once the certified DSP embed replaces this.
+pub fn read_placeholder_variant(fragment: &[u8]) -> Option<u8> {
+    let boxes = top_level_boxes(fragment).ok()?;
+    let (off, h) = boxes.iter().copied().rev().find(|(_, h)| &h.box_type == b"free")?;
+    let content_start = off + h.header_size;
+    let content_end = off + h.size;
+    let content = fragment.get(content_start..content_end)?;
+    let want = AV_PLACEHOLDER_MARK.len() + 1;
+    if content.len() != want || !content.starts_with(AV_PLACEHOLDER_MARK) {
+        return None;
+    }
+    content.last().copied()
+}
+
 /// Read the avc1 `codecs` string (e.g. `avc1.42E01E`) from the init segment by
 /// finding the `avcC` box and reading profile/constraints/level. Falls back to a
 /// safe baseline string if not found.
@@ -1093,5 +1140,41 @@ mod meta_tests {
                 "every re-parsed segment belongs to this track"
             );
         }
+    }
+
+    /// The bounded placeholder variant marker is byte-distinct per symbol, readable back, and —
+    /// crucially — SURVIVES the CENC rail: it is appended after `mdat`, so `encrypt_fragment` and
+    /// `strip_senc` carry it through, and the symbol is still recoverable from the clean fragment.
+    #[test]
+    fn placeholder_variant_is_distinct_and_survives_the_cenc_rail() {
+        let data = av_fixture();
+        let flat = split_fragmented(&data).expect("flat split");
+        let frag = &flat.fragments[0];
+
+        let a = embed_placeholder_variant(frag, 0);
+        let b = embed_placeholder_variant(frag, 1);
+        assert_ne!(a, b, "different symbols must yield different bytes");
+        assert!(a.starts_with(frag), "the marker strictly extends the fragment");
+        assert_eq!(read_placeholder_variant(&a), Some(0));
+        assert_eq!(read_placeholder_variant(&b), Some(1));
+        assert_eq!(
+            read_placeholder_variant(frag),
+            None,
+            "unmarked fragment reads as no variant"
+        );
+
+        // Survive the rail: embed -> CENC encrypt -> decrypt (strip senc) -> still variant B.
+        let cek = [7u8; 16];
+        let mut ctr = 0u64;
+        let enc_a = encrypt_fragment(&a, &cek, &mut ctr).expect("encrypt A");
+        let mut ctr2 = 0u64;
+        let enc_b = encrypt_fragment(&b, &cek, &mut ctr2).expect("encrypt B");
+        assert_ne!(enc_a, enc_b, "encrypted variants must differ (distinct served bytes)");
+        let clean_b = strip_senc(&enc_b).expect("decrypt B");
+        assert_eq!(
+            read_placeholder_variant(&clean_b),
+            Some(1),
+            "the served variant symbol must survive back to the clean fragment"
+        );
     }
 }
