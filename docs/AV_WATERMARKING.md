@@ -232,13 +232,19 @@ media** at the FP-controlled threshold (real content / screen-record / CMAF leng
 single-leaker tracing or c=2 only — and the FP-controlled threshold pushes these minimums
 **up**, not down.
 
-### Phase 5 — landed so far (chunks 1, 2, 6)
+### Phase 5 — landed so far (chunks 1, 2, 6 + the 3/4/5 *core*)
 
 > Canonical chunk numbering follows [`PHASE5_BUILD_SPEC`](AV_WATERMARKING.md) (1 schema · 2 codeword
 > · 3 mint · 4 AAD-weld · 5 serve · 6 extractor · 7 overlay). The numbered list below predates that
-> spec; the ✅ markers map the two. **Landed = chunks 1, 2, 6** (the tractable, pipeline-free pieces
-> built on the proven research). **Mine, deferred to the live CENC/DASH/quorum pipeline = chunks 3
-> (mint transcode DSP), 4 (full-variant-set AAD weld), 5 (serve-time selector).**
+> spec; the ✅ markers map the two. **Landed = chunks 1, 2, 6**, plus the **pure, pipeline-free CORE
+> of 3/4/5** (`ddrm-envelope::av`): the serve-time **selector** (`select_symbols`), the
+> full-variant-set **AAD weld** encoder (`variant_set_commitment` +
+> `DecryptTranscriptV1::to_aad_with_all_bindings`), and the mint-side **manifest builder + per-asset
+> secret KDF** (`build_manifest`, `asset_secret_from_master`) — all fail-closed and unit-tested.
+> **Still mine / needs the live pipeline = the WIRING** (mint emit + serve selection + decrypt-boundary
+> rebuild), the **real perceptual DSP embed** (the bounded placeholder seam is specified but the
+> certified embed is deferred until media-survival cert), and **media-survival certification on real
+> content**. See "remaining wiring" below.
 
 - **Chunk 1 — variant manifest schema.** `elastos.ddrm.av-variants/v1` lives in
   `capsules/ddrm-envelope/src/av.rs` (`VariantManifestV1`, behind the `av-variants` feature):
@@ -272,6 +278,27 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
   `bitERR 0`, true leaker ranked top with registration; all-erasures / no attribution without). The
   Rust `--extract-av-fingerprint` CLI is **deferred until the scheme is frozen/certified** (avoid a
   blind FFT port of an uncertified scheme — see the chunk-6 decision in `tools/av-forensics/README.md`).
+- **Chunks 3/4/5 — pure core (landed in `ddrm-envelope::av` + `lib.rs`).** The cryptography and
+  selection logic the pipeline will call, built and tested ahead of the wiring so the boundary stays
+  byte-aligned:
+  - **Serve selector (chunk 5 core):** `select_symbols(manifest, bias_q, grant_digest)` returns the
+    per-marked-segment symbol, fail-closed — wrong per-asset secret (bias-commitment mismatch),
+    unsupported arity, or malformed manifest all `Err`; a single-encode manifest selects nothing.
+    Arity-2 (A/B) direct mapping (codeword bit ↔ segment), matching the proven extractor.
+  - **AAD weld (chunk 4 core):** `variant_set_commitment(manifest)` (domain-separated, length-prefixed
+    hash of the full published set) bound via `DecryptTranscriptV1::to_aad_with_all_bindings` —
+    **strictly additive**: a non-fingerprinted open is byte-identical to the prior encoder (all goldens
+    replay), a fingerprinted open binds the exact set (manifest swap / out-of-set variant fails the CEK
+    unwrap closed at the decrypt boundary).
+  - **Mint core (chunk 3 core):** `build_manifest(...)` assembles + validates a fingerprinted manifest
+    from produced variants; `asset_secret_from_master(master, content_hash)` derives the per-asset
+    watermark secret so mint and serve agree on the bias/codebook **without publishing or per-asset
+    storing it** (manifest carries only the commitment; rotating `master` re-keys every asset). A
+    round-trip test closes the mint→serve loop.
+  - **Known follow-up (welded honesty):** the manifest's `interleave` is carried + committed but
+    **not yet applied** across embed/select/recover (the proven extractor maps bit `i`→segment `i`
+    directly); applying it is a single change that must land on the Rust selector AND the Python
+    extractor together, then re-run the extractor. Tracked, not silently dropped.
 
 1. ✅ **LANDED (chunk 1).** **Spec + manifest schema.** Define the variant manifest
    (`elastos.ddrm.av-variants/v1`: which segments carry `{A,B}`, the per-variant bit, the codeword
@@ -288,9 +315,12 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
    strategies** (random / majority / minority / all-ones / all-zeros / interleave): FP ≤ ε,
    100% detection. The published per-asset duration bound at this FP-controlled threshold
    still needs **real-media** re-validation (not code-level).
-3. **Serve-time selector (behind a flag, single-encode fallback).** `ddrm-media-authority`
-   picks `variant[i]` from the codeword when a manifest exists; else serves the single
-   encode and sets `fingerprinted:false`.
+3. **Serve-time selector (behind a flag, single-encode fallback).** ☑️ **Core landed**
+   (`av::select_symbols`, fail-closed, unit-tested). **Remaining = wiring:** `ddrm-media-authority`
+   (`compute_open_payload`) loads the manifest from the DASH dir, derives the per-asset bias from the
+   node master, calls `select_symbols`, and reads the selected variant ciphertext per marked segment;
+   else serves the single encode and sets `fingerprinted:false`. Needs the `av-variants` feature on
+   `ddrm-media-authority` + a live serve path to validate.
    *Check:* with a two-variant fixture dir, two different grants produce two different
    served segment-byte sequences; with no manifest, both get the identical single encode.
 4. ✅ **LANDED as Python (chunk 6).** **Offline extractor.** Recovers the codeword → buyer,
@@ -299,9 +329,14 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
    *Check:* a file assembled from a known A/B sequence extracts back to that codeword
    (clean), and still extracts after a lossy re-encode + crop pass (validated: `bitERR 0`, leaker
    ranked top with FM registration).
-5. **Mint transcode pipeline (the heavy lift).** Produce `{A,B}` per segment with the
-   per-variant DSP (video: spatial/temporal mark; audio: spread-spectrum/echo-hiding),
-   CENC-encrypt, publish manifest.
+5. **Mint transcode pipeline (the heavy lift).** ☑️ **Core landed** (`av::build_manifest`,
+   `av::asset_secret_from_master`). **Remaining = wiring + the real DSP:** produce `{A,B}` per marked
+   segment, CENC-encrypt each, publish the manifest beside `stream.mpd`. The **embed has a bounded
+   placeholder seam** (a valid, ignorable, byte-distinct marker — exercises mint→serve→select→weld
+   end-to-end **without** a perceptual claim); the **real per-variant DSP** (video: spatial/temporal
+   mark; audio: spread-spectrum/echo-hiding) **swaps in behind the same interface only after
+   media-survival certification** (avoid shipping an uncertified perceptual embed in the trusted mint
+   path).
    **Gating DSP research sub-item (the one genuine unknown):** blind **geometric
    registration** of the recovered mark — Phase 0 proved a search loop is insufficient (a
    fine scale grid made detection *worse*); it needs a **deterministic estimator** (an
@@ -327,6 +362,33 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
 
 Phases 1–4 are tractable and self-contained. **Phase 5 is the real cost** (a transcode
 pipeline) and gates the rest going live.
+
+### Remaining wiring (precise — picks up where the landed core stops)
+
+The pure core (selector, AAD weld, manifest builder, secret KDF) is in `ddrm-envelope::av` +
+`lib.rs`, fully unit-tested. What is **not** yet wired (each touches the trusted serve/decrypt path, so
+it needs a live serve path — synthetic media is enough; **real** content is only for the perceptual
+cert):
+
+1. **`ddrm-media-authority` (serve, chunk 5):** add the `av-variants` feature; in `compute_open_payload`
+   load `av-variants.json` from the DASH dir, derive `bias = asset_bias_vector(asset_secret_from_master(
+   node_master, content_hash), m)`, call `select_symbols`, and read the **selected** variant ciphertext
+   per marked segment (fall back to the flat `segment_paths` when no/invalid manifest). Set
+   `fingerprinted` on the serve descriptor (`serve_media`).
+2. **AAD weld (chunk 4):** compute `variant_set_commitment(manifest)` on the serve side and pass it into
+   `recover_quorum`'s transcript via `to_aad_with_all_bindings`; mirror it in
+   `decrypt-provider::prepare_bound_open` so the seal and rebuild stay byte-identical (extend the
+   `stream_segment` unit test).
+3. **Mint (chunk 3/5):** in `run_prepare_mint_media` → `media-provider` produce the per-marked-segment
+   variants (placeholder embed seam), `encrypt-provider` CENC each, write the manifest via
+   `build_manifest`, and persist the bias `master`→asset mapping for the serving node.
+4. **Smoke:** extend `quorum-helper-verify.sh` for the two-grant divergence check (different served
+   bytes, byte-identical with no manifest).
+
+**To validate this end-to-end I need you to:** bring up the gateway with a **synthetic** test asset
+(no real content required) so I can iterate the serve+mint wiring against a live path — same bring-up
+you ran before (`ELASTOS_DDRM_RIGHTS=chain`, `ELASTOS_DKMS_CARRIER=1`). **Real media + a screen-record
+are only needed later**, for media-survival certification + swapping the placeholder for the real DSP.
 
 ---
 
