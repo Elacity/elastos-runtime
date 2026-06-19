@@ -26,12 +26,14 @@ from canonical import (
     buyer_codeword,
     grant_watermark_digest16,
     tardos_score,
+    tardos_threshold,
 )
 from dsp import N, SEG, H, W, decode, detect, embed, encode, ff_transform, load_gray
 from fm_register import register
 
 N_BUYERS = 8
 ERASURE_TAU = 2.0                       # per-segment |z| below this -> erasure (untrusted symbol)
+ACCUSE_EPS = 1e-3                       # total false-accusation budget for the analytic threshold
 ASSET_SECRET = b"av-forensics-demo-asset"
 
 
@@ -91,14 +93,17 @@ def main():
     ]:
         y, conf = recover(leaked, master, est, nseg)
         scores, keep = accuse(y, conf, rows, bias_q)
+        kept = sum(1 for k in keep if k)
         acc = int(np.argmax(scores))
         second = sorted(scores)[-2]
-        named = acc if scores[acc] > 3.0 * max(second, 0.5) else None
+        # FP-controlled accusation: name a buyer ONLY if its score clears the analytic Tardos
+        # threshold over the KEPT positions (not the ad-hoc gap). Erasure-only ⇒ no accusation.
+        z = tardos_threshold(kept, N_BUYERS, ACCUSE_EPS) if kept > 0 else float("inf")
+        named = acc if scores[acc] > z else None
         bit_err = sum(1 for i in range(nseg) if keep[i] and y[i] != rows[leaker][i])
         verdict = f"NAMED buyer {named}" if named == leaker else f"mis/none: {named}"
-        print(f"{label:<16}: erasures={sum(1 for k in keep if not k)}/{nseg}  "
-              f"bitERR(vs leaker)={bit_err}  top=buyer {acc} "
-              f"(score {scores[acc]:.1f}, next {second:.1f})  -> {verdict}")
+        print(f"{label:<16}: erasures={nseg - kept}/{nseg}  bitERR(vs leaker)={bit_err}  "
+              f"top=buyer {acc} (score {scores[acc]:.1f}, next {second:.1f}, Z={z:.1f})  -> {verdict}")
 
 
 if __name__ == "__main__":

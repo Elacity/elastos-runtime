@@ -9,12 +9,14 @@ Pure stdlib — runnable in CI without numpy/ffmpeg:  python3 tools/av-forensics
 """
 import sys
 from canonical import (
+    _inv_norm_cdf,
     asset_bias_vector,
     bias_commitment_hex,
     buyer_codeword,
     grant_watermark_digest16,
     interleave_map,
     tardos_score,
+    tardos_threshold,
 )
 
 # GOLDEN (baked from the verified ddrm-envelope run; identical on both sides):
@@ -64,6 +66,22 @@ def main() -> int:
     else:
         ok = False
         print(f"  DRIFT tardos_score mis-ranked: {scores}")
+
+    # Analytic Tardos threshold sanity (Monte-Carlo-validated separately in montecarlo.py):
+    # inv-norm accuracy, monotonic in m and eps, and the published Z(2332,500,1e-3) value.
+    if abs(_inv_norm_cdf(0.975) - 1.959964) < 1e-4:
+        print("  ok    _inv_norm_cdf accurate (Φ⁻¹(0.975) ≈ 1.96)")
+    else:
+        ok = False
+        print(f"  DRIFT _inv_norm_cdf(0.975) = {_inv_norm_cdf(0.975)}")
+    z = tardos_threshold(2332, 500, 1e-3)
+    mono = (tardos_threshold(4000, 500, 1e-3) > z > tardos_threshold(1000, 500, 1e-3)
+            and tardos_threshold(2332, 500, 1e-4) > z)
+    if mono and abs(z - 222.69) < 0.1:
+        print(f"  ok    tardos_threshold monotone + Z(2332,500,1e-3)={z:.2f}")
+    else:
+        ok = False
+        print(f"  DRIFT tardos_threshold sanity: z={z}, monotone={mono}")
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

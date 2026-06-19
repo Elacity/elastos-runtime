@@ -27,8 +27,9 @@ on either side and **both** fail.
 
 | File | Role | Deps |
 |---|---|---|
-| `canonical.py` | Canonical codeword: bias vector, buyer row, interleave, Tardos score (mirror of `av.rs`) | stdlib |
-| `test_canonical.py` | Golden weld vs the Rust side (the smoke) | stdlib |
+| `canonical.py` | Canonical codeword: bias vector, buyer row, interleave, Tardos score, **analytic threshold** (mirror of `av.rs`) | stdlib |
+| `test_canonical.py` | Golden weld vs the Rust side + threshold sanity (the smoke) | stdlib |
+| `montecarlo.py` | **FP/FN certification sweep** of the analytic threshold across six collusion strategies | numpy |
 | `fm_register.py` | Deterministic Fourier-Mellin registration (informed; valid-region resolution) | numpy |
 | `dsp.py` | Spread-spectrum embed + differential detect + ffmpeg encode/decode/leak | numpy + ffmpeg |
 | `extractor.py` | End-to-end: grant → codeword → embed → leak → register → recover → accuse | numpy + ffmpeg |
@@ -53,6 +54,16 @@ what makes attribution survive a geometric leak.
 - **Rotation: OUT of envelope** — needs a proper rotation estimator (the rarest leak).
 - **Audio + the VMAF figure: synthetic-only so far** — real-content + real-screen-record
   re-validation (incl. PEAQ/ODG, human A/B/X, time-stretch/pitch) is mandatory before any claim.
-- The single-leaker gap test in `extractor.py` is a **DEMO, not a certified accusation**. A
-  certified collusion bound needs the **analytic Tardos threshold + a Monte-Carlo FP/FN sweep**
-  across multiple collusion strategies, and short clips are too thin for any certified `c`.
+- **Accusation is now FP-controlled (code level).** `extractor.py` accuses only above the
+  **analytic** Tardos threshold `canonical.tardos_threshold` (`Z = √m·Φ⁻¹(1−ε/N)`), not an
+  empirical gap. `montecarlo.py` (2000 trials, `m=2332 N=500 c=3 ε=1e-3 BER=0.13`) confirms
+  **FP ≤ ε with 100% detection across six collusion strategies**; the old `mean+3.5σ` ran 2–10×
+  over ε. This certifies the **accusation statistics only** — *not* media survival.
+- **Media survival is still uncertified:** real-content + real-screen-record re-validation
+  (audio incl. PEAQ/ODG + human A/B/X, real CMAF segment lengths) is mandatory before any
+  end-to-end claim, and short clips remain too thin for a certified `c`.
+
+```bash
+python3 tools/av-forensics/montecarlo.py            # default sweep (needs numpy)
+python3 tools/av-forensics/montecarlo.py --c 4 --trials 4000   # stress a larger collusion
+```

@@ -217,15 +217,15 @@ periodic-carrier **log-polar / Fourier–Mellin** method), not a search loop (§
 naming colluders, with **no per-buyer codeword storage** (the row is recomputed from the
 audit-log `grant_digest`; the server stores only a per-asset bias vector). Tight (Škorić
 symmetric) length `m = 2π²·c²·ln(N/ε) ≈ 2332` for c=3, N=500, ε=1e-3.
-**Correction (audit, baked in here):** the harness's single demonstration used an
-*empirical* threshold (`mean+3.5σ` of the realized scores). A Monte-Carlo sweep (400
-trials) showed that threshold gives a **~1.25% false-accusation rate — not ε=1e-3**.
-Detection power has large margin (100% catch at every threshold tried; `mean+4σ` → 0 FP
-in 400 trials), so the fix is cheap — **but a certified bound requires the *analytic*
-Tardos threshold plus a Monte-Carlo FP/FN sweep, and the per-asset bound must be
-recomputed for that FP-controlled threshold (which tightens the duration requirement a
-notch).** Only one collusion strategy (random-on-differing) was tested; **minority /
-all-ones / interleaving attacks must be tested before any certified bound** (chunk 2/6).
+**Correction (audit) — now RESOLVED at code level:** the original harness used an
+*empirical* threshold (`mean+3.5σ`); a Monte-Carlo sweep showed it gives **~1.25%
+false-accusation — not ε=1e-3**. The fix is landed: `canonical.tardos_threshold` is the
+**analytic** `Z = √m·Φ⁻¹(1−ε/N)`, and `tools/av-forensics/montecarlo.py` (2000 trials)
+now confirms **FP ≤ ε with 100% detection across all six collusion strategies**
+(random / majority / minority / all-ones / all-zeros / interleave) — the empirical
+threshold reproduces the failure at **2–10× over ε** (majority worst, ≈1.05%). What
+remains is **not** code-level: re-validating the per-asset duration bound on **real
+media** at the FP-controlled threshold (real content / screen-record / CMAF lengths).
 
 **Duration bound (provisional, pre-FP-recompute):** long-form (≥~20 min @ 1 mark/s, or
 ~10 min with q-ary A/B/C/D) supports c=3; short clips (2–4 min ≈ 120–240 marks) support
@@ -253,9 +253,16 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
   integers — **not** any language's RNG — so the serve selector (Rust) and the extractor (Python)
   derive *identical* codewords. Cross-language **golden vectors** are asserted on both sides
   (`av::tests::canonical_golden_vectors` ↔ `tools/av-forensics/test_canonical.py`) — the
-  `grant_watermark_digest16` anti-drift pattern. *Still uncertified:* the **analytic Tardos
-  threshold + Monte-Carlo FP/FN sweep** (the Phase-0 empirical `mean+kσ` is ~1.25% FP); `argmax`
-  alone is not proof.
+  `grant_watermark_digest16` anti-drift pattern.
+- **Accusation is FP-controlled (code-level — landed).** `canonical.tardos_threshold` is the
+  **analytic** threshold `Z = √m · Φ⁻¹(1 − ε/N)` — the innocent symmetric-Tardos score is exactly
+  mean-0, variance-1 per kept position ⇒ `N(0,m)` — replacing the Phase-0 empirical `mean+kσ`. A
+  Monte-Carlo sweep (`tools/av-forensics/montecarlo.py`, **2000 trials**, `m=2332 N=500 c=3 ε=1e-3
+  BER=0.13`) confirms **FP ≤ ε with 100% detection across six collusion strategies** (random /
+  majority / minority / all-ones / all-zeros / interleave); the old empirical threshold ran **2–10×
+  over ε** (majority attack ≈1.05% — the reproduced Phase-0 over-claim). The extractor now accuses
+  only above this `Z`; `argmax` alone is never proof. **Still open (NOT code-level):** media-survival
+  certification on **real content / real screen-record / real CMAF lengths**, and the rotation estimator.
 - **Chunk 6 — offline forensic extractor.** Landed as the **proven Python reference** under
   `tools/av-forensics/` (offline, operator-run, on already-leaked public files — no key material, not
   in the boundary), re-anchored to the chunk-2 canonical construction. **The load-bearing FM fix is
@@ -275,11 +282,12 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
    **timeline-interleaved** and layered over an **erasure-aware code** (§3.4). ECC for
    first light, but **design the schema for tight (Škorić symmetric) Tardos** from the
    start. No I/O.
-   *Check:* distinct grants → distinct codewords; collusion resolved using the **analytic
-   Tardos threshold** (not an empirical `mean+kσ`), validated by a **Monte-Carlo FP/FN
-   sweep** against **multiple collusion strategies** (random, minority, all-ones,
-   interleaving); the published per-asset bound is computed at the **FP-controlled**
-   threshold.
+   *Check (met):* distinct grants → distinct codewords; accusation uses the **analytic
+   Tardos threshold** (`canonical.tardos_threshold`, not an empirical `mean+kσ`), validated
+   by the **Monte-Carlo FP/FN sweep** (`montecarlo.py`, 2000 trials) against **six collusion
+   strategies** (random / majority / minority / all-ones / all-zeros / interleave): FP ≤ ε,
+   100% detection. The published per-asset duration bound at this FP-controlled threshold
+   still needs **real-media** re-validation (not code-level).
 3. **Serve-time selector (behind a flag, single-encode fallback).** `ddrm-media-authority`
    picks `variant[i]` from the codeword when a manifest exists; else serves the single
    encode and sets `fingerprinted:false`.
