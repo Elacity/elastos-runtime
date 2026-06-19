@@ -70,7 +70,10 @@ The technique premium VOD (studios/Netflix-class) actually uses:
 
 1. **At mint / transcode**, produce **two encodes of each segment** — `A` and `B` —
    carrying different embedded watermark bits (a robust, imperceptible spatial/temporal
-   mark per variant). Both are CENC-encrypted and published in the DASH directory.
+   mark per variant). Both are CENC-encrypted and published in the DASH directory. The
+   CEK/transcript AAD binds the **complete published variant set** (extending
+   `to_aad_with_segments`), so no variant can be substituted or injected; per-buyer
+   selection is **post-unwrap routing** over already-authenticated ciphertext.
 2. **At serve**, each buyer is handed a **unique A/B sequence** across segments
    (e.g. segment 0→A, 1→B, 2→B, 3→A, …). The sequence is a codeword derived
    deterministically from the buyer's access-grant identity.
@@ -113,6 +116,21 @@ against an MSE scrape — but it's a visible "you are identified" signal and cos
 nothing. Ship it as a deterrent **only**, clearly labelled non-forensic, never as the
 real control.
 
+### 3.4 Channel coding — required, not optional
+
+The leak channel is **bursty**: re-encode and segment/packet loss take out *whole
+segments* (contiguous runs of marks), not i.i.d. bits. So the codeword **must**:
+
+- **interleave across the timeline** — spread each buyer's codeword bits over
+  non-adjacent segments so a lost run becomes scattered erasures rather than a lost
+  block; and
+- use an **erasure-aware code** — mark dropped/low-confidence segments as *erasures*,
+  not forced bit decisions, layered under the anti-collusion code.
+
+This is a hard requirement on the codeword design (§5 chunk 2) and the robustness harness
+(§5 chunk 6), not a tuning afterthought. The Phase-0 harness modelled only i.i.d.
+bit-flips and so understates burst damage.
+
 ---
 
 ## 4. Architecture (where each piece lives)
@@ -142,7 +160,9 @@ Boundary discipline (must hold — see §7):
   grant*, not by anything the browser sends. The capsule/player never chooses its own
   variant (that would be ambient authority + a strip vector).
 - The **CEK never leaves the decrypt VM**; variant selection happens *before* decrypt,
-  on already-published ciphertext. No on-the-fly re-encryption.
+  on already-published ciphertext. No on-the-fly re-encryption. The transcript AAD binds
+  the **full published variant set**, so per-buyer selection is *routing*, not a new
+  authority — a substituted or injected variant fails the unwrap closed.
 - **One canonical path**: the quorum-media serve path gains a selector; there is no
   second "unmarked fast path." If variants are absent, the path serves the single
   encode and the descriptor says `fingerprinted: false` — explicit, not silent.
@@ -154,14 +174,77 @@ Boundary discipline (must hold — see §7):
 > Per [CLAUDE.md](../CLAUDE.md): smallest independently-verifiable steps. These are
 > roadmap chunks; each becomes its own approved plan + tests before code.
 
+### Phase 0 — feasibility study (DONE, off-tree throwaway harness)
+
+> A research-grade, off-tree Python harness (never part of the repo) answered the
+> go/no-go before any pipeline work. **Verdict: GO**, with two scoped engineering items
+> (geometric registration; code/redundancy sizing). The results below are on **synthetic
+> content at sub-segment lengths** and are a feasibility signal, **not** a production
+> validation — every number must be re-earned on real media at real CMAF segment lengths
+> (see chunk 6 and §7).
+
+**Video** (one bit per 8-frame segment; real CMAF segments are 8–22× longer → coherent
+gain ≈ √(len) is stronger — *but only for an attenuated-but-present mark*; a mark
+quantized away by heavy re-encode is not recovered by length alone):
+
+| Leak path | seg BER | verdict |
+|---|---|---|
+| publish encode | 0.000 | GREEN |
+| HiDPI screen-record (2× resample) | 0.067 | GREEN |
+| transcode → VP9 | 0.000 | GREEN |
+| re-encode @ ~½ bitrate | 0.133 | AMBER (needs ECC budget to certify GREEN) |
+| re-encode @ ~¼ bitrate | 0.600 | RED (mark quantized away — redundancy *not proven* to recover) |
+| crop 10% (geometric) | 0.333 | RED (registration — gating Phase-5 item) |
+
+Imperceptibility **VMAF 96.7** — measured on **480×270 synthetic content with a
+1080p-tuned model**, so treat it as a soft *relative* signal, **not the gate**.
+
+**Audio** (0.25 s segments, through AAC 96k / MP3 128k / 44.1k resample / gain): uniform
+**seg BER 0.083 (GREEN)**, codec-robust. **Not yet validated:** the test content is
+**pink noise** (stationary, broadband — the *easiest* case for both masking and codec
+survival), and imperceptibility is a **nominal −42 dB proxy, not a psychoacoustic
+measurement**. Real music/speech/silence and time-stretch/pitch are untested (chunk 6).
+
+**Registration (the one genuine research item):** bounded **translation is solved** (a
+16 px shift recovers GREEN via windowed FFT cross-correlation). **Scale/zoom is not**:
+both a coarse raw-max search and a fine, PSR-selected coherent-sum search (~17 scales)
+made detection *worse* — every extra hypothesis is another chance for a spurious peak.
+Blind geometric sync needs a **deterministic estimator** (embedded template/pilot, or a
+periodic-carrier **log-polar / Fourier–Mellin** method), not a search loop (§5 chunk 5).
+
+**Collusion (Tardos, anchored to `grant_digest`):** the full chain works — `grant_digest`
+→ deterministic Tardos row → variant selection → leak at the spike's BER → accusation
+naming colluders, with **no per-buyer codeword storage** (the row is recomputed from the
+audit-log `grant_digest`; the server stores only a per-asset bias vector). Tight (Škorić
+symmetric) length `m = 2π²·c²·ln(N/ε) ≈ 2332` for c=3, N=500, ε=1e-3.
+**Correction (audit, baked in here):** the harness's single demonstration used an
+*empirical* threshold (`mean+3.5σ` of the realized scores). A Monte-Carlo sweep (400
+trials) showed that threshold gives a **~1.25% false-accusation rate — not ε=1e-3**.
+Detection power has large margin (100% catch at every threshold tried; `mean+4σ` → 0 FP
+in 400 trials), so the fix is cheap — **but a certified bound requires the *analytic*
+Tardos threshold plus a Monte-Carlo FP/FN sweep, and the per-asset bound must be
+recomputed for that FP-controlled threshold (which tightens the duration requirement a
+notch).** Only one collusion strategy (random-on-differing) was tested; **minority /
+all-ones / interleaving attacks must be tested before any certified bound** (chunk 2/6).
+
+**Duration bound (provisional, pre-FP-recompute):** long-form (≥~20 min @ 1 mark/s, or
+~10 min with q-ary A/B/C/D) supports c=3; short clips (2–4 min ≈ 120–240 marks) support
+single-leaker tracing or c=2 only — and the FP-controlled threshold pushes these minimums
+**up**, not down.
+
 1. **Spec + manifest schema.** Define the variant manifest (`elastos.ddrm.av-variants/v1`:
    which segments carry `{A,B}`, the per-variant bit, the codeword scheme).
    *Check:* a fixture manifest round-trips through serde and an alignment test asserts
    the schema is referenced by both the mint and serve sides.
-2. **Codeword derivation.** Pure function `grant → anti-collusion codeword` (start with
-   ECC; design for Tardos). No I/O.
-   *Check:* unit tests — distinct grants give distinct codewords; the documented
-   collusion bound holds for `n` colluders on synthetic codewords.
+2. **Codeword derivation.** Pure function `grant → anti-collusion codeword`,
+   **timeline-interleaved** and layered over an **erasure-aware code** (§3.4). ECC for
+   first light, but **design the schema for tight (Škorić symmetric) Tardos** from the
+   start. No I/O.
+   *Check:* distinct grants → distinct codewords; collusion resolved using the **analytic
+   Tardos threshold** (not an empirical `mean+kσ`), validated by a **Monte-Carlo FP/FN
+   sweep** against **multiple collusion strategies** (random, minority, all-ones,
+   interleaving); the published per-asset bound is computed at the **FP-controlled**
+   threshold.
 3. **Serve-time selector (behind a flag, single-encode fallback).** `ddrm-media-authority`
    picks `variant[i]` from the codeword when a manifest exists; else serves the single
    encode and sets `fingerprinted:false`.
@@ -174,12 +257,25 @@ Boundary discipline (must hold — see §7):
 5. **Mint transcode pipeline (the heavy lift).** Produce `{A,B}` per segment with the
    per-variant DSP (video: spatial/temporal mark; audio: spread-spectrum/echo-hiding),
    CENC-encrypt, publish manifest.
+   **Gating DSP research sub-item (the one genuine unknown):** blind **geometric
+   registration** of the recovered mark — Phase 0 proved a search loop is insufficient (a
+   fine scale grid made detection *worse*); it needs a **deterministic estimator** (an
+   embedded template/pilot, or a periodic-carrier **log-polar / Fourier–Mellin** method).
+   Until it ships, crop/zoom/rotation are out of envelope (§7). The audio analogue is a
+   real **psychoacoustic masking model** for the embed (not the Phase-0 fixed-dB proxy).
    *Check:* a minted asset yields a DASH dir whose A/B segments are perceptually
    indistinguishable (objective metric threshold) yet decode to different bits.
-6. **Robustness harness.** Re-encode / crop / screen-record-sim / partial-collusion
-   round-trips.
-   *Check:* documented survival envelope holds on the harness; out-of-envelope cases are
-   listed honestly (like the image mark's stated limits).
+6. **Robustness harness (on real media, not synthetic).** Re-encode / crop /
+   screen-record / **bursty segment-loss (erasure)** / **multi-strategy collusion**
+   round-trips. **Audio re-validation is mandatory and concrete:** a psychoacoustic
+   masking model for the embed; imperceptibility by **PEAQ/ODG plus a human A/B/X
+   listening test on real music, speech, and silence**; and **time-stretch / pitch-shift**
+   attacks (the audio analogue of geometric desync). Video imperceptibility must be
+   re-measured on real content at real resolution (the Phase-0 VMAF figure on synthetic
+   480×270 does not count).
+   *Check:* documented survival envelope holds **on real media**; the collusion bound is
+   certified only after the analytic-threshold + Monte-Carlo + multi-strategy sweep (§5
+   chunk 2); out-of-envelope cases are listed honestly (like the image mark's limits).
 7. **(Optional, parallel) visible per-session overlay** in the player as an interim,
    clearly-labelled non-forensic deterrent.
    *Check:* overlay shows the buyer's `wallet·time`; documented as deterrent-only.
@@ -207,17 +303,45 @@ pipeline) and gates the rest going live.
 
 ## 7. Non-goals / honest limits
 
-- Not EME/Widewine/hardware DRM — we stay at the browser-MSE ceiling on purpose.
+- Not EME/Widevine/hardware DRM — we stay at the browser-MSE ceiling on purpose.
 - Not protection against a **boundary break** (CEK exfiltration) — that's the dKMS
   threat model.
+- **Geometric/temporal desync is out of envelope until registration ships:**
+  crop/zoom/rotation (video) and time-stretch/pitch-shift (audio). Phase 0 proved bounded
+  translation recovers but scale/zoom needs a deterministic estimator (§5 chunk 5).
+- **No certified collusion bound on short clips** — too few marks; short clips are
+  single-leaker / c=2 at best, and even that only after FP-controlled certification. Each
+  asset's certified `c` is stated in its descriptor; never imply a stronger bound.
+- **Phase-0 numbers are synthetic/research-grade.** Audio in particular is *unvalidated on
+  real content* (pink-noise test signal + a nominal-dB imperceptibility proxy) until
+  chunk 6; the VMAF figure is on synthetic 480×270 and is not the imperceptibility gate.
 - The interim visible overlay is **not** forensic and must never be described as such.
 - Until Phase 5 ships, AV remains **key-protected, not fingerprinted**, and the UI/docs
   must say so.
 
-## 8. Open decisions (resolve in the Phase-1/2 plans)
+## 8. Decisions (resolved in Phase 0) and remaining open items
 
-- Fingerprint code: ECC first vs. Tardos from the start (collusion resistance vs. length).
-- Storage cost of 2× segment encodes — all segments vs. a marked subset (cost vs.
-  codeword length / robustness).
+**Resolved (Phase 0 → bake into the Phase-1/2 schema):**
+
+- **Fingerprint code:** ECC for first light, **tighten to tight (Škorić symmetric)
+  Tardos** for the certified scheme; design the schema for Tardos from the start.
+- **Variant arity / q-ary is the density lever:** A/B is the baseline; **q-ary
+  (A/B/C/D)** packs more codeword bits per segment, roughly *halving* the timeline needed
+  for a given collusion order (≈10 min vs ≈20 min for c=3) at higher storage/DSP cost.
+- **The collusion bound is per-asset and published** — a function of **duration × mark
+  cadence × variant arity**, computed at the **FP-controlled analytic-Tardos threshold**.
+  (Phase 0 showed an empirical `mean+3.5σ` threshold is ~1.25% false-accusation — not
+  certifiable; the analytic threshold + Monte-Carlo sweep is required, and it pushes the
+  duration minimums up.) Long-form supports c=3; short clips get single-leaker / c=2 at
+  best. The asset descriptor states its certified `c`.
+- **Channel coding is required, not optional:** timeline interleaving + an erasure-aware
+  code (§3.4), because the leak channel is bursty (whole-segment loss), not i.i.d.
+
+**Still open (resolve in the Phase-1/2 plans):**
+
+- Storage cost of variant encodes — all segments vs. a marked subset (cost vs. codeword
+  length/robustness), and how q-ary arity trades against storage.
 - Audio: A/B variant (recommended) vs. any in-boundary case for short non-streamed clips.
+- The **geometric-registration estimator** choice (embedded template/pilot vs.
+  log-polar/Fourier–Mellin) — the one genuine DSP research item (§5 chunk 5).
 - Whether the visible interim overlay ships at all, given it can imply false assurance.
