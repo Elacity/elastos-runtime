@@ -377,6 +377,15 @@ The one mutating endpoint. Requires a **`Write`** inspect capability at
 a malformed id. The action is audited (`inspect.revoke`) in addition to the
 capability manager's own revocation audit.
 
+> **Path note (contract honesty):** `revoke` and `self` are served on the
+> **embedded `RequestHandler` (shell/runtime) path**, which holds the
+> `CapabilityManager`/runtime handles a mutation needs. The product-side
+> `InspectProvider` (the `ProviderRegistry` path both transports converge on) is
+> a deliberately **read-only projection** and serves only `capsules`, `capsule`,
+> `plan`, and `intent`. Recording a mutation (revoke, or a recorded approval
+> decision) belongs with the runtime/dispatcher, not the read-only provider —
+> see the roadmap's `act` step.
+
 ### `elastos://inspect/plan` — read (two reflective modes, never mixed)
 
 Metadata-driven invocation **preview** (read-only dry-run; dispatches no
@@ -426,6 +435,29 @@ is intentionally not implemented — that architecture is to be planned. When th
 DDRM branch lands, dispatch should consult its `required_action_for` op→action
 map as the authoritative classifier so the planner's preview and the carrier
 bridge's enforcement agree by construction.
+
+### `elastos://inspect/intent` (params: `{ "id", "operation" }`) — read
+
+The **approval-intent preview** — the *approve* step of the control loop, in
+read-only form. Given a provider operation it derives the gate (via `plan`), the
+approval that gate requires, and the **fail-closed default decision** — recording
+nothing and dispatching nothing:
+
+```json
+{ "valid": true, "kind": "approval_intent", "capsule": "capsule:key-provider",
+  "operation": "release", "resources": ["elastos://key/*"],
+  "capability_actions": ["execute"], "requires_approval": "user",
+  "default_decision": "pending_approval",
+  "audit_events": ["key.release.denied", "key.release.granted"] }
+```
+
+The decision core is `elastos-runtime::approval`: `required_approval(actions)`
+scales the approval requirement with action strength (anything beyond
+read/message needs a human), and `decide(mode, approver)` is fail-closed — the
+only path to `Approved` without an explicit "yes" is an affordance declared as
+needing no approval; `User`/`RuntimePolicy` default to `pending_approval`; an
+explicit "no" always wins. **Recording** an approve/deny is a mutation and lives
+with the runtime/dispatcher (the `act` step), not this read-only provider.
 
 ### Why `granted_capabilities` is observed, not enumerated
 
