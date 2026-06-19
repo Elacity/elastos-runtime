@@ -1,3 +1,7 @@
 [toolchain]
 channel = "1.89.0"
 components = ["rustfmt", "clippy"]
+# The Home capsules (capsules/home-cli and friends) build to wasm; pin the target so the
+# pinned toolchain auto-installs its std (carrier smoke + `just verify`) everywhere — CI and
+# local — instead of failing with E0463 "can't find crate for std".
+targets = ["wasm32-wasip1"]
