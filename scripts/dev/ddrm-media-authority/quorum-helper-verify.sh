@@ -39,7 +39,7 @@ build() { cargo build --quiet --manifest-path "$1/Cargo.toml" "${@:2}" || { echo
 build "$CAP/encrypt-provider" --features escrow
 build "$CAP/key-provider" --features key-authority-ref
 build "$CAP/decrypt-provider" --features rail-stream,rail-mint
-build "$CAP/dkms-authority"
+build "$CAP/dkms-authority" --features dev-modes
 build "$CAP/dkms-keygen"
 build "$REPO/scripts/dev/dkms-live-recover"
 build "$SMOKE_DIR"
