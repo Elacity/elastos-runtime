@@ -330,6 +330,61 @@ pub fn variant_set_commitment(manifest: &VariantManifestV1) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Per-asset watermark secret, derived ONCE at mint from a node-held master secret and the asset's
+/// content hash: `SHA-256(domain ‖ lp(master) ‖ lp(content_hash))`. The mint embed and the serve
+/// selector both derive it from the same `(master, content_hash)`, so neither the bias vector nor
+/// the codebook is ever published or stored per-asset — the published manifest carries only the bias
+/// COMMITMENT. Keep `master` in the serving node's secret store; rotating it re-keys every asset.
+pub fn asset_secret_from_master(master: &[u8], content_hash: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"elastos.av.asset-secret/v1");
+    h.update((master.len() as u32).to_be_bytes());
+    h.update(master);
+    h.update((content_hash.len() as u32).to_be_bytes());
+    h.update(content_hash);
+    h.finalize().into()
+}
+
+/// Build + validate a fingerprinted [`VariantManifestV1`] at mint from the per-asset secret and the
+/// produced per-marked-segment variants. `marked` is, in timeline order, `(segment_index, variants)`
+/// where `variants[s]` carries `symbol == s` for `s in 0..arity`. The canonical interleave + bias
+/// commitment are computed from `asset_secret`, so the published manifest is consistent with the
+/// secret the serve selector will use (`select_symbols` against `asset_bias_vector(asset_secret, m)`
+/// then succeeds). Fail-closed: any structural inconsistency returns `Err`. An empty `marked` yields
+/// the honest single-encode manifest (never a half-formed mark).
+pub fn build_manifest(
+    arity: u8,
+    erasure_tau: f64,
+    asset_secret: &[u8],
+    marked: &[(u32, Vec<VariantRef>)],
+) -> Result<VariantManifestV1, &'static str> {
+    if marked.is_empty() {
+        return Ok(VariantManifestV1::single_encode());
+    }
+    let m = marked.len() as u32;
+    let bias = asset_bias_vector(asset_secret, m);
+    let manifest = VariantManifestV1 {
+        schema: AV_VARIANTS_SCHEMA.to_string(),
+        fingerprinted: true,
+        arity,
+        codeword: CodewordScheme {
+            length: m,
+            interleave: interleave_map(asset_secret, m),
+            erasure_tau,
+            bias_commitment_hex: bias_commitment_hex(&bias),
+        },
+        marked_segments: marked
+            .iter()
+            .map(|(index, variants)| MarkedSegment {
+                index: *index,
+                variants: variants.clone(),
+            })
+            .collect(),
+    };
+    manifest.validate()?;
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +498,66 @@ mod tests {
         let mut qary = fixture_manifest();
         qary.arity = 4;
         assert!(select_symbols(&qary, &asset_bias_vector(b"asset-x", 3), &grant).is_err());
+    }
+
+    #[test]
+    fn asset_secret_is_deterministic_and_separates_master_and_content() {
+        let s = asset_secret_from_master(b"node-master", b"content-hash-bytes");
+        assert_eq!(
+            s,
+            asset_secret_from_master(b"node-master", b"content-hash-bytes")
+        );
+        assert_ne!(
+            s,
+            asset_secret_from_master(b"node-master-2", b"content-hash-bytes")
+        );
+        assert_ne!(
+            s,
+            asset_secret_from_master(b"node-master", b"other-content")
+        );
+        // Length-prefixed, so a (master,content) boundary shift cannot collide.
+        assert_ne!(
+            asset_secret_from_master(b"ab", b"c"),
+            asset_secret_from_master(b"a", b"bc")
+        );
+    }
+
+    #[test]
+    fn build_manifest_closes_the_mint_to_serve_loop() {
+        // Mint: derive the secret, build the manifest from produced variants.
+        let asset_secret = asset_secret_from_master(b"node-master", b"asset-cid");
+        let marked: Vec<(u32, Vec<VariantRef>)> = (0..4u32)
+            .map(|seg| {
+                (
+                    seg,
+                    vec![
+                        VariantRef {
+                            symbol: 0,
+                            uri: format!("seg-{seg}.A.m4s"),
+                            digest_hex: format!("a{seg}"),
+                        },
+                        VariantRef {
+                            symbol: 1,
+                            uri: format!("seg-{seg}.B.m4s"),
+                            digest_hex: format!("b{seg}"),
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let manifest = build_manifest(2, 2.0, &asset_secret, &marked).expect("valid mint manifest");
+        manifest.validate().unwrap();
+        // Serve: the selector keyed by the SAME secret accepts the manifest (commitment matches).
+        let bias = asset_bias_vector(&asset_secret, manifest.codeword.length);
+        let g1 = crate::grant_watermark_digest16("0xbuyer-1");
+        let g2 = crate::grant_watermark_digest16("0xbuyer-2");
+        let s1 = select_symbols(&manifest, &bias, &g1).expect("buyer 1 selects");
+        let s2 = select_symbols(&manifest, &bias, &g2).expect("buyer 2 selects");
+        assert_eq!(s1.len(), 4);
+        assert_ne!(s1, s2, "distinct buyers must select distinct variant sets");
+        // Empty marked ⇒ honest single encode.
+        let none = build_manifest(2, 2.0, &asset_secret, &[]).unwrap();
+        assert!(!none.fingerprinted);
     }
 
     #[test]
