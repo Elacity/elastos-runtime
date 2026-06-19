@@ -88,6 +88,8 @@ jobs:
             capsules/ddrm-envelope
             scripts/dev/ddrm-media-authority
       - uses: extractions/setup-just@v2
+      - name: Install ripgrep (required by alignment-check; not preinstalled on the runner)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: just verify
         run: just verify
 

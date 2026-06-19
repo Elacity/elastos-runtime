@@ -405,7 +405,8 @@ fn sniffs_as_lockable(bytes: &[u8]) -> Option<&'static str> {
         || starts(b"GIF87a") || starts(b"GIF89a")                   // GIF
         || starts(b"II*\x00") || starts(b"MM\x00*")                 // TIFF (little/big-endian)
         || (starts(b"BM") && bytes.len() >= 26)                     // BMP
-        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")  // WebP
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+    // WebP
     {
         return Some("image/*");
     }
@@ -527,8 +528,14 @@ mod tests {
 
     #[test]
     fn sniff_flags_renderable_document_types() {
-        assert_eq!(sniffs_as_lockable(b"%PDF-1.7\n..."), Some("application/pdf"));
-        assert_eq!(sniffs_as_lockable(b"PK\x03\x04rest"), Some("application/zip"));
+        assert_eq!(
+            sniffs_as_lockable(b"%PDF-1.7\n..."),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            sniffs_as_lockable(b"PK\x03\x04rest"),
+            Some("application/zip")
+        );
         assert_eq!(
             sniffs_as_lockable(b"\x89PNG\r\n\x1a\n...."),
             Some("image/*")
@@ -542,7 +549,10 @@ mod tests {
             sniffs_as_lockable(b"  <?xml version=\"1.0\"?><svg/>"),
             Some("image/svg+xml")
         );
-        assert_eq!(sniffs_as_lockable(b"<svg xmlns=...>"), Some("image/svg+xml"));
+        assert_eq!(
+            sniffs_as_lockable(b"<svg xmlns=...>"),
+            Some("image/svg+xml")
+        );
         // UTF-8 BOM before the markup must not hide it.
         assert_eq!(
             sniffs_as_lockable(b"\xEF\xBB\xBF<svg>"),
@@ -552,15 +562,26 @@ mod tests {
 
     #[test]
     fn html_lock_page_enforces_sandbox_csp_and_nosniff() {
-        let resp = image_page(b"<html><body>chapter</body></html>".to_vec(), "text/html; charset=utf-8", 5, 1);
+        let resp = image_page(
+            b"<html><body>chapter</body></html>".to_vec(),
+            "text/html; charset=utf-8",
+            5,
+            1,
+        );
         let h = resp.headers();
         let csp = h
             .get("content-security-policy")
             .expect("html-lock must carry an HTTP CSP")
             .to_str()
             .unwrap();
-        assert!(csp.contains("sandbox"), "CSP must enforce the sandbox at the resource level");
-        assert!(csp.contains("default-src 'none'"), "CSP must lock default-src to none");
+        assert!(
+            csp.contains("sandbox"),
+            "CSP must enforce the sandbox at the resource level"
+        );
+        assert!(
+            csp.contains("default-src 'none'"),
+            "CSP must lock default-src to none"
+        );
         assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
         assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
     }
@@ -580,7 +601,10 @@ mod tests {
     fn sniff_passes_genuinely_non_renderable_bytes() {
         // glTF binary (3D) and JSON glTF are legit raw passthrough — must NOT be flagged.
         assert_eq!(sniffs_as_lockable(b"glTF\x02\x00\x00\x00"), None);
-        assert_eq!(sniffs_as_lockable(b"{\"asset\":{\"version\":\"2.0\"}}"), None);
+        assert_eq!(
+            sniffs_as_lockable(b"{\"asset\":{\"version\":\"2.0\"}}"),
+            None
+        );
         // An fMP4 media segment (box-size dword + `ftyp`) is not a document.
         assert_eq!(sniffs_as_lockable(b"\x00\x00\x00\x18ftypisom"), None);
         // Short non-image blob starting with "BM" must not trip the BMP magic.
