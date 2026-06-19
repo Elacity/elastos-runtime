@@ -52,6 +52,15 @@ pub type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
 #[cfg(feature = "access-grant")]
 pub mod access;
 
+/// AV forensic-variant layer (AV Phase 5): the variant manifest schema
+/// (`elastos.ddrm.av-variants/v1`) and the **canonical, RNG-free** codeword derivation that the
+/// serve-time selector (Rust) and the offline forensic extractor (the Python reference under
+/// `tools/av-forensics/`) must compute identically. Anchored to [`grant_watermark_digest16`] so a
+/// buyer's variant sequence is bound to the same wallet-signed identity as the image marks. Behind
+/// `av-variants` so the lean wasm decrypt boundary stays serde-free unless it opts in.
+#[cfg(feature = "av-variants")]
+pub mod av;
+
 /// Domain separation + profile binding for the wrap-key KDF.
 const KDF_LABEL: &[u8] = b"elastos-pq-hybrid-threshold-v0/cek-wrap/v1";
 

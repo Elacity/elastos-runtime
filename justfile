@@ -84,8 +84,11 @@ _verify-tail:
 # Build + test the dDRM capsule crates the elastos-workspace gate does not reach
 verify-capsules:
     cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
-    cd capsules/ddrm-envelope && cargo test --features access-grant
+    cd capsules/ddrm-envelope && cargo test --features access-grant,av-variants
     cd scripts/dev/ddrm-media-authority && cargo test
+    # AV forensic cross-language weld: the Python extractor's canonical codeword must match the Rust
+    # serve selector byte-for-byte (golden vectors on both sides). Pure stdlib — no numpy/ffmpeg.
+    python3 tools/av-forensics/test_canonical.py
 
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:

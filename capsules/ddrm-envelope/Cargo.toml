@@ -19,6 +19,12 @@ hybrid = ["p256"]
 # EIP-1271 smart-account hook + the ML-DSA-65 per-request session signature. OFF by
 # default so the wasm decrypt boundary stays lean; the node + client + tests opt in.
 access-grant = ["serde", "serde_json", "k256", "sha3", "base64", "hex"]
+# av-variants: the A/B (q-ary) forensic-variant layer (AV Phase 5). The variant manifest
+# (`elastos.ddrm.av-variants/v1`) + the canonical, RNG-free codeword derivation both the
+# serve-time selector (Rust) and the offline extractor (Python reference) must agree on byte
+# for byte. OFF by default so the lean wasm decrypt boundary doesn't pull serde unless it opts
+# into variant selection. See docs/AV_WATERMARKING.md.
+av-variants = ["serde", "serde_json"]
 
 [dependencies]
 # Hybrid KEM (x25519 + ML-KEM-768), AEAD wrap, KDF — the runtime PQ-hybrid profile.

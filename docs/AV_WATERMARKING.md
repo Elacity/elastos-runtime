@@ -232,11 +232,46 @@ all-ones / interleaving attacks must be tested before any certified bound** (chu
 single-leaker tracing or c=2 only — and the FP-controlled threshold pushes these minimums
 **up**, not down.
 
-1. **Spec + manifest schema.** Define the variant manifest (`elastos.ddrm.av-variants/v1`:
-   which segments carry `{A,B}`, the per-variant bit, the codeword scheme).
+### Phase 5 — landed so far (chunks 1, 2, 6)
+
+> Canonical chunk numbering follows [`PHASE5_BUILD_SPEC`](AV_WATERMARKING.md) (1 schema · 2 codeword
+> · 3 mint · 4 AAD-weld · 5 serve · 6 extractor · 7 overlay). The numbered list below predates that
+> spec; the ✅ markers map the two. **Landed = chunks 1, 2, 6** (the tractable, pipeline-free pieces
+> built on the proven research). **Mine, deferred to the live CENC/DASH/quorum pipeline = chunks 3
+> (mint transcode DSP), 4 (full-variant-set AAD weld), 5 (serve-time selector).**
+
+- **Chunk 1 — variant manifest schema.** `elastos.ddrm.av-variants/v1` lives in
+  `capsules/ddrm-envelope/src/av.rs` (`VariantManifestV1`, behind the `av-variants` feature):
+  marked-subset, per-symbol variant refs (+ segment digest for the chunk-4 weld), arity (A/B or
+  q-ary), and the codeword scheme (length, interleave map, erasure τ, bias commitment). Round-trips
+  serde; `validate()` fails closed on any inconsistency; `single_encode()` is the honest
+  `fingerprinted:false` default.
+- **Chunk 2 — canonical, RNG-free codeword.** Same module: `asset_bias_vector` (quantized arcsine
+  Tardos biases — the per-asset secret), `buyer_codeword` (deterministic row from
+  `grant_watermark_digest16`, no per-buyer storage), `interleave_map` (timeline interleaving), and
+  `tardos_score`. **Decision baked in:** the construction is a domain-separated SHA-256 stream over
+  integers — **not** any language's RNG — so the serve selector (Rust) and the extractor (Python)
+  derive *identical* codewords. Cross-language **golden vectors** are asserted on both sides
+  (`av::tests::canonical_golden_vectors` ↔ `tools/av-forensics/test_canonical.py`) — the
+  `grant_watermark_digest16` anti-drift pattern. *Still uncertified:* the **analytic Tardos
+  threshold + Monte-Carlo FP/FN sweep** (the Phase-0 empirical `mean+kσ` is ~1.25% FP); `argmax`
+  alone is not proof.
+- **Chunk 6 — offline forensic extractor.** Landed as the **proven Python reference** under
+  `tools/av-forensics/` (offline, operator-run, on already-leaked public files — no key material, not
+  in the boundary), re-anchored to the chunk-2 canonical construction. **The load-bearing FM fix is
+  preserved:** `fm_register.register` resolves the Fourier-Mellin scale/rotation ambiguity by lowest
+  residual **on the valid (non-border) region** — whole-frame residual mis-resolves a crop to the
+  wrong scale-direction and sends recovery to garbage. Validated end-to-end (crop+re-encode leak →
+  `bitERR 0`, true leaker ranked top with registration; all-erasures / no attribution without). The
+  Rust `--extract-av-fingerprint` CLI is **deferred until the scheme is frozen/certified** (avoid a
+  blind FFT port of an uncertified scheme — see the chunk-6 decision in `tools/av-forensics/README.md`).
+
+1. ✅ **LANDED (chunk 1).** **Spec + manifest schema.** Define the variant manifest
+   (`elastos.ddrm.av-variants/v1`: which segments carry `{A,B}`, the per-variant bit, the codeword
+   scheme).
    *Check:* a fixture manifest round-trips through serde and an alignment test asserts
    the schema is referenced by both the mint and serve sides.
-2. **Codeword derivation.** Pure function `grant → anti-collusion codeword`,
+2. ✅ **LANDED (chunk 2).** **Codeword derivation.** Pure function `grant → anti-collusion codeword`,
    **timeline-interleaved** and layered over an **erasure-aware code** (§3.4). ECC for
    first light, but **design the schema for tight (Škorić symmetric) Tardos** from the
    start. No I/O.
@@ -250,10 +285,12 @@ single-leaker tracing or c=2 only — and the FP-controlled threshold pushes the
    encode and sets `fingerprinted:false`.
    *Check:* with a two-variant fixture dir, two different grants produce two different
    served segment-byte sequences; with no manifest, both get the identical single encode.
-4. **Offline extractor.** `--extract-av-fingerprint <file>` recovers the codeword →
-   buyer, mirroring the image extractor.
+4. ✅ **LANDED as Python (chunk 6).** **Offline extractor.** Recovers the codeword → buyer,
+   mirroring the image extractor. Landed in `tools/av-forensics/` (the proven reference); the Rust
+   `--extract-av-fingerprint <file>` CLI is deferred until the scheme is frozen.
    *Check:* a file assembled from a known A/B sequence extracts back to that codeword
-   (clean), and still extracts after a lossy re-encode pass.
+   (clean), and still extracts after a lossy re-encode + crop pass (validated: `bitERR 0`, leaker
+   ranked top with FM registration).
 5. **Mint transcode pipeline (the heavy lift).** Produce `{A,B}` per segment with the
    per-variant DSP (video: spatial/temporal mark; audio: spread-spectrum/echo-hiding),
    CENC-encrypt, publish manifest.
@@ -336,6 +373,13 @@ pipeline) and gates the rest going live.
   best. The asset descriptor states its certified `c`.
 - **Channel coding is required, not optional:** timeline interleaving + an erasure-aware
   code (§3.4), because the leak channel is bursty (whole-segment loss), not i.i.d.
+- **Codeword construction is canonical and RNG-free (landed, chunk 2):** a domain-separated
+  SHA-256 stream over integers (quantized arcsine biases + per-grant rows + interleave), so the
+  Rust serve selector and the Python extractor derive identical codewords — golden-vector welded
+  on both sides. The Phase-0 numpy-`default_rng` derivation is replaced by this.
+- **The offline extractor lands as the proven Python reference (chunk 6)**, not a blind Rust port,
+  because it is offline/non-boundary and the scheme is not yet certified; the Rust CLI port waits
+  for the frozen scheme.
 
 **Still open (resolve in the Phase-1/2 plans):**
 
