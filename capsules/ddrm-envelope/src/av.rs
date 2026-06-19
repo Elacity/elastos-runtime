@@ -263,6 +263,73 @@ pub fn tardos_score(y: &[u8], x: &[u8], bias_q: &[u16], keep: &[bool]) -> f64 {
     s
 }
 
+// ----------------------------------------------------------------------------------------------
+// chunk 3 — serve-time variant selection · chunk 4 — full-variant-set AAD weld input
+// ----------------------------------------------------------------------------------------------
+
+const DOMAIN_VARIANT_SET: &[u8] = b"elastos.av.variant-set/v1";
+
+/// Serve-time variant selection (chunk 3). Given the per-asset bias vector (the server-side secret,
+/// whose commitment the manifest pins) and a buyer's grant digest, return the symbol to serve at
+/// each marked segment, in the manifest's timeline order — symbol `s` selects
+/// `marked_segments[i].variants[s]`. **Fail-closed:** a malformed manifest, a bias vector that does
+/// not match the manifest's `bias_commitment_hex` (wrong per-asset secret), or an unsupported arity
+/// all return `Err`, so a copy can never be served *as a mark* unless the exact committed scheme is
+/// used. An unfingerprinted (single-encode) manifest returns an empty selection (`fingerprinted:false`).
+///
+/// Mapping is direct (codeword position `i` ↔ marked segment `i`), matching the proven extractor
+/// (`tools/av-forensics`); the manifest's `interleave` is carried + committed for timeline-robustness,
+/// but applying it across embed/select/recover is a single tracked follow-up that must land on BOTH
+/// the Rust selector and the Python extractor together (see `docs/AV_WATERMARKING.md`). Arity-2 (A/B)
+/// only for now — for arity 2 the codeword bit IS the symbol, the quantity already welded by the
+/// `canonical_golden_vectors` codeword golden.
+pub fn select_symbols(
+    manifest: &VariantManifestV1,
+    bias_q: &[u16],
+    grant_digest: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    manifest.validate()?;
+    if !manifest.fingerprinted {
+        return Ok(Vec::new());
+    }
+    if manifest.arity != 2 {
+        return Err("serve selector supports arity 2 (A/B) only for now");
+    }
+    if bias_q.len() != manifest.codeword.length as usize {
+        return Err("bias vector length does not match the codeword length");
+    }
+    // Bind the server secret to the published manifest: the provided bias must be the one committed.
+    if bias_commitment_hex(bias_q) != manifest.codeword.bias_commitment_hex {
+        return Err("bias commitment mismatch — wrong per-asset secret for this manifest");
+    }
+    Ok(buyer_codeword(grant_digest, bias_q))
+}
+
+/// Commitment to the FULL published variant set (chunk 4 weld input): SHA-256 over a domain-separated,
+/// length-prefixed encoding of the arity and every marked segment's `(index, per-symbol digest_hex)`
+/// in manifest order. Bound into the decrypt transcript AAD so the decrypt boundary confirms it is
+/// operating on the exact published set the serve side selected from — substituting/forging a variant
+/// outside the set, or swapping the manifest, changes this commitment and fails the CEK unwrap closed.
+/// Deterministic + portable (no float, length-prefixed) so an auditor can recompute it from the
+/// published manifest.
+pub fn variant_set_commitment(manifest: &VariantManifestV1) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(DOMAIN_VARIANT_SET);
+    h.update([manifest.arity]);
+    h.update((manifest.marked_segments.len() as u32).to_be_bytes());
+    for seg in &manifest.marked_segments {
+        h.update(seg.index.to_be_bytes());
+        h.update((seg.variants.len() as u32).to_be_bytes());
+        for v in &seg.variants {
+            h.update([v.symbol]);
+            let d = v.digest_hex.as_bytes();
+            h.update((d.len() as u32).to_be_bytes());
+            h.update(d);
+        }
+    }
+    h.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +405,64 @@ mod tests {
         assert_ne!(c1, c2, "different grants must produce different codewords");
         // deterministic: same grant ⇒ same codeword.
         assert_eq!(c1, buyer_codeword(&g1, &bias));
+    }
+
+    #[test]
+    fn selector_picks_the_codeword_symbol_per_marked_segment() {
+        let bias = asset_bias_vector(b"asset-x", 3);
+        let grant = crate::grant_watermark_digest16("0xdeadbeef");
+        let manifest = fixture_manifest();
+        let symbols = select_symbols(&manifest, &bias, &grant).expect("valid selection");
+        assert_eq!(symbols.len(), manifest.marked_segments.len());
+        // arity-2: the selection is exactly the welded codeword.
+        assert_eq!(symbols, buyer_codeword(&grant, &bias));
+        for s in &symbols {
+            assert!((*s as usize) < manifest.arity as usize, "symbol in range");
+        }
+        // deterministic: same grant ⇒ same selection.
+        assert_eq!(symbols, select_symbols(&manifest, &bias, &grant).unwrap());
+    }
+
+    #[test]
+    fn selector_fails_closed_on_wrong_secret_and_unsupported_arity() {
+        let manifest = fixture_manifest();
+        let grant = crate::grant_watermark_digest16("0xdeadbeef");
+        // Wrong per-asset secret ⇒ bias commitment mismatch ⇒ refuse to serve as a mark.
+        let wrong_bias = asset_bias_vector(b"a-different-asset", 3);
+        assert!(select_symbols(&manifest, &wrong_bias, &grant).is_err());
+        // Right secret, wrong length ⇒ refuse.
+        let short_bias = asset_bias_vector(b"asset-x", 2);
+        assert!(select_symbols(&manifest, &short_bias, &grant).is_err());
+        // Single-encode ⇒ empty selection, never an error.
+        let honest = VariantManifestV1::single_encode();
+        let empty_bias: Vec<u16> = Vec::new();
+        assert!(select_symbols(&honest, &empty_bias, &grant)
+            .unwrap()
+            .is_empty());
+        // Unsupported arity (q-ary) ⇒ refuse rather than mis-select.
+        let mut qary = fixture_manifest();
+        qary.arity = 4;
+        assert!(select_symbols(&qary, &asset_bias_vector(b"asset-x", 3), &grant).is_err());
+    }
+
+    #[test]
+    fn variant_set_commitment_is_stable_and_change_sensitive() {
+        let manifest = fixture_manifest();
+        let c0 = variant_set_commitment(&manifest);
+        assert_eq!(c0, variant_set_commitment(&manifest), "deterministic");
+        // Flipping any published variant digest changes the commitment (out-of-set ⇒ AAD fails closed).
+        let mut tampered = manifest.clone();
+        tampered.marked_segments[1].variants[0].digest_hex.push('f');
+        assert_ne!(
+            c0,
+            variant_set_commitment(&tampered),
+            "set commitment must bind every digest"
+        );
+        // A single-encode manifest commits to an empty set distinct from a fingerprinted one.
+        assert_ne!(
+            c0,
+            variant_set_commitment(&VariantManifestV1::single_encode())
+        );
     }
 
     #[test]

@@ -225,6 +225,26 @@ pub mod transcript {
             segment_digests: Option<&[u8]>,
             rights_receipt_hash: Option<&[u8]>,
         ) -> Vec<u8> {
+            self.to_aad_with_all_bindings(segment_digests, rights_receipt_hash, None)
+        }
+
+        /// As [`Self::to_aad_with_bindings`], but additionally welds the AV FORENSIC variant-set
+        /// commitment (chunk 4 — see [`crate::av::variant_set_commitment`]) into the transcript.
+        /// Appended ONLY when present, AFTER the rights binding, so:
+        ///   - an asset WITHOUT variants (`None`) is BYTE-IDENTICAL to [`Self::to_aad_with_bindings`]
+        ///     — every committed golden replays unchanged; and
+        ///   - a fingerprinted open is cryptographically bound to the EXACT published variant set the
+        ///     serve side selected from. The served bytes are already welded via `segment_digests`;
+        ///     this additionally binds the *whole* committed set, so a node cannot serve a variant
+        ///     outside the set, or swap the manifest, without changing the AAD and failing the CEK
+        ///     unwrap closed at the decrypt boundary. The serve side (sealing) and the decrypt
+        ///     boundary (rebuilding) call this with the SAME commitment — one encoder, no drift.
+        pub fn to_aad_with_all_bindings(
+            &self,
+            segment_digests: Option<&[u8]>,
+            rights_receipt_hash: Option<&[u8]>,
+            variant_set_commitment: Option<&[u8]>,
+        ) -> Vec<u8> {
             let mut v = Vec::new();
             let mut put = |bytes: &[u8]| {
                 v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -259,6 +279,11 @@ pub mod transcript {
             // ungated seal, so existing transcripts are byte-identical.
             if let Some(rights) = rights_receipt_hash {
                 put(rights);
+            }
+            // AV variant-set binding (same strictly-extending pattern): absent for a
+            // non-fingerprinted open, so existing transcripts are byte-identical.
+            if let Some(variant_set) = variant_set_commitment {
+                put(variant_set);
             }
             v
         }
@@ -2284,6 +2309,33 @@ mod tests {
         // Substituting a segment changes the binding.
         let d_ax = crate::segment_digests(&[seg_a, b"tampered".as_slice()]);
         assert_ne!(bound, t.to_aad_with_segments(Some(&d_ax)), "segment CONTENT is bound");
+    }
+
+    /// The AV variant-set binding is strictly ADDITIVE (chunk 4): a `None` commitment leaves the
+    /// AAD byte-identical to `to_aad_with_bindings`, while a present commitment strictly extends it
+    /// AFTER the rights binding and is sensitive to the set — so a CEK sealed for one published
+    /// variant set cannot open under a swapped/forged manifest.
+    #[test]
+    fn transcript_variant_set_binding_is_additive_and_bound() {
+        let t = sample_transcript();
+        let segs = crate::segment_digests(&[b"a".as_slice(), b"b".as_slice()]);
+        let rights = [7u8; 32];
+        let base = t.to_aad_with_bindings(Some(&segs), Some(&rights));
+        assert_eq!(
+            base,
+            t.to_aad_with_all_bindings(Some(&segs), Some(&rights), None),
+            "absent variant commitment == to_aad_with_bindings (goldens replay unchanged)"
+        );
+        let vsc = [9u8; 32];
+        let bound = t.to_aad_with_all_bindings(Some(&segs), Some(&rights), Some(&vsc));
+        assert_ne!(base, bound, "binding the variant set extends the AAD");
+        assert!(bound.starts_with(&base), "the variant set binding strictly EXTENDS the rights AAD");
+        let vsc2 = [10u8; 32];
+        assert_ne!(
+            bound,
+            t.to_aad_with_all_bindings(Some(&segs), Some(&rights), Some(&vsc2)),
+            "a different published variant set changes the binding (manifest swap fails closed)"
+        );
     }
 
     /// The encoder is deterministic and self-describing (domain label first), so the
