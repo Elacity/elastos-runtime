@@ -200,18 +200,12 @@ pub fn decide_owned_access(
     now_unix: u64,
     ttl_secs: u64,
 ) -> Result<RightsDecision, String> {
-    let bin = resolve_rights_bin();
-    if !std::path::Path::new(&bin).is_file() {
-        return Err(format!(
-            "rights-provider (chain-rights) not found at {bin}; build it with \
-             `cargo build --manifest-path capsules/rights-provider/Cargo.toml \
-             --features chain-rights` or set ELASTOS_RIGHTS_PROVIDER_BIN"
-        ));
-    }
-
     let mode = rights_mode();
     // The subject the on-chain check is keyed on. Chain modes REQUIRE a real wallet;
-    // dev mode derives a stable placeholder when none is linked.
+    // dev mode derives a stable placeholder when none is linked. Validate this FIRST — a
+    // request with no linked wallet in a chain mode is invalid on its face and must fail
+    // closed BEFORE we resolve or spawn any capsule binary (and so the check is hermetic:
+    // it does not depend on the rights-provider binary being present).
     let subject = if subject.trim().is_empty() {
         match mode {
             RightsMode::Dev => dev_subject_address(principal_id),
@@ -225,6 +219,15 @@ pub fn decide_owned_access(
     } else {
         subject.to_string()
     };
+
+    let bin = resolve_rights_bin();
+    if !std::path::Path::new(&bin).is_file() {
+        return Err(format!(
+            "rights-provider (chain-rights) not found at {bin}; build it with \
+             `cargo build --manifest-path capsules/rights-provider/Cargo.toml \
+             --features chain-rights` or set ELASTOS_RIGHTS_PROVIDER_BIN"
+        ));
+    }
 
     // PC2 parity: the live `hasAccessByContentId(address,bytes16)` read keys on the
     // 0x-prefixed KID (PC2's `normalizedKid = kid.startsWith('0x') ? kid : '0x'+kid`). Our
