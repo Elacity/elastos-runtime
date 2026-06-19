@@ -61,6 +61,17 @@ verify:
     cd elastos && cargo fmt --all -- --check
     cd elastos && cargo clippy --workspace --all-targets -- -D warnings
     cd elastos && cargo test --workspace
+    just verify-capsules
+
+# These crates live OUTSIDE the elastos workspace, so `verify` (cargo --workspace) misses them; they
+# carry the protected-content surface (watermark codec, grant-digest envelope, media-authority), are
+# exercised under their CANONICAL feature sets (matching scripts/dev/run-creator-gateway.sh), and
+# gated by build+test only (clippy -D warnings is held back for now: pre-existing lint debt).
+# Build + test the dDRM capsule crates the elastos-workspace gate does not reach
+verify-capsules:
+    cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
+    cd capsules/ddrm-envelope && cargo test --features access-grant
+    cd scripts/dev/ddrm-media-authority && cargo test
 
 # Release-trust gate: requires canonical publisher signer, not the dev signer
 verify-release:

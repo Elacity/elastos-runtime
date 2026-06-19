@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger so a feature branch can be put through the full Linux gate
+  # (incl. the Linux-only carrier smoke in `just verify`) before merge.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -59,3 +62,48 @@ jobs:
       - name: cargo build --release
         working-directory: elastos
         run: cargo build --workspace --release
+
+  # The full canonical gate on Linux: alignment-check + Linux-only carrier smoke +
+  # command smoke + fmt/clippy/test (elastos workspace) + the dDRM capsule build+test
+  # (verify-capsules). This is the box that turns "manually covered" into "full green",
+  # and is the merge gate that the macOS dev box cannot run (the carrier smoke is
+  # Linux-only). RUSTFLAGS=-D warnings is inherited from `env` above.
+  verify:
+    name: Verify (Linux full gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            elastos
+            capsules/decrypt-provider
+            capsules/ddrm-envelope
+            scripts/dev/ddrm-media-authority
+      - uses: extractions/setup-just@v2
+      - name: just verify
+        run: just verify
+
+  # Isolated, fast signal for the protected-content capsule crates that live OUTSIDE
+  # the elastos workspace (so the `check`/`test` jobs and `cargo --workspace` never
+  # reach them): the watermark codec, the grant-digest envelope, the media-authority.
+  # Independent of the carrier smoke, so a flaky/heavy smoke run never masks a capsule
+  # regression. Build+test only (these crates still carry pre-existing clippy debt).
+  capsules:
+    name: dDRM Capsule Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            capsules/decrypt-provider
+            capsules/ddrm-envelope
+            scripts/dev/ddrm-media-authority
+      - uses: extractions/setup-just@v2
+      - name: just verify-capsules
+        run: just verify-capsules
