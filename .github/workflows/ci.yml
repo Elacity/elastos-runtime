@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `main` is the live line. The feature branch is included so we can run the full
+    # gate on our own work in isolation (this entry lives only on the branch; it does
+    # NOT affect main or other branches until/unless it is merged). Drop or generalise
+    # to `feat/**` at merge time.
+    branches: [main, feat/ddrm-hardening-and-creator-parity]
   pull_request:
     branches: [main]
   # Manual trigger so a feature branch can be put through the full Linux gate
