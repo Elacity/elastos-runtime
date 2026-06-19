@@ -67,21 +67,21 @@ jobs:
         working-directory: elastos
         run: cargo build --workspace --release
 
-  # The full canonical gate on Linux: alignment-check + Linux-only carrier smoke +
-  # command smoke + fmt/clippy/test (elastos workspace) + the dDRM capsule build+test
-  # (verify-capsules). This is the box that turns "manually covered" into "full green",
-  # and is the merge gate that the macOS dev box cannot run (the carrier smoke is
-  # Linux-only). RUSTFLAGS=-D warnings is inherited from `env` above.
+  # The canonical gate on Linux, MINUS the Carrier-network setup smoke: alignment-check +
+  # command smoke + candidate-command-audit + fmt/clippy/test (elastos workspace) + the dDRM
+  # capsule build+test (verify-capsules). This turns "manually covered" into "green on a clean
+  # runner". The `local-carrier-setup-smoke` step is excluded here because it fetches the
+  # net-provider artifact over Elastos Carrier, which a stock GitHub runner cannot reach — run
+  # the full `just verify` on a Carrier-capable Linux box / self-hosted runner before merge.
+  # RUSTFLAGS=-D warnings is inherited from `env` above.
   verify:
-    name: Verify (Linux full gate)
+    name: Verify (Linux CI gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          # The carrier smoke builds the Home capsules to wasm32-wasip1; that target is
-          # declared in rust-toolchain.toml so the pinned toolchain installs its std.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -92,8 +92,8 @@ jobs:
       - uses: extractions/setup-just@v2
       - name: Install ripgrep (required by alignment-check; not preinstalled on the runner)
         run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: just verify
-        run: just verify
+      - name: just verify-ci
+        run: just verify-ci
 
   # Isolated, fast signal for the protected-content capsule crates that live OUTSIDE
   # the elastos workspace (so the `check`/`test` jobs and `cargo --workspace` never

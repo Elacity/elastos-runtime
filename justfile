@@ -52,10 +52,24 @@ fmt:
 audit:
     cd elastos && cargo audit --ignore RUSTSEC-2024-0436
 
-# Pre-commit gate: alignment, smoke tests, fmt/lint/test
+# Full pre-commit gate: alignment, smoke tests, fmt/lint/test. The carrier smoke needs a Linux
+# box with Elastos Carrier artifact access (it fetches the net-provider artifact over Carrier), so
+# stock GitHub runners cannot run it — for GitHub Actions use `verify-ci` (this gate MINUS that step).
 verify:
     just alignment-check
     just local-carrier-setup-smoke
+    just _verify-tail
+
+# CI gate: the full `verify` MINUS the Carrier-network setup smoke (`local-carrier-setup-smoke`),
+# which a stock GitHub runner cannot reach. Everything else a clean runner CAN verify runs here;
+# the carrier smoke is covered separately on a Carrier-capable Linux box / self-hosted runner.
+verify-ci:
+    just alignment-check
+    just _verify-tail
+
+# (hidden) gate steps shared by `verify` and `verify-ci` — everything after the alignment-check
+# + (verify-only) carrier-smoke preamble.
+_verify-tail:
     ./scripts/command-smoke.sh
     just candidate-command-audit
     cd elastos && cargo fmt --all -- --check
