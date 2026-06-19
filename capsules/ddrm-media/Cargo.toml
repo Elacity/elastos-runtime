@@ -18,4 +18,12 @@ aes = "0.8"
 ctr = "0.9"
 rand = "0.8"
 
+[features]
+# av-variants: pull in the ddrm-envelope AV forensic layer for the end-to-end pipeline
+# integration test (chunks 3/4/5). Off by default — production media prep does not need it.
+av-variants = ["ddrm-envelope/av-variants", "ddrm-envelope/access-grant"]
+
+[dev-dependencies]
+sha2 = "0.10"
+
 [workspace]
