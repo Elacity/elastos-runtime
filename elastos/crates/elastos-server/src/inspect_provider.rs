@@ -26,6 +26,7 @@ use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use elastos_common::{CapsuleAffordanceDescriptor, CapsuleManifest};
+use elastos_runtime::approval;
 use elastos_runtime::inspect::InspectScope;
 use elastos_runtime::invoke::{self, InvokeError};
 use elastos_runtime::provider::{
@@ -701,7 +702,76 @@ impl InspectProvider {
             // gate the call would require. Dispatches NO effect — this is the
             // reflective half of the CAR invoke kernel.
             "plan" => self.handle_plan(request).await,
+            // Approval-intent preview (read-only): given a provider operation,
+            // derive the gate (via plan) and the approval it would require, and
+            // show the fail-closed default decision. Records nothing, dispatches
+            // nothing — the "approve" step of the loop, in preview form.
+            "intent" => self.handle_intent(request).await,
             other => provider_error("unknown_op", &format!("unknown inspect op: {other}")),
+        }
+    }
+
+    async fn handle_intent(&self, request: &Value) -> Value {
+        let (id, operation) = match (
+            request.get("id").and_then(Value::as_str),
+            request.get("operation").and_then(Value::as_str),
+        ) {
+            (Some(id), Some(op)) => (id, op),
+            _ => {
+                return provider_error(
+                    "invalid_request",
+                    "inspect/intent requires \"id\" and \"operation\"",
+                )
+            }
+        };
+        let entry = match self.source.inspect_get(id).await {
+            Some(entry) => entry,
+            None => return provider_error("not_found", "no such capsule"),
+        };
+        let authority = match entry.manifest.as_ref().and_then(|m| m.authority.as_ref()) {
+            Some(a) => a,
+            None => {
+                return provider_error(
+                    "invalid_request",
+                    "capsule declares no provider authority to plan against",
+                )
+            }
+        };
+        match invoke::plan_provider_operation(authority, operation) {
+            Ok(plan) => {
+                // Derive the approval this gate requires, then the fail-closed
+                // default decision (no approver yet → never auto-approve a
+                // write/execute/admin op).
+                let mode = approval::required_approval(&plan.actions);
+                let default = approval::decide(&mode, None);
+                json!({
+                    "status": "ok",
+                    "data": {
+                        "valid": true,
+                        "kind": "approval_intent",
+                        "capsule": id,
+                        "operation": operation,
+                        "resources": plan.resources,
+                        "capability_actions": plan
+                            .actions
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>(),
+                        "requires_approval": serde_json::to_value(&mode).ok(),
+                        "default_decision": serde_json::to_value(&default).ok(),
+                        "audit_events": plan.audit_events,
+                    }
+                })
+            }
+            Err(InvokeError::UnknownOperation(op)) => json!({
+                "status": "ok",
+                "data": { "valid": false, "error": "unknown_operation", "operation": op }
+            }),
+            Err(InvokeError::UnknownDeclaredAction(action)) => provider_error(
+                "manifest_error",
+                &format!("authority declares an unknown action \"{action}\""),
+            ),
+            Err(other) => provider_error("invalid_request", &format!("{other:?}")),
         }
     }
 
@@ -1463,6 +1533,25 @@ mod tests {
         assert_eq!(resp["data"]["resources"][0], "elastos://key/*");
         assert_eq!(resp["data"]["capability_actions"][0], "execute");
         assert_eq!(resp["data"]["audit_events"][0], "key.release.denied");
+    }
+
+    #[tokio::test]
+    async fn intent_requires_approval_and_defaults_fail_closed() {
+        // key.release is an Execute op → it requires User approval, and with no
+        // approver recorded the default decision is fail-closed (pending), never
+        // auto-approved. Read-only: records and dispatches nothing.
+        let resp = key_provider_with_release()
+            .send_raw(&json!({
+                "op": "intent", "id": "capsule:key-provider", "operation": "release"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], true);
+        assert_eq!(resp["data"]["kind"], "approval_intent");
+        assert_eq!(resp["data"]["requires_approval"], "user");
+        assert_eq!(resp["data"]["default_decision"], "pending_approval");
+        assert_eq!(resp["data"]["resources"][0], "elastos://key/*");
     }
 
     #[tokio::test]

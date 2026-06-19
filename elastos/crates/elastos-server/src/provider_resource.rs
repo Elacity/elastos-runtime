@@ -110,7 +110,7 @@ pub fn build_capability_resource(
 pub fn inspect_op_required_action(op: &str) -> Option<elastos_runtime::capability::token::Action> {
     use elastos_runtime::capability::token::Action;
     match op {
-        "capsules" | "capsule" | "self" | "plan" => Some(Action::Read),
+        "capsules" | "capsule" | "self" | "plan" | "intent" => Some(Action::Read),
         "revoke" => Some(Action::Write),
         _ => None,
     }
@@ -319,6 +319,7 @@ mod tests {
         assert_eq!(inspect_op_required_action("capsule"), Some(Action::Read));
         assert_eq!(inspect_op_required_action("self"), Some(Action::Read));
         assert_eq!(inspect_op_required_action("plan"), Some(Action::Read));
+        assert_eq!(inspect_op_required_action("intent"), Some(Action::Read));
         assert_eq!(inspect_op_required_action("revoke"), Some(Action::Write));
         // Unknown ops are not silently mapped — fail-closed at the caller.
         assert_eq!(inspect_op_required_action("nope"), None);

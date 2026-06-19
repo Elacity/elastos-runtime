@@ -14,6 +14,7 @@
 //! The HTTP API, CLI, and capsule loading logic live in the `elastos-server` crate.
 //! This library is transport-agnostic — it has no HTTP framework dependencies.
 
+pub mod approval;
 pub mod auth;
 pub mod bootstrap;
 pub mod capability;

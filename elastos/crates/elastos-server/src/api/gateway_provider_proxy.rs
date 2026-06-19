@@ -1348,7 +1348,7 @@ pub(super) async fn gateway_provider_proxy(
             // gated. `plan` is the read-only invocation preview (no effect).
             // Write ops (e.g. revoke) are intentionally not exposed through the
             // browser proxy.
-            "capsules" | "capsule" | "plan" => &[SYSTEM_CAPSULE_ID],
+            "capsules" | "capsule" | "plan" | "intent" => &[SYSTEM_CAPSULE_ID],
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
