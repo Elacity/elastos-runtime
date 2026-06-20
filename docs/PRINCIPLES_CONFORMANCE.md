@@ -236,6 +236,32 @@ NOT applied to the crown-jewel recover path until it is needed and done with par
 recovery round-trip test. Recorded so a future pass neither "fixes" M1 as a security gap nor adds a
 naive normalization that breaks owner recovery.
 
+The audit/custody trail (PRE_AUDIT #3 / "GAP-8") was flagged as *best-effort, not tamper-evident:
+silent drops, no hash-chain, no signature, no fsync, and "the dDRM open path emits no audit event at
+all."* Traced to ground against the current tree: **already resolved.** `AuditLog::emit` returns
+`Result` and writes a `ChainedRecord` — monotonic `seq` + `prev_hash` + `record_hash` over
+`domain ‖ seq ‖ prev_hash ‖ event_json`, ed25519-signed with a crypto-agility tag (ML-DSA-ready) —
+which it `flush`es and `sync_all`s to disk BEFORE advancing the chain head, so a failed write retries
+the same `seq` (no gap, no silent loss); `verify_chain` walks the whole chain for tamper-evidence
+(`primitives/audit.rs:461-535`). The dDRM open emits a **fail-closed** `content_open`
+(`viewer_open.rs:481`): the open is REFUSED with `503` if the custody record can't be durably
+committed, and the emit sits on the common path BEFORE dispatch to the object/media/quorum handlers,
+so every authorized open is recorded. All session-bound segment/byte serving (`viewer_media_*`,
+`viewer_object_*`) is covered **transitively** — sessions are minted only by that handler, so the one
+custody record covers the whole open session. The original "no open event, only a comment at
+`viewer_open.rs:1021`" was a **misread**: `:1021` is media-layout *detection*, not an open path.
+Two paths a coverage sweep flags are **not** custody gaps: `GET /api/provider/object/download/raw`
+serves the principal's OWN library files (`library_download_object` → `read_library_file_bytes`, no
+decrypt/CEK/quorum), correctly audited via `append_provider_effect_audit` (a DDRM `content_open`
+would be the wrong abstraction, and there are no chain "rights" to revoke on one's own files); and the
+demo routes (`open_demo_media` / `open_owned_object`) serve an operator-fixed sample
+(`ELASTOS_DDRM_SAMPLE_VIDEO`), not attacker-selectable content. The one genuinely open item — external
+anchoring of the chain head to defend a *live-compromised* runtime that still holds the signing key —
+is documented as deliberate roadmap in the `audit.rs` threat-model header, not a present defect.
+Recorded so a future pass does not re-implement an already-tamper-evident audit log. (Surface-area
+note, separate from custody: the demo open routes are mounted unconditionally; gating them behind an
+explicit enable, or only when a sample is configured, is optional defense-in-depth, not a fix.)
+
 ## How this register was produced
 
 Six read-only audit agents, one per principle cluster (Carrier/transport, ambient authority,
