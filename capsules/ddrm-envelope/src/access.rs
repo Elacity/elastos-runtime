@@ -786,6 +786,27 @@ mod tests {
         assert_eq!(err, AccessVerifyError::DelSigInvalid);
     }
 
+    /// H1 invariant — the forensic watermark anchor is safe-by-construction.
+    /// The anchor digest is derived from the delegation signature, so it is only
+    /// trustworthy because a signature that does NOT recover to the claimed owner is
+    /// rejected. A real, well-formed EIP-191 signature by a DIFFERENT wallet (over the
+    /// same canonical delegation, so it recovers to a different address) must fail closed
+    /// with `DelSigInvalid`. This is the load-bearing fact behind the audit's H1 verdict:
+    /// a forged anchor can never authorize an open, so it can never reach an egressed,
+    /// decrypted frame. See docs/PRINCIPLES_CONFORMANCE.md ("do not re-churn") + THREAT_MODEL §4.
+    #[test]
+    fn delegation_sig_from_wrong_wallet_fails_closed() {
+        let (mut grant, ctx) = mk_grant();
+        let (other_sk, other_addr) = wallet(99);
+        assert!(
+            !eq_addr(&other_addr, &grant.delegation.owner_address),
+            "test wallets must differ"
+        );
+        grant.delegation_sig_hex = sign_eip191(&other_sk, &grant.delegation.canonical());
+        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        assert_eq!(err, AccessVerifyError::DelSigInvalid);
+    }
+
     #[test]
     fn stripped_request_sig_fails_closed() {
         let (mut grant, ctx) = mk_grant();

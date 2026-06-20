@@ -203,6 +203,23 @@ tested replacement flow (`create_managed_account_replaces_unavailable_idempotent
 old address stays visible and is recoverable via the Recovery Kit. Recorded here so a future
 audit pass does not "fix" intended behavior.
 
+`elastos/crates/elastos-server/src/api/viewer_open.rs:421` — the forensic watermark anchor
+(`grant_watermark_digest16`) is computed from the client-supplied `delegation_sig_hex` *before* the
+gateway itself verifies it, which *looks* like it trusts an unverified signature (audit finding
+"H1"). Traced to ground: it is **safe-by-construction, not exploitable.** The digest can only reach
+(a) an **egressed decrypted frame** or (b) attribution of a **real leaked copy** after the dKMS
+node's own `verify_access_grant` (EIP-191 owner recovery, `capsules/ddrm-envelope/src/access.rs`
+`recover_eip191`/line ~531) **and** a live on-chain `hasAccessByContentId` check both pass — a
+forged signature fails closed there (`DelSigInvalid`), so no CEK is recovered, no decrypt happens,
+and the watermark embed (which runs only AFTER a successful 2-of-3 quorum recover) never executes.
+The only residue of a forged signature is an intent-time custody "opened" row that then corresponds
+to a **failed** open with no media served — a detectable anomaly, not attribution of a leaked frame
+to an innocent wallet. The load-bearing invariant (a signature that does not recover to the owner is
+rejected) is pinned by the `access.rs` test `delegation_sig_from_wrong_wallet_fails_closed`. Recorded
+here so a future pass does not "fix" a non-exploitable hygiene item as if it were a security gap. A
+defense-in-depth tightening (defer the custody write until after authorization, or a server-key MAC
+over `owner ‖ content_id ‖ open_time`) is tracked in THREAT_MODEL §4 — an upgrade, not a blocker.
+
 ## How this register was produced
 
 Six read-only audit agents, one per principle cluster (Carrier/transport, ambient authority,

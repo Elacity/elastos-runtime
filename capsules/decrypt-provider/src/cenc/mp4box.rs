@@ -212,6 +212,19 @@ fn parse_trun(data: &[u8]) -> Result<TrunBox, String> {
     let flags = u32::from_be_bytes([0, data[1], data[2], data[3]]);
     let sample_count = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
 
+    // `sample_count` is parsed straight from the (untrusted) segment and otherwise
+    // drives both the pre-allocation below and the read loop. A degenerate trun with
+    // no per-sample flags reads 0 bytes per entry, so a forged count would OOM via
+    // push-growth even with a capped capacity. Reject an implausible count up front
+    // (fail-closed): real fMP4 fragments carry at most a few thousand samples; 1<<20
+    // is a generous ceiling that never rejects legitimate content.
+    const MAX_TRUN_SAMPLES: usize = 1 << 20;
+    if sample_count > MAX_TRUN_SAMPLES {
+        return Err(format!(
+            "trun sample_count {sample_count} exceeds maximum {MAX_TRUN_SAMPLES}"
+        ));
+    }
+
     let mut cursor = Cursor::new(&data[8..]);
     let mut buf4 = [0u8; 4];
 
@@ -303,6 +316,16 @@ pub fn parse_senc(data: &[u8], default_iv_size: u8) -> Result<SencBox, String> {
     let sample_count = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let has_subsamples = flags & 0x000002 != 0;
     let iv_size = default_iv_size as usize;
+
+    // Fail closed on an implausible (untrusted) sample_count before pre-allocating
+    // or looping — same rationale as parse_trun. (The per-sample subsample `count`
+    // below is a u16 and is therefore already bounded by its type.)
+    const MAX_SENC_SAMPLES: usize = 1 << 20;
+    if sample_count > MAX_SENC_SAMPLES {
+        return Err(format!(
+            "senc sample_count {sample_count} exceeds maximum {MAX_SENC_SAMPLES}"
+        ));
+    }
 
     let mut cursor = Cursor::new(&data[8..]);
     let mut samples = Vec::with_capacity(sample_count);
@@ -506,4 +529,43 @@ fn find_box_recursive(data: &[u8], path: &[&[u8; 4]]) -> Option<Vec<u8>> {
         offset = box_end;
     }
     None
+}
+
+#[cfg(test)]
+mod alloc_bound_tests {
+    use super::*;
+
+    /// A `trun` whose declared `sample_count` is enormous but whose body is short
+    /// must fail closed up front — NOT attempt a multi-gigabyte pre-allocation /
+    /// unbounded push loop. `sample_count` is attacker-influenced (parsed from the
+    /// segment), so this guards a denial-of-service reachable by untrusted input.
+    #[test]
+    fn parse_trun_rejects_implausible_sample_count() {
+        // version(1)=0, flags(3)=0x000200 (size-present), sample_count(4)=0xFFFFFFFF,
+        // then NO body — a real parse of 4 billion samples would OOM without the guard.
+        let mut data = vec![0u8, 0x00, 0x02, 0x00];
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = parse_trun(&data).expect_err("huge sample_count must be rejected");
+        assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
+    }
+
+    /// Same fail-closed bound for `senc` sample_count.
+    #[test]
+    fn parse_senc_rejects_implausible_sample_count() {
+        // version(1)=0, flags(3)=0, sample_count(4)=0xFFFFFFFF, then no IV body.
+        let mut data = vec![0u8, 0, 0, 0];
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = parse_senc(&data, 8).expect_err("huge sample_count must be rejected");
+        assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
+    }
+
+    /// A legitimate small count still parses (the guard never rejects real content).
+    #[test]
+    fn parse_trun_accepts_normal_sample_count() {
+        // sample_count=1, size-present, one 4-byte sample size.
+        let mut data = vec![0u8, 0x00, 0x02, 0x00, 0, 0, 0, 1];
+        data.extend_from_slice(&100u32.to_be_bytes());
+        let trun = parse_trun(&data).expect("normal trun must parse");
+        assert_eq!(trun.entries.len(), 1);
+    }
 }
