@@ -22,11 +22,11 @@ use crate::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 /// host functions read/write through.
 struct WasiState {
     wasi: WasiP1Ctx,
-    /// Per-execution resource caps (memory/table/instances). Enforces a capsule's resource BUDGET
-    /// so an untrusted capsule cannot exhaust host memory — PRINCIPLE 7 ("resource boundaries should
-    /// apply") + PRINCIPLE 11 (fail closed). This is a backstop default; per-capsule manifest-declared,
-    /// capability-GRANTED budgets (so game/AI capsules request more, untrusted stay modest) are the
-    /// tracked follow-up — see `capsule_store_limits`.
+    /// Per-execution resource caps (memory/table/instances). Enforces the capsule's DECLARED
+    /// per-capsule memory budget (`manifest.resources.memory_mb`, clamped to a host ceiling) so a
+    /// capsule cannot exhaust host memory — PRINCIPLE 7 ("resource boundaries should apply", explicit
+    /// not ambient) + PRINCIPLE 11 (fail closed). Consistent with the crosvm provider, which already
+    /// honors `memory_mb`. See `capsule_store_limits` / `effective_memory_bytes`.
     limits: StoreLimits,
 }
 
@@ -107,36 +107,40 @@ pub enum BridgeTransport {
     Fifos,
 }
 
-/// WASM compute provider using wasmtime with WASI support
-/// Default per-capsule linear-memory budget (MiB) when none is granted; override with
-/// `ELASTOS_WASM_MEMORY_LIMIT_MB`. Generous enough for ordinary app capsules. This is a BACKSTOP that
-/// bounds the previously-UNBOUNDED case (an untrusted capsule could grow memory without limit and OOM
-/// the host) — it is NOT the final design. The real design is per-capsule manifest-declared,
-/// capability-GRANTED budgets (PRINCIPLE 7: explicit, not ambient) so game/AI capsules can request
-/// more while untrusted capsules stay modest, with a host-protective ceiling. Tracked as a follow-up.
-const DEFAULT_WASM_MEMORY_LIMIT_MB: usize = 1024;
+/// Host-protective CEILING (MiB) on a capsule's declared memory budget — override with
+/// `ELASTOS_WASM_MEMORY_CEILING_MB`. A capsule's enforced cap is `min(manifest.resources.memory_mb,
+/// ceiling)`: it gets the per-capsule budget it DECLARED (PRINCIPLE 7 — explicit/granted, consistent
+/// with the crosvm provider which already honors `memory_mb`), but cannot declare an absurd value to
+/// OOM the host. The VM gets this for free (an over-sized VM just fails to launch); in-process WASM
+/// must clamp. 8 GiB is generous headroom for game/AI capsules while still bounding the host.
+const WASM_MEMORY_CEILING_DEFAULT_MB: u32 = 8192;
 /// Max table elements per capsule — bounds a table-growth bomb.
 const WASM_TABLE_ELEMENTS_LIMIT: usize = 1_000_000;
 
-fn wasm_memory_limit_bytes() -> usize {
-    let mb = std::env::var("ELASTOS_WASM_MEMORY_LIMIT_MB")
+fn wasm_memory_ceiling_mb() -> u32 {
+    std::env::var("ELASTOS_WASM_MEMORY_CEILING_MB")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.parse::<u32>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_WASM_MEMORY_LIMIT_MB);
-    mb.saturating_mul(1024 * 1024)
+        .unwrap_or(WASM_MEMORY_CEILING_DEFAULT_MB)
 }
 
-/// Resource caps applied to every capsule execution's `Store`. A capsule exceeding any of these
-/// fails closed (the grow is denied / instantiation traps) instead of exhausting the host.
-fn capsule_store_limits() -> StoreLimits {
+/// Bytes a capsule may use: its DECLARED `memory_mb` clamped to the host ceiling.
+fn effective_memory_bytes(declared_mb: u32) -> usize {
+    (declared_mb.min(wasm_memory_ceiling_mb()) as usize).saturating_mul(1024 * 1024)
+}
+
+/// Per-`Store` resource caps for a capsule with the given declared memory budget. A capsule that
+/// exceeds them fails closed (the grow / instantiation is denied) instead of exhausting the host.
+fn capsule_store_limits(declared_mb: u32) -> StoreLimits {
     StoreLimitsBuilder::new()
-        .memory_size(wasm_memory_limit_bytes())
+        .memory_size(effective_memory_bytes(declared_mb))
         .table_elements(WASM_TABLE_ELEMENTS_LIMIT)
         .instances(1)
         .build()
 }
 
+/// WASM compute provider using wasmtime with WASI support.
 pub struct WasmProvider {
     /// One wasmtime `Engine` shared across all capsules (it holds the JIT/compile context + config,
     /// NOT any tenant heap — per-tenant data lives in each execution's `Store`). Sharing avoids
@@ -494,12 +498,17 @@ impl WasmProvider {
     }
 
     /// Execute a WASM module with WASI preview1.
-    fn execute_wasm(engine: &Engine, module: &Module, wasi: WasiP1Ctx) -> Result<()> {
+    fn execute_wasm(
+        engine: &Engine,
+        module: &Module,
+        wasi: WasiP1Ctx,
+        declared_memory_mb: u32,
+    ) -> Result<()> {
         let mut store = Store::new(
             engine,
             WasiState {
                 wasi,
-                limits: capsule_store_limits(),
+                limits: capsule_store_limits(declared_memory_mb),
             },
         );
         // Enforce the per-capsule resource budget: a capsule that tries to exceed its memory / table
@@ -663,11 +672,16 @@ impl ComputeProvider for WasmProvider {
             spawner(pipes);
         }
 
+        // The capsule's DECLARED memory budget (manifest `resources.memory_mb`) — honored here just
+        // as the crosvm provider already honors it, clamped to the host ceiling inside execute_wasm.
+        let declared_memory_mb = manifest.resources.memory_mb;
+
         // Execute in a blocking task since wasmtime execution is synchronous
-        let result =
-            tokio::task::spawn_blocking(move || Self::execute_wasm(&engine, &module, wasi))
-                .await
-                .map_err(|e| ElastosError::Compute(format!("Task join error: {}", e)))?;
+        let result = tokio::task::spawn_blocking(move || {
+            Self::execute_wasm(&engine, &module, wasi, declared_memory_mb)
+        })
+        .await
+        .map_err(|e| ElastosError::Compute(format!("Task join error: {}", e)))?;
 
         // Update status based on result
         {
@@ -782,6 +796,20 @@ mod tests {
         store.limiter(|s: &mut WasiState| &mut s.limits);
         let linker: Linker<WasiState> = Linker::new(&engine);
         assert!(linker.instantiate(&mut store, &module).is_ok());
+    }
+
+    /// B1: a capsule's DECLARED `memory_mb` is honored exactly (Principle 7 — granted, explicit), and
+    /// an absurd declaration is clamped to the host ceiling so it can never OOM the host.
+    #[test]
+    fn declared_memory_is_honored_and_clamped_to_ceiling() {
+        let mib = 1024 * 1024usize;
+        // The real capsules declare 16–128 MiB — honored exactly.
+        assert_eq!(effective_memory_bytes(128), 128 * mib);
+        assert_eq!(effective_memory_bytes(16), 16 * mib);
+        // An absurd declaration is clamped to the ceiling and never exceeds it.
+        let ceiling = wasm_memory_ceiling_mb() as usize;
+        assert_eq!(effective_memory_bytes(u32::MAX), ceiling * mib);
+        assert!(effective_memory_bytes(u32::MAX) <= ceiling * mib);
     }
 
     #[tokio::test]
