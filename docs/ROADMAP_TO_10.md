@@ -75,13 +75,12 @@ TEE vs reproducible-builds by value-at-risk and your decentralization ethos. The
 
 ## Tracked follow-ups (Lane A, self-servable — so they don't rot)
 
-- **Per-capsule capability-granted memory budget (WASM).** Chunk A landed a *backstop*: a generous
-  global default (`ELASTOS_WASM_MEMORY_LIMIT_MB`, 1 GiB) enforced per `Store`, closing the
-  unbounded-memory DoS. The *real* design — needed before game/AI capsules ship — is a per-capsule
-  budget the manifest **declares** and the user/policy **grants** (Principle 7: explicit, not
-  ambient), with generous grants for games/AI, a modest default for untrusted, and a host-protective
-  ceiling. Mechanism is already wired (`capsule_store_limits` in `providers/wasm.rs`); this is the
-  budget-source + grant-flow on top.
+- **Per-capsule WASM memory budget — ✅ DONE (B1).** The WASM provider now honors each capsule's
+  declared `manifest.resources.memory_mb` clamped to a host ceiling (`ELASTOS_WASM_MEMORY_CEILING_MB`,
+  8 GiB default), consistent with the crosvm/VM provider (Principle 7 + 11). Remaining refinement
+  (lower priority): a separate per-launch user/policy **grant** step above the manifest declaration
+  (today it's manifest-declared + clamped, no interactive approval) — only needed if/when untrusted
+  capsules should require explicit memory approval beyond their declaration.
 - **WASM CPU runaway protection (Chunk B).** Epoch-interruption so a no-progress spinner can be
   trapped / an operator can terminate a runaway (today a spinning capsule permanently holds a
   blocking thread + CPU and `stop()` cannot kill it). Needs the service-vs-command policy decision.
