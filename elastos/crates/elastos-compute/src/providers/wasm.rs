@@ -22,6 +22,12 @@ use crate::{CapsuleHandle, CapsuleInfo, ComputeProvider};
 /// host functions read/write through.
 struct WasiState {
     wasi: WasiP1Ctx,
+    /// Per-execution resource caps (memory/table/instances). Enforces a capsule's resource BUDGET
+    /// so an untrusted capsule cannot exhaust host memory — PRINCIPLE 7 ("resource boundaries should
+    /// apply") + PRINCIPLE 11 (fail closed). This is a backstop default; per-capsule manifest-declared,
+    /// capability-GRANTED budgets (so game/AI capsules request more, untrusted stay modest) are the
+    /// tracked follow-up — see `capsule_store_limits`.
+    limits: StoreLimits,
 }
 
 /// A running WASM instance
@@ -102,7 +108,40 @@ pub enum BridgeTransport {
 }
 
 /// WASM compute provider using wasmtime with WASI support
+/// Default per-capsule linear-memory budget (MiB) when none is granted; override with
+/// `ELASTOS_WASM_MEMORY_LIMIT_MB`. Generous enough for ordinary app capsules. This is a BACKSTOP that
+/// bounds the previously-UNBOUNDED case (an untrusted capsule could grow memory without limit and OOM
+/// the host) — it is NOT the final design. The real design is per-capsule manifest-declared,
+/// capability-GRANTED budgets (PRINCIPLE 7: explicit, not ambient) so game/AI capsules can request
+/// more while untrusted capsules stay modest, with a host-protective ceiling. Tracked as a follow-up.
+const DEFAULT_WASM_MEMORY_LIMIT_MB: usize = 1024;
+/// Max table elements per capsule — bounds a table-growth bomb.
+const WASM_TABLE_ELEMENTS_LIMIT: usize = 1_000_000;
+
+fn wasm_memory_limit_bytes() -> usize {
+    let mb = std::env::var("ELASTOS_WASM_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_WASM_MEMORY_LIMIT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
+/// Resource caps applied to every capsule execution's `Store`. A capsule exceeding any of these
+/// fails closed (the grow is denied / instantiation traps) instead of exhausting the host.
+fn capsule_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(wasm_memory_limit_bytes())
+        .table_elements(WASM_TABLE_ELEMENTS_LIMIT)
+        .instances(1)
+        .build()
+}
+
 pub struct WasmProvider {
+    /// One wasmtime `Engine` shared across all capsules (it holds the JIT/compile context + config,
+    /// NOT any tenant heap — per-tenant data lives in each execution's `Store`). Sharing avoids
+    /// building an `Engine` per capsule (recommended wasmtime pattern).
+    engine: Engine,
     instances: Arc<RwLock<HashMap<CapsuleId, RunningInstance>>>,
     /// Base directory for capsule data
     data_base_dir: PathBuf,
@@ -129,6 +168,7 @@ impl WasmProvider {
     /// Create a new WASM provider with a custom data directory
     pub fn with_data_dir(data_dir: impl Into<PathBuf>) -> Self {
         Self {
+            engine: Engine::default(),
             instances: Arc::new(RwLock::new(HashMap::new())),
             data_base_dir: data_dir.into(),
             bridge_spawner: std::sync::RwLock::new(None),
@@ -455,7 +495,17 @@ impl WasmProvider {
 
     /// Execute a WASM module with WASI preview1.
     fn execute_wasm(engine: &Engine, module: &Module, wasi: WasiP1Ctx) -> Result<()> {
-        let mut store = Store::new(engine, WasiState { wasi });
+        let mut store = Store::new(
+            engine,
+            WasiState {
+                wasi,
+                limits: capsule_store_limits(),
+            },
+        );
+        // Enforce the per-capsule resource budget: a capsule that tries to exceed its memory / table
+        // / instance caps fails closed (the allocation is denied) instead of exhausting the host —
+        // PRINCIPLE 7 (resource boundaries) + PRINCIPLE 11 (fail closed).
+        store.limiter(|state: &mut WasiState| &mut state.limits);
 
         // Create linker and bind WASI preview1 host functions. wasmtime-wasi
         // 24 split `add_to_linker` into preview1/preview2 variants; the
@@ -521,11 +571,10 @@ impl ComputeProvider for WasmProvider {
             )));
         }
 
-        // Create engine with default config
-        let engine = Engine::default();
-
-        // Compile the module
-        let module = Module::from_file(&engine, &wasm_path)
+        // Compile the module against the provider's SHARED engine (one engine across all capsules;
+        // it holds the compile context, never tenant heap — per-tenant data lives in each
+        // execution's Store, dropped per run, so multi-tenant clearing is unaffected).
+        let module = Module::from_file(&self.engine, &wasm_path)
             .map_err(|e| ElastosError::Compute(format!("Failed to compile WASM: {}", e)))?;
 
         let id = CapsuleId::new(format!("wasm-{}", uuid::Uuid::new_v4()));
@@ -534,7 +583,7 @@ impl ComputeProvider for WasmProvider {
         let (_, data_dir, _, _) = self.build_wasi_context(&manifest, &id.0, &[], false, None)?;
 
         let instance = RunningInstance {
-            engine,
+            engine: self.engine.clone(),
             module,
             status: CapsuleStatus::Loading,
             manifest: manifest.clone(),
@@ -639,9 +688,10 @@ impl ComputeProvider for WasmProvider {
         let mut instances = self.instances.write().await;
 
         if let Some(instance) = instances.remove(&handle.id) {
-            // Dropping the RunningInstance releases the wasmtime Engine, Module,
-            // and any compiled code buffers.  This is the primary memory-clearing
-            // step for multi-tenant safety — no residual WASM heap survives.
+            // Dropping the RunningInstance releases THIS capsule's Module (its compiled code). The
+            // per-tenant WASM heap lived in the per-execution Store, already dropped when
+            // execute_wasm returned — so no residual tenant heap survives. The shared Engine
+            // persists (it holds no tenant data, only the JIT/compile context).
             tracing::info!("Stopped and cleared capsule '{}'", instance.manifest.name);
         }
 
@@ -688,6 +738,50 @@ mod tests {
         assert!(provider.supports(&CapsuleType::Wasm));
         assert!(!provider.supports(&CapsuleType::MicroVM));
         assert!(!provider.supports(&CapsuleType::Oci));
+    }
+
+    /// PRINCIPLE 7 + 11: a capsule that exceeds its memory BUDGET must fail closed (the allocation is
+    /// denied) rather than exhaust the host. Proves the `StoreLimits` mechanism the provider wires
+    /// into every execution — a module wanting more linear memory than the cap cannot instantiate,
+    /// and the host survives (this test process keeps running).
+    #[test]
+    fn over_budget_capsule_fails_closed_not_host_exhaustion() {
+        let engine = Engine::default();
+        // A module declaring 4 pages (256 KiB) of initial linear memory.
+        let module = Module::new(&engine, r#"(module (memory 4))"#).expect("compile wat");
+        // A Store budgeted to ONE page (64 KiB) must REFUSE to instantiate it.
+        let limits = StoreLimitsBuilder::new().memory_size(64 * 1024).build();
+        let mut store = Store::new(
+            &engine,
+            WasiState {
+                wasi: WasiCtxBuilder::new().build_p1(),
+                limits,
+            },
+        );
+        store.limiter(|s: &mut WasiState| &mut s.limits);
+        let linker: Linker<WasiState> = Linker::new(&engine);
+        assert!(
+            linker.instantiate(&mut store, &module).is_err(),
+            "a capsule exceeding its memory budget must fail closed, not allocate"
+        );
+    }
+
+    /// The cap never penalizes legitimate use: a capsule WITHIN its budget instantiates normally.
+    #[test]
+    fn within_budget_capsule_instantiates() {
+        let engine = Engine::default();
+        let module = Module::new(&engine, r#"(module (memory 1))"#).expect("compile wat");
+        let limits = StoreLimitsBuilder::new().memory_size(1024 * 1024).build(); // 1 MiB budget
+        let mut store = Store::new(
+            &engine,
+            WasiState {
+                wasi: WasiCtxBuilder::new().build_p1(),
+                limits,
+            },
+        );
+        store.limiter(|s: &mut WasiState| &mut s.limits);
+        let linker: Linker<WasiState> = Linker::new(&engine);
+        assert!(linker.instantiate(&mut store, &module).is_ok());
     }
 
     #[tokio::test]
