@@ -1602,8 +1602,15 @@ mod tests {
         let wallet = "0xABCDEF0123456789ABCDEF0123456789ABCDEF01";
         let fp = log_fp(wallet);
         assert!(fp.starts_with("fp:"), "must be a fingerprint tag, got {fp}");
-        assert!(!fp.contains(wallet), "the raw value must not appear in the fingerprint");
-        assert!(fp.len() <= 16, "fingerprint must stay short (got {})", fp.len());
+        assert!(
+            !fp.contains(wallet),
+            "the raw value must not appear in the fingerprint"
+        );
+        assert!(
+            fp.len() <= 16,
+            "fingerprint must stay short (got {})",
+            fp.len()
+        );
         assert_eq!(log_fp("   "), "<none>", "blank input must redact to <none>");
         // Deterministic + discriminating: same input -> same fp, different inputs -> different fp.
         assert_eq!(log_fp(wallet), log_fp(wallet));

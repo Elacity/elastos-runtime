@@ -174,8 +174,15 @@ fn verdicts_registry_is_intact() {
                 v.pinning
             );
         }
-        println!("[{}] ({}) {} — pinned by: {}", v.id, v.status, v.title, v.pinning);
+        println!(
+            "[{}] ({}) {} — pinned by: {}",
+            v.id, v.status, v.title, v.pinning
+        );
     }
     let partials = VERDICTS.iter().filter(|v| v.status == "partial").count();
-    println!("\n{} verdicts; {} partial (roadmap)", VERDICTS.len(), partials);
+    println!(
+        "\n{} verdicts; {} partial (roadmap)",
+        VERDICTS.len(),
+        partials
+    );
 }
