@@ -142,6 +142,7 @@ fn run() -> Result<(), String> {
     let mut caller_seed_b64: Option<String> = None;
     let mut access_grant_b64: Option<String> = None;
     let mut dash_dir: Option<String> = None;
+    let mut av_master_b64: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -173,6 +174,11 @@ fn run() -> Result<(), String> {
             // MEDIA quorum-open: local path of the DASH directory the gateway pre-fetched from
             // the asset CID (clear inits + ENCRYPTED segments + stream.mpd).
             "--dash-dir" => dash_dir = args.next(),
+            // AV forensic variants (chunk 3): the serving node's per-node bias MASTER secret (b64).
+            // With it (+ a wallet-signed grant + a published av-variants.json) the open serves the
+            // per-buyer selected variant; absent, the open serves the single encode (fingerprinted
+            // false). Falls back to ELASTOS_AV_MASTER_B64 if the flag is omitted.
+            "--av-master" => av_master_b64 = args.next(),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -202,6 +208,7 @@ fn run() -> Result<(), String> {
             ttl_secs,
             access_grant_b64,
             dash_dir,
+            av_master_b64: av_master_b64.or_else(|| std::env::var("ELASTOS_AV_MASTER_B64").ok()),
         });
     }
 

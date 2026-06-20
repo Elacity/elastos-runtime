@@ -1815,11 +1815,19 @@ async fn run_prepare_mint_media(
         })
         .collect();
     mint_progress::advance(job_id, "encrypt");
+    // AV forensic variants (chunk 3 mint emit): OPT-IN via `ELASTOS_AV_VARIANTS`. The encrypt
+    // boundary only actually emits variants when IT is provisioned with the bias master
+    // (`ELASTOS_AV_MASTER_B64`); otherwise the seal is byte-identical to the single encode. We never
+    // pass the master through the server — the secret stays inside the encrypt boundary.
+    let av_variants = std::env::var("ELASTOS_AV_VARIANTS")
+        .map(|v| matches!(v.as_str(), "1" | "true"))
+        .unwrap_or(false);
     let seal_req = json!({
         "op": "seal_segments_threshold",
         "segments_b64": all_segments,
         "init_b64": first_init_b64,
         "nodes": node_json,
+        "av_variants": av_variants,
     });
     let seal = provider_data(registry, "encrypt", &seal_req)
         .await
@@ -1859,6 +1867,27 @@ async fn run_prepare_mint_media(
         files.push(json!({ "path": seg_paths[i], "data": data }));
     }
     files.push(json!({ "path": DASH_MANIFEST_NAME, "data": b64.encode(manifest.as_bytes()) }));
+
+    // 3b) AV forensic variants (chunk 3 mint emit): when the encrypt boundary emitted per-segment
+    //     variants + a bias-committed manifest, publish them INTO the same DASH directory. The
+    //     serve selector (`ddrm-media-authority`) reads `av-variants.json` from the fetched dir and
+    //     swaps in the per-buyer variant; absent these the asset serves the single encode. Pure
+    //     pass-through — the variant bytes are public ciphertext, the manifest carries no secret.
+    if let Some(av_files) = seal.get("av_variant_files").and_then(Value::as_array) {
+        for f in av_files {
+            if let (Some(path), Some(data)) = (
+                f.get("path").and_then(Value::as_str),
+                f.get("data").and_then(Value::as_str),
+            ) {
+                files.push(json!({ "path": path, "data": data }));
+            }
+        }
+    }
+    if let Some(av_manifest) = seal.get("av_manifest").and_then(Value::as_str) {
+        files.push(
+            json!({ "path": "av-variants.json", "data": b64.encode(av_manifest.as_bytes()) }),
+        );
+    }
 
     // 4) publish the whole DASH directory -> one dir CID (the asset CID).
     mint_progress::advance(job_id, "publish");

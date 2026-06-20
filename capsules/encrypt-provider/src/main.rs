@@ -149,6 +149,13 @@ enum Request {
         init_b64: Option<String>,
         /// The quorum's 2-of-3 secret-holding node set (recipient + verifying keys). Exactly 3.
         nodes: Vec<ThresholdNode>,
+        /// AV forensic variants (chunk 3 mint emit). OPT-IN: when `true` AND this boundary's env
+        /// carries `ELASTOS_AV_MASTER_B64` (the serve-cluster bias master), the seal ALSO emits
+        /// per-marked-segment `{A,B}` placeholder variants + a bias-committed manifest
+        /// (`av-variants.json`) the caller publishes beside the segments. Absent / `false` / no
+        /// master ⇒ byte-identical single-encode seal (no behaviour change, honest fallback).
+        #[serde(default)]
+        av_variants: bool,
     },
     Shutdown,
 }
@@ -235,7 +242,13 @@ impl EncryptProvider {
                 segments_b64,
                 init_b64,
                 nodes,
-            } => self.seal_segments_threshold(&segments_b64, init_b64.as_deref(), &nodes),
+                av_variants,
+            } => self.seal_segments_threshold(
+                &segments_b64,
+                init_b64.as_deref(),
+                &nodes,
+                av_variants,
+            ),
             Request::Shutdown => Response::empty_ok(),
         }
     }
@@ -642,6 +655,7 @@ impl EncryptProvider {
         segments_b64: &[String],
         init_b64: Option<&str>,
         nodes: &[ThresholdNode],
+        av_variants: bool,
     ) -> Response {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -714,7 +728,7 @@ impl EncryptProvider {
             Ok(out) => out,
             Err(e) => return Response::error("invalid_request", e),
         };
-        Response::ok(json!({
+        let mut body = json!({
             "kid_hex": out.kid_hex,
             // The KID hex IS the on-chain bytes16 contentId / the asset's single default_KID.
             "content_id_hex": out.kid_hex,
@@ -735,7 +749,30 @@ impl EncryptProvider {
                 .as_ref()
                 .map(|p| b64.encode(&p.verifying_key))
                 .unwrap_or_default(),
-        }))
+        });
+        // AV forensic variants (chunk 3 mint emit): opt-in + only when this boundary is provisioned
+        // with the serve-cluster bias master. The variants are a PURE transform of the public
+        // ciphertext (an appended, ignorable marker box) keyed by the SAME `(master, content_id)`
+        // the serve selector derives from — so mint and serve agree on the bias without sharing the
+        // CEK. Absent ⇒ `fingerprinted:false` and the response is the single-encode seal above.
+        if av_variants {
+            match emit_av_variants(&out.kid_hex, &out.encrypted_segments) {
+                Ok(Some(av)) => {
+                    body["fingerprinted"] = json!(true);
+                    body["av_manifest"] = json!(av.manifest_json);
+                    body["av_variant_files"] = json!(av
+                        .files
+                        .iter()
+                        .map(|(path, data)| json!({ "path": path, "data": data }))
+                        .collect::<Vec<_>>());
+                }
+                Ok(None) => {
+                    body["fingerprinted"] = json!(false);
+                }
+                Err(e) => return Response::error("invalid_request", e),
+            }
+        }
+        Response::ok(body)
     }
 
     /// The in-boundary MEDIA threshold pipeline (feature `escrow`): mint ONE CEK+KID, CENC each
@@ -805,6 +842,94 @@ impl EncryptProvider {
         })
         // `minted` (Zeroizing CEK) + `coeff` drop here — both scrubbed before return.
     }
+}
+
+/// Per-asset erasure threshold carried in the manifest (`CodewordScheme.erasure_tau`). Placeholder
+/// value for the byte-distinct seam — the real value is set once the perceptual DSP + extractor
+/// detection statistic are frozen (AV chunk 2/5 follow-up). Kept here so mint and docs agree.
+#[cfg(feature = "escrow")]
+const AV_ERASURE_TAU: f64 = 2.0;
+
+/// The emitted AV variant set: the serialized variant manifest (written as `av-variants.json`) plus
+/// the `{path, base64}` variant segment files the caller publishes into the DASH directory.
+#[cfg(feature = "escrow")]
+struct AvEmit {
+    manifest_json: String,
+    files: Vec<(String, String)>,
+}
+
+/// Lowercase hex of `SHA-256(bytes)` — the per-variant segment digest welded into the manifest
+/// (chunk 4 AAD weld input; also a content check on the published variant file).
+#[cfg(feature = "escrow")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Read the serve-cluster bias master from this boundary's env and emit the variant set, or `None`
+/// when the boundary is **not** provisioned for AV (`ELASTOS_AV_MASTER_B64` unset/empty) — the
+/// honest single-encode fallback. Errors only on a malformed master or a manifest-build failure.
+#[cfg(feature = "escrow")]
+fn emit_av_variants(kid_hex: &str, encrypted: &[Vec<u8>]) -> Result<Option<AvEmit>, String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let master_b64 = match std::env::var("ELASTOS_AV_MASTER_B64") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(None),
+    };
+    let master = b64
+        .decode(master_b64.trim())
+        .map_err(|_| "ELASTOS_AV_MASTER_B64 is not valid base64".to_string())?;
+    Ok(Some(emit_av_variants_with_master(
+        kid_hex, encrypted, &master,
+    )?))
+}
+
+/// Pure variant emit (testable without env): derive the per-asset secret from `(master, content_id)`
+/// — where `content_id == kid_hex`, the SAME value the serve selector keys on — then for each marked
+/// segment append a byte-distinct placeholder marker to the (already public) CENC ciphertext for each
+/// symbol and build the bias-committed manifest. Marks **every** segment for the strongest code; the
+/// embed is a no-op-to-the-decoder `free` box (real perceptual DSP swaps in behind this seam).
+#[cfg(feature = "escrow")]
+fn emit_av_variants_with_master(
+    kid_hex: &str,
+    encrypted: &[Vec<u8>],
+    master: &[u8],
+) -> Result<AvEmit, String> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let asset_secret = ddrm_envelope::av::asset_secret_from_master(master, kid_hex.as_bytes());
+    let mut marked: Vec<(u32, Vec<ddrm_envelope::av::VariantRef>)> =
+        Vec::with_capacity(encrypted.len());
+    let mut files: Vec<(String, String)> = Vec::with_capacity(encrypted.len() * 2);
+    for (i, enc) in encrypted.iter().enumerate() {
+        let mut variants = Vec::with_capacity(2);
+        for symbol in 0u8..2 {
+            let bytes = ddrm_media::mp4::embed_placeholder_variant(enc, symbol);
+            let uri = format!("av/seg{i}.{symbol}.m4s");
+            let digest_hex = sha256_hex(&bytes);
+            files.push((uri.clone(), b64.encode(&bytes)));
+            variants.push(ddrm_envelope::av::VariantRef {
+                symbol,
+                uri,
+                digest_hex,
+            });
+        }
+        marked.push((i as u32, variants));
+    }
+    let manifest = ddrm_envelope::av::build_manifest(2, AV_ERASURE_TAU, &asset_secret, &marked)
+        .map_err(|e| format!("variant manifest build failed: {e}"))?;
+    let manifest_json =
+        serde_json::to_string(&manifest).map_err(|e| format!("manifest serialize failed: {e}"))?;
+    Ok(AvEmit {
+        manifest_json,
+        files,
+    })
 }
 
 /// The non-secret output of [`EncryptProvider::run_seal_pipeline`]. Carries only
@@ -1893,6 +2018,7 @@ mod tests {
                 &plaintext_frags,
                 Some(&b64.encode(&split.init)),
                 &nodes,
+                false,
             ) {
                 Response::Ok { data: Some(d) } => d,
                 Response::Ok { data: None } => panic!("expected data"),
@@ -1994,19 +2120,20 @@ mod tests {
                 code(provider.seal_segments_threshold(
                     &[b64.encode(b"x")],
                     None,
-                    &good_nodes[..2]
+                    &good_nodes[..2],
+                    false
                 )),
                 "invalid_request"
             );
             // no segments.
             assert_eq!(
-                code(provider.seal_segments_threshold(&[], None, &good_nodes)),
+                code(provider.seal_segments_threshold(&[], None, &good_nodes, false)),
                 "invalid_request"
             );
             // duplicate node identity.
             let dup = vec![node(1), node(1), node(3)];
             assert_eq!(
-                code(provider.seal_segments_threshold(&[b64.encode(b"x")], None, &dup)),
+                code(provider.seal_segments_threshold(&[b64.encode(b"x")], None, &dup, false)),
                 "invalid_request"
             );
             // segment that is not valid base64.
@@ -2014,7 +2141,8 @@ mod tests {
                 code(provider.seal_segments_threshold(
                     &["!!!notb64!!!".to_string()],
                     None,
-                    &good_nodes
+                    &good_nodes,
+                    false
                 )),
                 "invalid_request"
             );
@@ -2506,5 +2634,67 @@ mod tests {
             &segment,
             plaintext,
         );
+    }
+
+    /// AV chunk 3 mint emit: the variant emitter produces, for every segment, two byte-distinct
+    /// placeholder variants whose manifest is bias-committed to `(master, content_id)` — exactly the
+    /// derivation the serve selector re-runs. So the emitted manifest+files are serve-selectable
+    /// without sharing the CEK (the variants are a pure transform of the public ciphertext).
+    #[cfg(feature = "escrow")]
+    #[test]
+    fn av_mint_emit_is_bias_committed_and_serve_selectable() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let master = b"node-bias-master-secret-0001";
+        let kid_hex = "0xfeedface00112233445566778899aabb";
+        // Valid single-`mdat`-box fragments so the marker append + read-back round-trips like a real
+        // CENC segment (the placeholder reader parses top-level boxes).
+        let encrypted: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| {
+                let payload = format!("ciphertext-segment-{i}").into_bytes();
+                let mut frag = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+                frag.extend_from_slice(b"mdat");
+                frag.extend_from_slice(&payload);
+                frag
+            })
+            .collect();
+
+        let emit = emit_av_variants_with_master(kid_hex, &encrypted, master).expect("emit");
+        // Two variants per segment, each = the ciphertext with its symbol marker appended.
+        assert_eq!(emit.files.len(), encrypted.len() * 2);
+        for (i, enc) in encrypted.iter().enumerate() {
+            for symbol in 0u8..2 {
+                let (path, data) = &emit.files[i * 2 + symbol as usize];
+                assert_eq!(path, &format!("av/seg{i}.{symbol}.m4s"));
+                let bytes = b64.decode(data).expect("variant b64");
+                assert_eq!(
+                    bytes,
+                    ddrm_media::mp4::embed_placeholder_variant(enc, symbol)
+                );
+                assert_eq!(
+                    ddrm_media::mp4::read_placeholder_variant(&bytes),
+                    Some(symbol)
+                );
+            }
+        }
+
+        // The manifest re-parses, is fingerprinted, and its bias commitment matches what the serve
+        // side derives from the SAME (master, content_id==kid) — so `select_symbols` accepts it.
+        let manifest: ddrm_envelope::av::VariantManifestV1 =
+            serde_json::from_str(&emit.manifest_json).expect("manifest json");
+        assert!(manifest.fingerprinted);
+        assert_eq!(manifest.codeword.length as usize, encrypted.len());
+        let asset_secret = ddrm_envelope::av::asset_secret_from_master(master, kid_hex.as_bytes());
+        let bias = ddrm_envelope::av::asset_bias_vector(&asset_secret, manifest.codeword.length);
+        let grant_digest = ddrm_envelope::grant_watermark_digest16("0xabc");
+        let symbols = ddrm_envelope::av::select_symbols(&manifest, &bias, &grant_digest)
+            .expect("serve selector accepts the minted manifest");
+        assert_eq!(symbols.len(), encrypted.len());
+
+        // A DIFFERENT master ⇒ a different bias ⇒ the manifest is rejected (no cross-asset reuse).
+        let other =
+            ddrm_envelope::av::asset_secret_from_master(b"different-master", kid_hex.as_bytes());
+        let other_bias = ddrm_envelope::av::asset_bias_vector(&other, manifest.codeword.length);
+        assert!(ddrm_envelope::av::select_symbols(&manifest, &other_bias, &grant_digest).is_err());
     }
 }

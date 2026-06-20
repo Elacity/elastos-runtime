@@ -54,7 +54,10 @@ gen-vectors = []
 # the producer seals a freshly-minted CEK to the key authority's published recipient
 # key via ddrm-envelope, under the shared escrow AAD. OFF by default -> `seal` and the
 # escrow seam stay fail-closed (`not_configured`).
-escrow = ["dep:ddrm-envelope", "dep:ddrm-media"]
+# `ddrm-envelope/av-variants` adds the forensic variant manifest + bias-committed codeword so the
+# media seal can OPT-IN to emitting per-segment {A,B} variants + `av-variants.json` (AV chunk 3 mint
+# emit). Inert unless the request sets `av_variants` AND the boundary env carries the bias master.
+escrow = ["dep:ddrm-envelope", "dep:ddrm-media", "ddrm-envelope/av-variants"]
 
 [profile.release]
 opt-level = "s"

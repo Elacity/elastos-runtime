@@ -29,7 +29,10 @@ base64 = "0.22"
 # AAD with it — no private re-implementation, so it cannot drift from the capsules.
 # `access-grant` adds the wallet-signed AccessGrantV1 builder (grant-prepare/grant-assemble
 # sidecar modes): the gateway shells out to these so it never links the PQ session signer.
-ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant"] }
+# `av-variants` adds the forensic variant manifest + serve-time selector (chunk 3): the open mode
+# loads the published manifest, derives the per-asset bias from this node's master, and serves the
+# per-buyer selected variant — the same canonical construction the offline extractor mirrors.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant", "av-variants"] }
 
 [profile.dev]
 opt-level = 1

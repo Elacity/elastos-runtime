@@ -399,6 +399,24 @@ done
 [[ -x "${INSTALLED_BIN}/shell" ]] && export ELASTOS_SHELL_BIN="${INSTALLED_BIN}/shell"
 MEDIA_AUTH_BIN="${REPO_ROOT}/scripts/dev/ddrm-media-authority/target/debug/ddrm-media-authority"
 [[ -x "$MEDIA_AUTH_BIN" ]] && export ELASTOS_DDRM_MEDIA_AUTHORITY_BIN="$MEDIA_AUTH_BIN"
+
+# ── AV forensic watermarking (dDRM AV Phase 5) ────────────────────────────────
+# Enable per-buyer forensic variants: the mint boundary (encrypt-provider) emits {A,B} variants +
+# a bias-committed manifest, and the serve helper (ddrm-media-authority) selects each buyer's
+# variant from the wallet-signed grant. BOTH inherit this gateway env, so they share one bias
+# MASTER — which MUST be (a) stable across restarts (an asset minted today still serves its
+# committed variants tomorrow) and (b) identical on the mint + serve sides (else the manifest's
+# bias commitment won't match and the open honestly falls back to the single encode). We persist
+# one master per data-dir. Forensic marking needs the wallet-grant (chain) open path, so divergence
+# only appears with ELASTOS_DDRM_RIGHTS=chain.
+AV_MASTER_FILE="${QUORUM_DIR}/av-bias.master"
+mkdir -p "$QUORUM_DIR" 2>/dev/null || true
+if [[ ! -s "$AV_MASTER_FILE" ]]; then
+  head -c 32 /dev/urandom | base64 | tr -d '\n' > "$AV_MASTER_FILE"
+  chmod 600 "$AV_MASTER_FILE" 2>/dev/null || true
+fi
+export ELASTOS_AV_MASTER_B64="$(tr -d '\r\n' < "$AV_MASTER_FILE")"
+export ELASTOS_AV_VARIANTS=1
 # The Create portal reads the quorum here (also the default <data_dir>/dkms/quorum.json).
 export ELASTOS_DKMS_QUORUM_DESCRIPTOR="$QUORUM_JSON"
 # dKMS consumer-open (double-click a minted asset): the key-provider the helper drives + the LIVE
@@ -452,6 +470,13 @@ if [[ "$ELASTOS_DDRM_RIGHTS" == "chain" ]]; then
   export ELASTOS_CHAIN_BASE_RPC="${ELASTOS_CHAIN_BASE_RPC:-https://mainnet.base.org}"
 fi
 
+echo "AV forensic watermarking: ENABLED (ELASTOS_AV_VARIANTS=1)"
+echo "  bias master: ${AV_MASTER_FILE} (persistent; shared by mint + serve)"
+if [[ "${ELASTOS_DDRM_RIGHTS:-dev}" != "chain" ]]; then
+  echo "  NOTE: forensic marking activates on the wallet-grant (chain) open path — run with"
+  echo "        ELASTOS_DDRM_RIGHTS=chain to see per-buyer variants (else assets serve single-encode)."
+fi
+echo
 echo "provider overrides:"
 for v in ELASTOS_ENCRYPT_PROVIDER_BIN ELASTOS_MEDIA_PROVIDER_BIN ELASTOS_PUBLISH_PROVIDER_BIN \
          ELASTOS_CHAIN_PROVIDER_BIN ELASTOS_WALLET_PROVIDER_BIN ELASTOS_IPFS_PROVIDER_BIN \

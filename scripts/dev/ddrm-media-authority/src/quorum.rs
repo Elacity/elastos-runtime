@@ -58,6 +58,11 @@ pub struct QuorumArgs {
     /// `hasAccessByContentId` themselves) instead of trusting the unsigned rights receipt. The
     /// gateway builds it from the user's `personal_sign`; this helper only forwards it.
     pub access_grant_b64: Option<String>,
+    /// AV forensic variants (chunk 3): the serving node's per-node bias MASTER secret (base64).
+    /// Combined with the stable `object_cid` it derives the per-asset bias vector
+    /// ([`ddrm_envelope::av::asset_secret_from_master`]) the selector keys on. `None` (node not
+    /// provisioned for AV) ⇒ the single encode is served, `fingerprinted:false` (honest).
+    pub av_master_b64: Option<String>,
 }
 
 fn now_unix() -> u64 {
@@ -536,6 +541,7 @@ fn recover_quorum(args: &QuorumArgs) -> Result<QuorumOpen, String> {
         material,
         now,
         media: payload.media,
+        fingerprinted: payload.fingerprinted,
     })
 }
 
@@ -552,6 +558,10 @@ struct OpenPayload {
     segment_digests: Option<Vec<u8>>,
     /// Media presentation info for the streaming descriptor (`None` for objects).
     media: Option<MediaInfo>,
+    /// AV forensic state (chunk 3): `true` iff a valid per-buyer variant selection was served from a
+    /// published manifest. The HONEST default — single encode, no manifest, or a node not provisioned
+    /// for AV — is `false` (never claim a mark that isn't there).
+    fingerprinted: bool,
 }
 
 /// One playable DASH track (AdaptationSet) for the MSE player: its clear init, the MSE
@@ -631,6 +641,13 @@ fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayloa
             let rel = p.as_str().ok_or("segment_paths entry is not a string")?;
             segments.push(read_dash_file(dir, rel)?);
         }
+        // AV forensic variants (chunk 3): if the asset published a variant manifest and this node is
+        // provisioned for AV with a wallet-signed grant, replace each marked segment's ciphertext
+        // with the per-buyer SELECTED variant. The served bytes are then welded into the transcript
+        // AAD via `segment_digests` below (the decrypt boundary recomputes the same digest), so a
+        // buyer's served copy is cryptographically bound to their selection. Absent any of those
+        // (no manifest / no master / no grant) the single encode is served, `fingerprinted:false`.
+        let fingerprinted = apply_variant_selection(dir, &mut segments, args)?;
         let init_bytes = if init_path.is_empty() {
             Vec::new()
         } else {
@@ -663,6 +680,7 @@ fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayloa
             init_b64,
             segment_digests,
             media: Some(MediaInfo { tracks }),
+            fingerprinted,
         });
     }
 
@@ -678,6 +696,7 @@ fn compute_open_payload(capsule: &Value, args: &QuorumArgs) -> Result<OpenPayloa
         init_b64: None,
         segment_digests: None,
         media: None,
+        fingerprinted: false,
     })
 }
 
@@ -787,6 +806,10 @@ struct QuorumOpen {
     /// MEDIA: the clear init + streamable segment count (set when the open recovered a DASH
     /// segment set). `None` for the object / pixel-lock paths.
     media: Option<MediaInfo>,
+    /// AV forensic state (chunk 3): whether this open served a per-buyer variant selection (an
+    /// honest `false` for single-encode assets). Surfaced on the media descriptor so the gateway /
+    /// player / audit can record that the served stream is fingerprinted — never claimed otherwise.
+    fingerprinted: bool,
 }
 
 /// A rendered page returned from the decrypt boundary: the watermarked image plus the
@@ -967,6 +990,18 @@ fn watermark_for(args: &QuorumArgs, opened_at: u64) -> String {
 /// --extract-watermark --verify-grant`) derives the identical value (no drift, Principle 12).
 /// `None` when no parseable grant is attached.
 fn grant_digest_hex(args: &QuorumArgs) -> Option<String> {
+    let digest = grant_digest_raw(args)?;
+    let mut hex = String::with_capacity(32);
+    for b in digest {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Some(hex)
+}
+
+/// The raw 16-byte forensic grant digest (the codeword input the serve selector keys on), derived
+/// via the SHARED [`ddrm_envelope::grant_watermark_digest16`] from the wallet-signed grant's EIP-191
+/// delegation signature. `None` when no parseable grant is attached.
+fn grant_digest_raw(args: &QuorumArgs) -> Option<[u8; 16]> {
     let grant_b64 = args
         .access_grant_b64
         .as_deref()
@@ -974,12 +1009,72 @@ fn grant_digest_hex(args: &QuorumArgs) -> Option<String> {
     let bytes = B64.decode(grant_b64.trim()).ok()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     let sig = v.get("delegation_sig_hex")?.as_str()?;
-    let digest = ddrm_envelope::grant_watermark_digest16(sig);
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        hex.push_str(&format!("{b:02x}"));
+    Some(ddrm_envelope::grant_watermark_digest16(sig))
+}
+
+/// The published variant manifest filename in the DASH directory (chunk 3).
+const AV_VARIANTS_FILE: &str = "av-variants.json";
+
+/// AV forensic variant selection (chunk 3). If `dir` carries a valid, fingerprinted variant manifest
+/// AND this node is provisioned with a bias master AND a wallet-signed grant is present, replace each
+/// marked segment's ciphertext in `segments` with the per-buyer SELECTED variant (read from the DASH
+/// dir) and return `true`. Otherwise leave `segments` untouched and return `false` — the honest
+/// single-encode path (no manifest / not provisioned / no grant). It FAILS CLOSED only when the
+/// manifest claims a mark and the node is AV-provisioned with a grant but the selection cannot be
+/// honored (malformed manifest, wrong master ⇒ bias-commitment mismatch, out-of-range index, or a
+/// missing variant file) — never silently serving a half-applied mark.
+fn apply_variant_selection(
+    dir: &std::path::Path,
+    segments: &mut [Vec<u8>],
+    args: &QuorumArgs,
+) -> Result<bool, String> {
+    // Manifest present? Absent ⇒ single encode (the common, honest case).
+    let Ok(bytes) = std::fs::read(dir.join(AV_VARIANTS_FILE)) else {
+        return Ok(false);
+    };
+    let manifest: ddrm_envelope::av::VariantManifestV1 = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{AV_VARIANTS_FILE} is not a valid variant manifest: {e}"))?;
+    manifest
+        .validate()
+        .map_err(|e| format!("{AV_VARIANTS_FILE} failed validation: {e}"))?;
+    if !manifest.fingerprinted {
+        return Ok(false);
     }
-    Some(hex)
+    // Node provisioned for AV? (a bias master) — absent ⇒ serve the single encode, honestly.
+    let Some(master_b64) = args
+        .av_master_b64
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+    let master = B64
+        .decode(master_b64.trim())
+        .map_err(|e| format!("--av-master is not valid base64: {e}"))?;
+    // Per-buyer grant present? Without it there is no codeword input ⇒ serve the single encode.
+    let Some(grant_digest) = grant_digest_raw(args) else {
+        return Ok(false);
+    };
+    // From here the manifest claims a mark, the node is provisioned, and a buyer is identified —
+    // any failure is a real integrity/config error and MUST fail closed.
+    let asset_secret =
+        ddrm_envelope::av::asset_secret_from_master(&master, args.object_cid.as_bytes());
+    let bias = ddrm_envelope::av::asset_bias_vector(&asset_secret, manifest.codeword.length);
+    let symbols = ddrm_envelope::av::select_symbols(&manifest, &bias, &grant_digest)
+        .map_err(|e| format!("variant selection failed closed: {e}"))?;
+    for (seg, &sym) in manifest.marked_segments.iter().zip(&symbols) {
+        let idx = seg.index as usize;
+        let variant = seg
+            .variants
+            .get(sym as usize)
+            .ok_or("selected symbol out of range for the marked segment")?;
+        let selected = read_dash_file(dir, &variant.uri)?;
+        let slot = segments.get_mut(idx).ok_or_else(|| {
+            format!("marked segment index {idx} is out of range of the sealed segment set")
+        })?;
+        *slot = selected;
+    }
+    Ok(true)
 }
 
 /// `(display identity, short content id)` for the stamp. Prefers the wallet address + on-chain
@@ -1193,6 +1288,9 @@ fn serve_media(open: &mut QuorumOpen, args: &QuorumArgs) -> Result<(), String> {
         "kind": "media",
         "tracks": descriptor_tracks,
         "expires_at": now_unix() + args.ttl_secs.max(60),
+        // AV forensic state (chunk 3): honest signal of whether the served stream carries a per-buyer
+        // variant selection. `false` for single-encode assets — never claim a mark that isn't there.
+        "fingerprinted": open.fingerprinted,
     });
     if let Some(first) = descriptor
         .get("tracks")
@@ -1353,6 +1451,202 @@ fn reply(out: &mut impl Write, value: &Value) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod av_selection_tests {
+    use super::*;
+    use ddrm_envelope::av;
+
+    const OBJECT_CID: &str = "owned:av-selection-test";
+    const MASTER: &[u8] = b"node-bias-master-secret-0001";
+
+    /// `(variant-A bytes, variant-B bytes)` for one marked segment.
+    type VariantPair = (Vec<u8>, Vec<u8>);
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "ddrm-av-sel-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn grant(sig: &str) -> String {
+        B64.encode(serde_json::to_vec(&json!({ "delegation_sig_hex": sig })).unwrap())
+    }
+
+    fn av_args(
+        dir: &std::path::Path,
+        master_b64: Option<String>,
+        grant_b64: Option<String>,
+    ) -> QuorumArgs {
+        QuorumArgs {
+            principal: "person:test".into(),
+            decrypt_bin: String::new(),
+            key_bin: String::new(),
+            capsule_path: String::new(),
+            descriptor_path: String::new(),
+            caller_seed_b64: String::new(),
+            object_cid: OBJECT_CID.into(),
+            mime: "video/mp4".into(),
+            ttl_secs: 60,
+            dash_dir: Some(dir.to_string_lossy().into_owned()),
+            access_grant_b64: grant_b64,
+            av_master_b64: master_b64,
+        }
+    }
+
+    /// Mint a fingerprinted DASH dir (manifest + per-segment A/B variant files) keyed by the SAME
+    /// secret the serve selector derives from `(MASTER, OBJECT_CID)`. Returns the default (all-A)
+    /// served segments + the (A,B) byte pairs so a test can check which variant was selected.
+    fn mint_fixture(dir: &std::path::Path, nseg: usize) -> (Vec<Vec<u8>>, Vec<VariantPair>) {
+        let asset_secret = av::asset_secret_from_master(MASTER, OBJECT_CID.as_bytes());
+        let mut marked = Vec::new();
+        let mut default_segments = Vec::new();
+        let mut pairs = Vec::new();
+        for i in 0..nseg {
+            let a = format!("seg-{i}-A-ciphertext-bytes").into_bytes();
+            let b = format!("seg-{i}-B-ciphertext-bytes").into_bytes();
+            let (uri_a, uri_b) = (format!("seg-{i}.A.m4s"), format!("seg-{i}.B.m4s"));
+            std::fs::write(dir.join(&uri_a), &a).unwrap();
+            std::fs::write(dir.join(&uri_b), &b).unwrap();
+            marked.push((
+                i as u32,
+                vec![
+                    av::VariantRef {
+                        symbol: 0,
+                        uri: uri_a,
+                        digest_hex: format!("da{i}"),
+                    },
+                    av::VariantRef {
+                        symbol: 1,
+                        uri: uri_b,
+                        digest_hex: format!("db{i}"),
+                    },
+                ],
+            ));
+            default_segments.push(a.clone());
+            pairs.push((a, b));
+        }
+        let manifest = av::build_manifest(2, 2.0, &asset_secret, &marked).unwrap();
+        std::fs::write(
+            dir.join(AV_VARIANTS_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        (default_segments, pairs)
+    }
+
+    fn symbols_for(grant_sig: &str, nseg: usize) -> Vec<u8> {
+        let asset_secret = av::asset_secret_from_master(MASTER, OBJECT_CID.as_bytes());
+        let bias = av::asset_bias_vector(&asset_secret, nseg as u32);
+        let gd = ddrm_envelope::grant_watermark_digest16(grant_sig);
+        // build a throwaway manifest only to satisfy select_symbols' shape (commitment matches).
+        let marked: Vec<(u32, Vec<av::VariantRef>)> = (0..nseg as u32)
+            .map(|i| {
+                (
+                    i,
+                    vec![
+                        av::VariantRef {
+                            symbol: 0,
+                            uri: String::new(),
+                            digest_hex: "x".into(),
+                        },
+                        av::VariantRef {
+                            symbol: 1,
+                            uri: String::new(),
+                            digest_hex: "y".into(),
+                        },
+                    ],
+                )
+            })
+            .collect();
+        let m = av::build_manifest(2, 2.0, &asset_secret, &marked).unwrap();
+        av::select_symbols(&m, &bias, &gd).unwrap()
+    }
+
+    #[test]
+    fn serve_selection_diverges_per_buyer_and_matches_the_codeword() {
+        let dir = unique_dir("diverge");
+        let nseg = 16usize;
+        let (default_segments, pairs) = mint_fixture(&dir, nseg);
+        let master_b64 = B64.encode(MASTER);
+
+        let args_a = av_args(&dir, Some(master_b64.clone()), Some(grant("0xalice")));
+        let args_b = av_args(&dir, Some(master_b64), Some(grant("0xbob")));
+
+        let mut seg_a = default_segments.clone();
+        let mut seg_b = default_segments.clone();
+        assert!(apply_variant_selection(&dir, &mut seg_a, &args_a).unwrap());
+        assert!(apply_variant_selection(&dir, &mut seg_b, &args_b).unwrap());
+
+        let sym_a = symbols_for("0xalice", nseg);
+        let sym_b = symbols_for("0xbob", nseg);
+        assert_ne!(sym_a, sym_b, "distinct buyers select distinct variant sets");
+        assert_ne!(seg_a, seg_b, "served bytes diverge between buyers");
+
+        // Each served segment is exactly the variant the buyer's codeword selects.
+        for i in 0..nseg {
+            let (a, b) = &pairs[i];
+            let want_a = if sym_a[i] == 0 { a } else { b };
+            let want_b = if sym_b[i] == 0 { a } else { b };
+            assert_eq!(&seg_a[i], want_a, "buyer A segment {i}");
+            assert_eq!(&seg_b[i], want_b, "buyer B segment {i}");
+            if sym_a[i] == sym_b[i] {
+                assert_eq!(
+                    seg_a[i], seg_b[i],
+                    "same symbol ⇒ identical served bytes at {i}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_falls_back_to_single_encode_when_not_provisioned() {
+        let dir = unique_dir("fallback");
+        let (default_segments, _) = mint_fixture(&dir, 8);
+
+        // No master ⇒ honest single encode (segments untouched, fingerprinted=false).
+        let mut segs = default_segments.clone();
+        let args = av_args(&dir, None, Some(grant("0xalice")));
+        assert!(!apply_variant_selection(&dir, &mut segs, &args).unwrap());
+        assert_eq!(segs, default_segments, "no master ⇒ served bytes unchanged");
+
+        // Master but no grant ⇒ can't select per-buyer ⇒ single encode.
+        let mut segs2 = default_segments.clone();
+        let args2 = av_args(&dir, Some(B64.encode(MASTER)), None);
+        assert!(!apply_variant_selection(&dir, &mut segs2, &args2).unwrap());
+        assert_eq!(segs2, default_segments);
+
+        // No manifest at all ⇒ single encode.
+        let empty = unique_dir("empty");
+        let mut segs3 = default_segments.clone();
+        let args3 = av_args(&empty, Some(B64.encode(MASTER)), Some(grant("0xalice")));
+        assert!(!apply_variant_selection(&empty, &mut segs3, &args3).unwrap());
+        assert_eq!(segs3, default_segments);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn serve_fails_closed_on_wrong_master() {
+        // Provisioned + grant + fingerprinted manifest, but the WRONG master ⇒ bias-commitment
+        // mismatch ⇒ refuse to serve (never a half-applied or mis-keyed mark).
+        let dir = unique_dir("wrongmaster");
+        let (default_segments, _) = mint_fixture(&dir, 8);
+        let mut segs = default_segments.clone();
+        let wrong = B64.encode(b"a-different-node-master-secret");
+        let args = av_args(&dir, Some(wrong), Some(grant("0xalice")));
+        assert!(apply_variant_selection(&dir, &mut segs, &args).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod watermark_tests {
     use super::*;
 
@@ -1369,6 +1663,7 @@ mod watermark_tests {
             ttl_secs: 60,
             dash_dir: None,
             access_grant_b64: grant_b64,
+            av_master_b64: None,
         }
     }
 
