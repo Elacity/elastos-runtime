@@ -195,9 +195,10 @@ async fn token_denies_after_use_limit() {
     );
 }
 
-/// A denial must be recorded in the audit log. This proves the *positive* side of
-/// inventory finding #8 (denials are emitted); the *gap* — that the runtime-core audit
-/// sink is best-effort and unsigned — is recorded in `KNOWN_GAPS`.
+/// A denial must be recorded in the audit log, AND that record must be tamper-evident.
+/// This pins the now-closed half of GAP-8: the audit log is hash-chained + signed (the record
+/// carries seq + prev_hash + record_hash), not the un-chained "best-effort, unsigned" sink the
+/// gap once described. The residual best-effort emission of non-custody events stays in `KNOWN_GAPS`.
 #[tokio::test]
 async fn denial_is_audited() {
     let path = std::env::temp_dir().join("elastos-capconf-denial-audit.log");
@@ -229,6 +230,20 @@ async fn denial_is_audited() {
     assert!(
         !logged.trim().is_empty(),
         "a capability denial must produce an audit record (got empty log)"
+    );
+    // GAP-8 (tamper-evidence) is closed: the record is a CHAINED, signed envelope — it carries a
+    // monotonic seq, the prior record's hash, and its own record_hash — not a bare best-effort line.
+    assert!(
+        logged.contains("\"seq\""),
+        "audit record must carry a chain seq (hash-chained)"
+    );
+    assert!(
+        logged.contains("\"prev_hash\""),
+        "audit record must carry prev_hash (hash-chained)"
+    );
+    assert!(
+        logged.contains("\"record_hash\""),
+        "audit record must carry record_hash (tamper-evident)"
     );
 }
 
@@ -284,9 +299,9 @@ const KNOWN_GAPS: &[KnownGap] = &[
     // `gap7_dev_modes_are_fenced_out_of_release_builds` below.
     KnownGap {
         id: "GAP-8",
-        severity: "med",
-        finding: "Runtime-core audit sink is best-effort and unsigned: a denial whose write fails is silently dropped; the log is not hash-chained/tamper-evident.",
-        location: "primitives/audit.rs:300 (emit)",
+        severity: "low",
+        finding: "Capability audit events (grant/use/denial) emit best-effort: a write failure drops the event (logged) rather than propagating. The log itself is now hash-chained + ed25519-signed + fsync'd and tamper-evident (verify_chain), and custody-critical opens emit fail-closed — so this residual is a deliberate availability-over-completeness choice for NON-custody events, not the un-chained/unsigned sink the gap once described.",
+        location: "capability/manager.rs (audit_validation_failure -> emit_best_effort); primitives/audit.rs:461 (chained, signed emit)",
     },
     KnownGap {
         id: "GAP-9",
