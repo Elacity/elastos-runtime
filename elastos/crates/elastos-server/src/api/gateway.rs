@@ -946,14 +946,39 @@ async fn landing_page() -> Html<String> {
 include!("gateway_models.rs");
 
 fn load_existing_gateway_runtime_did(data_dir: &std::path::Path) -> Option<String> {
+    // The gateway DID is deterministically derived from the on-disk device key
+    // (SHA-256 over a fixed label || device_key) and is therefore boot-stable.
+    // Per-request token verification calls this on every protected-asset fetch, so
+    // re-reading device.key + re-deriving the ed25519 identity each time is pure
+    // waste. Memoize the resolved DID instead.
+    //
+    // Containment: only the POSITIVE result is cached. A missing identity keeps
+    // being re-checked (so a device key provisioned after gateway start is still
+    // picked up), and the cached value can only ever be the real derived DID — it
+    // can never widen authority. The signature/expiry/session checks that actually
+    // authorize a request stay per-request in the callers; this only memoizes WHO
+    // the trusted signer is, not WHETHER a given token is valid.
+    static DID_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    let cache = DID_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(did) = cache.lock().ok().and_then(|m| m.get(data_dir).cloned()) {
+        return Some(did);
+    }
+
     let device_key = data_dir.join("identity").join("device.key");
     if !device_key.exists() {
         return None;
     }
-    elastos_identity::load_or_create_did(data_dir)
+    let did = elastos_identity::load_or_create_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
-        .filter(|did| !did.trim().is_empty())
+        .filter(|did| !did.trim().is_empty())?;
+    if let Ok(mut m) = cache.lock() {
+        m.insert(data_dir.to_path_buf(), did.clone());
+    }
+    Some(did)
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -160,35 +160,28 @@ pub fn process(
 
     let cek_arr: [u8; 16] = cek_bytes[..16].try_into().unwrap();
 
-    let mdat = &segment_data[parsed.mdat_offset..parsed.mdat_offset + parsed.mdat_size];
+    let mdat_start = parsed.mdat_offset;
+    let mdat_end = parsed.mdat_offset + parsed.mdat_size;
 
-    let decrypted_mdat = match cenc::decrypt_samples(
-        mdat,
+    // Copy the segment ONCE, then decrypt the mdat content range in place. Bytes
+    // outside the mdat content (moof, the mdat box header, any trailing bytes) are
+    // preserved verbatim, so the output is byte-identical to the previous
+    // decrypt-then-reconstruct path — only the redundant whole-mdat copy is
+    // removed. The CEK is still zeroized on every return path, as before.
+    let mut output = segment_data.to_vec();
+    if let Err(e) = cenc::decrypt_samples_in_place(
+        &mut output[mdat_start..mdat_end],
         &cek_arr,
         trun_entries,
         &senc.samples,
         default_sample_size,
     ) {
-        Ok(d) => d,
-        Err(e) => {
-            cek_bytes.iter_mut().for_each(|b| *b = 0);
-            return (error_result(&format!("decrypt: {e}")), None);
-        }
-    };
+        cek_bytes.iter_mut().for_each(|b| *b = 0);
+        return (error_result(&format!("decrypt: {e}")), None);
+    }
 
     // Zero CEK
     cek_bytes.iter_mut().for_each(|b| *b = 0);
-
-    // Reconstruct the segment: everything before mdat content stays the same,
-    // mdat content is replaced with decrypted bytes
-    let mut output = Vec::with_capacity(segment_data.len());
-    output.extend_from_slice(&segment_data[..parsed.mdat_offset]);
-    output.extend_from_slice(&decrypted_mdat);
-    // Include any data after mdat (unlikely but safe)
-    let mdat_end = parsed.mdat_offset + parsed.mdat_size;
-    if mdat_end < segment_data.len() {
-        output.extend_from_slice(&segment_data[mdat_end..]);
-    }
 
     // Strip encryption metadata boxes if requested
     let final_output = if cmd.strip {

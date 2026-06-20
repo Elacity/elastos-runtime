@@ -9,23 +9,23 @@ use aes::cipher::{KeyIvInit, StreamCipher};
 
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
-/// Decrypt all samples in an mdat payload using CENC AES-128-CTR.
+/// Decrypt all samples of an mdat payload **in place** using CENC AES-128-CTR.
 ///
-/// - `mdat`: raw mdat content bytes
+/// - `mdat`: the mutable mdat content bytes (decrypted in place)
 /// - `cek`: 16-byte Content Encryption Key
 /// - `trun_entries`: sample sizes from trun box
 /// - `senc_samples`: per-sample IVs (and optional subsample info) from senc box
 ///
-/// Returns decrypted mdat bytes. The layout and sizes are identical to the
-/// input — only encrypted byte ranges are decrypted in-place.
-pub fn decrypt_samples(
-    mdat: &[u8],
+/// Only encrypted byte ranges are touched; the layout and sizes are unchanged.
+/// Decrypting in place lets the caller hold a single segment buffer instead of
+/// allocating a separate decrypted-mdat copy and then reconstructing the segment.
+pub fn decrypt_samples_in_place(
+    mdat: &mut [u8],
     cek: &[u8; 16],
     trun_entries: &[TrunEntry],
     senc_samples: &[SencSample],
     default_sample_size: u32,
-) -> Result<Vec<u8>, String> {
-    let mut output = mdat.to_vec();
+) -> Result<(), String> {
     let mut offset = 0usize;
 
     for (i, senc_sample) in senc_samples.iter().enumerate() {
@@ -34,20 +34,20 @@ pub fn decrypt_samples(
             .and_then(|e| e.sample_size)
             .unwrap_or(default_sample_size) as usize;
 
-        if offset + sample_size > output.len() {
+        if offset + sample_size > mdat.len() {
             return Err(format!(
                 "sample {i} exceeds mdat: offset={offset} size={sample_size} mdat_len={}",
-                output.len()
+                mdat.len()
             ));
         }
 
         let iv = build_iv(&senc_sample.iv)?;
 
         if senc_sample.subsamples.is_empty() {
-            decrypt_range(&mut output[offset..offset + sample_size], cek, &iv)?;
+            decrypt_range(&mut mdat[offset..offset + sample_size], cek, &iv);
         } else {
             decrypt_subsamples(
-                &mut output[offset..offset + sample_size],
+                &mut mdat[offset..offset + sample_size],
                 cek,
                 &iv,
                 &senc_sample.subsamples,
@@ -57,6 +57,21 @@ pub fn decrypt_samples(
         offset += sample_size;
     }
 
+    Ok(())
+}
+
+/// Vec-returning wrapper preserved for the PC2 conformance driver
+/// (`scripts/pc2-conformance/driver.rs`), which pins this exact signature.
+/// Allocates one copy and decrypts it in place — byte-identical output.
+pub fn decrypt_samples(
+    mdat: &[u8],
+    cek: &[u8; 16],
+    trun_entries: &[TrunEntry],
+    senc_samples: &[SencSample],
+    default_sample_size: u32,
+) -> Result<Vec<u8>, String> {
+    let mut output = mdat.to_vec();
+    decrypt_samples_in_place(&mut output, cek, trun_entries, senc_samples, default_sample_size)?;
     Ok(output)
 }
 
@@ -73,10 +88,9 @@ fn build_iv(senc_iv: &[u8]) -> Result<[u8; 16], String> {
 }
 
 /// Decrypt an entire byte range with AES-128-CTR.
-fn decrypt_range(data: &mut [u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<(), String> {
+fn decrypt_range(data: &mut [u8], key: &[u8; 16], iv: &[u8; 16]) {
     let mut cipher = Aes128Ctr::new(key.into(), iv.into());
     cipher.apply_keystream(data);
-    Ok(())
 }
 
 /// Decrypt with subsample encryption: alternate clear and encrypted ranges.
@@ -130,7 +144,7 @@ mod tests {
 
         // Decrypt
         let mut decrypted = encrypted.clone();
-        decrypt_range(&mut decrypted, &key, &iv).unwrap();
+        decrypt_range(&mut decrypted, &key, &iv);
         assert_eq!(&decrypted, plaintext);
     }
 
