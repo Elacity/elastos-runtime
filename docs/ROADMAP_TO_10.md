@@ -73,6 +73,19 @@ Today: 2-of-3 over an **operator-curated** set — real trust-*minimization*, no
 TEE vs reproducible-builds by value-at-risk and your decentralization ethos. The strongest end state is
 **threshold + attestation + staking together.** *Decentralization 6 → 8+, and softens the t=2 caveat.*
 
+## Tracked follow-ups (Lane A, self-servable — so they don't rot)
+
+- **Per-capsule capability-granted memory budget (WASM).** Chunk A landed a *backstop*: a generous
+  global default (`ELASTOS_WASM_MEMORY_LIMIT_MB`, 1 GiB) enforced per `Store`, closing the
+  unbounded-memory DoS. The *real* design — needed before game/AI capsules ship — is a per-capsule
+  budget the manifest **declares** and the user/policy **grants** (Principle 7: explicit, not
+  ambient), with generous grants for games/AI, a modest default for untrusted, and a host-protective
+  ceiling. Mechanism is already wired (`capsule_store_limits` in `providers/wasm.rs`); this is the
+  budget-source + grant-flow on top.
+- **WASM CPU runaway protection (Chunk B).** Epoch-interruption so a no-progress spinner can be
+  trapped / an operator can terminate a runaway (today a spinning capsule permanently holds a
+  blocking thread + CPU and `stop()` cannot kill it). Needs the service-vs-command policy decision.
+
 ## Recommended sequence
 
 1. **Now:** green-light ① (external audit) — clock starts; our registries make it cheaper.
