@@ -496,6 +496,11 @@ pub async fn open_owned_in_viewer(
     }
 
     if let Some(capsule) = capsule {
+        // Capture (owner, kid) for the grant BEFORE `object_cid` is moved into the call, so the
+        // quorum retry loop can regenerate a fresh per-request grant (A7). Must match the (subject,
+        // kid) the grant above was assembled for.
+        let owner_for_quorum = subject.clone();
+        let kid_for_quorum = normalize_kid_0x(&object_cid);
         return open_quorum(
             state,
             context,
@@ -507,6 +512,8 @@ pub async fn open_owned_in_viewer(
             session_id,
             rights_binding,
             capsule_access_grant_b64,
+            owner_for_quorum,
+            kid_for_quorum,
         )
         .await;
     }
@@ -1047,6 +1054,10 @@ async fn open_quorum(
     session_id: String,
     rights_binding: String,
     access_grant_b64: Option<String>,
+    // (owner, kid) the grant was assembled for — used to regenerate a fresh per-request grant on
+    // retries so the node's single-use replay guard doesn't reject a legitimate retry (A7).
+    owner_address: String,
+    kid_hex: String,
 ) -> Response {
     let principal_id = context.principal_id.clone();
     let title = capsule
@@ -1124,6 +1135,8 @@ async fn open_quorum(
             session_id,
             rights_binding,
             access_grant_b64,
+            owner_address,
+            kid_hex,
         )
         .await;
     }
@@ -1147,9 +1160,18 @@ async fn open_quorum(
         let caller_seed = caller_seed.clone();
         let object_cid_c = object_cid.clone();
         let mime_c = mime.clone();
-        let grant_c = access_grant_b64.clone();
+        let orig_grant = access_grant_b64.clone();
+        let owner_c = owner_address.clone();
+        let kid_c = kid_hex.clone();
         let capsule_bytes = capsule_bytes.clone();
         let built = tokio::task::spawn_blocking(move || {
+            // A7: on a RETRY (attempt > 1) send a FRESH grant — a new per-request nonce assembled
+            // from the cached wallet-signed delegation (no popup, same delegation signature/anchor)
+            // — so the node's single-use replay guard doesn't reject a legitimate retry after
+            // transient transport loss. Regeneration shells the grant sidecar, hence it runs here in
+            // the blocking task; it fails soft to the original grant.
+            let grant_c =
+                super::access_grant::grant_for_attempt(orig_grant.as_deref(), &owner_c, &kid_c, attempt);
             // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
             // temp file, unlinked as soon as the helper has read it at launch.
             let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
@@ -1262,6 +1284,9 @@ async fn open_quorum_media(
     session_id: String,
     rights_binding: String,
     access_grant_b64: Option<String>,
+    // (owner, kid) the grant was assembled for — see open_quorum (A7 retry-nonce refresh).
+    owner_address: String,
+    kid_hex: String,
 ) -> Response {
     let principal_id = context.principal_id.clone();
     let title = capsule
@@ -1359,10 +1384,16 @@ async fn open_quorum_media(
         let caller_seed = caller_seed.clone();
         let object_cid_c = object_cid.clone();
         let mime_c = mime.clone();
-        let grant_c = access_grant_b64.clone();
+        let orig_grant = access_grant_b64.clone();
+        let owner_c = owner_address.clone();
+        let kid_c = kid_hex.clone();
         let dash_dir_c = dash_dir_path.clone();
         let capsule_bytes = capsule_bytes.clone();
         let built = tokio::task::spawn_blocking(move || {
+            // A7 (same as the object path): regenerate a fresh per-request grant on retries so the
+            // node's single-use replay guard doesn't reject a legitimate retry. Fails soft.
+            let grant_c =
+                super::access_grant::grant_for_attempt(orig_grant.as_deref(), &owner_c, &kid_c, attempt);
             // The capsule (escrow + identities, never plaintext) goes to the helper as a 0600 temp
             // file; the helper reads it + the DASH dir at launch, recovers the CEK, and warms the
             // boundary. `temp` is unlinked when this closure returns.

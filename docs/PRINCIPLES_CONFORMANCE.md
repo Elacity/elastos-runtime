@@ -220,6 +220,22 @@ here so a future pass does not "fix" a non-exploitable hygiene item as if it wer
 defense-in-depth tightening (defer the custody write until after authorization, or a server-key MAC
 over `owner ‖ content_id ‖ open_time`) is tracked in THREAT_MODEL §4 — an upgrade, not a blocker.
 
+ECDSA signature malleability (high-`s`) at the `recover_from_prehash` / `verify_prehash` sites
+(`capsules/ddrm-envelope/src/access.rs` `recover_eip191`, `elastos/crates/elastos-auth/src/lib.rs`
+`recover_evm_address`, `capsules/wallet-provider/src/approval.rs`, `…/crypto/evm/proof.rs` — audit
+finding "M1") *looks* like it could let a second valid signature form bypass a replay/dedup gate. It
+cannot: a full sweep confirms **no replay/dedup key in the tree is keyed on signature bytes.** The
+grant replay guard keys on explicit server-generated nonces (`"{delegation_nonce}:{request_nonce}"`,
+`access.rs` `ReplayGuard::check_and_record`), recovered identities are derived from the *public key*
+(malleability-invariant), and the `signature_hash` fields in `approval.rs` / `proof.rs` are
+audit/receipt values or equality checks, never dedup keys. So malleability has no reachable impact —
+**safe-by-construction.** Low-`s` normalization is reasonable future hygiene, but it is **not** a
+no-op to add blindly: normalizing `s` without also flipping the `recovery_id` parity changes the
+recovered address and would reject every high-`s` (but valid) grant. It is therefore deliberately
+NOT applied to the crown-jewel recover path until it is needed and done with parity handling + a
+recovery round-trip test. Recorded so a future pass neither "fixes" M1 as a security gap nor adds a
+naive normalization that breaks owner recovery.
+
 ## How this register was produced
 
 Six read-only audit agents, one per principle cluster (Carrier/transport, ambient authority,

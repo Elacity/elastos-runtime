@@ -343,3 +343,83 @@ pub fn grant_to_b64(grant: &Value) -> Result<String, String> {
     let bytes = serde_json::to_vec(grant).map_err(|e| format!("serialize grant: {e}"))?;
     Ok(B64.encode(bytes))
 }
+
+/// Choose the grant base64 to send on quorum-open `attempt` (1-based).
+///
+/// The dKMS node's replay guard makes each grant's per-request nonce SINGLE-USE, so re-sending the
+/// same grant on a retry is (correctly) rejected as a replay — which would turn transient Carrier
+/// transport flakiness on attempt 1 into a hard "access grant rejected: replayed" open failure
+/// (DKMS_OVER_CARRIER known-gap). On attempts after the first we therefore assemble a FRESH grant
+/// from the cached wallet-signed delegation: a new per-request nonce + timestamp, signed by the
+/// cached session key — no MetaMask popup, and the SAME delegation signature, so the forensic
+/// watermark anchor is unchanged. Fail-soft: if no live session is cached or regeneration fails,
+/// fall back to the original grant (never worse than the pre-fix behavior). Returns `None` only
+/// when there was no grant to begin with (the legacy enrolled-caller path, which carries no
+/// replay-protected nonce). Shells the grant sidecar via `assemble_cached`, so call it off the
+/// async executor (e.g. inside `spawn_blocking`).
+pub fn grant_for_attempt(
+    original: Option<&str>,
+    owner_address: &str,
+    kid_hex: &str,
+    attempt: usize,
+) -> Option<String> {
+    pick_grant_for_attempt(original, attempt, || {
+        match assemble_cached(owner_address, kid_hex) {
+            Ok(Some(grant)) => grant_to_b64(&grant).ok(),
+            _ => None,
+        }
+    })
+}
+
+/// I/O-free core of [`grant_for_attempt`] so the per-attempt decision is unit-testable without the
+/// grant sidecar. `regenerate` is only invoked on retries (attempt > 1).
+fn pick_grant_for_attempt(
+    original: Option<&str>,
+    attempt: usize,
+    regenerate: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match original {
+        // Legacy enrolled-caller path: no wallet grant on the wire, so no single-use nonce to refresh.
+        None => None,
+        // First attempt uses the grant assembled up front for this open.
+        Some(orig) if attempt <= 1 => Some(orig.to_string()),
+        // Retry: send a fresh per-request grant; fall back to the original if we cannot regenerate.
+        Some(orig) => Some(regenerate().unwrap_or_else(|| orig.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+
+    #[test]
+    fn attempt_one_uses_original_without_regenerating() {
+        let mut regenerated = false;
+        let g = pick_grant_for_attempt(Some("ORIG"), 1, || {
+            regenerated = true;
+            Some("FRESH".to_string())
+        });
+        assert_eq!(g.as_deref(), Some("ORIG"));
+        assert!(!regenerated, "attempt 1 must not waste a sidecar call regenerating");
+    }
+
+    #[test]
+    fn retry_uses_freshly_regenerated_grant() {
+        // The load-bearing A7 fix: a retry must carry a DIFFERENT (fresh-nonce) grant, not the
+        // original, or the node's single-use replay guard rejects the legitimate retry.
+        let g = pick_grant_for_attempt(Some("ORIG"), 2, || Some("FRESH".to_string()));
+        assert_eq!(g.as_deref(), Some("FRESH"));
+    }
+
+    #[test]
+    fn retry_falls_back_to_original_when_regeneration_unavailable() {
+        let g = pick_grant_for_attempt(Some("ORIG"), 3, || None);
+        assert_eq!(g.as_deref(), Some("ORIG"), "no cached session -> fail soft to original");
+    }
+
+    #[test]
+    fn no_original_grant_stays_none() {
+        let g = pick_grant_for_attempt(None, 2, || Some("FRESH".to_string()));
+        assert_eq!(g, None);
+    }
+}
