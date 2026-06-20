@@ -603,12 +603,13 @@ fn authorize_media_session(
 ) -> Result<Arc<MediaSession>, Box<Response>> {
     let viewer = clean_capsule_ref(viewer)
         .map_err(|_| Box::new(media_error(StatusCode::BAD_REQUEST, "invalid viewer")))?;
-    if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
-        return Err(Box::new(media_error(
-            StatusCode::NOT_FOUND,
-            "viewer capsule not found",
-        )));
-    }
+    // A media session is created ONLY by the open path, which resolved + validated the viewer
+    // capsule at creation time and bound it into `session.viewer`. On a segment request (hundreds
+    // per playback) that proof is already in hand: the home-token below is scoped to `viewer`, and
+    // the `session.viewer` match seals it — so we skip re-resolving the capsule manifest from disk on
+    // every fragment. (Trade-off: an active playback keeps serving if the viewer capsule is
+    // uninstalled mid-stream; the principal still owns the content and the token + session + principal
+    // gates below are unchanged — still fail-closed.)
     let context = require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
         .map_err(|_| {
             Box::new(media_error(

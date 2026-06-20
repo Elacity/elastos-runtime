@@ -312,12 +312,12 @@ fn authorize_object_session(
 ) -> Result<Arc<ObjectSession>, Box<Response>> {
     let viewer = clean_capsule_ref(viewer)
         .map_err(|_| Box::new(object_error(StatusCode::BAD_REQUEST, "invalid viewer")))?;
-    if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
-        return Err(Box::new(object_error(
-            StatusCode::NOT_FOUND,
-            "viewer capsule not found",
-        )));
-    }
+    // An object session is created ONLY by the open path, which resolved + validated the viewer
+    // capsule at creation and bound it into `session.viewer`. On a bytes/page request that proof is
+    // already in hand: the home-token below is scoped to `viewer` and the `session.viewer` match
+    // seals it — so we skip re-resolving the capsule manifest from disk on every read. (Trade-off:
+    // an active view keeps serving if the viewer capsule is uninstalled mid-session; the principal
+    // still owns the content and the token + session + principal gates below are unchanged.)
     let context = require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
         .map_err(|_| {
             Box::new(object_error(
