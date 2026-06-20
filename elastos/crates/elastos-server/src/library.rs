@@ -3295,7 +3295,10 @@ fn file_listing_facts(
             let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
             Ok(FileListingFacts {
                 display_size: metadata.len(),
-                revision: format!("rev:blocked:{}", hex::encode(Sha256::digest(revision_input))),
+                revision: format!(
+                    "rev:blocked:{}",
+                    hex::encode(Sha256::digest(revision_input))
+                ),
                 content_cid: None,
                 thumbnail_uri: None,
                 blocked_reason: Some("protected_principal_root_object_not_encrypted".to_string()),
@@ -3549,6 +3552,10 @@ fn is_public_uri(localhost_root: &str, uri: &str) -> bool {
     uri == public_root || uri.starts_with(&format!("{public_root}/"))
 }
 
+/// Hash a buffer and build its raw content CID in one call. The production list path derives the
+/// CID from an already-computed digest via [`sha256_digest_to_raw_cid`]; this whole-buffer form is
+/// retained only as the independent reference the byte-identity test checks the split form against.
+#[cfg(test)]
 fn raw_sha256_cid(bytes: &[u8]) -> anyhow::Result<String> {
     sha256_digest_to_raw_cid(Sha256::digest(bytes).as_slice())
 }
@@ -7176,15 +7183,30 @@ mod tests {
     /// optimization can never silently change a revision (a compare-and-swap token) or a content CID.
     #[test]
     fn single_hash_listing_matches_two_pass_revision_and_cid() {
-        for bytes in [b"".as_slice(), b"x", b"the quick brown fox", &[0u8; 4096][..]] {
+        for bytes in [
+            b"".as_slice(),
+            b"x",
+            b"the quick brown fox",
+            &[0u8; 4096][..],
+        ] {
             let digest = Sha256::digest(bytes);
             let rev_once = format!("rev:{}", hex::encode(digest.as_slice()));
             let rev_twice = format!("rev:{}", hex::encode(Sha256::digest(bytes)));
-            assert_eq!(rev_once, rev_twice, "revision drifted for {} bytes", bytes.len());
+            assert_eq!(
+                rev_once,
+                rev_twice,
+                "revision drifted for {} bytes",
+                bytes.len()
+            );
 
             let cid_once = sha256_digest_to_raw_cid(digest.as_slice()).unwrap();
             let cid_twice = raw_sha256_cid(bytes).unwrap();
-            assert_eq!(cid_once, cid_twice, "content_cid drifted for {} bytes", bytes.len());
+            assert_eq!(
+                cid_once,
+                cid_twice,
+                "content_cid drifted for {} bytes",
+                bytes.len()
+            );
         }
     }
 
@@ -7198,9 +7220,15 @@ mod tests {
         let same: ListingCacheKey = (p.clone(), 10, (1000, 0));
         let diff_len: ListingCacheKey = (p.clone(), 11, (1000, 0));
         let diff_mtime: ListingCacheKey = (p.clone(), 10, (1000, 1));
-        assert_eq!(k1, same, "identical identity must be the same cache key (a hit)");
+        assert_eq!(
+            k1, same,
+            "identical identity must be the same cache key (a hit)"
+        );
         assert_ne!(k1, diff_len, "a length change must miss the cache");
-        assert_ne!(k1, diff_mtime, "an mtime change (any write) must miss the cache");
+        assert_ne!(
+            k1, diff_mtime,
+            "an mtime change (any write) must miss the cache"
+        );
     }
 
     /// The load-bearing safety property: the CAS/mutation path (`library_object` → cache=false)
@@ -7209,8 +7237,7 @@ mod tests {
     /// key and asserting only the cached helper would surface it — the fresh path recomputes.
     #[test]
     fn cas_path_does_not_consult_the_listing_cache() {
-        let key: ListingCacheKey =
-            (PathBuf::from("/poison/only/in/cache.bin"), 7, (42, 7));
+        let key: ListingCacheKey = (PathBuf::from("/poison/only/in/cache.bin"), 7, (42, 7));
         let poisoned = FileListingFacts {
             display_size: 999,
             revision: "rev:POISONED".to_string(),

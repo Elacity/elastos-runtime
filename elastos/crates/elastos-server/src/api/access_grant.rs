@@ -400,7 +400,10 @@ mod attempt_tests {
             Some("FRESH".to_string())
         });
         assert_eq!(g.as_deref(), Some("ORIG"));
-        assert!(!regenerated, "attempt 1 must not waste a sidecar call regenerating");
+        assert!(
+            !regenerated,
+            "attempt 1 must not waste a sidecar call regenerating"
+        );
     }
 
     #[test]
@@ -414,7 +417,11 @@ mod attempt_tests {
     #[test]
     fn retry_falls_back_to_original_when_regeneration_unavailable() {
         let g = pick_grant_for_attempt(Some("ORIG"), 3, || None);
-        assert_eq!(g.as_deref(), Some("ORIG"), "no cached session -> fail soft to original");
+        assert_eq!(
+            g.as_deref(),
+            Some("ORIG"),
+            "no cached session -> fail soft to original"
+        );
     }
 
     #[test]

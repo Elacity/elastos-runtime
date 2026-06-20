@@ -1170,8 +1170,12 @@ async fn open_quorum(
             // — so the node's single-use replay guard doesn't reject a legitimate retry after
             // transient transport loss. Regeneration shells the grant sidecar, hence it runs here in
             // the blocking task; it fails soft to the original grant.
-            let grant_c =
-                super::access_grant::grant_for_attempt(orig_grant.as_deref(), &owner_c, &kid_c, attempt);
+            let grant_c = super::access_grant::grant_for_attempt(
+                orig_grant.as_deref(),
+                &owner_c,
+                &kid_c,
+                attempt,
+            );
             // The capsule (escrow + CIPHERTEXT, never plaintext) is handed to the helper as a 0600
             // temp file, unlinked as soon as the helper has read it at launch.
             let temp = PlaintextTemp::write(&capsule_bytes, "ddrm")?;
@@ -1392,8 +1396,12 @@ async fn open_quorum_media(
         let built = tokio::task::spawn_blocking(move || {
             // A7 (same as the object path): regenerate a fresh per-request grant on retries so the
             // node's single-use replay guard doesn't reject a legitimate retry. Fails soft.
-            let grant_c =
-                super::access_grant::grant_for_attempt(orig_grant.as_deref(), &owner_c, &kid_c, attempt);
+            let grant_c = super::access_grant::grant_for_attempt(
+                orig_grant.as_deref(),
+                &owner_c,
+                &kid_c,
+                attempt,
+            );
             // The capsule (escrow + identities, never plaintext) goes to the helper as a 0600 temp
             // file; the helper reads it + the DASH dir at launch, recovers the CEK, and warms the
             // boundary. `temp` is unlinked when this closure returns.
