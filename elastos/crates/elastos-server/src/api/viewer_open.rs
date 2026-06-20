@@ -1592,4 +1592,24 @@ mod tests {
         // 16 bytes => 32 hex chars.
         assert_eq!(grant_watermark_digest16_hex("anything").len(), 32);
     }
+
+    /// PRE-2 (log-redaction half): `log_fp` must turn a sensitive identifier into a short,
+    /// NON-reversible fingerprint — the raw wallet/content-id must never appear — so the gateway log
+    /// cannot persist the `(wallet, content_id)` access pattern. Pinned by the DDRM-verdict ratchet
+    /// (`tests/ddrm_verdicts.rs`, PRE-2).
+    #[test]
+    fn log_fp_redacts_sensitive_identifiers() {
+        let wallet = "0xABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let fp = log_fp(wallet);
+        assert!(fp.starts_with("fp:"), "must be a fingerprint tag, got {fp}");
+        assert!(!fp.contains(wallet), "the raw value must not appear in the fingerprint");
+        assert!(fp.len() <= 16, "fingerprint must stay short (got {})", fp.len());
+        assert_eq!(log_fp("   "), "<none>", "blank input must redact to <none>");
+        // Deterministic + discriminating: same input -> same fp, different inputs -> different fp.
+        assert_eq!(log_fp(wallet), log_fp(wallet));
+        assert_ne!(
+            log_fp(wallet),
+            log_fp("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        );
+    }
 }

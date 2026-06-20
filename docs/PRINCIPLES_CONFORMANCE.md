@@ -262,6 +262,15 @@ Recorded so a future pass does not re-implement an already-tamper-evident audit 
 note, separate from custody: the demo open routes are mounted unconditionally; gating them behind an
 explicit enable, or only when a sample is configured, is optional defense-in-depth, not a fix.)
 
+### Build-enforced verdict ratchet
+
+The "do not re-churn" verdicts above (H1, M1, audit/PRE-3, PRE-2, …) are indexed by a ratchet test —
+`elastos/crates/elastos-server/tests/ddrm_verdicts.rs` — that pairs each verdict's load-bearing
+invariant with the test or CI job that pins it, and `verdicts_registry_is_intact` keeps the table
+honest in CI. So a verified-safe verdict cannot quietly rot into stale prose: closing or re-opening one
+means updating the row (and its cited test), not just editing Markdown. This mirrors the capability
+side's `KNOWN_GAPS` (`capability_conformance.rs`).
+
 ## How this register was produced
 
 Six read-only audit agents, one per principle cluster (Carrier/transport, ambient authority,

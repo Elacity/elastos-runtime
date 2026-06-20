@@ -57,6 +57,12 @@ firm this status so they can scope the resolved items OUT:
 - **#8 — RESOLVED.** `effective_now` clamps the caller-supplied clock to the node's real time in release
   (caller may only *shorten* its window, never push time forward) (`dkms-authority/src/main.rs:118-135`).
 
+**Build-enforced index:** these verdicts (and H1/M1/M3/A7 from the dDRM deep audit) are now carried by
+a ratchet test — `elastos/crates/elastos-server/tests/ddrm_verdicts.rs` — that records each verdict's
+load-bearing invariant and the test/CI-job that pins it. `verdicts_registry_is_intact` fails if a row
+drifts; this is the source of truth, the prose above is the narrative. Mirror of the capability side's
+`KNOWN_GAPS` (capability_conformance.rs).
+
 ## Verified clean — with evidence (ask the firm to scope these OUT)
 
 Each below was adversarially examined and found sound; the citations let an auditor confirm in
