@@ -3184,8 +3184,14 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     } else {
         match read_library_file_bytes(data_dir, principal_id, &target) {
             Ok(bytes) => {
-                let revision = format!("rev:{}", hex::encode(Sha256::digest(&bytes)));
-                let content_cid = raw_sha256_cid(&bytes)?;
+                // Hash the file ONCE: the `revision` token and the `content_cid` are both SHA-256
+                // over the same bytes (`raw_sha256_cid` wraps the identical digest in a CIDv1
+                // multihash). This runs per directory entry on every List, so the old second pass
+                // was pure waste — deriving both from one digest is byte-identical and ~halves the
+                // per-file hashing on the listing hot path.
+                let digest = Sha256::digest(&bytes);
+                let revision = format!("rev:{}", hex::encode(digest.as_slice()));
+                let content_cid = sha256_digest_to_raw_cid(digest.as_slice())?;
                 // For a `.ddrm` capsule the on-disk size is just the capsule (for media the encrypted
                 // segments live elsewhere), so show the ORIGINAL content size + a cover-art pointer —
                 // like a normal file manager (PC2 parity). Falls back to the on-disk size for legacy
@@ -3409,8 +3415,14 @@ fn is_public_uri(localhost_root: &str, uri: &str) -> bool {
 }
 
 fn raw_sha256_cid(bytes: &[u8]) -> anyhow::Result<String> {
-    let digest = Sha256::digest(bytes);
-    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &digest)
+    sha256_digest_to_raw_cid(Sha256::digest(bytes).as_slice())
+}
+
+/// Build the raw (0x55) CIDv1 from an ALREADY-COMPUTED SHA-256 digest. Split out so a caller that
+/// has just hashed the bytes for another purpose (e.g. the library `revision` token) can derive the
+/// content CID from the same digest instead of hashing the buffer a second time.
+fn sha256_digest_to_raw_cid(digest: &[u8]) -> anyhow::Result<String> {
+    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, digest)
         .map_err(|err| anyhow!("failed to build raw content CID: {err}"))?;
     Ok(cid::Cid::new_v1(0x55, multihash).to_string())
 }
@@ -7022,6 +7034,24 @@ fn provider_error(code: &str, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The List hot path now hashes each file once and derives both the `revision` token and the
+    /// `content_cid` from that single digest. Pin that this is byte-identical to the previous
+    /// two-pass form (`raw_sha256_cid` hashing the buffer itself) for representative inputs — so the
+    /// optimization can never silently change a revision (a compare-and-swap token) or a content CID.
+    #[test]
+    fn single_hash_listing_matches_two_pass_revision_and_cid() {
+        for bytes in [b"".as_slice(), b"x", b"the quick brown fox", &[0u8; 4096][..]] {
+            let digest = Sha256::digest(bytes);
+            let rev_once = format!("rev:{}", hex::encode(digest.as_slice()));
+            let rev_twice = format!("rev:{}", hex::encode(Sha256::digest(bytes)));
+            assert_eq!(rev_once, rev_twice, "revision drifted for {} bytes", bytes.len());
+
+            let cid_once = sha256_digest_to_raw_cid(digest.as_slice()).unwrap();
+            let cid_twice = raw_sha256_cid(bytes).unwrap();
+            assert_eq!(cid_once, cid_twice, "content_cid drifted for {} bytes", bytes.len());
+        }
+    }
 
     #[test]
     fn object_provider_exposes_object_scheme_only() {
