@@ -185,10 +185,22 @@ export function createLibraryRuntime({ getHomeToken }) {
   // header — never a token in the URL — and returns an object URL. Cached per endpoint so a row
   // re-render (or scroll) never refetches. Resolves to null when there's no cover (caller keeps the
   // type icon).
+  // Bounded LRU so a long browse session can't grow the cache without limit. Each entry resolves to
+  // an object URL, and createObjectURL keeps the underlying blob alive until it is revoked — so
+  // eviction MUST revoke the URL to actually free the blob memory; capping the Map alone would still
+  // leak. Map iteration is insertion order, so we treat the front as least-recently-used and "touch"
+  // an entry on access by re-inserting it at the back.
   const coverCache = new Map();
+  const COVER_CACHE_MAX = 256;
   function loadCover(coverEndpoint) {
     if (!coverEndpoint) return Promise.resolve(null);
-    if (coverCache.has(coverEndpoint)) return coverCache.get(coverEndpoint);
+    if (coverCache.has(coverEndpoint)) {
+      // Touch: move to most-recently-used so a cover still on screen is never the one evicted.
+      const cached = coverCache.get(coverEndpoint);
+      coverCache.delete(coverEndpoint);
+      coverCache.set(coverEndpoint, cached);
+      return cached;
+    }
     const promise = (async () => {
       try {
         const response = await fetch(coverEndpoint, {
@@ -203,6 +215,18 @@ export function createLibraryRuntime({ getHomeToken }) {
       }
     })();
     coverCache.set(coverEndpoint, promise);
+    // Evict least-recently-used entries beyond the cap, revoking their object URLs to free the blob.
+    // (An evicted URL still rendered into an <img> stays visible — revoke only blocks new resolves.)
+    while (coverCache.size > COVER_CACHE_MAX) {
+      const oldestKey = coverCache.keys().next().value;
+      const evicted = coverCache.get(oldestKey);
+      coverCache.delete(oldestKey);
+      Promise.resolve(evicted)
+        .then((url) => {
+          if (url) URL.revokeObjectURL(url);
+        })
+        .catch(() => {});
+    }
     return promise;
   }
 
