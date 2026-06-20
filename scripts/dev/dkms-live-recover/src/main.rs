@@ -476,7 +476,6 @@ fn recover_value_with_grant(
         ddrm_envelope::seal::seal_bound(&recipient_public, share, &escrow, &b.producer_signer).to_bytes(),
     );
     let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
-    let aad = B64.decode(&b.aad_b64).unwrap_or_default();
     let caller_sig_b64 = B64.encode(ddrm_envelope::sign_recover_proof(
         &b.caller_signer,
         &chal,
@@ -484,7 +483,6 @@ fn recover_value_with_grant(
         b.kid_hex.as_bytes(),
         &b.session_pub_bytes,
         1,
-        &aad,
     ));
     let mut req = json!({
         "op": "recover",

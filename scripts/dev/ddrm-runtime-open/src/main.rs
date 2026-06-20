@@ -2228,8 +2228,6 @@ fn dkms_node_adversarial_probe(
     let proof = |token: &Value, signer: &ddrm_envelope::seal::MlDsaSealSigner, seq: u64| -> String {
         let chal = B64.decode(token["challenge_b64"].as_str().unwrap_or("")).unwrap_or_default();
         let sp = B64.decode(&material.session_pub_b64).unwrap_or_default();
-        // Bind the re-seal AAD the genuine recover sends (`material.aad_b64`) into the proof (v2).
-        let aad = B64.decode(&material.aad_b64).unwrap_or_default();
         B64.encode(ddrm_envelope::sign_recover_proof(
             signer,
             &chal,
@@ -2237,7 +2235,6 @@ fn dkms_node_adversarial_probe(
             material.kid_hex.as_bytes(),
             &sp,
             seq,
-            &aad,
         ))
     };
     let genuine = |token: &Value, now: u64, seq: u64| {
@@ -2672,7 +2669,6 @@ fn dkms_threshold_probe(node_bin: &str, work_dir: &std::path::Path) -> Result<()
             kid_hex.as_bytes(),
             &session_pub_bytes,
             1,
-            &aad,
         ));
         let recover = ok_data(
             &node.call(&json!({
@@ -3136,7 +3132,6 @@ fn dkms_rotation_and_revocation_gates(
             fixture.kid_hex.as_bytes(),
             &session_pub_bytes,
             seq,
-            &old_aad,
         ));
         conn.call(&json!({
             "op": "recover",
@@ -3725,7 +3720,6 @@ fn dkms_quorum_reconfigure_gates(
             fixture.kid_hex.as_bytes(),
             &session_pub_bytes,
             1,
-            &new_aad,
         ));
         let recover = ok_data(
             &node.call(&json!({
@@ -4018,7 +4012,6 @@ fn dkms_dkg_gates(
             fixture.kid_hex.as_bytes(),
             &session_pub_bytes,
             1,
-            &dkg_decrypt_aad,
         ));
         let recover = ok_data(
             &node.call(&json!({
@@ -4365,7 +4358,6 @@ fn dkms_release_attestation_gates(
             fixture.kid_hex.as_bytes(),
             &session_pub_bytes,
             1,
-            &decrypt_aad,
         ));
         let recover = ok_data(
             &node.call(&json!({

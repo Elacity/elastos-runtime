@@ -112,8 +112,35 @@ dKMS recovery through the runtime's single Carrier endpoint via the carrier-prov
 |---|---|---|
 | No wallet "sign the session" prompt | rights mode is `dev` (local attestation) | relaunch with `ELASTOS_DDRM_RIGHTS=chain` / `chain-mock` |
 | 502 "could not open owned asset from the dKMS quorum" + node "foreign/tampered escrow, wrong KID/scheme" | open rail ≠ seal rail (e.g. local daemons but asset sealed to geo) | match the mint rail — `ELASTOS_DKMS_CARRIER=1` for geo-sealed |
+| 502 + node "possession proof is missing, forged, signed by the wrong key…" on **ALL** nodes (`0 of N` served), but the channel `hello`/session succeeded | **client/node protocol skew** — the runtime's `key-provider` builds the recover possession-proof under a NEWER preimage than the deployed nodes verify (e.g. a bumped `DKMS_RECOVER_DOMAIN` or an added bound field). The session handshake uses a different, unchanged domain, so it passes; only the recover proof is rejected. | the client MUST speak the deployed nodes' protocol. Do not change `recover_proof_message`/`DKMS_RECOVER_DOMAIN` (`ddrm-envelope`) on the runtime side until the geo nodes are redeployed with the matching verifier. See "Protocol compatibility invariant" below. |
 | `access grant rejected: replayed` on open attempts 2–3 | the open retry loop re-sends a single-use grant nonce (attempt 1 is the real signal) | known robustness gap — re-mint a fresh grant per attempt (tracked) |
 | rights **denied** (not a 502) | the connected wallet does not currently hold on-chain access for that `contentId` on Base mainnet (sell/transfer revokes) | open with the wallet that holds the token |
+
+## Protocol compatibility invariant (recover possession-proof)
+
+> **The runtime client and the deployed dKMS nodes must agree, byte-for-byte, on the recover
+> possession-proof preimage. The geo nodes are live, sovereign infrastructure and are NOT
+> redeployed as part of a runtime build — so the CLIENT cannot unilaterally change the wire
+> format. A skew fails closed at every node (`0 of N` served → 502), which looks like an open
+> bug but is a protocol-version mismatch.**
+
+The signed preimage is defined ONCE in `ddrm-envelope` (`recover_proof_message`,
+`DKMS_RECOVER_DOMAIN`) so the node and client cannot drift *within one build*. But the
+deployed nodes run an EARLIER build, so any change there is a breaking protocol bump:
+
+- Changing `DKMS_RECOVER_DOMAIN` (e.g. `…/v1` → `…/v2`), or
+- Adding/removing/reordering a bound field (e.g. binding `sha256(reseal_aad)`)
+
+…makes every freshly-built client's proof unverifiable by the live v1 nodes. Symptom: the
+channel `hello` + session token succeed (those use the unchanged `DKMS_SESSION_DOMAIN`), then
+all nodes reject the recover proof as "forged / wrong key".
+
+**Rule:** treat the recover proof as a deployed protocol. Land a proof-format change ONLY as a
+coordinated upgrade — nodes first (or simultaneously), client second — never client-only on a
+branch that opens against the live quorum. The "bind re-seal AAD into the recover proof"
+hardening (a real pre-mainnet invariant) is therefore **staged, not active**: it must ship
+together with a geo-node redeploy. Until then the client stays on `v1`. Tracked in
+`docs/AUDITOR_PACKET.md` / `docs/DEPLOY_CHECKLIST.md`.
 
 ## Validation
 

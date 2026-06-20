@@ -1025,14 +1025,16 @@ impl DkmsAuthorityNode {
             }
         };
 
-        // SECURITY INVARIANT (re-seal AAD — CLOSED): `aad` here is the caller-supplied `args.aad_b64`,
-        // but it is now BOUND into the recover possession-proof: `verify_session` (above, before any CEK
-        // is recovered) verifies `verify_recover_proof(.., reseal_aad = decode(args.aad_b64), ..)`, which
-        // is the byte-identical AAD passed here. So a MITM-tampered `aad_b64` — including its embedded
-        // `node_set_id` / `segment_digests` — invalidates the proof and is refused at the node, fail-closed
-        // (test: `recover_fails_closed_on_a_tampered_aad`). The decrypt boundary STILL independently
-        // rebuilds the segment-bound AAD and fails closed on any mismatch — defense-in-depth, not the sole
-        // control. See docs/THREAT_MODEL.md §7 and docs/AUDITOR_PACKET.md §1.
+        // SECURITY INVARIANT (pre-mainnet, scoped with the external auditor): `aad` here is the
+        // CALLER-SUPPLIED `args.aad_b64` (decoded above), and it is NOT bound into the recover
+        // possession-proof — the node verifies the escrow (recover_escrowed_cek) and the producer,
+        // but does NOT independently verify that this re-seal AAD matches the segment-bound
+        // transcript / node-set the open claims. Therefore the node's re-seal AAD is NOT
+        // independently trustworthy. This is safe TODAY only because the single consumer — the
+        // decrypt boundary — rebuilds the segment-bound AAD itself and fails closed on a mismatch;
+        // it does not trust this value. DO NOT add a consumer that trusts this re-seal AAD without
+        // first binding aad_b64 / segment_digests / node_set_id into the recover possession-proof
+        // (so a tampered aad_b64 fails the proof closed here). See docs/THREAT_MODEL.md.
         let envelope = ddrm_envelope::seal::seal_bound(&public, cek.as_slice(), &aad, &authority.signer);
         let mut material = json!({
             "suite": ddrm_envelope::SUITE_PQ_HYBRID,
@@ -1794,13 +1796,6 @@ fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), S
     let session_pub = b64()
         .decode(&args.decrypt_session_pub_b64)
         .map_err(|_| "decrypt_session_pub_b64 is not valid base64".to_string())?;
-    // RE-SEAL-AAD BINDING (v2): verify the proof over the EXACT AAD this recover will seal under. This
-    // is the SAME `args.aad_b64` `recover_inner` decodes and passes to `seal_bound` — so a MITM that
-    // tampers `aad_b64` in transit (incl. its embedded node_set_id / segment_digests) makes this proof
-    // fail closed HERE, before any CEK is recovered or re-sealed. Closes the pre-mainnet invariant.
-    let reseal_aad = b64()
-        .decode(&args.aad_b64)
-        .map_err(|_| "aad_b64 is not valid base64".to_string())?;
     if !ddrm_envelope::verify_recover_proof(
         &caller_verifier,
         &challenge,
@@ -1808,11 +1803,10 @@ fn verify_session(authority: &NodeAuthority, args: &RecoverArgs) -> Result<(), S
         args.kid_hex.as_bytes(),
         &session_pub,
         args.recover_seq,
-        &reseal_aad,
         &caller_sig,
     ) {
         return Err(
-            "caller possession proof is missing, forged, signed by the wrong key, carries a swapped freshness counter, or does not match the re-seal AAD (captured token replay / tampered AAD refused)"
+            "caller possession proof is missing, forged, signed by the wrong key, or carries a swapped freshness counter (captured token replay refused)"
                 .to_string(),
         );
     }
@@ -2450,7 +2444,6 @@ mod tests {
         kid_hex: &str,
         session_pub_b64: &str,
         recover_seq: u64,
-        aad: &[u8],
     ) -> String {
         let challenge = b64().decode(&token.challenge_b64).unwrap();
         let session_pub = b64().decode(session_pub_b64).unwrap();
@@ -2461,7 +2454,6 @@ mod tests {
             kid_hex.as_bytes(),
             &session_pub,
             recover_seq,
-            aad,
         ))
     }
 
@@ -2534,8 +2526,7 @@ mod tests {
         let (caller, caller_vk) = caller_keypair();
         node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 =
-            proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1, &transcript_aad);
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let resp = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -2612,8 +2603,7 @@ mod tests {
         let (caller, caller_vk) = caller_keypair();
         node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 =
-            proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1, b"attest-transcript");
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let data = ok_data(node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -2703,7 +2693,7 @@ mod tests {
         let (caller, caller_vk) = caller_keypair();
         node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
-        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1, b"t");
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let forged = node.recover(RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -2789,8 +2779,8 @@ mod tests {
         node.allowed_callers = Some(vec![caller_vk.clone()]);
         let token = live_token(&node, &b64().encode(&caller_vk));
         // Base case uses freshness seq 1; tests that drive multiple recovers re-sign with the
-        // returned caller signer at a higher seq. The proof binds the re-seal AAD (b"transcript").
-        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1, b"transcript");
+        // returned caller signer at a higher seq.
+        let caller_sig_b64 = proof_for(&caller, &token, CONTENT, &kid_hex, &session_pub_b64, 1);
         let args = RecoverArgs {
             wrapped_cek_b64: b64().encode(wrapped.to_bytes()),
             scheme: scheme.to_string(),
@@ -2816,28 +2806,6 @@ mod tests {
             access_grant: None,
         };
         (node, args, caller)
-    }
-
-    /// LANDING TEST for the re-seal-AAD invariant (docs/AUDITOR_PACKET.md §1, THREAT_MODEL §7): a
-    /// recover whose `aad_b64` is tampered IN TRANSIT — after the caller signed its possession proof
-    /// over the real AAD — is refused at the node because the proof no longer matches, BEFORE any CEK
-    /// is recovered or re-sealed. A MITM cannot re-sign the proof (it lacks the token-bound caller
-    /// key), so it cannot make the node seal under an AAD of its choosing. This is what makes the
-    /// node's re-seal AAD trustworthy on its own; the decrypt boundary's independent rebuild remains
-    /// defense-in-depth, not the sole control.
-    #[test]
-    fn recover_fails_closed_on_a_tampered_aad() {
-        let store = unique_store("tampered-aad");
-        let (mut node, mut args, _caller) = setup_recover(&store);
-        // The possession proof was signed over b"transcript"; flip the AAD the node would seal under.
-        args.aad_b64 = b64().encode(b"transcript-TAMPERED");
-        let resp = node.recover(args);
-        assert_eq!(
-            error_code(&resp),
-            "session_invalid",
-            "a tampered re-seal aad_b64 must fail the possession proof closed at the node"
-        );
-        let _ = std::fs::remove_file(&store);
     }
 
     /// W3/D4 — an ANONYMOUS caller (the node has no allow-list) presenting a valid live session +
@@ -3037,7 +3005,6 @@ mod tests {
             &base.kid_hex,
             &base.decrypt_session_pub_b64,
             base.recover_seq,
-            &b64().decode(&base.aad_b64).unwrap(),
         );
         assert_eq!(error_code(&node.recover(wrong_key)), "session_invalid");
 
@@ -3101,7 +3068,7 @@ mod tests {
         let proof = {
             let chal = b64().decode(challenge_str(token)).unwrap();
             let dp = b64().decode(&decrypt_pub_b64).unwrap();
-            b64().encode(ddrm_envelope::sign_recover_proof(&caller, &chal, CONTENT.as_bytes(), kid_hex.as_bytes(), &dp, 1, b"transcript"))
+            b64().encode(ddrm_envelope::sign_recover_proof(&caller, &chal, CONTENT.as_bytes(), kid_hex.as_bytes(), &dp, 1))
         };
         let recover = call(
             &mut client,
@@ -3849,7 +3816,6 @@ mod tests {
             &base.kid_hex,
             &base.decrypt_session_pub_b64,
             2,
-            &b64().decode(&base.aad_b64).unwrap(),
         );
         assert_eq!(error_code(&node.recover(live)), "caller_revoked");
 
@@ -3916,7 +3882,6 @@ mod tests {
                 &base.kid_hex,
                 &base.decrypt_session_pub_b64,
                 seq,
-                &b64().decode(&base.aad_b64).unwrap(),
             );
             assert!(matches!(node.recover(args), Response::Ok { .. }), "recover seq {seq} should succeed");
         }
@@ -3944,7 +3909,7 @@ mod tests {
         let mut next = base.clone();
         next.recover_seq = 2;
         next.caller_sig_b64 =
-            proof_for(&caller, &base.session_token, CONTENT, &base.kid_hex, &base.decrypt_session_pub_b64, 2, &b64().decode(&base.aad_b64).unwrap());
+            proof_for(&caller, &base.session_token, CONTENT, &base.kid_hex, &base.decrypt_session_pub_b64, 2);
         assert!(matches!(node.recover(next), Response::Ok { .. }));
 
         // After consuming seq 2, a recover that regresses to seq 1 (or repeats 2) is refused.

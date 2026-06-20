@@ -589,7 +589,6 @@ impl DkmsNodeConn {
         kid_hex: &str,
         decrypt_session_pub_b64: &str,
         recover_seq: u64,
-        aad_b64: &str,
     ) -> Result<String, String> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -602,9 +601,6 @@ impl DkmsNodeConn {
         let session_pub = b64
             .decode(decrypt_session_pub_b64)
             .map_err(|e| e.to_string())?;
-        // Bind the EXACT re-seal AAD into the possession proof so the node refuses to seal under any
-        // AAD we did not sign (a tampered aad_b64 in transit fails the proof closed at the node).
-        let aad = b64.decode(aad_b64).map_err(|e| e.to_string())?;
         let sig = ddrm_envelope::sign_recover_proof(
             &self.caller_signer,
             &challenge,
@@ -612,7 +608,6 @@ impl DkmsNodeConn {
             kid_hex.as_bytes(),
             &session_pub,
             recover_seq,
-            &aad,
         );
         Ok(b64.encode(sig))
     }
@@ -1782,17 +1777,8 @@ impl KeyProvider {
         let recover = {
             let conn = guard.as_mut().expect("session ensured above");
             let recover_seq = conn.next_recover_seq();
-            let aad_b64 = recover_req
-                .get("aad_b64")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            match conn.recover_proof_b64(
-                content_id,
-                kid_hex,
-                decrypt_session_pub_b64,
-                recover_seq,
-                aad_b64,
-            ) {
+            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq)
+            {
                 Ok(caller_sig_b64) => {
                     let mut req = recover_req.clone();
                     req["session_token"] = conn.session_token.clone();
@@ -1859,18 +1845,9 @@ impl KeyProvider {
     ) -> Result<Value, String> {
         let t_rec = std::time::Instant::now();
         let recover_seq = conn.next_recover_seq();
-        let aad_b64 = recover_req
-            .get("aad_b64")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         let recover =
-            match conn.recover_proof_b64(
-                content_id,
-                kid_hex,
-                decrypt_session_pub_b64,
-                recover_seq,
-                aad_b64,
-            ) {
+            match conn.recover_proof_b64(content_id, kid_hex, decrypt_session_pub_b64, recover_seq)
+            {
                 Ok(caller_sig_b64) => {
                     let mut req = recover_req.clone();
                     req["session_token"] = conn.session_token.clone();
