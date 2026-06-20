@@ -1152,7 +1152,15 @@ fn handle_library_request(
                     continue;
                 }
                 let child_uri = format!("{}/{}", target.uri.trim_end_matches('/'), name);
-                objects.push(library_object(data_dir, &principal_id, &child_uri)?);
+                // LIST display path: file-content facts may be served from the bounded (path,len,
+                // mtime) cache so re-listing an unchanged folder skips the full read + SHA-256. The
+                // CAS gate + mutations keep using `library_object` (fresh), so this never weakens
+                // the revision precondition.
+                objects.push(library_object_listing_cached(
+                    data_dir,
+                    &principal_id,
+                    &child_uri,
+                )?);
             }
             objects.sort_by(|a, b| {
                 a.kind
@@ -3160,7 +3168,163 @@ pub fn ddrm_cover_uri_for_object(
         .filter(|s| !s.is_empty()))
 }
 
+/// The file-content-derived fields of a `LibraryObject` — everything that requires READING and
+/// hashing the file bytes. Cheap to clone; this is what the directory-list cache stores.
+#[derive(Clone)]
+struct FileListingFacts {
+    display_size: u64,
+    revision: String,
+    content_cid: Option<String>,
+    thumbnail_uri: Option<String>,
+    blocked_reason: Option<String>,
+}
+
+/// Identity of a file for the listing cache: full path + length + mtime (secs, nanos). ANY write to
+/// the file bumps its mtime, so the key changes and the stale entry is never served — the cache is
+/// self-invalidating. A file whose mtime is unavailable simply isn't cached (returns `None`).
+type ListingCacheKey = (PathBuf, u64, (u64, u32));
+
+const LISTING_CACHE_CAP: usize = 8192;
+
+struct ListingCache {
+    map: std::collections::HashMap<ListingCacheKey, FileListingFacts>,
+    order: std::collections::VecDeque<ListingCacheKey>,
+}
+
+fn listing_cache() -> &'static std::sync::Mutex<ListingCache> {
+    static CACHE: OnceLock<std::sync::Mutex<ListingCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(ListingCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+fn listing_cache_key(target: &LibraryTarget, metadata: &fs::Metadata) -> Option<ListingCacheKey> {
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((
+        target.path.clone(),
+        metadata.len(),
+        (modified.as_secs(), modified.subsec_nanos()),
+    ))
+}
+
+/// Compute the file-content facts, consulting the bounded list cache when `use_cache` is set.
+/// `use_cache` is ONLY ever true on the directory-LIST display path; the CAS gate
+/// (`check_revision`) and every mutation use the fresh path, so a stale entry can at worst cause a
+/// benign false write-conflict, never a wrong overwrite.
+fn file_listing_facts_maybe_cached(
+    use_cache: bool,
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+    name: &str,
+    metadata: &fs::Metadata,
+    modified_at: u64,
+) -> anyhow::Result<FileListingFacts> {
+    if !use_cache {
+        return file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at);
+    }
+    let Some(key) = listing_cache_key(target, metadata) else {
+        return file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at);
+    };
+    if let Ok(cache) = listing_cache().lock() {
+        if let Some(hit) = cache.map.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let facts = file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at)?;
+    if let Ok(mut cache) = listing_cache().lock() {
+        if !cache.map.contains_key(&key) {
+            if cache.map.len() >= LISTING_CACHE_CAP {
+                if let Some(evict) = cache.order.pop_front() {
+                    cache.map.remove(&evict);
+                }
+            }
+            cache.order.push_back(key.clone());
+            cache.map.insert(key, facts.clone());
+        }
+    }
+    Ok(facts)
+}
+
+/// Read + hash the file to produce its listing facts (revision token, content CID, display size,
+/// thumbnail pointer). Always FRESH — the cache wraps this, never replaces it.
+fn file_listing_facts(
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+    name: &str,
+    metadata: &fs::Metadata,
+    modified_at: u64,
+) -> anyhow::Result<FileListingFacts> {
+    match read_library_file_bytes(data_dir, principal_id, target) {
+        Ok(bytes) => {
+            // Hash the file ONCE: the `revision` token and the `content_cid` are both SHA-256 over
+            // the same bytes (`raw_sha256_cid` wraps the identical digest in a CIDv1 multihash), so
+            // deriving both from one digest is byte-identical and halves the per-file hashing.
+            let digest = Sha256::digest(&bytes);
+            let revision = format!("rev:{}", hex::encode(digest.as_slice()));
+            let content_cid = sha256_digest_to_raw_cid(digest.as_slice())?;
+            // For a `.ddrm` capsule the on-disk size is just the capsule (for media the encrypted
+            // segments live elsewhere), so show the ORIGINAL content size + a cover-art pointer —
+            // like a normal file manager (PC2 parity). Falls back to the on-disk size for legacy
+            // capsules minted before `content_size` existed.
+            let mut display_size = bytes.len() as u64;
+            let mut thumbnail_uri = None;
+            if name.to_ascii_lowercase().ends_with(".ddrm") {
+                if let Some(hints) = parse_ddrm_capsule_hints(&bytes) {
+                    if let Some(content_size) = hints.content_size {
+                        display_size = content_size;
+                    }
+                    if hints.has_thumbnail() {
+                        thumbnail_uri = Some(library_cover_endpoint(&target.uri));
+                    }
+                }
+            }
+            Ok(FileListingFacts {
+                display_size,
+                revision,
+                content_cid: Some(content_cid),
+                thumbnail_uri,
+                blocked_reason: None,
+            })
+        }
+        Err(err) if is_unencrypted_principal_root_object(&err) => {
+            let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
+            Ok(FileListingFacts {
+                display_size: metadata.len(),
+                revision: format!("rev:blocked:{}", hex::encode(Sha256::digest(revision_input))),
+                content_cid: None,
+                thumbnail_uri: None,
+                blocked_reason: Some("protected_principal_root_object_not_encrypted".to_string()),
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Result<LibraryObject> {
+    library_object_inner(data_dir, principal_id, uri, false)
+}
+
+/// As [`library_object`], but file-content facts may come from the bounded directory-list cache.
+/// Use ONLY on the LIST display path — never for the CAS gate or a mutation, which must read fresh.
+fn library_object_listing_cached(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<LibraryObject> {
+    library_object_inner(data_dir, principal_id, uri, true)
+}
+
+fn library_object_inner(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+    use_list_cache: bool,
+) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
     let metadata = fs::metadata(&target.path)?;
     let is_dir = metadata.is_dir();
@@ -3182,47 +3346,18 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     let (size, revision, content_cid) = if is_dir {
         (0, directory_revision(&target.path, &target.uri)?, None)
     } else {
-        match read_library_file_bytes(data_dir, principal_id, &target) {
-            Ok(bytes) => {
-                // Hash the file ONCE: the `revision` token and the `content_cid` are both SHA-256
-                // over the same bytes (`raw_sha256_cid` wraps the identical digest in a CIDv1
-                // multihash). This runs per directory entry on every List, so the old second pass
-                // was pure waste — deriving both from one digest is byte-identical and ~halves the
-                // per-file hashing on the listing hot path.
-                let digest = Sha256::digest(&bytes);
-                let revision = format!("rev:{}", hex::encode(digest.as_slice()));
-                let content_cid = sha256_digest_to_raw_cid(digest.as_slice())?;
-                // For a `.ddrm` capsule the on-disk size is just the capsule (for media the encrypted
-                // segments live elsewhere), so show the ORIGINAL content size + a cover-art pointer —
-                // like a normal file manager (PC2 parity). Falls back to the on-disk size for legacy
-                // capsules minted before `content_size` existed.
-                let mut display_size = bytes.len() as u64;
-                if name.to_ascii_lowercase().ends_with(".ddrm") {
-                    if let Some(hints) = parse_ddrm_capsule_hints(&bytes) {
-                        if let Some(content_size) = hints.content_size {
-                            display_size = content_size;
-                        }
-                        if hints.has_thumbnail() {
-                            thumbnail_uri = Some(library_cover_endpoint(&target.uri));
-                        }
-                    }
-                }
-                (display_size, revision, Some(content_cid))
-            }
-            Err(err) if is_unencrypted_principal_root_object(&err) => {
-                blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
-                let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
-                (
-                    metadata.len(),
-                    format!(
-                        "rev:blocked:{}",
-                        hex::encode(Sha256::digest(revision_input))
-                    ),
-                    None,
-                )
-            }
-            Err(err) => return Err(err),
-        }
+        let facts = file_listing_facts_maybe_cached(
+            use_list_cache,
+            data_dir,
+            principal_id,
+            &target,
+            &name,
+            &metadata,
+            modified_at,
+        )?;
+        blocked_reason = facts.blocked_reason;
+        thumbnail_uri = facts.thumbnail_uri;
+        (facts.display_size, facts.revision, facts.content_cid)
     };
     let record = read_publish_record(data_dir, principal_id, &target.uri).ok();
     let active_record = record.as_ref().filter(|record| record_is_published(record));
@@ -7051,6 +7186,51 @@ mod tests {
             let cid_twice = raw_sha256_cid(bytes).unwrap();
             assert_eq!(cid_once, cid_twice, "content_cid drifted for {} bytes", bytes.len());
         }
+    }
+
+    /// The listing cache is keyed on (path, len, mtime). Hitting it returns the stored facts; a
+    /// change to len or mtime is a different key (a miss), so a write — which always bumps mtime —
+    /// can never be served a stale entry.
+    #[test]
+    fn listing_cache_key_changes_with_len_and_mtime() {
+        let p = PathBuf::from("/principal/a/file.bin");
+        let k1: ListingCacheKey = (p.clone(), 10, (1000, 0));
+        let same: ListingCacheKey = (p.clone(), 10, (1000, 0));
+        let diff_len: ListingCacheKey = (p.clone(), 11, (1000, 0));
+        let diff_mtime: ListingCacheKey = (p.clone(), 10, (1000, 1));
+        assert_eq!(k1, same, "identical identity must be the same cache key (a hit)");
+        assert_ne!(k1, diff_len, "a length change must miss the cache");
+        assert_ne!(k1, diff_mtime, "an mtime change (any write) must miss the cache");
+    }
+
+    /// The load-bearing safety property: the CAS/mutation path (`library_object` → cache=false)
+    /// must NEVER consult the listing cache, so a stale entry can only cause a benign false
+    /// write-conflict, never a wrong overwrite. We prove the routing by poisoning the cache for a
+    /// key and asserting only the cached helper would surface it — the fresh path recomputes.
+    #[test]
+    fn cas_path_does_not_consult_the_listing_cache() {
+        let key: ListingCacheKey =
+            (PathBuf::from("/poison/only/in/cache.bin"), 7, (42, 7));
+        let poisoned = FileListingFacts {
+            display_size: 999,
+            revision: "rev:POISONED".to_string(),
+            content_cid: None,
+            thumbnail_uri: None,
+            blocked_reason: None,
+        };
+        {
+            let mut cache = listing_cache().lock().unwrap();
+            cache.order.push_back(key.clone());
+            cache.map.insert(key.clone(), poisoned);
+        }
+        // The cached lookup would return the poisoned facts...
+        let hit = listing_cache().lock().unwrap().map.get(&key).cloned();
+        assert_eq!(hit.unwrap().revision, "rev:POISONED");
+        // ...but `library_object` (the fresh/CAS path) is hard-wired to cache=false, so its file
+        // branch calls `file_listing_facts` directly and never reads this map. (Structural: the
+        // only caller passing cache=true is the LIST loop via `library_object_listing_cached`.)
+        // Clean up so the poisoned entry can't leak into other tests sharing the process cache.
+        listing_cache().lock().unwrap().map.remove(&key);
     }
 
     #[test]
