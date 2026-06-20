@@ -81,9 +81,16 @@ TEE vs reproducible-builds by value-at-risk and your decentralization ethos. The
   (lower priority): a separate per-launch user/policy **grant** step above the manifest declaration
   (today it's manifest-declared + clamped, no interactive approval) — only needed if/when untrusted
   capsules should require explicit memory approval beyond their declaration.
-- **WASM CPU runaway protection (Chunk B).** Epoch-interruption so a no-progress spinner can be
-  trapped / an operator can terminate a runaway (today a spinning capsule permanently holds a
-  blocking thread + CPU and `stop()` cannot kill it). Needs the service-vs-command policy decision.
+- **WASM CPU runaway — operator-terminable — ✅ DONE (B2a).** The engine now runs with epoch
+  interruption; each execution arms an epoch deadline whose callback checks a per-instance
+  `should_stop` flag, and `stop()` sets it + bumps the epoch so a spinning capsule traps on its next
+  backedge (a legitimate capsule with no stop signal runs untouched). Closes the "`stop()` cannot
+  kill a runaway" hole (Principle 7). Pinned by
+  `runaway_capsule_is_terminable_via_stop_signal`.
+- **WASM CPU runaway — automatic kill (Chunk B2b, deferred).** Today termination is operator-driven
+  (`stop()`); a fully autonomous no-progress/timeout kill still needs the service-vs-command policy
+  decision (a long-running service vs a one-shot command) and a `max_runtime`/`cpu_shares` semantics
+  call before it can fail closed without killing legitimate long-running capsules.
 
 ## Recommended sequence
 
