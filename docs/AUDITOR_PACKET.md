@@ -109,6 +109,28 @@ These are asserted in CI, not just documented (see [DEPLOY_CHECKLIST.md](DEPLOY_
 - Re-seal AAD open item (§1) appears as an explicit unchecked box under *"Open, scoped with the
   external auditor"* — it is not allowed to be ticked until the landing test passes.
 
+## 4b. Already-verified — scope these OUT (so the engagement bills for the hard crypto)
+
+The dDRM / dKMS findings that were investigated and **resolved** (or **cleared** safe-by-construction)
+are carried as **build-visible ratchets** — each verdict paired with the test (or CI job / explicit
+structural reason) that pins it — so a reviewer can confirm them in minutes and scope them out instead
+of re-deriving them:
+
+- **`elastos/crates/elastos-server/tests/ddrm_verdicts.rs`** — the dDRM verdict registry: H1
+  (watermark-anchor safe-by-construction), M1 (ECDSA malleability not exploitable — replay is
+  nonce-keyed), M3 (CENC box-count bounds, fail-closed), A7 (retry-nonce refresh), A1/A2 (perf,
+  byte-identical), PRE-1 (CEK-reconstruction integrity / Byzantine-share fail-closed), PRE-3 (audit
+  tamper-evidence), PRE-4 (central fail-closed action enforcement), PRE-5/7/8, PRE-2 (log-redaction
+  half). `verdicts_registry_is_intact` fails if a *settled* verdict cites no real pin.
+- **`elastos/crates/elastos-runtime/tests/capability_conformance.rs`** — `KNOWN_GAPS` for the
+  runtime-core capability findings, with `#[ignore]`d ratchet placeholders for the still-open ones.
+- **[PRE_AUDIT.md](PRE_AUDIT.md)** — internal adversarial pass: **7/8 findings RESOLVED** (incl. the
+  CRITICAL CEK-reconstruction integrity — production-wired + Byzantine-tested); #2 metadata is PARTIAL
+  by design. **[PRINCIPLES_CONFORMANCE.md](PRINCIPLES_CONFORMANCE.md)** "do not re-churn" carries the
+  traced-safe verdicts.
+
+These are the **scope-out** evidence; §1 (re-seal AAD binding) is the **scope-in** item that remains.
+
 ## 5. How to reproduce the verification state
 
 ```bash
@@ -116,6 +138,8 @@ just verify            # full gate: alignment-check + smoke + fmt/lint/test (def
 just alignment-check   # fail-closed contract-drift detection (docs/code/tests/ops must agree)
 just test-crate dkms-authority
 just test-crate key-provider     # reference backend tests need --features dev-modes
+cargo test -p elastos-server --test ddrm_verdicts -- --nocapture   # print the verdict registry (§4b)
+cargo test -p elastos-runtime --test capability_conformance         # KNOWN_GAPS capability ratchet
 ```
 
 `just alignment-check` is the contract-drift guard: if this packet, the threat model, the deploy
@@ -131,3 +155,4 @@ checklist, and the code ever disagree about the §1 invariant, it should fail.
 - [ ] Confirm release-build fences (§4) actually prevent `dev-modes` / `legacy-receipt-authz`.
 - [ ] Confirm `Debug` redaction (§4) covers all CEK / escrow-bearing structs.
 - [ ] Note any second consumer of the node re-seal output anywhere in the tree (should be none).
+- [ ] Spot-check the §4b verdict registries against the code and confirm the scope-out is sound.
