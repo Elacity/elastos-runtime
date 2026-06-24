@@ -100,6 +100,12 @@ pub struct InspectEntry {
     /// Content identity (IPFS CID) from the installed-capsule catalog, when
     /// known — the provenance anchor (Principle #15).
     pub cid: Option<String>,
+    /// Verified signer identity (a trusted-key fingerprint) resolved by a real
+    /// signature check at launch, when available. `None` until launch-time
+    /// verification is wired (loop 3c); the projection reports "verified" trust
+    /// and a non-null `signed_by` only when this is `Some`, never from mere
+    /// signature presence.
+    pub verified_signer: Option<String>,
 }
 
 /// Read-only source of inspectable capsules. Decouples the provider from the
@@ -230,6 +236,9 @@ fn running_to_entry(info: crate::runtime::RunningCapsuleInfo) -> InspectEntry {
         capsule_type: format!("{:?}", info.capsule_type).to_lowercase(),
         manifest: Some(*info.manifest),
         cid: None,
+        // Launch-time verification result is threaded here in loop 3c; until then
+        // running capsules report honest presence-based trust, never "verified".
+        verified_signer: None,
     }
 }
 
@@ -278,6 +287,7 @@ impl RegistryInspectSource {
             capsule_type: "provider".to_string(),
             manifest: None,
             cid: None,
+            verified_signer: None,
         }
     }
 }
@@ -391,6 +401,7 @@ impl CatalogInspectSource {
             capsule_type: format!("{:?}", manifest.capsule_type).to_lowercase(),
             manifest: Some(manifest),
             cid,
+            verified_signer: None,
         })
     }
 }
@@ -527,7 +538,21 @@ impl InspectProvider {
         // fabricated (#15: trust travels with DID/CID/hash/sig).
         let author = field(&manifest, "author");
         let did = capsule_did(&entry.id, &author);
-        let trust = trust_level(signature_present, cid.is_some());
+        // Verified signer (G2): present ONLY when a real signature check resolved
+        // one (threaded onto the entry at launch). Never fabricated from the
+        // self-asserted author or from mere signature presence.
+        let verified_signer = entry.verified_signer.clone();
+        let signed_by = verified_signer
+            .clone()
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+        // Trust reaches the "verified" tier only when a signer was genuinely
+        // verified; otherwise the presence-based classifier applies.
+        let trust = if verified_signer.is_some() {
+            "verified".to_string()
+        } else {
+            trust_level(signature_present, cid.is_some()).to_string()
+        };
         let sig_fingerprint = manifest
             .get("signature")
             .and_then(Value::as_str)
@@ -590,11 +615,11 @@ impl InspectProvider {
             "identity": {
                 "did": did.clone(),
                 "cid": cid.clone(),
-                "trust_level": trust,
+                "trust_level": trust.clone(),
                 "signature_present": signature_present,
-                // No verified signer is available from the manifest schema; we do
-                // not invent one. `signed_by` stays null until verification is wired.
-                "signed_by": Value::Null,
+                // A verified signer appears only when a real ed25519 check resolved
+                // one (G2); honest null otherwise, never the self-asserted author.
+                "signed_by": signed_by.clone(),
             },
             "manifest": {
                 "schema": field(&manifest, "schema"),
@@ -623,7 +648,7 @@ impl InspectProvider {
                 // available, so it stays null rather than echoing the author as if
                 // verified.
                 "author": author,
-                "signed_by": Value::Null,
+                "signed_by": signed_by,
                 "trust_level": trust,
                 "version": field(&manifest, "version"),
                 "installed_at": Value::Null,
@@ -982,6 +1007,7 @@ mod tests {
             capsule_type: "wasm".to_string(),
             manifest: Some(probe_manifest()),
             cid: None,
+            verified_signer: None,
         }
     }
 
@@ -1066,6 +1092,7 @@ mod tests {
                 capsule_type: "wasm".to_string(),
                 manifest: Some(manifest),
                 cid: None,
+                verified_signer: None,
             }],
         }))
     }
@@ -1182,12 +1209,21 @@ mod tests {
                 "{capsule}: projected affordances must match declared methods"
             );
             for a in affordances {
-                assert!(a["id"].is_string(), "{capsule}: affordance id must be a string");
+                assert!(
+                    a["id"].is_string(),
+                    "{capsule}: affordance id must be a string"
+                );
                 let risk = a["risk"].as_str().unwrap_or("");
                 assert!(
                     matches!(
                         risk,
-                        "read" | "write" | "launch" | "payment" | "rights" | "actuator" | "privileged"
+                        "read"
+                            | "write"
+                            | "launch"
+                            | "payment"
+                            | "rights"
+                            | "actuator"
+                            | "privileged"
                     ),
                     "{capsule}: affordance must carry a known risk class, got {risk:?}"
                 );
@@ -1209,9 +1245,24 @@ mod tests {
             actions: &'static [&'static str],
         }
         const PROVIDERS: &[Expect] = &[
-            Expect { capsule: "key-provider", operation: "release", resource: "elastos://key/*", actions: &["read"] },
-            Expect { capsule: "rights-provider", operation: "has_access_by_content_id", resource: "elastos://rights/*", actions: &["read"] },
-            Expect { capsule: "chain-provider", operation: "broadcast_transaction", resource: "elastos://chain/*", actions: &["read", "write", "admin"] },
+            Expect {
+                capsule: "key-provider",
+                operation: "release",
+                resource: "elastos://key/*",
+                actions: &["read"],
+            },
+            Expect {
+                capsule: "rights-provider",
+                operation: "has_access_by_content_id",
+                resource: "elastos://rights/*",
+                actions: &["read"],
+            },
+            Expect {
+                capsule: "chain-provider",
+                operation: "broadcast_transaction",
+                resource: "elastos://chain/*",
+                actions: &["read", "write", "admin"],
+            },
         ];
         for p in PROVIDERS {
             let path = format!(
@@ -1233,9 +1284,19 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp["status"], "ok", "{}: plan op failed", p.capsule);
-            assert_eq!(resp["data"]["valid"], true, "{}: plan should be valid", p.capsule);
-            assert_eq!(resp["data"]["kind"], "operation", "{}: should reflect a provider operation", p.capsule);
-            let resources = resp["data"]["resources"].as_array().expect("resources array");
+            assert_eq!(
+                resp["data"]["valid"], true,
+                "{}: plan should be valid",
+                p.capsule
+            );
+            assert_eq!(
+                resp["data"]["kind"], "operation",
+                "{}: should reflect a provider operation",
+                p.capsule
+            );
+            let resources = resp["data"]["resources"]
+                .as_array()
+                .expect("resources array");
             assert!(
                 resources.iter().any(|r| r == p.resource),
                 "{}: must reflect resource {} (got {:?})",
@@ -1307,19 +1368,62 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "KNOWN_GAPS G2: signer verification not yet wired (manifest has no signer DID); see docs/KNOWN_GAPS.md"]
     async fn ratchet_provenance_verified_signer_present() {
-        // Desired: a signed capsule reports a *verified* signer. Today signed_by
-        // is null (we refuse to present the declared author as verified). When a
-        // signature-verification source is wired, delete the #[ignore].
-        let resp = provider_with_probe()
+        // G2 (loop 3b): a capsule whose signature was GENUINELY verified reports a
+        // verified signer + "verified" trust. The Some(fingerprint) below is earned
+        // by a real ed25519 check (generate -> sign -> verify_capsule_signer), not a
+        // hand-set field, so this ratchet cannot pass against a stub.
+        use elastos_runtime::signature::{
+            generate_keypair, hash_content, key_fingerprint, sign_capsule, SignatureVerifier,
+        };
+        let (signing_key, verifying_key) = generate_keypair();
+        let mut manifest = probe_manifest();
+        let content_hash = hash_content(b"verified-capsule-bytes");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+
+        // A real verification resolves the signer; only then do we name it.
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(verifying_key);
+        let matched = verifier
+            .verify_capsule_signer(&manifest, &content_hash)
+            .unwrap()
+            .expect("the trusted key verifies the freshly signed manifest");
+        let fingerprint = key_fingerprint(&matched);
+
+        // Build an entry as the launch path will once 3c wires it: verified_signer
+        // set from the real check.
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![InspectEntry {
+                id: "cap_verified_1".to_string(),
+                name: "verified".to_string(),
+                status: "running".to_string(),
+                capsule_type: "wasm".to_string(),
+                manifest: Some(manifest),
+                cid: None,
+                verified_signer: Some(fingerprint.clone()),
+            }],
+        }));
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_verified_1" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["data"]["provenance"]["signed_by"], fingerprint,
+            "signed_by must carry the verified signer fingerprint"
+        );
+        assert_eq!(
+            resp["data"]["identity"]["trust_level"], "verified",
+            "trust reaches 'verified' only when a real check resolved a signer"
+        );
+
+        // Negative: the same projection with NO verified signer stays honest-null
+        // and presence-based — proving the green is earned by the check, not the field.
+        let unverified = provider_with_probe()
             .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
             .await
             .unwrap();
-        assert!(
-            !resp["data"]["provenance"]["signed_by"].is_null(),
-            "provenance.signed_by should carry a verified signer once verification is wired"
-        );
+        assert!(unverified["data"]["provenance"]["signed_by"].is_null());
+        assert_eq!(unverified["data"]["identity"]["trust_level"], "signed");
     }
 
     #[tokio::test]
@@ -1405,6 +1509,7 @@ mod tests {
                     capsule_type: "provider".to_string(),
                     manifest: None,
                     cid: None,
+                    verified_signer: None,
                 },
             ],
         });
@@ -1683,6 +1788,7 @@ mod tests {
             capsule_type: "microvm".to_string(),
             manifest: Some(manifest),
             cid: None,
+            verified_signer: None,
         };
         let provider = InspectProvider::new(Arc::new(MockSource {
             entries: vec![entry],
@@ -1737,6 +1843,7 @@ mod tests {
             capsule_type: "microvm".to_string(),
             manifest: Some(manifest),
             cid: None,
+            verified_signer: None,
         };
         InspectProvider::new(Arc::new(MockSource {
             entries: vec![entry],

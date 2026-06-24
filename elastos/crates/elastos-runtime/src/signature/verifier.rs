@@ -116,7 +116,9 @@ impl SignatureVerifier {
     /// [`SignatureVerifier::verify_capsule_signer`] so there is one canonical
     /// verify path.
     pub fn verify_capsule(&self, manifest: &CapsuleManifest, content_hash: &[u8]) -> Result<bool> {
-        Ok(self.verify_capsule_signer(manifest, content_hash)?.is_some())
+        Ok(self
+            .verify_capsule_signer(manifest, content_hash)?
+            .is_some())
     }
 
     /// Check if verification is enabled (has trusted keys)
