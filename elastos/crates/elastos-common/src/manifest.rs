@@ -1898,6 +1898,8 @@ mod tests {
             "archive-manager",
             "gba-emulator",
             "system",
+            "chat-room",
+            "chat-wasm",
         ];
         for capsule in EXPECTED {
             let path = format!(
@@ -1907,8 +1909,8 @@ mod tests {
             );
             let data = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {capsule} manifest at {path}: {e}"));
-            let manifest: CapsuleManifest =
-                serde_json::from_str(&data).unwrap_or_else(|e| panic!("{capsule} manifest parses: {e}"));
+            let manifest: CapsuleManifest = serde_json::from_str(&data)
+                .unwrap_or_else(|e| panic!("{capsule} manifest parses: {e}"));
             manifest
                 .validate()
                 .unwrap_or_else(|e| panic!("{capsule} manifest validates: {e}"));

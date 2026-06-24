@@ -1313,6 +1313,8 @@ mod tests {
             "archive-manager",
             "gba-emulator",
             "system",
+            "chat-room",
+            "chat-wasm",
         ];
         for capsule in REGISTRY {
             let path = format!(

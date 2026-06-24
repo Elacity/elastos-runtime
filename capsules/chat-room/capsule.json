@@ -7,6 +7,37 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "chat-room.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.chat",
+      "version": "0.1.0",
+      "description": "Peer-to-peer chat room: send and read messages.",
+      "methods": [
+        {
+          "id": "message.send",
+          "description": "Send a chat message to the room.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "body": { "type": "string", "description": "Message text to send." } },
+            "required": ["body"]
+          },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "message.history",
+          "description": "Read recent messages in the room.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 32,
     "gpu": false
