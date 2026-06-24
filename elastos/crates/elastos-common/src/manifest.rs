@@ -1889,7 +1889,16 @@ mod tests {
         // affordance (interfaces[].methods[]). Add a capsule here as it gains an
         // interfaces[] block; the test fails closed if a listed capsule regresses
         // to affordances:[] or breaks its manifest contract.
-        const EXPECTED: &[&str] = &["capsule-inspector", "documents", "library", "inbox"];
+        const EXPECTED: &[&str] = &[
+            "capsule-inspector",
+            "documents",
+            "library",
+            "inbox",
+            "chat",
+            "archive-manager",
+            "gba-emulator",
+            "system",
+        ];
         for capsule in EXPECTED {
             let path = format!(
                 "{}/../../../capsules/{}/capsule.json",

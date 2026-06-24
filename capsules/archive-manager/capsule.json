@@ -10,6 +10,41 @@
   "requires": [
     { "name": "object-provider", "kind": "capsule" }
   ],
+  "interfaces": [
+    {
+      "id": "elastos.archive",
+      "version": "0.1.0",
+      "description": "Browse and extract supported archive contents through the Library.",
+      "methods": [
+        {
+          "id": "archive.browse",
+          "description": "List the contents of an archive object.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI of the archive." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "archive.extract",
+          "description": "Extract an entry from an archive object.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI of the archive to extract." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 24,
     "gpu": false

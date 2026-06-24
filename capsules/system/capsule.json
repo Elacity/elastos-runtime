@@ -7,6 +7,24 @@
   "role": "app",
   "type": "wasm",
   "entrypoint": "system.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.system",
+      "version": "0.1.0",
+      "description": "View System settings for access, appearance, and diagnostics.",
+      "methods": [
+        {
+          "id": "settings.view",
+          "description": "Read current System settings and diagnostics.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 32,
     "gpu": false

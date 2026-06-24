@@ -8,6 +8,37 @@
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
   "requires": [],
+  "interfaces": [
+    {
+      "id": "elastos.chat",
+      "version": "0.1.0",
+      "description": "Peer-to-peer chat: send and read messages.",
+      "methods": [
+        {
+          "id": "message.send",
+          "description": "Send a chat message to the current channel.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "body": { "type": "string", "description": "Message text to send." } },
+            "required": ["body"]
+          },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "message.history",
+          "description": "Read recent messages in the current channel.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 256,
     "gpu": false

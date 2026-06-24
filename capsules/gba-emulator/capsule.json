@@ -7,6 +7,28 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "gba-emulator.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.gba",
+      "version": "0.1.0",
+      "description": "Play Game Boy Advance game objects.",
+      "methods": [
+        {
+          "id": "game.play",
+          "description": "Load and run a GBA game object.",
+          "risk": "launch",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI of the GBA game to play." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/*"]
   },
