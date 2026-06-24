@@ -42,6 +42,37 @@ pub fn domain_separated_sign(
     (hex::encode(sig.to_bytes()), did)
 }
 
+/// Verify a domain-separated signature over raw payload bytes — the direct
+/// inverse of [`domain_separated_sign`]. Recomputes `SHA256(domain || b"\0" ||
+/// payload)` and checks the Ed25519 signature against `verifying_key`. Returns
+/// `Ok(())` on a valid signature and `Err` otherwise (fail-closed). This is the
+/// verifier for signatures produced by `domain_separated_sign` where there is no
+/// `{ payload, signature, signer_did }` JSON envelope to use
+/// [`verify_signed_json_envelope_against_dids`] — e.g. a signed audit event
+/// (`AUDIT_EVENT_DOMAIN`), whose signature was previously produced but never
+/// verifiable.
+pub fn domain_separated_verify(
+    verifying_key: &VerifyingKey,
+    domain: &str,
+    payload: &[u8],
+    signature_hex: &str,
+) -> anyhow::Result<()> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    let digest = hasher.finalize();
+
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| anyhow::anyhow!("Invalid signature hex: {}", e))?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid Ed25519 signature: {}", e))?;
+    verifying_key
+        .verify(&digest, &sig)
+        .map_err(|_| anyhow::anyhow!("domain-separated signature verification failed"))
+}
+
 /// Verify a signed JSON envelope `{ payload, signature, signer_did }`.
 /// The `domain` is the domain separator used when signing.
 /// Returns the parsed JSON value and signer DID on success.
@@ -187,5 +218,28 @@ mod tests {
         let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
         let result = verify_release_envelope(&envelope_bytes, "test", &signer_did);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn domain_separated_verify_round_trips_and_fails_closed() {
+        // G8b step 1: the direct inverse of domain_separated_sign. A valid signature
+        // verifies; tampered payload, wrong domain, wrong key, and malformed hex all
+        // fail closed (never a panic).
+        let (sk, vk) = generate_keypair();
+        let domain = "elastos.audit.event.v1";
+        let payload = b"a recorded audit event";
+        let (sig_hex, _did) = domain_separated_sign(&sk, domain, payload);
+
+        // Valid signature verifies.
+        assert!(domain_separated_verify(&vk, domain, payload, &sig_hex).is_ok());
+        // Tampered payload -> rejected.
+        assert!(domain_separated_verify(&vk, domain, b"tampered", &sig_hex).is_err());
+        // Wrong domain -> rejected (domain separation holds).
+        assert!(domain_separated_verify(&vk, "elastos.other.v1", payload, &sig_hex).is_err());
+        // Wrong key -> rejected.
+        let (_other_sk, other_vk) = generate_keypair();
+        assert!(domain_separated_verify(&other_vk, domain, payload, &sig_hex).is_err());
+        // Malformed signature hex -> Err, not a panic.
+        assert!(domain_separated_verify(&vk, domain, payload, "zz").is_err());
     }
 }
