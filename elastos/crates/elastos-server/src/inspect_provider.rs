@@ -1196,6 +1196,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_providers_reflect_their_authority_via_op_path() {
+        // EYES for providers: a provider exposes its tool surface through
+        // authority.capabilities[] (the twin of an app's interfaces[]). Each
+        // dDRM-critical provider must, through the real inspect plan op, reflect
+        // the resource an operation touches and the full capability-action set the
+        // manifest declares (fail-closed union, never under-stated).
+        struct Expect {
+            capsule: &'static str,
+            operation: &'static str,
+            resource: &'static str,
+            actions: &'static [&'static str],
+        }
+        const PROVIDERS: &[Expect] = &[
+            Expect { capsule: "key-provider", operation: "release", resource: "elastos://key/*", actions: &["read"] },
+            Expect { capsule: "rights-provider", operation: "has_access_by_content_id", resource: "elastos://rights/*", actions: &["read"] },
+            Expect { capsule: "chain-provider", operation: "broadcast_transaction", resource: "elastos://chain/*", actions: &["read", "write", "admin"] },
+        ];
+        for p in PROVIDERS {
+            let path = format!(
+                "{}/../../../capsules/{}/capsule.json",
+                env!("CARGO_MANIFEST_DIR"),
+                p.capsule
+            );
+            let data = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {} manifest at {path}: {e}", p.capsule));
+            let manifest: CapsuleManifest =
+                serde_json::from_str(&data).unwrap_or_else(|e| panic!("{} parses: {e}", p.capsule));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("{} validates: {e}", p.capsule));
+
+            let id = format!("cap_{}", p.capsule);
+            let resp = provider_over(manifest, &id)
+                .send_raw(&json!({ "op": "plan", "id": id, "operation": p.operation }))
+                .await
+                .unwrap();
+            assert_eq!(resp["status"], "ok", "{}: plan op failed", p.capsule);
+            assert_eq!(resp["data"]["valid"], true, "{}: plan should be valid", p.capsule);
+            assert_eq!(resp["data"]["kind"], "operation", "{}: should reflect a provider operation", p.capsule);
+            let resources = resp["data"]["resources"].as_array().expect("resources array");
+            assert!(
+                resources.iter().any(|r| r == p.resource),
+                "{}: must reflect resource {} (got {:?})",
+                p.capsule,
+                p.resource,
+                resources
+            );
+            let got: Vec<&str> = resp["data"]["capability_actions"]
+                .as_array()
+                .expect("capability_actions array")
+                .iter()
+                .filter_map(|a| a.as_str())
+                .collect();
+            for a in p.actions {
+                assert!(
+                    got.contains(a),
+                    "{}: must reflect capability action {} (got {:?})",
+                    p.capsule,
+                    a,
+                    got
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn provenance_is_derived_honestly_not_fabricated() {
         // The signed probe (id is not a DID, no cid): trust is "signed", a
         // signature fingerprint is present, and we never invent a signer DID.
