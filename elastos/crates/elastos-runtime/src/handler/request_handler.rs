@@ -12,14 +12,13 @@ use tokio::sync::RwLock;
 use elastos_common::localhost::{is_supported_resource_scheme, rooted_localhost_uri};
 use elastos_namespace::ContentUri;
 
-use crate::capability::token::{Action, ResourceId, TokenConstraints as InternalConstraints};
+use crate::capability::token::{Action, ResourceId};
 use crate::capability::CapabilityManager;
 use crate::capsule::{prepare_fetched_capsule, CapsuleId, CapsuleInfo, CapsuleManager};
 use crate::content::ContentResolver;
 use crate::messaging::Message;
 use crate::messaging::MessageChannel;
 use crate::primitives::audit::{AuditLog, StopReason, TrustLevel};
-use crate::primitives::time::SecureTimestamp;
 use crate::provider::{ProviderRegistry, ResourceAction};
 
 use super::protocol::*;
@@ -112,8 +111,6 @@ impl RequestHandler {
         shell_id.is_shell(id)
     }
 
-    /// Maximum length for capsule IDs
-    const MAX_CAPSULE_ID_LEN: usize = 256;
     /// Maximum length for resource URIs
     const MAX_RESOURCE_LEN: usize = 4096;
     /// Maximum length for CIDs
@@ -1185,6 +1182,7 @@ impl RequestHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::token::TokenConstraints as InternalConstraints;
     use crate::capability::CapabilityStore;
     use crate::content::{NullFetcher, ResolverConfig};
     use crate::primitives::metrics::MetricsManager;
