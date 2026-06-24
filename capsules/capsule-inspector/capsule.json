@@ -10,6 +10,46 @@
   "capabilities": [
     "elastos://inspect/*"
   ],
+  "interfaces": [
+    {
+      "id": "elastos.inspect",
+      "version": "0.1.0",
+      "description": "Read-only inspection of live capsules: identity, affordances, capabilities, provenance, and audit.",
+      "methods": [
+        {
+          "id": "capsule.list",
+          "description": "List the live capsules the inspector can see.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://inspect/*",
+          "operation": "list",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "capsule.view",
+          "description": "Project one capsule's identity, affordances, capabilities, provenance, and audit into a single read-only view.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://inspect/*",
+          "operation": "view",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string",
+                "description": "Capsule id or resource URI to inspect."
+              }
+            },
+            "required": ["target"]
+          },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 32,
     "gpu": false

@@ -1838,4 +1838,47 @@ mod tests {
         assert!(manifest.provides.is_some());
         assert!(manifest.validate().is_ok());
     }
+
+    // ── Flint foundation: shipped-capsule affordance declaration ─────
+
+    #[test]
+    fn shipped_capsule_inspector_declares_typed_affordances() {
+        // Foundational wedge (flint): the capsule-inspector capsule must ship a
+        // real `interfaces[]` block so it is a discoverable typed tool by data,
+        // not code. Pins the declaration contract at the manifest layer, against
+        // the on-disk manifest (not an inline fixture).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../capsules/capsule-inspector/capsule.json"
+        );
+        let data = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read shipped capsule-inspector manifest at {path}: {e}"));
+        let manifest: CapsuleManifest =
+            serde_json::from_str(&data).expect("shipped capsule-inspector manifest parses");
+        manifest
+            .validate()
+            .expect("shipped capsule-inspector manifest validates");
+
+        assert!(
+            !manifest.interfaces.is_empty(),
+            "capsule-inspector must declare interfaces[] (the typed-tool contract)"
+        );
+        let view = manifest
+            .interfaces
+            .iter()
+            .flat_map(|iface| &iface.methods)
+            .find(|method| method.id == "capsule.view")
+            .expect("capsule-inspector declares a capsule.view affordance");
+        assert_eq!(view.risk, AffordanceRisk::Read);
+        assert_eq!(view.approval, AffordanceApprovalMode::RuntimePolicy);
+        // The view affordance is typed: it requires a target to inspect.
+        let input_schema = view
+            .input_schema
+            .as_ref()
+            .expect("capsule.view declares an input_schema");
+        assert_eq!(
+            input_schema["required"][0], "target",
+            "capsule.view must require a target argument"
+        );
+    }
 }

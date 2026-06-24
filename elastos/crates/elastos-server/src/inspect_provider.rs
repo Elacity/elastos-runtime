@@ -1035,6 +1035,107 @@ mod tests {
         );
     }
 
+    // ── Flint foundation: the SHIPPED inspector manifest is a typed tool ──
+    //
+    // The wedge: 0 of the shipped capsules used to declare `interfaces[]`, so an
+    // agent inspecting any real capsule saw `affordances: []`. These tests drive
+    // the public op path (reflect -> plan) over the on-disk capsule-inspector
+    // manifest, proving the perceive->plan machinery fires on a real capsule.
+
+    fn shipped_inspector_manifest() -> CapsuleManifest {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../capsules/capsule-inspector/capsule.json"
+        );
+        let data = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read shipped capsule-inspector manifest at {path}: {e}"));
+        let manifest: CapsuleManifest =
+            serde_json::from_str(&data).expect("shipped capsule-inspector manifest parses");
+        manifest
+            .validate()
+            .expect("shipped capsule-inspector manifest validates");
+        manifest
+    }
+
+    fn provider_over(manifest: CapsuleManifest, id: &str) -> InspectProvider {
+        InspectProvider::new(Arc::new(MockSource {
+            entries: vec![InspectEntry {
+                id: id.to_string(),
+                name: manifest.name.clone(),
+                status: "running".to_string(),
+                capsule_type: "wasm".to_string(),
+                manifest: Some(manifest),
+                cid: None,
+            }],
+        }))
+    }
+
+    #[tokio::test]
+    async fn shipped_inspector_surfaces_discoverable_affordances() {
+        let manifest = shipped_inspector_manifest();
+        assert!(
+            !manifest.interfaces.is_empty(),
+            "capsule-inspector must declare interfaces[]"
+        );
+
+        // EYES: the projection surfaces the declared methods as affordances, so
+        // an agent sees a non-empty tool surface instead of affordances:[].
+        let resp = provider_over(manifest, "cap_inspector_1")
+            .send_raw(&json!({ "op": "capsule", "id": "cap_inspector_1" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        let affordances = resp["data"]["affordances"]
+            .as_array()
+            .expect("affordances array");
+        assert!(
+            !affordances.is_empty(),
+            "agent must see a non-empty affordance surface, not affordances:[]"
+        );
+        assert!(
+            affordances.iter().any(|a| a["id"] == "capsule.view"),
+            "the inspector must expose a capsule.view affordance"
+        );
+    }
+
+    #[tokio::test]
+    async fn shipped_inspector_affordance_derives_gate_fail_closed() {
+        let provider = provider_over(shipped_inspector_manifest(), "cap_inspector_1");
+
+        // HANDS: a declared read affordance derives the Read capability gate purely
+        // from metadata, before any dispatch.
+        let ok = provider
+            .send_raw(&json!({
+                "op": "plan",
+                "id": "cap_inspector_1",
+                "interface": "elastos.inspect",
+                "method": "capsule.view",
+                "args": { "target": "elastos://inspect/capsule-inspector" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["data"]["valid"], true);
+        assert_eq!(ok["data"]["capability_action"], "read");
+
+        // Fail-closed: the same call with the required `target` missing is rejected
+        // by the declared input_schema, never planned through.
+        let bad = provider
+            .send_raw(&json!({
+                "op": "plan",
+                "id": "cap_inspector_1",
+                "interface": "elastos.inspect",
+                "method": "capsule.view",
+                "args": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(bad["status"], "ok");
+        assert_eq!(bad["data"]["valid"], false);
+        assert_eq!(bad["data"]["error"], "missing_required_field");
+        assert_eq!(bad["data"]["field"], "target");
+    }
+
     #[tokio::test]
     async fn provenance_is_derived_honestly_not_fabricated() {
         // The signed probe (id is not a DID, no cid): trust is "signed", a
