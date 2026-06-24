@@ -1349,6 +1349,10 @@ pub(super) async fn gateway_provider_proxy(
             // Write ops (e.g. revoke) are intentionally not exposed through the
             // browser proxy.
             "capsules" | "capsule" | "plan" | "intent" => &[SYSTEM_CAPSULE_ID],
+            // Self-tier: an app/browser principal may inspect ONLY its own record.
+            // Gated to the browser/app principal set (NOT System); the provider's
+            // self branch forces target = the authenticated principal.
+            "self" => &[BROWSER_CAPSULE_ID],
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1391,7 +1395,11 @@ pub(super) async fn gateway_provider_proxy(
         }
     };
     request["op"] = serde_json::Value::String(op.clone());
-    if scheme == "documents" || scheme == "object" || scheme == "net" {
+    if scheme == "documents"
+        || scheme == "object"
+        || scheme == "net"
+        || (scheme == "inspect" && op == "self")
+    {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
     if scheme == "object" && op == "shared_access" {

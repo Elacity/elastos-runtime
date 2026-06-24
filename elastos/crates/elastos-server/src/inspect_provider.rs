@@ -829,6 +829,33 @@ impl InspectProvider {
                 },
                 None => provider_error("invalid_request", "inspect/capsule requires an \"id\""),
             },
+            // Self-scope detail: a SelfOnly caller inspects ONLY its own record.
+            // The target is ALWAYS the authenticated principal injected by the
+            // gateway (principal_id), NEVER a client-supplied `id` (Principle 16).
+            // Routed through the canonical runtime gate (inspect::authorize_view /
+            // InspectScope::SelfOnly: caller == target), fail-closed otherwise.
+            "self" => {
+                let Some(caller) = request
+                    .get("principal_id")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty())
+                else {
+                    return provider_error("out_of_scope", "missing authenticated principal");
+                };
+                // SelfOnly: the target is the caller's own id; request["id"] is ignored.
+                let granted = [elastos_runtime::inspect::INSPECT_SELF.to_string()];
+                if !elastos_runtime::inspect::authorize_view(false, caller, caller, &granted) {
+                    return provider_error("out_of_scope", "caller may not inspect this capsule");
+                }
+                match self.source.inspect_get(caller).await {
+                    Some(entry) => {
+                        let audit = self.audit_value(&entry).await;
+                        let granted_v = self.granted_value(&entry).await;
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted_v) })
+                    }
+                    None => provider_error("not_found", "no such capsule"),
+                }
+            }
             // Metadata-driven invocation *preview* (read-only, dry-run): given a
             // capsule + interface + method + args, validate the args against the
             // affordance's input_schema and derive the capability/approval/audit

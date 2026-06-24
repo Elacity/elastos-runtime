@@ -91,6 +91,93 @@ async fn inspect_capsules_requires_token_and_lists_installed_capsule() {
 }
 
 #[tokio::test]
+async fn inspect_self_returns_own_record_and_ignores_client_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+
+    // A browser/app token whose authenticated principal IS the caller's own
+    // capsule id (the catalog ids entries as "capsule:<name>").
+    let mut ctx = local_home_launch_token_context(dir.path()).unwrap();
+    ctx.principal_id = "capsule:probe-capsule".to_string();
+    let token = issue_home_launch_token_with_context(dir.path(), BROWSER_CAPSULE_ID, &ctx).unwrap();
+
+    // Positive: a SelfOnly caller reads ITS OWN record.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/self")
+                .header("x-elastos-home-token", token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("capsule:probe-capsule"),
+        "self did not return the caller's own record: {text}"
+    );
+
+    // Negative (Principle 16): a client-supplied id for ANOTHER capsule is ignored
+    // — the target is forced to the authenticated principal, so the response is
+    // STILL the caller's own record (a redirect would have been not_found).
+    let resp2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/self")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"id":"capsule:someone-else"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text2 = String::from_utf8_lossy(&body2);
+    assert!(
+        text2.contains("capsule:probe-capsule"),
+        "client-supplied id must be ignored; expected own record, got: {text2}"
+    );
+}
+
+#[tokio::test]
+async fn inspect_self_token_cannot_reach_system_capsule_op() {
+    // Escalation blocked at the allow-list: a browser self token cannot reach the
+    // System-scope `capsule` detail op.
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/capsule")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"id":"capsule:probe-capsule"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a browser/self token must not reach the System capsule op"
+    );
+}
+
+#[tokio::test]
 async fn inspect_write_op_revoke_is_not_browser_reachable() {
     // Least-privilege at the edge (#16): the write op `revoke` is deliberately
     // absent from the browser allow-list, so it is unreachable through the
