@@ -7,6 +7,41 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "documents.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.documents",
+      "version": "0.1.0",
+      "description": "Create, edit, and open markdown document objects.",
+      "methods": [
+        {
+          "id": "document.open",
+          "description": "Open a document object for reading.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI of the document to open." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "document.edit",
+          "description": "Edit the contents of a document object.",
+          "risk": "write",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI of the document to edit." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 24,
     "gpu": false

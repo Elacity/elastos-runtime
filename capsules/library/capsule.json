@@ -10,6 +10,37 @@
   "requires": [
     { "name": "object-provider", "kind": "capsule" }
   ],
+  "interfaces": [
+    {
+      "id": "elastos.library",
+      "version": "0.1.0",
+      "description": "Browse local files, folders, and published objects via the Runtime object provider.",
+      "methods": [
+        {
+          "id": "object.list",
+          "description": "List objects in the library.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        },
+        {
+          "id": "object.open",
+          "description": "Open a single object from the library.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "input_schema": {
+            "type": "object",
+            "properties": { "uri": { "type": "string", "description": "Object URI to open." } },
+            "required": ["uri"]
+          },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

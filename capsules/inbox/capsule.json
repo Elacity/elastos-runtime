@@ -7,6 +7,24 @@
   "type": "wasm",
   "author": "elastos",
   "entrypoint": "inbox.wasm",
+  "interfaces": [
+    {
+      "id": "elastos.inbox",
+      "version": "0.1.0",
+      "description": "Review pending requests (approvals and notifications).",
+      "methods": [
+        {
+          "id": "request.list",
+          "description": "List pending requests awaiting review.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        }
+      ]
+    }
+  ],
   "resources": {
     "memory_mb": 16,
     "gpu": false

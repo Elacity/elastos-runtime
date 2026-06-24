@@ -1881,4 +1881,33 @@ mod tests {
             "capsule.view must require a target argument"
         );
     }
+
+    #[test]
+    fn first_party_capsules_declare_typed_affordances() {
+        // Flint gap registry: the set of shipped capsules that expose a typed tool
+        // surface to the agent. Each must parse, validate, and declare at least one
+        // affordance (interfaces[].methods[]). Add a capsule here as it gains an
+        // interfaces[] block; the test fails closed if a listed capsule regresses
+        // to affordances:[] or breaks its manifest contract.
+        const EXPECTED: &[&str] = &["capsule-inspector", "documents", "library", "inbox"];
+        for capsule in EXPECTED {
+            let path = format!(
+                "{}/../../../capsules/{}/capsule.json",
+                env!("CARGO_MANIFEST_DIR"),
+                capsule
+            );
+            let data = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {capsule} manifest at {path}: {e}"));
+            let manifest: CapsuleManifest =
+                serde_json::from_str(&data).unwrap_or_else(|e| panic!("{capsule} manifest parses: {e}"));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("{capsule} manifest validates: {e}"));
+            let method_count: usize = manifest.interfaces.iter().map(|i| i.methods.len()).sum();
+            assert!(
+                method_count > 0,
+                "{capsule} must declare at least one typed affordance (interfaces[].methods[])"
+            );
+        }
+    }
 }
