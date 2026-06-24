@@ -142,12 +142,35 @@ pub struct CapsuleAudit {
     pub recent: Vec<AuditRecord>,
 }
 
+/// A single OBSERVED granted capability (resource + action), derived from
+/// recorded audit events — never from the manifest's *requested* capabilities.
+/// Safe to display: no bearer token, no signature (#16). Observed / best-effort /
+/// unsigned per G8; `granted=false` means an observed grant whose later use was
+/// denied, not absence of authority.
+#[derive(Debug, Clone)]
+pub struct GrantRecord {
+    pub resource: String,
+    pub action: String,
+    pub granted: bool,
+}
+
 /// Read-only source of per-capsule audit activity. Optional on the provider;
 /// when absent, the audit section is empty.
 #[async_trait]
 pub trait AuditSource: Send + Sync {
     /// Audit for `capsule_key`, newest-first, capped at `recent_limit`.
     async fn for_capsule(&self, capsule_key: &str, recent_limit: usize) -> CapsuleAudit;
+
+    /// Observed granted capabilities for `capsule_key` (resource + action), derived
+    /// from recorded grant/use events. Default empty: a source whose plane lacks
+    /// resource/action honestly reports no observed grants rather than fabricating.
+    async fn granted_for_capsule(
+        &self,
+        _capsule_key: &str,
+        _recent_limit: usize,
+    ) -> Vec<GrantRecord> {
+        Vec::new()
+    }
 }
 
 /// Audit source backed by the signed runtime audit log in the auth state
@@ -211,6 +234,72 @@ impl AuditSource for AuthAuditSource {
         })
         .await
         .unwrap_or_default()
+    }
+}
+
+/// Audit source backed by the in-memory runtime [`AuditLog`] — the only plane that
+/// records resource + action with each capability grant/use. Surfaces OBSERVED
+/// granted capabilities by folding recorded `capability_grant` / `capability_use`
+/// events: the exact fold the runtime-side inspector uses, so the two agree.
+/// Observed / best-effort / unsigned per G8; never the manifest's requested caps.
+pub struct RuntimeAuditLogGrantSource {
+    audit_log: std::sync::Arc<elastos_runtime::primitives::audit::AuditLog>,
+}
+
+impl RuntimeAuditLogGrantSource {
+    pub fn new(audit_log: std::sync::Arc<elastos_runtime::primitives::audit::AuditLog>) -> Self {
+        Self { audit_log }
+    }
+}
+
+#[async_trait]
+impl AuditSource for RuntimeAuditLogGrantSource {
+    // Grant-focused: the signed activity list comes from the auth plane; this
+    // source reports no activity (honest empty) and only observed grants.
+    async fn for_capsule(&self, _capsule_key: &str, _recent_limit: usize) -> CapsuleAudit {
+        CapsuleAudit::default()
+    }
+
+    async fn granted_for_capsule(
+        &self,
+        capsule_key: &str,
+        recent_limit: usize,
+    ) -> Vec<GrantRecord> {
+        // Mirror of the runtime-side fold (handler/request_handler.rs): fold the
+        // recorded capability_grant/use events into one entry per (resource,
+        // action), flipping granted=false when an observed use was denied.
+        let events = self.audit_log.recent_events(recent_limit);
+        let mut grants: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
+        for ev in &events {
+            let Ok(v) = serde_json::to_value(ev) else {
+                continue;
+            };
+            if v.get("capsule_id").and_then(|c| c.as_str()) != Some(capsule_key) {
+                continue;
+            }
+            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let Some(resource) = v.get("resource").and_then(|r| r.as_str()) else {
+                continue;
+            };
+            let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
+            let entry = grants.entry(format!("{resource} {action}")).or_insert(true);
+            if etype == "capability_use" && !success {
+                *entry = false;
+            }
+        }
+        grants
+            .into_iter()
+            .map(|(key, granted)| {
+                let mut parts = key.splitn(2, ' ');
+                GrantRecord {
+                    resource: parts.next().unwrap_or("").to_string(),
+                    action: parts.next().unwrap_or("").to_string(),
+                    granted,
+                }
+            })
+            .collect()
     }
 }
 
@@ -515,7 +604,7 @@ impl InspectProvider {
     /// Project a capsule into the inspector wire contract (see
     /// docs/CAPSULE_INSPECTOR.md). Read-only; unknown fields are null rather
     /// than fabricated, and no bearer token / raw signature is ever included.
-    fn project(entry: &InspectEntry, audit: Value) -> Value {
+    fn project(entry: &InspectEntry, audit: Value, granted: Value) -> Value {
         fn field(v: &Value, key: &str) -> Value {
             v.get(key).cloned().unwrap_or(Value::Null)
         }
@@ -629,10 +718,11 @@ impl InspectProvider {
             // Provider powers (declarative authority), for provider capsules.
             "authority": authority,
             "required_capabilities": field(&manifest, "capabilities"),
-            // Bearer-token object-capabilities have no central per-capsule grant
-            // registry; observed grants come from the audit plane (not yet wired
-            // into this provider). Empty rather than fabricated.
-            "granted_capabilities": Value::Array(vec![]),
+            // OBSERVED granted capabilities from the runtime audit plane
+            // (capability_grant folded with capability_use failures); best-effort
+            // + unsigned per G8, and NEVER the manifest's requested capabilities
+            // (those stay in required_capabilities above). Empty when unobserved.
+            "granted_capabilities": granted,
             "storage_namespaces": manifest
                 .pointer("/permissions/storage")
                 .cloned()
@@ -685,6 +775,23 @@ impl InspectProvider {
         })
     }
 
+    /// Observed granted capabilities for display: empty when no source is attached
+    /// or none were observed. Never the manifest's requested capabilities.
+    async fn granted_value(&self, entry: &InspectEntry) -> Value {
+        let Some(audit) = &self.audit else {
+            return Value::Array(vec![]);
+        };
+        let grants = audit.granted_for_capsule(&entry.name, 500).await;
+        Value::Array(
+            grants
+                .into_iter()
+                .map(
+                    |g| json!({ "resource": g.resource, "action": g.action, "granted": g.granted }),
+                )
+                .collect(),
+        )
+    }
+
     async fn handle_op(&self, request: &Value) -> Value {
         match request.get("op").and_then(Value::as_str).unwrap_or("") {
             // System-scope list. Upstream (gateway allow-list / capability
@@ -715,7 +822,8 @@ impl InspectProvider {
                 Some(id) => match self.source.inspect_get(id).await {
                     Some(entry) => {
                         let audit = self.audit_value(&entry).await;
-                        json!({ "status": "ok", "data": Self::project(&entry, audit) })
+                        let granted = self.granted_value(&entry).await;
+                        json!({ "status": "ok", "data": Self::project(&entry, audit, granted) })
                     }
                     None => provider_error("not_found", "no such capsule"),
                 },
@@ -1351,19 +1459,62 @@ mod tests {
     // real ratchets, not vacuous passes).
 
     #[tokio::test]
-    #[ignore = "KNOWN_GAPS G1: granted_capabilities not yet wired (no resource/action in audit events); see docs/KNOWN_GAPS.md"]
     async fn ratchet_granted_capabilities_populated() {
-        // Desired: a capsule with grants reports them. Today the projection
-        // always returns []. When an observed-grant source is wired, delete the
-        // #[ignore] and this goes green.
-        let resp = provider_with_probe()
+        // G1 (loop 4): granted_capabilities lists OBSERVED grants from the audit
+        // plane. The grant below is a REAL recorded capability_grant event (the
+        // same call the canonical mint path makes), folded by the real source — so
+        // this cannot pass against the old hardcoded [] nor a hand-set fixture.
+        use elastos_runtime::capability::token::{Action, ResourceId, TokenId};
+        use elastos_runtime::primitives::audit::AuditLog;
+
+        let audit_log = Arc::new(AuditLog::new());
+        audit_log.capability_grant(
+            &TokenId::new(),
+            "cap_granted_1",
+            &ResourceId::new("elastos://inspect/*"),
+            Action::Read,
+            None,
+        );
+
+        let provider = InspectProvider::new(Arc::new(MockSource {
+            entries: vec![InspectEntry {
+                id: "cap_granted_1".to_string(),
+                // name MUST equal the recorded capsule_id — the grant source keys by name.
+                name: "cap_granted_1".to_string(),
+                status: "running".to_string(),
+                capsule_type: "wasm".to_string(),
+                manifest: Some(probe_manifest()),
+                cid: None,
+                verified_signer: None,
+            }],
+        }))
+        .with_audit(Arc::new(RuntimeAuditLogGrantSource::new(audit_log)));
+
+        let resp = provider
+            .send_raw(&json!({ "op": "capsule", "id": "cap_granted_1" }))
+            .await
+            .unwrap();
+        let granted = resp["data"]["granted_capabilities"]
+            .as_array()
+            .expect("granted_capabilities array");
+        assert!(
+            granted
+                .iter()
+                .any(|g| g["resource"] == "elastos://inspect/*"
+                    && g["action"] == "read"
+                    && g["granted"] == true),
+            "granted_capabilities must list the observed grant, got {granted:?}"
+        );
+
+        // Honest empty: a capsule with NO recorded grants (no source) reports [].
+        let empty = provider_with_probe()
             .send_raw(&json!({ "op": "capsule", "id": "cap_probe_1" }))
             .await
             .unwrap();
-        let granted = resp["data"]["granted_capabilities"].as_array().unwrap();
-        assert!(
-            !granted.is_empty(),
-            "granted_capabilities should be populated once an observed-grant source exists"
+        assert_eq!(
+            empty["data"]["granted_capabilities"],
+            json!([]),
+            "no observed grants => honest empty"
         );
     }
 

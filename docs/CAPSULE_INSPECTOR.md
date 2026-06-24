@@ -279,13 +279,19 @@ signature without echoing it, #16), the self-declared `author`, and a `did`
 signer DID/pubkey, so we refuse to present the author as if verified. Wiring a
 real signature-verification source is the next provenance step.
 
-**Remaining enrichment (honest gap):** `granted_capabilities` is still empty on
-the product path. ElastOS capabilities are bearer tokens with no central
-per-capsule registry, and `RuntimeAuditEventV1` carries no resource/action — so
-deriving the observed grant list needs a capability-event source that records
-resource + action. Everything else is done: projection, scope, no-leak,
-transport wiring, source aggregation, rich manifest detail, sub-provider
-running-status coverage, live audit (recent + counts), and derived provenance.
+**`granted_capabilities` (observed, wired):** the projection now lists OBSERVED
+grants from `RuntimeAuditLogGrantSource`, which folds recorded `capability_grant`
+/ `capability_use` events (the in-memory `AuditLog` is the plane that carries
+resource + action), mirroring the runtime-side fold so the two agree. These are
+*observed / best-effort / unsigned* (per G8), `granted=false` means an observed
+grant whose later use was denied, and they are **never** the manifest's requested
+capabilities (those stay in `required_capabilities`). Honest empty when nothing
+was observed. **Remaining (G1b):** the live serve path still attaches only
+`AuthAuditSource` (signed activity, no grants), so production inspect populates
+grants only once serve *composes* the grant source in. Everything else is done:
+projection, scope, no-leak, transport wiring, source aggregation, rich manifest
+detail, sub-provider running-status coverage, live audit (recent + counts), and
+derived provenance.
 
 The UI adapter targets the Carrier-shaped `inspect/<op>` contract and degrades
 to sample data until the data source is populated on the browser path.
