@@ -361,18 +361,21 @@ impl PendingRequestStore {
             return Err(format!("Request {} is not pending", request_id));
         }
 
-        request.status = RequestStatus::Denied {
-            reason: reason.to_string(),
-        };
-
-        // Audit
+        // G8a: write the denial's audit record durably and FAIL CLOSED before the
+        // status mutation. If the durable write fails, the denial aborts and the
+        // request stays Pending rather than silently completing.
         self.audit_log
-            .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
+            .emit_critical(crate::primitives::audit::AuditEvent::CapabilityDenied {
                 timestamp: SecureTimestamp::now(),
                 request_id: request_id.to_string(),
                 session_id: request.session_id.to_string(),
                 reason: reason.to_string(),
-            });
+            })
+            .map_err(|e| format!("audit write failed, denial aborted: {e}"))?;
+
+        request.status = RequestStatus::Denied {
+            reason: reason.to_string(),
+        };
 
         Ok(())
     }
@@ -855,5 +858,78 @@ mod tests {
             recovered.is_pending() || recovered.is_expired(),
             "should be accepted after expired cleanup"
         );
+    }
+
+    // ── G8a: fail-closed audit on the user-deny write ────────────────
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "flint_g8a_{tag}_{}_{}.log",
+            std::process::id(),
+            line!()
+        ))
+    }
+
+    #[tokio::test]
+    async fn deny_request_fails_closed_when_audit_write_fails() {
+        // A read-only file handle makes the durable audit write fail at flush —
+        // the denial must abort and the request must stay Pending, never silently
+        // complete with a lost audit record (G8a).
+        let path = unique_tmp("ro");
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let audit = Arc::new(AuditLog::with_file_handle(ro));
+        let pending = PendingRequestStore::new(audit);
+
+        let req = pending
+            .create_request(
+                SessionId::new(),
+                ResourceId::new("localhost://Users/self/Documents/x"),
+                Action::Read,
+            )
+            .await;
+
+        let res = pending.deny_request(req.id.as_str(), "nope").await;
+        assert!(
+            res.is_err(),
+            "deny must fail closed when its durable audit write fails"
+        );
+        let after = pending.get_request(req.id.as_str()).await.unwrap();
+        assert!(
+            matches!(after.status, RequestStatus::Pending),
+            "request must stay Pending when its denial audit write fails"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn deny_request_succeeds_and_records_with_working_audit() {
+        // Companion: with a working durable sink the deny commits AND the event is
+        // recorded — proving the fail-closed path triggers on real failure only,
+        // not always (catches an always-Err stub).
+        let path = unique_tmp("ok");
+        let audit = Arc::new(AuditLog::with_file(&path).unwrap());
+        let pending = PendingRequestStore::new(audit.clone());
+
+        let req = pending
+            .create_request(
+                SessionId::new(),
+                ResourceId::new("localhost://Users/self/Documents/x"),
+                Action::Read,
+            )
+            .await;
+
+        let res = pending.deny_request(req.id.as_str(), "nope").await;
+        assert!(res.is_ok(), "deny succeeds with a working audit sink");
+        let after = pending.get_request(req.id.as_str()).await.unwrap();
+        assert!(matches!(after.status, RequestStatus::Denied { .. }));
+        assert!(
+            audit.recent_events(50).iter().any(|e| matches!(
+                e,
+                crate::primitives::audit::AuditEvent::CapabilityDenied { .. }
+            )),
+            "the denial event must be recorded"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

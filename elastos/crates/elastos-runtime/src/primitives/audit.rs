@@ -247,6 +247,34 @@ pub enum FetchSource {
 /// Maximum events to keep in memory buffer
 const MAX_MEMORY_EVENTS: usize = 1000;
 
+/// Why a security-relevant audit write failed. Surfaced by
+/// [`AuditLog::emit_critical`] so a failed write fails closed (G8a) instead of
+/// being logged-and-dropped.
+#[derive(Debug)]
+pub enum AuditError {
+    /// The in-memory ring or the file writer lock was poisoned.
+    LockPoisoned,
+    /// The event could not be serialized.
+    Serialize(String),
+    /// The durable file write failed.
+    Write(String),
+    /// The flush / fsync that makes the write durable failed.
+    Flush(String),
+}
+
+impl std::fmt::Display for AuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditError::LockPoisoned => write!(f, "audit lock poisoned"),
+            AuditError::Serialize(e) => write!(f, "audit serialize failed: {e}"),
+            AuditError::Write(e) => write!(f, "audit write failed: {e}"),
+            AuditError::Flush(e) => write!(f, "audit flush/fsync failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AuditError {}
+
 /// Audit log manager
 pub struct AuditLog {
     writer: Option<Mutex<BufWriter<File>>>,
@@ -289,48 +317,80 @@ impl AuditLog {
         })
     }
 
+    /// Wrap an already-opened file handle as the durable writer. Test seam for
+    /// exercising fail-closed on a real write/flush failure (e.g. a read-only fd).
+    #[cfg(test)]
+    pub(crate) fn with_file_handle(file: File) -> Self {
+        Self {
+            writer: Some(Mutex::new(BufWriter::new(file))),
+            log_path: None,
+            echo_stdout: false,
+            memory_buffer: RwLock::new(VecDeque::with_capacity(MAX_MEMORY_EVENTS)),
+        }
+    }
+
     /// Enable/disable echoing to stdout
     pub fn set_echo_stdout(&mut self, echo: bool) {
         self.echo_stdout = echo;
     }
 
-    /// Emit an audit event
-    ///
-    /// This is the ONLY way to create audit records. Capsules cannot call this directly.
-    pub fn emit(&self, event: AuditEvent) {
-        // Store in memory buffer
+    /// Fail-closed write core: record to the in-memory ring and, when a file
+    /// writer is configured, write the event. Every failure becomes an `Err`
+    /// instead of being logged-and-dropped. When `durable`, the write is flushed
+    /// AND fsync'd so durability is honest; non-durable writes flush only (the
+    /// historical best-effort behavior, kept cheap for high-frequency events).
+    fn write_event(&self, event: &AuditEvent, durable: bool) -> Result<(), AuditError> {
         {
-            if let Ok(mut buffer) = self.memory_buffer.write() {
-                if buffer.len() >= MAX_MEMORY_EVENTS {
-                    buffer.pop_front();
-                }
-                buffer.push_back(event.clone());
+            let mut buffer = self
+                .memory_buffer
+                .write()
+                .map_err(|_| AuditError::LockPoisoned)?;
+            if buffer.len() >= MAX_MEMORY_EVENTS {
+                buffer.pop_front();
             }
+            buffer.push_back(event.clone());
         }
 
-        let json = match serde_json::to_string(&event) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!("Audit event serialization failed: {}", e);
-                return;
-            }
-        };
+        let json =
+            serde_json::to_string(event).map_err(|e| AuditError::Serialize(e.to_string()))?;
 
-        // Echo to stdout if enabled
         if self.echo_stdout {
             println!("[AUDIT] {}", json);
         }
 
-        // Write to file if configured
         if let Some(writer) = &self.writer {
-            if let Ok(mut w) = writer.lock() {
-                if let Err(e) = writeln!(w, "{}", json) {
-                    tracing::error!("Audit event write failed: {}", e);
-                }
-                // Flush to ensure durability
-                let _ = w.flush();
+            let mut w = writer.lock().map_err(|_| AuditError::LockPoisoned)?;
+            writeln!(w, "{}", json).map_err(|e| AuditError::Write(e.to_string()))?;
+            // Flush the BufWriter; fsync only for durable (critical) writes so the
+            // durability claim is honest exactly where it is paid for.
+            w.flush().map_err(|e| AuditError::Flush(e.to_string()))?;
+            if durable {
+                w.get_ref()
+                    .sync_all()
+                    .map_err(|e| AuditError::Flush(e.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    /// Emit an audit event, FAIL-OPEN (best-effort).
+    ///
+    /// This is the ONLY way to create audit records. Capsules cannot call this
+    /// directly. On a write failure it logs and drops — appropriate for the many
+    /// non-security events. Security-relevant writes that must fail closed use
+    /// [`AuditLog::emit_critical`].
+    pub fn emit(&self, event: AuditEvent) {
+        if let Err(e) = self.write_event(&event, false) {
+            tracing::error!("Audit event dropped (best-effort): {}", e);
+        }
+    }
+
+    /// Emit a security-relevant audit event, FAIL-CLOSED and durable (G8a).
+    ///
+    /// Returns the write error so the guarded operation can abort instead of
+    /// silently completing when its audit record could not be durably written.
+    pub fn emit_critical(&self, event: AuditEvent) -> Result<(), AuditError> {
+        self.write_event(&event, true)
     }
 
     /// Emit a runtime start event
