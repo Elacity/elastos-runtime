@@ -325,71 +325,26 @@ impl RequestHandler {
         }
     }
 
-    /// Handle GrantCapability request
+    /// Handle GrantCapability request.
+    ///
+    /// Canonical-path enforcement (Principle 10 / G4a): capability grants are
+    /// authorized by exactly ONE path — the approval-gated HTTP handler
+    /// (`/api/capability/grant` -> `approval::decide`). This runtime IPC arm used
+    /// to mint unconditionally after only an `is_shell` check (no consent gate),
+    /// a second authorization path reachable by the shell process. It now mints
+    /// nothing and fails closed; callers must use the approval-gated path.
     async fn handle_grant_capability(
         &self,
-        from: &CapsuleId,
-        capsule_id: &str,
-        resource: &str,
-        action: &str,
-        constraints: CapabilityConstraints,
+        _from: &CapsuleId,
+        _capsule_id: &str,
+        _resource: &str,
+        _action: &str,
+        _constraints: CapabilityConstraints,
     ) -> RuntimeResponse {
-        // Only shell can grant capabilities
-        if !self.is_shell(from).await {
-            return RuntimeResponse::error("unauthorized", "Only shell can grant capabilities");
-        }
-
-        // Input length validation
-        if capsule_id.len() > Self::MAX_CAPSULE_ID_LEN {
-            return RuntimeResponse::error("invalid_input", "capsule_id exceeds maximum length");
-        }
-        if resource.len() > Self::MAX_RESOURCE_LEN {
-            return RuntimeResponse::error("invalid_input", "resource exceeds maximum length");
-        }
-        if Self::has_control_chars(capsule_id) || Self::has_control_chars(resource) {
-            return RuntimeResponse::error("invalid_input", "input contains control characters");
-        }
-
-        // Parse action
-        let action = match action.to_lowercase().as_str() {
-            "read" => Action::Read,
-            "write" => Action::Write,
-            "execute" => Action::Execute,
-            "message" => Action::Message,
-            _ => {
-                return RuntimeResponse::error(
-                    "invalid_action",
-                    format!("Unknown action: {}", action),
-                );
-            }
-        };
-
-        // Convert constraints
-        let internal_constraints = InternalConstraints {
-            epoch: self.capability_manager.current_epoch(),
-            delegatable: constraints.delegatable,
-            max_classification: None,
-            max_uses: constraints.max_uses,
-        };
-
-        // Calculate expiry
-        let expiry = constraints.expiry_secs.map(|secs| {
-            let now = SecureTimestamp::now();
-            SecureTimestamp::at(now.unix_secs + secs)
-        });
-
-        // Grant the capability
-        let token = self.capability_manager.grant(
-            capsule_id,
-            ResourceId::new(resource),
-            action,
-            internal_constraints,
-            expiry,
-        );
-
-        RuntimeResponse::CapabilityGranted {
-            token_id: token.id.to_string(),
-        }
+        RuntimeResponse::error(
+            "unauthorized",
+            "capability grants must use the approval-gated path /api/capability/grant",
+        )
     }
 
     /// Handle RevokeCapability request
@@ -1890,7 +1845,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_grant_capability() {
+    async fn test_runtime_grant_arm_fails_closed() {
+        // G4a (Principle 10): the runtime grant arm mints nothing — the canonical
+        // authorization path is the approval-gated HTTP handler.
         let (handler, shell_id) = create_test_handler().await;
 
         let response = handler
@@ -1906,10 +1863,8 @@ mod tests {
             .await;
 
         match response {
-            RuntimeResponse::CapabilityGranted { token_id } => {
-                assert!(!token_id.is_empty());
-            }
-            _ => panic!("Expected CapabilityGranted response"),
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "unauthorized"),
+            other => panic!("expected unauthorized (arm neutralized), got {other:?}"),
         }
     }
 

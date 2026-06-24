@@ -12,6 +12,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use elastos_common::localhost::{is_supported_resource_scheme, is_system_only_backend_resource};
+use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::{
     pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
     PolicyOutcome, ResourceId, TokenConstraints,
@@ -308,13 +309,29 @@ pub async fn grant_request(
         ));
     }
 
-    // Policy evaluation (observational)
+    // Policy evaluation (observational audit only; the PolicyEvaluator is a
+    // non-authoritative recorder — see KNOWN_GAPS G4/G4b).
     let rationale = input.rationale.as_deref().unwrap_or("Shell auto-grant");
     let _decision = state
         .policy_evaluator
         .evaluate(&request, PolicyOutcome::Grant, rationale);
 
-    // Create the capability token
+    // Canonical consent gate (G4a, Principle 10): the live grant is authorized by
+    // the SAME fail-closed core the preview uses (approval::decide). The
+    // authenticated shell POST (it passed shell_only_middleware and references an
+    // existing pending request) is the explicit approver, so today this resolves
+    // to Approved; routing it THROUGH decide means any future approver source that
+    // yields None / Some(false) fails closed and mints nothing, instead of the old
+    // unconditional mint after a discarded policy run.
+    let mode = approval::required_approval(&[request.action]);
+    if approval::decide(&mode, Some(true)) != ApprovalDecision::Approved {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("capability grant not approved: {}", input.request_id),
+        ));
+    }
+
+    // Create the capability token (reached only on an Approved decision)
     let constraints = match duration {
         GrantDuration::Once => TokenConstraints::new(0, false, None, Some(1)),
         GrantDuration::Session => TokenConstraints::default(),
