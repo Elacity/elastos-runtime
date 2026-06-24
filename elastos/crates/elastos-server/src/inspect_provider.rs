@@ -1137,6 +1137,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_capsules_surface_their_affordances_via_op_path() {
+        // EYES at scale: every capsule in the Flint gap registry must, through the
+        // real inspect op path, surface exactly its declared affordances to an
+        // agent (count matches, each with a known risk class). Keep this list in
+        // step with the elastos-common gap registry.
+        const REGISTRY: &[&str] = &[
+            "capsule-inspector",
+            "documents",
+            "library",
+            "inbox",
+            "chat",
+            "archive-manager",
+            "gba-emulator",
+            "system",
+        ];
+        for capsule in REGISTRY {
+            let path = format!(
+                "{}/../../../capsules/{}/capsule.json",
+                env!("CARGO_MANIFEST_DIR"),
+                capsule
+            );
+            let data = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {capsule} manifest at {path}: {e}"));
+            let manifest: CapsuleManifest =
+                serde_json::from_str(&data).unwrap_or_else(|e| panic!("{capsule} parses: {e}"));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("{capsule} validates: {e}"));
+            let declared: usize = manifest.interfaces.iter().map(|i| i.methods.len()).sum();
+
+            let id = format!("cap_{capsule}");
+            let resp = provider_over(manifest, &id)
+                .send_raw(&json!({ "op": "capsule", "id": id }))
+                .await
+                .unwrap();
+            assert_eq!(resp["status"], "ok", "{capsule}: inspect op failed");
+            let affordances = resp["data"]["affordances"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{capsule}: affordances must be an array"));
+            assert_eq!(
+                affordances.len(),
+                declared,
+                "{capsule}: projected affordances must match declared methods"
+            );
+            for a in affordances {
+                assert!(a["id"].is_string(), "{capsule}: affordance id must be a string");
+                let risk = a["risk"].as_str().unwrap_or("");
+                assert!(
+                    matches!(
+                        risk,
+                        "read" | "write" | "launch" | "payment" | "rights" | "actuator" | "privileged"
+                    ),
+                    "{capsule}: affordance must carry a known risk class, got {risk:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn provenance_is_derived_honestly_not_fabricated() {
         // The signed probe (id is not a DID, no cid): trust is "signed", a
         // signature fingerprint is present, and we never invent a signer DID.
