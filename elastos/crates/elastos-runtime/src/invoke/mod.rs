@@ -26,7 +26,8 @@ use serde_json::Value;
 use crate::capability::token::Action;
 
 /// Why a proposed invocation is rejected before dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InvokeError {
     /// Arguments did not match the declared input `type`.
     InputTypeMismatch { expected: String },

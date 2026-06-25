@@ -66,7 +66,8 @@ pub struct SubGoal<'a> {
 /// Why a goal could not be compiled to a plan. Resolution errors are the new
 /// vocabulary the compiler adds; gate errors are propagated VERBATIM from
 /// [`crate::invoke`] (never re-invented, so a gate is never under-stated).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IntentError {
     /// No declared affordance or provider operation satisfies the goal.
     Unresolvable { operation: String },
@@ -815,5 +816,23 @@ mod tests {
             compile_sequence_discovered(&set, &[]).unwrap_err(),
             IntentError::EmptySequence
         );
+    }
+
+    #[test]
+    fn plan_and_error_serialize_to_shell_agnostic_json() {
+        // The full shell-agnostic data contract: BOTH a success plan AND a failure
+        // serialize to JSON a shell renders without any runtime types in scope.
+        let inspector = shipped("capsule-inspector");
+
+        let plan = compile(&inspector, &intent("list", serde_json::json!({}))).unwrap();
+        let plan_json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(plan_json["composition"], "single_step");
+        assert_eq!(plan_json["steps"][0]["kind"], "affordance");
+        assert_eq!(plan_json["steps"][0]["operation"], "list");
+
+        // The failure path is data too: externally tagged, snake_case variant name.
+        let err = compile(&inspector, &intent("nope", serde_json::json!({}))).unwrap_err();
+        let err_json = serde_json::to_value(&err).unwrap();
+        assert_eq!(err_json["unresolvable"]["operation"], "nope");
     }
 }
