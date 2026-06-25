@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use elastos_common::CapsuleManifest;
+use elastos_common::{CapsuleAffordanceDescriptor, CapsuleManifest, ProviderAuthority};
 
 use crate::invoke::{self, InvocationPlan, InvokeError, ProviderOperationPlan};
 
@@ -129,23 +129,32 @@ pub struct CompiledPlan {
     pub steps: Vec<CompiledStep>,
 }
 
-/// Resolve ONE goal against ONE manifest to a single [`CompiledStep`]. This is the
-/// one canonical resolution + gate-derivation path; both [`compile`] and
-/// [`compile_sequence`] reuse it verbatim.
-///
-/// Precondition: `manifest` is assumed VALIDATED ([`CapsuleManifest::validate`]) --
-/// interface and method ids are unique only after validation, the same implicit
-/// contract `invoke::plan` and the inspector already rely on.
-fn compile_step(
-    manifest: &CapsuleManifest,
-    intent: &StructuredIntent,
-) -> Result<CompiledStep, IntentError> {
-    let op = intent.operation.as_str();
+/// A located capability within ONE manifest: enough to plan it, borrowing into the
+/// manifest so the gate path re-derives nothing. The provider arm carries the matched
+/// authority, so presence is type-level (no re-lookup).
+enum Located<'m> {
+    Affordance {
+        capsule: &'m str,
+        interface: String,
+        method: &'m CapsuleAffordanceDescriptor,
+    },
+    Provider {
+        capsule: &'m str,
+        authority: &'m ProviderAuthority,
+    },
+}
 
-    // Resolve against declared interface affordances by their `operation` field
-    // (NOT their id -- the goal names the capability, not the affordance, so this
-    // is real resolution: "view" finds the method whose operation is "view").
-    let mut affordance_matches = Vec::new();
+/// Every declared affordance or provider operation in ONE manifest that satisfies the
+/// goal (matched by `operation`, narrowed by `resource`). A provider operation counts
+/// as EXACTLY ONE match per manifest even when split across capability blocks
+/// (`plan_provider_operation` re-unions them downstream), so a split-privilege
+/// provider is never falsely reported ambiguous.
+fn locate<'m>(manifest: &'m CapsuleManifest, intent: &StructuredIntent) -> Vec<Located<'m>> {
+    let op = intent.operation.as_str();
+    let mut hits = Vec::new();
+
+    // Interface affordances, matched by their `operation` field (NOT their id -- the
+    // goal names the capability: "view" finds the method whose operation is "view").
     for iface in &manifest.interfaces {
         for method in &iface.methods {
             let op_match = method.operation.as_deref() == Some(op);
@@ -154,60 +163,88 @@ fn compile_step(
                 None => true,
             };
             if op_match && resource_match {
-                affordance_matches.push((iface.id.clone(), method));
+                hits.push(Located::Affordance {
+                    capsule: &manifest.name,
+                    interface: iface.id.clone(),
+                    method,
+                });
             }
         }
     }
 
-    // Resolve against provider operations (the authority's capability blocks). An
-    // operation can span several blocks; `plan_provider_operation` unions them, so
-    // it counts as exactly ONE provider match here.
-    let provider_match = manifest.authority.as_ref().is_some_and(|authority| {
-        authority.capabilities.iter().any(|cap| {
+    // Provider operations: ONE match per manifest (the union across blocks), never one
+    // per block -- else a split-privilege provider would self-collide to ambiguous.
+    if let Some(authority) = manifest.authority.as_ref() {
+        let provider_match = authority.capabilities.iter().any(|cap| {
             let op_match = cap.operations.iter().any(|o| o == op);
             let resource_match = match &intent.resource {
                 Some(r) => &cap.resource == r,
                 None => true,
             };
             op_match && resource_match
-        })
-    });
-
-    let total = affordance_matches.len() + usize::from(provider_match);
-    if total == 0 {
-        return Err(IntentError::Unresolvable {
-            operation: intent.operation.clone(),
         });
-    }
-    if total > 1 {
-        return Err(IntentError::Ambiguous {
-            operation: intent.operation.clone(),
-            matches: total,
-        });
+        if provider_match {
+            hits.push(Located::Provider {
+                capsule: &manifest.name,
+                authority,
+            });
+        }
     }
 
-    // Exactly one match. Delegate gate derivation to the canonical planner and
-    // store its output verbatim; any InvokeError propagates whole (fail-closed).
-    if let Some((interface, method)) = affordance_matches.into_iter().next() {
-        let gate = invoke::plan(method, &intent.args).map_err(IntentError::Gate)?;
-        Ok(CompiledStep::Affordance {
-            capsule: manifest.name.clone(),
+    hits
+}
+
+/// Derive the gate for a located capability, delegating VERBATIM to the canonical
+/// invoke planner. The one gate-derivation path shared by every entry point.
+fn plan_located(located: Located, intent: &StructuredIntent) -> Result<CompiledStep, IntentError> {
+    match located {
+        Located::Affordance {
+            capsule,
             interface,
-            method: method.id.clone(),
+            method,
+        } => {
+            let gate = invoke::plan(method, &intent.args).map_err(IntentError::Gate)?;
+            Ok(CompiledStep::Affordance {
+                capsule: capsule.to_string(),
+                interface,
+                method: method.id.clone(),
+                operation: intent.operation.clone(),
+                gate,
+            })
+        }
+        Located::Provider { capsule, authority } => {
+            let gate = invoke::plan_provider_operation(authority, &intent.operation)
+                .map_err(IntentError::Gate)?;
+            Ok(CompiledStep::Operation {
+                capsule: capsule.to_string(),
+                operation: intent.operation.clone(),
+                gate,
+            })
+        }
+    }
+}
+
+/// Resolve ONE goal against ONE manifest to a single [`CompiledStep`]. This is the one
+/// canonical resolution + gate-derivation path; [`compile`], [`compile_sequence`], and
+/// [`discover`] all reuse it (via [`locate`] / [`plan_located`]) verbatim.
+///
+/// Precondition: `manifest` is assumed VALIDATED ([`CapsuleManifest::validate`]) --
+/// interface and method ids are unique only after validation, the same implicit
+/// contract `invoke::plan` and the inspector already rely on.
+fn compile_step(
+    manifest: &CapsuleManifest,
+    intent: &StructuredIntent,
+) -> Result<CompiledStep, IntentError> {
+    let mut hits = locate(manifest, intent);
+    match hits.len() {
+        0 => Err(IntentError::Unresolvable {
             operation: intent.operation.clone(),
-            gate,
-        })
-    } else {
-        let authority = manifest
-            .authority
-            .as_ref()
-            .expect("a provider match implies the authority is present");
-        let gate = invoke::plan_provider_operation(authority, op).map_err(IntentError::Gate)?;
-        Ok(CompiledStep::Operation {
-            capsule: manifest.name.clone(),
+        }),
+        1 => plan_located(hits.remove(0), intent),
+        n => Err(IntentError::Ambiguous {
             operation: intent.operation.clone(),
-            gate,
-        })
+            matches: n,
+        }),
     }
 }
 
@@ -250,6 +287,39 @@ pub fn compile_sequence(steps: &[SubGoal]) -> Result<CompiledPlan, IntentError> 
         composition: CompositionKind::MultiStep,
         steps: compiled,
     })
+}
+
+/// Discover which capsule in a SET offers the goal, then plan it. Unlike [`compile`]
+/// (which the caller pins to one manifest), `discover` searches the set and makes the
+/// CROSS-CAPSULE decision the single-manifest path cannot: 0 capabilities across the
+/// set -> `Unresolvable`; EXACTLY 1 -> resolve + plan it (the same canonical gate
+/// path); >1 (two capsules each offering the op, OR one capsule offering it
+/// ambiguously) -> `Ambiguous`, NEVER guessing which capsule. Pure: the caller passes
+/// the loaded set (enumerating installed capsules is the server/shell's job). The
+/// `Ambiguous` error reports the operation and aggregate match count, never which
+/// capsules -- the runtime never names a candidate it refuses to pick.
+pub fn discover(
+    manifests: &[&CapsuleManifest],
+    intent: &StructuredIntent,
+) -> Result<CompiledPlan, IntentError> {
+    let mut all: Vec<Located> = manifests
+        .iter()
+        .copied()
+        .flat_map(|manifest| locate(manifest, intent))
+        .collect();
+    match all.len() {
+        0 => Err(IntentError::Unresolvable {
+            operation: intent.operation.clone(),
+        }),
+        1 => Ok(CompiledPlan {
+            composition: CompositionKind::SingleStep,
+            steps: vec![plan_located(all.remove(0), intent)?],
+        }),
+        n => Err(IntentError::Ambiguous {
+            operation: intent.operation.clone(),
+            matches: n,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -536,6 +606,98 @@ mod tests {
         assert_eq!(
             compile_sequence(empty).unwrap_err(),
             IntentError::EmptySequence
+        );
+    }
+
+    #[test]
+    fn discover_resolves_unique_provider_op_across_the_set() {
+        // The caller does NOT name the capsule: discover finds that "release" is
+        // offered only by key-provider out of the whole set, and gates it.
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        let plan = discover(
+            &[&rights, &key, &inspector],
+            &intent("release", serde_json::json!({})),
+        )
+        .expect("'release' is offered only by key-provider");
+        assert_eq!(plan.composition, CompositionKind::SingleStep);
+        match &plan.steps[0] {
+            CompiledStep::Operation {
+                capsule, operation, ..
+            } => {
+                assert_eq!(capsule, "key-provider", "discovered the right capsule");
+                assert_eq!(operation, "release");
+            }
+            other => panic!("expected the key provider op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_resolves_unique_affordance_across_the_set() {
+        // Discovery also resolves an interface affordance: "view" is offered only by
+        // capsule-inspector (an affordance, not a provider op).
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        let plan = discover(
+            &[&rights, &key, &inspector],
+            &intent("view", serde_json::json!({ "target": "capsule:probe" })),
+        )
+        .expect("'view' is offered only by capsule-inspector");
+        match &plan.steps[0] {
+            CompiledStep::Affordance {
+                capsule, method, ..
+            } => {
+                assert_eq!(capsule, "capsule-inspector");
+                assert_eq!(method, "capsule.view");
+            }
+            other => panic!("expected the inspector affordance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_fails_closed_on_cross_capsule_ambiguity() {
+        // The load-bearing cross-capsule decision: "status" is declared by BOTH
+        // rights-provider AND key-provider. N independent compile() calls each succeed
+        // and never see the collision; only discover, summing across the set, fails
+        // closed -- and never guesses which capsule.
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        // Each capsule resolves "status" on its own ...
+        assert!(compile(&rights, &intent("status", serde_json::json!({}))).is_ok());
+        assert!(compile(&key, &intent("status", serde_json::json!({}))).is_ok());
+        // ... but discovering across the set is ambiguous.
+        let err = discover(
+            &[&rights, &key, &inspector],
+            &intent("status", serde_json::json!({})),
+        )
+        .expect_err("two capsules offer 'status' -> ambiguous, never guessed");
+        assert_eq!(
+            err,
+            IntentError::Ambiguous {
+                operation: "status".to_string(),
+                matches: 2
+            }
+        );
+    }
+
+    #[test]
+    fn discover_fails_closed_on_operation_no_capsule_offers() {
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        let err = discover(
+            &[&rights, &key, &inspector],
+            &intent("obliterate", serde_json::json!({})),
+        )
+        .expect_err("no capsule in the set offers it");
+        assert_eq!(
+            err,
+            IntentError::Unresolvable {
+                operation: "obliterate".to_string()
+            }
         );
     }
 }
