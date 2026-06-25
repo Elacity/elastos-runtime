@@ -235,3 +235,85 @@ async fn inspect_capsules_rejects_non_system_app() {
         "non-System app must not inspect"
     );
 }
+
+#[tokio::test]
+async fn discover_is_reachable_by_system_operator() {
+    // discover is a System-scope op: a System-operator token reaches the handler
+    // end-to-end. Over the probe-only fixture the goal is Unresolvable, which is a
+    // NORMAL fail-closed answer (status ok) — proving the route admitted System and
+    // the handler ran.
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/discover")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"intent":{"operation":"release"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("unresolvable"),
+        "discover should run and report unresolvable over the probe-only set: {text}"
+    );
+}
+
+#[tokio::test]
+async fn discover_self_token_cannot_reach_discover() {
+    // The cross-capsule capability map is a System surface: a browser/self token is
+    // blocked at the allow-list (discover is NOT in the self arm).
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/discover")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"intent":{"operation":"release"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a browser/self token must not reach the System discover op"
+    );
+}
+
+#[tokio::test]
+async fn discover_rejects_non_system_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(inspect_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), LIBRARY_CAPSULE_ID).unwrap();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/provider/inspect/discover")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"intent":{"operation":"release"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a non-System app must not reach discover"
+    );
+}

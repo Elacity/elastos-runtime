@@ -1402,7 +1402,11 @@ pub(super) async fn gateway_provider_proxy(
             // gated. `plan` is the read-only invocation preview (no effect).
             // Write ops (e.g. revoke) are intentionally not exposed through the
             // browser proxy.
-            "capsules" | "capsule" | "plan" | "intent" => &[SYSTEM_CAPSULE_ID],
+            // `discover` resolves which capsule offers a goal across the WHOLE
+            // installed set (the cross-capsule capability map), so it is a System-
+            // operator surface, pinned here exactly like capsules/plan/intent and
+            // NEVER added to the `self` arm below.
+            "capsules" | "capsule" | "plan" | "intent" | "discover" => &[SYSTEM_CAPSULE_ID],
             // Self-tier: an app/browser principal may inspect ONLY its own record.
             // Gated to the browser/app principal set (NOT System); the provider's
             // self branch forces target = the authenticated principal.

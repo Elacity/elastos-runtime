@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use elastos_common::{CapsuleAffordanceDescriptor, CapsuleManifest};
 use elastos_runtime::approval;
 use elastos_runtime::inspect::InspectScope;
+use elastos_runtime::intent;
 use elastos_runtime::invoke::{self, InvokeError};
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
@@ -905,6 +906,12 @@ impl InspectProvider {
             // show the fail-closed default decision. Records nothing, dispatches
             // nothing — the "approve" step of the loop, in preview form.
             "intent" => self.handle_intent(request).await,
+            // Cross-capsule discovery (read-only, System scope): resolve WHICH capsule
+            // in the whole installed set offers a goal. Gated to SYSTEM_CAPSULE_ID at
+            // the gateway allow-list; carrier-locked to Admin (deliberately absent from
+            // inspect_op_required_action), so a routine inspect/* Read token cannot
+            // reach the cross-capsule capability map. Dispatches nothing.
+            "discover" => self.handle_discover(request).await,
             other => provider_error("unknown_op", &format!("unknown inspect op: {other}")),
         }
     }
@@ -970,6 +977,54 @@ impl InspectProvider {
                 &format!("authority declares an unknown action \"{action}\""),
             ),
             Err(other) => provider_error("invalid_request", &format!("{other:?}")),
+        }
+    }
+
+    /// Cross-capsule discovery (read-only, System scope): given a StructuredIntent,
+    /// resolve WHICH installed capsule offers that goal across the whole manifest set,
+    /// returning the runtime's CompiledPlan (exactly one match) or IntentError (0 =>
+    /// Unresolvable, >1 => Ambiguous) verbatim as JSON. Unlike `intent`/`plan`, the
+    /// caller supplies NO capsule id -- the runtime makes the cross-capsule resolution
+    /// and Ambiguous decision the single-id ops structurally cannot. Dispatches
+    /// nothing, mutates nothing, writes no audit (a pure preview, like `plan`).
+    async fn handle_discover(&self, request: &Value) -> Value {
+        let intent: intent::StructuredIntent = match request.get("intent").cloned() {
+            Some(value) => match serde_json::from_value(value) {
+                Ok(parsed) => parsed,
+                Err(_) => return provider_error(
+                    "invalid_request",
+                    "inspect/discover requires an \"intent\" object {operation, resource?, args?}",
+                ),
+            },
+            None => {
+                return provider_error(
+                    "invalid_request",
+                    "inspect/discover requires an \"intent\" object",
+                )
+            }
+        };
+        // The manifest SET comes from the source; capsules that did not retain a
+        // manifest are simply not discoverable (filtered out, never erroring the op).
+        // `manifests` owns the values; `refs` borrows it -- both must live to the end
+        // of the handler, so do NOT inline the two steps into a borrow error.
+        let manifests: Vec<CapsuleManifest> = self
+            .source
+            .inspect_list()
+            .await
+            .into_iter()
+            .filter_map(|entry| entry.manifest)
+            .collect();
+        let refs: Vec<&CapsuleManifest> = manifests.iter().collect();
+        match intent::discover(&refs, &intent) {
+            Ok(plan) => json!({ "status": "ok", "data": serde_json::to_value(&plan).ok() }),
+            // Unresolvable/Ambiguous are NORMAL fail-closed ANSWERS (the query
+            // succeeded; the goal does not resolve across the set), NOT transport
+            // errors -- mirroring handle_intent's valid:false precedent. The
+            // IntentError is serialized whole; the handler re-derives no resolution.
+            Err(err) => json!({
+                "status": "ok",
+                "data": { "valid": false, "error": serde_json::to_value(&err).ok() }
+            }),
         }
     }
 
@@ -1200,6 +1255,107 @@ mod tests {
         assert_eq!(resp["data"]["scope"], "system");
         assert_eq!(resp["data"]["capsules"][0]["id"], "cap_probe_1");
         assert_eq!(resp["data"]["capsules"][0]["name"], "probe");
+    }
+
+    fn provider_entry(id: &str, name: &str, resource: &str, ops: &[&str]) -> InspectEntry {
+        let manifest: CapsuleManifest = serde_json::from_value(json!({
+            "schema": "elastos.capsule/v1", "version": "0.1.0", "name": name,
+            "role": "app", "type": "wasm", "entrypoint": "x.wasm",
+            "authority": {
+                "reason": "test provider authority",
+                "capabilities": [
+                    { "resource": resource, "operations": ops, "actions": ["read"] }
+                ],
+                "audit_events": []
+            }
+        }))
+        .expect("provider manifest deserializes");
+        InspectEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: "running".to_string(),
+            capsule_type: "wasm".to_string(),
+            manifest: Some(manifest),
+            cid: None,
+            verified_signer: None,
+        }
+    }
+
+    // A set mirroring the shipped providers: key-provider offers [status, release],
+    // rights-provider offers [status, ...] -- so "status" collides across capsules.
+    fn discover_provider() -> InspectProvider {
+        InspectProvider::new(Arc::new(MockSource {
+            entries: vec![
+                provider_entry(
+                    "cap_key_1",
+                    "key-provider",
+                    "elastos://key/*",
+                    &["status", "release"],
+                ),
+                provider_entry(
+                    "cap_rights_1",
+                    "rights-provider",
+                    "elastos://rights/*",
+                    &["status", "has_access_by_content_id"],
+                ),
+            ],
+        }))
+    }
+
+    #[tokio::test]
+    async fn discover_resolves_a_unique_op_to_its_capsule() {
+        // "release" is offered only by key-provider across the set: discover finds it
+        // (the caller named no capsule) and returns the planned step.
+        let resp = discover_provider()
+            .send_raw(&json!({ "op": "discover", "intent": { "operation": "release" } }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["composition"], "single_step");
+        assert_eq!(resp["data"]["steps"][0]["kind"], "operation");
+        assert_eq!(resp["data"]["steps"][0]["capsule"], "key-provider");
+        assert_eq!(resp["data"]["steps"][0]["operation"], "release");
+    }
+
+    #[tokio::test]
+    async fn discover_reports_cross_capsule_ambiguity_fail_closed() {
+        // "status" is offered by BOTH providers: discover never guesses -- it returns a
+        // fail-closed valid:false Ambiguous answer, the decision a single-id op cannot
+        // make.
+        let resp = discover_provider()
+            .send_raw(&json!({ "op": "discover", "intent": { "operation": "status" } }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], false);
+        assert_eq!(resp["data"]["error"]["ambiguous"]["operation"], "status");
+        assert_eq!(resp["data"]["error"]["ambiguous"]["matches"], 2);
+    }
+
+    #[tokio::test]
+    async fn discover_reports_unresolvable_for_absent_op() {
+        let resp = discover_provider()
+            .send_raw(&json!({ "op": "discover", "intent": { "operation": "obliterate" } }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["data"]["valid"], false);
+        assert_eq!(
+            resp["data"]["error"]["unresolvable"]["operation"],
+            "obliterate"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_a_malformed_intent() {
+        // A missing "intent" object is a transport error (invalid_request), distinct
+        // from a well-formed query whose goal merely does not resolve.
+        let resp = discover_provider()
+            .send_raw(&json!({ "op": "discover" }))
+            .await
+            .unwrap();
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "invalid_request");
     }
 
     #[tokio::test]

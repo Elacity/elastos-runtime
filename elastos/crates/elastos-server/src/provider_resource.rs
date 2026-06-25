@@ -250,6 +250,12 @@ pub fn inspect_op_required_action(op: &str) -> Option<elastos_runtime::capabilit
     match op {
         "capsules" | "capsule" | "self" | "plan" | "intent" => Some(Action::Read),
         "revoke" => Some(Action::Write),
+        // NOTE: `discover` (cross-capsule resolution) is DELIBERATELY unmapped. It is a
+        // System-operator surface reached only through the System-pinned gateway
+        // allow-list, never the carrier capability path. Leaving it unmapped makes
+        // `required_action_for` fall through to its `Admin` default, so a routine
+        // `inspect/*` Read token cannot drive it over the carrier (fail-closed). Do
+        // NOT add it here unless you intend to open carrier reachability.
         _ => None,
     }
 }
@@ -531,6 +537,11 @@ mod tests {
         assert_eq!(inspect_op_required_action("revoke"), Some(Action::Write));
         // Unknown ops are not silently mapped — fail-closed at the caller.
         assert_eq!(inspect_op_required_action("nope"), None);
+        // `discover` is deliberately unmapped: it is a System-gateway-only op, so it
+        // must fall through to the Admin default and stay carrier-locked. Pinning this
+        // stops a future edit from silently opening carrier reachability of the
+        // cross-capsule capability map.
+        assert_eq!(inspect_op_required_action("discover"), None);
     }
 
     #[test]

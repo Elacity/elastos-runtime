@@ -1343,6 +1343,84 @@ mod tests {
         assert_eq!(denied["response"]["code"], "missing_token");
     }
 
+    #[tokio::test]
+    async fn carrier_inspect_discover_is_admin_locked() {
+        // The cross-capsule capability map (op=discover) is a System-gateway-only
+        // surface. Over the CARRIER it is fail-closed: required_action_for("discover")
+        // is the Admin default (discover is deliberately absent from
+        // inspect_op_required_action), so a routine inspect/* Read token -- the SAME
+        // grant that DOES reach op=capsules -- is denied for discover BEFORE the
+        // provider runs. discover does not inherit the existing System inspect ops'
+        // carrier reachability.
+        use crate::inspect_provider::{CatalogInspectSource, InspectProvider, InspectSource};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let capsule_dir = tmp.path().join("capsules").join("probe");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "probe",
+                "role": "app", "type": "wasm", "entrypoint": "probe.wasm"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics,
+        ));
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let source: Arc<dyn InspectSource> = Arc::new(CatalogInspectSource::new(
+            tmp.path().join("capsules"),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register(Arc::new(InspectProvider::new(source)))
+            .await;
+
+        // The SAME inspect/* Read grant that reaches op=capsules above.
+        let token = encode_bridge_capability_token(&capability_manager.grant(
+            "test-capsule",
+            ResourceId::new("elastos://inspect/*"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        ));
+
+        let ctx = Some(BridgeContext {
+            provider_registry: registry,
+            capability_manager: capability_manager.clone(),
+            pending_store: Arc::new(
+                elastos_runtime::capability::pending::PendingRequestStore::new(audit_log),
+            ),
+            capsule_id: "test-capsule".to_string(),
+            principal_id: None,
+            data_dir: None,
+        });
+
+        let line = serde_json::json!({
+            "id": 1,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://inspect/discover",
+                "operation": "discover",
+                "token": token,
+            }
+        })
+        .to_string();
+        let resp = handle_request(&line, &ctx).await.unwrap();
+        // Denied at the capability gate (Admin required, Read held) — the provider
+        // never runs, the capability map is never disclosed.
+        assert_eq!(resp["response"]["type"], "error");
+        assert_eq!(resp["response"]["code"], "capability_denied");
+    }
+
     // MERGE TRIPWIRE. For every inspect op the product provider serves, a token
     // minted at the *canonical* action (provider_resource::inspect_op_required_action)
     // must pass the carrier capability gate and reach the provider. Today our gate
