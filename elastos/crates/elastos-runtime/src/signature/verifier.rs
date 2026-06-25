@@ -141,7 +141,17 @@ fn build_signing_message(manifest: &CapsuleManifest, content_hash: &[u8]) -> Res
     let mut manifest_for_hash = manifest.clone();
     manifest_for_hash.signature = None;
 
-    let manifest_json = serde_json::to_string(&manifest_for_hash).map_err(|e| {
+    // Canonicalize the signed form (AUD-1): round-trip through serde_json::Value so
+    // EVERY object key serializes in deterministic sorted order. The manifest's
+    // `providers` is a HashMap whose iteration order is process-random, so a direct
+    // to_string would sign in one process and FALSE-FAIL verification in another for
+    // any capsule with >=2 providers. serde_json::Value's object map is a sorted
+    // BTreeMap (preserve_order is off in this workspace), so to_value -> to_string is
+    // a stable canonical form used identically by sign and verify.
+    let manifest_value = serde_json::to_value(&manifest_for_hash).map_err(|e| {
+        ElastosError::InvalidManifest(format!("Failed to serialize manifest: {}", e))
+    })?;
+    let manifest_json = serde_json::to_string(&manifest_value).map_err(|e| {
         ElastosError::InvalidManifest(format!("Failed to serialize manifest: {}", e))
     })?;
 
@@ -222,6 +232,38 @@ mod tests {
             viewer: None,
             signature: None,
         }
+    }
+
+    #[test]
+    fn signed_manifest_with_multiple_providers_verifies_across_serialization() {
+        // AUD-1 determinism: `providers` is a HashMap (process-random iteration order).
+        // The signed form is canonicalized (sorted keys), so a manifest signed in one
+        // process verifies after a serialize -> deserialize round-trip (the real
+        // sign-in-trust_cmd / verify-at-launch boundary), even with many providers.
+        let (signing_key, verifying_key) = generate_keypair();
+        let mut manifest = create_test_manifest();
+        let mut providers = std::collections::HashMap::new();
+        for k in ["zeta", "alpha", "mike", "bravo", "yankee", "delta"] {
+            providers.insert(k.to_string(), format!("vm-{k}"));
+        }
+        manifest.providers = Some(providers);
+        let content_hash = hash_content(b"entrypoint bytes");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+
+        // Cross-process boundary: serialize the signed manifest and deserialize a FRESH
+        // copy (a new HashMap whose iteration order may differ from the signer's).
+        let json = serde_json::to_string(&manifest).unwrap();
+        let reparsed: CapsuleManifest = serde_json::from_str(&json).unwrap();
+
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(verifying_key);
+        assert_eq!(
+            verifier
+                .verify_capsule_signer(&reparsed, &content_hash)
+                .unwrap(),
+            Some(verifying_key),
+            "a multi-provider signed manifest must verify after a serialize/deserialize round-trip"
+        );
     }
 
     // ── Flint G2 (loop 3a): verified-signer capability ───────────────
