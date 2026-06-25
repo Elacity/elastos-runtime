@@ -818,10 +818,13 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 // Create a pending request — the shell decides whether to grant.
                 let pending = ctx
                     .pending_store
-                    .create_request(
+                    .create_request_with_capsule(
                         elastos_runtime::session::SessionId(ctx.capsule_id.clone()),
                         resource_id.clone(),
                         action,
+                        // The carrier already knows the real capsule identity
+                        // ("vm-{name}"); record it on the request (G-ID interim).
+                        Some(ctx.capsule_id.clone()),
                     )
                     .await;
                 let request_id = pending.id.to_string();

@@ -1001,7 +1001,12 @@ impl Supervisor {
                 // Mint a fresh Capsule token via the session registry
                 match &self.session_registry {
                     Some(reg) => {
-                        let session = reg.create_session(SessionType::Capsule, None).await;
+                        // G-ID: carry the real capsule identity ("vm-{name}", the
+                        // same string the carrier gate uses at supervisor.rs:1099)
+                        // on the session, so the grant path can record it.
+                        let session = reg
+                            .create_session(SessionType::Capsule, Some(format!("vm-{}", name)))
+                            .await;
                         Some(session.token)
                     }
                     None => {
@@ -1187,7 +1192,10 @@ impl Supervisor {
             env_vars.push(("ELASTOS_API".into(), format!("http://{api_addr}")));
         }
         if let Some(reg) = &self.session_registry {
-            let session = reg.create_session(SessionType::Capsule, None).await;
+            // G-ID: carry the real capsule identity ("vm-{name}") on the session.
+            let session = reg
+                .create_session(SessionType::Capsule, Some(format!("vm-{}", name)))
+                .await;
             env_vars.push(("ELASTOS_TOKEN".into(), session.token));
         }
 

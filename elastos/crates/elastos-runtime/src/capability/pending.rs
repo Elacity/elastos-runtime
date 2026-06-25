@@ -125,6 +125,11 @@ pub struct PendingCapabilityRequest {
 
     /// Current status
     pub status: RequestStatus,
+
+    /// The requester's real capsule identity (the carrier "vm-{name}"), recorded
+    /// at request time (G-ID interim) so the eventual grant can mint at it instead
+    /// of the session-id shim. `None` when the session has no capsule identity.
+    pub requester_capsule_id: Option<String>,
 }
 
 impl PendingCapabilityRequest {
@@ -146,6 +151,7 @@ impl PendingCapabilityRequest {
             requested_at,
             expires_at,
             status: RequestStatus::Pending,
+            requester_capsule_id: None,
         }
     }
 
@@ -225,6 +231,22 @@ impl PendingRequestStore {
         resource: ResourceId,
         action: Action,
     ) -> PendingCapabilityRequest {
+        self.create_request_with_capsule(session_id, resource, action, None)
+            .await
+    }
+
+    /// Like [`create_request`], but records the requester's real capsule identity
+    /// (the carrier "vm-{name}") on the pending request so the eventual grant can
+    /// mint at it instead of the session-id shim (G-ID interim). Recorded only; no
+    /// gate reads it yet. `None` when the session has no capsule identity (a bare
+    /// shell), recorded honestly rather than fabricated.
+    pub async fn create_request_with_capsule(
+        &self,
+        session_id: SessionId,
+        resource: ResourceId,
+        action: Action,
+        requester_capsule_id: Option<String>,
+    ) -> PendingCapabilityRequest {
         // Capacity guard: evict expired if at limit
         {
             let count = self.requests.read().await.len();
@@ -278,12 +300,13 @@ impl PendingRequestStore {
             }
         }
 
-        let request = PendingCapabilityRequest::new(
+        let mut request = PendingCapabilityRequest::new(
             session_id.clone(),
             resource.clone(),
             action,
             self.timeout_secs,
         );
+        request.requester_capsule_id = requester_capsule_id;
 
         // Store request
         {
@@ -1030,5 +1053,37 @@ mod tests {
             "the signed approval record must verify on the chain"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn create_request_with_capsule_records_requester_identity() {
+        // G-ID interim: the requester's real capsule identity is recorded on the
+        // pending request when present, and left None (not fabricated) when absent.
+        let audit = Arc::new(AuditLog::new());
+        let pending = PendingRequestStore::new(audit);
+
+        let with_id = pending
+            .create_request_with_capsule(
+                SessionId::new(),
+                ResourceId::new("elastos://rights/x"),
+                Action::Read,
+                Some("vm-market".to_string()),
+            )
+            .await;
+        assert_eq!(
+            with_id.requester_capsule_id.as_deref(),
+            Some("vm-market"),
+            "the real capsule identity is recorded on the request"
+        );
+
+        // The plain delegator records None -- honest absence, no shim/fabrication.
+        let without = pending
+            .create_request(
+                SessionId::new(),
+                ResourceId::new("elastos://rights/x"),
+                Action::Read,
+            )
+            .await;
+        assert_eq!(without.requester_capsule_id, None);
     }
 }

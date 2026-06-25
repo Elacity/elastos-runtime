@@ -108,7 +108,7 @@ pub async fn request_capability(
 
     let request = state
         .pending_store
-        .create_request(session.id.clone(), resource, action)
+        .create_request_with_capsule(session.id.clone(), resource, action, session.vm_id.clone())
         .await;
 
     // If pre-denied (e.g. rate limit), surface the denial immediately
@@ -797,6 +797,36 @@ mod tests {
                 audit_log,
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn request_capability_records_requester_capsule_identity() {
+        // G-ID interim: an HTTP capsule request records the session's real capsule
+        // identity (vm_id = "vm-{name}", which the supervisor now populates) on the
+        // pending request, so the eventual grant can mint at it. No gate changes yet.
+        let state = test_state();
+        let out = request_capability(
+            State(state.clone()),
+            Extension(Session::new_capsule("vm-market".to_string())),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/has".to_string(),
+                action: "read".to_string(),
+            }),
+        )
+        .await
+        .expect("request accepted")
+        .0;
+        let request_id = out.request_id.expect("a pending request id");
+        let request = state
+            .pending_store
+            .get_request(&request_id)
+            .await
+            .expect("request stored");
+        assert_eq!(
+            request.requester_capsule_id.as_deref(),
+            Some("vm-market"),
+            "the HTTP path records the session's capsule identity on the request"
+        );
     }
 
     #[tokio::test]
