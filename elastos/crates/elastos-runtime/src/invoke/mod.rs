@@ -42,7 +42,7 @@ pub enum InvokeError {
 /// The validated plan for an invocation: the capability action it requires,
 /// whether it needs approval, and how it must be audited. Derived entirely from
 /// the affordance metadata — a dispatcher MUST enforce all three.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InvocationPlan {
     pub capability_action: Action,
     pub approval: AffordanceApprovalMode,
@@ -132,7 +132,7 @@ pub fn plan(
 /// their powers). It dispatches nothing; it answers "what authority would this
 /// ask for?" straight from the manifest, so the preview can never under-state a
 /// gate the runtime would later enforce.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderOperationPlan {
     /// Every capability resource URI the operation acts on (e.g. `elastos://key/*`).
     /// Surfaced as the union across *all* capability blocks that declare the
