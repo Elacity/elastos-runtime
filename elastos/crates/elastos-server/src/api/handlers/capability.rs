@@ -530,8 +530,20 @@ pub async fn revoke_capability(
                 .revoke(*token.id(), "Revoked by user via API")
                 .await;
 
-            // Mark the request as revoked in the pending store
-            state.pending_store.revoke_request(&request_id).await;
+            // Mark the request as revoked in the pending store, fail-closed on the
+            // audit record (AUD-3): the token is already revoked above, but if the
+            // revocation cannot be durably+signed attested we surface it rather than
+            // returning success with a lost record.
+            state
+                .pending_store
+                .revoke_request(&request_id)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("revocation could not be attested: {e}"),
+                    )
+                })?;
 
             Ok(Json(RevokeCapabilityOutput {
                 success: true,
@@ -575,17 +587,28 @@ pub async fn revoke_all_capabilities(
     State(state): State<CapabilityState>,
     Extension(_session): Extension<Session>, // Shell check done by middleware
     Json(input): Json<RevokeAllInput>,
-) -> Json<RevokeAllOutput> {
+) -> Result<Json<RevokeAllOutput>, (StatusCode, String)> {
     let new_epoch = state.capability_manager.revoke_all(&input.reason);
 
-    // Mark all granted requests as revoked
-    state.pending_store.revoke_all_granted().await;
+    // Mark all granted requests as revoked, fail-closed on the audit records (AUD-3):
+    // the epoch increment above already invalidated the tokens, but an incomplete
+    // attestation is surfaced rather than silently lost.
+    state
+        .pending_store
+        .revoke_all_granted()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("epoch advanced but revocation attestation failed: {e}"),
+            )
+        })?;
 
-    Json(RevokeAllOutput {
+    Ok(Json(RevokeAllOutput {
         success: true,
         new_epoch,
         reason: input.reason,
-    })
+    }))
 }
 
 // === Session Info ===

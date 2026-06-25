@@ -543,53 +543,62 @@ impl PendingRequestStore {
             .collect()
     }
 
-    /// Mark a granted request as revoked
+    /// Mark a granted request as revoked, FAIL-CLOSED on its audit record (AUD-3).
     ///
-    /// This changes the status to Denied with reason "Revoked"
-    pub async fn revoke_request(&self, request_id: &str) {
+    /// Changes the status to Denied with reason "Revoked". Mirrors `deny_request`:
+    /// the revocation's signed record is written durably BEFORE the status mutation,
+    /// and the revocation aborts (status unchanged) if that durable write fails.
+    /// `emit_best_effort` here was fail-OPEN and would silently lose the record.
+    /// A non-granted / unknown request is a no-op (revoke stays idempotent).
+    pub async fn revoke_request(&self, request_id: &str) -> Result<(), String> {
         let mut requests = self.requests.write().await;
         if let Some(request) = requests.get_mut(request_id) {
             if request.is_granted() {
-                request.status = RequestStatus::Denied {
-                    reason: "Revoked by user".to_string(),
-                };
-
-                // Audit
-                self.audit_log.emit_best_effort(
-                    crate::primitives::audit::AuditEvent::CapabilityDenied {
+                self.audit_log
+                    .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
                         timestamp: SecureTimestamp::now(),
                         request_id: request_id.to_string(),
                         session_id: request.session_id.to_string(),
                         reason: "Revoked by user".to_string(),
-                    },
-                );
+                    })
+                    .map_err(|e| format!("audit write failed, revocation aborted: {e}"))?;
+
+                request.status = RequestStatus::Denied {
+                    reason: "Revoked by user".to_string(),
+                };
             }
         }
+        Ok(())
     }
 
-    /// Mark all granted requests as revoked
+    /// Mark all granted requests as revoked, FAIL-CLOSED on each audit record (AUD-3).
     ///
-    /// Called when epoch is advanced to revoke all capabilities
-    pub async fn revoke_all_granted(&self) {
+    /// Called when the epoch is advanced. Each revocation's signed record is written
+    /// durably BEFORE its status mutation; the bulk aborts on the first write failure
+    /// (returning Err), so every request whose status is flipped HAS a durable record
+    /// and an incomplete attestation is loudly surfaced rather than silently lost. The
+    /// epoch increment (the real enforcement) has already invalidated the tokens.
+    pub async fn revoke_all_granted(&self) -> Result<(), String> {
         let mut requests = self.requests.write().await;
         let now = SecureTimestamp::now();
 
         for (request_id, request) in requests.iter_mut() {
             if request.is_granted() {
-                request.status = RequestStatus::Denied {
-                    reason: "Epoch advanced - all capabilities revoked".to_string(),
-                };
-
-                self.audit_log.emit_best_effort(
-                    crate::primitives::audit::AuditEvent::CapabilityDenied {
+                self.audit_log
+                    .emit(crate::primitives::audit::AuditEvent::CapabilityDenied {
                         timestamp: now,
                         request_id: request_id.clone(),
                         session_id: request.session_id.to_string(),
                         reason: "Epoch advanced - all capabilities revoked".to_string(),
-                    },
-                );
+                    })
+                    .map_err(|e| format!("audit write failed, bulk revocation aborted: {e}"))?;
+
+                request.status = RequestStatus::Denied {
+                    reason: "Epoch advanced - all capabilities revoked".to_string(),
+                };
             }
         }
+        Ok(())
     }
 }
 
@@ -985,6 +994,94 @@ mod tests {
                 crate::primitives::audit::AuditEvent::CapabilityDenied { .. }
             )),
             "the denial event must be recorded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn revoke_request_fails_closed_when_audit_write_fails() {
+        // AUD-3: a read-only audit makes the durable write fail — the revocation must
+        // abort and the request must stay Granted, never silently completing with a
+        // lost record (the exact mirror of deny_request_fails_closed_when_audit_write_fails).
+        let path = unique_tmp("revoke-ro");
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let audit = Arc::new(AuditLog::with_file_handle(ro));
+        let pending = PendingRequestStore::new(audit);
+
+        let req = pending
+            .create_request(
+                SessionId::new(),
+                ResourceId::new("localhost://Users/self/Documents/x"),
+                Action::Read,
+            )
+            .await;
+        let token = CapabilityToken::new(
+            "test-capsule".to_string(),
+            [0u8; 32],
+            ResourceId::new("localhost://Users/self/Documents/x"),
+            Action::Read,
+            Default::default(),
+            SecureTimestamp::now(),
+            None,
+        );
+        pending
+            .grant_request(req.id.as_str(), token, GrantDuration::Session)
+            .await
+            .unwrap();
+
+        let res = pending.revoke_request(req.id.as_str()).await;
+        assert!(
+            res.is_err(),
+            "revoke must fail closed when its durable audit write fails"
+        );
+        let after = pending.get_request(req.id.as_str()).await.unwrap();
+        assert!(
+            after.is_granted(),
+            "request must stay Granted when its revocation audit write fails"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn revoke_request_succeeds_and_records_with_working_audit() {
+        // Companion: with a working sink the revoke commits AND records — proving the
+        // fail-closed path triggers on real failure only, not always.
+        let path = unique_tmp("revoke-ok");
+        let audit = Arc::new(AuditLog::with_file(&path).unwrap());
+        let pending = PendingRequestStore::new(audit.clone());
+
+        let req = pending
+            .create_request(
+                SessionId::new(),
+                ResourceId::new("localhost://Users/self/Documents/x"),
+                Action::Read,
+            )
+            .await;
+        let token = CapabilityToken::new(
+            "test-capsule".to_string(),
+            [0u8; 32],
+            ResourceId::new("localhost://Users/self/Documents/x"),
+            Action::Read,
+            Default::default(),
+            SecureTimestamp::now(),
+            None,
+        );
+        pending
+            .grant_request(req.id.as_str(), token, GrantDuration::Session)
+            .await
+            .unwrap();
+
+        let res = pending.revoke_request(req.id.as_str()).await;
+        assert!(res.is_ok(), "revoke succeeds with a working audit sink");
+        let after = pending.get_request(req.id.as_str()).await.unwrap();
+        assert!(matches!(after.status, RequestStatus::Denied { .. }));
+        assert!(
+            audit.recent_events(50).iter().any(|e| matches!(
+                e,
+                crate::primitives::audit::AuditEvent::CapabilityDenied { .. }
+            )),
+            "the revocation event must be recorded"
         );
         let _ = std::fs::remove_file(&path);
     }
