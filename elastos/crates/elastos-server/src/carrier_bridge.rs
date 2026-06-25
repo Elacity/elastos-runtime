@@ -1437,6 +1437,247 @@ mod tests {
         }
     }
 
+    // G3 (act leg): the gate the agent is SHOWN in preview must equal the gate the
+    // carrier actually ENFORCES when the SAME provider operation is dispatched and
+    // executed. Preview (invoke::plan_provider_operation over the manifest's
+    // authority) and enforcement (provider_resource::required_action_for, the
+    // carrier verb map) are two DISJOINT derivations with no shared function, so
+    // proving them equal through a REAL executed dispatch closes the "shown one
+    // gate, a different one enforced" hazard. Target: rights-provider's read-only
+    // `has_access_by_content_id` (key-free, fund-free, engine-free). An in-process
+    // rights provider lets an authorized dispatch actually reach execution.
+    struct RightsOkProvider;
+
+    #[async_trait::async_trait]
+    impl elastos_runtime::provider::Provider for RightsOkProvider {
+        async fn handle(
+            &self,
+            _r: elastos_runtime::provider::ResourceRequest,
+        ) -> Result<
+            elastos_runtime::provider::ResourceResponse,
+            elastos_runtime::provider::ProviderError,
+        > {
+            Err(elastos_runtime::provider::ProviderError::Provider(
+                "test rights provider answers via send_raw only".into(),
+            ))
+        }
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["rights"]
+        }
+        fn name(&self) -> &'static str {
+            "test-rights-ok"
+        }
+        async fn send_raw(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<serde_json::Value, elastos_runtime::provider::ProviderError> {
+            Ok(serde_json::json!({ "status": "ok", "allowed": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_rights_op_gate_enforces_exactly_the_previewed_action() {
+        use crate::inspect_provider::{CatalogInspectSource, InspectProvider, InspectSource};
+        use crate::provider_resource::build_capability_resource;
+
+        // Seed the rights-provider authority into a catalog tempdir so the inspect
+        // `plan` preview reflects the manifest the runtime ships.
+        let tmp = tempfile::tempdir().unwrap();
+        let capsule_dir = tmp.path().join("capsules").join("rights-provider");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "rights-provider",
+                "role": "provider", "type": "microvm", "entrypoint": "rootfs.ext4",
+                "provides": "elastos://rights/*",
+                "authority": {
+                    "reason": "test",
+                    "capabilities": [{
+                        "resource": "elastos://rights/*",
+                        "actions": ["read"],
+                        "operations": ["has_access_by_content_id"]
+                    }],
+                    "audit_events": ["rights.status"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let audit_log = Arc::new(elastos_runtime::primitives::audit::AuditLog::new());
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit_log.clone(),
+            metrics,
+        ));
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let source: Arc<dyn InspectSource> = Arc::new(CatalogInspectSource::new(
+            tmp.path().join("capsules"),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register(Arc::new(InspectProvider::new(source)))
+            .await;
+        // In-process rights provider so an AUTHORIZED dispatch actually executes.
+        registry.register(Arc::new(RightsOkProvider)).await;
+
+        let ctx = Some(BridgeContext {
+            provider_registry: registry,
+            capability_manager: capability_manager.clone(),
+            pending_store: Arc::new(
+                elastos_runtime::capability::pending::PendingRequestStore::new(audit_log),
+            ),
+            capsule_id: "test-capsule".to_string(),
+            principal_id: None,
+            data_dir: None,
+        });
+
+        // 1. PREVIEW (executed through the carrier): the action the agent is SHOWN
+        //    for has_access_by_content_id, read out of a real `plan` dispatch.
+        let preview_token = encode_bridge_capability_token(&capability_manager.grant(
+            "test-capsule",
+            ResourceId::new("elastos://inspect/*"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        ));
+        let plan_line = serde_json::json!({
+            "id": 1,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://inspect/plan",
+                "operation": "plan",
+                "token": preview_token,
+                "body": { "id": "capsule:rights-provider", "operation": "has_access_by_content_id" }
+            }
+        })
+        .to_string();
+        let preview = handle_request(&plan_line, &ctx).await.unwrap();
+        assert_eq!(preview["response"]["type"], "carrier_result");
+        assert_eq!(
+            preview["response"]["result"]["data"]["capability_actions"],
+            serde_json::json!(["read"]),
+            "preview must surface the manifest-declared action for the op: {preview}"
+        );
+
+        // The carrier derives the SAME resource for the dispatched op; grant at it
+        // exactly so the gate's resource check matches and the ONLY variable is the
+        // action (so a denial below is provably action-driven, not resource-driven).
+        let rights_resource =
+            build_capability_resource("rights", "has_access_by_content_id", &serde_json::json!({}))
+                .expect("rights op resource builds");
+
+        // 2. ENFORCE / ALLOW (executed): a token sized to the PREVIEWED action
+        //    (Read) clears the gate for the ACTUAL op — required_action_for(
+        //    has_access_by_content_id) = Read — and REACHES the provider. The
+        //    executed dispatch is the rights op itself, so the gate enforced is
+        //    that op's gate, NOT the `plan` gate.
+        let allow_token = encode_bridge_capability_token(&capability_manager.grant(
+            "test-capsule",
+            ResourceId::new(&rights_resource),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        ));
+        let allow_line = serde_json::json!({
+            "id": 2,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://rights/access/has_access_by_content_id",
+                "operation": "has_access_by_content_id",
+                "token": allow_token,
+            }
+        })
+        .to_string();
+        let allowed = handle_request(&allow_line, &ctx).await.unwrap();
+        assert_eq!(allowed["response"]["type"], "carrier_result");
+        assert_eq!(
+            allowed["response"]["result"]["status"], "ok",
+            "a token sized to the previewed action must pass the enforced gate AND reach the provider: {allowed}"
+        );
+
+        // 3. ENFORCE / FAIL-CLOSED (executed, action-isolated): a token one action
+        //    OFF (Write) at the SAME matching resource is denied BEFORE the provider
+        //    — proving the denial is action-driven, and that only the exact
+        //    previewed action passes (exact-equality gate, no action hierarchy).
+        let wrong_token = encode_bridge_capability_token(&capability_manager.grant(
+            "test-capsule",
+            ResourceId::new(&rights_resource),
+            Action::Write,
+            TokenConstraints::default(),
+            None,
+        ));
+        let deny_line = serde_json::json!({
+            "id": 3,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://rights/access/has_access_by_content_id",
+                "operation": "has_access_by_content_id",
+                "token": wrong_token,
+            }
+        })
+        .to_string();
+        let denied = handle_request(&deny_line, &ctx).await.unwrap();
+        assert_eq!(
+            denied["response"]["code"], "capability_denied",
+            "resource matches, so the denial is purely the action inequality (Write != Read): {denied}"
+        );
+    }
+
+    // Conformance pin: for EVERY operation the shipped rights-provider manifest
+    // declares, the PREVIEW action set (the real invoke::plan_provider_operation
+    // derivation over the manifest authority) must equal the action the carrier
+    // gate enforces (provider_resource::required_action_for). These are two
+    // hand-written, independent tables with NO shared function (agreement is
+    // by-convention today). This converts that convention into an enforced
+    // invariant: add an op whose declared actions diverge from the verb map and
+    // this fails LOUDLY. Only the ACTION dimension is pinned; the manifest's
+    // elastos://rights/* resource and the per-op carrier resource diverge by
+    // construction and are tracked as a separate gap.
+    #[test]
+    fn rights_fixture_preview_actions_match_verb_map() {
+        use crate::provider_resource::required_action_for;
+        use elastos_common::CapsuleManifest;
+        use elastos_runtime::invoke::plan_provider_operation;
+
+        let manifest: CapsuleManifest = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../capsules/rights-provider/capsule.json"
+        )))
+        .expect("rights-provider manifest parses");
+        let authority = manifest
+            .authority
+            .expect("rights-provider declares provider authority");
+
+        // Enumerate WHATEVER the fixture declares (not a hand-copied op list) so a
+        // newly-added op is auto-covered by the pin.
+        let mut ops: Vec<String> = authority
+            .capabilities
+            .iter()
+            .flat_map(|cap| cap.operations.iter().cloned())
+            .collect();
+        ops.sort();
+        ops.dedup();
+        assert!(!ops.is_empty(), "rights fixture declares at least one op");
+
+        for op in &ops {
+            let plan = plan_provider_operation(&authority, op)
+                .unwrap_or_else(|e| panic!("preview failed for op {op}: {e:?}"));
+            // Full action SET (a union, never just [0]) so a future multi-action
+            // block cannot pass by matching only the first element.
+            let mut previewed: Vec<String> = plan.actions.iter().map(|a| a.to_string()).collect();
+            previewed.sort();
+            let enforced = vec![required_action_for(op).to_string()];
+            assert_eq!(
+                previewed, enforced,
+                "op {op}: previewed gate {previewed:?} must equal the carrier-enforced action {enforced:?}"
+            );
+        }
+    }
+
     #[test]
     fn carrier_invoke_dispatch_uses_uri_resource_contract() {
         let dispatch = carrier_invoke_dispatch(
