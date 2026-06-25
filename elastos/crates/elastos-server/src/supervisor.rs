@@ -22,6 +22,7 @@ use crate::vm_provider::VmCapsuleProvider;
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::{SessionRegistry, SessionType};
+use elastos_runtime::signature::{hash_content, SignatureVerifier};
 
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.
@@ -203,8 +204,59 @@ pub struct Supervisor {
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
+    /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
+    /// trusted keys), in which case the gate skips and launches are byte-for-byte
+    /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
+    signature_verifier: SignatureVerifier,
     /// Optional running gateway server task.
     gateway: Arc<RwLock<Option<RunningGateway>>>,
+}
+
+/// AUD-1 author-signature launch gate, FAIL-CLOSED WHEN CONFIGURED. With no trusted
+/// keys (the default) it logs a warning and allows the launch — byte-for-byte today's
+/// behavior, zero breakage. With >=1 trusted key it REFUSES (returns Err, before boot)
+/// a capsule that is unsigned OR whose signature matches no trusted key. Uses the same
+/// canonical content-hash domain as `trust_cmd` signing (`SHA256(manifest_without_sig)
+/// || hash_content(entrypoint bytes)`), so it never false-denies a legitimately-signed
+/// capsule (the sign and verify domains are byte-identical — see `signature/verifier.rs`).
+/// A pure, sync, VM-free function so the gate is unit-testable without a crosvm boot.
+fn gate_author_signature(
+    verifier: &SignatureVerifier,
+    capsule_dir: &Path,
+    manifest: &elastos_common::CapsuleManifest,
+) -> Result<()> {
+    if !verifier.is_enabled() {
+        tracing::warn!(
+            "author-signature verification skipped for '{}' (no trusted keys configured)",
+            manifest.name
+        );
+        return Ok(());
+    }
+    if manifest.signature.is_none() {
+        bail!(
+            "capsule '{}' is unsigned but trusted keys are configured; refusing launch",
+            manifest.name
+        );
+    }
+    let entrypoint_path = capsule_dir.join(&manifest.entrypoint);
+    let content = std::fs::read(&entrypoint_path).with_context(|| {
+        format!(
+            "failed to read entrypoint {} for the signature gate",
+            manifest.entrypoint
+        )
+    })?;
+    let content_hash = hash_content(&content);
+    if !verifier
+        .verify_capsule(manifest, &content_hash)
+        .map_err(|e| anyhow::anyhow!("signature verification error for '{}': {e}", manifest.name))?
+    {
+        bail!(
+            "capsule '{}' signature does not match any trusted key; refusing launch",
+            manifest.name
+        );
+    }
+    tracing::info!("author signature verified for '{}'", manifest.name);
+    Ok(())
 }
 
 impl Supervisor {
@@ -375,6 +427,7 @@ impl Supervisor {
             provider_registry: None,
             capability_manager: None,
             pending_store: None,
+            signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
     }
@@ -412,6 +465,14 @@ impl Supervisor {
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     ) {
         self.pending_store = Some(pending_store);
+    }
+
+    /// Seed the author-signature launch gate with trusted keys (AUD-1). Called at
+    /// serve time from the config `trusted_keys`. An empty verifier (the default)
+    /// leaves the gate inert (launches unchanged); a non-empty one makes
+    /// [`gate_author_signature`] refuse unsigned / wrong-signer capsules before boot.
+    pub fn set_signature_verifier(&mut self, verifier: SignatureVerifier) {
+        self.signature_verifier = verifier;
     }
 
     /// Handle a supervisor request from the shell.
@@ -910,6 +971,11 @@ impl Supervisor {
                 .launch_carrier_service(name, &capsule_dir, &manifest, config)
                 .await;
         }
+
+        // AUD-1: author-signature gate (VM path). Fail-closed when trusted keys are
+        // configured, skips (warns) when none are. Runs BEFORE the KVM check and the
+        // overlay copy, so it hashes the signed base entrypoint in capsule_dir.
+        gate_author_signature(&self.signature_verifier, &capsule_dir, &manifest)?;
 
         // VM path — hard require KVM
         if !elastos_crosvm::is_supported() {
@@ -2084,5 +2150,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    // ── AUD-1: the author-signature launch gate ─────────────────────
+    use elastos_runtime::signature::{generate_keypair, sign_capsule, SigningKey};
+
+    fn aud1_signed_capsule(
+        signing_key: &SigningKey,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, elastos_common::CapsuleManifest) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.wasm"), bytes).unwrap();
+        let mut manifest: elastos_common::CapsuleManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "probe",
+                "role": "app", "type": "wasm", "entrypoint": "main.wasm"
+            }))
+            .unwrap();
+        let content_hash = hash_content(bytes);
+        sign_capsule(signing_key, &mut manifest, &content_hash).unwrap();
+        (dir, manifest)
+    }
+
+    #[test]
+    fn aud1_gate_trusted_signed_capsule_passes() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(gate_author_signature(&verifier, dir.path(), &manifest).is_ok());
+    }
+
+    #[test]
+    fn aud1_gate_foreign_signed_capsule_refused() {
+        let (sk, _vk) = generate_keypair();
+        let (_, trusted_vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(trusted_vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a capsule signed by a non-trusted key must be refused"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_unsigned_capsule_refused_when_configured() {
+        let (sk, vk) = generate_keypair();
+        let (dir, mut manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        manifest.signature = None;
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "an unsigned capsule must be refused when trusted keys are configured"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_empty_verifier_passes_as_today() {
+        let (sk, _vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let verifier = SignatureVerifier::new();
+        let mut unsigned = manifest.clone();
+        unsigned.signature = None;
+        assert!(gate_author_signature(&verifier, dir.path(), &manifest).is_ok());
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &unsigned).is_ok(),
+            "with zero trusted keys the gate is inert (zero breakage)"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_tampered_entrypoint_refused() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"original rootfs");
+        std::fs::write(dir.path().join("main.wasm"), b"TAMPERED rootfs").unwrap();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a tampered entrypoint must fail the signature gate"
+        );
     }
 }

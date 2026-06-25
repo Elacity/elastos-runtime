@@ -27,7 +27,7 @@ pub async fn run_serve(
     if !subordinate_host {
         elastos_server::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "serve");
     }
-    let (_runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
+    let (runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
     if is_first_run {
         crate::print_first_run_welcome(&data_dir);
     }
@@ -422,6 +422,19 @@ pub async fn run_serve(
             s.set_provider_registry(infra.provider_registry.clone());
             s.set_capability_manager(infra.capability_manager.clone());
             s.set_pending_store(infra.pending_store.clone());
+            // AUD-1: seed the author-signature launch gate from config `trusted_keys`.
+            // Empty by default (gate inert, launches byte-for-byte unchanged); a
+            // malformed hex key aborts serve startup LOUDLY (fail-closed at boot) rather
+            // than dropping it and leaving a partial/empty keyset that fails open.
+            let mut verifier = elastos_runtime::signature::SignatureVerifier::new();
+            for key_hex in runtime_config.effective_trusted_keys() {
+                verifier.add_trusted_key_hex(&key_hex).map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid trusted_keys entry in runtime config (refusing to start): {e}"
+                    )
+                })?;
+            }
+            s.set_signature_verifier(verifier);
             Some(Arc::new(s))
         } else {
             None
