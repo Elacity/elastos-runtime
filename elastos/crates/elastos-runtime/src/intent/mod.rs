@@ -289,6 +289,32 @@ pub fn compile_sequence(steps: &[SubGoal]) -> Result<CompiledPlan, IntentError> 
     })
 }
 
+/// Resolve ONE goal across a SET of manifests to a single [`CompiledStep`]: the
+/// cross-capsule core shared by [`discover`] and [`compile_sequence_discovered`]. 0
+/// across the set -> `Unresolvable`; exactly 1 -> plan it (the canonical gate path); >1
+/// -> `Ambiguous`, never guessing which capsule. A provider op is ONE match per
+/// manifest (see [`locate`]), so a split-privilege provider is never falsely ambiguous.
+fn discover_step(
+    manifests: &[&CapsuleManifest],
+    intent: &StructuredIntent,
+) -> Result<CompiledStep, IntentError> {
+    let mut all: Vec<Located> = manifests
+        .iter()
+        .copied()
+        .flat_map(|manifest| locate(manifest, intent))
+        .collect();
+    match all.len() {
+        0 => Err(IntentError::Unresolvable {
+            operation: intent.operation.clone(),
+        }),
+        1 => plan_located(all.remove(0), intent),
+        n => Err(IntentError::Ambiguous {
+            operation: intent.operation.clone(),
+            matches: n,
+        }),
+    }
+}
+
 /// Discover which capsule in a SET offers the goal, then plan it. Unlike [`compile`]
 /// (which the caller pins to one manifest), `discover` searches the set and makes the
 /// CROSS-CAPSULE decision the single-manifest path cannot: 0 capabilities across the
@@ -302,24 +328,38 @@ pub fn discover(
     manifests: &[&CapsuleManifest],
     intent: &StructuredIntent,
 ) -> Result<CompiledPlan, IntentError> {
-    let mut all: Vec<Located> = manifests
-        .iter()
-        .copied()
-        .flat_map(|manifest| locate(manifest, intent))
-        .collect();
-    match all.len() {
-        0 => Err(IntentError::Unresolvable {
-            operation: intent.operation.clone(),
-        }),
-        1 => Ok(CompiledPlan {
-            composition: CompositionKind::SingleStep,
-            steps: vec![plan_located(all.remove(0), intent)?],
-        }),
-        n => Err(IntentError::Ambiguous {
-            operation: intent.operation.clone(),
-            matches: n,
-        }),
+    Ok(CompiledPlan {
+        composition: CompositionKind::SingleStep,
+        steps: vec![discover_step(manifests, intent)?],
+    })
+}
+
+/// Compile an ORDERED sequence of goals where each step is DISCOVERED across the SET
+/// (the caller does not pin a manifest per step, unlike [`compile_sequence`]). Each
+/// step is discovered + planned in order; FAIL-CLOSED and atomic: the first step that
+/// is `Unresolvable`/`Ambiguous`/`Gate(..)` aborts the WHOLE compile with
+/// `IntentError::Step { index, source }` carrying the failing index -- no partial plan.
+/// Empty -> `EmptySequence`. The steps are independently discovered + gated (cross-step
+/// dataflow binding is deferred, as in [`compile_sequence`]).
+pub fn compile_sequence_discovered(
+    manifests: &[&CapsuleManifest],
+    intents: &[StructuredIntent],
+) -> Result<CompiledPlan, IntentError> {
+    if intents.is_empty() {
+        return Err(IntentError::EmptySequence);
     }
+    let mut compiled = Vec::with_capacity(intents.len());
+    for (index, intent) in intents.iter().enumerate() {
+        let step = discover_step(manifests, intent).map_err(|source| IntentError::Step {
+            index,
+            source: Box::new(source),
+        })?;
+        compiled.push(step);
+    }
+    Ok(CompiledPlan {
+        composition: CompositionKind::MultiStep,
+        steps: compiled,
+    })
 }
 
 #[cfg(test)]
@@ -698,6 +738,82 @@ mod tests {
             IntentError::Unresolvable {
                 operation: "obliterate".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn compile_sequence_discovered_resolves_each_step_across_the_set() {
+        // Each step is DISCOVERED across the set (the caller pins no manifest): a key
+        // release THEN an inspector view, in order, as one MultiStep plan.
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        let set = [&rights, &key, &inspector];
+        let plan = compile_sequence_discovered(
+            &set,
+            &[
+                intent("release", serde_json::json!({})),
+                intent("view", serde_json::json!({ "target": "capsule:probe" })),
+            ],
+        )
+        .expect("both goals discover uniquely across the set");
+        assert_eq!(plan.composition, CompositionKind::MultiStep);
+        assert_eq!(plan.steps.len(), 2);
+        match &plan.steps[0] {
+            CompiledStep::Operation {
+                capsule, operation, ..
+            } => {
+                assert_eq!(capsule, "key-provider");
+                assert_eq!(operation, "release");
+            }
+            other => panic!("step 0 should be the discovered key op, got {other:?}"),
+        }
+        match &plan.steps[1] {
+            CompiledStep::Affordance {
+                capsule, method, ..
+            } => {
+                assert_eq!(capsule, "capsule-inspector");
+                assert_eq!(method, "capsule.view");
+            }
+            other => panic!("step 1 should be the discovered inspector affordance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_sequence_discovered_fails_closed_on_ambiguous_step() {
+        // A cross-capsule-ambiguous step ("status", offered by both providers) fails
+        // the WHOLE sequence with its index -- no partial plan, never a guess.
+        let rights = shipped("rights-provider");
+        let key = shipped("key-provider");
+        let inspector = shipped("capsule-inspector");
+        let set = [&rights, &key, &inspector];
+        let err = compile_sequence_discovered(
+            &set,
+            &[
+                intent("release", serde_json::json!({})),
+                intent("status", serde_json::json!({})),
+            ],
+        )
+        .expect_err("the ambiguous 'status' step fails the whole sequence");
+        assert_eq!(
+            err,
+            IntentError::Step {
+                index: 1,
+                source: Box::new(IntentError::Ambiguous {
+                    operation: "status".to_string(),
+                    matches: 2
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn compile_sequence_discovered_rejects_empty() {
+        let rights = shipped("rights-provider");
+        let set = [&rights];
+        assert_eq!(
+            compile_sequence_discovered(&set, &[]).unwrap_err(),
+            IntentError::EmptySequence
         );
     }
 }
