@@ -2241,4 +2241,280 @@ mod tests {
             .unwrap()
             .contains("local runtime data directory"));
     }
+
+    // The FIVE-BEAT LOOP turning ONCE over the crown-jewel rights op
+    // `has_access_by_content_id`, on ONE shared file-backed SIGNED audit chain:
+    // PLAN (preview the gate from the manifest) -> CONSENT (the REAL request ->
+    // grant_request records a fail-closed signed CapabilityApproved, then mints a
+    // token) -> ACT (that real token clears the carrier gate and executes against a
+    // mock rights provider, recording CapabilityUse) -> AUDIT (the on-disk signed
+    // chain re-verifies; consent + act are present on the ring).
+    //
+    // Honesty scope: only the CONSENT beat is fail-closed (CapabilityApproved via
+    // emit+?). CapabilityRequested / CapabilityGrant / CapabilityUse are best-effort
+    // (they land + verify on a healthy sink; asserted by PRESENCE, not fail-closed).
+    // The real minted token validates because THIS test owns one session and binds
+    // the carrier capsule_id to that session's id; it does NOT exercise the
+    // production divergence (an HTTP session UUID vs a VM carrier's `vm-{name}`
+    // never match) -- retiring that capsule_id shim is a separate runtime-capsule
+    // identity task, not claimed here.
+    #[tokio::test]
+    async fn five_beat_loop_turns_once_on_one_signed_chain_over_a_real_consent_token() {
+        use crate::api::handlers::capability::{
+            grant_request, request_capability, CapabilityState, GrantRequestInput,
+            RequestCapabilityInput,
+        };
+        use crate::inspect_provider::{CatalogInspectSource, InspectProvider, InspectSource};
+        use crate::provider_resource::build_capability_resource;
+        use axum::extract::State;
+        use axum::{Extension, Json};
+        use elastos_runtime::session::Session;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let capsule_dir = tmp.path().join("capsules").join("rights-provider");
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "rights-provider",
+                "role": "provider", "type": "microvm", "entrypoint": "rootfs.ext4",
+                "provides": "elastos://rights/*",
+                "authority": {
+                    "reason": "test",
+                    "capabilities": [{
+                        "resource": "elastos://rights/*",
+                        "actions": ["read"],
+                        "operations": ["has_access_by_content_id"]
+                    }],
+                    "audit_events": ["rights.status"]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // ONE shared, file-backed SIGNED audit chain for the whole loop.
+        let audit = Arc::new(
+            elastos_runtime::primitives::audit::AuditLog::with_file(tmp.path().join("audit.log"))
+                .unwrap(),
+        );
+        let store = Arc::new(elastos_runtime::capability::CapabilityStore::new());
+        let metrics = Arc::new(elastos_runtime::primitives::metrics::MetricsManager::new());
+        // ONE shared manager (ONE signing key, so the minted token validates on the
+        // same key the gate checks) + ONE shared pending store, both off one chain.
+        let capability_manager = Arc::new(elastos_runtime::capability::CapabilityManager::new(
+            store,
+            audit.clone(),
+            metrics,
+        ));
+        let pending_store =
+            Arc::new(elastos_runtime::capability::pending::PendingRequestStore::new(audit.clone()));
+        let registry = Arc::new(elastos_runtime::provider::ProviderRegistry::new());
+        let source: Arc<dyn InspectSource> = Arc::new(CatalogInspectSource::new(
+            tmp.path().join("capsules"),
+            Arc::downgrade(&registry),
+        ));
+        registry
+            .register(Arc::new(InspectProvider::new(source)))
+            .await;
+        registry.register(Arc::new(RightsOkProvider)).await;
+
+        // The CONSENT-layer handler state and the ACT-layer bridge share the SAME
+        // manager + pending store + signed chain.
+        let cap_state = CapabilityState {
+            pending_store: pending_store.clone(),
+            capability_manager: capability_manager.clone(),
+            policy_evaluator: Arc::new(elastos_runtime::capability::PolicyEvaluator::new(
+                Box::new(elastos_runtime::capability::evaluator::ShellPassthroughVerifier),
+                audit.clone(),
+            )),
+        };
+
+        // ONE session; the test owns its id and binds the carrier to it.
+        let requester = Session::new_capsule("rights-app".to_string());
+        let capsule_id = requester.id.to_string();
+        let bridge = Some(BridgeContext {
+            provider_registry: registry,
+            capability_manager: capability_manager.clone(),
+            pending_store: pending_store.clone(),
+            capsule_id: capsule_id.clone(),
+            principal_id: None,
+            data_dir: None,
+        });
+
+        // The capability resource the carrier enforces for this op; request + grant
+        // at exactly this so the minted token validates at the gate.
+        let rights_resource =
+            build_capability_resource("rights", "has_access_by_content_id", &serde_json::json!({}))
+                .expect("rights op resource builds");
+
+        // BEAT 1 -- PLAN: the gate is previewed from the manifest (read-only, no row).
+        let plan_token = encode_bridge_capability_token(&capability_manager.grant(
+            &capsule_id,
+            ResourceId::new("elastos://inspect/*"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        ));
+        let plan_line = serde_json::json!({
+            "id": 1,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://inspect/plan",
+                "operation": "plan",
+                "token": plan_token,
+                "body": { "id": "capsule:rights-provider", "operation": "has_access_by_content_id" }
+            }
+        })
+        .to_string();
+        let preview = handle_request(&plan_line, &bridge).await.unwrap();
+        assert_eq!(
+            preview["response"]["result"]["data"]["capability_actions"],
+            serde_json::json!(["read"]),
+            "PLAN: the previewed gate is derived from the manifest: {preview}"
+        );
+
+        // BEAT 2 -- CONSENT: request -> the REAL grant_request records a signed,
+        // fail-closed CapabilityApproved BEFORE minting the token.
+        let req_out = request_capability(
+            State(cap_state.clone()),
+            Extension(requester.clone()),
+            Json(RequestCapabilityInput {
+                resource: rights_resource.clone(),
+                action: "read".to_string(),
+            }),
+        )
+        .await
+        .expect("request accepted")
+        .0;
+        assert_eq!(req_out.status, "pending", "request is pending: {req_out:?}");
+        let request_id = req_out.request_id.expect("a pending request id");
+
+        let grant_out = grant_request(
+            State(cap_state.clone()),
+            Extension(requester.clone()),
+            Json(GrantRequestInput {
+                request_id,
+                duration: "session".to_string(),
+                rationale: Some("e2e shell approval".to_string()),
+            }),
+        )
+        .await
+        .expect("grant approved + attested")
+        .0;
+        assert!(grant_out.success, "consent granted: {grant_out:?}");
+        let token = grant_out.token.expect("the consent path minted a token");
+
+        // The PLAN dispatch above was itself a gated carrier call and already
+        // recorded one CapabilityUse; capture that baseline so the ACT can be
+        // attributed exactly one MORE use (a delta, not an absolute count).
+        let uses_before_act = audit
+            .recent_events_filtered(50, Some("capability_use"))
+            .len();
+
+        // BEAT 3 -- ACT: the REAL consent token clears the carrier gate for the op
+        // and EXECUTES against the mock rights provider.
+        let act_line = serde_json::json!({
+            "id": 2,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://rights/access/has_access_by_content_id",
+                "operation": "has_access_by_content_id",
+                "token": token,
+            }
+        })
+        .to_string();
+        let acted = handle_request(&act_line, &bridge).await.unwrap();
+        assert_eq!(acted["response"]["type"], "carrier_result");
+        assert_eq!(
+            acted["response"]["result"]["status"], "ok",
+            "ACT: the real consent token clears the gate and reaches the provider: {acted}"
+        );
+
+        // BEAT 4 -- AUDIT, two distinct surfaces asserted SEPARATELY:
+        // (a) the in-memory ring holds the consent + act decisions,
+        let approved = audit.recent_events_filtered(50, Some("capability_approved"));
+        assert_eq!(
+            approved.len(),
+            1,
+            "CONSENT recorded exactly once (CapabilityApproved)"
+        );
+        assert_eq!(
+            audit
+                .recent_events_filtered(50, Some("capability_use"))
+                .len(),
+            uses_before_act + 1,
+            "ACT recorded exactly one new CapabilityUse"
+        );
+        // (b) the on-disk SIGNED chain independently re-verifies every signature.
+        use ed25519_dalek::VerifyingKey;
+        let hex = audit.verifying_key_hex().expect("signed chain has a key");
+        let bytes: [u8; 32] = hex::decode(&hex).unwrap().try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&bytes).unwrap();
+        assert!(
+            audit.verify_chain(Some(&vk)).is_ok(),
+            "AUDIT: the on-disk signed chain re-verifies"
+        );
+
+        // Negative control: a token minted via the SAME real consent path but for
+        // action Write (same session, same resource) is DENIED at the carrier for
+        // the Read op -- and the denial is itself honestly attested as a FAILED
+        // CapabilityUse (success=false), so the chain records refusals, not just
+        // grants (no silent drop, no spurious success).
+        let req2 = request_capability(
+            State(cap_state.clone()),
+            Extension(requester.clone()),
+            Json(RequestCapabilityInput {
+                resource: rights_resource.clone(),
+                action: "write".to_string(),
+            }),
+        )
+        .await
+        .expect("write request accepted")
+        .0;
+        let grant2 = grant_request(
+            State(cap_state.clone()),
+            Extension(requester.clone()),
+            Json(GrantRequestInput {
+                request_id: req2.request_id.expect("write request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("write grant attested")
+        .0;
+        let write_token = grant2.token.expect("write token minted");
+        let denied_line = serde_json::json!({
+            "id": 3,
+            "request": {
+                "type": "carrier_invoke",
+                "uri": "elastos://rights/access/has_access_by_content_id",
+                "operation": "has_access_by_content_id",
+                "token": write_token,
+            }
+        })
+        .to_string();
+        let denied = handle_request(&denied_line, &bridge).await.unwrap();
+        assert_eq!(
+            denied["response"]["code"], "capability_denied",
+            "a Write token is denied for the Read op (action-isolated): {denied}"
+        );
+        let has_failed_use = audit
+            .recent_events_filtered(50, Some("capability_use"))
+            .iter()
+            .any(|e| {
+                matches!(
+                    e,
+                    elastos_runtime::primitives::audit::AuditEvent::CapabilityUse {
+                        success: false,
+                        ..
+                    }
+                )
+            });
+        assert!(
+            has_failed_use,
+            "the denied act is attested as a failed CapabilityUse (success=false)"
+        );
+    }
 }
