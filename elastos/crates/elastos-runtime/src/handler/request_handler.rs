@@ -947,7 +947,7 @@ impl RequestHandler {
 
         // Audit who drove the revoke (the revoke itself is also audited by the
         // capability manager).
-        self._audit_log.emit(AuditEvent::Custom {
+        self._audit_log.emit_best_effort(AuditEvent::Custom {
             event_type: "inspect.revoke".to_string(),
             details: serde_json::json!({ "caller": from.as_str(), "token_id": token_id }),
         });
@@ -1000,7 +1000,7 @@ impl RequestHandler {
         use crate::primitives::audit::AuditEvent;
 
         if !scope.can_view(from.as_str(), target) {
-            self._audit_log.emit(AuditEvent::Custom {
+            self._audit_log.emit_best_effort(AuditEvent::Custom {
                 event_type: "inspect.out_of_scope".to_string(),
                 details: serde_json::json!({ "caller": from.as_str(), "target": target }),
             });

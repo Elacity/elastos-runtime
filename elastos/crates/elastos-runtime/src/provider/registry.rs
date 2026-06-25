@@ -468,6 +468,12 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "decrypt",
     "availability",
     "block-graph",
+    // dDRM producer spine (Create portal): in-boundary CEK escrow + on-chain mint assembly.
+    "encrypt",
+    "publish",
+    // Media packaging (Create portal, video/audio): ffmpeg transcode -> DASH-fragment ->
+    // PLAINTEXT segments + metadata. Holds NO key material (CENC + escrow stay in `encrypt`).
+    "media",
 ];
 
 /// Registry of providers

@@ -126,6 +126,159 @@ The provider plane should expose typed questions instead:
 - `elastos://decrypt/session/open`
 - `elastos://decrypt/render`
 
+## Pixel-Lock Secure Rendering (documents)
+
+Some content types must never reach the browser as their source file — a PDF handed to
+the browser is a raw, re-extractable, unwatermarked copy (and browsers like Brave block
+`blob:`/`data:` PDFs in iframes anyway). For these, the runtime uses a **pixel-lock**
+tier (PC2 `ddrm-renderer` parity): the asset is rasterised to flattened, buyer-watermarked
+page **images** *inside the decrypt boundary*, and only those images egress.
+
+- Renderer placement: the `decrypt-provider` capsule (feature `pdf-render`), NOT the
+  trusted core. It uses pure-Rust rasterisers — `hayro` (PDF, `#![forbid(unsafe_code)]`),
+  `resvg`/`tiny-skia` (SVG), `image` (raster + JPEG encode), `zip` (CBZ archive), and
+  `ab_glyph` + vendored DejaVu fonts (anti-aliased body text — proportional for prose, mono
+  for code — AND the faint tiled forensic watermark, same vector face). The trusted core gains
+  no render code — it only routes bytes (Principle 5/13).
+- Containment: the `StreamSegment` op takes an optional `render` directive; when present
+  for a pixel-lock mime, the boundary extracts the object from the decrypted fragment and
+  returns a watermarked JPEG (`rendered_b64` + `total_pages`) — never the raw bytes. The
+  recovered CEK stays in-VM and the plaintext document never leaves the sandbox.
+- Fail-closed: a non-pixel-lock mime, an unparseable object, or a render error returns an
+  error with no bytes (Principle 11). There is **one canonical path** per mime — the raw
+  `/bytes` egress is refused for pixel-lock sessions (Principle 10).
+- Resource bounds (bound-before-you-allocate): a creator controls the source file, so every
+  raster decode and rasterisation is bounded BEFORE allocating, to stop a tiny crafted "pixel
+  bomb" from forcing a multi-GB allocation in the boundary. Raster decode (single image + CBZ
+  pages) runs through `decode_bounded` with strict `image::Limits` (max dims `MAX_DIM`, max
+  alloc `MAX_DECODE_BYTES`); the PDF rasteriser bounds its scale on both axes and by area
+  (`MAX_PIXELS`) with a final predicted-size guard; CBZ caps each page and the archive total
+  (which also bounds warm session memory). Not yet bounded: per-format decode *time* (a
+  CPU-pathological but small file) — a wall-clock/watchdog follow-up, called out, not assumed.
+- Browser contract (served by `elastos-server`, routing only):
+  - `GET /api/viewers/ddrm-viewer/object/{session}` → manifest adds
+    `pixel_locked: true`, `total_pages`, `page_content_type`.
+  - `GET /api/viewers/ddrm-viewer/object/{session}/page?n=N` → one rendered page (content type =
+    the manifest's `page_content_type`: `image/jpeg` for pixel-lock, `text/html` for an EPUB
+    chapter) + `X-Asset-Pages`/`X-Asset-Page` headers.
+  - `GET …/object/{session}/bytes` → `403` for render-locked (pixel-lock + html-lock) sessions;
+    decrypt-passthrough assets (3D `model/*`) are served here.
+- Watermark (two layers, both carrying the SAME identity — `wallet · content · time`, where
+  `wallet` is the FULL owner EVM address recovered from the wallet-signed access grant, `content`
+  the short on-chain content id, and `time` the UTC open-minute):
+  1. **Visible**: stamped diagonally + tiled across every page (forensic provenance, uncroppable),
+     rendered in the anti-aliased DejaVu mono face at low opacity (a quiet caption, not the old
+     blocky bitmap).
+  2. **Invisible** (`render/invisible.rs`): a blind **DCT-domain QIM** stamp embedded in luminance
+     under perceptual masking (flat white margins left pristine). Each 8×8 block carries one bit in
+     the parity of `round((A−B)/STEP)` for two symmetric mid-band coefficients `A=(1,2)`, `B=(2,1)`;
+     QIM (vs a fixed margin) bounds the per-block nudge so a high-contrast block can never end up
+     carrying the wrong bit. To keep the codeword recoverable from CONTENT-SPARSE pages (a short
+     snippet on a mostly-empty page), the invisible layer carries a COMPACT, self-describing payload
+     framed as `SYNC|LEN|DATA|CRC-16` (232-bit period), raster-tiled and majority-vote folded. On a
+     production (grant-bearing) open `DATA` is the **authenticated anchor** `[wallet_prefix(4) +
+     grant_digest(16)]` (21 B ≤ the 24-byte cap, so the period is unchanged); on a no-grant/local-dev
+     open it falls back to the compact 20-byte wallet. Either way a LEAKED frame stays attributable
+     even if the visible mark is cropped/painted out — but it is a **tracer with non-repudiation, not
+     tamper-proof evidence**, and (production case) the invisible layer no longer reveals the full
+     wallet — only a digest that *commits to* it (see *Forensic strength & privacy* below).
+     Recovers through our q85 encode, moderate recompression, brightness/contrast shifts,
+     same-resolution screenshots, and vertical offsets; does NOT survive rescaling/rotation/
+     width-changing crops (a geometric-sync layer is future work). NB "same-resolution screenshot"
+     means a 1:1 pixel-grid capture — a HiDPI/Retina screenshot resamples (≈2× upscale), which is
+     rescaling, so it falls under the unsupported case and generally will NOT recover; most
+     real-world screenshots on HiDPI displays are out of envelope. Validated end-to-end against the
+     actual rendered text AND (sparse) code pages, not just synthetic images. Offline read:
+     `decrypt-provider --extract-watermark <image> [--verify-grant <grant.json>]` — prints the wallet
+     prefix + grant digest (or the `0x…` wallet for a legacy compact mark) and, given a candidate
+     grant, reports MATCH / NO MATCH by recomputing via the shared `grant_watermark_digest16`.
+- **Fail closed**: the single pixel-lock egress (`watermark::finalize`) and the HTML-lock egress
+  (EPUB) both REFUSE to emit a protected page without a non-empty forensic stamp — no identity, no
+  image. There is no code path that emits protected pixels without a traceable mark.
+- **Forensic strength & privacy (honest scope — state it exactly, like the threat model does).** Two
+  things this watermark is deliberately NOT:
+  1. **Authenticated (non-repudiable), but not yet unforgeable by a third party.** The invisible
+     layer embeds an **authenticated grant digest** — `ddrm_envelope::grant_watermark_digest16` =
+     SHA-256 of the buyer's wallet-signed delegation signature, truncated to 16 bytes — alongside a
+     4-byte wallet prefix (a 21-byte payload, ≤ the 24-byte cap, so sparse-page recovery is
+     unchanged). This gives **non-repudiation** — only the buyer's own wallet signature reproduces
+     that digest — and raises forgery from *"anyone can plant any wallet"* to *"only a party holding
+     the victim's signed grant can."* It is **not** the full anti-framing guarantee: the delegation
+     signature is not a hard secret (it transits the recover flow), so whoever obtains a victim's
+     grant could still replant it; the frame `SYNC|LEN|DATA|CRC` still uses a CRC for frame
+     *integrity*, not authenticity. Treat the mark as a **strong tracer with non-repudiation**, not
+     yet court-grade against a determined framer. North-star upgrade: a **server-key MAC**, or an
+     **opaque token resolved via the custody log**, so no identity-derived value rides in the mark at
+     all. The authenticated, tamper-evident system-of-record remains the hash-chained, signed
+     **custody audit log** ([THREAT_MODEL.md](THREAT_MODEL.md) §4), which also retains the grant
+     digest (minimized — option C) so a leaked frame can be *verified* against a candidate grant.
+  2. **Not anonymous (the visible layer).** The **visible** stamp embeds the **full** opening wallet
+     (human-readable); the **invisible** layer carries only the 4-byte prefix + grant digest, not the
+     full wallet. So anyone who sees a rendered page — a screenshot, a screen-share, a photo, a leaked
+     frame — recovers the buyer's on-chain identity **from the visible mark**. This is the deliberate
+     trade: leak-attribution in exchange for buyer anonymity at view time
+     ([THREAT_MODEL.md](THREAT_MODEL.md) §3, §6).
+
+Pixel-lock covers, per renderer in `decrypt-provider/src/render`:
+- `application/pdf` → `pdf` (multi-page, `hayro`)
+- `application/vnd.comicbook+zip`, `application/x-cbz` → `cbz` (multi-page, natural page order)
+- `text/plain`, `text/markdown` (prose) → `text` (multi-page **light reading reader**: a real
+  anti-aliased PROPORTIONAL vector face (DejaVu Sans via `ab_glyph`) on a warm page with line
+  leading, true measured-width word-wrap and full Unicode — smart quotes/dashes/accents render as
+  themselves — rasterised so source can't be copied)
+- source-code mimes (`application/json`, `application/javascript`, `application/xml`,
+  `application/x-yaml`, `application/toml`, `application/x-sh`) → `code` (multi-page **dark code
+  view**: anti-aliased fixed-pitch face (DejaVu Sans Mono via `ab_glyph`) with a line-number gutter
+  + conservative per-language colour for comments/strings/numbers/XML tags, base16-ocean theme —
+  mirrors PC2 `render::code` intent)
+- `image/svg+xml` → `svg` (rasterised to pixels — SVG is scriptable XML, never shipped raw)
+- other `image/*` → `image_page` (single page, re-encoded so source file + EXIF is stripped)
+
+A second render-lock variant, **html-lock**, serves reflowable EPUB without rasterising:
+- `application/epub+zip`, `application/epub` → `epub` (one "page" per spine chapter). The boundary
+  reads the EPUB ZIP, resolves the OPF spine order (`roxmltree`), and for each chapter emits a
+  **sanitised, self-contained HTML document** (scripts/styles/handlers/dangerous tags stripped,
+  `javascript:` URLs neutralised, images inlined as `data:` URIs, our reader CSS + a tiled
+  forensic watermark + `user-select:none` + a strict CSP `<meta>`). The page is served with
+  `page_content_type: text/html; charset=utf-8` **and an enforced HTTP `Content-Security-Policy`
+  response header carrying a `sandbox` directive** (`default-src 'none'; … ; sandbox`), plus
+  `X-Content-Type-Options: nosniff` — so the document is sandboxed **at the resource level by the
+  browser even if loaded directly or framed without the attribute** (no script, no same-origin, no
+  network, no form post). The viewer additionally renders it in a `sandbox=""` iframe. The
+  containment order is now: **enforced HTTP CSP `sandbox` (true layer) ▸ inline `<meta>` CSP +
+  iframe attribute (belt) ▸ the hand-rolled sanitiser (defence-in-depth)** — the sanitiser is no
+  longer the sole barrier. The raw EPUB ZIP never egresses (`/bytes` is refused like any
+  render-lock asset). This mirrors PC2's `EpubRenderer` html-lock tier rather than a pixel-lock
+  rasterise.
+
+The single source of truth for the render-locked set is `render::is_pixel_lock` (covers pixel-lock
+**and** html-lock mimes); the media-authority helper (`scripts/dev/ddrm-media-authority/src/quorum.rs`)
+mirrors it and the two must stay in sync (Principle 12). The `page_content_type` is decided by the
+renderer (`RenderSession::page_content_type` → `image/jpeg` or `text/html`) and threaded through the
+helper descriptor to the viewer. Office docs remain tracked in `docs/ASSET_TIERS.md`.
+
+3D (`model/*`: glTF/GLB/STL/OBJ) is NOT render-locked — it is **decrypt-passthrough** (Tier 5):
+the boundary decrypts the mesh and serves the cleartext bytes via `/bytes`, which the `ddrm-viewer`
+renders with a **bundled, local Three.js** WebGL viewer (no CDN, vendored under the capsule's
+`/vendor`). Like PC2's 3D path, the cleartext mesh reaches the browser; frames are not watermarked
+yet (see `docs/ASSET_TIERS.md` North star 2 for the render-only-containment upgrade).
+
+Audio/video are NOT pixel-lock — they take the stream-decrypt rail (DASH/CENC + MSE);
+`viewer_open::is_media_mime` routes `video/*` and `audio/*` to the media player. A minted dDRM
+media `.ddrm` opens via the **quorum-media** path (`viewer_open::open_quorum_media`): the gateway
+fetches the published DASH directory by its `asset_cid`, then `ddrm-media-authority --quorum
+--dash-dir` recovers the CEK 2-of-3 and serves CENC-decrypted fragments per-segment over the same
+descriptor/`segment` protocol as the local media path. The whole ordered segment set is welded
+into the transcript AAD (`to_aad_with_segments`), so a substituted/reordered fragment fails the
+CEK unwrap closed before any byte is decrypted; the recovered CEK never leaves the decrypt VM.
+
+AV is therefore **key-protected, not yet fingerprinted**: the decrypted segment bytes that reach
+MSE carry no per-buyer mark (the browser-MSE ceiling without EME/Widevine — exactly PC2's model).
+The forensic upgrade (A/B variant watermarking for video, spread-spectrum/echo-hiding for audio,
+chosen per buyer from their signed grant at serve time) is a transcode-pipeline roadmap item, not a
+patch — see [AV_WATERMARKING.md](AV_WATERMARKING.md). Until it ships, UI/docs must not claim AV is
+watermarked.
+
 ## Remaining Sequence
 
 1. Wire real `elastos://drm/open` orchestration behind the declared sequence:

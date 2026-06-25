@@ -1,0 +1,54 @@
+# dKMS authority node — systemd unit. Install on EACH node host as
+#   /etc/systemd/system/dkms-authority.service
+# then: systemctl daemon-reload && systemctl enable --now dkms-authority
+#
+# The node is a long-lived daemon: it binds DKMS_AUTHORITY_LISTEN and serves many sequential
+# framed connections, each with its own handshake session (capsules/dkms-authority/src/main.rs).
+# A torn/oversized frame drops that one connection fail-closed; the listener keeps accepting.
+
+[Unit]
+Description=ElastOS dKMS authority node (PQ-hybrid threshold key authority)
+Documentation=file:///opt/elastos/docs/convergence/dkms-deploy/RUNBOOK.md
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+# Dedicated unprivileged service account (create it: useradd --system --home /var/lib/elastos/dkms dkms)
+User=dkms
+Group=dkms
+EnvironmentFile=/etc/elastos/dkms-authority.env
+ExecStart=/opt/elastos/bin/dkms-authority
+Restart=on-failure
+RestartSec=2s
+# The node binds the listener at startup; if it cannot, it exits — let systemd retry.
+TimeoutStartSec=15s
+
+# --- Hardening (the master seed in DKMS_AUTHORITY_KEY_STORE is the crown jewel) -------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# The ONLY writable path: the master-seed store directory. Everything else is read-only.
+ReadWritePaths=/var/lib/elastos/dkms
+StateDirectory=elastos/dkms
+StateDirectoryMode=0700
+# Restrict to the address families the node needs (TCP over the WireGuard mesh + unix sockets).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

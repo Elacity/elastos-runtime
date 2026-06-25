@@ -166,7 +166,7 @@ pub struct RightsChainBindingV1 {
     pub method: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KeyReleaseRequestV1 {
     pub schema: String,
@@ -179,6 +179,13 @@ pub struct KeyReleaseRequestV1 {
     pub key_envelope: KeyEnvelopeV1,
     pub reason: String,
     pub expires_at: u64,
+    /// TRUSTLESS AUTHORIZATION (W4): the wallet-signed `AccessGrantV1`, carried opaquely (the
+    /// dKMS node deserializes + verifies it). When present, the node authorizes via the grant +
+    /// its own on-chain check instead of the unsigned receipt. Absent on the legacy path. Opaque
+    /// `Value` keeps this core type free of the PQ-crypto capsule dependency (no drift: the node's
+    /// `ddrm_envelope::access::AccessGrantV1` is the single canonical shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_grant: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

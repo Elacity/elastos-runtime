@@ -423,11 +423,23 @@ impl IdentityManager {
             auth_data_bytes[36],
         ]);
 
-        // AAGUID (16 bytes) + credential ID length (2 bytes) + credential ID + COSE key
+        // AAGUID (16 bytes) + credential ID length (2 bytes) + credential ID + COSE key.
+        // authData is attacker-controlled (it is lifted from the supplied attestation
+        // object), so every slice below must be bounds-checked first: an out-of-range
+        // index here would panic the auth thread (fail-open-by-crash DoS) instead of
+        // failing closed. Attested credential data needs at least 55 bytes
+        // (37-byte header + 16-byte AAGUID + 2-byte credential-id length).
+        if auth_data_bytes.len() < 55 {
+            anyhow::bail!("AuthData too short for attested credential data");
+        }
         let _aaguid = &auth_data_bytes[37..53];
         let cred_id_len = u16::from_be_bytes([auth_data_bytes[53], auth_data_bytes[54]]) as usize;
-        let cred_id = &auth_data_bytes[55..55 + cred_id_len];
-        let cose_key_bytes = &auth_data_bytes[55 + cred_id_len..];
+        let cred_id_end = 55usize
+            .checked_add(cred_id_len)
+            .filter(|end| *end <= auth_data_bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("AuthData credential ID length out of range"))?;
+        let cred_id = &auth_data_bytes[55..cred_id_end];
+        let cose_key_bytes = &auth_data_bytes[cred_id_end..];
 
         let credential_id = URL_SAFE_NO_PAD.encode(cred_id);
         let public_key = URL_SAFE_NO_PAD.encode(cose_key_bytes);
@@ -1070,6 +1082,165 @@ mod tests {
 
         let no_verification = require_user_present_and_verified(FLAG_USER_PRESENT).unwrap_err();
         assert!(no_verification.to_string().contains("User verification"));
+    }
+
+    #[test]
+    fn registration_rejects_malformed_attested_credential_data_without_panicking() {
+        // Regression: authData is lifted from the attacker-supplied attestation
+        // object, so a truncated header or an oversized credential-id length must
+        // fail closed with an error, not panic the auth thread (a DoS in an
+        // authority primitive).
+        let attested_flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL_DATA;
+
+        // Case 1: AT flag set, but authData carries only the 37-byte header.
+        {
+            let mut manager = registration_manager();
+            let challenge = manager
+                .begin_registration("session-token", "localhost")
+                .unwrap()
+                .public_key
+                .challenge;
+            let mut auth_data_bytes = Vec::new();
+            auth_data_bytes.extend_from_slice(&Sha256::digest("localhost".as_bytes()));
+            auth_data_bytes.push(attested_flags);
+            auth_data_bytes.extend_from_slice(&0u32.to_be_bytes()); // 37 bytes, no attested data
+            let response = registration_response(&challenge, auth_data_bytes);
+            let err = manager
+                .complete_registration("session-token", &response, "localhost", "http://localhost")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("too short"), "unexpected error: {err}");
+        }
+
+        // Case 2: credential-id length claims more bytes than authData contains.
+        {
+            let mut manager = registration_manager();
+            let challenge = manager
+                .begin_registration("session-token", "localhost")
+                .unwrap()
+                .public_key
+                .challenge;
+            let mut auth_data_bytes = Vec::new();
+            auth_data_bytes.extend_from_slice(&Sha256::digest("localhost".as_bytes()));
+            auth_data_bytes.push(attested_flags);
+            auth_data_bytes.extend_from_slice(&0u32.to_be_bytes());
+            auth_data_bytes.extend_from_slice(&[0u8; 16]); // AAGUID
+            auth_data_bytes.extend_from_slice(&u16::MAX.to_be_bytes()); // cred_id_len = 65535
+            let response = registration_response(&challenge, auth_data_bytes);
+            let err = manager
+                .complete_registration("session-token", &response, "localhost", "http://localhost")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("out of range"), "unexpected error: {err}");
+        }
+    }
+
+    fn registration_manager() -> IdentityManager {
+        let temp = tempfile::tempdir().unwrap();
+        IdentityManager::new(temp.path().to_path_buf()).unwrap()
+    }
+
+    fn registration_response(challenge: &str, auth_data_bytes: Vec<u8>) -> RegistrationResponse {
+        let client_data = serde_json::json!({
+            "type": "webauthn.create",
+            "challenge": challenge,
+            "origin": "http://localhost"
+        });
+        let att_obj = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("authData".to_string()),
+            ciborium::Value::Bytes(auth_data_bytes),
+        )]);
+        let mut att_bytes = Vec::new();
+        ciborium::into_writer(&att_obj, &mut att_bytes).unwrap();
+        RegistrationResponse {
+            _id: "credential-id".to_string(),
+            _raw_id: "credential-id".to_string(),
+            response: AuthenticatorAttestationResponse {
+                client_data_json: URL_SAFE_NO_PAD.encode(client_data.to_string()),
+                attestation_object: URL_SAFE_NO_PAD.encode(att_bytes),
+            },
+            _type: "public-key".to_string(),
+        }
+    }
+
+    #[test]
+    fn complete_registration_never_panics_on_fuzzed_attestation() {
+        // Fuzz the attestation/authData parse path where a real DoS lived (an unchecked slice on
+        // attacker-controlled authData). A trust-boundary parser must return Err, never panic, on
+        // any input. Builds a valid rp-hash + attested flags so it reaches the credential-data
+        // slicing, then fuzzes the tail length (straddling the 16-byte AAGUID + 2-byte length +
+        // credential-id boundaries). Deterministic seed ⇒ any failure reproduces exactly.
+        let mut m = registration_manager();
+        let rp_hash = Sha256::digest("localhost".as_bytes());
+        let attested = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL_DATA;
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        macro_rules! rnd {
+            () => {{
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            }};
+        }
+        for i in 0..6000u32 {
+            let challenge = m
+                .begin_registration("fuzz", "localhost")
+                .unwrap()
+                .public_key
+                .challenge;
+            let tail_len = (rnd!() as usize) % 48;
+            let mut authdata = Vec::with_capacity(37 + tail_len);
+            authdata.extend_from_slice(&rp_hash);
+            authdata.push(attested);
+            authdata.extend_from_slice(&i.to_be_bytes()); // sign_count → 37-byte header
+            for _ in 0..tail_len {
+                authdata.push((rnd!() & 0xff) as u8);
+            }
+            let resp = registration_response(&challenge, authdata.clone());
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = m.complete_registration("fuzz", &resp, "localhost", "http://localhost");
+            }));
+            assert!(
+                r.is_ok(),
+                "complete_registration PANICKED on authData ({} bytes): {:02x?}",
+                authdata.len(),
+                authdata
+            );
+        }
+    }
+
+    #[test]
+    fn complete_registration_never_panics_on_random_blobs() {
+        // Shallow fuzz: fully random client_data + attestation_object bytes exercise the early
+        // base64 / JSON / CBOR reject path. Must fail closed (Err), never panic.
+        let mut m = registration_manager();
+        let mut state: u64 = 0x0123_4567_89AB_CDEF;
+        macro_rules! rnd {
+            () => {{
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            }};
+        }
+        for _ in 0..6000 {
+            let _ = m.begin_registration("fuzz", "localhost");
+            let blen = (rnd!() as usize) % 256;
+            let bytes: Vec<u8> = (0..blen).map(|_| (rnd!() & 0xff) as u8).collect();
+            let resp = RegistrationResponse {
+                _id: "x".to_string(),
+                _raw_id: "x".to_string(),
+                response: AuthenticatorAttestationResponse {
+                    client_data_json: URL_SAFE_NO_PAD.encode(&bytes),
+                    attestation_object: URL_SAFE_NO_PAD.encode(&bytes),
+                },
+                _type: "public-key".to_string(),
+            };
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = m.complete_registration("fuzz", &resp, "localhost", "http://localhost");
+            }));
+            assert!(r.is_ok(), "complete_registration PANICKED on a random blob");
+        }
     }
 
     fn manager_with_credential(sign_count: u32) -> IdentityManager {

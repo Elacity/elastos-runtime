@@ -33,3 +33,16 @@ opt-level = 1                 # Optimize deps (compiled once, run many times)
 [profile.test]
 opt-level = 0
 debug = "line-tables-only"
+
+# Release tuning for the main binaries (elastos-server, runtime, …). Without this they shipped
+# with rustc defaults (no LTO, codegen-units=16, unstripped). `lto = "thin"` lands most of LTO's
+# size/speed win without the build-time blow-up of fat LTO + codegen-units=1 (which would slow the
+# CI `build-release` job); `strip` removes symbols but KEEPS panic messages. To dial up later:
+# `lto = true` + `codegen-units = 1` (slower build, a few % smaller/faster).
+# `panic` deliberately stays "unwind": elastos-identity's WebAuthn handler relies on
+# std::panic::catch_unwind for its fail-closed DoS bounds-check (PRINCIPLE 11) — "abort" would
+# break it. The size-tuned `tools/*` set `panic = "abort"` locally where that's safe.
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

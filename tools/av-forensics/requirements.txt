@@ -1,0 +1,4 @@
+# Offline AV forensic extractor deps. The CANONICAL codeword weld (canonical.py / test_canonical.py)
+# is pure stdlib and needs NONE of these; only the DSP extractor (dsp.py / fm_register.py /
+# extractor.py) needs numpy + a system ffmpeg on PATH.
+numpy==2.2.1

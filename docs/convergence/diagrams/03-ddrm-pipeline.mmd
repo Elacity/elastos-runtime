@@ -1,0 +1,44 @@
+flowchart TB
+    subgraph CREATE["1-2. Create + package + sign"]
+        ENC["encrypt-provider 🟢<br/>CEK mint + CENC seal<br/>bytes16 KID, CIDv1"]
+        PUB["publish-provider 🟢<br/>UnsignedMintV1"]
+        ASM["chain-provider.assemble_mint 🟢<br/>PC2-faithful mint() calldata"]
+        SIGN["wallet-provider 🟡<br/>signs payloads; live EVM tx signing 🔴"]
+    end
+
+    subgraph STORE["3. Store"]
+        IPFS["ipfs-provider 🟢<br/>Kubo add/cat/pin (CIDv1 = Helia-identical)"]
+    end
+
+    subgraph MARKET["4-5. Discover + buy"]
+        MKT["content-market 🟢 offline<br/>listing from mint calldata + metadata"]
+        BUY["buy_authority 🟡<br/>assemble buyAccess → broadcast → record<br/>selector = pinned config (no guess)"]
+        BCAST["chain-provider.broadcast_transaction 🟢<br/>eth_sendRawTransaction"]
+    end
+
+    subgraph OPEN["6-8. Validate + key + decrypt + play"]
+        DRM["drm-provider 🟢<br/>emits DrmOpenPlanV1 (zero authority)"]
+        RIGHTS["rights-provider 🟢<br/>decide_access_from_chain → signed receipt"]
+        CHAINR["chain-provider.has_access_by_content_id 🟢<br/>real eth_call"]
+        KEY["key-provider 🟢<br/>release: re-seal CEK to session"]
+        DKMS["dkms-authority 🟢<br/>distributed key custody (PQ-hybrid, quorum)"]
+        DEC["decrypt-provider 🟢<br/>in-sandbox unwrap + CENC decrypt"]
+        VIEW["elacity-player / ddrm-viewer 🟢<br/>scoped output only — never the CEK"]
+    end
+
+    ENC --> PUB --> ASM --> SIGN --> BCAST
+    ENC --> IPFS
+    ASM --> MKT
+    MKT --> BUY --> BCAST --> CHAINR
+    DRM --> RIGHTS --> CHAINR
+    RIGHTS --> KEY --> DKMS
+    KEY --> DEC
+    DKMS --> DEC
+    DEC --> VIEW
+    IPFS -. ciphertext .-> DEC
+
+    classDef done fill:#2e7d32,color:#fff;
+    classDef partial fill:#f9a825,color:#000;
+    classDef gap fill:#c62828,color:#fff;
+    class ENC,PUB,ASM,IPFS,MKT,BCAST,DRM,RIGHTS,CHAINR,KEY,DKMS,DEC,VIEW done;
+    class BUY,SIGN partial;

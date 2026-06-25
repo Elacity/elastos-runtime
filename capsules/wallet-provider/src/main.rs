@@ -17,6 +17,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
+use zeroize::Zeroizing;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -600,7 +601,7 @@ impl WalletProvider {
         let key = self
             .managed_storage_key(principal_id)
             .map_err(|err| err.to_string())?;
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|err| err.to_string())?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).map_err(|err| err.to_string())?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let aad = managed_key_aad(account_id, principal_id, chain_namespace, address);
         let ciphertext = cipher
@@ -645,29 +646,33 @@ impl WalletProvider {
             .map_err(|_| "managed wallet nonce must be 12 bytes".to_string())?;
         let nonce = Nonce::from(nonce_array);
         let ciphertext = hex::decode(&secret.ciphertext).map_err(|err| err.to_string())?;
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|err| err.to_string())?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_slice()).map_err(|err| err.to_string())?;
         let aad = managed_key_aad(
             &secret.account_id,
             &secret.principal_id,
             &secret.chain_namespace,
             &secret.address,
         );
-        let private_key = cipher
-            .decrypt(
-                &nonce,
-                Payload {
-                    msg: ciphertext.as_slice(),
-                    aad: aad.as_bytes(),
-                },
-            )
-            .map_err(|_| {
-                "managed wallet key could not be decrypted; recover or recreate this account"
-                    .to_string()
-            })?;
+        // Zeroize the decrypted private-key bytes when this scope ends, so raw key
+        // material does not linger in freed heap after the signing key is built.
+        let private_key = Zeroizing::new(
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: ciphertext.as_slice(),
+                        aad: aad.as_bytes(),
+                    },
+                )
+                .map_err(|_| {
+                    "managed wallet key could not be decrypted; recover or recreate this account"
+                        .to_string()
+                })?,
+        );
         SigningKey::from_slice(&private_key).map_err(|err| err.to_string())
     }
 
-    fn managed_storage_key(&self, principal_id: &str) -> Result<[u8; 32], String> {
+    fn managed_storage_key(&self, principal_id: &str) -> Result<Zeroizing<[u8; 32]>, String> {
         let storage_key = self
             .storage_key
             .as_ref()
@@ -676,7 +681,8 @@ impl WalletProvider {
         hasher.update(b"elastos.wallet.managed-key.v1");
         hasher.update(storage_key);
         hasher.update(principal_id.as_bytes());
-        Ok(hasher.finalize().into())
+        // The derived AES-256 key-wrapping key zeroizes on drop instead of lingering.
+        Ok(Zeroizing::new(hasher.finalize().into()))
     }
 
     fn save(&self) -> Result<(), String> {

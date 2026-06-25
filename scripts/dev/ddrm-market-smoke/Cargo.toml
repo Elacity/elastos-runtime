@@ -1,0 +1,18 @@
+[package]
+name = "ddrm-market-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev-only orchestrator (NOT a capsule, never shipped): drives the REAL publish-provider,
+# chain-provider, and content-market binaries over their stdin/stdout JSON protocol to
+# prove producer -> chain -> discovery closes as ONE identity — a sealed asset's KID
+# becomes mint calldata, and that same calldata reconstructs a marketplace listing whose
+# content_id is the same KID. See scripts/ddrm-market-smoke.sh.
+
+[[bin]]
+name = "ddrm-market-smoke"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0"

@@ -1,0 +1,22 @@
+[package]
+name = "content-market"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS dDRM content-market capsule — reconstructs a marketplace listing from on-chain mint calldata, capability-clean (no RPC/IPFS/keys)"
+license = "MIT"
+
+[[bin]]
+name = "content-market"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

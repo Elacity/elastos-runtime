@@ -9,12 +9,197 @@ license = "MIT"
 name = "decrypt-provider"
 path = "src/main.rs"
 
+[features]
+# rail-prep: compile (and test) the in-boundary composition the Hybrid decrypt rail
+# will wire once Anders confirms the CEK-transport rail
+# (docs/convergence/DDRM_DECRYPT_RAIL.md): upstream CEK-sealing envelope unwrap ->
+# decrypt-step cenc engine, colocated in this boundary. OFF by default (Parallel
+# Change) so the live dispatch and the default test surface stay unchanged.
+rail-prep = []
+# pq-envelope: de-risking island for the runtime PQ-hybrid CEK-seal profile
+# (x25519 + ml-kem-768 KEM -> AEAD-wrapped CEK; ml-dsa-65 signature behind an
+# abstraction). The PQ analogue of the classical src/envelope.rs, proven to
+# recover a CEK in Zeroizing and build to wasm32-wasip1. OFF by default; pulls the
+# PQ crates only when enabled. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
+# The PQ-hybrid crypto now lives ONCE in the shared `ddrm-envelope` crate (the key
+# authority seals with it, this boundary unwraps with it). `pq_envelope.rs` re-exports
+# it, so x25519/aes-gcm are gone from here entirely; ml-kem + sha2 remain only because
+# the golden-vector helpers + stub signer still name those crates directly.
+pq-envelope = ["dep:ddrm-envelope", "dep:ml-kem", "dep:sha2"]
+# pq-rail-prep: the full pre-rail dDRM data path proven end to end — PQ-hybrid
+# unwrap (pq-envelope) -> cenc decrypt -> scoped output, CEK in Zeroizing
+# throughout. Unifies the rail-prep composition (Day 18), in-boundary keygen
+# (Day 19) and the PQ envelope (Day 20) into one cross-engine proof. OFF by
+# default; enables pq-envelope. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
+pq-rail-prep = ["pq-envelope"]
+# rail-shim: the transport adapter from a sealed-CEK carrier (rail Option A) to
+# the already-proven unwrap->cenc engines, for BOTH profiles (classical + PQ).
+# A tested island, NOT wired into OpenSession/dispatch — the day Anders confirms
+# the rail (DDRM_DECRYPT_RAIL.md) it becomes a flag flip. OFF by default.
+rail-shim = ["rail-prep", "pq-rail-prep"]
+# pq-mldsa: plug the REAL ML-DSA-65 (FIPS 204) signature primitive into the
+# CekSealVerifier slot, replacing the test stub on the PQ rail. Verify-only in the
+# decrypt boundary (the VM verifies the key authority's seal signature before
+# unwrap). Pure-Rust, rng-free verify path -> builds to wasm32-wasip1. OFF by
+# default (separate axis): the default build + base ladder stay byte-stable.
+pq-mldsa = ["pq-envelope", "dep:ml-dsa"]
+# pq-mldsa-hybrid: the OTHER answer to Anders' open Q2 (DDRM_DECRYPT_RAIL.md) —
+# a HYBRID seal-signature verifier where a classical ECDSA-P256 signature AND a PQ
+# ML-DSA-65 signature must BOTH verify (defense-in-depth during PC2's classical->PQ
+# migration). Slots into the SAME CekSealVerifier the rail uses, so once both Q2
+# answers are pre-proven the rail landing is a pure policy pick. Enables the ecdsa
+# feature on the (already-present) p256 dep only when active; OFF by default.
+pq-mldsa-hybrid = ["pq-mldsa", "ddrm-envelope/hybrid", "p256/ecdsa"]
+# rail-shim-mldsa: the rail-shim carrier path driven by the REAL ML-DSA-65
+# verifier (not the stub) on a committed golden — the strongest pre-rail proof:
+# the real PQ signature verified through the exact `decrypt_from_carrier`
+# entrypoint OpenSession will call. OFF by default; combines rail-shim + pq-mldsa.
+rail-shim-mldsa = ["rail-shim", "pq-mldsa"]
+# harden: adversarial negative-space + containment test sweeps over the untrusted-
+# input boundaries the rail exposes (envelope::parse, PqSealedEnvelope::from_bytes,
+# decrypt_from_carrier dispatch) — every malformed shape must fail closed and never
+# panic; error/response surfaces must leak no CEK/plaintext. Test-only gate (pulls
+# all engines + the real verifier); OFF by default, base ladder stays byte-stable.
+harden = ["rail-shim-mldsa"]
+# rail-live: the recommended rail (DDRM_DECRYPT_RAIL.md Option A) WIRED INTO the
+# provider dispatch — `OpenSessionLive` receives VM-sealed material, recovers the CEK
+# INSIDE the boundary via the proven `decrypt_from_carrier`, decrypts, and returns a
+# scoped response that carries neither CEK nor plaintext. This is the reference the
+# live path becomes once Anders blesses the carrier delivery on the public contract
+# (today it rides a capsule-local request variant so `elastos-common` stays
+# byte-identical). OFF by default — the default build/dispatch stay fail-closed.
+rail-live = ["rail-shim", "pq-mldsa"]
+# rail-bind: the Day-45 Anders decision made cryptographic — the sealed decrypt
+# material is BOUND to the full decrypt transcript (principal, session, object/
+# content hash, action, viewer interface, output kind, expiry, release-receipt
+# hash, decrypt-session public key, algorithm suite, provider identity, replay
+# nonce) via AES-256-GCM AAD + an ML-DSA-65 signature over `payload ‖ transcript`.
+# A CEK sealed for one transcript fails closed against any other (replay/swap).
+# Adds `OpenSessionBound`; default + all unbound goldens stay byte-identical
+# (empty AAD == legacy). OFF by default. See DDRM_DECRYPT_RAIL.md §Transcript binding.
+rail-bind = ["rail-live"]
+# rail-mint: the in-sandbox session-key step Anders requires — the decrypt boundary
+# MINTS its own per-session hybrid KEM keypair (x25519 + ML-KEM-768) at `init`,
+# holds the secret in-VM, and PUBLISHES the public key (+ suite) for the key
+# authority to seal the CEK to. This is the only place the decrypt boundary needs
+# entropy (keygen); the unwrap path stays RNG-free. OsRng -> WASI `random_get`, so
+# it builds + runs on wasm32-wasip1. OFF by default. Builds on rail-bind so the
+# minted key feeds the transcript-bound open. See DDRM_DECRYPT_RAIL.md §Transcript binding.
+rail-mint = ["rail-bind", "dep:rand_core", "dep:getrandom"]
+# rail-audit: the "short expiry, audit" half of Anders' Day-45 spec. The audited
+# open ENFORCES the grant expiry (reject when the injected `now_unix` is past the
+# request / release-receipt expiry, before any unwrap) and emits a scoped,
+# tamper-evident audit record bound to the transcript hash on EVERY decision
+# (opened|denied) — carrying no CEK and no plaintext. The clock is an injected
+# capability input, never ambient. OFF by default. See DDRM_DECRYPT_RAIL.md.
+rail-audit = ["rail-bind"]
+# rail-material: the consolidated, backend-neutral `SealedDecryptMaterialV1`
+# envelope Anders named — a single suite-TAGGED type (dKMS-native PQ-hybrid vs
+# P-256/Lit compat is a field, not a fork) that is the exact drop-in shape to fold
+# into the shared `DecryptSessionRequestV1` when the contract opens. `OpenSessionV1`
+# routes it through the audited/expiry-enforcing bound path; an unknown suite, and
+# the compat suite on the product path, both fail closed. OFF by default. See
+# DDRM_DECRYPT_RAIL.md §Consolidated envelope.
+rail-material = ["rail-audit"]
+# rail-stream: the media STREAM read (B2 of the viewer seam) — a session-scoped op
+# that, for an OPENED media session's sealed material + a segment index, unwraps the
+# CEK in-VM (Zeroizing), decrypts, and returns ONLY that segment's already-decrypted
+# fMP4 bytes as the `stream` output kind. The CEK/IV never leave the boundary and only
+# one segment's plaintext is produced per call; the elacity-player viewer feeds these
+# into MSE. Built on the proven transcript-bound decrypt, so a reordered/substituted/
+# expired set fails closed before any byte is returned. Single-node rail for now;
+# threshold/quorum streaming is refused pending its wiring. OFF by default. See
+# docs/convergence/PC2_PLAYER_ALIGNMENT.md.
+rail-stream = ["rail-material"]
+# vectors: replay the committed portable golden vectors (tests/vectors/) through
+# the engines — substrate-independent proof that survives refactor/rebase/port and
+# is replayable against PC2 (classical path is byte-identical to ddrm-decrypt).
+# Enables pq-rail-prep so both classical and PQ paths compile. OFF by default.
+vectors = ["pq-rail-prep"]
+# gen-vectors: regenerate the committed golden vectors (writes tests/vectors/).
+# Run manually: `cargo test --features gen-vectors emit_`. OFF by default.
+gen-vectors = ["vectors"]
+# envelope-conformance: end-to-end key->decrypt handoff guard. Has the key authority
+# (shared `ddrm-envelope`) seal a CEK to a published decrypt-session key and this
+# provider open it via its `pq_envelope` unwrap — pinning the published-key round-trip,
+# the ML-DSA-65 vk encoding, and the wire decode across the boundary. Since Day-53 the
+# unwrap re-exports the shared crate, so this also confirms the dedup stays coherent.
+# Adds one test under `pq-mldsa`. OFF by default.
+envelope-conformance = ["pq-mldsa"]
+# pdf-render: the "pixel-lock" secure renderer (PC2 ddrm-renderer parity). Rasterises a
+# protected PDF page to a watermarked JPEG INSIDE this decrypt boundary via the pure-Rust,
+# `#![forbid(unsafe_code)]` `hayro` rasteriser — so the plaintext PDF never leaves the sandbox
+# (only a flattened, buyer-watermarked page image egresses). Closes the "raw plaintext reaches
+# the browser" gap and is browser-agnostic (an image always renders). Pulls `hayro` + `image`
+# only when enabled; the default + security-critical builds stay lean. OFF by default.
+pdf-render = ["dep:hayro", "dep:image", "dep:zip", "dep:resvg", "dep:roxmltree", "dep:ab_glyph"]
+
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+aes = "0.8"
+ctr = "0.9"
+base64 = "0.22"
+# dDRM CEK-sealing envelope (P-256 ECDH unwrap, AES-256-CBC) — see src/envelope.rs.
+# Mirrors PC2 ddrm-decrypt so CEK recovery + content decryption stay colocated in
+# this provider's wasm boundary (CEK never crosses FFI).
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+elliptic-curve = { version = "0.13", default-features = false, features = ["sec1"] }
+cbc = { version = "0.1", features = ["alloc"] }
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+zeroize = "1"
+# Single source of truth for the PQ-hybrid seal/unwrap + wire format + ML-DSA-65
+# signer/verifier (feature `pq-envelope`). `src/pq_envelope.rs` re-exports it so the
+# crypto (x25519 + ML-KEM-768 KEM, AES-256-GCM wrap, SHA-256 KDF) exists ONCE and the
+# key authority + decrypt boundary cannot drift. Versions match the Day-15 proof.
+ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+# ml-kem + sha2 stay only for the test-side golden-vector helpers (ML-KEM key
+# (de)serialization) and the deterministic stub signer; the live crypto is in
+# ddrm-envelope.
+ml-kem = { version = "0.2.3", optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+# ML-DSA-65 (FIPS 204) signature — the shipped PQ-rail seal-signature primitive
+# behind CekSealVerifier (feature `pq-mldsa`). Same RustCrypto family as ml-kem
+# (consistent provenance/maintenance); deterministic from-seed keygen keeps the
+# committed KAT reproducible. default-features off (no pkcs8/getrandom) — the
+# decrypt boundary only verifies, so no RNG is pulled into the wasm build.
+ml-dsa = { version = "0.1", default-features = false, optional = true }
+# In-sandbox session-key MINT only (feature `rail-mint`). Optional so the default +
+# verify-only rungs pull no RNG; on wasm32-wasip1 getrandom uses WASI `random_get`.
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+getrandom = { version = "0.2", optional = true }
+# Pixel-lock PDF renderer (feature `pdf-render`). `hayro` is a pure-Rust,
+# `#![forbid(unsafe_code)]` PDF rasteriser that compiles to wasm32-wasip1; `image` encodes the
+# rasterised page to JPEG. Mirrors PC2's ddrm-renderer (same crates/versions) so the secure-view
+# behaviour stays aligned. Optional → no footprint on the default decrypt build.
+hayro = { version = "0.5", default-features = false, features = ["embed-fonts"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"], optional = true }
+# Comic-book archive reader (feature `pdf-render`): a CBZ is a ZIP of page images. Pure-Rust
+# deflate (miniz_oxide) so the boundary stays unsafe-free; default features off so no C zlib /
+# encryption backends are pulled. Used only by the pixel-lock comic renderer. Optional.
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+# Pure-Rust SVG rasteriser (feature `pdf-render`): SVG is scriptable XML, so it is flattened to
+# pixels in-boundary like every other document rather than shipped raw. `raster-images` renders
+# embedded bitmaps; `text` rendering is intentionally OFF (no system-font surface; text nodes are
+# best-effort) to keep the boundary lean. Pulls tiny-skia/usvg (all pure Rust). Optional.
+resvg = { version = "0.45", default-features = false, features = ["raster-images"], optional = true }
+# Text rasteriser (feature `pdf-render`). `ab_glyph` is a pure-Rust, unsafe-free TrueType glyph
+# rasteriser (builds to wasm32-wasip1) that anti-aliases real vector glyphs — so the text reader
+# (proportional DejaVu Sans), the code reader (DejaVu Sans Mono), AND the faint tiled forensic
+# watermark all render as a friendly, legible typeface instead of the blocky 8x8 bitmap. Fonts are
+# vendored under `assets/fonts` (DejaVu, a freely-redistributable Bitstream-Vera–derived family).
+# Optional → no default footprint.
+ab_glyph = { version = "0.2", optional = true }
+# EPUB OPF/container parsing (feature `pdf-render`): pure-Rust, allocation-light XML reader
+# (already in-tree via resvg/usvg), used to read the spine order + manifest hrefs so EPUB
+# chapters are served in reading order. The chapter XHTML itself is sanitised by hand (no
+# html5ever) and displayed in a locked, script-less sandbox iframe (the "html-lock" tier).
+roxmltree = { version = "0.20", optional = true }
 
 [dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"
 
 [profile.release]
 opt-level = "s"

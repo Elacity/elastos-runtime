@@ -1,0 +1,84 @@
+# Pre-audit — internal adversarial review (hand to the external firm)
+
+Date: 2026-06-15. Method: four read-only adversarial passes — Byzantine dKMS nodes,
+side-channel/constant-time, host-adapter boundaries, metadata + audit integrity — every claim
+`file:line`. Purpose: **scope the external engagement down.** Fix the findings below first; hand
+the firm the "verified clean (with evidence)" list so they don't bill you to re-derive it.
+
+> Trust-model note for the firm: the dKMS is **2-of-3**. "No *single* party can betray you" is
+> accurate and verified. *Two* colluding custodians who physically hold both ciphertext-shares can
+> reconstruct off-protocol — inherent to t=2, not a defect. State 2-of-3, never "no collusion."
+
+## Findings to fix before the audit (cheaper now than as audit findings)
+
+| # | Sev | Finding | Evidence | Fix |
+|---|---|---|---|---|
+| 1 | ✅ **RESOLVED** (was HIGH; verified 2026-06-20 — see banner below) | **CEK reconstruction is not integrity-checked.** A single malicious node can return a validly-sealed, validly-indexed, but wrong-*valued* share; it passes every structural check and Lagrange/XOR-combines into a **silently wrong CEK**. The AES-CTR content layer is unauthenticated, so a wrong key yields wrong output, not an error. The commitment that would catch this (`dkg_cek_binding`) exists but is **test-only**. Low impact for media (visible garble), **disastrous for agent-key custody** (a silently-wrong signing key). | combine: `ddrm-envelope/src/lib.rs:432-461` (Shamir), `:287-300` (XOR); reconstruct: `decrypt-provider/src/rail_shim.rs:197-199, 233-237`; commitment used only at `rail_shim.rs:1052-1115`; `dkg_cek_binding` `lib.rs:676-684` | Bind the reconstructed CEK to a published commitment on the open path, and add cheater-detection across the 3 candidate shares (the rail already fetches all three — `key-provider/main.rs:1809-1843` — so a 2-of-3 consistency check is cheap). |
+| 2 | ⚠️ **PARTIAL** (log-redaction done; deep metadata = roadmap — see banner) | **Metadata is not confidential.** Content stays sealed, but the `(principal/wallet, content_id, time)` triple is visible to: dKMS node operators (≥2-of-3 see the full recover bundle), the chain (`hasAccessByContentId(holder, contentId)` reads + buy/mint txs), RPC providers, and the local gateway `info!` logs. The quorum that protects the key also *observes the access pattern*. No blinded identifiers / oblivious lookup / frame padding; frame sizes+timing leak. | node recover bundle: `dkms-authority/src/main.rs:199-204, 911-951`; chain read: `chain-provider/src/main.rs:808,835`; logs: `viewer_open.rs:282-289`; frame (no pad): `ddrm-envelope/src/lib.rs:1448-1494` | Near-term: stop logging wallet/principal/content at `info!`; add frame padding/cover. Deep (research/roadmap): blinded identifiers / oblivious lookup — flag for the firm, not a quick fix. Document the node-operator exposure honestly in the threat model. |
+| 3 | ✅ **RESOLVED** (verified 2026-06; see PRINCIPLES_CONFORMANCE "do not re-churn") | **[RESOLVED in current tree.] Audit log is best-effort, not tamper-evident (GAP-8).** Entries silently dropped on serialize/lock/write failure; no hash-chain, no signature, no fsync, no sequence number; a compromised runtime can erase its own trail; `emit()` returns `()`. **And the dDRM open path emits no audit event at all** — the custody-critical event lives only in `tracing`. | `primitives/audit.rs:300-331` (best-effort `emit`), `:594-607` (silent drop on parse), header `:6-7`; no open event: `viewer_open.rs` (only a comment at `:1021`) | **DONE:** `emit()` returns `Result` and builds a `ChainedRecord` (`seq` + `prev_hash` + `record_hash` over `domain‖seq‖prev_hash‖event_json`), ed25519-signed (crypto-agility tag, ML-DSA-ready), durably written with `flush` + `sync_all` BEFORE the chain head advances, walked by `verify_chain` (`audit.rs:461-535`). The dDRM open emits a **fail-closed** `content_open` at `viewer_open.rs:481` (refuses the open `503` if it can't commit), on the common path before object/media/quorum dispatch; session-bound segment/byte serving is covered transitively. The `:1021` "no open event" note was a misread — that line is media-layout detection. Remaining (separately tracked roadmap): external anchoring of the chain head vs a live-compromised runtime. |
+| 4 | MED | **Action enforcement is delegated to provider capsules.** The host bridge validates the token is signed, caller-bound, and resource-matched — but for localhost, `read` and `write` share the *same* resource string, and fine-grained *action* checks are left to each provider. A capsule with a `read` token could drive a `write` op if a provider forgets to re-check the action. Soundness rests on per-capsule discipline, not the central validator. | `carrier_bridge.rs:688`, `api/handlers/provider.rs:112-118` (delegates action); resource: `provider_resource.rs` localhost arm | Audit every provider's dispatch for an explicit operation→action check, or enforce the action centrally at the bridge. |
+| 5 | MED | **Node-set-id pin is optional.** Absent `DKMS_AUTHORITY_NODE_SET_ID_B64`, a live node trusts the grant's *self-declared* node-set (anti-cross-quorum-replay degrades to the grant's claim). Comment says operators "SHOULD" set it. | `dkms-authority/src/main.rs:1793-1796` | Make it mandatory in release builds. |
+| 6 | LOW | **`vsock-proxy` hardening.** Identity/capability-blind byte pipe (correct by position — the real gate is upstream), but: binds `0.0.0.0` (`main.rs:278`), no `MAX_LINE_BYTES` cap (OOM/DoS), head-of-line DoS through one serial child. | `tools/vsock-proxy/src/main.rs:171-325` | Bound line length; confirm the guest netns is non-routable to other tenants. |
+| 7 | LOW | **GF(256) multiply is not constant-time.** Table-free shift-XOR with two secret-data-dependent branches (`b&1`, high-bit `a`). Local/co-resident low-severity leak only — *not* the cache-timing table-lookup oracle (there are no tables). | `ddrm-envelope/src/lib.rs:317-331` (`:320, :325`) | ~5-line branchless mask rewrite (`subtle` already vendored). Adopt `ct_eq` as a coding standard for any future secret compare. |
+| 8 | LOW | **`effective_now` (session issuance) trusts the caller clock** in release; a caller can inflate their own session token's lifetime. Backstopped: the security-relevant windows use `security_now` (clamped) + the on-chain check + `recover_seq`. | `dkms-authority/src/main.rs:99-101` | Clamp `effective_now` for issuance to match `security_now`. |
+
+## ✅ Verification pass — 2026-06-20 (all eight findings re-checked against the current tree)
+
+Every finding above was re-verified against current code (deep-verified with passing tests for #1/#3/#6;
+code+mechanism for #2/#4/#5/#7/#8). **Seven of eight are RESOLVED; #2 is PARTIAL by design.** Hand the
+firm this status so they can scope the resolved items OUT:
+
+- **#1 — RESOLVED (was HIGH/CRITICAL).** CEK reconstruction is integrity-checked end-to-end and
+  production-wired: producer publishes `cek_commitment(node_set_id, cek)` at mint (`decrypt-provider/src/main.rs:3964`),
+  carried in escrow; the open path parses it (`:1390`) and reconstructs via `reconstruct_quorum_cek_checked`
+  (`rail_shim.rs:270-315`) — 3+ shares cross-check every pair (cheater detection), any commitment mismatch
+  fails closed, and a **degraded 2-share quorum with no commitment is refused outright**. Tests:
+  `sealed_material_v1_quorum_byzantine_share_fails_closed`, `..._forged_or_duplicate_share_fails_closed`,
+  `boundary_opens_a_dkg_born_quorum_and_matches_the_cek_binding` (decrypt-provider, 146 pass).
+- **#2 — PARTIAL (by design).** The near-term log-redaction IS done: the `(wallet, content_id)` triple is
+  logged only as non-reversible `log_fp()` fingerprints (`viewer_open.rs:360-369`). The DEEP parts —
+  blinded identifiers / oblivious lookup, frame padding, and node-operator visibility of the access triple
+  — remain **documented roadmap** in THREAT_MODEL, not code defects (inherent to a 2-of-3 recover). Keep on
+  the firm's list as a design/governance topic, not a quick fix.
+- **#3 — RESOLVED.** Tamper-evident hash-chained, ed25519-signed, fsync'd audit log + fail-closed
+  `content_open` (see the row above and PRINCIPLES_CONFORMANCE "do not re-churn"; `audit.rs` 17 tests pass).
+- **#4 — RESOLVED.** Central `required_action_for(op)` map (`provider_resource.rs:24`), unmapped op →
+  `Action::Admin` (fail closed, `:136`), enforced at the bridge on the REQUIRED action
+  (`carrier_bridge.rs:687`); test `required_action_classifies_operations_and_fails_closed`.
+- **#5 — RESOLVED.** `DKMS_AUTHORITY_NODE_SET_ID_B64` is mandatory in release: `compile_error!` fence
+  (`dkms-authority/src/main.rs:50`) + the authorize path refuses a caller-declared node-set under
+  `#[cfg(not(any(test, feature="dev-modes")))]` (`:1845-1848`).
+- **#6 — RESOLVED.** `read_line_capped` enforces `MAX_LINE_BYTES = 16 MiB` and **fails closed** on an
+  over-long line (`elastos/tools/vsock-proxy/src/main.rs:17-33`, used on every read at `:195/206/226/235`);
+  the listener binds the guest-isolated vsock wildcard CID, not TCP `0.0.0.0`.
+- **#7 — RESOLVED.** GF(256) multiply rewritten branchless: secret-dependent branches replaced with
+  arithmetic masks (`add_mask = 0u8.wrapping_sub(b & 1)`, `reduce_mask = 0u8.wrapping_sub((a >> 7) & 1)`),
+  fixed 8-iteration loop — constant-time in `a`/`b` (`ddrm-envelope/src/lib.rs:360-390`).
+- **#8 — RESOLVED.** `effective_now` clamps the caller-supplied clock to the node's real time in release
+  (caller may only *shorten* its window, never push time forward) (`dkms-authority/src/main.rs:118-135`).
+
+**Build-enforced index:** these verdicts (and H1/M1/M3/A7 from the dDRM deep audit) are now carried by
+a ratchet test — `elastos/crates/elastos-server/tests/ddrm_verdicts.rs` — that records each verdict's
+load-bearing invariant and the test/CI-job that pins it. `verdicts_registry_is_intact` fails if a row
+drifts; this is the source of truth, the prose above is the narrative. Mirror of the capability side's
+`KNOWN_GAPS` (capability_conformance.rs).
+
+## Verified clean — with evidence (ask the firm to scope these OUT)
+
+Each below was adversarially examined and found sound; the citations let an auditor confirm in
+minutes instead of re-hunting:
+
+- **GF(256) has NO table-lookup side channel.** Table-free shift-XOR multiply; no log/antilog/S-box tables anywhere. The classic cache-timing oracle does not apply. (Only the LOW branch issue above.) `ddrm-envelope/src/lib.rs:317-347`.
+- **No exploitable variable-time secret comparison.** Authentication is signature-rooted (ML-DSA-65 / ECDSA-recover), not byte-compare. Every `==`/`!=` found is on a public value or a single-use freshness nonce, never a recoverable secret/MAC/tag gate. (Traced across 8 crates.)
+- **A single malicious node cannot steal the key or forge authorization.** It holds one information-theoretically useless share; recovery is gated by a wallet-signed grant + a live on-chain check it cannot produce. `node_chain.rs:195-226`, `dkms-authority/main.rs:516-531`.
+- **Node-set trust is pinned + attested, not config-trust.** Public-only descriptor (rejects any master seed), pinned vk + fresh-challenge attestation, channel-key attestation defeats MITM, duplicate identities fail closed. `dkms-authority/main.rs:2202-2253, 2104-2117`; `lib.rs:1271-1278`.
+- **The quorum-release proof verifier is clean** — recomputes the node-set id, rejects duplicate signers, enforces valid<t → fail closed, expiry-gated, binds the caller-supplied principal/session. `ddrm-envelope/src/lib.rs:1182-1243`.
+- **Six of seven host adapters are fail-closed and identity-bound to dDRM-rail standard.** Identity is transport-bound per-connection, never wire-supplied — a malicious capsule/guest/page cannot forge `from`/principal, inject a capability, bypass the token, or read another principal's traffic. `io_bridge.rs:38-113`, `carrier_bridge.rs:647-727`, `wasm.rs:232-340`, `shell.js:366-479`, `gateway_home_token.rs:298-360`, `local_http.rs:10-52`.
+- **The dev-mode fences are by-construction** (prior verification): release builds cannot compile/select the forgeable reference/legacy/Dev-rights paths; startup guard refuses to boot. See `SECURITY_AUDIT.md` + `DEV_MODE_GUARD_SPEC.md`.
+- **Prior fixes intact:** wallet/did zeroization, the WebAuthn DoS bounds-check.
+
+## What still requires the external firm (cannot be self-served)
+
+- A **funded crypto + protocol audit** (the PQ-hybrid envelope, the Shamir/threshold scheme, the GF math) before custodying real value — non-negotiable.
+- A **live pen-test** of a deployed instance (everything here is static source review).
+- The **node-operator trust model at scale** — attestation/slashing for a path to permissionless nodes (the metadata + Byzantine items are partly governance, not just code).

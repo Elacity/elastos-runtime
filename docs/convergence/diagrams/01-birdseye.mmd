@@ -1,0 +1,67 @@
+flowchart TB
+    subgraph WORLD["the world"]
+        PEERS["other ElastOS nodes"]
+        CHAIN["Base / ESC chains"]
+        IPFSNET["IPFS / Kubo / supernode"]
+        WEB["public web"]
+    end
+
+    subgraph NODE["ElastOS Node (one per machine)"]
+        direction TB
+
+        subgraph UX["Human surface (Apps)"]
+            HOME["Home shell<br/>wallpaper, launcher, windows"]
+            APPS["App capsules<br/>Library · Documents · Chat · Marketplace · Browser · Viewers"]
+        end
+
+        subgraph CORE["Node Core / Runtime (trusted, small)"]
+            CAP["Capabilities<br/>Ed25519 tokens"]
+            SESS["Sessions + passkey principals"]
+            DISP["Provider dispatch + routing"]
+            AUDIT["Audit + lifecycle"]
+        end
+
+        subgraph SUBSTRATE["Capsule Runtime (substrate-independent execution)"]
+            WASMT["WASM / WASI sandbox"]
+            MVM["microVM (Linux/crosvm)"]
+            SUBP["host subprocess (stdio JSON)"]
+        end
+
+        subgraph PROV["Providers (semantics behind elastos://)"]
+            DIDP["did"]
+            WALLP["wallet"]
+            CHAINP["chain"]
+            IPFSP["ipfs / content / availability"]
+            NETP["net / exit"]
+            DRMP["dDRM chain: drm · rights · key · dkms · decrypt"]
+        end
+
+        subgraph CARR["Carrier (decentralized substrate, built-in)"]
+            GOSSIP["peer discovery · gossip · relay"]
+            XFER["peer-to-peer content transport"]
+        end
+    end
+
+    HOME --> CAP
+    APPS -->|"carrier_invoke / localhost:// / elastos://"| DISP
+    CAP --> DISP
+    SESS --> CAP
+    DISP --> PROV
+    DISP --> SUBSTRATE
+    PROV --> CARR
+    APPS -. "run on" .- SUBSTRATE
+    PROV -. "run on" .- SUBSTRATE
+
+    CARR <--> PEERS
+    CHAINP <--> CHAIN
+    IPFSP <--> IPFSNET
+    NETP --> WEB
+
+    classDef core fill:#1f3a5f,color:#fff,stroke:#0d1b2a;
+    classDef ux fill:#2e7d32,color:#fff,stroke:#14361a;
+    classDef prov fill:#6a4c93,color:#fff,stroke:#2c1d3f;
+    classDef carr fill:#b5651d,color:#fff,stroke:#3f2208;
+    class CORE,CAP,SESS,DISP,AUDIT core;
+    class UX,HOME,APPS ux;
+    class PROV,DIDP,WALLP,CHAINP,IPFSP,NETP,DRMP prov;
+    class CARR,GOSSIP,XFER carr;

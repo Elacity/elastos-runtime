@@ -589,6 +589,60 @@ pub(super) async fn gateway_library_upload_cancel(
     .into_response()
 }
 
+/// GET /api/provider/object/cover?uri=<library uri> — an owned `.ddrm` asset's PUBLIC cover art.
+///
+/// The Library browser renders this as the asset's tile thumbnail (PC2 parity). It resolves the
+/// capsule's `thumbnail` (a key-free `ipfs://<cid>` pinned at mint) and proxies the image through
+/// the ipfs provider — the same canonical cover-fetch path the media player uses. It serves no
+/// plaintext content and no key material, is scoped to the caller's own objects, and fails closed
+/// (404) when the asset has no cover, so the browser falls back to the generic type icon.
+pub(super) async fn gateway_library_cover(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let mut uri = String::new();
+    for (key, value) in form_urlencoded::parse(raw_query.as_deref().unwrap_or_default().as_bytes())
+    {
+        if key == "uri" {
+            uri = value.trim().to_string();
+        }
+    }
+    if uri.is_empty() {
+        return (StatusCode::BAD_REQUEST, "cover uri is required").into_response();
+    }
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[LIBRARY_CAPSULE_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => return gateway_provider_error_response("object", err),
+    };
+    let Some(registry) = state.provider_registry.as_ref().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content provider unavailable",
+        )
+            .into_response();
+    };
+    // Resolve the PUBLIC cover reference from the owner's own capsule (no content, no keys).
+    let cover_uri = match crate::library::ddrm_cover_uri_for_object(
+        &state.data_dir,
+        &context.principal_id,
+        &uri,
+    ) {
+        Ok(Some(cover_uri)) => cover_uri,
+        Ok(None) | Err(_) => {
+            return (StatusCode::NOT_FOUND, "this asset has no cover art").into_response()
+        }
+    };
+    match crate::api::viewer_media::fetch_public_cover_bytes(&registry, &cover_uri).await {
+        Ok(bytes) => crate::api::viewer_media::cover_image_response(bytes),
+        Err((code, message)) => (code, message).into_response(),
+    }
+}
+
 pub(super) async fn gateway_library_download(
     State(state): State<GatewayState>,
     headers: HeaderMap,

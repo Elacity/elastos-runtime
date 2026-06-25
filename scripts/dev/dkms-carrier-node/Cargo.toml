@@ -1,0 +1,39 @@
+[package]
+name = "dkms-carrier-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# dkms-carrier-node — the NODE-SIDE Carrier bridge for the dKMS quorum transport.
+#
+# Runs ALONGSIDE the existing `dkms-authority` daemon on each quorum node (A/B/C).
+# It is a DUMB, UNTRUSTED byte relay: it exposes a stable Carrier `did:key` address
+# over iroh (ALPN `elastos/dkms-authority/1`) and, for every accepted bi-stream,
+# connects to the node's EXISTING `dkms-authority` listener (e.g. tcp:10.66.66.1:9443)
+# and pumps bytes both ways. The end-to-end PQ-hybrid channel terminates between the
+# runtime's `key-provider` and the node, so this relay only ever sees ciphertext —
+# the same hostile-network threat model the node already assumes for its TCP listener.
+#
+# It does NOT change the `dkms-authority` binary, env, or systemd unit. Deploying it
+# is purely additive: a separate process that fronts the node's existing socket.
+#
+# Its own workspace (empty `[workspace]` below) so the iroh stack stays isolated and
+# this cross-compiles cleanly for the Linux supernodes via `cargo zigbuild`.
+
+[[bin]]
+name = "dkms-carrier-node"
+path = "src/main.rs"
+
+[dependencies]
+iroh = { version = "0.96", features = ["address-lookup-mdns"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+futures-lite = "2.6"
+anyhow = "1.0"
+bs58 = "0.5"
+getrandom = "0.2"
+url = "2.5"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

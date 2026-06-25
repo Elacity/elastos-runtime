@@ -157,15 +157,98 @@ impl ChainProvider {
             .map_err(|err| Response::error("upstream_invalid_text", &err.to_string()))
     }
 
+    /// The ordered RPC endpoints for a network: the primary `rpc_url` first, then each
+    /// `rpc_fallback_urls` entry, de-duplicated and trimmed of empties. Mirrors PC2's
+    /// round-robin pool ordering (primary head, public fallbacks behind).
+    fn evm_rpc_pool<'a>(network: &'a ChainNetwork) -> Vec<&'a str> {
+        let mut pool: Vec<&str> = Vec::new();
+        for url in std::iter::once(&network.rpc_url).chain(network.rpc_fallback_urls.iter()) {
+            let url = url.trim();
+            if !url.is_empty() && !pool.contains(&url) {
+                pool.push(url);
+            }
+        }
+        pool
+    }
+
+    /// The RPC pool for `eth_getLogs`: the network's `log_query_rpc_urls` subset (range-capable
+    /// endpoints) when configured, else the full pool. Channel discovery routes log queries
+    /// here so a strict public endpoint (e.g. `1rpc.io`'s 50-block cap) can never break a scan.
+    fn evm_log_rpc_pool<'a>(network: &'a ChainNetwork) -> Vec<&'a str> {
+        let mut pool: Vec<&str> = Vec::new();
+        for url in &network.log_query_rpc_urls {
+            let url = url.trim();
+            if !url.is_empty() && !pool.contains(&url) {
+                pool.push(url);
+            }
+        }
+        if pool.is_empty() {
+            return Self::evm_rpc_pool(network);
+        }
+        pool
+    }
+
+    /// `eth_getLogs` over the range-capable pool only. Same rotate-on-error failover as
+    /// `evm_rpc`, but restricted to endpoints that actually serve wide log ranges.
+    pub(super) fn evm_rpc_logs(
+        &self,
+        network: &ChainNetwork,
+        filter: Value,
+    ) -> Result<Value, Response> {
+        let pool = Self::evm_log_rpc_pool(network);
+        if pool.is_empty() {
+            return Err(Response::error(
+                "backend_not_configured",
+                &format!("no log-query RPC endpoint is configured for {}", network.id),
+            ));
+        }
+        let params = json!([filter]);
+        let mut last_err: Option<Response> = None;
+        for url in pool {
+            match self.evm_rpc_once(url, "eth_getLogs", &params) {
+                Ok(value) => return Ok(value),
+                Err(response) => last_err = Some(response),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Response::error("upstream_unreachable", "all log-query RPC endpoints failed")
+        }))
+    }
+
+    /// Call an EVM JSON-RPC method, failing over across the network's RPC pool: a transport
+    /// error, an HTTP error, or a JSON-RPC error on one endpoint advances to the next (PC2's
+    /// `baseRpcCall` rotate-on-error). The answer itself is never softened — a definitive
+    /// result is returned as-is; only endpoint failures rotate. Returns the LAST error if
+    /// every endpoint failed (fail-closed for the caller).
     pub(super) fn evm_rpc(
         &self,
         network: &ChainNetwork,
         method: &str,
         params: Value,
     ) -> Result<Value, Response> {
+        let pool = Self::evm_rpc_pool(network);
+        if pool.is_empty() {
+            return Err(Response::error(
+                "backend_not_configured",
+                &format!("no RPC endpoint is configured for {}", network.id),
+            ));
+        }
+        let mut last_err: Option<Response> = None;
+        for url in pool {
+            match self.evm_rpc_once(url, method, &params) {
+                Ok(value) => return Ok(value),
+                Err(response) => last_err = Some(response),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Response::error("upstream_unreachable", "all RPC endpoints failed")))
+    }
+
+    /// A single JSON-RPC round trip against one endpoint URL.
+    fn evm_rpc_once(&self, url: &str, method: &str, params: &Value) -> Result<Value, Response> {
         let response = self
             .client
-            .post(&network.rpc_url)
+            .post(url)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,

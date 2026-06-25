@@ -217,9 +217,40 @@ pub struct GatewayState {
     pub cache_dir: PathBuf,
     /// Runtime data directory backing rooted Publisher/Edge/MyWebSite state.
     pub data_dir: PathBuf,
+    /// Tamper-evident audit sink (GAP-8), lazily file-backed under `data_dir/audit/`. Mirrors the
+    /// `identity_manager` lazy pattern: an EXPLICIT field (no hidden global), initialized on first
+    /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. FOLLOW-ON: unify this with the
+    /// runtime/infra audit sink so the gateway and runtime share ONE custody log.
+    pub audit_log: Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>>,
 }
 
 impl GatewayState {
+    /// The tamper-evident audit log, lazily opened (hash-chained + ed25519-signed) under
+    /// `data_dir/audit/gateway-audit.log`. If the file cannot be opened it FALLS BACK to a
+    /// memory-only log and logs loudly — content opens still proceed, but that run is not
+    /// persistently tamper-evident (the open itself is gated elsewhere).
+    pub(crate) fn audit_log(&self) -> Arc<elastos_runtime::primitives::audit::AuditLog> {
+        use elastos_runtime::primitives::audit::AuditLog;
+        if let Some(existing) = self.audit_log.get() {
+            return existing.clone();
+        }
+        let path = self.data_dir.join("audit").join("gateway-audit.log");
+        let log = match AuditLog::with_file(&path) {
+            Ok(log) => Arc::new(log),
+            Err(e) => {
+                tracing::error!(
+                    "audit log file init failed at {:?} ({e}); falling back to memory-only \
+                     (this run's audit is NOT persistently tamper-evident)",
+                    path
+                );
+                Arc::new(AuditLog::new())
+            }
+        };
+        let _ = self.audit_log.set(log.clone());
+        // Another thread may have won the race; return whatever is now canonical.
+        self.audit_log.get().cloned().unwrap_or(log)
+    }
+
     pub(crate) fn identity_manager(
         &self,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<IdentityManager>>> {
@@ -345,6 +376,7 @@ pub fn gateway_router(state: GatewayState) -> Router {
             "/api/provider/object/download/raw",
             get(gateway_library_download),
         )
+        .route("/api/provider/object/cover", get(gateway_library_cover))
         .route(
             "/api/provider/object/upload",
             put(gateway_library_upload).layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
@@ -649,6 +681,102 @@ pub fn gateway_router(state: GatewayState) -> Router {
                 .put(super::viewer_gateway::viewer_storage_put),
         )
         .route(
+            "/api/viewers/open",
+            axum::routing::post(super::viewer_open::open_owned_in_viewer),
+        )
+        .route(
+            "/api/viewers/prepare-grant",
+            axum::routing::post(super::viewer_open::prepare_owned_grant),
+        )
+        .route(
+            "/api/market/buy",
+            axum::routing::post(super::viewer_open::buy_owned_access),
+        )
+        .route(
+            "/api/create/mint",
+            axum::routing::post(super::viewer_open::mint_create_asset),
+        )
+        .route(
+            "/api/apps/creator/status",
+            get(super::creator::creator_status),
+        )
+        .route(
+            "/api/apps/creator/prepare-mint",
+            // The mint payload carries the asset bytes (base64) inline, so it far exceeds axum's
+            // 2 MB default body cap. Allow the same ceiling as a Library upload (100 MB) — base64
+            // inflation (~33%) means this comfortably covers an image and a modest video.
+            axum::routing::post(super::creator::creator_prepare_mint)
+                .layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
+        )
+        .route(
+            "/api/apps/creator/prepare-progress/:job_id",
+            get(super::creator::creator_prepare_progress),
+        )
+        .route(
+            "/api/apps/creator/wallet",
+            get(super::creator::creator_wallet),
+        )
+        .route(
+            "/api/apps/creator/channels",
+            get(super::creator::creator_list_channels),
+        )
+        .route(
+            "/api/apps/creator/create-channel",
+            axum::routing::post(super::creator::creator_create_channel),
+        )
+        .route(
+            "/api/apps/creator/prepare-trade-approval",
+            axum::routing::post(super::creator::creator_prepare_trade_approval),
+        )
+        .route(
+            "/api/apps/creator/mint-status",
+            axum::routing::post(super::creator::creator_mint_status),
+        )
+        .route(
+            "/api/viewers/elacity-player/media/open",
+            axum::routing::post(super::media_authority::open_demo_media),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session",
+            get(super::viewer_media::viewer_media_manifest),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/init",
+            get(super::viewer_media::viewer_media_init),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/cover",
+            get(super::viewer_media::viewer_media_cover),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/segment/:index",
+            get(super::viewer_media::viewer_media_segment),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/init",
+            get(super::viewer_media::viewer_media_track_init),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/segment/:index",
+            get(super::viewer_media::viewer_media_track_segment),
+        )
+        .route(
+            "/api/viewers/ddrm-viewer/object/open",
+            axum::routing::post(super::object_authority::open_owned_object),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session",
+            get(super::viewer_object::viewer_object_manifest),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session/bytes",
+            get(super::viewer_object::viewer_object_bytes),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session/page",
+            get(super::viewer_object::viewer_object_page),
+        )
+        .route(
             "/apps/:app",
             get(super::browser_capsules::serve_browser_app_root),
         )
@@ -818,14 +946,39 @@ async fn landing_page() -> Html<String> {
 include!("gateway_models.rs");
 
 fn load_existing_gateway_runtime_did(data_dir: &std::path::Path) -> Option<String> {
+    // The gateway DID is deterministically derived from the on-disk device key
+    // (SHA-256 over a fixed label || device_key) and is therefore boot-stable.
+    // Per-request token verification calls this on every protected-asset fetch, so
+    // re-reading device.key + re-deriving the ed25519 identity each time is pure
+    // waste. Memoize the resolved DID instead.
+    //
+    // Containment: only the POSITIVE result is cached. A missing identity keeps
+    // being re-checked (so a device key provisioned after gateway start is still
+    // picked up), and the cached value can only ever be the real derived DID — it
+    // can never widen authority. The signature/expiry/session checks that actually
+    // authorize a request stay per-request in the callers; this only memoizes WHO
+    // the trusted signer is, not WHETHER a given token is valid.
+    static DID_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    let cache = DID_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(did) = cache.lock().ok().and_then(|m| m.get(data_dir).cloned()) {
+        return Some(did);
+    }
+
     let device_key = data_dir.join("identity").join("device.key");
     if !device_key.exists() {
         return None;
     }
-    elastos_identity::load_or_create_did(data_dir)
+    let did = elastos_identity::load_or_create_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
-        .filter(|did| !did.trim().is_empty())
+        .filter(|did| !did.trim().is_empty())?;
+    if let Ok(mut m) = cache.lock() {
+        m.insert(data_dir.to_path_buf(), did.clone());
+    }
+    Some(did)
 }
 
 #[derive(Debug, Clone, Deserialize)]

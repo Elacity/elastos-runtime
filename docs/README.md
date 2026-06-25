@@ -9,6 +9,7 @@ These are the main active docs for outside readers and contributors.
 - [../README.md](../README.md) — repo front door
 - [state.md](../state.md) — factual current-state summary
 - [GETTING_STARTED.md](GETTING_STARTED.md) — developer build/run path
+- [RUN_HOME_MACOS.md](RUN_HOME_MACOS.md) — repeatable runbook for the browser Home shell + passkey login on macOS (host lock + WebAuthn gotchas)
 - [COMMAND_MATRIX.md](COMMAND_MATRIX.md) — command/runtime contract
 - [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) — release-facing test matrix and manual runbook
 - [SITES.md](SITES.md) — current site and public-edge model
@@ -24,6 +25,11 @@ Planning and truth surfaces outside `docs/`:
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design and crate/layer structure
 - [OVERVIEW.md](OVERVIEW.md) — high-level repo/system summary
+- [PRINCIPLES_CONFORMANCE.md](PRINCIPLES_CONFORMANCE.md) — audit of where code holds/breaks PRINCIPLES.md, ranked improvement areas, and an investigated-but-not-a-defect list
+- [adr/0001-extract-app-and-service-logic-from-trusted-core.md](adr/0001-extract-app-and-service-logic-from-trusted-core.md) — ADR: shrink the trusted core by moving app/service logic into its capsules (Principle 5)
+- [CAPABILITY_AUDIT.md](CAPABILITY_AUDIT.md) — capability-conformance audit: enforcement architecture, what's proven, and the gaps (machine-checked in the `capability_conformance` test harness)
+- [SECURITY_AUDIT.md](SECURITY_AUDIT.md) — adversarial security audit: crypto correctness, identity binding, secrets hygiene, memory safety; findings + what's sound
+- [CONFIDENTIAL_COMPUTE.md](CONFIDENTIAL_COMPUTE.md) — TEE / hardware-enclave (SEV-SNP, TDX, remote attestation) opportunity, runtime-wide wedges, and a phased architecture scaffold (forward design; nothing implemented yet)
 - [CAPSULE_MODEL.md](CAPSULE_MODEL.md) — supplemental capsule/runtime terminology note
 - [CARRIER.md](CARRIER.md) — supplemental Carrier framing note
 - [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md) — IPLD, CID sync, availability receipts, and SmartWeb content-plane direction
@@ -37,6 +43,7 @@ Planning and truth surfaces outside `docs/`:
 - [KEY_PROVIDER.md](KEY_PROVIDER.md) — protected-content key release and PQ-hybrid envelope boundary
 - [DECRYPT_PROVIDER.md](DECRYPT_PROVIDER.md) — protected-content decrypt/render session boundary
 - [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) — sealed objects, DRM provider boundary, and protected-content sequence
+- [ASSET_TIERS.md](ASSET_TIERS.md) — the 5-tier containment model + asset taxonomy for the marketplace (what's shipped, blind spots, North stars)
 - [GLOSSARY.md](GLOSSARY.md) — vocabulary only
 
 These should stay narrower than the canonical current docs. If they repeat the same story in different words, they should be merged or shortened rather than expanded.

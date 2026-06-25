@@ -1,0 +1,18 @@
+[package]
+name = "ddrm-publish-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev-only orchestrator (NOT a capsule, never shipped): drives the REAL publish-provider
+# and chain-provider binaries over their stdin/stdout JSON protocol to prove the
+# producer->chain seam — a sealed asset's identity (KID) flows publish(prepare) ->
+# chain(assemble_mint) into byte-faithful mint calldata, one contentId end to end.
+# See scripts/ddrm-publish-smoke.sh.
+
+[[bin]]
+name = "ddrm-publish-smoke"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0"

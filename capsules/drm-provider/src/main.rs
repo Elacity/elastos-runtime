@@ -72,13 +72,6 @@ impl Response {
         }
     }
 
-    fn error_with_details(code: &str, message: impl Into<String>, details: Value) -> Self {
-        Response::Error {
-            code: code.to_string(),
-            message: message.into(),
-            details: Some(details),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -112,14 +105,7 @@ impl DrmProvider {
             "supported_actions": PROTECTED_CONTENT_ACTIONS,
             "required_sequence": drm_open_sequence(),
             "required_runtime_events": drm_required_runtime_events(),
-            "blocked_authority": [
-                "raw_cek",
-                "key_backend_sdk",
-                "wallet_rpc",
-                "chain_rpc",
-                "kubo_api",
-                "elacity_sdk"
-            ],
+            "blocked_authority": drm_blocked_authority(),
             "next_required_providers": drm_next_required_providers(),
         }))
     }
@@ -128,12 +114,147 @@ impl DrmProvider {
         if let Err(err) = validate_open_request(&request) {
             return Response::error("invalid_request", err);
         }
-        Response::error_with_details(
-            "not_configured",
-            "DRM open requires the declared content, rights, key, decrypt, receipt, and audit sequence",
-            drm_open_blocked_details(),
-        )
+        // The drm-provider PLANS the open; it never opens. It holds no CEK, no
+        // key-backend SDK, no chain/wallet RPC — so it cannot fetch content,
+        // check rights, release a key, or decrypt. It emits the single canonical
+        // `drm/open` sequence (status `planned`, never `opened`) with the explicit
+        // binding edges between steps, and the runtime injects the capabilities and
+        // executes it. This mirrors `publish-provider`'s `prepared` mint intent
+        // (Day 61) and PC2's `recoverCEKEnvelope` sequencer, which signs a request,
+        // runs the access-check -> key-release -> seal action in fixed order, and
+        // returns only sealed material (chipotle-client.ts:1438-1538).
+        match build_open_plan(&request) {
+            Ok(plan) => Response::ok(serde_json::to_value(plan).expect("plan serializes")),
+            Err(err) => Response::error("invalid_request", err),
+        }
     }
+}
+
+/// The single backend-neutral identifier of the executable open plan. Capsule-local
+/// (like `publish-provider::UnsignedMintV1`), so the frozen shared `protected_content`
+/// contract surface — and the drift gate — stays untouched.
+const DRM_OPEN_PLAN_SCHEMA: &str = "elastos.drm.open.plan/v1";
+
+/// One edge of the canonical open sequence: the artifact a `from_step` produces and
+/// the request field of `into_step` it must be bound into. This is the "what flows
+/// where" the runtime needs to chain the providers; it is declarative data, not an
+/// invocation (the drm-provider invokes nothing).
+#[derive(Debug, Serialize)]
+struct DrmPlanBindingV1 {
+    from_step: &'static str,
+    produces: &'static str,
+    into_step: &'static str,
+    into_field: &'static str,
+}
+
+/// The typed, executable `drm/open` plan the runtime follows. The drm-provider emits
+/// it (status `planned`) holding zero authority; the runtime injects the rights/key/
+/// decrypt capabilities and runs the steps in order, binding each step's output into
+/// the next per `bindings`. The CEK never appears here — `blocked_authority` is
+/// advertised exactly as in `status`.
+#[derive(Debug, Serialize)]
+struct DrmOpenPlanV1 {
+    schema: &'static str,
+    status: &'static str,
+    provider: &'static str,
+    principal_id: String,
+    session_id: String,
+    /// The content identity the on-chain rights check keys on. Per the Day-58 join
+    /// this is the KID (== `bytes16 contentId`), carried as `object.key_envelope.kid`.
+    content_id: String,
+    /// The decrypt boundary's object reference. The shared contract requires
+    /// `rights_receipt.content_id == key/decrypt.object_cid` (enforced in
+    /// `key-provider`), so this equals `content_id` — one identity, two field names.
+    object_cid: String,
+    action: String,
+    viewer_interface: String,
+    steps: Value,
+    bindings: Vec<DrmPlanBindingV1>,
+    next_required_providers: Value,
+    required_runtime_events: Value,
+    blocked_authority: Vec<&'static str>,
+}
+
+/// The raw authority the drm-provider can never hold or surface — advertised
+/// identically by `status` and embedded in every plan so a reader can prove the
+/// orchestrator is incapable of doing the dangerous work itself.
+fn drm_blocked_authority() -> Vec<&'static str> {
+    vec![
+        "raw_cek",
+        "key_backend_sdk",
+        "wallet_rpc",
+        "chain_rpc",
+        "kubo_api",
+        "elacity_sdk",
+    ]
+}
+
+/// Build the executable open plan from an already-validated request. The content
+/// identity is the KID; the shared contract's `content_id == object_cid` invariant
+/// is honoured by emitting the same value under both names.
+fn build_open_plan(request: &DrmOpenRequest) -> Result<DrmOpenPlanV1, String> {
+    let content_id = request.object.key_envelope.kid.trim().to_string();
+    if content_id.is_empty() {
+        return Err("key_envelope.kid is required".to_string());
+    }
+    let viewer_interface = request.object.viewer.required_interface.trim().to_string();
+    Ok(DrmOpenPlanV1 {
+        schema: DRM_OPEN_PLAN_SCHEMA,
+        status: "planned",
+        provider: "drm",
+        principal_id: request.principal_id.clone(),
+        session_id: request.session_id.clone(),
+        object_cid: content_id.clone(),
+        content_id,
+        action: request.action.clone(),
+        viewer_interface,
+        steps: drm_open_sequence(),
+        bindings: drm_open_plan_bindings(),
+        next_required_providers: drm_next_required_providers(),
+        required_runtime_events: drm_required_runtime_events(),
+        blocked_authority: drm_blocked_authority(),
+    })
+}
+
+/// The binding edges of the canonical sequence: the content identity flows into the
+/// rights check and the decrypt session; the rights decision gates the key release;
+/// the release receipt gates the decrypt session; the object's declared viewer
+/// requirement selects the decrypt viewer interface. Field names match the shared
+/// `RightsDecisionReceiptV1` / `KeyReleaseRequestV1` / `DecryptSessionRequestV1`
+/// surface (pinned by `chain_seam_tests`), so a contract rename fails loudly.
+fn drm_open_plan_bindings() -> Vec<DrmPlanBindingV1> {
+    vec![
+        DrmPlanBindingV1 {
+            from_step: "drm_open",
+            produces: "content_id",
+            into_step: "rights_check",
+            into_field: "content_id",
+        },
+        DrmPlanBindingV1 {
+            from_step: "rights_check",
+            produces: "RightsDecisionReceiptV1",
+            into_step: "key_release",
+            into_field: "rights_receipt",
+        },
+        DrmPlanBindingV1 {
+            from_step: "key_release",
+            produces: "ReleaseReceiptV1",
+            into_step: "decrypt_session",
+            into_field: "release_receipt",
+        },
+        DrmPlanBindingV1 {
+            from_step: "drm_open",
+            produces: "object_cid",
+            into_step: "decrypt_session",
+            into_field: "object_cid",
+        },
+        DrmPlanBindingV1 {
+            from_step: "drm_open",
+            produces: "viewer_interface",
+            into_step: "decrypt_session",
+            into_field: "viewer_interface",
+        },
+    ]
 }
 
 fn drm_open_sequence() -> Value {
@@ -193,14 +314,6 @@ fn drm_required_runtime_events() -> Value {
 
 fn drm_next_required_providers() -> Value {
     json!(["rights-provider", "key-provider", "decrypt-provider"])
-}
-
-fn drm_open_blocked_details() -> Value {
-    json!({
-        "required_sequence": drm_open_sequence(),
-        "required_runtime_events": drm_required_runtime_events(),
-        "next_required_providers": drm_next_required_providers(),
-    })
 }
 
 fn validate_open_request(request: &DrmOpenRequest) -> Result<(), String> {
@@ -392,30 +505,112 @@ mod tests {
     }
 
     #[test]
-    fn open_fails_closed_until_real_rights_key_and_decrypt_providers_exist() {
+    fn open_emits_a_planned_plan_never_opens_itself() {
+        // The drm-provider PLANS but never OPENS: a valid request yields a typed
+        // plan whose status is `planned` (not `opened`), declaring the canonical
+        // sequence the runtime must execute. The capsule decrypts nothing.
         let provider = DrmProvider;
-        assert_eq!(error_code(provider.open(open_request())), "not_configured");
+        let data = ok_data(provider.open(open_request()));
+
+        assert_eq!(data["schema"], DRM_OPEN_PLAN_SCHEMA);
+        assert_eq!(data["status"], "planned");
+        assert_ne!(data["status"], "opened");
+        assert_eq!(data["provider"], "drm");
+        assert_eq!(data["principal_id"], "person:local:test");
+        assert_eq!(data["session_id"], "session:test");
+        assert_eq!(data["action"], "view");
     }
 
     #[test]
-    fn open_failure_declares_required_sequence() {
+    fn open_plan_declares_canonical_sequence_and_runtime_events() {
         let provider = DrmProvider;
-        let response = serde_json::to_value(provider.open(open_request())).unwrap();
+        let data = ok_data(provider.open(open_request()));
+        let steps = data["steps"].as_array().unwrap();
 
-        assert_eq!(response["status"], "error");
-        assert_eq!(response["code"], "not_configured");
+        assert_eq!(steps.len(), 8);
+        assert_eq!(steps[0]["resource"], "elastos://content/status");
         assert_eq!(
-            response["details"]["required_sequence"][0]["resource"],
-            "elastos://content/status"
+            steps[2]["resource"],
+            "elastos://rights/access/has_access_by_content_id"
         );
-        assert_eq!(
-            response["details"]["required_sequence"][3]["resource"],
-            "elastos://key/release"
-        );
-        assert!(response["details"]["required_runtime_events"]
+        assert_eq!(steps[3]["resource"], "elastos://key/release");
+        assert_eq!(steps[4]["resource"], "elastos://decrypt/session/open");
+        assert_eq!(steps[6]["step"], "release_receipt");
+        assert_eq!(steps[7]["step"], "audit");
+        assert!(data["required_runtime_events"]
             .as_array()
             .unwrap()
             .contains(&json!("protected_content.open.audit")));
+        let providers = data["next_required_providers"].as_array().unwrap();
+        assert!(providers.contains(&json!("rights-provider")));
+        assert!(providers.contains(&json!("key-provider")));
+        assert!(providers.contains(&json!("decrypt-provider")));
+    }
+
+    #[test]
+    fn open_plan_carries_one_content_identity_under_both_names() {
+        // The shared contract requires rights `content_id == key/decrypt object_cid`
+        // (enforced in key-provider). The plan emits the KID under both names so the
+        // identity cannot drift between the rights check and the decrypt session.
+        let provider = DrmProvider;
+        let data = ok_data(provider.open(open_request()));
+
+        assert_eq!(data["content_id"], "kid:test");
+        assert_eq!(data["object_cid"], "kid:test");
+        assert_eq!(data["content_id"], data["object_cid"]);
+        assert_eq!(data["viewer_interface"], "elastos.viewer/document@1");
+    }
+
+    #[test]
+    fn open_plan_declares_the_receipt_binding_edges() {
+        let provider = DrmProvider;
+        let data = ok_data(provider.open(open_request()));
+        let bindings = data["bindings"].as_array().unwrap();
+
+        // rights -> key: the RightsDecisionReceiptV1 binds into key_release.rights_receipt.
+        assert!(bindings.iter().any(|b| {
+            b["from_step"] == "rights_check"
+                && b["produces"] == "RightsDecisionReceiptV1"
+                && b["into_step"] == "key_release"
+                && b["into_field"] == "rights_receipt"
+        }));
+        // key -> decrypt: the ReleaseReceiptV1 binds into decrypt_session.release_receipt.
+        assert!(bindings.iter().any(|b| {
+            b["from_step"] == "key_release"
+                && b["produces"] == "ReleaseReceiptV1"
+                && b["into_step"] == "decrypt_session"
+                && b["into_field"] == "release_receipt"
+        }));
+        // content identity flows into the rights check.
+        assert!(bindings.iter().any(|b| {
+            b["produces"] == "content_id"
+                && b["into_step"] == "rights_check"
+                && b["into_field"] == "content_id"
+        }));
+        // the object's declared viewer requirement selects the decrypt viewer interface.
+        assert!(bindings.iter().any(|b| {
+            b["produces"] == "viewer_interface"
+                && b["into_step"] == "decrypt_session"
+                && b["into_field"] == "viewer_interface"
+        }));
+    }
+
+    #[test]
+    fn open_plan_carries_no_raw_authority() {
+        // The plan must be incapable of doing the dangerous work: it advertises the
+        // blocked authority and contains neither a CEK nor any wrapped key material.
+        let provider = DrmProvider;
+        let data = ok_data(provider.open(open_request()));
+        let blocked = data["blocked_authority"].as_array().unwrap();
+
+        assert!(blocked.contains(&json!("raw_cek")));
+        assert!(blocked.contains(&json!("key_backend_sdk")));
+        assert!(blocked.contains(&json!("chain_rpc")));
+
+        let serialized = serde_json::to_string(&data).unwrap();
+        assert!(!serialized.contains("wrapped")); // the sealed object's wrapped_cek is not echoed
+        assert!(!serialized.contains("cek_b64"));
+        assert!(!serialized.contains("raw_plaintext"));
     }
 
     #[test]
@@ -479,5 +674,121 @@ mod tests {
         .to_string();
 
         assert!(err.contains("unknown field"));
+    }
+}
+
+/// Characterization tests for the inter-provider contract seams.
+///
+/// The drm-provider orchestrates `rights -> key -> decrypt`. These tests prove the
+/// receipt each step emits deserializes *exactly* into the next step's request type,
+/// so the contracts compose end-to-end. If a shared contract type drifts, these fail
+/// loudly here rather than silently at runtime.
+#[cfg(test)]
+mod chain_seam_tests {
+    use elastos_common::protected_content::{
+        DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
+        DECRYPT_SESSION_REQUEST_SCHEMA, KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA,
+        RIGHTS_DECISION_RECEIPT_SCHEMA,
+    };
+    use serde_json::json;
+
+    const PRINCIPAL: &str = "person:local:test";
+    const SESSION: &str = "session:test";
+    const OBJECT: &str = "bafybeigprotectedcontent";
+
+    fn key_envelope_json() -> serde_json::Value {
+        json!({
+            "scheme": "elastos-pq-hybrid-threshold-v0",
+            "kid": "kid:test",
+            "wrapped_cek": "wrapped",
+            "policy_hash": "sha256:test",
+            "algorithms": {
+                "cipher": "aes-256-gcm",
+                "signature": ["ed25519", "ml-dsa-65"],
+                "kem": ["x25519", "ml-kem-768"],
+                "share_scheme": "shamir-t-of-n"
+            }
+        })
+    }
+
+    /// rights -> key: a RightsDecisionReceiptV1 deserializes as the `rights_receipt`
+    /// field of the key-provider's request, with binding fields intact.
+    #[test]
+    fn rights_receipt_flows_into_key_release_request() {
+        let rights_receipt = json!({
+            "schema": RIGHTS_DECISION_RECEIPT_SCHEMA,
+            "request_id": "rights:test",
+            "content_id": OBJECT,
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "right": "view",
+            "provider": "rights-provider",
+            "allowed": true,
+            "issued_at": 1_800_000_000u64,
+            "expires_at": 1_900_000_000u64
+        });
+
+        // The shape stands alone as a RightsDecisionReceiptV1 ...
+        serde_json::from_value::<RightsDecisionReceiptV1>(rights_receipt.clone()).unwrap();
+
+        // ... and embeds cleanly into the next step's request.
+        let request: KeyReleaseRequestV1 = serde_json::from_value(json!({
+            "schema": KEY_RELEASE_REQUEST_SCHEMA,
+            "request_id": "key-release:test",
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "object_cid": OBJECT,
+            "action": "view",
+            "rights_receipt": rights_receipt,
+            "key_envelope": key_envelope_json(),
+            "reason": "open protected document",
+            "expires_at": 1_900_000_000u64
+        }))
+        .unwrap();
+
+        assert!(request.rights_receipt.allowed);
+        assert_eq!(request.rights_receipt.content_id, request.object_cid);
+        assert_eq!(request.rights_receipt.principal_id, request.principal_id);
+        assert_eq!(request.rights_receipt.right, request.action);
+    }
+
+    /// key -> decrypt: a ReleaseReceiptV1 deserializes as the `release_receipt` field
+    /// of the decrypt-provider's session request, with binding fields intact.
+    #[test]
+    fn release_receipt_flows_into_decrypt_session_request() {
+        let release_receipt = json!({
+            "schema": RELEASE_RECEIPT_SCHEMA,
+            "request_id": "key-release:test",
+            "object_cid": OBJECT,
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "action": "view",
+            "provider": "key-provider",
+            "status": "released",
+            "issued_at": 1_800_000_000u64,
+            "expires_at": 1_900_000_000u64
+        });
+
+        serde_json::from_value::<ReleaseReceiptV1>(release_receipt.clone()).unwrap();
+
+        let request: DecryptSessionRequestV1 = serde_json::from_value(json!({
+            "schema": DECRYPT_SESSION_REQUEST_SCHEMA,
+            "request_id": "decrypt:test",
+            "principal_id": PRINCIPAL,
+            "session_id": SESSION,
+            "object_cid": OBJECT,
+            "action": "view",
+            "viewer_interface": "elastos.viewer/document@1",
+            "release_receipt": release_receipt,
+            "output_kind": "rendered",
+            "reason": "open protected document",
+            "expires_at": 1_900_000_000u64
+        }))
+        .unwrap();
+
+        assert_eq!(request.release_receipt.status, "released");
+        assert_eq!(request.release_receipt.object_cid, request.object_cid);
+        assert_eq!(request.release_receipt.principal_id, request.principal_id);
+        assert_eq!(request.release_receipt.action, request.action);
     }
 }

@@ -5,7 +5,145 @@
 //! local and capsule-kernel calls from drifting.
 
 use elastos_common::localhost::rooted_localhost_uri;
+use elastos_runtime::capability::Action;
 use serde_json::Value;
+
+/// Map a provider OPERATION to the capability [`Action`] it actually requires (PRE-AUDIT #3).
+///
+/// The carrier bridge and the HTTP provider proxy used to validate the token against
+/// `token.action()` — i.e. the token AGAINST ITSELF — which made the action check a no-op and let a
+/// Read-granted token drive a Write/Delete operation on the same resource (the resource string is
+/// identical across read/write/delete for `localhost`, `did`, `peer`, `object`, `documents`). This
+/// is the single, central operation→action map the bridge consults instead, so the capability
+/// manager can enforce the REAL required action.
+///
+/// Verbs are consistent across providers, so this is keyed on the operation name. FAIL CLOSED: any
+/// operation not listed requires [`Action::Admin`] — a newly-added op that someone forgot to map is
+/// DENIED to ordinary Read/Write/Execute grants until it is explicitly classified here, rather than
+/// silently accepting a low-privilege token (PRINCIPLES #11).
+pub fn required_action_for(op: &str) -> Action {
+    // Inspect ops carry their own canonical action contract (the inspector
+    // substrate's single source of truth, `inspect_op_required_action`). Honor it
+    // before the generic verb map so carrier inspect calls gate at Read/Write
+    // instead of the fail-closed `Admin` default a merge would otherwise impose
+    // (the inspect arm DDRM's map lacked). Reads stay Read; revoke stays Write.
+    if let Some(action) = inspect_op_required_action(op) {
+        return action;
+    }
+    match op {
+        // ---- Read: observation, never mutation ------------------------------------------------
+        "status"
+        | "read"
+        | "list"
+        | "stat"
+        | "exists"
+        | "resolve"
+        | "networks"
+        | "block_number"
+        | "sync_health"
+        | "balance"
+        | "contract_call"
+        | "estimate_gas"
+        | "transaction_count"
+        | "gas_price"
+        | "fee_history"
+        | "code"
+        | "logs"
+        | "transaction"
+        | "receipt"
+        | "proof"
+        | "fetch"
+        | "has_access_by_content_id"
+        | "is_subscription_active"
+        | "can_stream"
+        | "can_download"
+        | "accounts"
+        | "default_account"
+        | "approval_requests"
+        | "get_did"
+        | "get_nickname"
+        | "get_persona_did"
+        | "get_ticket"
+        | "get_node_id"
+        | "list_peers"
+        | "list_topics"
+        | "list_topic_peers"
+        | "gossip_recv"
+        | "page_status"
+        | "frame"
+        | "screenshot"
+        | "summary"
+        | "roots"
+        | "ping"
+        | "list_backends"
+        | "list_channels" => Action::Read,
+        // ---- Write: creates/changes state but does not destroy --------------------------------
+        "write"
+        | "mkdir"
+        | "set_nickname"
+        | "remember_peer"
+        | "link_account"
+        | "create_managed_account"
+        | "set_default_account"
+        | "rename_account"
+        | "revoke_account"
+        | "publish"
+        | "ensure"
+        | "repair"
+        | "create"
+        | "save"
+        | "rename"
+        | "move"
+        | "copy" => Action::Write,
+        // ---- Delete: destroys state -----------------------------------------------------------
+        "delete" | "delete_permanently" | "trash" | "unpublish" => Action::Delete,
+        // ---- Message: peer messaging ----------------------------------------------------------
+        "gossip_send" => Action::Message,
+        // ---- Execute: invoke an authorized capability (sign/decrypt/connect/tx-assembly) ------
+        "gossip_join"
+        | "gossip_leave"
+        | "gossip_join_peers"
+        | "connect"
+        | "verify"
+        | "verify_did_recovery"
+        | "verify_proof"
+        | "verify_bip322_proof"
+        | "verify_contract_proof"
+        | "sign_chat_message"
+        | "request_signature"
+        | "challenge"
+        | "bitcoin_challenge"
+        | "release"
+        | "release_ref"
+        | "release_from_escrow_ref"
+        | "open_session"
+        | "render"
+        | "stream_segment"
+        | "prepare_transaction"
+        | "assemble_mint"
+        | "assemble_create_channel"
+        | "assemble_trade_approval"
+        | "broadcast_transaction"
+        | "decide_access_from_chain"
+        | "chat_completions"
+        | "stream"
+        | "http"
+        | "open_stream"
+        | "close_stream"
+        | "http_fetch"
+        | "launch"
+        | "attach_stream"
+        | "close_page"
+        | "input"
+        | "webrtc_signal"
+        | "open"
+        | "quote" => Action::Execute,
+        // ---- Admin: lifecycle + secret/approval custody (highest privilege) -------------------
+        // `init`/`shutdown`, node lifecycle, secret import/export, approval workflow, and EVERY
+        // unmapped operation fall here — fail closed.
+        _ => Action::Admin,
+    }
+}
 
 /// Build the capability resource string for a provider request.
 ///
@@ -286,6 +424,76 @@ fn decrypt_resource(op: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_action_classifies_operations_and_fails_closed() {
+        // Read: observation.
+        for op in [
+            "status",
+            "read",
+            "list",
+            "stat",
+            "exists",
+            "fetch",
+            "balance",
+            "gossip_recv",
+        ] {
+            assert_eq!(required_action_for(op), Action::Read, "{op} should be Read");
+        }
+        // Write: mutate-not-destroy.
+        for op in ["write", "mkdir", "set_nickname", "publish", "link_account"] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Write,
+                "{op} should be Write"
+            );
+        }
+        // Delete: destruction (the read/write/delete collapse is the core PRE-AUDIT #3 risk).
+        for op in ["delete", "delete_permanently", "trash", "unpublish"] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Delete,
+                "{op} should be Delete"
+            );
+        }
+        // Message.
+        assert_eq!(required_action_for("gossip_send"), Action::Message);
+        // Execute: invoke an authorized capability.
+        for op in [
+            "release",
+            "open_session",
+            "render",
+            "request_signature",
+            "broadcast_transaction",
+        ] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Execute,
+                "{op} should be Execute"
+            );
+        }
+        // Admin: lifecycle + secret/approval custody.
+        for op in [
+            "init",
+            "shutdown",
+            "node_lifecycle",
+            "export_managed_secret",
+            "sign_approved",
+        ] {
+            assert_eq!(
+                required_action_for(op),
+                Action::Admin,
+                "{op} should be Admin"
+            );
+        }
+        // FAIL CLOSED: an unmapped/unknown operation requires Admin, so a Read/Write token cannot
+        // drive it — a forgotten mapping denies rather than under-enforces.
+        assert_eq!(
+            required_action_for("totally_new_unmapped_op"),
+            Action::Admin
+        );
+        assert_eq!(required_action_for(""), Action::Admin);
+    }
 
     #[test]
     fn ai_resource_with_backend() {

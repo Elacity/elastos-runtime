@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Create</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --surface: #ffffff;
+        --line: #e4e7ec;
+        --text: #14181f;
+        --muted: #5b6472;
+        --accent: #2f6bff;
+        --accent-weak: #eaf0ff;
+        --ok: #1f9d57;
+        --err: #d23b3b;
+        --radius: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+      }
+      main {
+        width: 100%;
+        max-width: 560px;
+        padding: 28px 22px 56px;
+      }
+      header h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -0.01em; }
+      header p { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 18px;
+        margin-bottom: 16px;
+      }
+      label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+      input[type="text"], input[type="number"], textarea, select {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 14px;
+        background: #fff;
+        color: var(--text);
+      }
+      textarea { resize: vertical; min-height: 64px; }
+      .row { display: flex; gap: 12px; }
+      .row > div { flex: 1; }
+      .field { margin-bottom: 14px; }
+      .field:last-child { margin-bottom: 0; }
+      .drop {
+        border: 1.5px dashed var(--line);
+        border-radius: var(--radius);
+        padding: 26px 18px;
+        text-align: center;
+        color: var(--muted);
+        cursor: pointer;
+        transition: border-color .15s, background .15s;
+      }
+      .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-weak); }
+      .drop strong { color: var(--text); display: block; font-size: 14px; }
+      .drop .meta { font-size: 12px; margin-top: 4px; }
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: var(--accent-weak);
+        color: var(--accent);
+        margin-left: 6px;
+      }
+      button.primary {
+        width: 100%;
+        border: 0;
+        border-radius: 10px;
+        background: var(--accent);
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 13px;
+        cursor: pointer;
+      }
+      button.primary:disabled { background: #b9c6e8; cursor: not-allowed; }
+      /* "Mint another" — a calm secondary action shown after a mint is broadcast. */
+      button.secondary {
+        width: 100%;
+        margin-top: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--accent);
+        padding: 11px 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.secondary:hover { background: #f4f7ff; }
+      /* Promote "Enable trading" once the mint confirms on-chain so it reads as the next action. */
+      button.primary.is-ready {
+        animation: enable-trading-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes enable-trading-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(64, 120, 240, 0.45); }
+        50% { box-shadow: 0 0 0 7px rgba(64, 120, 240, 0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        button.primary.is-ready { animation: none; box-shadow: 0 0 0 3px rgba(64, 120, 240, 0.35); }
+      }
+      .steps { list-style: none; padding: 0; margin: 0; }
+      .steps li {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        padding: 7px 0;
+      }
+      .steps li .dot {
+        width: 16px; height: 16px; border-radius: 50%;
+        border: 2px solid var(--line); flex: none;
+      }
+      .steps li.active { color: var(--text); }
+      .steps li.active .dot { border-color: var(--accent); }
+      .steps li.done .dot { border-color: var(--ok); background: var(--ok); }
+      .steps li.err { color: var(--err); }
+      .steps li.err .dot { border-color: var(--err); background: var(--err); }
+      .tech-progress {
+        margin: 12px 0;
+        padding: 10px 12px;
+        border: 1px solid var(--border, #2a2a2a);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .tech-progress > summary {
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 8px;
+      }
+      .tech-progress .steps li.active .dot {
+        animation: tech-pulse 1s ease-in-out infinite;
+      }
+      @keyframes tech-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+      .status { font-size: 13px; margin-top: 14px; min-height: 18px; }
+      .status.err { color: var(--err); }
+      .status.ok { color: var(--ok); }
+      .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+      .hidden { display: none !important; }
+      /* Access-method selector cards (free / buy_once / buy_and_resell) */
+      .method-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      .method {
+        border: 1.5px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 8px;
+        text-align: center;
+        cursor: pointer;
+        transition: border-color .15s, background .15s;
+      }
+      .method:hover { border-color: var(--accent); }
+      .method.sel { border-color: var(--accent); background: var(--accent-weak); }
+      .method strong { display: block; font-size: 13px; color: var(--text); }
+      .method span { font-size: 10.5px; color: var(--muted); }
+      /* Royalty split rows */
+      .royalty-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+      .royalty-row input { padding: 8px 10px; font-size: 13px; }
+      .royalty-row .ry-addr { flex: 1; }
+      .royalty-row .ry-pct { width: 72px; }
+      .royalty-row .ry-del {
+        border: 1px solid var(--line); background: #fff; color: var(--err);
+        border-radius: 8px; width: 30px; height: 34px; cursor: pointer; flex: none;
+      }
+      .btn-add {
+        border: 1px dashed var(--line); background: #fff; color: var(--accent);
+        border-radius: 8px; padding: 7px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+      }
+      .royalty-total { font-size: 11px; margin-top: 6px; }
+      .royalty-total.bad { color: var(--err); }
+      .royalty-total.ok { color: var(--ok); }
+      .check { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; color: var(--text); }
+      .check input { width: auto; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Create</h1>
+        <p>Mint an asset to your own quorum &mdash; PQ custody, no Lit.</p>
+      </header>
+
+      <section class="card">
+        <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a file">
+          <strong id="drop-title">Choose a file</strong>
+          <div class="meta" id="drop-meta">media or any document &middot; click or drop</div>
+          <input id="file" type="file" class="hidden" />
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="field">
+          <label for="title">Title</label>
+          <input id="title" type="text" placeholder="My asset" />
+        </div>
+        <div class="field">
+          <label for="desc">Description</label>
+          <textarea id="desc" placeholder="What is it?"></textarea>
+        </div>
+        <div class="field">
+          <label for="thumb-input">Cover thumbnail (optional)</label>
+          <div id="thumb-drop" class="drop" tabindex="0" role="button" aria-label="Choose a cover image" style="padding:16px">
+            <strong id="thumb-drop-title">Add a cover image</strong>
+            <div class="meta" id="thumb-drop-meta">Auto-generated if you skip this &middot; click or drop</div>
+            <input id="thumb-input" type="file" accept="image/*" class="hidden" />
+          </div>
+          <div id="thumb-preview-wrap" class="hidden" style="margin-top:10px;display:flex;align-items:center;gap:10px">
+            <img id="thumb-preview-img" alt="cover preview" style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" />
+            <button id="thumb-remove" type="button" style="border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer">Remove</button>
+          </div>
+          <div class="hint" id="thumb-hint">No cover? A degraded preview is generated automatically (blurred for images, a frame for video, a waveform for audio, a template otherwise) — the full asset stays encrypted.</div>
+        </div>
+        <div class="field">
+          <label>Access method</label>
+          <div class="method-grid" id="method-grid">
+            <div class="method sel" data-method="free" role="button" tabindex="0">
+              <strong>Free</strong><span>Open access</span>
+            </div>
+            <div class="method" data-method="buy_once" role="button" tabindex="0">
+              <strong>Buy now</strong><span>One-time sale</span>
+            </div>
+            <div class="method" data-method="buy_and_resell" role="button" tabindex="0">
+              <strong>Buy &amp; resell</strong><span>Tradable + royalty</span>
+            </div>
+          </div>
+        </div>
+        <div class="field row hidden" id="price-row">
+          <div>
+            <label for="price">Price</label>
+            <input id="price" type="number" min="0" step="0.0001" value="0" />
+          </div>
+          <div>
+            <label for="currency">Currency</label>
+            <select id="currency">
+              <option value="ELA">ELA</option>
+              <option value="USDC">USDC</option>
+              <option value="ETH">ETH</option>
+            </select>
+          </div>
+        </div>
+        <div class="field row">
+          <div>
+            <label for="copies">Access tokens (supply)</label>
+            <input id="copies" type="number" min="1" step="1" value="10000" />
+            <div class="hint" id="copies-hint">How many holders can be granted access. Each access token unlocks the content for one owner.</div>
+          </div>
+          <div>
+            <label for="category">Category</label>
+            <select id="category">
+              <option value="">Auto-detect</option>
+              <option value="art">Art</option>
+              <option value="music">Music</option>
+              <option value="video">Video</option>
+              <option value="image">Image</option>
+              <option value="document">Document</option>
+              <option value="ebook">eBook</option>
+              <option value="comic">Comic</option>
+              <option value="3d-model">3D model</option>
+              <option value="ai-model">AI model</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field" id="resell-field">
+          <label for="reseller-cut">Resale royalty (RRL %)</label>
+          <input id="reseller-cut" type="number" min="0" max="100" step="0.1" value="90" />
+          <div class="hint">Your cut on every secondary trade (resale). PC2 default 90%.</div>
+        </div>
+
+        <div class="field" id="royalty-field">
+          <label>Royalty split</label>
+          <div id="royalty-rows"></div>
+          <button id="royalty-add" type="button" class="btn-add">+ Add payee</button>
+          <div id="royalty-total" class="royalty-total"></div>
+          <div class="hint">Payees share primary-sale revenue. The protocol takes 5% automatically, so your rows must total 95%. Leave empty to send the full 95% to your wallet.</div>
+        </div>
+
+        <div class="field">
+          <label class="check">
+            <input id="ai-licensing" type="checkbox" />
+            <span>Grant AI training rights</span>
+          </label>
+          <div class="hint">Off = perpetual personal-use license only. On = buyers may use the asset to train AI models (PC2 <em>training-rights</em>).</div>
+        </div>
+
+        <div class="field">
+          <label class="check">
+            <input id="adult-flag" type="checkbox" />
+            <span>Adult content (18+)</span>
+          </label>
+        </div>
+
+        <div class="field">
+          <label class="check">
+            <input id="legal-attest" type="checkbox" />
+            <span>I own or have the rights to distribute this content</span>
+          </label>
+          <div class="hint" id="legal-hint">Required legal attestation, signed into the asset metadata.</div>
+        </div>
+        <div class="field hidden" id="preview-settings">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input id="preview-enabled" type="checkbox" style="width:auto" />
+            <span>Free preview clip (video/audio)</span>
+          </label>
+          <div id="preview-controls" class="hidden" style="margin-top:8px">
+            <input id="preview-duration" type="range" min="5" max="60" step="5" value="15" style="width:100%" />
+            <div class="hint">Plays the first <strong id="preview-duration-display">15s</strong> unencrypted as a public teaser (max 60s). The full asset stays dKMS-encrypted.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="wallet">Wallet</label>
+          <select id="wallet"><option value="">Connect a wallet on Base…</option></select>
+          <div class="hint" id="wallet-hint">The wallet that signs the mint — must be linked on Base.</div>
+        </div>
+        <div class="field">
+          <label for="channel">Channel</label>
+          <select id="channel"><option value="">Select a wallet first…</option></select>
+          <div class="hint" id="channel-hint">Your channels are discovered on-chain.</div>
+          <div class="field hidden" id="channel-manual" style="margin-top:10px">
+            <label for="channel-manual-input">Channel contract address</label>
+            <input id="channel-manual-input" type="text" placeholder="0x… (your channel on Base)" autocomplete="off" spellcheck="false" />
+            <div class="hint" id="channel-manual-hint">Paste your channel's contract address. It's verified on-chain (must be created by your wallet) before minting.</div>
+          </div>
+        </div>
+        <div class="field hidden" id="create-channel">
+          <label for="channel-name">New channel name</label>
+          <input id="channel-name" type="text" placeholder="My channel" />
+          <div class="field row" style="margin-top:10px">
+            <div>
+              <label for="channel-scope">Scope</label>
+              <select id="channel-scope">
+                <option value="private">Private (subscription)</option>
+                <option value="public">Public</option>
+              </select>
+            </div>
+            <div style="display:flex;align-items:flex-end">
+              <button id="create-channel-btn" class="primary" type="button">Create channel</button>
+            </div>
+          </div>
+          <div class="hint" id="create-channel-hint">Deploys a new channel from your wallet (you approve in Wallet).</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <button id="mint" class="primary" disabled>Mint</button>
+        <details id="tech-progress" class="tech-progress" hidden open>
+          <summary>Encoding &amp; publishing progress</summary>
+          <ul class="steps" id="tech-steps">
+            <li data-tech="analyze"><span class="dot"></span> Analyze source</li>
+            <li data-tech="package"><span class="dot"></span> Transcode &amp; fragment (DASH)</li>
+            <li data-tech="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
+            <li data-tech="publish"><span class="dot"></span> Publish to IPFS</li>
+            <li data-tech="sign"><span class="dot"></span> Assemble mint</li>
+          </ul>
+        </details>
+        <ul class="steps" id="steps">
+          <li data-step="encrypt"><span class="dot"></span> Encrypt &amp; escrow to quorum</li>
+          <li data-step="publish"><span class="dot"></span> Assemble mint</li>
+          <li data-step="sign"><span class="dot"></span> Sign with wallet</li>
+          <li data-step="broadcast"><span class="dot"></span> Broadcast</li>
+          <li data-step="approve"><span class="dot"></span> Approve gateway (enable trading)</li>
+        </ul>
+        <div id="status" class="status"></div>
+        <button id="enable-trading" class="primary" hidden>Step 2 — Enable trading</button>
+        <div id="enable-trading-hint" class="hint" hidden>
+          Once the mint confirms on-chain, approve the gateway so others can trade your asset.
+        </div>
+        <button id="mint-another" class="secondary" type="button" hidden>+ Mint another asset</button>
+      </section>
+    </main>
+    <script src="creator.js?v=creator-20260618a"></script>
+  </body>
+</html>

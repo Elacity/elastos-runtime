@@ -1,0 +1,14 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "elacity-player",
+  "version": "0.1.0",
+  "description": "Play an owned, protected video (fMP4/CENC) via MSE. Satisfies the elastos.viewer/media@1 interface; consumes only scoped decrypted segments over a session handle, never the CEK or IV.",
+  "role": "viewer",
+  "type": "data",
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "resources": {
+    "memory_mb": 96,
+    "gpu": false
+  }
+}

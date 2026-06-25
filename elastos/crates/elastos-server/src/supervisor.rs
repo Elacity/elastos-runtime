@@ -1567,6 +1567,7 @@ mod tests {
                 sha256: String::new(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -1759,6 +1760,7 @@ mod tests {
             version: None,
             install_path: Some(install_path.to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -1968,6 +1970,7 @@ mod tests {
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -2012,6 +2015,7 @@ mod tests {
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );

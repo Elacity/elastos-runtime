@@ -25,6 +25,7 @@ import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
 import { createLibraryRenderer, iconPlaceholder } from "./render.js";
 import { createLibrarySelection } from "./selection.js";
+import { TAG_COLORS, getTag, setTag } from "./tags.js";
 import {
   MUTATING_PROVIDER_OPS,
   cacheFolderListing,
@@ -44,6 +45,7 @@ import { createLibraryUploads } from "./uploads.js";
       providerApi: runtimeProviderApi,
       uploadObject,
       downloadObjectRaw,
+      loadCover,
       openTarget,
       openPublishedUri,
       deliverToTarget,
@@ -210,6 +212,7 @@ import { createLibraryUploads } from "./uploads.js";
     } = createLibraryRenderer({
       elements,
       isSelected,
+      loadCover,
       perf,
       selectedObjects,
       state,
@@ -675,6 +678,7 @@ import { createLibraryUploads } from "./uploads.js";
         documents: "icons/sidebar-folder-documents.svg",
         pictures: "icons/sidebar-folder-pictures.svg",
         videos: "icons/sidebar-folder-videos.svg",
+        music: "icons/sidebar-folder.svg",
         downloads: "icons/sidebar-folder.svg",
         public: "icons/sidebar-folder-public.svg",
         webspaces: "icons/sidebar-folder.svg",
@@ -718,6 +722,61 @@ import { createLibraryUploads } from "./uploads.js";
 
     function visibleObjects() {
       return visibleObjectsForState(state);
+    }
+
+    // Apply (or, when colorId is falsy, clear) a colour tag on every given object, then refresh
+    // just those rows. Tags live in localStorage (see tags.js), so this is instant and local.
+    function applyTag(objects, colorId) {
+      for (const object of objects) {
+        if (!object || !object.uri) continue;
+        setTag(object.uri, colorId);
+        state.objectNodeCache.delete(object.uri); // bust the render cache so the dot updates
+      }
+      scheduleContentRender();
+    }
+
+    // A Finder-style colour-tag row: seven dots + Clear. A dot already on every selected item is
+    // shown active; clicking it toggles it off. Returns a custom menu entry that builds its own DOM.
+    function tagsMenuRow(objects) {
+      const uris = objects.map((object) => object.uri).filter(Boolean);
+      const current = uris.length
+        ? uris.map((uri) => getTag(uri)).reduce((a, b) => (a === b ? a : ""))
+        : "";
+      return {
+        custom: ({ hideMenu }) => {
+          const row = document.createElement("div");
+          row.className = "menu-tags-row";
+          for (const color of TAG_COLORS) {
+            const dot = document.createElement("button");
+            dot.type = "button";
+            dot.className = "menu-tag-dot";
+            dot.style.setProperty("--tag-color", color.hex);
+            dot.title = color.label;
+            dot.setAttribute("aria-label", `Tag ${color.label}`);
+            if (current && current === color.id) dot.dataset.active = "true";
+            dot.addEventListener("click", (event) => {
+              event.stopPropagation();
+              // Toggle: clicking the colour already on all selected items clears it.
+              applyTag(objects, current === color.id ? "" : color.id);
+              hideMenu();
+            });
+            row.appendChild(dot);
+          }
+          const clear = document.createElement("button");
+          clear.type = "button";
+          clear.className = "menu-tag-clear";
+          clear.title = "Clear tag";
+          clear.setAttribute("aria-label", "Clear tag");
+          clear.textContent = "\u2715";
+          clear.addEventListener("click", (event) => {
+            event.stopPropagation();
+            applyTag(objects, "");
+            hideMenu();
+          });
+          row.appendChild(clear);
+          return row;
+        },
+      };
     }
 
     function showMenuForObject(object, x, y) {
@@ -799,6 +858,10 @@ import { createLibraryUploads } from "./uploads.js";
       if (object.published && publicCid) {
         actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));
       }
+      if (!inTrash(object)) {
+        actions.push("-");
+        actions.push(tagsMenuRow([object]));
+      }
       actions.push(menuAction("Properties", () => showProperties(object)));
       renderMenu(actions, x, y);
     }
@@ -866,6 +929,10 @@ import { createLibraryUploads } from "./uploads.js";
       if (active.some((object) => hasCapability(object, "trash"))) actions.push(menuAction("Delete", trashSelectedObjects));
       if (trash.length) actions.push(menuAction("Restore", restoreSelectedObjects));
       if (permanentlyDeletable) actions.push(menuAction("Delete Permanently", deleteSelectedObjects));
+      if (active.length) {
+        actions.push("-");
+        actions.push(tagsMenuRow(active));
+      }
       renderMenu(actions, x, y);
     }
 

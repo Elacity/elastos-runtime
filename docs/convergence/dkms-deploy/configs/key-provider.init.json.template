@@ -1,0 +1,9 @@
+{
+  "_comment": "Runtime-side key-provider init config that CUTS OVER the recovery rail to the deployed 2-of-3 quorum. Lives on the RUNTIME host. Shape grounded in scripts/dev/ddrm-runtime-open/src/main.rs (the dkms authority object) and capsules/key-provider/src/main.rs::build_dkms_client. The caller seed is the runtime's OWN identity (its public half is allow-listed on every node); it is NOT a dKMS secret.",
+  "op": "init",
+  "config": {
+    "backend": "dkms",
+    "dkms_authority_descriptor": "/etc/elastos/dkms-authority.v2.json",
+    "dkms_caller_seed_b64": "__RUNTIME_CALLER_SEED_B64__"
+  }
+}

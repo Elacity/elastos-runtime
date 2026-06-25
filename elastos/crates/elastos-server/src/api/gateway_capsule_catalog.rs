@@ -202,8 +202,10 @@ pub(super) fn capsule_catalog_summary(data_dir: &std::path::Path) -> CapsuleCata
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    let mut counts = CapsuleCatalogCounts::default();
-    counts.total = capsules.len();
+    let mut counts = CapsuleCatalogCounts {
+        total: capsules.len(),
+        ..Default::default()
+    };
     for capsule in &capsules {
         match capsule.role.as_str() {
             "app" => counts.apps += 1,
@@ -262,12 +264,14 @@ pub(super) fn capsule_interface_registry_summary(
         }
     }
 
-    let mut counts = CapsuleInterfaceRegistryCounts::default();
-    counts.capsules = interfaces
-        .iter()
-        .map(|interface| interface.capsule.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
+    let mut counts = CapsuleInterfaceRegistryCounts {
+        capsules: interfaces
+            .iter()
+            .map(|interface| interface.capsule.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        ..Default::default()
+    };
     counts.interfaces = interfaces.len();
     counts.methods = interfaces
         .iter()
@@ -994,26 +998,30 @@ mod tests {
                 }]
             }),
         );
+        // capsule_roots() also scans DEV_CAPSULES_ROOT (the repo's shipped
+        // capsules/), which since the Flint merge declare their own typed
+        // affordances. Global catalog/registry counts therefore reflect the whole
+        // shipped surface, not just the seeded capsule — so assert on the
+        // marketplace capsule's OWN contribution (what this test verifies),
+        // immune to how many other capsules ship affordances.
         let catalog = capsule_catalog_summary(data_dir.path());
-        assert_eq!(catalog.counts.interfaces, 1);
-        assert_eq!(catalog.counts.methods, 2);
         let marketplace = catalog
             .capsules
             .iter()
             .find(|capsule| capsule.name == "marketplace")
             .unwrap();
+        assert_eq!(marketplace.interfaces.len(), 1);
         assert_eq!(marketplace.interfaces[0].id, "elastos.marketplace.catalog");
 
         let registry = capsule_interface_registry_summary(data_dir.path());
         assert_eq!(registry.schema, CAPSULE_INTERFACE_REGISTRY_SCHEMA);
-        assert_eq!(registry.counts.capsules, 1);
-        assert_eq!(registry.counts.interfaces, 1);
-        assert_eq!(registry.counts.methods, 2);
-        assert_eq!(registry.interfaces[0].capsule, "marketplace");
-        assert_eq!(
-            registry.interfaces[0].interface.methods[1].id,
-            "capsule.open"
-        );
+        let marketplace_entry = registry
+            .interfaces
+            .iter()
+            .find(|entry| entry.capsule == "marketplace")
+            .expect("marketplace interface listed in the registry");
+        assert_eq!(marketplace_entry.interface.methods.len(), 2);
+        assert_eq!(marketplace_entry.interface.methods[1].id, "capsule.open");
         assert_eq!(registry.policy.invocation_state, "runtime-gated");
     }
 

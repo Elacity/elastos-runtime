@@ -177,6 +177,11 @@ mod tests {
         assert!(manager.overlay_dir().exists());
     }
 
+    // Shells out to `mkfs.ext4`, which is part of e2fsprogs on Linux. macOS and
+    // Windows hosts do not ship it, so the test is scoped to Linux. The
+    // production code that calls mkfs.ext4 is itself only reached on Linux via
+    // the /dev/kvm fail-closed path in vm.rs::start().
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_data_disk_creation() {
         let temp = tempdir().unwrap();

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::io::{self, BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const NONCE_LEN: usize = 12;
 const DID_RECOVERY_PROOF_SCHEMA: &str = "elastos.did.recovery-proof/v1";
@@ -439,7 +439,8 @@ impl DidProvider {
         let normalized = name.to_ascii_lowercase();
         let dir = self.did_dir().join("personas");
         let key_path = dir.join(format!("{}.enc", normalized));
-        let storage_key = derive_storage_key(dk);
+        // Zeroize the derived persona-storage AES key on drop (per-operation hot path).
+        let storage_key = Zeroizing::new(derive_storage_key(dk));
 
         let persona_vk = if key_path.exists() {
             // Load existing persona key

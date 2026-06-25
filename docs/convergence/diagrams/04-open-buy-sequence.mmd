@@ -1,0 +1,38 @@
+sequenceDiagram
+    participant U as User (Home)
+    participant G as Gateway (Node Core)
+    participant L as Library (own-root read)
+    participant W as wallet-provider
+    participant R as rights-provider
+    participant C as chain-provider
+    participant B as buy_authority
+    participant M as media/object-authority
+    participant D as decrypt-provider
+    participant V as Viewer (WASM)
+
+    U->>G: POST /api/viewers/open { uri } + Home launch token
+    G->>L: resolve inside principal's OWN root
+    L-->>G: plaintext bytes + content_id (KID/CID)
+    G->>W: resolve EVM subject (linked wallet)
+    G->>R: decide_access_from_chain(content_id, subject, "view")
+    R->>C: has_access_by_content_id (real eth_call)
+    C-->>R: owned? true/false
+    R-->>G: signed RightsDecisionReceiptV1 (allowed + hash)
+
+    alt denied (no access token)
+        G-->>U: 403 "no valid access token"
+        U->>G: POST /api/market/buy { uri }
+        G->>B: buy_access(content_id, subject)
+        B->>C: broadcast_transaction (buyAccess tx)
+        C-->>B: tx hash
+        B-->>G: owned_now=true (ledger/chain)
+        U->>G: retry /api/viewers/open
+        G->>R: decide_access_from_chain (now owned)
+    end
+
+    G->>M: launch bound to content_id + rights-receipt hash
+    M->>D: sealed material (CEK sealed to session, AAD-bound)
+    D-->>M: scoped output (rendered/stream) — no CEK
+    M-->>G: { viewer, session, play_url }
+    G-->>V: open at play_url (+ scoped launch token)
+    V-->>U: plays — CEK never left the decrypt boundary

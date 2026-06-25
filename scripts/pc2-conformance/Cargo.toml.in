@@ -1,0 +1,22 @@
+# Template for the on-demand PC2 conformance driver crate. `pc2-conformance.sh`
+# substitutes __PC2_DDRM_PATH__ with the resolved path to PC2 `ddrm-decrypt` and
+# materializes this in a throwaway temp dir — so no absolute path or PC2 coupling
+# is ever committed into the ElastOS build graph.
+[package]
+name = "pc2-conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pc2-conformance"
+path = "src/main.rs"
+
+[dependencies]
+ddrm-decrypt = { path = "__PC2_DDRM_PATH__" }
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+base64 = "0.22"
+serde_json = "1"
+
+# Stand alone — never adopt a parent workspace discovered above the temp dir.
+[workspace]

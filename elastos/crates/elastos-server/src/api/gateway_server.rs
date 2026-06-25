@@ -19,6 +19,7 @@ pub async fn start_gateway_server(
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
         data_dir,
+        audit_log: Arc::new(OnceLock::new()),
     };
     let app = gateway_router(state);
     let listener = TcpListener::bind(addr).await?;

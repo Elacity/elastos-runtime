@@ -20,12 +20,12 @@ import {
   shouldIgnoreDesktopKeydown,
   shellInteractionActive,
   targetById,
-} from "./shell-core.js?v=home-20260607e";
+} from "./shell-core.js?v=home-20260615b";
 import {
   syncIdentity,
   clearIdentitySurface,
   updateClock,
-} from "./shell-chrome.js?v=home-20260607e";
+} from "./shell-chrome.js?v=home-20260615b";
 import {
   renderDesktop,
   renderTaskbar,
@@ -45,7 +45,7 @@ import {
   openDesktopContextMenu,
   hideDesktopContextMenu,
   handleContextAction,
-} from "./shell-surface.js?v=home-20260607e";
+} from "./shell-surface.js?v=home-20260615b";
 import {
   configureWindowHooks,
   renderBootError,
@@ -56,7 +56,7 @@ import {
   restoreShellSession,
   cleanupBeforeUnload,
   handleShellResize,
-} from "./shell-windows.js?v=home-20260607e";
+} from "./shell-windows.js?v=home-20260615b";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -64,7 +64,7 @@ import {
   refreshHomeSession,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260607e";
+} from "./shell-auth.js?v=home-20260615b";
 
 configureWindowHooks({
   clearIdentitySurface,
@@ -87,7 +87,15 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   "chat-room": new Set(["library"]),
   inbox: "visible-target",
-  library: new Set(["archive-manager", "documents", "library"]),
+  library: new Set([
+    "archive-manager",
+    "documents",
+    "library",
+    // Protected owned-asset viewers: opening a minted dKMS `.ddrm` (object) or a protected
+    // media asset routes the owned URI through POST /api/viewers/open (quorum recover/decrypt).
+    "ddrm-viewer",
+    "elacity-player",
+  ]),
   marketplace: "runtime-target",
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),

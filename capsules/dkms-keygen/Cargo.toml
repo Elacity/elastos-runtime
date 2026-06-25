@@ -1,0 +1,25 @@
+[package]
+name = "dkms-keygen"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS dKMS operator/caller identity keygen — operator-console tool for the dKMS deployment kit"
+license = "MIT"
+
+[[bin]]
+name = "dkms-keygen"
+path = "src/main.rs"
+
+[dependencies]
+# SINGLE SOURCE OF TRUTH: the exact ML-DSA-65 seal keypair the key authority (dkms-authority) and
+# the key-provider client use. An emitted verifying key is byte-identical to what a node's
+# allow-list / operator pin expects, because it is produced by the same function.
+ddrm-envelope = { path = "../ddrm-envelope" }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]
