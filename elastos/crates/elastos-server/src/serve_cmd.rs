@@ -201,7 +201,14 @@ pub async fn run_serve(
                     use elastos_server::inspect_provider as ip;
                     let source: Arc<dyn ip::InspectSource> =
                         Arc::new(ip::RuntimeInspectSource::new(Arc::downgrade(&runtime_arc)));
-                    let audit = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
+                    // G1b-LIVE: compose signed activity (AuthAuditSource) with observed
+                    // grants from the SAME AuditLog the capability manager records to,
+                    // so a running capsule's grants surface live.
+                    let activity = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
+                    let grants = Arc::new(ip::RuntimeAuditLogGrantSource::new(
+                        capability_manager.audit_log().clone(),
+                    ));
+                    let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
                     provider_registry
                         .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))
                         .await;
@@ -320,7 +327,13 @@ pub async fn run_serve(
             runtime_src,
             catalog_src,
         ]));
-        let audit = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
+        // G1b-LIVE: compose signed activity with observed grants from the SAME
+        // AuditLog the capability manager records to, so live grants surface.
+        let activity = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
+        let grants = Arc::new(ip::RuntimeAuditLogGrantSource::new(
+            infra.capability_manager.audit_log().clone(),
+        ));
+        let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
         infra
             .provider_registry
             .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))

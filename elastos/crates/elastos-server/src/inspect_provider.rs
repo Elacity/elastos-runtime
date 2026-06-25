@@ -173,6 +173,40 @@ pub trait AuditSource: Send + Sync {
     }
 }
 
+/// Composes signed activity (one source) with observed grants (another) so the
+/// inspector shows BOTH a capsule's attested auth/session activity AND its observed
+/// granted capabilities (G1b-LIVE). `for_capsule` delegates to the activity source;
+/// `granted_for_capsule` delegates to the grants source, both keyed by the same
+/// capsule id. Neither plane's data is fabricated or merged -- each answer comes
+/// from the source that owns it.
+pub struct CompositeAuditSource {
+    activity: Arc<dyn AuditSource>,
+    grants: Arc<dyn AuditSource>,
+}
+
+impl CompositeAuditSource {
+    pub fn new(activity: Arc<dyn AuditSource>, grants: Arc<dyn AuditSource>) -> Self {
+        Self { activity, grants }
+    }
+}
+
+#[async_trait]
+impl AuditSource for CompositeAuditSource {
+    async fn for_capsule(&self, capsule_key: &str, recent_limit: usize) -> CapsuleAudit {
+        self.activity.for_capsule(capsule_key, recent_limit).await
+    }
+
+    async fn granted_for_capsule(
+        &self,
+        capsule_key: &str,
+        recent_limit: usize,
+    ) -> Vec<GrantRecord> {
+        self.grants
+            .granted_for_capsule(capsule_key, recent_limit)
+            .await
+    }
+}
+
 /// Audit source backed by the signed runtime audit log in the auth state
 /// (`RuntimeAuditEventV1`). Correlates by `capsule_id`.
 pub struct AuthAuditSource {
@@ -1550,6 +1584,62 @@ mod tests {
             json!([]),
             "no observed grants => honest empty"
         );
+    }
+
+    #[tokio::test]
+    async fn composite_audit_source_delegates_activity_and_grants_separately() {
+        // G1b-LIVE: the composite serves observed grants from the GRANTS source (a
+        // real grant recorded on the capability manager's log) AND signed activity
+        // from the ACTIVITY source -- each answer comes from the source that owns it,
+        // neither fabricated nor merged.
+        use elastos_runtime::capability::token::{Action, ResourceId, TokenId};
+        use elastos_runtime::primitives::audit::AuditLog;
+
+        // grants source: a real recorded grant under the canonical "vm-probe".
+        let audit_log = Arc::new(AuditLog::new());
+        audit_log.capability_grant(
+            &TokenId::new(),
+            "vm-probe",
+            &ResourceId::new("elastos://rights/*"),
+            Action::Read,
+            None,
+        );
+        let grants: Arc<dyn AuditSource> = Arc::new(RuntimeAuditLogGrantSource::new(audit_log));
+
+        // activity source: a mock returning a sentinel CapsuleAudit.
+        struct ActivityMock;
+        #[async_trait]
+        impl AuditSource for ActivityMock {
+            async fn for_capsule(&self, _key: &str, _limit: usize) -> CapsuleAudit {
+                CapsuleAudit {
+                    total: 42,
+                    denied: 7,
+                    attested: 3,
+                    recent: vec![],
+                }
+            }
+        }
+        let activity: Arc<dyn AuditSource> = Arc::new(ActivityMock);
+
+        let composite = CompositeAuditSource::new(activity, grants);
+
+        // granted_for_capsule delegates to the grants source (the observed grant).
+        let granted = composite.granted_for_capsule("vm-probe", 100).await;
+        assert!(
+            granted
+                .iter()
+                .any(|g| g.resource == "elastos://rights/*" && g.action == "read" && g.granted),
+            "composite serves observed grants from the grants source: {granted:?}"
+        );
+
+        // for_capsule delegates to the activity source (its sentinel), not the
+        // grants source's empty activity.
+        let audit = composite.for_capsule("vm-probe", 100).await;
+        assert_eq!(
+            audit.total, 42,
+            "composite serves signed activity from the activity source"
+        );
+        assert_eq!(audit.denied, 7);
     }
 
     #[tokio::test]
