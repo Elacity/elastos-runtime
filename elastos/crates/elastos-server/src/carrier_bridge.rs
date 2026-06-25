@@ -2256,11 +2256,10 @@ mod tests {
     // Honesty scope: only the CONSENT beat is fail-closed (CapabilityApproved via
     // emit+?). CapabilityRequested / CapabilityGrant / CapabilityUse are best-effort
     // (they land + verify on a healthy sink; asserted by PRESENCE, not fail-closed).
-    // The real minted token validates because THIS test owns one session and binds
-    // the carrier capsule_id to that session's id; it does NOT exercise the
-    // production divergence (an HTTP session UUID vs a VM carrier's `vm-{name}`
-    // never match) -- retiring that capsule_id shim is a separate runtime-capsule
-    // identity task, not claimed here.
+    // Post-flip (G-ID): the token is minted at the requester's REAL capsule identity
+    // (session.vm_id) and the carrier validates against the SAME session.vm_id, so
+    // they agree by the canonical identity field -- the production path, not a test
+    // artifice. The session-id shim is retired.
     #[tokio::test]
     async fn five_beat_loop_turns_once_on_one_signed_chain_over_a_real_consent_token() {
         use crate::api::handlers::capability::{
@@ -2333,9 +2332,14 @@ mod tests {
             )),
         };
 
-        // ONE session; the test owns its id and binds the carrier to it.
+        // ONE capsule session carrying its real identity (vm_id). Post-flip the mint
+        // keys the token on session.vm_id and the carrier validates against the SAME
+        // vm_id, so they agree by the real identity field, not a test artifice.
         let requester = Session::new_capsule("rights-app".to_string());
-        let capsule_id = requester.id.to_string();
+        let capsule_id = requester
+            .vm_id
+            .clone()
+            .expect("a capsule session carries its vm_id");
         let bridge = Some(BridgeContext {
             provider_registry: registry,
             capability_manager: capability_manager.clone(),

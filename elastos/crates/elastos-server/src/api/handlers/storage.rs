@@ -449,8 +449,14 @@ async fn enforce_capability(
 
     let resource = ResourceId::new(canonical_local_uri(path)?);
 
+    // G-ID flip: validate against the session's canonical capsule identity
+    // (session.vm_id), not the session id. Fail closed when absent -- never fall
+    // back to session.id or an empty string.
+    let caller_id = session.vm_id.as_deref().ok_or_else(|| {
+        StorageApiError::PermissionDenied("session has no capsule identity".into())
+    })?;
     cap_mgr
-        .validate(&token, session.id.as_str(), action, &resource, None)
+        .validate(&token, caller_id, action, &resource, None)
         .await
         .map_err(|e| StorageApiError::PermissionDenied(e.to_string()))
 }
@@ -685,11 +691,13 @@ mod tests {
     #[tokio::test]
     async fn test_capsule_session_accepted_with_valid_token() {
         let cap_mgr = make_capability_manager();
-        let session = make_session(SessionType::Capsule);
+        // A capsule session carrying its canonical identity (vm_id); the gate now
+        // validates against vm_id (G-ID flip), so grant the token at the same id.
+        let session = Session::new(SessionType::Capsule, Some("vm-test".to_string()));
 
-        // Grant a token for this session's capsule ID
+        // Grant a token for this session's capsule identity (vm_id)
         let token = cap_mgr.grant(
-            session.id.as_str(),
+            session.vm_id.as_deref().unwrap(),
             ResourceId::new("localhost://MyWebSite/Pictures/*"),
             Action::Read,
             TokenConstraints::default(),

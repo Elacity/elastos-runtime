@@ -781,7 +781,11 @@ impl InspectProvider {
         let Some(audit) = &self.audit else {
             return Value::Array(vec![]);
         };
-        let grants = audit.granted_for_capsule(&entry.name, 500).await;
+        // G-ID flip: grants are recorded under the canonical "vm-{name}" (the mint
+        // keys the audit event on the token's capsule id), so look them up there.
+        let grants = audit
+            .granted_for_capsule(&format!("vm-{}", entry.name), 500)
+            .await;
         Value::Array(
             grants
                 .into_iter()
@@ -1499,7 +1503,7 @@ mod tests {
         let audit_log = Arc::new(AuditLog::new());
         audit_log.capability_grant(
             &TokenId::new(),
-            "cap_granted_1",
+            "vm-cap_granted_1",
             &ResourceId::new("elastos://inspect/*"),
             Action::Read,
             None,
@@ -1508,7 +1512,8 @@ mod tests {
         let provider = InspectProvider::new(Arc::new(MockSource {
             entries: vec![InspectEntry {
                 id: "cap_granted_1".to_string(),
-                // name MUST equal the recorded capsule_id — the grant source keys by name.
+                // The grant source keys by the normalized "vm-{name}"; the fixture
+                // records under "vm-cap_granted_1", which format!("vm-{}", name) matches.
                 name: "cap_granted_1".to_string(),
                 status: "running".to_string(),
                 capsule_type: "wasm".to_string(),

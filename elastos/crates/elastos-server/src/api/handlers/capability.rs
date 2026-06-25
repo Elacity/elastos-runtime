@@ -358,9 +358,24 @@ pub async fn grant_request(
         GrantDuration::Session => TokenConstraints::default(),
     };
 
-    // Use session ID as capsule ID for now
+    // G-ID flip: mint at the requester's REAL capsule identity ("vm-{name}",
+    // recorded on the request), not the session-id shim. Fail closed FORBIDDEN if
+    // the requester had no capsule identity -- mint NOTHING rather than fabricate
+    // one (mirror of the approval guard above). The request stays Pending.
+    let requester_capsule_id = match request.requester_capsule_id.as_deref() {
+        Some(id) => id,
+        None => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "capability grant has no requester capsule identity: {}",
+                    input.request_id
+                ),
+            ));
+        }
+    };
     let token = state.capability_manager.grant(
-        &request.session_id.to_string(),
+        requester_capsule_id,
         request.resource.clone(),
         request.action,
         constraints,
@@ -827,6 +842,90 @@ mod tests {
             Some("vm-market"),
             "the HTTP path records the session's capsule identity on the request"
         );
+    }
+
+    #[tokio::test]
+    async fn grant_mints_at_requester_capsule_identity() {
+        // G-ID flip: the granted token is keyed on the requester's capsule identity
+        // (session.vm_id = "vm-market"), NOT the session UUID -- so it validates at
+        // the carrier/HTTP gates which compare against the same vm-{name}.
+        use elastos_runtime::capability::token::CapabilityToken;
+        use elastos_runtime::capability::{Action, ResourceId};
+        let state = test_state();
+        let session = Session::new_capsule("vm-market".to_string());
+        let req = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/has".to_string(),
+                action: "read".to_string(),
+            }),
+        )
+        .await
+        .expect("request accepted")
+        .0;
+        let grant = grant_request(
+            State(state.clone()),
+            Extension(session),
+            Json(GrantRequestInput {
+                request_id: req.request_id.expect("request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect("grant approved + attested")
+        .0;
+        let token = CapabilityToken::from_base64(&grant.token.expect("token minted")).unwrap();
+        let resource = ResourceId::new("elastos://rights/has");
+        assert!(
+            state
+                .capability_manager
+                .validate(&token, "vm-market", Action::Read, &resource, None)
+                .await
+                .is_ok(),
+            "token validates at the capsule identity vm-market (mint off the session-id shim)"
+        );
+        assert!(
+            state
+                .capability_manager
+                .validate(&token, "vm-other", Action::Read, &resource, None)
+                .await
+                .is_err(),
+            "and not against a different identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_fails_closed_when_no_capsule_identity() {
+        // G-ID flip: a Capsule session with no capsule identity (vm_id=None) records
+        // requester_capsule_id=None, so the grant FAILS CLOSED (FORBIDDEN) and mints
+        // nothing -- never fabricates an identity.
+        let state = test_state();
+        let session = Session::new(elastos_runtime::session::SessionType::Capsule, None);
+        let req = request_capability(
+            State(state.clone()),
+            Extension(session.clone()),
+            Json(RequestCapabilityInput {
+                resource: "elastos://rights/has".to_string(),
+                action: "read".to_string(),
+            }),
+        )
+        .await
+        .expect("request accepted")
+        .0;
+        let err = grant_request(
+            State(state),
+            Extension(session),
+            Json(GrantRequestInput {
+                request_id: req.request_id.expect("request id"),
+                duration: "session".to_string(),
+                rationale: None,
+            }),
+        )
+        .await
+        .expect_err("grant must fail closed with no capsule identity");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

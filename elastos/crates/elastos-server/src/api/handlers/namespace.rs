@@ -78,8 +78,16 @@ async fn enforce_capability(
 
     let resource = ResourceId::new(format!("elastos://namespace/{}", path));
 
+    // G-ID flip: validate against session.vm_id (canonical capsule identity), fail
+    // closed when absent.
+    let caller_id = session.vm_id.as_deref().ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "session has no capsule identity".to_string(),
+        )
+    })?;
     cap_mgr
-        .validate(&token, session.id.as_str(), action, &resource, None)
+        .validate(&token, caller_id, action, &resource, None)
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("capability denied: {}", e)))
 }
@@ -671,12 +679,13 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_capability_valid_token() {
         let (state, _dir) = test_namespace_state();
-        let session = Session::new(SessionType::Capsule, None);
+        let session = Session::new(SessionType::Capsule, Some("vm-test".to_string()));
         let cap_mgr = state.capability_manager.as_ref().unwrap();
 
-        // Grant a token for this session+resource+action
+        // Grant a token at this session's capsule identity (vm_id), which the gate
+        // now validates against (G-ID flip).
         let token = cap_mgr.grant(
-            session.id.as_str(),
+            session.vm_id.as_deref().unwrap(),
             ResourceId::new("elastos://namespace/photos/test.jpg"),
             Action::Read,
             TokenConstraints::new(0, false, None, None),

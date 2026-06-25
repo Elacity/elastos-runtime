@@ -1682,22 +1682,29 @@ async fn serve_web_capsule(
         .session_registry
         .create_session(session::SessionType::Shell, None)
         .await;
+    // G-ID flip: the web-capsule viewer's session must carry its REAL capsule
+    // identity ("vm-{name}") so the bundled viewer's request->grant->validate loop
+    // (it drives /api/capability + /api/localhost storage) holds post-flip.
+    // manifest.name is the real capsule name, not fabricated.
+    let capsule_name = manifest
+        .as_ref()
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "local".to_string());
     let app_session = infra
         .session_registry
-        .create_session(session::SessionType::Capsule, None)
+        .create_session(
+            session::SessionType::Capsule,
+            Some(format!("vm-{capsule_name}")),
+        )
         .await;
 
     // Set a stable owner so storage paths persist across server restarts.
     // Without this, session_user_id() hashes the random session ID, creating
     // a new storage directory each time the server starts.
-    let stable_owner = manifest
-        .as_ref()
-        .map(|m| m.name.clone())
-        .unwrap_or_else(|| "local".to_string());
     infra
         .session_registry
         .get_session_mut(&app_session.token, |s| {
-            s.owner = Some(stable_owner);
+            s.owner = Some(capsule_name);
         })
         .await;
 

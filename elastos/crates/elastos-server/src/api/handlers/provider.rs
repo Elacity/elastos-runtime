@@ -115,14 +115,16 @@ async fn enforce_capability(
     // PRE-AUDIT #3: enforce the action the OPERATION requires, not the token's own action. The
     // bridge no longer trusts capsules to self-check fine-grained actions — a Read-granted token on
     // a write/delete/admin operation fails closed here (WrongAction).
-    cap_mgr
-        .validate(
-            &token,
-            session.id.as_str(),
-            required_action,
-            &resource_id,
-            None,
+    // G-ID flip: validate against session.vm_id (canonical capsule identity), fail
+    // closed when absent.
+    let caller_id = session.vm_id.as_deref().ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "session has no capsule identity".to_string(),
         )
+    })?;
+    cap_mgr
+        .validate(&token, caller_id, required_action, &resource_id, None)
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("Capability denied: {}", e)))
 }
