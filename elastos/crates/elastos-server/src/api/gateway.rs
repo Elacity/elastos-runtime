@@ -226,29 +226,25 @@ pub struct GatewayState {
 
 impl GatewayState {
     /// The tamper-evident audit log, lazily opened (hash-chained + ed25519-signed) under
-    /// `data_dir/audit/gateway-audit.log`. If the file cannot be opened it FALLS BACK to a
-    /// memory-only log and logs loudly — content opens still proceed, but that run is not
-    /// persistently tamper-evident (the open itself is gated elsewhere).
-    pub(crate) fn audit_log(&self) -> Arc<elastos_runtime::primitives::audit::AuditLog> {
+    /// `data_dir/audit/gateway-audit.log`. FAIL-CLOSED (AUD-2): if the signed, durable file
+    /// log cannot be opened this returns `Err` rather than silently swapping in an unsigned,
+    /// fail-open memory log. A custody caller must then refuse to serve — content whose open
+    /// is recorded only to a volatile, non-tamper-evident memory log must never be served.
+    pub(crate) fn audit_log(
+        &self,
+    ) -> Result<Arc<elastos_runtime::primitives::audit::AuditLog>, String> {
         use elastos_runtime::primitives::audit::AuditLog;
         if let Some(existing) = self.audit_log.get() {
-            return existing.clone();
+            return Ok(existing.clone());
         }
         let path = self.data_dir.join("audit").join("gateway-audit.log");
-        let log = match AuditLog::with_file(&path) {
-            Ok(log) => Arc::new(log),
-            Err(e) => {
-                tracing::error!(
-                    "audit log file init failed at {:?} ({e}); falling back to memory-only \
-                     (this run's audit is NOT persistently tamper-evident)",
-                    path
-                );
-                Arc::new(AuditLog::new())
-            }
-        };
+        let log = Arc::new(
+            AuditLog::with_file(&path)
+                .map_err(|e| format!("gateway audit log unavailable at {path:?}: {e}"))?,
+        );
         let _ = self.audit_log.set(log.clone());
         // Another thread may have won the race; return whatever is now canonical.
-        self.audit_log.get().cloned().unwrap_or(log)
+        Ok(self.audit_log.get().cloned().unwrap_or(log))
     }
 
     pub(crate) fn identity_manager(
@@ -1088,3 +1084,29 @@ mod gateway_browser_tests;
 #[cfg(test)]
 #[path = "gateway_tests/mod.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+mod aud2_audit_failclosed_tests {
+    use super::*;
+
+    #[test]
+    fn audit_log_fails_closed_when_signed_log_cannot_open() {
+        // AUD-2: when the signed file log cannot be opened, audit_log() must return Err
+        // (so the custody caller refuses to serve), NOT silently fall back to an unsigned,
+        // fail-open memory log. Force the failure by placing a FILE where the audit/ dir
+        // would go, so AuditLog::with_file cannot create+open data_dir/audit/...log.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit"), b"not a directory").unwrap();
+        let state = GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
+        };
+        assert!(
+            state.audit_log().is_err(),
+            "audit_log must fail closed when the signed file log cannot open, never fall back to a memory log"
+        );
+    }
+}

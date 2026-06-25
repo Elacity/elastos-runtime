@@ -377,17 +377,22 @@ pub async fn open_owned_in_viewer(
             log_fp(&object_cid)
         );
         // GAP-8 custody record for the REFUSAL (best-effort: the access is already denied, so a
-        // failed append cannot loosen the decision — it only loses one trail entry, logged loudly).
-        if let Err(e) = state.audit_log().content_open(
-            &session_id,
-            &context.principal_id,
-            &object_cid,
-            "open",
-            "denied",
-            &rights.source,
-            None,
-        ) {
-            tracing::error!("AUDIT content_open(denied) append failed: {e}");
+        // failed append/log-open cannot loosen the decision — it only loses one trail entry, logged loudly).
+        match state.audit_log() {
+            Ok(audit) => {
+                if let Err(e) = audit.content_open(
+                    &session_id,
+                    &context.principal_id,
+                    &object_cid,
+                    "open",
+                    "denied",
+                    &rights.source,
+                    None,
+                ) {
+                    tracing::error!("AUDIT content_open(denied) append failed: {e}");
+                }
+            }
+            Err(e) => tracing::error!("AUDIT log unavailable for denied-open record: {e}"),
         }
         return (
             StatusCode::FORBIDDEN,
@@ -478,7 +483,21 @@ pub async fn open_owned_in_viewer(
     // FAIL CLOSED if it cannot be durably committed: an open that cannot be recorded in the custody
     // trail does not happen (custody integrity over availability — fail closed, then explain). The
     // forensic grant anchor rides here (non-reversible; `None` for media/no-grant opens).
-    if let Err(e) = state.audit_log().content_open(
+    // AUD-2: get the signed custody log FAIL-CLOSED (a memory-only fallback is no longer
+    // possible), then write the record fail-closed. Either failure refuses the open — content
+    // whose open cannot be durably, tamper-evidently recorded does not happen.
+    let audit = match state.audit_log() {
+        Ok(audit) => audit,
+        Err(e) => {
+            tracing::error!("AUDIT log unavailable; refusing the open: {e}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit log unavailable; refusing to open without a custody record",
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = audit.content_open(
         &session_id,
         &context.principal_id,
         &object_cid,
