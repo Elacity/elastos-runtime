@@ -262,6 +262,18 @@ pub enum AuditEvent {
         reason: String,
     },
 
+    /// Capability request approved — the human CONSENT decision (G4b). Distinct
+    /// from `CapabilityGrant` (token issuance): keyed on request_id/session_id and
+    /// records WHO approved, the exact mirror of `CapabilityDenied`.
+    CapabilityApproved {
+        timestamp: SecureTimestamp,
+        request_id: String,
+        session_id: String,
+        resource: String,
+        action: String,
+        approver: String,
+    },
+
     /// Identity registered (passkey)
     IdentityRegistered {
         timestamp: SecureTimestamp,
@@ -967,6 +979,7 @@ impl AuditEvent {
             AuditEvent::SessionDestroyed { .. } => "session_destroyed",
             AuditEvent::CapabilityRequested { .. } => "capability_requested",
             AuditEvent::CapabilityDenied { .. } => "capability_denied",
+            AuditEvent::CapabilityApproved { .. } => "capability_approved",
             AuditEvent::IdentityRegistered { .. } => "identity_registered",
             AuditEvent::StorageAccess { .. } => "storage_access",
             AuditEvent::MessageSent { .. } => "message_sent",

@@ -281,7 +281,7 @@ pub struct GrantRequestOutput {
 /// Grant a pending capability request (shell only).
 pub async fn grant_request(
     State(state): State<CapabilityState>,
-    Extension(_session): Extension<Session>, // Shell check done by middleware
+    Extension(session): Extension<Session>, // Shell check done by middleware
     Json(input): Json<GrantRequestInput>,
 ) -> Result<Json<GrantRequestOutput>, (StatusCode, String)> {
     // Parse duration
@@ -331,7 +331,28 @@ pub async fn grant_request(
         ));
     }
 
-    // Create the capability token (reached only on an Approved decision)
+    // G4b: attest the APPROVE decision onto the signed audit chain, fail-closed and
+    // BEFORE the mint — the exact mirror of the deny side. An approval that cannot
+    // be durably + signed recorded grants NOTHING: the token below is never minted,
+    // the request stays Pending, and nothing reaches the client. Records the
+    // DECISION (who approved which request), distinct from grant()'s best-effort
+    // token-issuance breadcrumb.
+    let approver = session
+        .owner
+        .clone()
+        .unwrap_or_else(|| session.id.to_string());
+    state
+        .pending_store
+        .approve_request(
+            &input.request_id,
+            &request.session_id.to_string(),
+            &request.resource.to_string(),
+            &request.action.to_string(),
+            &approver,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Create the capability token (reached only on an Approved AND attested decision)
     let constraints = match duration {
         GrantDuration::Once => TokenConstraints::new(0, false, None, Some(1)),
         GrantDuration::Session => TokenConstraints::default(),

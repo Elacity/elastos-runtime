@@ -384,6 +384,33 @@ impl PendingRequestStore {
         Ok(())
     }
 
+    /// Attest an APPROVE decision onto the signed audit chain, fail-closed (G4b).
+    /// The exact mirror of `deny_request`'s fail-closed emit: the decision record
+    /// is written durably + signed and this returns `Err` if that write fails, so a
+    /// caller that propagates the error (the grant handler) mints and returns
+    /// NOTHING for an approval that cannot be attested. Records the DECISION (who
+    /// approved which request) — distinct from the best-effort token-issuance
+    /// breadcrumb `CapabilityManager::grant` emits.
+    pub fn approve_request(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        resource: &str,
+        action: &str,
+        approver: &str,
+    ) -> Result<(), String> {
+        self.audit_log
+            .emit(crate::primitives::audit::AuditEvent::CapabilityApproved {
+                timestamp: SecureTimestamp::now(),
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                resource: resource.to_string(),
+                action: action.to_string(),
+                approver: approver.to_string(),
+            })
+            .map_err(|e| format!("audit write failed, approval aborted: {e}"))
+    }
+
     /// List all pending requests (for shell to display)
     pub async fn list_pending(&self) -> Vec<PendingCapabilityRequest> {
         let requests = self.requests.read().await;
@@ -935,6 +962,72 @@ mod tests {
                 crate::primitives::audit::AuditEvent::CapabilityDenied { .. }
             )),
             "the denial event must be recorded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn approve_request_fails_closed_when_audit_write_fails() {
+        // Mirror of deny_request_fails_closed: a read-only file handle makes the
+        // durable+signed audit write fail, so the APPROVE decision cannot be
+        // attested and approve_request returns Err. The grant handler propagates
+        // this, so no token is minted and the request stays Pending (G4b).
+        let path = unique_tmp("approve_ro");
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let audit = Arc::new(AuditLog::with_file_handle(ro));
+        let pending = PendingRequestStore::new(audit);
+
+        let res = pending.approve_request(
+            "req-1",
+            "sess-1",
+            "localhost://Users/self/Documents/x",
+            "read",
+            "approver-1",
+        );
+        assert!(
+            res.is_err(),
+            "approve must fail closed when its durable audit write fails"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn approve_request_records_signed_decision_that_verifies() {
+        // Companion: with a working SIGNED sink the approve commits, a
+        // CapabilityApproved decision is recorded, AND its ed25519 signature
+        // verifies on the chain — proving the record is genuinely signed (not just
+        // present) and that the fail-closed path triggers on real failure only.
+        use ed25519_dalek::VerifyingKey;
+        let path = unique_tmp("approve_ok");
+        let audit = Arc::new(AuditLog::with_file(&path).unwrap());
+        let pending = PendingRequestStore::new(audit.clone());
+
+        let res = pending.approve_request(
+            "req-1",
+            "sess-1",
+            "localhost://Users/self/Documents/x",
+            "read",
+            "approver-1",
+        );
+        assert!(res.is_ok(), "approve records onto a working signed sink");
+        assert!(
+            audit.recent_events(50).iter().any(|e| matches!(
+                e,
+                crate::primitives::audit::AuditEvent::CapabilityApproved { .. }
+            )),
+            "the approval decision must be recorded"
+        );
+
+        // The recorded decision's signature verifies against the log's key.
+        let hex = audit
+            .verifying_key_hex()
+            .expect("a file-backed log must be signed");
+        let bytes: [u8; 32] = hex::decode(&hex).unwrap().try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&bytes).unwrap();
+        assert!(
+            audit.verify_chain(Some(&vk)).is_ok(),
+            "the signed approval record must verify on the chain"
         );
         let _ = std::fs::remove_file(&path);
     }

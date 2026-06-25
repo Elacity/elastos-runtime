@@ -491,6 +491,7 @@ fn system_runtime_event_summary(
         | AuditEvent::SessionDestroyed { timestamp, .. }
         | AuditEvent::CapabilityRequested { timestamp, .. }
         | AuditEvent::CapabilityDenied { timestamp, .. }
+        | AuditEvent::CapabilityApproved { timestamp, .. }
         | AuditEvent::IdentityRegistered { timestamp, .. }
         | AuditEvent::StorageAccess { timestamp, .. }
         | AuditEvent::MessageSent { timestamp, .. }
@@ -558,6 +559,9 @@ fn system_runtime_event_summary(
         AuditEvent::SessionDestroyed { .. } => return None,
         AuditEvent::CapabilityRequested { .. } => return None,
         AuditEvent::CapabilityDenied { reason, .. } => format!("Capability denied — {reason}"),
+        AuditEvent::CapabilityApproved {
+            action, resource, ..
+        } => format!("Capability approved — {action} {resource}"),
         AuditEvent::IdentityRegistered {
             user_id, method, ..
         } => format!("Registered identity {user_id} via {method}"),
