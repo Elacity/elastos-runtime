@@ -10,8 +10,8 @@ experience (the killer app) that sits on top, later, on `flint-shell`.
 
 **Status at a glance (2026-06-26):** substrate DONE; intent compiler DONE; security
 audited + hardened to ~9/10 (AUD-1..5 closed); Astrid/UniCity research DONE (validation +
-adopt-list); now executing the ADOPTION WEDGES before the shell. Next focused pass =
-`elastos mcp serve` implementation.
+adopt-list); now executing the ADOPTION WEDGES before the shell. Wedge 1 (`elastos mcp serve`)
+DONE; next = wedge 2 (typed dataflow binding).
 
 ---
 
@@ -53,7 +53,7 @@ carrier-for-off-box).
 
 | # | Wedge | Status | Notes |
 |---|-------|--------|-------|
-| **1** | `elastos mcp serve` (MCP bridge, read surface) | **DESIGNED + DECIDED + license-cleared; IMPL = next focused pass** | Operator-authority model. Fix: extract a shared `gated_inspect_dispatch` (one canonical gate), route the stdio edge through it; rmcp Apache-2.0; effects deferred. Security-touching (gateway gate). |
+| **1** | `elastos mcp serve` (MCP bridge, read surface) | **✅ DONE `6c524baf`** | Clean-room (open MCP spec, hand-rolled over serde_json, ZERO new deps). Read tools capsules/capsule/plan/intent; every tools/call routes through the carrier's `handle_request` VERBATIM (one canonical gate); bridge holds a scoped time-boxed `mcp-bridge` token; discover Admin-locked + excluded; effects deferred. 6 earned tests (gate runs, empty token denied). server 837 pass. |
 | **2** | Typed dataflow binding (port-graph above `compile_sequence`) | TODO | Output→input typed binding, fail-closed on unbindable ports. Completes the composition-engine lead. No auth coupling. |
 | **3** | NL→StructuredIntent provider capsule | TODO | Small additive front-door; `compile()` unchanged. Pairs with #2. |
 | **4** | Dual-scope meter (reservation/refund + per-principal CPU/mem caps) | TODO | = the deferred ai-provider meter; bind spend-cap to the capability token; audit chain exists. |
