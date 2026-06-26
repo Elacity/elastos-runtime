@@ -644,7 +644,14 @@ fn wallet_signature_parts_from_uri(uri: &str) -> Option<(String, String)> {
 }
 
 /// Handle a single request from the guest capsule.
-async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde_json::Value> {
+///
+/// `pub(crate)` so the `elastos mcp serve` edge can reuse the ONE canonical
+/// gate-then-dispatch (validate → send_raw) verbatim, holding the bridge token, rather
+/// than re-implementing enforcement at the MCP edge.
+pub(crate) async fn handle_request(
+    line: &str,
+    ctx: &Option<BridgeContext>,
+) -> Result<serde_json::Value> {
     let envelope: serde_json::Value =
         serde_json::from_str(line.trim()).context("Invalid JSON from guest")?;
 
@@ -964,7 +971,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
     }))
 }
 
-fn encode_bridge_capability_token(
+pub(crate) fn encode_bridge_capability_token(
     token: &elastos_runtime::capability::token::CapabilityToken,
 ) -> String {
     token.to_base64().unwrap_or_default()

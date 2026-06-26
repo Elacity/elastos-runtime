@@ -82,6 +82,12 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum McpCommands {
+    /// Run a read-only MCP server over stdio (operator-authority; reflect the runtime to an MCP client)
+    Serve,
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Power-user path: run an arbitrary capsule from a local directory or IPFS CID
     Run {
@@ -115,6 +121,12 @@ enum Commands {
         /// IPFS CID of capsule to serve
         #[arg(long, conflicts_with = "capsule")]
         cid: Option<String>,
+    },
+
+    /// Model Context Protocol bridge: expose the runtime to MCP clients (Claude/Codex/Gemini)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
     },
 
     /// Key management commands
@@ -1263,6 +1275,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             return serve_cmd::run_serve(addr, storage_path, capsule, cid).await;
         }
+
+        Commands::Mcp { command } => match command {
+            McpCommands::Serve => return serve_cmd::run_mcp_serve().await,
+        },
 
         Commands::Keys(keys_cmd) => {
             trust_cmd::run_keys(keys_cmd)?;

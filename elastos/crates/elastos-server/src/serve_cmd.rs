@@ -524,3 +524,71 @@ fn current_binary_sha256() -> anyhow::Result<String> {
     let bytes = std::fs::read(self_exe)?;
     Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
+
+/// `elastos mcp serve` — the stdio I/O shell for the read-only MCP bridge. Builds the
+/// inspect infra, mints the scoped bridge token, and pumps newline-delimited JSON-RPC
+/// over stdin/stdout, driving the gated core (`mcp_serve_cmd::handle_mcp_message`). The
+/// MCP client (Claude Code / Codex / Gemini) spawns this as a child process; all logging
+/// goes to stderr, stdout carries ONLY MCP messages.
+pub async fn run_mcp_serve() -> anyhow::Result<()> {
+    use elastos_server::carrier_bridge::BridgeContext;
+    use elastos_server::inspect_provider as ip;
+    use elastos_server::mcp_serve_cmd::{handle_mcp_message, mint_bridge_token, MCP_BRIDGE_ID};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let data_dir = crate::default_data_dir();
+    let infra = crate::setup_server_infrastructure().await?;
+
+    // Read-only Capsule Inspector over the installed-capsule catalog, with the live
+    // grant/activity audit (mirrors serve_cmd's inspect wiring, minus the running runtime).
+    {
+        let source: Arc<dyn ip::InspectSource> = Arc::new(ip::CatalogInspectSource::new(
+            data_dir.join("capsules"),
+            Arc::downgrade(&infra.provider_registry),
+        ));
+        let activity = Arc::new(ip::AuthAuditSource::new(data_dir.clone()));
+        let grants = Arc::new(ip::RuntimeAuditLogGrantSource::new(
+            infra.capability_manager.audit_log().clone(),
+        ));
+        let audit = Arc::new(ip::CompositeAuditSource::new(activity, grants));
+        infra
+            .provider_registry
+            .register(Arc::new(ip::InspectProvider::new(source).with_audit(audit)))
+            .await;
+    }
+
+    let token = mint_bridge_token(&infra.capability_manager);
+    let ctx = Some(BridgeContext {
+        provider_registry: infra.provider_registry.clone(),
+        capability_manager: infra.capability_manager.clone(),
+        pending_store: infra.pending_store.clone(),
+        capsule_id: MCP_BRIDGE_ID.to_string(),
+        principal_id: None,
+        data_dir: None,
+    });
+
+    eprintln!("elastos mcp serve: ready (stdio, read-only inspect; operator-authority).");
+    let mut reader = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = reader.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let msg: serde_json::Value = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("mcp: ignoring malformed JSON-RPC line: {e}");
+                continue;
+            }
+        };
+        if let Some(resp) = handle_mcp_message(&msg, &ctx, &token).await {
+            let mut out = serde_json::to_string(&resp).unwrap_or_default();
+            out.push('\n');
+            stdout.write_all(out.as_bytes()).await?;
+            stdout.flush().await?;
+        }
+    }
+    Ok(())
+}
