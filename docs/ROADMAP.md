@@ -61,8 +61,12 @@ carrier-for-off-box).
 | **5** | COW workspace VFS + manifest hardening | **NEEDS DESIGN-FIT** | COW overlay is real; the manifest "typed imports" hardening may not map (we declare interfaces/authority, not Astrid-style imports). Map before building. |
 
 **Then → Phase 4: the Flint shell** (on `flint-shell`) — the unique front-end experience.
-Needs the founder's product direction (the first thin slice of the experience). Sits on a
-runtime that is interoperable (MCP), can execute pipelines (dataflow), and is bounded (meter).
+VISION RESOLVED: see `FLINT_SHELL_VISION.md` (design-council swarm `w0r00ut7f`) — the "glass
+delegation desk" / identity-collapse paradigm, 3 objects (conversation / gate / sidebar) + 2
+properties (trust-as-material / scope), agentic-chat-YES + windowed-apps-as-results, the first
+thin slice (buildable on the SHIPPED discover + intent compiler + signed chain), and 6 open
+founder decisions. Sits on a runtime that is interoperable (MCP) and can express pipelines
+(dataflow). NEXT = founder answers the 6 decisions → build the first slice on `flint-shell`.
 
 ---
 
