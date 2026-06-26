@@ -10,8 +10,9 @@ experience (the killer app) that sits on top, later, on `flint-shell`.
 
 **Status at a glance (2026-06-26):** substrate DONE; intent compiler DONE; security
 audited + hardened to ~9/10 (AUD-1..5 closed); Astrid/UniCity research DONE (validation +
-adopt-list); now executing the ADOPTION WEDGES before the shell. Wedge 1 (`elastos mcp serve`)
-DONE; next = wedge 2 (typed dataflow binding).
+adopt-list); now executing the ADOPTION WEDGES before the shell. Wedges 1 (`elastos mcp serve`)
++ 2 (typed dataflow binding) — the council's two pre-shell priorities — DONE. Wedges
+3-5 are decision-coupled (ai-backend track / design-fit) → founder's steer.
 
 ---
 
@@ -54,10 +55,10 @@ carrier-for-off-box).
 | # | Wedge | Status | Notes |
 |---|-------|--------|-------|
 | **1** | `elastos mcp serve` (MCP bridge, read surface) | **✅ DONE `6c524baf`** | Clean-room (open MCP spec, hand-rolled over serde_json, ZERO new deps). Read tools capsules/capsule/plan/intent; every tools/call routes through the carrier's `handle_request` VERBATIM (one canonical gate); bridge holds a scoped time-boxed `mcp-bridge` token; discover Admin-locked + excluded; effects deferred. 6 earned tests (gate runs, empty token denied). server 837 pass. |
-| **2** | Typed dataflow binding (port-graph above `compile_sequence`) | TODO | Output→input typed binding, fail-closed on unbindable ports. Completes the composition-engine lead. No auth coupling. |
-| **3** | NL→StructuredIntent provider capsule | TODO | Small additive front-door; `compile()` unchanged. Pairs with #2. |
-| **4** | Dual-scope meter (reservation/refund + per-principal CPU/mem caps) | TODO | = the deferred ai-provider meter; bind spend-cap to the capability token; audit chain exists. |
-| **5** | COW workspace VFS + manifest hardening | TODO | Capability-typed handles + commit/discard; semver/optional typed imports + revocation store + ABI checklist. |
+| **2** | Typed dataflow binding (`compile_pipeline`) | **✅ DONE `11b017b5`** | Caller-declared port edges, compiler-validated against COMO typed schemas, fail-closed (out-of-range / backward / untyped / missing pointer-or-field / type-mismatch); affordance-only; shell-agnostic. Strict superset of compile_sequence. 9 earned tests; runtime 336. Honest: shipped outputs opaque (mechanism is the value). Deferred (named in-code): duplicate-target-port + required-input completeness + runtime value-passing. |
+| **3** | NL→StructuredIntent provider capsule | **DECISION-COUPLED** | Needs an LLM provider capsule + the deferred ai-backend track ([[project_runtime-ai-backend-strategy]]). Not a clean pure-runtime wedge; founder's steer. |
+| **4** | Dual-scope meter (reservation/refund + per-principal CPU/mem caps) | **DECISION-COUPLED** | = the deferred ai-provider meter; coupled to the ai-backend track (it meters ai-provider spend). Substantial; founder's steer. |
+| **5** | COW workspace VFS + manifest hardening | **NEEDS DESIGN-FIT** | COW overlay is real; the manifest "typed imports" hardening may not map (we declare interfaces/authority, not Astrid-style imports). Map before building. |
 
 **Then → Phase 4: the Flint shell** (on `flint-shell`) — the unique front-end experience.
 Needs the founder's product direction (the first thin slice of the experience). Sits on a
