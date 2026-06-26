@@ -11,7 +11,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use elastos_common::localhost::{is_supported_resource_scheme, is_system_only_backend_resource};
+use elastos_common::localhost::{
+    is_overbroad_grant_resource, is_supported_resource_scheme, is_system_only_backend_resource,
+};
 use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::{
     pending::PendingRequestStore, Action, CapabilityManager, GrantDuration, PolicyEvaluator,
@@ -97,6 +99,20 @@ pub async fn request_capability(
             token: None,
             reason: Some(
                 "system backends are not app capabilities; use elastos://content".to_string(),
+            ),
+        }));
+    }
+    // AUD-5: refuse a BARE scheme-level wildcard (elastos://* etc.) — it would
+    // prefix-match every resource under the scheme. Legit grants are scheme-scoped.
+    if is_overbroad_grant_resource(&input.resource) {
+        return Ok(Json(RequestCapabilityOutput {
+            status: "denied".to_string(),
+            request_id: None,
+            token: None,
+            reason: Some(
+                "scheme-level wildcard grants are not permitted; scope to at least one \
+                 path segment, e.g. elastos://<provider>/*"
+                    .to_string(),
             ),
         }));
     }
@@ -306,6 +322,17 @@ pub async fn grant_request(
         return Err((
             StatusCode::BAD_REQUEST,
             format!("Request {} is not pending", input.request_id),
+        ));
+    }
+
+    // AUD-5 defense-in-depth: refuse to MINT a bare scheme-level wildcard even if one
+    // reached a pending request (request_capability already guards intake; this covers
+    // any other request path). The token would prefix-match every resource under the scheme.
+    if is_overbroad_grant_resource(&request.resource.to_string()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "scheme-level wildcard grants are not permitted; scope to at least one path segment"
+                .to_string(),
         ));
     }
 
