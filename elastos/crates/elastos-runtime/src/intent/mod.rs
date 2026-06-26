@@ -85,6 +85,39 @@ pub enum IntentError {
     },
     /// A sequence with no steps is not a plan.
     EmptySequence,
+    /// A caller-declared dataflow port binding could not be validated; carries its
+    /// 0-based `binding` edge index and the reason. Fail-closed: the WHOLE pipeline
+    /// fails, no partial plan. The compiler NEVER infers a binding (caller declares,
+    /// compiler validates -- the multi-step honesty extended to dataflow).
+    Unbindable {
+        binding: usize,
+        reason: UnbindableReason,
+    },
+}
+
+/// Why a caller-declared [`PortBinding`] could not be validated (fail-closed). The
+/// compiler never coerces a type or synthesizes a pointer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnbindableReason {
+    /// `from_step` or `to_step` is out of range for the step list.
+    StepIndexOutOfRange { index: usize, len: usize },
+    /// `from_step >= to_step`: a backward or self edge would need the reorder the
+    /// compiler refuses; only forward dataflow is honest.
+    BackwardEdge { from_step: usize, to_step: usize },
+    /// The step has no typed port surface: a provider operation (no per-op schema) or an
+    /// affordance whose schema is the opaque `{type:object}` with no declared
+    /// `properties` (the shipped state -- nothing binds until typed outputs are declared).
+    UntypedPort { step: usize },
+    /// `output_pointer` names a property absent from the source's `output_schema.properties`.
+    MissingOutputPointer { pointer: String },
+    /// `input_field` names a property absent from the target's `input_schema.properties`.
+    MissingInputField { field: String },
+    /// Both ports are typed leaves but their JSON-Schema `type` strings differ.
+    TypeMismatch {
+        output_type: String,
+        input_type: String,
+    },
 }
 
 /// How a [`CompiledPlan`] was composed, so a shell never mistakes a chained plan
@@ -128,6 +161,44 @@ pub enum CompiledStep {
 pub struct CompiledPlan {
     pub composition: CompositionKind,
     pub steps: Vec<CompiledStep>,
+}
+
+/// A caller-DECLARED dataflow edge: wire step `from_step`'s named output to step
+/// `to_step`'s named input. The typed-edge analogue of [`compile_sequence`]'s
+/// caller-supplied ORDER -- the caller declares it, the compiler only VALIDATES it (never
+/// infers/synthesizes an edge). v1 pointer grammar: a FLAT top-level property name in the
+/// affordance's schema `properties` map.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PortBinding {
+    pub from_step: usize,
+    pub output_pointer: String,
+    pub to_step: usize,
+    pub input_field: String,
+}
+
+/// A [`PortBinding`] the compiler VALIDATED: forward-only, both ports typed, and the
+/// JSON-Schema `type` strings agree (`port_type`). Shell-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidatedBinding {
+    pub from_step: usize,
+    pub output_pointer: String,
+    pub to_step: usize,
+    pub input_field: String,
+    pub port_type: String,
+}
+
+/// A shell-agnostic compiled PIPELINE: the ordered, gated steps (identical to
+/// [`compile_sequence`]) PLUS the caller-declared, compiler-VALIDATED dataflow edges.
+///
+/// NOTE: `bindings` is a validated edge LIST, not yet a conflict-free graph -- duplicate
+/// edges into the same `(to_step, input_field)` are NOT yet rejected (a deferred unbindable
+/// case), and required-input COMPLETENESS is not checked. Runtime value-passing/execution
+/// of the pipeline is also deferred; this is PURE planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompiledPipeline {
+    pub composition: CompositionKind,
+    pub steps: Vec<CompiledStep>,
+    pub bindings: Vec<ValidatedBinding>,
 }
 
 /// A located capability within ONE manifest: enough to plan it, borrowing into the
@@ -287,6 +358,137 @@ pub fn compile_sequence(steps: &[SubGoal]) -> Result<CompiledPlan, IntentError> 
     Ok(CompiledPlan {
         composition: CompositionKind::MultiStep,
         steps: compiled,
+    })
+}
+
+/// Which side of an affordance schema a port resolves into.
+enum PortSide<'a> {
+    Output(&'a str),
+    Input(&'a str),
+}
+
+/// Resolve the JSON-Schema `type` string at a named port of a step's affordance.
+/// Fail-closed: a provider step or an opaque-schema affordance is `UntypedPort`; a name
+/// absent from `properties` is Missing{Output,Input}; a property with no `type` keyword is
+/// treated as missing (we never invent a type). The step resolved in [`compile_sequence`]
+/// already, so [`locate`] returns exactly one match.
+fn port_type_at(sub: &SubGoal, side: PortSide, step: usize) -> Result<String, UnbindableReason> {
+    let located = locate(sub.manifest, &sub.intent);
+    let descriptor = located.iter().find_map(|l| match l {
+        Located::Affordance { method, .. } => Some(*method),
+        Located::Provider { .. } => None,
+    });
+    // A provider operation (or no affordance) has no typed port surface.
+    let Some(descriptor) = descriptor else {
+        return Err(UnbindableReason::UntypedPort { step });
+    };
+    let (schema, name) = match side {
+        PortSide::Output(p) => (&descriptor.output_schema, p),
+        PortSide::Input(f) => (&descriptor.input_schema, f),
+    };
+    // The opaque shipped case: `{type:object}` with no `properties` -> no typed ports.
+    let Some(properties) = schema
+        .as_ref()
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object())
+    else {
+        return Err(UnbindableReason::UntypedPort { step });
+    };
+    let missing = || match side {
+        PortSide::Output(p) => UnbindableReason::MissingOutputPointer {
+            pointer: p.to_string(),
+        },
+        PortSide::Input(f) => UnbindableReason::MissingInputField {
+            field: f.to_string(),
+        },
+    };
+    let type_str = properties
+        .get(name)
+        .and_then(|field| field.get("type"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(missing)?;
+    Ok(type_str.to_string())
+}
+
+/// Validate ONE caller-declared [`PortBinding`] against the steps' typed schemas,
+/// returning the agreed port `type`. Fail-closed, never inferring or coercing.
+fn validate_binding(steps: &[SubGoal], binding: &PortBinding) -> Result<String, UnbindableReason> {
+    let len = steps.len();
+    if binding.from_step >= len {
+        return Err(UnbindableReason::StepIndexOutOfRange {
+            index: binding.from_step,
+            len,
+        });
+    }
+    if binding.to_step >= len {
+        return Err(UnbindableReason::StepIndexOutOfRange {
+            index: binding.to_step,
+            len,
+        });
+    }
+    // Forward-only: a later output cannot feed an earlier input without the reorder the
+    // compiler refuses (mirrors the no-derived-order honesty).
+    if binding.from_step >= binding.to_step {
+        return Err(UnbindableReason::BackwardEdge {
+            from_step: binding.from_step,
+            to_step: binding.to_step,
+        });
+    }
+    let output_type = port_type_at(
+        &steps[binding.from_step],
+        PortSide::Output(&binding.output_pointer),
+        binding.from_step,
+    )?;
+    let input_type = port_type_at(
+        &steps[binding.to_step],
+        PortSide::Input(&binding.input_field),
+        binding.to_step,
+    )?;
+    if output_type != input_type {
+        return Err(UnbindableReason::TypeMismatch {
+            output_type,
+            input_type,
+        });
+    }
+    Ok(output_type)
+}
+
+/// Compile a caller-ordered sequence of goals into a typed dataflow PIPELINE: the
+/// ordered, gated steps (identical to [`compile_sequence`]) PLUS a set of caller-declared,
+/// compiler-VALIDATED port bindings (step output -> step input).
+///
+/// A strict additive superset of [`compile_sequence`]: with no `bindings` it is exactly
+/// that. The steps are resolved + gated first (fail-closed atomic via
+/// [`IntentError::Step`]); only then are the bindings validated, fail-closed on the FIRST
+/// unbindable edge via [`IntentError::Unbindable`] (out-of-range / backward / untyped port
+/// / missing pointer or field / type mismatch) -- no partial pipeline. The compiler NEVER
+/// infers a binding: the caller declares both the order AND the edges; the compiler only
+/// validates + gates. Affordance-only (provider operations have no typed port surface).
+pub fn compile_pipeline(
+    steps: &[SubGoal],
+    bindings: &[PortBinding],
+) -> Result<CompiledPipeline, IntentError> {
+    // Phase (a): the ordered, gated steps -- reuse compile_sequence verbatim.
+    let plan = compile_sequence(steps)?;
+
+    // Phase (b): validate each caller-declared binding, fail-closed on the first.
+    let mut validated = Vec::with_capacity(bindings.len());
+    for (i, binding) in bindings.iter().enumerate() {
+        let port_type = validate_binding(steps, binding)
+            .map_err(|reason| IntentError::Unbindable { binding: i, reason })?;
+        validated.push(ValidatedBinding {
+            from_step: binding.from_step,
+            output_pointer: binding.output_pointer.clone(),
+            to_step: binding.to_step,
+            input_field: binding.input_field.clone(),
+            port_type,
+        });
+    }
+
+    Ok(CompiledPipeline {
+        composition: plan.composition,
+        steps: plan.steps,
+        bindings: validated,
     })
 }
 
@@ -834,5 +1036,376 @@ mod tests {
         let err = compile(&inspector, &intent("nope", serde_json::json!({}))).unwrap_err();
         let err_json = serde_json::to_value(&err).unwrap();
         assert_eq!(err_json["unresolvable"]["operation"], "nope");
+    }
+
+    // ── Typed dataflow binding (compile_pipeline) ──────────────────
+
+    /// A manifest with ONE affordance whose input/output schemas carry typed `properties`
+    /// (the surface a port binding type-checks against).
+    fn typed_manifest(
+        name: &str,
+        op: &str,
+        input_props: Value,
+        output_props: Value,
+    ) -> CapsuleManifest {
+        let manifest: CapsuleManifest = serde_json::from_value(serde_json::json!({
+            "schema": "elastos.capsule/v1", "version": "0.1.0", "name": name,
+            "role": "app", "type": "wasm", "entrypoint": "x.wasm",
+            "interfaces": [{
+                "id": "i", "version": "0.1.0",
+                "methods": [{
+                    "id": "m", "operation": op, "risk": "read", "approval": "none", "audit": "none",
+                    "input_schema": {"type": "object", "properties": input_props},
+                    "output_schema": {"type": "object", "properties": output_props},
+                }]
+            }]
+        }))
+        .unwrap();
+        manifest.validate().expect("typed manifest is valid");
+        manifest
+    }
+
+    #[test]
+    fn pipeline_empty_bindings_equals_compile_sequence() {
+        // The strict additive superset: no edges => exactly compile_sequence's steps.
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let steps = [SubGoal {
+            manifest: &src,
+            intent: intent("fetch", serde_json::json!({})),
+        }];
+        let pipeline = compile_pipeline(&steps, &[]).unwrap();
+        let plan = compile_sequence(&steps).unwrap();
+        assert_eq!(pipeline.steps, plan.steps);
+        assert!(pipeline.bindings.is_empty());
+    }
+
+    #[test]
+    fn pipeline_binds_string_to_string_over_typed_manifests() {
+        // step0 outputs {cid: string}; step1 inputs {cid: string}; the edge type-checks.
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let dst = typed_manifest(
+            "dst",
+            "open",
+            serde_json::json!({"cid": {"type": "string"}}),
+            serde_json::json!({}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &src,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &dst,
+                intent: intent("open", serde_json::json!({})),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "cid".to_string(),
+        };
+        let pipeline = compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap();
+        assert_eq!(pipeline.bindings.len(), 1);
+        assert_eq!(pipeline.bindings[0].port_type, "string");
+        assert_eq!(pipeline.bindings[0].from_step, 0);
+    }
+
+    #[test]
+    fn pipeline_type_mismatch_fails_closed_with_index_and_reason() {
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let dst = typed_manifest(
+            "dst",
+            "open",
+            serde_json::json!({"n": {"type": "number"}}),
+            serde_json::json!({}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &src,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &dst,
+                intent: intent("open", serde_json::json!({})),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "n".to_string(),
+        };
+        let err = compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap_err();
+        // mustFix: assert BOTH the 0-based edge index AND the reason payload.
+        assert_eq!(
+            err,
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::TypeMismatch {
+                    output_type: "string".to_string(),
+                    input_type: "number".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn pipeline_missing_pointer_and_field_fail_closed() {
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let dst = typed_manifest(
+            "dst",
+            "open",
+            serde_json::json!({"cid": {"type": "string"}}),
+            serde_json::json!({}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &src,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &dst,
+                intent: intent("open", serde_json::json!({})),
+            },
+        ];
+        let bad_out = PortBinding {
+            from_step: 0,
+            output_pointer: "nope".to_string(),
+            to_step: 1,
+            input_field: "cid".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&bad_out)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::MissingOutputPointer { .. }
+            }
+        ));
+        let bad_in = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "nope".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&bad_in)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::MissingInputField { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_backward_and_out_of_range_fail_closed() {
+        let m = typed_manifest(
+            "m",
+            "fetch",
+            serde_json::json!({"cid": {"type": "string"}}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &m,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &m,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+        ];
+        let backward = PortBinding {
+            from_step: 1,
+            output_pointer: "cid".to_string(),
+            to_step: 0,
+            input_field: "cid".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&backward)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::BackwardEdge { .. }
+            }
+        ));
+        let oor = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 9,
+            input_field: "cid".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&oor)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::StepIndexOutOfRange { index: 9, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_opaque_shipped_output_is_untyped_port() {
+        // Over the REAL shipped inspector (output_schema {type:object}, no properties):
+        // there is no typed output to bind -> UntypedPort (honest, not a wrong-pointer lie).
+        let inspector = shipped("capsule-inspector");
+        let steps = [
+            SubGoal {
+                manifest: &inspector,
+                intent: intent("list", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &inspector,
+                intent: intent("view", serde_json::json!({ "target": "x" })),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "anything".to_string(),
+            to_step: 1,
+            input_field: "target".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::UntypedPort { step: 0 }
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_provider_endpoint_is_untyped_port_not_a_panic() {
+        // A provider operation has no per-op schema: a binding touching it is UntypedPort,
+        // never a panic / None-unwrap (mustFix).
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let key = shipped("key-provider");
+        let steps = [
+            SubGoal {
+                manifest: &src,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &key,
+                intent: intent("release", serde_json::json!({})),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "cid".to_string(),
+        };
+        assert!(matches!(
+            compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap_err(),
+            IntentError::Unbindable {
+                binding: 0,
+                reason: UnbindableReason::UntypedPort { step: 1 }
+            }
+        ));
+    }
+
+    #[test]
+    fn pipeline_step_error_aborts_before_binding_pass() {
+        // An unresolvable step fails as Step{index,source} BEFORE the binding pass runs.
+        let m = typed_manifest(
+            "m",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &m,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &m,
+                intent: intent("nope", serde_json::json!({})),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "cid".to_string(),
+        };
+        let err = compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap_err();
+        assert!(matches!(err, IntentError::Step { index: 1, .. }));
+    }
+
+    #[test]
+    fn pipeline_and_unbindable_serialize_to_shell_agnostic_json() {
+        let src = typed_manifest(
+            "src",
+            "fetch",
+            serde_json::json!({}),
+            serde_json::json!({"cid": {"type": "string"}}),
+        );
+        let dst = typed_manifest(
+            "dst",
+            "open",
+            serde_json::json!({"cid": {"type": "string"}}),
+            serde_json::json!({}),
+        );
+        let steps = [
+            SubGoal {
+                manifest: &src,
+                intent: intent("fetch", serde_json::json!({})),
+            },
+            SubGoal {
+                manifest: &dst,
+                intent: intent("open", serde_json::json!({})),
+            },
+        ];
+        let binding = PortBinding {
+            from_step: 0,
+            output_pointer: "cid".to_string(),
+            to_step: 1,
+            input_field: "cid".to_string(),
+        };
+        let pipeline = compile_pipeline(&steps, std::slice::from_ref(&binding)).unwrap();
+        let pj = serde_json::to_value(&pipeline).unwrap();
+        assert_eq!(pj["composition"], "multi_step");
+        assert_eq!(pj["bindings"][0]["port_type"], "string");
+        assert_eq!(pj["bindings"][0]["input_field"], "cid");
+
+        let err = IntentError::Unbindable {
+            binding: 2,
+            reason: UnbindableReason::TypeMismatch {
+                output_type: "string".into(),
+                input_type: "number".into(),
+            },
+        };
+        let ej = serde_json::to_value(&err).unwrap();
+        assert_eq!(ej["unbindable"]["binding"], 2);
+        assert_eq!(
+            ej["unbindable"]["reason"]["type_mismatch"]["output_type"],
+            "string"
+        );
     }
 }
