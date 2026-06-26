@@ -124,8 +124,9 @@ pub struct AuditRecord {
     pub event: String,
     pub detail: String,
     pub success: bool,
-    /// Whether this event is cryptographically attested (a signature is present).
-    /// We surface the *fact* of attestation, never the signature itself (#16).
+    /// Whether this event is cryptographically attested: its signature VERIFIES (AUD-4)
+    /// against the runtime's own DID, not merely that a signature is present. We surface
+    /// the *fact* of attestation, never the signature itself (#16).
     pub signed: bool,
     /// The DID that attested the event, when present. A DID is public identity,
     /// safe to surface, and is the verified-signer evidence the audit plane
@@ -220,6 +221,34 @@ impl AuthAuditSource {
     }
 }
 
+/// AUD-4 (verify-on-read): is this audit event cryptographically ATTESTED? True ONLY
+/// when it carries a signature, its `signer_did` is the runtime's OWN DID (the
+/// load-bearing anti-spoof pin: a file-rewriting attacker who re-signs with their own
+/// key and sets a matching `signer_did` is rejected here), AND the ed25519 signature
+/// verifies over the canonical signed bytes — the exact contract of `sign_audit_event`
+/// (`signer_did` set, `signature` omitted via `skip_serializing_if`). A present-but-
+/// unverifiable, wrong-signer, or absent signature returns false (not attested), so the
+/// inspector never claims attestation it cannot prove.
+fn audit_event_is_attested(
+    event: &elastos_runtime::auth::RuntimeAuditEventV1,
+    expected_did: &str,
+    vk: &ed25519_dalek::VerifyingKey,
+) -> bool {
+    let Some(sig_hex) = event.signature.as_deref() else {
+        return false;
+    };
+    if event.signer_did.as_deref() != Some(expected_did) {
+        return false;
+    }
+    let mut probe = event.clone();
+    probe.signature = None;
+    let Ok(bytes) = serde_json::to_vec(&probe) else {
+        return false;
+    };
+    crate::crypto::domain_separated_verify(vk, crate::auth::AUDIT_EVENT_DOMAIN, &bytes, sig_hex)
+        .is_ok()
+}
+
 #[async_trait]
 impl AuditSource for AuthAuditSource {
     async fn for_capsule(&self, capsule_key: &str, recent_limit: usize) -> CapsuleAudit {
@@ -231,6 +260,14 @@ impl AuditSource for AuthAuditSource {
                 Ok(state) => state,
                 Err(_) => return CapsuleAudit::default(),
             };
+            // AUD-4: load the runtime's OWN DID + verifying key ONCE so each event's
+            // signature can be VERIFIED on read (not merely presence-checked). If the DID
+            // cannot be loaded, degrade CLOSED: claim no attestation rather than fake it.
+            let expected = elastos_identity::load_or_create_did(&data_dir)
+                .ok()
+                .and_then(|(_sk, did)| {
+                    crate::crypto::decode_did_key(&did).ok().map(|vk| (did, vk))
+                });
             let mut total = 0u64;
             let mut denied = 0u64;
             let mut attested = 0u64;
@@ -245,7 +282,13 @@ impl AuditSource for AuthAuditSource {
                 if !success {
                     denied += 1;
                 }
-                let signed = event.signature.is_some();
+                // AUD-4: attested == cryptographically VERIFIED (+ anti-spoof DID pin),
+                // never signature presence. A forged / wrong-signer / unverifiable
+                // signature is NOT attested.
+                let signed = match &expected {
+                    Some((did, vk)) => audit_event_is_attested(event, did, vk),
+                    None => false,
+                };
                 if signed {
                     attested += 1;
                 }
@@ -2356,5 +2399,59 @@ mod tests {
         fn name(&self) -> &'static str {
             "mock-wallet"
         }
+    }
+
+    fn aud4_test_event() -> elastos_runtime::auth::RuntimeAuditEventV1 {
+        elastos_runtime::auth::RuntimeAuditEventV1 {
+            schema: "elastos.runtime.audit-event/v1".to_string(),
+            event_id: "evt-1".to_string(),
+            event_type: "capability.use".to_string(),
+            principal_id: None,
+            proof_binding_id: None,
+            session_id: None,
+            challenge_id: None,
+            capsule_id: Some("vm-probe".to_string()),
+            result: "ok".to_string(),
+            reason: "test".to_string(),
+            occurred_at: 1,
+            signer_did: None,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn aud4_attested_only_when_signature_verifies_against_runtime_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sk, did) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+        let vk = crate::crypto::decode_did_key(&did).unwrap();
+
+        // A genuinely signed event verifies (the canonical-bytes round-trip: a real
+        // event is NEVER false-denied).
+        let signed = crate::auth::sign_audit_event(dir.path(), aud4_test_event()).unwrap();
+        assert!(
+            audit_event_is_attested(&signed, &did, &vk),
+            "a genuine runtime signature must attest"
+        );
+
+        // No signature -> not attested, no error (legacy / seed events).
+        assert!(!audit_event_is_attested(&aud4_test_event(), &did, &vk));
+
+        // Present-but-forged signature -> not attested.
+        let mut forged = signed.clone();
+        forged.signature = Some("00".repeat(64));
+        assert!(
+            !audit_event_is_attested(&forged, &did, &vk),
+            "a present-but-invalid signature must NOT count as attested"
+        );
+
+        // A signature by a DIFFERENT (attacker) DID -> not attested. The verifier pins
+        // the runtime's OWN DID + key, never the embedded signer_did (anti-spoof).
+        let attacker_dir = tempfile::tempdir().unwrap();
+        let attacker_signed =
+            crate::auth::sign_audit_event(attacker_dir.path(), aud4_test_event()).unwrap();
+        assert!(
+            !audit_event_is_attested(&attacker_signed, &did, &vk),
+            "a signature by a non-runtime DID must be rejected"
+        );
     }
 }
