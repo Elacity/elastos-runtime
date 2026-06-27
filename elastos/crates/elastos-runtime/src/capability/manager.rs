@@ -7,9 +7,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::Path;
 use std::sync::Arc;
 
+use super::receipt::AffordanceGrantReceiptV1;
 use super::store::CapabilityStore;
 use super::token::{Action, CapabilityToken, ResourceId, TokenConstraints, TokenId};
-use crate::primitives::audit::AuditLog;
+use crate::primitives::audit::{AuditEvent, AuditLog};
 use crate::primitives::metrics::MetricsManager;
 use crate::primitives::time::SecureTimestamp;
 
@@ -18,17 +19,40 @@ use crate::primitives::time::SecureTimestamp;
 pub enum ValidationError {
     InvalidSignature,
     UntrustedIssuer,
-    WrongCapsule { expected: String, got: String },
-    WrongAction { expected: Action, got: Action },
-    WrongResource { expected: String, got: String },
+    WrongCapsule {
+        expected: String,
+        got: String,
+    },
+    WrongAction {
+        expected: Action,
+        got: Action,
+    },
+    WrongResource {
+        expected: String,
+        got: String,
+    },
     TokenRevoked,
     TokenExpired,
     FutureDatedToken,
-    UseLimitExceeded { current: u32, max: u32 },
-    ClassificationExceeded { token: u8, resource: u8 },
-    InvalidVersion { expected: u8, got: u8 },
+    UseLimitExceeded {
+        current: u32,
+        max: u32,
+    },
+    ClassificationExceeded {
+        token: u8,
+        resource: u8,
+    },
+    InvalidVersion {
+        expected: u8,
+        got: u8,
+    },
     DelegationNotAllowed,
     DelegationScopeWidened,
+    /// The signed, durable use-record could not be written for a single-use
+    /// affordance-consent token, so the redemption fails closed (W2 step 9). The
+    /// token's use IS consumed (single-use), so the act must be refused rather
+    /// than dispatched without a durable signed record.
+    AuditWriteFailed,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -68,6 +92,9 @@ impl std::fmt::Display for ValidationError {
             Self::DelegationNotAllowed => write!(f, "token is not delegatable"),
             Self::DelegationScopeWidened => {
                 write!(f, "delegated token cannot widen scope of parent")
+            }
+            Self::AuditWriteFailed => {
+                write!(f, "durable signed use-record could not be written")
             }
         }
     }
@@ -384,19 +411,65 @@ impl CapabilityManager {
             }
         }
 
-        // SUCCESS - emit audit event
-        self.audit_log.capability_use(
-            &token.id,
-            caller_capsule_id,
-            requested_resource,
-            requested_action,
-            true,
-        );
+        // SUCCESS - emit audit event.
+        //
+        // For affordance-consent tokens (single-use, bound to a method + args) the
+        // use-record is BLOCKING: if the signed durable record cannot be written
+        // the redemption FAILS CLOSED (W2 step 9), so a consent-gated affordance
+        // can never be consumed without a durable signed record — mirroring the
+        // AUD-2/AUD-3 fail-closed audit fixes. Ordinary capability tokens keep the
+        // existing best-effort emit (no behaviour change for other callers).
+        if token.constraints.method_id.is_some() {
+            self.audit_log
+                .emit(AuditEvent::CapabilityUse {
+                    timestamp: SecureTimestamp::now(),
+                    token_id: token.id.to_string(),
+                    capsule_id: caller_capsule_id.to_string(),
+                    resource: requested_resource.to_string(),
+                    action: requested_action.to_string(),
+                    success: true,
+                })
+                .map_err(|_| ValidationError::AuditWriteFailed)?;
+        } else {
+            self.audit_log.capability_use(
+                &token.id,
+                caller_capsule_id,
+                requested_resource,
+                requested_action,
+                true,
+            );
+        }
 
         // Record metrics
         self.metrics.record_capability_use(caller_capsule_id);
 
         Ok(())
+    }
+
+    /// Issue a signed [`AffordanceGrantReceiptV1`] attesting that an
+    /// affordance-consent token was redeemed for the exact `(capsule, method,
+    /// arguments)` approved (W2 step 9). Signed by the runtime's capability issuer
+    /// key — the same trust root that minted the token — so the holder can prove
+    /// what was done in their name. Verifiable via [`public_key`].
+    pub fn issue_affordance_receipt(
+        &self,
+        token_id: &str,
+        capsule: &str,
+        method_id: &str,
+        input_hash: &str,
+        resource: &str,
+        action: Action,
+    ) -> AffordanceGrantReceiptV1 {
+        AffordanceGrantReceiptV1::issue(
+            &self.signing_key,
+            self.public_key_bytes(),
+            token_id,
+            capsule,
+            method_id,
+            input_hash,
+            resource,
+            &action.to_string(),
+        )
     }
 
     /// Delegate a token: issue a narrower token on behalf of the parent.

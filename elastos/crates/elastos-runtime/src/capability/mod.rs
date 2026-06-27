@@ -8,6 +8,7 @@ pub mod evaluator;
 pub mod manager;
 pub mod pending;
 pub mod policy;
+pub mod receipt;
 pub mod store;
 pub mod token;
 
@@ -22,6 +23,8 @@ pub use policy::{
     AutoGrantVerifier, DecisionId, GrantProposal, PolicyDecision, PolicyOutcome, PolicyRule,
     PolicyVerifier, ProposedConstraints, RuleCheck, RulesVerifier, VerifierCheck,
 };
+#[allow(unused_imports)]
+pub use receipt::{AffordanceGrantReceiptV1, AFFORDANCE_RECEIPT_SCHEMA_V1};
 #[allow(unused_imports)]
 pub use store::CapabilityStore;
 #[allow(unused_imports)]

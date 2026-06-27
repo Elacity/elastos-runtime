@@ -15,7 +15,7 @@ agent-containment audit (EU AI Act Art 12/14).
 **Status at a glance (2026-06-27):** substrate + intent compiler DONE; security audited + hardened
 ~9/10 (AUD-1..5); Astrid research DONE; adoption wedges 1-2 (MCP-serve + dataflow) DONE; the PRODUCT +
 STRATEGY resolved (KEEP, the PDR, the shell vision, the ESP protocol, the narrative); now executing the
-**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~80%)**.
+**ESP build wedges W0-W7** toward the shell — **W2 (consent act path) IN PROGRESS (~90%)**.
 
 ---
 
@@ -78,7 +78,7 @@ The PDR/ESP plan: build the honest substrate first, then the shell as a read-onl
 |---|---|---|
 | **W0** | Core-derived reach (the honest halo) | not started |
 | **W1** | Egress-as-capability | not started |
-| **W2** | **Unstub the consent act path** | **IN PROGRESS ~80%** (below) |
+| **W2** | **Unstub the consent act path** | **IN PROGRESS ~90%** (below) |
 | **W3** | De-hardcode "the shell" → "a shell" + rename `consent-broker` | not started |
 | **W4** | Write ESP v0 (protocol doc + TS types) | not started |
 | **W5** | The v1 Svelte projection shell + the hero dDRM act | not started |
@@ -109,12 +109,20 @@ value**, so a consent-gated affordance cannot be dispatched without a live redee
 guarantee, not a convention). The invoke handler now routes via a pure, unit-tested
 `plan_affordance_dispatch` (Direct / RaiseConsent / RedeemThenDispatch); on a consent retry it redeems
 the token by **forwarding the caller's own authorization** (runtime authenticates as the bound
-`vm-{name}`), fail-closed on any non-success (no witness → no dispatch). REMAINING: 9 (signed BLOCKING
-audit + receipt on the grant→use chain), 10 (full journey test + fail-closed branch matrix — this also
-verifies the live identity round-trip end-to-end), 11 (alignment assertions + docs).
+`vm-{name}`), fail-closed on any non-success (no witness → no dispatch). **Step 9 DONE** (this slice):
+the affordance use-record is now **BLOCKING** — for a bound (single-use) token `validate()` emits the
+signed durable `CapabilityUse` via `emit()` and fails closed (`AuditWriteFailed` → 503) if it can't be
+written, so an affordance can never be consumed without a durable signed record (mirrors AUD-2/AUD-3;
+ordinary tokens keep best-effort, no ripple). `validate-and-consume` now returns a signed
+`AffordanceGrantReceiptV1` — runtime-signed (the issuer/trust root), verifiable under the capability
+key, binding (capsule, method, input_hash, resource, action); tampering any field breaks verification
+(proven). REMAINING: 10 (full journey test + fail-closed branch matrix — also verifies the live
+identity round-trip end-to-end), 11 (alignment assertions + docs). Small follow-up: sign the gateway
+provider-effect *telemetry* envelope (`signer_did: None`) — the authoritative attestation is the
+runtime-signed receipt.
 
-**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 9 (signed blocking audit +
-receipt) → 10 (journey) → 11 → W3 → … → W7.
+**Immediate next (on `claude/keep-consent-architecture-0fz0ll`):** W2 step 10 (journey test +
+fail-closed matrix) → 11 (alignment + docs) → W3 → … → W7.
 
 ---
 

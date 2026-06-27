@@ -18,8 +18,8 @@ use elastos_runtime::approval::{self, ApprovalDecision};
 use elastos_runtime::capability::manager::ValidationError;
 use elastos_runtime::capability::{
     pending::{AffordanceBinding, PendingRequestStore},
-    Action, CapabilityManager, CapabilityToken, GrantDuration, PolicyEvaluator, PolicyOutcome,
-    ResourceId, TokenConstraints,
+    Action, AffordanceGrantReceiptV1, CapabilityManager, CapabilityToken, GrantDuration,
+    PolicyEvaluator, PolicyOutcome, ResourceId, TokenConstraints,
 };
 use elastos_runtime::session::Session;
 
@@ -239,22 +239,36 @@ fn parse_action(raw: &str) -> Result<Action, (StatusCode, String)> {
 /// per failure. We never forward the error's `Display` (it embeds expected/got
 /// resources + capsule ids), which would leak internal topology to the caller.
 fn map_validation_error(err: &ValidationError) -> (StatusCode, String) {
-    let code = match err {
-        ValidationError::InvalidVersion { .. } => "token_version_unsupported",
-        ValidationError::InvalidSignature => "token_signature_invalid",
-        ValidationError::UntrustedIssuer => "token_issuer_untrusted",
-        ValidationError::WrongCapsule { .. } => "token_wrong_caller",
-        ValidationError::WrongAction { .. } => "token_wrong_action",
-        ValidationError::WrongResource { .. } => "token_wrong_resource",
-        ValidationError::TokenRevoked => "token_revoked",
-        ValidationError::TokenExpired => "token_expired",
-        ValidationError::FutureDatedToken => "token_not_yet_valid",
-        ValidationError::UseLimitExceeded { .. } => "token_already_used",
-        ValidationError::ClassificationExceeded { .. } => "token_classification_insufficient",
-        ValidationError::DelegationNotAllowed => "token_delegation_not_allowed",
-        ValidationError::DelegationScopeWidened => "token_delegation_scope_widened",
+    // Most failures are caller-authorization problems (403). A failed durable
+    // signed-audit write (W2 step 9) is a SERVER fault, surfaced fail-closed as
+    // 503 — the act was refused because the redemption could not be recorded.
+    let (status, code) = match err {
+        ValidationError::InvalidVersion { .. } => {
+            (StatusCode::FORBIDDEN, "token_version_unsupported")
+        }
+        ValidationError::InvalidSignature => (StatusCode::FORBIDDEN, "token_signature_invalid"),
+        ValidationError::UntrustedIssuer => (StatusCode::FORBIDDEN, "token_issuer_untrusted"),
+        ValidationError::WrongCapsule { .. } => (StatusCode::FORBIDDEN, "token_wrong_caller"),
+        ValidationError::WrongAction { .. } => (StatusCode::FORBIDDEN, "token_wrong_action"),
+        ValidationError::WrongResource { .. } => (StatusCode::FORBIDDEN, "token_wrong_resource"),
+        ValidationError::TokenRevoked => (StatusCode::FORBIDDEN, "token_revoked"),
+        ValidationError::TokenExpired => (StatusCode::FORBIDDEN, "token_expired"),
+        ValidationError::FutureDatedToken => (StatusCode::FORBIDDEN, "token_not_yet_valid"),
+        ValidationError::UseLimitExceeded { .. } => (StatusCode::FORBIDDEN, "token_already_used"),
+        ValidationError::ClassificationExceeded { .. } => {
+            (StatusCode::FORBIDDEN, "token_classification_insufficient")
+        }
+        ValidationError::DelegationNotAllowed => {
+            (StatusCode::FORBIDDEN, "token_delegation_not_allowed")
+        }
+        ValidationError::DelegationScopeWidened => {
+            (StatusCode::FORBIDDEN, "token_delegation_scope_widened")
+        }
+        ValidationError::AuditWriteFailed => {
+            (StatusCode::SERVICE_UNAVAILABLE, "audit_write_failed")
+        }
     };
-    (StatusCode::FORBIDDEN, code.to_string())
+    (status, code.to_string())
 }
 
 /// Body for `POST /api/capability/validate-and-consume`.
@@ -279,6 +293,9 @@ pub struct ValidateAndConsumeInput {
 pub struct ValidateAndConsumeOutput {
     /// Always "consumed" on success (the single use has been atomically spent).
     pub status: String,
+    /// Signed attestation of the redemption (W2 step 9) — the portable proof the
+    /// caller keeps. Verifiable under the runtime's capability public key.
+    pub receipt: AffordanceGrantReceiptV1,
 }
 
 /// POST /api/capability/validate-and-consume
@@ -347,8 +364,21 @@ pub async fn validate_and_consume(
         .await
         .map_err(|err| map_validation_error(&err))?;
 
+    // The use is now consumed AND a signed durable record was written (blocking,
+    // inside validate()). Mint the portable signed receipt the caller keeps —
+    // "if there's no receipt, there's no act" (W2 step 9).
+    let receipt = state.capability_manager.issue_affordance_receipt(
+        &token.id().to_string(),
+        caller,
+        &input.method_id,
+        &recomputed,
+        &input.resource,
+        action,
+    );
+
     Ok(Json(ValidateAndConsumeOutput {
         status: "consumed".to_string(),
+        receipt,
     }))
 }
 
@@ -1316,16 +1346,23 @@ mod tests {
 
         // Correct redemption succeeds once; replay is refused (single use spent).
         let token = mint_affordance_token(&state, "play", &hash).await;
+        let redeemed = validate_and_consume(
+            State(state.clone()),
+            player(),
+            Json(redeem_input(&token, "play", serde_json::json!({"x": 1}))),
+        )
+        .await
+        .expect("a correct redemption consumes the single use");
+        // W2 step 9: the redemption returns a signed receipt that verifies under
+        // the runtime's capability key and binds the exact (method, args).
+        let receipt = &redeemed.0.receipt;
         assert!(
-            validate_and_consume(
-                State(state.clone()),
-                player(),
-                Json(redeem_input(&token, "play", serde_json::json!({"x": 1}))),
-            )
-            .await
-            .is_ok(),
-            "a correct redemption consumes the single use"
+            receipt.verify(state.capability_manager.public_key()),
+            "receipt must verify under the runtime capability key"
         );
+        assert_eq!(receipt.method_id, "play");
+        assert_eq!(receipt.input_hash, hash);
+        assert_eq!(receipt.capsule, "vm-player");
         assert!(
             validate_and_consume(
                 State(state.clone()),
